@@ -18,7 +18,12 @@ import {
   convertDshEventsToRawMessages,
   deriveMutationPlan,
   dshSeqForOrdinal,
+  DSH_AGENT_INSTRUCTIONS_KEY,
+  DSH_SYSTEM_PROMPT_KEY,
   findKnowledgeBaselineNodeIndices,
+  isAgentInstructionsBaselineMessage,
+  isDshSystemPromptBaselineMessage,
+  isDurableInjectedMessage,
   isKnowledgeBaselineMessage,
   isSkillCatalogBaselineMessage,
   readDshTranscript,
@@ -170,6 +175,67 @@ describe("transcript mapping (DSH events → RawMessage[])", () => {
     expect(view.messages.some((m) => isKnowledgeBaselineMessage(m))).toBe(true);
     const indices = findKnowledgeBaselineNodeIndices(session.events, view.surfaceNodes);
     expect(indices).toEqual([0]);
+  });
+
+  it("detects agent-instructions and dsh-system-prompt baselines via view markers and source fallback", () => {
+    const session = Session.create(SessionId("sess-durable"));
+    const aiMsg = createUserMessage({
+      content: [{ type: "text", text: "agent instructions" }],
+      source: { kind: "agent-instructions" } as never,
+    });
+    session.append("user/message", aiMsg, { surfaceOp: "append" });
+    const promptMsg = createUserMessage({
+      content: [{ type: "text", text: "system prompt snapshot" }],
+      source: { kind: "plugin", plugin: "@deepseek-ai/dsh-system-prompt" } as never,
+    });
+    session.append("user/message", promptMsg, { surfaceOp: "append" });
+    const view = viewOf(session);
+    const aiView = view.messages.find((m) => isAgentInstructionsBaselineMessage(m))!;
+    const promptView = view.messages.find((m) => isDshSystemPromptBaselineMessage(m))!;
+    expect(aiView).toBeDefined();
+    expect(promptView).toBeDefined();
+    expect(isDurableInjectedMessage(aiView)).toBe(true);
+    expect(isDurableInjectedMessage(promptView)).toBe(true);
+    // Baseline helpers fallback to source when marker absent
+    const rawAi: any = { source: { kind: "agent-instructions" }, parts: [] };
+    const rawPrompt: any = { source: { kind: "plugin", plugin: "@deepseek-ai/dsh-system-prompt" }, parts: [] };
+    expect(isAgentInstructionsBaselineMessage(rawAi)).toBe(true);
+    expect(isDshSystemPromptBaselineMessage(rawPrompt)).toBe(true);
+    // Marker path
+    const markerAi: any = { source: { kind: "user" }, parts: [] };
+    Object.defineProperty(markerAi, DSH_AGENT_INSTRUCTIONS_KEY, { value: true, enumerable: false });
+    expect(isAgentInstructionsBaselineMessage(markerAi)).toBe(true);
+    const markerPrompt: any = { source: { kind: "user" }, parts: [] };
+    Object.defineProperty(markerPrompt, DSH_SYSTEM_PROMPT_KEY, { value: true, enumerable: false });
+    expect(isDshSystemPromptBaselineMessage(markerPrompt)).toBe(true);
+    // Non-durable is false
+    const normal: any = { source: { kind: "user" }, parts: [{ type: "text", text: "hi" }] };
+    expect(isDurableInjectedMessage(normal as any)).toBe(false);
+  });
+
+  it("isDurableInjectedMessage covers all durable kinds and buildRecordingTranscript skips them (no ops)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-durable-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const session = Session.create(SessionId("sess-durable-skip"));
+      const aiCatalog = createUserMessage({
+        content: [{ type: "text", text: "agent instructions durable" }],
+        source: { kind: "agent-instructions" } as never,
+      });
+      session.append("user/message", aiCatalog, { surfaceOp: "append" });
+      const promptSnap = createUserMessage({
+        content: [{ type: "text", text: "prompt snapshot" }],
+        source: { kind: "plugin", plugin: "@deepseek-ai/dsh-system-prompt" } as never,
+      });
+      session.append("user/message", promptSnap, { surfaceOp: "append" });
+      const view = viewOf(session);
+      expect(view.messages.every((m) => isDurableInjectedMessage(m))).toBe(true);
+      const plan = deriveMutationPlan(view, { db, protectedTags: 0 });
+      expect(plan).toBeNull();
+      db.close();
+    } finally {
+      await cleanupDir(dir);
+    }
   });
 });
 

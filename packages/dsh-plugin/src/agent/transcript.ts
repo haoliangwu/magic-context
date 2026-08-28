@@ -245,9 +245,8 @@ function isSkillCatalogMessage(message: Record<string, unknown>): boolean {
  * step — the injection-compression loop (session-11d586ad: 116 baselines,
  * 58 dsh-system-prompt snapshots re-injected each round).
  */
-export function isAgentInstructionsMessage(message: Record<string, unknown> | RawMessage): boolean {
+function isAgentInstructionsMessage(message: Record<string, unknown> | RawMessage): boolean {
   const rec = message as unknown as Record<string, unknown>;
-  if (rec["__dshAgentInstructionsBaseline"] === true) return true;
   const source = isRecord(rec.source) ? (rec.source as Record<string, unknown>) : null;
   return source !== null && source.kind === "agent-instructions";
 }
@@ -259,9 +258,8 @@ export function isAgentInstructionsMessage(message: Record<string, unknown> | Ra
  * shadowed. Same loop as agent-instructions: compress gain ≈0, must stay out
  * of tag/drop pipeline or visibleBaselineSource misses it and host re-injects.
  */
-export function isDshSystemPromptMessage(message: Record<string, unknown> | RawMessage): boolean {
+function isDshSystemPromptMessage(message: Record<string, unknown> | RawMessage): boolean {
   const rec = message as unknown as Record<string, unknown>;
-  if (rec["__dshDshSystemPromptBaseline"] === true) return true;
   const source = isRecord(rec.source) ? (rec.source as Record<string, unknown>) : null;
   return source !== null && source.kind === "plugin" && source.plugin === "@deepseek-ai/dsh-system-prompt";
 }
@@ -402,7 +400,7 @@ export const DSH_SKILL_CATALOG_KEY = "__dshSkillCatalog";
 /** Non-enumerable agent-instructions marker (durable injected baseline). */
 export const DSH_AGENT_INSTRUCTIONS_KEY = "__dshAgentInstructionsBaseline";
 /** Non-enumerable dsh-system-prompt marker (durable injected snapshot). */
-export const DSH_DSH_SYSTEM_PROMPT_KEY = "__dshDshSystemPromptBaseline";
+export const DSH_SYSTEM_PROMPT_KEY = "__dshSystemPromptBaseline";
 
 /** The surface span of a view message, or null for messages without one. */
 export function messageNodeSpan(message: RawMessage): DshMessageSpan | null {
@@ -431,7 +429,7 @@ export function isAgentInstructionsBaselineMessage(message: RawMessage): boolean
 /** True when the view message is a durable dsh-system-prompt snapshot (plugin==='@deepseek-ai/dsh-system-prompt'). */
 export function isDshSystemPromptBaselineMessage(message: RawMessage): boolean {
   const rec = message as unknown as Record<string, unknown>;
-  if (rec[DSH_DSH_SYSTEM_PROMPT_KEY] === true) return true;
+  if (rec[DSH_SYSTEM_PROMPT_KEY] === true) return true;
   const source = isRecord(rec.source) ? (rec.source as Record<string, unknown>) : null;
   return source !== null && source.kind === "plugin" && source.plugin === "@deepseek-ai/dsh-system-prompt";
 }
@@ -802,7 +800,7 @@ export function readDshTranscript(input: DshTranscriptInput): DshTranscriptView 
       });
     }
     if (walk.dshSystemPromptOrdinals.has(message.ordinal)) {
-      Object.defineProperty(message, DSH_DSH_SYSTEM_PROMPT_KEY, {
+      Object.defineProperty(message, DSH_SYSTEM_PROMPT_KEY, {
         value: true,
         enumerable: false,
         configurable: true,
@@ -1161,10 +1159,7 @@ function buildRecordingTranscript(
     // see them missing, and the host re-injects them every step, causing the
     // injection-compression loop (session-11d586ad: 116 baselines + 58 snapshots
     // re-injected each round). They must stay out of the pipeline too.
-    if (isKnowledgeBaselineMessage(raw)) continue;
-    if (isSkillCatalogBaselineMessage(raw)) continue;
-    if (isAgentInstructionsBaselineMessage(raw)) continue;
-    if (isDshSystemPromptBaselineMessage(raw)) continue;
+    if (isDurableInjectedMessage(raw)) continue;
     const message = new RecordingMessage(
       { id: raw.id, role: raw.role, sessionId: view.sessionId },
       messageNodeSpan(raw),
