@@ -62,6 +62,17 @@ const CANONICAL_MODEL_IDENTITY_ALIASES: Readonly<Record<string, string>> = {
     "github-copilot/gpt-6-astra": "openai/gpt-6-astra",
 };
 
+export const CANONICAL_DEEPSEEK_PROVIDER = "deepseek";
+export const DSH_DEEPSEEK_PROVIDER = "deepseek-official";
+
+const CANONICAL_TO_DSH: Readonly<Record<string, string>> = {
+    [CANONICAL_DEEPSEEK_PROVIDER]: DSH_DEEPSEEK_PROVIDER,
+};
+
+const DSH_TO_CANONICAL: Readonly<Record<string, string>> = {
+    [DSH_DEEPSEEK_PROVIDER]: CANONICAL_DEEPSEEK_PROVIDER,
+};
+
 /** Remap only the provider prefix (text before the first "/"), preserving the
  *  model id verbatim. No "/", empty provider, or unmapped provider -> unchanged.
  *  Lookups are own-property only, so provider ids that collide with
@@ -127,4 +138,16 @@ export function ompModelRefToCanonical(ref: string): string {
 /** Canonical shared-config model reference -> OMP-native selector. */
 export function resolveModelRefForOmp(ref: string): string {
     return remapProviderPrefix(ompModelRefToCanonical(ref), CANONICAL_TO_OMP_PROVIDER);
+}
+
+/** DSH-native `provider/model` -> canonical (OpenCode). Identity when unmapped. */
+export function dshModelRefToCanonical(ref: string): string {
+    return remapProviderPrefix(ref, DSH_TO_CANONICAL);
+}
+
+/** Canonical (OpenCode) `provider/model` -> DSH-native, for spawning a model on
+ *  DSH. Idempotent: normalizes any DSH-form prefix back to canonical first, so it
+ *  is safe on a config that already holds DSH-form ids (hand-edited or pre-fix). */
+export function resolveModelRefForDsh(ref: string): string {
+    return remapProviderPrefix(dshModelRefToCanonical(ref), CANONICAL_TO_DSH);
 }
