@@ -1,5 +1,5 @@
 /**
- * compat/dsh-0.1/typert — the MagicContext Remote seam.
+ * compat/dsh-0.1/remote-seam — the MagicContext Remote seam (renamed from typert).
  *
  * Validated in Phase 0 spike-4: strict descriptors + codecs, gateway dispatch,
  * `typertRemote` service binding, error envelopes, fiber-owned registration.

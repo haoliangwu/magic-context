@@ -4,7 +4,7 @@
  * The shared DB must be opened AFTER the harness identity is locked: tests
  * call `setDshHarness()` exactly like the Pi suite calls `setHarness("pi")`.
  */
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,4 +28,50 @@ export async function createTestDb(dbPath: string): Promise<Database> {
   if (db === null) throw new Error("createTestDb: openDatabaseAsync refused");
   initializeDatabase(db);
   return db;
+}
+
+/** Isolated env: temp dir + migrated DB + cleanup (Windows WAL retry). */
+export interface TestEnv {
+  dir: string;
+  db: Database;
+  cleanup: () => Promise<void>;
+}
+
+async function cleanupDirWithDb(dir: string, db?: Database): Promise<void> {
+  try {
+    db?.close();
+  } catch {
+    // already closed
+  }
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
+export async function createTestEnv(prefix = "dsh-magic-test-"): Promise<TestEnv> {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const db = await createTestDb(join(dir, "context.db"));
+  return {
+    dir,
+    db,
+    cleanup: () => cleanupDirWithDb(dir, db),
+  };
+}
+
+/** Run fn with an isolated env; always cleans up (mkdtemp + createTestDb + rmSync). */
+export async function withTestDb<T>(
+  fn: (env: TestEnv) => Promise<T>,
+  prefix = "dsh-magic-test-",
+): Promise<T> {
+  const env = await createTestEnv(prefix);
+  try {
+    return await fn(env);
+  } finally {
+    await env.cleanup();
+  }
 }

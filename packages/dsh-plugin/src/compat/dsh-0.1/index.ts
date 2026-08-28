@@ -13,6 +13,6 @@ export * from "./prestep";
 export * from "./tools";
 export * from "./commands";
 export * from "./subagent";
-export * from "./typert";
+export * from "./remote-seam";
 export * from "./liveness";
 export * from "./preset";

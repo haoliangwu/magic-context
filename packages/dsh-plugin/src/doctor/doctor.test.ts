@@ -16,6 +16,7 @@ import {
   LATEST_SUPPORTED_VERSION,
   openDatabaseAsync,
 } from "@magic-context/core/features/magic-context/storage-db";
+import { withTestDb } from "../test-utils";
 import {
   classifyDatabaseOpen,
   listProfiles,
@@ -109,9 +110,8 @@ function byId(report: Awaited<ReturnType<typeof runDshDoctor>>): Map<string, Awa
 
 describe("dsh-magic-context doctor (Phase 2 slice C)", () => {
   it("classifies a healthy shared DB open as ok", async () => {
-    const env = makeEnv();
-    try {
-      const dbPath = join(env.root, "ok", "context.db");
+    await withTestDb(async ({ dir }) => {
+      const dbPath = join(dir, "ok", "context.db");
       const outcome = await classifyDatabaseOpen(dbPath);
       expect(outcome.kind).toBe("ok");
       if (outcome.kind === "ok") {
@@ -119,9 +119,7 @@ describe("dsh-magic-context doctor (Phase 2 slice C)", () => {
         expect(outcome.latestSupported).toBe(LATEST_SUPPORTED_VERSION);
         outcome.db?.close();
       }
-    } finally {
-      await cleanup(env.root);
-    }
+    }, "dsh-magic-doctor-");
   });
 
   it("classifies a newer persisted schema as a schema-fence refusal", async () => {
