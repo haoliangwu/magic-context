@@ -26,10 +26,7 @@ import {
   setSqlitePragmaConfig,
 } from "@magic-context/core/features/magic-context/storage-db";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import {
-  canonicalSessionKey,
-  setDshHarness,
-} from "../shared/dsh-harness";
+import { setDshHarness } from "../shared/dsh-harness";
 import {
   markerPath,
   removeDshLivenessMarker,
@@ -135,11 +132,6 @@ export async function bootstrapDshStorage(
     removeDshLivenessMarker(ownLivenessPath);
     throw error;
   }
-}
-
-/** Canonical Magic session key for a DSH session under this home. */
-export function dshCanonicalSessionKey(homeHash: string, dshSessionId: string): string {
-  return canonicalSessionKey(homeHash, dshSessionId);
 }
 
 /** Convenience: the shared DB file path inside a storage dir (tests). */

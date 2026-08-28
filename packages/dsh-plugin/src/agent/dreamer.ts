@@ -165,55 +165,12 @@ type SyntheticPart =
   | { type: "text"; text: string }
   | { type: "tool"; tool: string; state: { input: { description: string } } };
 
-/**
- * Build `toolCallCount` synthetic tool parts so the shared
- * `investigationToolCallCount` / `extractToolCallSummaries` consumers see the
- * agent's investigation. P1 is direct-LLM only, so the count is always 0 (the
- * parts list is empty) — kept to mirror the Pi facade and document intent.
- */
-function syntheticToolParts(count: number): SyntheticPart[] {
-  const safe = Math.max(0, Math.floor(count));
-  return Array.from({ length: safe }, () => ({
-    type: "tool" as const,
-    tool: "investigation",
-    state: { input: { description: "investigation step" } },
-  }));
-}
-
 /** OpenCode-shaped synthetic message (mirror of the Pi facade's makeMessage). */
 function makeMessage(role: "user" | "assistant", parts: SyntheticPart[]): unknown {
   return {
     info: { role, time: { created: Date.now() } },
     parts,
   };
-}
-
-function extractUserMessage(args: DreamFacadePromptArgs): string {
-  const parts = args.body?.parts;
-  if (!Array.isArray(parts)) return "";
-  return parts
-    .map((part) => part?.text)
-    .filter((text): text is string => typeof text === "string" && text.length > 0)
-    .join("\n");
-}
-
-function extractSystemPrompt(args: DreamFacadePromptArgs): string | undefined {
-  const system = args.body?.system;
-  return typeof system === "string" && system.length > 0 ? system : undefined;
-}
-
-function extractBodyAgent(args: DreamFacadePromptArgs): string | undefined {
-  const agent = args.body?.agent;
-  return typeof agent === "string" && agent.length > 0 ? agent : undefined;
-}
-
-function extractBodyModel(
-  args: DreamFacadePromptArgs,
-): { providerID: string; modelID: string } | undefined {
-  const model = args.body?.model;
-  if (!model || typeof model !== "object") return undefined;
-  const { providerID, modelID } = model;
-  return typeof providerID === "string" && typeof modelID === "string" ? { providerID, modelID } : undefined;
 }
 
 /** Read the LLM runtime without declaring a hard inject (optional service). */
@@ -322,7 +279,10 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
       if (args.signal?.aborted) {
         throw new Error("prompt aborted by external signal");
       }
-      const agent = extractBodyAgent(args);
+      const agent =
+        typeof args.body?.agent === "string" && args.body.agent.length > 0
+          ? args.body.agent
+          : undefined;
       if (agent !== undefined && TOOL_REQUIRING_DREAM_AGENTS.has(agent)) {
         // Explicit, non-transient failure: tool worker wiring (ctx.subagents.start
         // + toolFilter allowlist) is a Phase 4 follow-up / integrator decision.
@@ -332,18 +292,40 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
             `Wire ctx.subagents.start workers in a later Phase 4 slice or disable this task.`,
         );
       }
-      const userText = extractUserMessage(args);
-      const model = resolveDreamModel(ctx, extractBodyModel(args));
+      const rawParts = args.body?.parts;
+      const userText = Array.isArray(rawParts)
+        ? rawParts
+            .map((part) => part?.text)
+            .filter((text): text is string => typeof text === "string" && text.length > 0)
+            .join("\n")
+        : "";
+      const rawModel = args.body?.model as { providerID?: unknown; modelID?: unknown } | undefined;
+      const bodyModel =
+        rawModel !== undefined &&
+        rawModel !== null &&
+        typeof rawModel === "object" &&
+        typeof (rawModel as Record<string, unknown>).providerID === "string" &&
+        typeof (rawModel as Record<string, unknown>).modelID === "string"
+          ? {
+              providerID: (rawModel as { providerID: string }).providerID,
+              modelID: (rawModel as { modelID: string }).modelID,
+            }
+          : undefined;
+      const model = resolveDreamModel(ctx, bodyModel);
       try {
+        const rawSystem = args.body?.system;
+        const system =
+          typeof rawSystem === "string" && rawSystem.length > 0 ? rawSystem : undefined;
         const text = await streamDreamTurn(ctx, {
-          system: extractSystemPrompt(args),
+          system,
           userText,
           model,
           signal: args.signal ?? undefined,
         });
         dreamSession.messages = [
           makeMessage("user", [{ type: "text", text: userText }]),
-          makeMessage("assistant", [...syntheticToolParts(0), { type: "text", text }]),
+          // synthetic tool parts: always 0 in P1 direct-LLM (empty) — mirrors Pi facade intent
+          makeMessage("assistant", [{ type: "text", text }]),
         ];
         return {};
       } catch (error) {
@@ -585,23 +567,13 @@ export function dshDreamSeams(
   const tasks = buildDreamTaskRuntimeConfigs(state.coreConfig, "opencode").filter(
     (task) => task.schedule.trim() !== "",
   );
-  const runnable = state.enabled && !readDreamerCompactionOff(deps);
+  const runnable = state.enabled && deps.compactionOff !== true;
   return {
     tasks,
     executor,
     runnable,
     scheduleSummary: summarizeDreamSchedule(state.coreConfig),
   };
-}
-
-/**
- * Compaction-off is agent-plane integrator config (`config.commands.compactionOff`,
- * the same flag /ctx-flush and /ctx-recomp gate on). The agent-plane apply
- * threads it through the deps — NEVER read `ctx.config` as a property (cordis
- * throws on undeclared property access).
- */
-function readDreamerCompactionOff(deps: { compactionOff?: boolean }): boolean {
-  return deps.compactionOff === true;
 }
 
 /* ────────────────────────────── test seam ─────────────────────────────── */

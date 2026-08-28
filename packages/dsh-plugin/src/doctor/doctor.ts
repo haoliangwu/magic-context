@@ -32,12 +32,13 @@ import {
   scanStockPresetLayout,
 } from "../compat/dsh-0.1/preset";
 import type { RpcPortFileRecord } from "../compat/dsh-0.1/liveness";
+import { describeError } from "@magic-context/core/shared/error-message";
 import {
   DSH_COMPAT_EXPECTED_VERSION,
   DSH_PACKAGE,
+  formatDetail,
   LEGACY_MAGIC_CONTEXT_PACKAGE,
   MAGIC_CONTEXT_PACKAGE,
-  errorMessage,
   locateDshInstall,
   magicEntryPath,
   magicStandardAgentCordisPath,
@@ -116,7 +117,7 @@ export async function classifyDatabaseOpen(
       latestSupported: LATEST_SUPPORTED_VERSION,
     };
   } catch (error) {
-    return { kind: "fatal", detail: errorMessage(error) };
+    return { kind: "fatal", detail: describeError(error).brief };
   }
 }
 
@@ -275,7 +276,7 @@ export async function runDshDoctor(
         id: "dsh-version",
         title: "DSH version",
         status: "fail",
-        detail: `${manifestPath}: ${errorMessage(error)}`,
+        detail: `${manifestPath}: ${describeError(error).brief}`,
         fix: `Reinstall DSH ${DSH_COMPAT_EXPECTED_VERSION}.`,
       });
       installedVersion = undefined;
@@ -436,7 +437,7 @@ export async function runDshDoctor(
       }
     } catch (error) {
       presetStatus = "fail";
-      presetDetail = `${agentCordisPath}: ${errorMessage(error)}`;
+      presetDetail = `${agentCordisPath}: ${describeError(error).brief}`;
     }
     checks.push({
       id: "preset-generated",
@@ -569,14 +570,4 @@ export async function runDshDoctor(
     exitCode: checks.some((check) => check.status === "fail") ? 1 : 0,
     checks,
   };
-}
-
-function formatDetail(detail: unknown): string {
-  if (detail === undefined || detail === null) return "";
-  if (typeof detail === "string") return detail;
-  try {
-    return JSON.stringify(detail);
-  } catch {
-    return String(detail);
-  }
 }
