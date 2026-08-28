@@ -21,7 +21,7 @@ dsh-magic-context doctor --profile web  # 5/5 ok（liveness 警告可忽略）
 
 ## 安装
 
-**生产（已发布）：**
+**生产 — npm（已发布后）：**
 
 ```json
 // ~/.dsh/profiles/<name>/package.json
@@ -36,6 +36,27 @@ dsh plugin --profile <name> install
 dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
+
+**生产 — GitHub 子路径（未发 npm 时，已用 pnpm 11 验证）：**
+
+```json
+// ~/.dsh/profiles/<name>/package.json
+{
+  "dependencies": { "@cortexkit/dsh-magic-context": "github:haoliangwu/magic-context#master&path:packages/dsh-plugin" },
+  "dsh": { "profile": { "bundles": ["@cortexkit/dsh-magic-context"] } }
+}
+```
+
+```sh
+dsh plugin --profile <name> install
+# 若 dist/ 缺失（git 拉取未含构建产物），在已安装包内手动构建一次：
+bun --cwd ~/.dsh/profiles/<name>/node_modules/@cortexkit/dsh-magic-context run build
+# prepare 已尝试 bun run build；若 profile 环境无 bun，需手动执行上一行
+dsh-magic-context setup --profile <name>
+dsh-magic-context doctor --profile <name>
+```
+
+> 已验证：`pnpm add "@cortexkit/dsh-magic-context@github:haoliangwu/magic-context#master&path:packages/dsh-plugin"` 可解析（170 包）。`prepare` 会尝试 `bun run build`，若 profile 无 `bun` 则按上一行手动构建。
 
 **本地开发（单仓）：**
 
