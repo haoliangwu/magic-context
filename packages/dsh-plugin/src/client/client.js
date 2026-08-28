@@ -30,7 +30,7 @@
  * with the factory-form CJS shape used by the framework's own client bundles.
  */
 window.__ModuleLoader__.load({
-	id: "dsh-magic-context",
+	id: "@cortexkit/dsh-magic-context",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
