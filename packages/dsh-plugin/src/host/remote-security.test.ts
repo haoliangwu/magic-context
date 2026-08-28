@@ -6,7 +6,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { MAGIC_CONTEXT_REMOTE_NAMESPACE } from "../compat/dsh-0.1/typert";
+import { MAGIC_CONTEXT_REMOTE_NAMESPACE } from "../compat/dsh-0.1/remote-seam";
 import {
   MAGIC_DIAGNOSTICS_METHOD,
   MAGIC_STATUS_METHOD,
