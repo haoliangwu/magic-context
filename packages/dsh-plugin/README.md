@@ -72,6 +72,16 @@ Remove the `bundles` entry and restart DSH. Shared SQLite and `dsh_*` adapter ro
 - DSH `0.1.1-rc.2` exact-rc (run `doctor` contract gate before upgrading)
 - Magic Context shared schema `v81` (this package's `LATEST_SUPPORTED_VERSION`)
 
+## Q&A
+
+**Q: I use Pi / OpenCode and DSH together and want to share memories. Do versions need to match?**
+
+Yes — all harnesses share one SQLite at `~/.local/share/cortexkit/magic-context/context.db`. The DB is versioned (`schema v81` at `LATEST_SUPPORTED_VERSION`); a newer plugin migrates the DB forward, an older one will fail the schema fence and refuse to open it. If you share memories across `pi` / `opencode` / `dsh`, keep their `@cortexkit/*-magic-context` versions in sync (same monorepo tag) so they agree on the schema. `doctor` reports the schema version and the adapter ceiling.
+
+**Q: What happens on a version mismatch?**
+
+The older harness fails closed (loud error, no silent fallback) until you upgrade it. The DB itself is not corrupted — upgrading the lagging plugin re-opens it after migration.
+
 ## Credit
 
 Original DSH port: [xiaohj233/dsh-magic-context](https://github.com/xiaohj233/dsh-magic-context). This package continues that work inside the upstream monorepo; upstream issues and PRs belong at [cortexkit/magic-context](https://github.com/cortexkit/magic-context).
