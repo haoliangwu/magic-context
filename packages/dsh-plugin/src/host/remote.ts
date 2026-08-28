@@ -14,7 +14,6 @@
  * codecs, so no decorators or generated artifacts are involved.
  */
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { Service, type Context } from "@deepseek-ai/cordis";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
@@ -27,7 +26,7 @@ import type { InvocationDescriptor } from "@deepseek-ai/dsh-typert-protocol";
 import type { TypertContribution } from "@deepseek-ai/dsh-typert-registry/types";
 import { MAGIC_CONTEXT_REMOTE_NAMESPACE } from "../compat/dsh-0.1/typert";
 import type { MagicContextHostService } from "../index";
-import { MAGIC_CONTEXT_PACKAGE } from "../doctor/env";
+import { formatDetail, MAGIC_CONTEXT_PACKAGE, resolveDshHome } from "../doctor/env";
 
 /** Wire endpoint name (client calls `magicContext/status`). */
 export const MAGIC_STATUS_METHOD = "status";
@@ -65,12 +64,6 @@ export interface MagicStatus {
   readonly sessionId?: string | null;
 }
 
-function dshHome(): string {
-  const explicit = process.env.DSH_HOME;
-  if (explicit !== undefined && explicit.trim() !== "") return explicit;
-  return join(homedir(), ".dsh");
-}
-
 /** Cordis Service backing the `magicContext` Remote namespace. */
 export class MagicContextRemoteService extends Service {
   /** Hand-built Typert Gateway binding (protocol `bindTypertRemote` shape). */
@@ -101,7 +94,7 @@ export class MagicContextRemoteService extends Service {
           ok: false,
           latestSupported: LATEST_SUPPORTED_VERSION,
           reason: bootstrap.reason,
-          detail: safeDetail(bootstrap.detail),
+          detail: formatDetail(bootstrap.detail) || undefined,
         };
       }
       return {
@@ -110,7 +103,7 @@ export class MagicContextRemoteService extends Service {
         latestSupported: LATEST_SUPPORTED_VERSION,
       };
     })();
-    const home = dshHome();
+    const home = resolveDshHome();
     const configPath = resolveCortexKitUserConfigPath();
     const presetDir = join(home, ".agent-presets", "magic-standard");
     return {
@@ -196,16 +189,6 @@ export class MagicContextRemoteService extends Service {
     } catch {
       return empty;
     }
-  }
-}
-
-function safeDetail(detail: unknown): string | undefined {
-  if (detail === undefined || detail === null) return undefined;
-  if (typeof detail === "string") return detail;
-  try {
-    return JSON.stringify(detail);
-  } catch {
-    return String(detail);
   }
 }
 

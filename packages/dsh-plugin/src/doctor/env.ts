@@ -27,6 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { describeError } from "@magic-context/core/shared/error-message";
 
 /** npm package identity of this adapter (checked against profile bundles). */
 export const MAGIC_CONTEXT_PACKAGE = "@cortexkit/dsh-magic-context";
@@ -259,8 +260,18 @@ export function parseFlags(
 
 /** Stable human-readable error text for a thrown value. */
 export function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return String(error);
+  return describeError(error).brief;
+}
+
+/** JSON-safe detail string for doctor/remote status — string for missing, JSON otherwise. */
+export function formatDetail(detail: unknown): string {
+  if (detail === undefined || detail === null) return "";
+  if (typeof detail === "string") return detail;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return String(detail);
+  }
 }
 
 /** Read one flag as an optional string (boolean flags yield undefined). */
