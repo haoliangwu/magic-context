@@ -19,7 +19,7 @@
  * boot-time constant per plugin instance. Cross-harness leakage is a
  * correctness bug, not a feature.
  */
-export type HarnessId = "opencode" | "pi";
+export type HarnessId = "opencode" | "pi" | "dsh";
 
 let currentHarness: HarnessId = "opencode";
 let harnessLocked = false;
