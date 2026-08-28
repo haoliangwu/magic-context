@@ -14,6 +14,7 @@ This repository is a monorepo containing TypeScript packages (under `packages/`)
 ├── packages/               # TypeScript packages
 │   ├── plugin/             # OpenCode plugin package (published as @cortexkit/opencode-magic-context)
 │   ├── pi-plugin/          # Pi plugin package (published as @cortexkit/pi-magic-context)
+│   ├── dsh-plugin/         # DSH plugin package (published as @cortexkit/dsh-magic-context)
 │   ├── cli/                # Unified setup/doctor/migrate CLI (@cortexkit/magic-context)
 │   ├── dashboard/          # Dashboard (Tauri-based)
 │   ├── docs/               # Project documentation website
