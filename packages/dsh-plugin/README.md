@@ -21,7 +21,7 @@ dsh-magic-context doctor --profile web  # 5/5 ok (liveness warn is harmless)
 
 ## Install
 
-**Production (published):**
+**Production — npm (when published):**
 
 ```json
 // ~/.dsh/profiles/<name>/package.json
@@ -36,6 +36,27 @@ dsh plugin --profile <name> install
 dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
+
+**Production — GitHub subpath (no npm publish, verified with pnpm 11):**
+
+```json
+// ~/.dsh/profiles/<name>/package.json
+{
+  "dependencies": { "@cortexkit/dsh-magic-context": "github:haoliangwu/magic-context#master&path:packages/dsh-plugin" },
+  "dsh": { "profile": { "bundles": ["@cortexkit/dsh-magic-context"] } }
+}
+```
+
+```sh
+dsh plugin --profile <name> install
+# if dist/ is missing (fresh git clone without committed dist), build once inside the installed package:
+bun --cwd ~/.dsh/profiles/<name>/node_modules/@cortexkit/dsh-magic-context run build
+# or: node-built prepare will try bun run build automatically if bun is available
+dsh-magic-context setup --profile <name>
+dsh-magic-context doctor --profile <name>
+```
+
+> Verified: `pnpm add "@cortexkit/dsh-magic-context@github:haoliangwu/magic-context#master&path:packages/dsh-plugin"` resolves (170 packages). `prepare` tries `bun run build`; if `bun` is not in the profile env, run the `bun --cwd … run build` line manually.
 
 **Local dev (monorepo):**
 
