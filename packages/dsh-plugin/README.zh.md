@@ -50,8 +50,9 @@ dsh-magic-context doctor --profile <name>
 ```sh
 dsh plugin --profile <name> install
 # 若 dist/ 缺失（git 拉取未含构建产物），在已安装包内手动构建一次：
-bun --cwd ~/.dsh/profiles/<name>/node_modules/@cortexkit/dsh-magic-context run build
-# prepare 已尝试 bun run build；若 profile 环境无 bun，需手动执行上一行
+pnpm --filter @cortexkit/dsh-magic-context run build
+# 或：pnpm --cwd ~/.dsh/profiles/<name>/node_modules/@cortexkit/dsh-magic-context run build
+# （prepare 尝试 pnpm run build；底层仍需 bun）
 dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```

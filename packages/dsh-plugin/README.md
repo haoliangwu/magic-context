@@ -50,8 +50,9 @@ dsh-magic-context doctor --profile <name>
 ```sh
 dsh plugin --profile <name> install
 # if dist/ is missing (fresh git clone without committed dist), build once inside the installed package:
-bun --cwd ~/.dsh/profiles/<name>/node_modules/@cortexkit/dsh-magic-context run build
-# or: node-built prepare will try bun run build automatically if bun is available
+pnpm --filter @cortexkit/dsh-magic-context run build
+# or: pnpm --cwd ~/.dsh/profiles/<name>/node_modules/@cortexkit/dsh-magic-context run build
+# (prepare tries pnpm run build automatically; needs bun for the underlying build)
 dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
