@@ -1,43 +1,38 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bootstrapDshStorage, contextDbPath } from "./bootstrap";
 import { canonicalSessionKey } from "../shared/dsh-harness";
 import { removeDshLivenessMarker } from "../compat/dsh-0.1/liveness";
+import { createTestEnv } from "../test-utils";
 
 describe("dsh storage bootstrap (Phase 1 boundary)", () => {
   it("opens the shared DB with the liveness marker present", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-boot-"));
+    const env = await createTestEnv("dsh-magic-boot-");
+    // Keep env.db alive at env.dir/context.db; bootstrap uses a separate subdir so the core's path-cache doesn't collide with the helper DB.
+    const bootDir = join(env.dir, "boot");
+    let livenessPath: string | undefined;
     try {
-      const dbPath = join(dir, "context.db");
+      const dbPath = join(bootDir, "context.db");
       const outcome = await bootstrapDshStorage({
-        directory: join(dir, "proj"),
+        directory: join(bootDir, "proj"),
         port: 0,
         dbPath,
-        storageDirOverride: dir,
+        storageDirOverride: bootDir,
         homeHash: "a1b2c3d4",
       });
       expect(outcome.kind).toBe("ok");
       if (outcome.kind !== "ok") return;
       expect(outcome.db).toBeDefined();
-      expect(outcome.storageDir).toBe(dir);
+      expect(outcome.storageDir).toBe(bootDir);
       // The marker file exists while the process is live.
       expect(outcome.livenessPath).toContain("port-");
+      livenessPath = outcome.livenessPath;
       // The shared DB is created at the canonical location.
-      expect(contextDbPath(dir)).toBe(join(dir, "context.db"));
+      expect(contextDbPath(bootDir)).toBe(join(bootDir, "context.db"));
       outcome.db.close();
-      removeDshLivenessMarker(outcome.livenessPath);
     } finally {
-      // Windows may hold WAL handles briefly after close; best-effort retry.
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        try {
-          rmSync(dir, { recursive: true, force: true });
-          break;
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-      }
+      if (livenessPath) removeDshLivenessMarker(livenessPath);
+      await env.cleanup();
     }
   });
 

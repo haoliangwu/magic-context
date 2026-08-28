@@ -24,7 +24,7 @@ import {
 import type TypertRegistry from "@deepseek-ai/dsh-typert-registry";
 import type { InvocationDescriptor } from "@deepseek-ai/dsh-typert-protocol";
 import type { TypertContribution } from "@deepseek-ai/dsh-typert-registry/types";
-import { MAGIC_CONTEXT_REMOTE_NAMESPACE } from "../compat/dsh-0.1/typert";
+import { MAGIC_CONTEXT_REMOTE_NAMESPACE } from "../compat/dsh-0.1/remote-seam";
 import type { MagicContextHostService } from "../index";
 import { formatDetail, MAGIC_CONTEXT_PACKAGE, resolveDshHome } from "../doctor/env";
 

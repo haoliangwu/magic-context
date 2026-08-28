@@ -230,6 +230,34 @@ export function resolveAgentContext(
   };
 }
 
+/**
+ * Guard helper: resolve the agent runtime and throw the canonical toolError
+ * for any missing prerequisite. Centralises the 16 duplicated
+ * `!runtime.sessionId` / `!runtime.cwd` / `!runtime.projectIdentity` blocks
+ * with identical error strings.
+ */
+export interface RequireAgentRuntimeNeeds {
+  needsCwd?: boolean;
+  needsProject?: boolean;
+  /** Override the project-identity error (per-tool phrasing). */
+  projectMessage?: string;
+}
+
+export function requireAgentRuntime(
+  ctx: Context,
+  opts: CtxRuntimeOptions,
+  agent: Agent,
+  needs: RequireAgentRuntimeNeeds = {},
+): AgentExecutionContext & { sessionId: string } {
+  const runtime = resolveAgentContext(ctx, opts, agent);
+  if (!runtime.sessionId) throw toolError("Could not resolve the canonical session id for this agent.");
+  if (needs.needsCwd && !runtime.cwd) throw toolError("Could not resolve the working directory for this agent.");
+  if (needs.needsProject && !runtime.projectIdentity) {
+    throw toolError(needs.projectMessage ?? "Could not resolve project identity.");
+  }
+  return runtime as AgentExecutionContext & { sessionId: string };
+}
+
 /* ────────────────────────────── output shape ───────────────────────────── */
 
 /** Canonical tool output: a single model-facing text projection. */
@@ -402,16 +430,15 @@ export function createCtxSearchTool(ctx: Context, opts: CtxToolsOptions): ToolDe
       const query = params.query?.trim();
       if (!query) throw toolError("'query' is required.");
 
-      const runtime = resolveAgentContext(ctx, opts, agent);
-      if (!runtime.sessionId) throw toolError("Could not resolve the canonical session id for this agent.");
-      if (!runtime.cwd) throw toolError("Could not resolve the working directory for this agent.");
-      if (!runtime.projectIdentity) {
-        throw toolError("Could not resolve project identity for search.");
-      }
+      const runtime = requireAgentRuntime(ctx, opts, agent, {
+        needsCwd: true,
+        needsProject: true,
+        projectMessage: "Could not resolve project identity for search.",
+      });
       const db = await resolveDb(ctx, opts);
-      await opts.ensureProjectRegistered?.(runtime.cwd, db);
+      await opts.ensureProjectRegistered?.(runtime.cwd as string, db);
 
-      const snapshot = getProjectEmbeddingSnapshot(runtime.projectIdentity);
+      const snapshot = getProjectEmbeddingSnapshot(runtime.projectIdentity as string);
       const memoryEnabled =
         snapshot?.features.memoryEnabled ?? opts.memoryEnabled;
       const embeddingEnabled = snapshot
@@ -432,17 +459,17 @@ export function createCtxSearchTool(ctx: Context, opts: CtxToolsOptions): ToolDe
       if (idShape && memoryEnabled) {
         const idResults = resolveMemoriesByIdsForSearch({
           db,
-          projectPath: runtime.projectIdentity,
+          projectPath: runtime.projectIdentity as string,
           ids: idShape,
           limit: Math.max(normalizeLimit(params.limit), idShape.length),
           visibleMemoryIds,
         });
         if (idResults !== null) {
-          return { text: formatSearchResults(query, idResults, runtime.sessionId) };
+          return { text: formatSearchResults(query, idResults, runtime.sessionId as string) };
         }
       }
 
-      const results = await unifiedSearch(db, runtime.sessionId, runtime.projectIdentity, query, {
+      const results = await unifiedSearch(db, runtime.sessionId as string, runtime.projectIdentity as string, query, {
         limit: normalizeLimit(params.limit),
         memoryEnabled,
         embeddingEnabled,
@@ -647,15 +674,14 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
         throw toolError(`Action '${params.action}' is not allowed in this context.`);
       }
 
-      const runtime = resolveAgentContext(ctx, opts, agent);
-      if (!runtime.sessionId) throw toolError("Could not resolve the canonical session id for this agent.");
-      if (!runtime.cwd) throw toolError("Could not resolve the working directory for this agent.");
-      if (!runtime.projectIdentity) {
-        throw toolError("Could not resolve project identity for memory action.");
-      }
-      const projectIdentity = runtime.projectIdentity;
+      const runtime = requireAgentRuntime(ctx, opts, agent, {
+        needsCwd: true,
+        needsProject: true,
+        projectMessage: "Could not resolve project identity for memory action.",
+      });
+      const projectIdentity = runtime.projectIdentity as string;
       const db = await resolveDb(ctx, opts);
-      await opts.ensureProjectRegistered?.(runtime.cwd, db);
+      await opts.ensureProjectRegistered?.(runtime.cwd as string, db);
 
       const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
       if (snapshot ? !snapshot.features.memoryEnabled : opts.memoryEnabled === false) {
@@ -667,9 +693,8 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
       const memoryOwnedByTool = (memory: Memory): boolean =>
         storedPathBelongsToIdentity(memory.projectPath, projectIdentity);
 
-      const { action } = params;
-
-      if (action === "write") {
+      // ── per-action handlers (dispatched via map to avoid long if-chain) ──
+      const handleWrite = async (): Promise<{ text: string }> => {
         const content = params.content?.trim();
         if (!content) throw toolError("'content' is required when action is 'write'.");
         const rawCategory = asMemoryCategory(params.category);
@@ -686,22 +711,22 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
           projectPath: projectIdentity,
           category: rawCategory,
           content,
-          sourceSessionId: runtime.sessionId,
+          sourceSessionId: runtime.sessionId as string,
           sourceType: dreamerAllowed ? "dreamer" : "agent",
         });
         queueEmbedding({ db, projectIdentity, memoryId: memory.id, content });
         return { text: `Saved memory [ID: ${memory.id}] in ${rawCategory}.` };
-      }
+      };
 
-      if (action === "list") {
+      const handleList = async (): Promise<{ text: string }> => {
         const limit = normalizeLimit(params.limit, DEFAULT_LIST_LIMIT);
         const filtered = getMemoriesByProject(db, projectIdentity);
         const category = params.category;
         const filtered2 = category ? filtered.filter((m) => m.category === category) : filtered;
         return { text: formatMemoryList(filtered2.slice(0, limit)) };
-      }
+      };
 
-      if (action === "get") {
+      const handleGet = async (): Promise<{ text: string }> => {
         const getIds = params.ids;
         if (!getIds || getIds.length === 0 || !getIds.every(Number.isInteger)) {
           throw toolError("'ids' must contain at least one integer memory ID when action is 'get'.");
@@ -715,9 +740,9 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
           fetched.filter((memory) => memoryOwnedByTool(memory)).map((memory) => [memory.id, memory]),
         );
         return { text: formatGetOutput({ requestedIds: uniqueIds, memoriesById }) };
-      }
+      };
 
-      if (action === "update") {
+      const handleUpdate = async (): Promise<{ text: string }> => {
         const updateIds = params.ids;
         if (updateIds?.length !== 1 || !updateIds.every(Number.isInteger)) {
           throw toolError("'ids' must contain exactly one integer memory ID when action is 'update'.");
@@ -752,9 +777,9 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
         });
         queueEmbedding({ db, projectIdentity, memoryId: memory.id, content });
         return { text: `Updated memory [ID: ${memory.id}] in ${memory.category}.` };
-      }
+      };
 
-      if (action === "merge") {
+      const handleMerge = async (): Promise<{ text: string }> => {
         const ids = params.ids;
         if (!ids || ids.length < 2 || !ids.every(Number.isInteger)) {
           throw toolError("'ids' must include at least two integer memory IDs when action is 'merge'.");
@@ -838,7 +863,7 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
               projectPath: projectIdentity,
               category,
               content,
-              sourceSessionId: runtime.sessionId,
+              sourceSessionId: runtime.sessionId as string,
               sourceType: dreamerAllowed ? "dreamer" : "agent",
             });
           }
@@ -878,9 +903,9 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
         return {
           text: `Merged memories [${ids.join(", ")}] into canonical memory [ID: ${canonicalMemory.id}] in ${category}; superseded [${supersededIds.join(", ")}].`,
         };
-      }
+      };
 
-      if (action === "archive") {
+      const handleArchive = async (): Promise<{ text: string }> => {
         const rawArchiveIds = params.ids;
         if (!rawArchiveIds || rawArchiveIds.length === 0 || !rawArchiveIds.every(Number.isInteger)) {
           throw toolError("'ids' must contain at least one integer memory ID when action is 'archive'.");
@@ -909,9 +934,21 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
         const idList = archiveIds.join(", ");
         const plural = archiveIds.length > 1 ? "memories" : "memory";
         return { text: `Archived ${plural} [ID: ${idList}]${reasonSuffix}.` };
-      }
+      };
 
-      throw toolError("Unknown action.");
+      const memoryHandlers: Record<CtxMemoryAction, () => Promise<{ text: string }>> = {
+        write: handleWrite,
+        list: handleList,
+        get: handleGet,
+        update: handleUpdate,
+        merge: handleMerge,
+        archive: handleArchive,
+      };
+
+      const { action } = params;
+      const handler = memoryHandlers[action as CtxMemoryAction];
+      if (!handler) throw toolError("Unknown action.");
+      return handler();
     },
   });
 }
@@ -1100,15 +1137,14 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
         offset: "number",
       }) as CtxNoteArgs;
 
-      const runtime = resolveAgentContext(ctx, opts, agent);
-      if (!runtime.sessionId) throw toolError("Could not resolve the canonical session id for this agent.");
-      const sessionId = runtime.sessionId;
+      const runtime = requireAgentRuntime(ctx, opts, agent);
+      const sessionId = runtime.sessionId as string;
       const db = await resolveDb(ctx, opts);
       const dreamerEnabled = opts.dreamerEnabled;
 
       const action = params.action ?? (params.content?.trim() ? "write" : "read");
 
-      if (action === "write") {
+      const handleWrite = async (): Promise<{ text: string }> => {
         const content = params.content?.trim();
         if (!content) throw toolError("'content' is required when action is 'write'.");
         const anchorOrdinal = captureAnchorOrdinal(db, sessionId);
@@ -1119,14 +1155,15 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
               "Smart notes require dreamer to be enabled. Enable dreamer in magic-context.jsonc to use surface_condition.",
             );
           }
-          if (!runtime.cwd) throw toolError("Could not resolve the working directory for this agent.");
-          if (!runtime.projectIdentity) {
-            throw toolError("Could not resolve project identity for smart note.");
-          }
+          const validated = requireAgentRuntime(ctx, opts, agent, {
+            needsCwd: true,
+            needsProject: true,
+            projectMessage: "Could not resolve project identity for smart note.",
+          });
           const note = addNote(db, "smart", {
             content,
             sessionId,
-            projectPath: runtime.projectIdentity,
+            projectPath: validated.projectIdentity as string,
             surfaceCondition,
             anchorOrdinal,
           });
@@ -1136,27 +1173,28 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
         }
         const note = addNote(db, "session", { sessionId, content, anchorOrdinal });
         return { text: `Saved session note #${note.id}.` };
-      }
+      };
 
-      if (action === "dismiss") {
+      const handleDismiss = async (): Promise<{ text: string }> => {
         if (typeof params.note_id !== "number") {
           throw toolError("'note_id' is required when action is 'dismiss'.");
         }
-        if (!runtime.cwd) throw toolError("Could not resolve the working directory for this agent.");
-        if (!runtime.projectIdentity) {
-          throw toolError("Could not resolve project identity for note dismiss.");
-        }
+        const validated = requireAgentRuntime(ctx, opts, agent, {
+          needsCwd: true,
+          needsProject: true,
+          projectMessage: "Could not resolve project identity for note dismiss.",
+        });
         const dismissed = dismissNote(db, params.note_id, {
-          projectPath: runtime.projectIdentity,
+          projectPath: validated.projectIdentity as string,
           sessionId,
         });
         if (!dismissed) {
           throw toolError(`Note #${params.note_id} not found in your session/project or already dismissed.`);
         }
         return { text: `Note #${params.note_id} dismissed.` };
-      }
+      };
 
-      if (action === "update") {
+      const handleUpdate = async (): Promise<{ text: string }> => {
         if (typeof params.note_id !== "number") {
           throw toolError("'note_id' is required when action is 'update'.");
         }
@@ -1169,12 +1207,13 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
         if (!updates.content && !updates.surfaceCondition) {
           throw toolError("Provide 'content' and/or 'surface_condition' to update.");
         }
-        if (!runtime.cwd) throw toolError("Could not resolve the working directory for this agent.");
-        if (!runtime.projectIdentity) {
-          throw toolError("Could not resolve project identity for note update.");
-        }
+        const validated = requireAgentRuntime(ctx, opts, agent, {
+          needsCwd: true,
+          needsProject: true,
+          projectMessage: "Could not resolve project identity for note update.",
+        });
         const updated = updateNote(db, params.note_id, updates, {
-          projectPath: runtime.projectIdentity,
+          projectPath: validated.projectIdentity as string,
           sessionId,
         });
         if (!updated) throw toolError(`Note #${params.note_id} not found in your session/project.`);
@@ -1182,31 +1221,43 @@ export function createCtxNoteTool(ctx: Context, opts: CtxToolsOptions): ToolDefi
         if (updates.content) parts.push(`content: ${updates.content}`);
         if (updates.surfaceCondition) parts.push(`condition: ${updates.surfaceCondition}`);
         return { text: `Updated note #${params.note_id}\n- ${parts.join("\n- ")}` };
-      }
+      };
 
-      const limit =
-        typeof params.limit === "number" && params.limit > 0 ? Math.floor(params.limit) : DEFAULT_READ_LIMIT;
-      const offset =
-        typeof params.offset === "number" && params.offset > 0 ? Math.floor(params.offset) : 0;
-      const sections = readNotes({
-        db,
-        sessionId,
-        projectIdentity: runtime.projectIdentity,
-        filter: params.filter,
-        limit,
-        offset,
-      });
-      try {
-        setNoteLastReadAt(db, sessionId);
-      } catch {
-        // Watermark is a hint, not correctness.
-      }
-      if (sections.length === 0) return { text: "## Notes\n\nNo session notes or smart notes." };
-      const body = sections.join("\n\n");
-      const anchorHint = body.includes("↳ @msg ")
-        ? "\n\n↳ @msg N marks the conversation tail when a note was written. To see what led to it: ctx_expand(start=N-x, end=N) (pick x for how far back to look)."
-        : "";
-      return { text: `${body}${anchorHint}${DISMISS_FOOTER}` };
+      const handleRead = async (): Promise<{ text: string }> => {
+        const limit =
+          typeof params.limit === "number" && params.limit > 0 ? Math.floor(params.limit) : DEFAULT_READ_LIMIT;
+        const offset =
+          typeof params.offset === "number" && params.offset > 0 ? Math.floor(params.offset) : 0;
+        const sections = readNotes({
+          db,
+          sessionId,
+          projectIdentity: runtime.projectIdentity,
+          filter: params.filter,
+          limit,
+          offset,
+        });
+        try {
+          setNoteLastReadAt(db, sessionId);
+        } catch {
+          // Watermark is a hint, not correctness.
+        }
+        if (sections.length === 0) return { text: "## Notes\n\nNo session notes or smart notes." };
+        const body = sections.join("\n\n");
+        const anchorHint = body.includes("↳ @msg ")
+          ? "\n\n↳ @msg N marks the conversation tail when a note was written. To see what led to it: ctx_expand(start=N-x, end=N) (pick x for how far back to look)."
+          : "";
+        return { text: `${body}${anchorHint}${DISMISS_FOOTER}` };
+      };
+
+      const noteHandlers: Record<string, () => Promise<{ text: string }>> = {
+        write: handleWrite,
+        dismiss: handleDismiss,
+        update: handleUpdate,
+        read: handleRead,
+      };
+      const handler = noteHandlers[action];
+      if (!handler) throw toolError(`Unknown action '${action}'.`);
+      return handler();
     },
   });
 }
@@ -1263,9 +1314,8 @@ export function createCtxExpandTool(ctx: Context, opts: CtxToolsOptions): ToolDe
         message: "number",
       }) as CtxExpandArgs;
 
-      const runtime = resolveAgentContext(ctx, opts, agent);
-      if (!runtime.sessionId) throw toolError("Could not resolve the canonical session id for this agent.");
-      const sessionId = runtime.sessionId;
+      const runtime = requireAgentRuntime(ctx, opts, agent);
+      const sessionId = runtime.sessionId as string;
       const db = await resolveDb(ctx, opts);
 
       // Register the DSH raw-message source for the duration of this one call.
@@ -1370,9 +1420,8 @@ export function createCtxReduceTool(ctx: Context, opts: CtxToolsOptions): ToolDe
         drop: "string",
       }) as CtxReduceArgs;
 
-      const runtime = resolveAgentContext(ctx, opts, agent);
-      if (!runtime.sessionId) throw toolError("Could not resolve the canonical session id for this agent.");
-      const sessionId = runtime.sessionId;
+      const runtime = requireAgentRuntime(ctx, opts, agent);
+      const sessionId = runtime.sessionId as string;
       const protectedTags = Math.max(0, Math.floor(opts.protectedTags ?? 20));
 
       if (!params.drop) throw toolError("'drop' must be provided.");
@@ -1525,10 +1574,7 @@ export function createTodowriteTool(ctx: Context, opts: CtxToolsOptions): ToolDe
       const todos: TodowriteItem[] = Array.isArray(params.todos)
         ? (params.todos as TodowriteItem[])
         : [];
-      const runtime = resolveAgentContext(ctx, opts, agent);
-      if (!runtime.sessionId) {
-        throw toolError("Could not resolve the canonical session id for this agent.");
-      }
+      const runtime = requireAgentRuntime(ctx, opts, agent);
       // Persist the capture contract (Pi index.ts message_end capture path):
       // only shapes matching the exact enum contract update last_todo_state.
       try {

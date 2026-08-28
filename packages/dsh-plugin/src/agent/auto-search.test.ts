@@ -1,11 +1,7 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import type { UserMessage } from "@deepseek-ai/dsh-llm";
 import type { UnifiedSearchResult } from "@magic-context/core/features/magic-context/search";
-import { createTestDb } from "../test-utils";
-import type { Database } from "@magic-context/core/shared/sqlite";
+import { withTestDb } from "../test-utils";
 import { getAutoSearchHintDecisions } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import * as searchModule from "@magic-context/core/features/magic-context/search";
 import {
@@ -19,23 +15,6 @@ import {
 import type { Agent } from "@deepseek-ai/dsh-agent";
 
 const SESSION_ID = "dsh:a1b2c3d4:auto-search-session";
-
-/** Close the test DB, then remove the temp dir (Windows may hold WAL handles). */
-async function cleanupDir(dir: string, db?: Database): Promise<void> {
-  try {
-    db?.close();
-  } catch {
-    // already closed
-  }
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      rmSync(dir, { recursive: true, force: true });
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-  }
-}
 
 function userMessage(text: string, id = `user-${Math.random().toString(36).slice(2)}`): UserMessage {
   return {
@@ -98,10 +77,7 @@ function mockUnifiedSearch(results: UnifiedSearchResult[] | (() => UnifiedSearch
 
 describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
   it("queues a hint when the top hit clears the threshold and persists the decision", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "dsh-as-"));
-    let db: Database | undefined;
-    try {
-      db = await createTestDb(join(dir, "context.db"));
+    await withTestDb(async ({ db }) => {
       const searchSpy = mockUnifiedSearch([memoryHit(0.9)]);
       const { agent, injected } = fakeAgent();
       const message = userMessage(
@@ -136,16 +112,11 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
       expect(decisions).toEqual([
         expect.objectContaining({ messageId: message.id, decision: "hint" }),
       ]);
-    } finally {
-      await cleanupDir(dir, db);
-    }
+    }, "dsh-as-");
   });
 
   it("skips (too-short) without searching and records a no-hint decision", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "dsh-as-"));
-    let db: Database | undefined;
-    try {
-      db = await createTestDb(join(dir, "context.db"));
+    await withTestDb(async ({ db }) => {
       const searchSpy = mockUnifiedSearch([]);
       const { agent, injected } = fakeAgent();
       const message = userMessage("hi");
@@ -165,16 +136,11 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
       expect(getAutoSearchHintDecisions(db, SESSION_ID)).toEqual([
         expect.objectContaining({ messageId: message.id, decision: "no-hint", reason: "too-short" }),
       ]);
-    } finally {
-      await cleanupDir(dir, db);
-    }
+    }, "dsh-as-");
   });
 
   it("skips stacked augmentations without searching", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "dsh-as-"));
-    let db: Database | undefined;
-    try {
-      db = await createTestDb(join(dir, "context.db"));
+    await withTestDb(async ({ db }) => {
       const searchSpy = mockUnifiedSearch([]);
       const { agent, injected } = fakeAgent();
       const message = userMessage(
@@ -196,16 +162,11 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
       expect(getAutoSearchHintDecisions(db, SESSION_ID)).toEqual([
         expect.objectContaining({ messageId: message.id, decision: "no-hint", reason: "stacked" }),
       ]);
-    } finally {
-      await cleanupDir(dir, db);
-    }
+    }, "dsh-as-");
   });
 
   it("does not inject below the score threshold", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "dsh-as-"));
-    let db: Database | undefined;
-    try {
-      db = await createTestDb(join(dir, "context.db"));
+    await withTestDb(async ({ db }) => {
       mockUnifiedSearch([memoryHit(0.3)]);
       const { agent, injected } = fakeAgent();
       const message = userMessage(
@@ -226,16 +187,11 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
       expect(getAutoSearchHintDecisions(db, SESSION_ID)).toEqual([
         expect.objectContaining({ messageId: message.id, decision: "no-hint", reason: "below-threshold" }),
       ]);
-    } finally {
-      await cleanupDir(dir, db);
-    }
+    }, "dsh-as-");
   });
 
   it("does not double-inject when a decision for the message already exists", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "dsh-as-"));
-    let db: Database | undefined;
-    try {
-      db = await createTestDb(join(dir, "context.db"));
+    await withTestDb(async ({ db }) => {
       mockUnifiedSearch([memoryHit(0.9)]);
       const { agent, injected } = fakeAgent();
       const message = userMessage(
@@ -265,9 +221,7 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
         log: () => {},
       });
       expect(injected.length).toBe(1);
-    } finally {
-      await cleanupDir(dir, db);
-    }
+    }, "dsh-as-");
   });
 
   it("extractLatestUserPrompt picks the latest genuine user-sourced message", () => {
