@@ -2,11 +2,8 @@ import { describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  bootstrapDshStorage,
-  contextDbPath,
-  dshCanonicalSessionKey,
-} from "./bootstrap";
+import { bootstrapDshStorage, contextDbPath } from "./bootstrap";
+import { canonicalSessionKey } from "../shared/dsh-harness";
 import { removeDshLivenessMarker } from "../compat/dsh-0.1/liveness";
 
 describe("dsh storage bootstrap (Phase 1 boundary)", () => {
@@ -45,7 +42,7 @@ describe("dsh storage bootstrap (Phase 1 boundary)", () => {
   });
 
   it("derives canonical session keys", () => {
-    expect(dshCanonicalSessionKey("a1b2c3d4", "session-x")).toBe(
+    expect(canonicalSessionKey("a1b2c3d4", "session-x")).toBe(
       "dsh:a1b2c3d4:session-x",
     );
   });

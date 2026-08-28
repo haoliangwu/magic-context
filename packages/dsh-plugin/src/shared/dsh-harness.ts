@@ -7,22 +7,14 @@
  *  2. crosses closed-union via setDshHarness -> core setHarness("dsh");
  *  3. derives canonical Magic session key `dsh:<home-hash>:<dsh-session-id>`.
  */
-import { setHarness, getHarness } from "@magic-context/core/shared/harness";
+import { setHarness } from "@magic-context/core/shared/harness";
 
 /** DSH harness identity as persisted into the shared SQLite `harness` column. */
 export const DSH_HARNESS = "dsh" as const;
 
-/** Narrow closed core union to DSH string. */
-export type DshHarnessId = "dsh";
-
 /** Lock harness identity to "dsh" (idempotent; throws on different value). */
 export function setDshHarness(): void {
   setHarness(DSH_HARNESS as Parameters<typeof setHarness>[0]);
-}
-
-/** Current harness identity (runtime string). */
-export function currentHarness(): string {
-  return getHarness();
 }
 
 /** Canonical Magic session key namespace prefix. */

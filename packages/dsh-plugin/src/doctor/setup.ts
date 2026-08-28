@@ -26,10 +26,10 @@ import {
   buildThinPresetEntries,
   scanStockPresetLayout,
 } from "../compat/dsh-0.1/preset";
+import { describeError } from "@magic-context/core/shared/error-message";
 import {
   DSH_COMPAT_EXPECTED_VERSION,
   MAGIC_CONTEXT_PACKAGE,
-  errorMessage,
   locateDshInstall,
   magicEntryPath,
   magicStandardAgentCordisPath,
@@ -195,7 +195,7 @@ export async function runDshSetup(
       steps.push({
         status: "fail",
         title: "Stock preset contract scan",
-        detail: `${located.stockPresetPath}: ${errorMessage(error)}`,
+        detail: `${located.stockPresetPath}: ${describeError(error).brief}`,
       });
       failed = true;
     }
@@ -256,7 +256,7 @@ export async function runDshSetup(
       steps.push({
         status: "fail",
         title: "Generate magic-standard preset",
-        detail: errorMessage(error),
+        detail: describeError(error).brief,
       });
       failed = true;
     }
@@ -274,7 +274,7 @@ export async function runDshSetup(
       steps.push({
         status: "warn",
         title: "Magic Context user config",
-        detail: `${configPath} exists but is not valid JSONC (${errorMessage(error)}); leaving untouched.`,
+        detail: `${configPath} exists but is not valid JSONC (${describeError(error).brief}); leaving untouched.`,
       });
       missing = [];
     }
@@ -321,7 +321,7 @@ export async function runDshSetup(
         steps.push({
           status: "fail",
           title: "Magic Context user config",
-          detail: `could not create ${configPath}: ${errorMessage(error)}`,
+          detail: `could not create ${configPath}: ${describeError(error).brief}`,
         });
         failed = true;
       }
