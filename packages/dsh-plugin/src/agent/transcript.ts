@@ -1192,9 +1192,14 @@ export function minimalCacheClassForOp(
 }
 
 function baselineNodeIndices(view: DshTranscriptView): number[] {
+  // Collect all durable injected baselines for hard cache classification symmetry
+  // (knowledge, skill-catalog, agent-instructions, dsh-system-prompt). Any op
+  // covering these nodes must be hard — compress gain ≈0 and host re-injects
+  // when shadowed (session-11d586ad loop). Backward compat: knowledge-only
+  // baseline was the original; now expanded to isDurableInjectedMessage.
   const out: number[] = [];
   for (const message of view.messages) {
-    if (!isKnowledgeBaselineMessage(message)) continue;
+    if (!isDurableInjectedMessage(message)) continue;
     const span = messageNodeSpan(message);
     if (span !== null) out.push(span.nodeStart);
   }
