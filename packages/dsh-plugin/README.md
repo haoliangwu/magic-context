@@ -39,25 +39,33 @@ dsh-magic-context doctor --profile <name>
 
 **Production — GitHub subpath (no npm publish, verified with pnpm 11):**
 
+Pin to a tagged release for reproducibility:
+
 ```json
 // ~/.dsh/profiles/<name>/package.json
 {
-  "dependencies": { "@cortexkit/dsh-magic-context": "github:haoliangwu/magic-context#master&path:packages/dsh-plugin" },
+  "dependencies": { "@cortexkit/dsh-magic-context": "github:haoliangwu/magic-context#dsh-v0.2.0&path:packages/dsh-plugin" },
   "dsh": { "profile": { "bundles": ["@cortexkit/dsh-magic-context"] } }
 }
 ```
 
+The `prepare` script runs `bun run build` automatically on install. If pnpm blocks it (git-hosted `prepare` needs allowlisting), add the tarball key to `pnpm-workspace.yaml`:
+
+```yaml
+# ~/.dsh/profiles/<name>/pnpm-workspace.yaml
+allowBuilds:
+  'tar.gz/<sha>#path:packages/dsh-plugin': true
+```
+
+The exact key is printed by pnpm in `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` — copy it verbatim. See Q&A below.
+
 ```sh
 dsh plugin --profile <name> install
-# if dist/ is missing (fresh git clone without committed dist), build once inside the installed package:
-pnpm --filter @cortexkit/dsh-magic-context run build
-# or: pnpm --cwd ~/.dsh/profiles/<name>/node_modules/@cortexkit/dsh-magic-context run build
-# (prepare tries pnpm run build automatically; needs bun for the underlying build)
 dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
 
-> Verified: `pnpm add "@cortexkit/dsh-magic-context@github:haoliangwu/magic-context#master&path:packages/dsh-plugin"` resolves (170 packages). `prepare` tries `bun run build`; if `bun` is not in the profile env, run the `bun --cwd … run build` line manually.
+> Verified: `pnpm add "@cortexkit/dsh-magic-context@github:haoliangwu/magic-context#dsh-v0.2.0&path:packages/dsh-plugin"` resolves. `prepare` runs `bun run build`; if `bun` is not in the profile env, run `bun --cwd …/node_modules/@cortexkit/dsh-magic-context run build` manually.
 
 **Local dev (monorepo):**
 
@@ -95,6 +103,17 @@ Remove the `bundles` entry and restart DSH. Shared SQLite and `dsh_*` adapter ro
 - Magic Context shared schema `v81` (this package's `LATEST_SUPPORTED_VERSION`)
 
 ## Q&A
+
+**Q: pnpm 报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` 怎么办?**
+
+pnpm 默认禁止 git-hosted 依赖的 `prepare` 脚本。把报错里打印的 tarball key 加到 profile 的 `pnpm-workspace.yaml`:
+
+```yaml
+allowBuilds:
+  'tar.gz/<hash>#path:packages/dsh-plugin': true
+```
+
+key 必须和报错信息里的完全一致。`github:...` 和 `git+https://...` 两种 spec 形式会被 pnpm 归一化到同一个 codeload tarball key,所以哪种写法都行。
 
 **Q: I use Pi / OpenCode and DSH together and want to share memories. Do versions need to match?**
 
