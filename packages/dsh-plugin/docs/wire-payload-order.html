@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wire payload order · Layer stack</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', system-ui, -apple-system, sans-serif;
+      --font-serif:    'Instrument Serif', Georgia, serif;
+      --font-mono:     'Geist Mono', 'SF Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    .frame { max-width: 1200px; width: 100%; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 960px; display: block; }
+    svg text {
+      font-family: 'Geist', system-ui, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Layer stack · Magic Context</p>
+    <h1>Wire payload order · system → tools → messages</h1>
+
+    <svg viewBox="0 0 1200 620" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="wire-title wire-desc">
+      <title id="wire-title">Wire payload order across OpenCode, Pi, and DSH</title>
+      <desc id="wire-desc">Layer stack showing the LLM request wire order: SYSTEM field, TOOLS field, then a MESSAGES array whose first two entries are the m[0] user-profile baseline and the m[1] session-history delta, followed by the real conversation tail. The m[0] and m[1] layers are highlighted as the focal pair. An annotation notes that DSH places its runtime-context and skill-catalog inside the messages tail rather than the system field, unlike OpenCode and Pi.</desc>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+      <!-- Direction column (left margin) -->
+      <text x="64" y="72" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" letter-spacing="0.20em">WIRE</text>
+      <line x1="92" y1="84" x2="92" y2="500" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <polygon points="88,500 96,500 92,508" fill="#4f5d75"/>
+      <text x="52" y="524" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" letter-spacing="0.20em">LLM</text>
+
+      <!-- Stack container hairlines (top + bottom edges) -->
+      <line x1="140" y1="84" x2="1120" y2="84" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+      <line x1="140" y1="452" x2="1120" y2="452" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+
+      <!-- L1 — SYSTEM field (top layer, near-white fill) -->
+      <rect x="140" y="84" width="980" height="84" fill="#ffffff"/>
+      <line x1="140" y1="168" x2="1120" y2="168" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+      <text x="164" y="124" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" letter-spacing="0.16em">L1</text>
+      <text x="300" y="126" fill="#2d3142" font-size="20" font-weight="600" font-family="'Geist', sans-serif">SYSTEM field</text>
+      <text x="1100" y="118" fill="#4f5d75" font-size="12" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.04em">persona · harness-identity · tool:* · mc:guidance</text>
+      <text x="1100" y="138" fill="#7a8399" font-size="11" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.04em">DSH: section-based system prompt</text>
+
+      <!-- L2 — TOOLS field -->
+      <rect x="140" y="168" width="980" height="84" fill="#ececec"/>
+      <line x1="140" y1="252" x2="1120" y2="252" stroke="rgba(45,49,66,0.12)" stroke-width="1"/>
+      <text x="164" y="208" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" letter-spacing="0.16em">L2</text>
+      <text x="300" y="210" fill="#2d3142" font-size="20" font-weight="600" font-family="'Geist', sans-serif">TOOLS field</text>
+      <text x="1100" y="210" fill="#4f5d75" font-size="12" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.04em">tool definitions</text>
+
+      <!-- MESSAGES array label (spans L3–L5, left margin tag) -->
+      <rect x="140" y="252" width="980" height="200" fill="#f5f5f5"/>
+      <text x="164" y="278" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" letter-spacing="0.16em">MESSAGES</text>
+      <text x="270" y="278" fill="#7a8399" font-size="11" font-family="'Geist Mono', monospace" letter-spacing="0.04em">array — user-role slots, in order</text>
+
+      <!-- L3 — m[0] (FOCAL, coral) -->
+      <rect x="180" y="288" width="900" height="52" fill="rgba(235,108,54,0.08)"/>
+      <rect x="180" y="288" width="900" height="52" fill="none" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="204" y="318" fill="#eb6c36" font-size="10" font-family="'Geist Mono', monospace" letter-spacing="0.16em" font-weight="600">[0]</text>
+      <text x="300" y="320" fill="#2d3142" font-size="18" font-weight="600" font-family="'Geist', sans-serif">m[0] — user-profile baseline</text>
+      <text x="1100" y="320" fill="#eb6c36" font-size="11" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.04em">project-docs · profile · decayed compartments</text>
+
+      <!-- L4 — m[1] (FOCAL, coral) -->
+      <rect x="180" y="352" width="900" height="52" fill="rgba(235,108,54,0.08)"/>
+      <rect x="180" y="352" width="900" height="52" fill="none" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="204" y="382" fill="#eb6c36" font-size="10" font-family="'Geist Mono', monospace" letter-spacing="0.16em" font-weight="600">[1]</text>
+      <text x="300" y="384" fill="#2d3142" font-size="18" font-weight="600" font-family="'Geist', sans-serif">m[1] — session-history delta</text>
+      <text x="1100" y="384" fill="#eb6c36" font-size="11" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.04em">new memories · new compartments</text>
+
+      <!-- L5 — conversation tail -->
+      <rect x="180" y="412" width="900" height="52" fill="#ffffff"/>
+      <rect x="180" y="412" width="900" height="52" fill="none" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="204" y="442" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" letter-spacing="0.16em">[2+]</text>
+      <text x="300" y="444" fill="#2d3142" font-size="18" font-weight="600" font-family="'Geist', sans-serif">conversation tail</text>
+      <text x="1100" y="444" fill="#4f5d75" font-size="11" font-family="'Geist Mono', monospace" text-anchor="end" letter-spacing="0.04em">user · assistant · tool_use · tool_result …</text>
+
+      <!-- Annotation callout (DSH-specific) -->
+      <line x1="650" y1="452" x2="650" y2="496" stroke="#eb6c36" stroke-width="0.8" stroke-dasharray="3,3"/>
+      <circle cx="650" cy="452" r="2.4" fill="#eb6c36"/>
+      <text x="164" y="520" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace" letter-spacing="0.20em">DSH ONLY</text>
+      <text x="280" y="520" fill="#4f5d75" font-size="13" font-family="'Instrument Serif', Georgia, serif" font-style="italic">DSH appends runtime-context + skill-catalog as user-role messages inside the tail (after the user turn), not into the system field — OpenCode and Pi put the equivalents in the system prompt.</text>
+
+      <!-- Footer colophon -->
+      <line x1="140" y1="560" x2="1120" y2="560" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="140" y="584" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace" letter-spacing="0.16em">SAME WIRE ORDER ACROSS OPENCODE · PI · DSH · CONFIRMED VIA agent/request PAYLOAD DUMP</text>
+    </svg>
+  </div>
+</body>
+</html>
