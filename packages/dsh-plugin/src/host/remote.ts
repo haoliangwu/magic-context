@@ -120,15 +120,24 @@ export class MagicContextRemoteService extends Service {
   async diagnostics(args: { sessionId: string }): Promise<MagicSessionDiagnostics> {
     // Security: bound the session id (Remote 限额 — PLAN §11) and never echo
     // unvalidated input into SQL beyond the bound parameter.
-    const sessionId = String(args?.sessionId ?? "").slice(0, 512);
+    const rawSessionId = String(args?.sessionId ?? "").slice(0, 512);
     const empty = {
-      sessionId,
+      sessionId: rawSessionId,
       outbox: { pending: 0, applied: 0, committed: 0, abandoned: 0 },
       tags: { active: 0, dropped: 0 },
       compartments: 0,
       meta: { hasM0: false },
     };
-    if (sessionId.length === 0) return empty;
+    if (rawSessionId.length === 0) return empty;
+    // The slot passes a DSH-native session id (header.id), but the shared DB
+    // keys rows by the canonical Magic session id `dsh:<homeHash>:<id>`.
+    // Accept either form: if parseKey already recognises it, it's canonical;
+    // otherwise canonicalise a native id. Keeps the wire payload stable when
+    // the client already sends a canonical key.
+    const sessionId =
+      this.host.parseKey(rawSessionId) !== undefined
+        ? rawSessionId
+        : this.host.canonicalKey(rawSessionId);
     const bootstrap = await this.host.ready;
     if (bootstrap.kind !== "ok") return empty;
     const db = bootstrap.db;
