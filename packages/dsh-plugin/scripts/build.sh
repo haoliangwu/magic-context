@@ -15,4 +15,7 @@ $EB --bundle src/doctor/cli.ts --outdir=dist --platform=node --target=node20 --f
 $EB --bundle src/entries/agent.ts src/entries/compaction.ts src/entries/commands.ts src/entries/tools.ts src/entries/remote.ts src/entries/preset-include.ts \
   --outdir=dist/entries --platform=node --target=node20 --format=esm --splitting $EXT_ENTRIES
 
+# client bundle: classic-script __ModuleLoader__ factory shape (see scripts/build-client.mjs)
+bun scripts/build-client.mjs
+
 tsc --emitDeclarationOnly || echo "[dsh-magic-context] tsc emitDeclarationOnly skipped (missing @types)" >&2
