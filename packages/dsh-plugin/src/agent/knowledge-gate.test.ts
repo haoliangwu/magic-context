@@ -43,21 +43,39 @@ async function cleanupDir(dir: string, db?: Database): Promise<void> {
 
 interface FakeAgentHarness {
   agent: KnowledgeAgentView;
+  /** Messages delivered via agent.inject (nudge/note path). */
   injected: UserMessage[];
+  /** Messages delivered via the pre-step unshift path (knowledge baseline). */
+  delivered: UserMessage[];
   events: Array<Record<string, unknown>>;
   nodes: number[];
   replaceGeneration: number;
+  /** Simulate the host appending a message to the durable surface. */
+  surfaceAppend(message: UserMessage): void;
 }
 
 function makeFakeAgent(directory: string): FakeAgentHarness {
   const injected: UserMessage[] = [];
+  const delivered: UserMessage[] = [];
   const events: Array<Record<string, unknown>> = [];
   const nodes: number[] = [];
+  const surfaceAppend = (message: UserMessage): void => {
+    events.push({
+      type: "user/message",
+      seq: events.length,
+      time: Date.now(),
+      data: message,
+      surfaceOp: "append",
+    });
+    nodes.push(events.length - 1);
+  };
   const harness: FakeAgentHarness = {
     injected,
+    delivered,
     events,
     nodes,
     replaceGeneration: 0,
+    surfaceAppend,
     agent: {
       id: "sess-1" as SessionId,
       options: { provider: "deepseek", model: "deepseek-chat" },
@@ -75,14 +93,7 @@ function makeFakeAgent(directory: string): FakeAgentHarness {
       },
       inject(message: UserMessage) {
         injected.push(message);
-        events.push({
-          type: "user/message",
-          seq: events.length,
-          time: Date.now(),
-          data: message,
-          surfaceOp: "append",
-        });
-        nodes.push(events.length - 1);
+        surfaceAppend(message);
       },
     },
   };
@@ -114,6 +125,28 @@ function passThroughNext(): () => Promise<PreStepDecision> {
   return async () => ({ kind: "enter", messages: [] });
 }
 
+/**
+ * Simulate the host's pre-step completion: the host appends every
+ * `decision.messages` entry to the durable surface. `runKnowledgeGateStep`
+ * mutates `messages` in place (unshifting injected knowledge messages), so by
+ * the time `next()` runs the array already carries them. Magic-context
+ * messages are also recorded in `harness.delivered` for assertions.
+ */
+function surfaceNext(
+  harness: FakeAgentHarness,
+  messages: UserMessage[],
+): () => Promise<PreStepDecision> {
+  return async () => {
+    for (const m of messages) {
+      harness.surfaceAppend(m);
+      if ((m.source as { plugin?: string }).plugin === "magic-context") {
+        harness.delivered.push(m);
+      }
+    }
+    return { kind: "enter", messages: [...messages] };
+  };
+}
+
 function userMessage(text: string): UserMessage {
   return {
     id: `user-msg-${Math.random().toString(36).slice(2)}`,
@@ -142,22 +175,23 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const state = createKnowledgeGateState();
       const harness = makeFakeAgent(dir);
 
+      const messages: UserMessage[] = [userMessage("hello world this is my first question about the project")];
       const decision = await runKnowledgeGateStep(
         state,
         deps,
-        { agent: harness.agent, messages: [userMessage("hello world this is my first question about the project")] },
-        passThroughNext(),
+        { agent: harness.agent, messages },
+        surfaceNext(harness, messages),
       );
 
       expect(decision.kind).toBe("enter");
       // Pi 语义：m0 与 m1 是两条独立合成消息。
-      expect(harness.injected.length).toBe(2);
-      const message = harness.injected[0];
+      expect(harness.delivered.length).toBe(2);
+      const message = harness.delivered[0];
       expect(message.role).toBe("user");
       expect(message.content[0].type).toBe("text");
       const text = message.content[0].type === "text" ? message.content[0].text : "";
       expect(text).toContain("unique knowledge content alpha");
-      const m1Text = harness.injected[1].content[0].type === "text" ? harness.injected[1].content[0].text : "";
+      const m1Text = harness.delivered[1].content[0].type === "text" ? harness.delivered[1].content[0].text : "";
       expect(m1Text).toContain("<session-history-since>");
       const source = message.source as {
         kind: string;
@@ -197,11 +231,14 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const state = createKnowledgeGateState();
       const harness = makeFakeAgent(dir);
 
-      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("first message about the project setup")] }, passThroughNext());
-      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("second message about the build pipeline")] }, passThroughNext());
-      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("third message about the release process")] }, passThroughNext());
+      const m1: UserMessage[] = [userMessage("first message about the project setup")];
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: m1 }, surfaceNext(harness, m1));
+      const m2: UserMessage[] = [userMessage("second message about the build pipeline")];
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: m2 }, surfaceNext(harness, m2));
+      const m3: UserMessage[] = [userMessage("third message about the release process")];
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: m3 }, surfaceNext(harness, m3));
 
-      expect(harness.injected.length).toBe(2);
+      expect(harness.delivered.length).toBe(2);
     } finally {
       await cleanupDir(dir, db);
     }
@@ -223,20 +260,23 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const state = createKnowledgeGateState();
       const harness = makeFakeAgent(dir);
 
-      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("first turn question")] }, passThroughNext());
-      expect(harness.injected.length).toBe(2);
-      const firstWatermark = (harness.injected[0].source as { messageId?: string }).messageId;
+      const m1: UserMessage[] = [userMessage("first turn question")];
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: m1 }, surfaceNext(harness, m1));
+      expect(harness.delivered.length).toBe(2);
+      const firstWatermark = (harness.delivered[0].source as { messageId?: string }).messageId;
 
       // Compact/clear: surface replaced → new generation, old nodes shadowed.
       harness.replaceGeneration = 1;
       harness.nodes.length = 0;
       harness.events.length = 0;
+      harness.delivered.length = 0;
 
-      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("second turn after compaction")] }, passThroughNext());
+      const m2: UserMessage[] = [userMessage("second turn after compaction")];
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: m2 }, surfaceNext(harness, m2));
 
       // 新 generation 重新注入两条（m0+m1）→ 累计 4 条。
-      expect(harness.injected.length).toBe(4);
-      const secondWatermark = (harness.injected[2].source as { messageId?: string }).messageId;
+      expect(harness.delivered.length).toBe(2);
+      const secondWatermark = (harness.delivered[0].source as { messageId?: string }).messageId;
       // Cache was valid: same persisted bytes → same content watermark.
       expect(secondWatermark).toBe(firstWatermark);
     } finally {
@@ -254,16 +294,18 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
 
       // First process: inject once.
       const firstState = createKnowledgeGateState();
-      await runKnowledgeGateStep(firstState, deps, { agent: harness.agent, messages: [userMessage("resume scenario first message")] }, passThroughNext());
-      expect(harness.injected.length).toBe(2);
-      const watermark = (harness.injected[0].source as { messageId?: string }).messageId as string;
+      const m1: UserMessage[] = [userMessage("resume scenario first message")];
+      await runKnowledgeGateStep(firstState, deps, { agent: harness.agent, messages: m1 }, surfaceNext(harness, m1));
+      expect(harness.delivered.length).toBe(2);
+      const watermark = (harness.delivered[0].source as { messageId?: string }).messageId as string;
       expect(isMagicWatermarkOnSurface(harness.agent.session, watermark)).toBe(true);
 
       // Restart: fresh state (empty Maps) but the same durable log is replayed —
       // the visible surface still carries the watermark → no re-injection.
       const resumedState = createKnowledgeGateState();
-      await runKnowledgeGateStep(resumedState, deps, { agent: harness.agent, messages: [userMessage("post-restart message")] }, passThroughNext());
-      expect(harness.injected.length).toBe(2);
+      const m2: UserMessage[] = [userMessage("post-restart message")];
+      await runKnowledgeGateStep(resumedState, deps, { agent: harness.agent, messages: m2 }, surfaceNext(harness, m2));
+      expect(harness.delivered.length).toBe(2);
     } finally {
       await cleanupDir(dir, db);
     }
@@ -292,7 +334,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
         passThroughNext(),
       );
       expect(decision.kind).toBe("enter");
-      expect(harness.injected.length).toBe(0);
+      expect(harness.delivered.length).toBe(0);
     } finally {
       await cleanupDir(dir, db);
     }
@@ -329,7 +371,7 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const state: KnowledgeGateState = createKnowledgeGateState();
       const harness = makeFakeAgent(dir);
       maybeInjectKnowledge(state, deps, harness.agent, db, canonicalSessionKey(HOME_HASH, "sess-1"), resolveKnowledgeProjectPath(dir), dir);
-      expect(harness.injected.length).toBe(0);
+      expect(state.lastInjectedMessages.length).toBe(0);
     } finally {
       await cleanupDir(dir, db);
     }
@@ -367,8 +409,8 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       const state2 = createKnowledgeGateState();
       const harness2 = makeFakeAgent(dir);
       await maybeInjectKnowledge(state2, depsMuralConfig, harness2.agent, db, magicSessionId, resolveKnowledgeProjectPath(dir), dir);
-      expect(harness2.injected.length).toBe(2);
-      const content = harness2.injected[0]?.content ?? [];
+      expect(state2.lastInjectedMessages.length).toBe(2);
+      const content = state2.lastInjectedMessages[0]?.content ?? [];
       expect(content.some((block) => block.type === "image")).toBe(true);
       expect(content.some((block) => block.type === "text")).toBe(true);
     } finally {
@@ -398,9 +440,10 @@ describe("synthetic todowrite replay (Magic todo-view parity)", () => {
       getOrCreateSessionMeta(db, sid);
       db.prepare("UPDATE session_meta SET last_todo_state = ? WHERE session_id = ?").run(todoState, sid);
 
-      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("first message")] }, passThroughNext());
+      const messages: UserMessage[] = [userMessage("first message")];
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages }, surfaceNext(harness, messages));
 
-      const todoMessages = harness.injected.filter((m) => {
+      const todoMessages = harness.delivered.filter((m) => {
         const src = m.source as { messageId?: string };
         return typeof src.messageId === "string" && src.messageId.startsWith("mc-todo:");
       });
@@ -429,8 +472,9 @@ describe("synthetic todowrite replay (Magic todo-view parity)", () => {
       getOrCreateSessionMeta(db, sid2);
       db.prepare("UPDATE session_meta SET last_todo_state = ? WHERE session_id = ?").run(todoState, sid2);
 
-      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages: [userMessage("first")] }, passThroughNext());
-      const todoMessages = harness.injected.filter((m) => {
+      const messages: UserMessage[] = [userMessage("first")];
+      await runKnowledgeGateStep(state, deps, { agent: harness.agent, messages }, surfaceNext(harness, messages));
+      const todoMessages = harness.delivered.filter((m) => {
         const src = m.source as { messageId?: string };
         return typeof src.messageId === "string" && src.messageId.startsWith("mc-todo:");
       });
