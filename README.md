@@ -424,6 +424,20 @@ Omit `--once` for the built-in one-minute loop, or invoke `--once` from cron/lau
 `--send` switches from JSON-line dry-run output to the `prefrontal` module's `wake.event_record` subc operation. Do not enable it until that operation is deployed. Known dispositions (`accepted`, `unowned_session`, `dedup`, and `superseded`) are counted and logged; malformed replies fail the run. Use `--connection-file`, `--wake-module-id`, `--state-file`, `--db`, or `--rust-store` only when the corresponding runtime location is non-default.
 
 ---
+## Q & A
+
+**Q: `dsh plugin --profile web add "github:haoliangwu/magic-context#master&path:packages/dsh-plugin"` fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` / `IGNORED_BUILDS` and asks to edit `.dsh/profiles/web/pnpm-workspace.yaml:allowBuilds` — why?**
+
+`@cortexkit/dsh-magic-context` is a git-hosted package with a `prepare` script (`bash scripts/build.sh` → `esbuild` + `tsc`). `pnpm` blocks build scripts of git dependencies by default (supply-chain policy). DSH profiles are plain `pnpm` projects (`~/.dsh/profiles/web`), so the first install of a new tarball hash is rejected until you allowlist it:
+
+```yaml
+# ~/.dsh/profiles/web/pnpm-workspace.yaml
+allowBuilds:
+  "@cortexkit/dsh-magic-context@https://codeload.github.com/haoliangwu/magic-context/tar.gz/<hash>#path:packages/dsh-plugin": true
+```
+
+Copy the exact key `pnpm` prints in the error (it contains the `tar.gz/<hash>` of the fetched commit). `github:` and `git+https://github.com/...` are equivalent — `pnpm` normalizes both to the same `codeload` key. After editing, re-run `dsh plugin --profile web add ...`; `dist/` is `.gitignore`d, so `prepare` must run via `bun` on install.
+
 ## Contributing
 
 Bug reports and pull requests are welcome. For larger changes, open an issue first to discuss the approach. Run `bun run format` before submitting; CI rejects unformatted code.
