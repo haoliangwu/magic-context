@@ -396,14 +396,20 @@ export async function maybeInjectKnowledge(
     messageId: `${blocks.watermark}:m1`,
   };
   const m1Message = magicUserMessage(blocks.m1Text, m1Source, []);
-  agent.inject(m0Message);
-  agent.inject(m1Message);
+  // Delivery: unshift into the pre-step payload.messages (consumed by
+  // runKnowledgeGateStep). The host appends payload.messages to the surface
+  // as durable user/message events, so this single path gives both immediate
+  // visibility (this step) and durability. Do NOT also agent.inject() these
+  // — inject queues into the next-step inbox, which the loop claims and
+  // appends AGAIN on the following step, producing a duplicate surface
+  // append of the same message id ("received more than one start Match").
+  state.lastInjectedMessages.push(m0Message, m1Message);
   // Synthetic todowrite replay (Magic todo-view parity): this pass IS a
   // cache-bust (HARD materialization) — resurface the last todo snapshot so
   // the model regains its task list after the fold, exactly like OpenCode/Pi
-  // ride the synthetic pair on cache-busting passes. DSH delivery keeps the
-  // inject + watermark semantics; the part is rendered in the DSH folded
-  // tool-call text shape the model already sees.
+  // ride the synthetic pair on cache-busting passes. Same unshift delivery
+  // path as m0/m1; the part is rendered in the DSH folded tool-call text
+  // shape the model already sees.
   try {
     const meta = getOrCreateSessionMeta(db, magicSessionId) as unknown as {
       lastTodoState?: string | null;
@@ -425,7 +431,6 @@ export async function maybeInjectKnowledge(
             messageId: todoWatermark,
           };
           const todoMessage = magicUserMessage(todoText, todoSource, []);
-          agent.inject(todoMessage);
           state.lastInjectedMessages.push(todoMessage);
         }
       }
@@ -434,10 +439,6 @@ export async function maybeInjectKnowledge(
     // Todo replay must never break injection (fail-open).
   }
   state.injectedGenerations.set(magicSessionId, generation);
-  // 首轮 pre-step 前置用：本次 LLM 调用即可见（Pi transform unshift 语义）。
-  if (state.lastInjectedMessages.length === 0) {
-    state.lastInjectedMessages = [m0Message, m1Message];
-  }
   deps.log?.(
     `[magic-context] injected knowledge baseline ${blocks.watermark} for ${magicSessionId}@gen${generation}`,
   );
