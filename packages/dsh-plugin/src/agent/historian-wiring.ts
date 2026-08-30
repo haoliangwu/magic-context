@@ -64,6 +64,36 @@ export function currentModel(ctx: Context): string {
  * (input + cacheRead + cacheWrite). This restores the historian pressure
  * trigger where the projection path yields nothing.
  */
+/**
+ * Read the dsh-native context token breakdown (lag 1 step): the host
+ * `sessionProjections` fold publishes `{ systemTokens, toolsTokens, messageTokens }`
+ * per commit. Used by the context plane to persist token-category columns into
+ * `session_meta` so the Context tab sidebar can render a calibrated breakdown.
+ *
+ * Falls back to `undefined` (same as `readContextPressure`) when the projection
+ * is unavailable (DSH 0.1.0-rc.6 environments with empty snapshot values).
+ */
+export function readContextBreakdown(ctx: Context): (agent: Agent) => { systemTokens: number; toolsTokens: number; messageTokens: number } | undefined {
+  return (agent: Agent) => {
+    const projections = ctx.get("sessionProjections") as
+      | { snapshot?: (session: unknown) => { values?: Record<string, unknown> } }
+      | undefined;
+    const breakdown = projections?.snapshot?.(agent.session)?.values?.contextBreakdown as
+      | { systemTokens?: unknown; toolsTokens?: unknown; messageTokens?: unknown }
+      | undefined;
+    if (breakdown === undefined) return undefined;
+    const num = (v: unknown): number | undefined =>
+      typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+    const systemTokens = num(breakdown.systemTokens);
+    const toolsTokens = num(breakdown.toolsTokens);
+    const messageTokens = num(breakdown.messageTokens);
+    if (systemTokens === undefined || toolsTokens === undefined || messageTokens === undefined) {
+      return undefined;
+    }
+    return { systemTokens, toolsTokens, messageTokens };
+  };
+}
+
 export function readContextPressure(ctx: Context): (agent: Agent) => { projectedTokens?: number; contextWindow?: number } | undefined {
   return (agent: Agent) => {
     const projections = ctx.get("sessionProjections") as

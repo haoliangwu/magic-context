@@ -13,6 +13,7 @@
  * `{service, serviceKey, namespace}` shape) and the descriptor uses src-json
  * codecs, so no decorators or generated artifacts are involved.
  */
+import { Buffer } from "node:buffer";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Service, type Context } from "@deepseek-ai/cordis";
@@ -21,6 +22,12 @@ import {
   LATEST_SUPPORTED_VERSION,
   getPersistedSchemaVersion,
 } from "@magic-context/core/features/magic-context/storage-db";
+import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
+import {
+  calibrateBuckets,
+  resolveModelCalibration,
+} from "@magic-context/core/hooks/magic-context/tokenizer-calibration";
+import pkg from "../../package.json";
 import type TypertRegistry from "@deepseek-ai/dsh-typert-registry";
 import type { InvocationDescriptor } from "@deepseek-ai/dsh-typert-protocol";
 import type { TypertContribution } from "@deepseek-ai/dsh-typert-registry/types";
@@ -33,6 +40,37 @@ export const MAGIC_STATUS_METHOD = "status";
 
 /** Wire endpoint name for the per-session diagnostics (Phase 4). */
 export const MAGIC_DIAGNOSTICS_METHOD = "diagnostics";
+
+/** Wire endpoint name for the per-session token breakdown (Phase 5). */
+export const MAGIC_SNAPSHOT_METHOD = "sidebar-snapshot";
+
+/** dsh-plugin package version, shipped with every snapshot payload. */
+const MAGIC_CONTEXT_VERSION = pkg.version;
+
+/**
+ * JSON-safe sidebar snapshot subset (`magicContext/sidebar-snapshot`). The dsh
+ * host cannot fill OpenCode's live-state fields (tool-definition measurement,
+ * tail-hygiene scans, dreamer progress), so this is a strict subset of the
+ * OpenCode `SidebarSnapshot`: the token breakdown the Context tab renders.
+ */
+export interface DshSidebarSnapshot {
+  readonly sessionId: string;
+  readonly usagePercentage: number;
+  readonly inputTokens: number;
+  readonly contextLimit: number;
+  readonly executeThreshold: number;
+  readonly systemPromptTokens: number;
+  readonly docsTokens: number;
+  readonly compartmentTokens: number;
+  readonly factTokens: number;
+  readonly memoryTokens: number;
+  readonly profileTokens: number;
+  readonly conversationTokens: number;
+  readonly toolCallTokens: number;
+  readonly toolDefinitionTokens: number;
+  readonly tailHygiene?: { readonly u: number; readonly t: number; readonly severity: string };
+  readonly version: string;
+}
 
 /** JSON-safe per-session diagnostics (outbox/tags/compartments/meta). */
 export interface MagicSessionDiagnostics {
@@ -199,6 +237,134 @@ export class MagicContextRemoteService extends Service {
       return empty;
     }
   }
+
+  /** `magicContext/sidebar-snapshot` — token breakdown for the Context tab. */
+  async ["sidebar-snapshot"](args: { sessionId: string }): Promise<DshSidebarSnapshot> {
+    // Security: bound the session id exactly like diagnostics (PLAN §11).
+    const rawSessionId = String(args?.sessionId ?? "").slice(0, 512);
+    const empty: DshSidebarSnapshot = {
+      sessionId: rawSessionId,
+      usagePercentage: 0,
+      inputTokens: 0,
+      contextLimit: 200_000,
+      executeThreshold: 65,
+      systemPromptTokens: 0,
+      docsTokens: 0,
+      compartmentTokens: 0,
+      factTokens: 0,
+      memoryTokens: 0,
+      profileTokens: 0,
+      conversationTokens: 0,
+      toolCallTokens: 0,
+      toolDefinitionTokens: 0,
+      version: MAGIC_CONTEXT_VERSION,
+    };
+    if (rawSessionId.length === 0) return empty;
+    // Accept canonical or DSH-native session ids (same policy as diagnostics).
+    const sessionId =
+      this.host.parseKey(rawSessionId) !== undefined
+        ? rawSessionId
+        : this.host.canonicalKey(rawSessionId);
+    const bootstrap = await this.host.ready;
+    if (bootstrap.kind !== "ok") return { ...empty, sessionId };
+    const db = bootstrap.db;
+    try {
+      const row = db
+        .prepare(
+          `SELECT last_context_percentage, last_input_tokens, system_prompt_tokens,
+                  conversation_tokens, tool_call_tokens, cached_m0_bytes,
+                  memory_block_count, cached_m0_project_identity,
+                  last_usage_context_limit, detected_context_limit
+           FROM session_meta WHERE session_id = ?`,
+        )
+        .get(sessionId) as
+        | {
+            last_context_percentage: number | null;
+            last_input_tokens: number | null;
+            system_prompt_tokens: number | null;
+            conversation_tokens: number | null;
+            tool_call_tokens: number | null;
+            cached_m0_bytes: Uint8Array | string | null;
+            memory_block_count: number | null;
+            cached_m0_project_identity: string | null;
+            last_usage_context_limit: number | null;
+            detected_context_limit: number | null;
+          }
+        | undefined;
+      if (!row) return { ...empty, sessionId };
+
+      const usagePercentage = Number(row.last_context_percentage ?? 0);
+      const inputTokens = Number(row.last_input_tokens ?? 0);
+      const systemPromptTokens = Number(row.system_prompt_tokens ?? 0);
+      // conversation_tokens is the persisted estimate of output.messages[]
+      // INCLUDING injected compartments/facts/memories/docs/profile (all live
+      // in message[0]) — subtract them so "conversation" reflects real dialog.
+      const messagesBlockTokens = Number(row.conversation_tokens ?? 0);
+      const toolCallsLocal = Math.max(0, Number(row.tool_call_tokens ?? 0));
+      // The m[0] per-block attribution is computed by the SHARED helper so the
+      // dsh Context tab and the OpenCode sidebar can never diverge on how the
+      // categories are measured.
+      const cachedM0Bytes = row.cached_m0_bytes;
+      const m0Text =
+        cachedM0Bytes instanceof Uint8Array
+          ? Buffer.from(cachedM0Bytes).toString("utf8")
+          : typeof cachedM0Bytes === "string"
+            ? (cachedM0Bytes as string)
+            : "";
+      const m0Blocks = computeM0BlockTokens(db, sessionId, {
+        m0Text,
+        projectIdentity: row.cached_m0_project_identity ?? undefined,
+        injectionBudgetTokens: undefined,
+        memoryBlockCount: Number(row.memory_block_count ?? 0),
+      });
+      const injectedInMessages =
+        m0Blocks.compartmentTokens +
+        m0Blocks.factTokens +
+        m0Blocks.memoryTokens +
+        m0Blocks.docsTokens +
+        m0Blocks.profileTokens;
+      const conversationLocal = Math.max(0, messagesBlockTokens - injectedInMessages);
+      // No per-model resolution on the dsh host → neutral ratios (1.0/1.0).
+      const contextLimit =
+        Number(row.last_usage_context_limit ?? 0) > 0
+          ? Number(row.last_usage_context_limit)
+          : Number(row.detected_context_limit ?? 0) > 0
+            ? Number(row.detected_context_limit)
+            : 200_000;
+      const calibrated = calibrateBuckets({
+        inputTokens,
+        systemLocal: systemPromptTokens,
+        toolDefsLocal: 0, // dsh has no live tool-definition measurement
+        compartmentsLocal: m0Blocks.compartmentTokens,
+        factsLocal: m0Blocks.factTokens,
+        memoriesLocal: m0Blocks.memoryTokens,
+        docsLocal: m0Blocks.docsTokens,
+        profileLocal: m0Blocks.profileTokens,
+        conversationLocal,
+        toolCallsLocal,
+        calibration: resolveModelCalibration(undefined, undefined),
+      });
+      return {
+        sessionId,
+        usagePercentage,
+        inputTokens,
+        contextLimit,
+        executeThreshold: 65, // runtime default; dsh has no per-model config
+        systemPromptTokens: calibrated.systemTokens,
+        docsTokens: calibrated.docsTokens,
+        compartmentTokens: calibrated.compartmentTokens,
+        factTokens: calibrated.factTokens,
+        memoryTokens: calibrated.memoryTokens,
+        profileTokens: calibrated.profileTokens,
+        conversationTokens: calibrated.conversationTokens,
+        toolCallTokens: calibrated.toolCallTokens,
+        toolDefinitionTokens: calibrated.toolDefinitionTokens,
+        version: MAGIC_CONTEXT_VERSION,
+      };
+    } catch {
+      return { ...empty, sessionId };
+    }
+  }
 }
 
 /** Strict descriptor for `magicContext/status` (src-json codecs, no schemas). */
@@ -251,6 +417,31 @@ export function magicDiagnosticsDescriptor(): InvocationDescriptor {
   };
 }
 
+/** Strict descriptor for `magicContext/sidebar-snapshot` (Phase 5). */
+export function magicSnapshotDescriptor(): InvocationDescriptor {
+  return {
+    id: "magicContext.sidebar-snapshot",
+    service: "magicContextRemote",
+    namespace: MAGIC_CONTEXT_REMOTE_NAMESPACE,
+    method: MAGIC_SNAPSHOT_METHOD,
+    invocation: { kind: "direct" },
+    parameters: [
+      {
+        name: "args",
+        wire: "args",
+        source: "json",
+        codec: { mode: "src-json" },
+      },
+    ],
+    result: { mode: "src-json" },
+    sourceLocation: {
+      file: "packages/dsh-plugin/src/host/remote.ts",
+      line: 1,
+      column: 1,
+    },
+  };
+}
+
 /**
  * Provide the remote service and register the `magicContext/status`
  * contribution. Returns a disposer, or undefined when the Typert registry is
@@ -274,7 +465,11 @@ export function registerMagicContextRemote(
     face: "host",
     schemas: [],
     model: { services: [], events: [], objects: [] },
-    invocations: [magicStatusDescriptor(), magicDiagnosticsDescriptor()],
+    invocations: [
+      magicStatusDescriptor(),
+      magicDiagnosticsDescriptor(),
+      magicSnapshotDescriptor(),
+    ],
   };
   const disposer = typert.register(contribution);
   return () => {

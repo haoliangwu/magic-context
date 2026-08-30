@@ -91,6 +91,8 @@ export interface ContextPlaneDeps {
     readonly config?: ContextPlaneHistorianConfig;
     /** Read the current context pressure (production: sessionProjections). */
     readPressure?: (agent: Agent) => ContextPressureSample | undefined;
+    /** Read the dsh-native context token breakdown (lag 1 step). */
+    readBreakdown?: (agent: Agent) => { systemTokens: number; toolsTokens: number; messageTokens: number } | undefined;
     /** Fire one background historian pass for the session. */
     fire: (deps: {
       readonly db: Database;
@@ -256,8 +258,24 @@ function maybeFireHistorian(
     }
     // 压力持久化（对齐 Pi persistPiPressureFromMessageEnd）：把最近一次的
     // 百分比写入 session_meta，供 /ctx-status 与共享状态读取。
+    // 同时持久化 dsh 原生 context breakdown（lag 1 step）的 token 分类，
+    // 供 Context tab sidebar 渲染校准后的分段（calibrateBuckets 需非 0
+    // inputTokens 才能分配 bucket）。
     try {
-      updateSessionMeta(db, sessionId, { lastContextPercentage: percentage });
+      const breakdown = historian.readBreakdown?.(agent);
+      if (breakdown !== undefined) {
+        updateSessionMeta(db, sessionId, {
+          lastContextPercentage: percentage,
+          lastInputTokens: breakdown.systemTokens + breakdown.toolsTokens + breakdown.messageTokens,
+          systemPromptTokens: breakdown.systemTokens,
+          // toolsTokens = tool definitions（schema），对齐 sidebar 的 Tool Defs 段；
+          // tool_call_tokens = 0（dsh 原生 breakdown 不拆 call I/O，messageTokens 已含）。
+          toolCallTokens: 0,
+          conversationTokens: breakdown.messageTokens,
+        });
+      } else {
+        updateSessionMeta(db, sessionId, { lastContextPercentage: percentage });
+      }
     } catch {
       // 持久化失败不可破坏 pre-step 链（fail-open）。
     }
