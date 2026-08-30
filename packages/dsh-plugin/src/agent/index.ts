@@ -36,6 +36,7 @@ import {
   registerMagicHistorianPlane,
   createLlmSummarizeCall,
   readContextPressure,
+  readContextBreakdown,
   currentModel,
 } from "./historian-wiring";
 import {
@@ -294,6 +295,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     historian: {
       config: config.historian,
       readPressure: readContextPressure(ctx),
+      readBreakdown: readContextBreakdown(ctx),
       fire: ({ db, sessionId, directory: fireDirectory, provider, contextWindow }) => {
         // Fire-and-forget: the pass publishes atomically and only signals
         // deferred work; it must never block the pre-step chain.

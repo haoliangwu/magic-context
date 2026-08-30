@@ -21,8 +21,9 @@
  * Client→Host channel: this package is a PERSISTENT bundle, so the dynamic-
  * package `host.call` primitive does not exist. The channel is the Typert
  * Gateway over the shared `/api` RPC transport (dsh-reference §F.4 / §G.1):
- * `connection.rpc.call('/api', 'magicContext/status' | 'magicContext/diagnostics',
- * { args: { args: request } })`, served by the host half (src/host/remote.ts).
+ * `connection.rpc.call('/api', 'magicContext/status' | 'magicContext/diagnostics'
+ * | 'magicContext/sidebar-snapshot', { args: { args: request } })`, served by
+ * the host half (src/host/remote.ts).
  * The descriptor declares one parameter with wire "args", so the argument
  * object rides under payload.args.args — a bare `{ sessionId }` would fail
  * the gateway's assertExactArguments. Every failure degrades to a visible
@@ -75,6 +76,13 @@ const css = [
   ".ckmc-bar{height:6px;border-radius:3px;background:var(--dsw-alias-bg-layer-3);overflow:hidden;margin:2px 0 6px}",
   ".ckmc-barFill{height:100%;border-radius:3px;background:var(--dsw-alias-state-success-primary);transition:width .2s ease}",
   ".ckmc-rows{border-top:1px solid var(--dsw-alias-border-l2);margin-top:6px}",
+  // Sidebar (token breakdown) extras.
+  ".ckmc-segBar{display:flex;height:6px;border-radius:3px;overflow:hidden;margin:2px 0 6px}",
+  ".ckmc-seg{height:100%;min-width:2px}",
+  ".ckmc-version{color:var(--dsw-alias-label-tertiary);font-family:var(--dsw-font-mono);font-size:11px;line-height:20px;flex:none}",
+  ".ckmc-catLeft{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-tertiary);min-width:0}",
+  ".ckmc-dot{width:8px;height:8px;border-radius:2px;flex:none}",
+  ".ckmc-footnote{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);margin:4px 0 0}",
 ].join("");
 if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(CSS_TAG_ID) + "]") === null) {
   const tag = document.createElement("style");
@@ -104,6 +112,12 @@ const C = {
   bar: "ckmc-bar",
   barFill: "ckmc-barFill",
   rows: "ckmc-rows",
+  segBar: "ckmc-segBar",
+  seg: "ckmc-seg",
+  version: "ckmc-version",
+  catLeft: "ckmc-catLeft",
+  dot: "ckmc-dot",
+  footnote: "ckmc-footnote",
 } as const;
 
 /* ----------------------------------------- wire types (mirror of src/host/remote.ts) */
@@ -137,6 +151,26 @@ export interface MagicSessionDiagnostics {
   readonly meta: { readonly lastContextPercentage?: number; readonly hasM0: boolean };
 }
 
+/** Host `magicContext/sidebar-snapshot` payload. Keep in sync with src/host/remote.ts. */
+export interface SidebarSnapshot {
+  readonly sessionId: string;
+  readonly usagePercentage: number;
+  readonly inputTokens: number;
+  readonly contextLimit: number;
+  readonly executeThreshold: number;
+  readonly systemPromptTokens: number;
+  readonly docsTokens: number;
+  readonly compartmentTokens: number;
+  readonly factTokens: number;
+  readonly memoryTokens: number;
+  readonly profileTokens: number;
+  readonly conversationTokens: number;
+  readonly toolCallTokens: number;
+  readonly toolDefinitionTokens: number;
+  readonly tailHygiene?: { readonly u: number; readonly t: number; readonly severity: string };
+  readonly version: string;
+}
+
 /** Error branch of the gateway RPC result (structural subset of dsh-host-apiproxy). */
 export interface MagicRpcError {
   readonly code: string;
@@ -160,6 +194,7 @@ export interface RpcConnectionLike {
 const CHANNEL = "/api";
 const STATUS_ENDPOINT = "magicContext/status";
 const DIAGNOSTICS_ENDPOINT = "magicContext/diagnostics";
+const SIDEBAR_ENDPOINT = "magicContext/sidebar-snapshot";
 
 function unavailable(message: string): MagicRpcResult<never> {
   return { ok: false, error: { code: "unavailable", message, details: {} } };
@@ -215,6 +250,14 @@ export function callDiagnostics(
   return callRpc<MagicSessionDiagnostics>(connection, DIAGNOSTICS_ENDPOINT, args);
 }
 
+/** Call the host `magicContext/sidebar-snapshot` Remote for one session. */
+export function callSidebarSnapshot(
+  connection: RpcConnectionLike | undefined,
+  args: { sessionId: string },
+): Promise<MagicRpcResult<SidebarSnapshot>> {
+  return callRpc<SidebarSnapshot>(connection, SIDEBAR_ENDPOINT, args);
+}
+
 /* ------------------------------------------------ controllers */
 export interface StatusSnapshotState {
   readonly state: "idle" | "loading" | "ready" | "error";
@@ -225,6 +268,12 @@ export interface StatusSnapshotState {
 export interface DiagnosticsSnapshotState {
   readonly state: "idle" | "loading" | "ready" | "error";
   readonly diagnostics: MagicSessionDiagnostics | null;
+  readonly error: MagicRpcError | null;
+}
+
+export interface SidebarSnapshotState {
+  readonly state: "idle" | "loading" | "ready" | "error";
+  readonly snapshot: SidebarSnapshot | null;
   readonly error: MagicRpcError | null;
 }
 
@@ -278,6 +327,32 @@ class DiagnosticsController {
   }
 
   /** Re-pull the diagnostics for one session. */
+  readonly refresh: (args: { sessionId: string }) => Promise<void>;
+}
+
+/**
+ * Same shape as DiagnosticsController but for `magicContext/sidebar-snapshot`
+ * (the token-breakdown view). One controller per slot; the view refreshes with
+ * whichever session is current when it mounts / is asked to.
+ */
+class SidebarController {
+  readonly store: SnapshotStore<SidebarSnapshotState>;
+
+  constructor(connection: RpcConnectionLike | undefined) {
+    this.store = createSnapshotStore<SidebarSnapshotState>({ state: "idle", snapshot: null, error: null });
+    this.refresh = (args: { sessionId: string }) => {
+      this.store.set({ state: "loading", snapshot: null, error: null });
+      return callSidebarSnapshot(connection, args).then((result) => {
+        this.store.set(
+          result.ok === true
+            ? { state: "ready", snapshot: result.value, error: null }
+            : { state: "error", snapshot: null, error: result.error },
+        );
+      });
+    };
+  }
+
+  /** Re-pull the sidebar snapshot for one session. */
   readonly refresh: (args: { sessionId: string }) => Promise<void>;
 }
 
@@ -438,65 +513,137 @@ export function MagicHeaderAction({ useMagicStatus, refresh, sessionId }: MagicH
 }
 
 /* -------------------------------- conversation.view entry */
-/** Session-scope view props: standard kit (sessionId) + injected diagnostics face. */
+/** Session-scope view props: standard kit (sessionId) + injected sidebar face. */
 export interface ContextTabViewProps {
-  useMagicDiagnostics: SnapshotSelectorHook<DiagnosticsSnapshotState>;
-  refresh: (args: { sessionId: string }) => void;
+  useMagicSidebar: SnapshotSelectorHook<SidebarSnapshotState>;
+  refreshSidebar: (args: { sessionId: string }) => void;
   sessionId: string;
 }
 
-/** Clamp the host-reported occupancy into a legal bar width. */
-function occupancyWidth(percentage: number): string {
-  return `${Math.max(0, Math.min(100, percentage))}%`;
+/** Segment colors — ported 1:1 from the OpenCode TUI sidebar. */
+const SEGMENT_COLORS = {
+  system: "#c084fc",
+  docs: "#22d3ee",
+  compartments: "#60a5fa",
+  facts: "#fbbf24",
+  memories: "#34d399",
+  profile: "#a3e635",
+  conversation: "#f87171",
+  toolCalls: "#fb923c",
+  toolDefs: "#f472b6",
+} as const;
+
+export interface TokenSegment {
+  readonly key: string;
+  readonly label: string;
+  readonly tokens: number;
+  readonly color: string;
 }
 
 /**
- * "Context" tab: reads `magicContext/diagnostics` for the current session and
- * shows occupancy (primary, as a bar) plus outbox/tags/compartments counts.
- * Refresh = first open + the manual button (no polling, Q4 scope).
+ * Build the token segments in TUI build order. Facts and Tool Defs are omitted
+ * entirely when 0 (the dsh host always reports 0 for both); Conversation is
+ * always present, including zero, with the asterisk footnote.
  */
-export function ContextTabView({ useMagicDiagnostics, refresh, sessionId }: ContextTabViewProps) {
-  const snapshot = useMagicDiagnostics((state) => state);
+function tokenSegments(s: SidebarSnapshot): TokenSegment[] {
+  const result: TokenSegment[] = [];
+  if (s.systemPromptTokens > 0) result.push({ key: "sys", label: "System", tokens: s.systemPromptTokens, color: SEGMENT_COLORS.system });
+  if (s.docsTokens > 0) result.push({ key: "docs", label: "Docs", tokens: s.docsTokens, color: SEGMENT_COLORS.docs });
+  if (s.compartmentTokens > 0) result.push({ key: "comp", label: "Compartments", tokens: s.compartmentTokens, color: SEGMENT_COLORS.compartments });
+  if (s.factTokens > 0) result.push({ key: "fact", label: "Facts", tokens: s.factTokens, color: SEGMENT_COLORS.facts });
+  if (s.memoryTokens > 0) result.push({ key: "mem", label: "Memories", tokens: s.memoryTokens, color: SEGMENT_COLORS.memories });
+  if (s.profileTokens > 0) result.push({ key: "profile", label: "User Profile", tokens: s.profileTokens, color: SEGMENT_COLORS.profile });
+  result.push({ key: "conv", label: "Conversation*", tokens: s.conversationTokens, color: SEGMENT_COLORS.conversation });
+  if (s.toolCallTokens > 0) result.push({ key: "tool-calls", label: "Tool Calls", tokens: s.toolCallTokens, color: SEGMENT_COLORS.toolCalls });
+  if (s.toolDefinitionTokens > 0) result.push({ key: "tool-defs", label: "Tool Defs", tokens: s.toolDefinitionTokens, color: SEGMENT_COLORS.toolDefs });
+  return result;
+}
+
+/** Compact a token count: >= 1K renders as "1.0K", else the raw number. */
+function compactTokens(value: number): string {
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}K`;
+  return String(value);
+}
+
+/** Share of one segment inside inputTokens, 1 decimal. */
+function segmentPct(tokens: number, inputTokens: number): string {
+  return `${(inputTokens > 0 ? (tokens / inputTokens) * 100 : 0).toFixed(1)}%`;
+}
+
+/**
+ * "Context" tab: reads `magicContext/sidebar-snapshot` for the current session
+ * and renders the token-breakdown sidebar (header + usage row + segmented
+ * proportional bar + category rows + hygiene line), ported from the OpenCode
+ * TUI sidebar. Refresh = first open + the manual button (no polling, Q4 scope).
+ */
+export function ContextTabView({ useMagicSidebar, refreshSidebar, sessionId }: ContextTabViewProps) {
+  const snapshot = useMagicSidebar((state) => state);
   useEffect(() => {
-    refresh({ sessionId });
-  }, [sessionId, refresh]);
-  const diagnostics = snapshot.diagnostics;
-  const lastPct = diagnostics?.meta.lastContextPercentage;
+    refreshSidebar({ sessionId });
+  }, [sessionId, refreshSidebar]);
+  const s = snapshot.snapshot;
+  const segments = s === null ? [] : tokenSegments(s);
+  // Zero-token segments claim no flex weight — only the bar prunes them; the
+  // legend shows every built segment (incl. Conversation at 0) for stability.
+  const barSegments = segments.filter((seg) => seg.tokens > 0);
   return (
     <div className={C.card}>
-      <h3 className={C.title}>Magic Context · 上下文</h3>
+      <div className={C.barRow}>
+        <h3 className={C.title}>Magic Context</h3>
+        {s !== null && <span className={C.version}>v{s.version}</span>}
+      </div>
       <p className={C.desc}>dsh-magic-context · DSH 适配器</p>
       {snapshot.state === "loading" && <p className={C.loading}>读取状态…</p>}
       {snapshot.state === "error" && (
         <p className={C.loading}>
           主机端点不可用：{snapshot.error && snapshot.error.message !== undefined ? snapshot.error.message : "unknown"}（需要 host
-          半侧注册 magicContext/diagnostics）
+          半侧注册 magicContext/sidebar-snapshot）
         </p>
       )}
-      {snapshot.state === "ready" && diagnostics !== null && (
+      {snapshot.state === "ready" && s !== null && (
         <>
           <div className={C.barRow}>
-            <span className={C.label}>上下文占比</span>
-            <span className={C.value}>{lastPct !== undefined ? `${lastPct}%` : "未知"}</span>
+            <span className={C.label}>
+              {s.usagePercentage}% / {s.executeThreshold}%
+            </span>
+            <span className={C.value}>
+              {compactTokens(s.inputTokens)} / {compactTokens(s.contextLimit)}
+            </span>
           </div>
-          {lastPct !== undefined && (
-            <div className={C.bar} role="progressbar" aria-valuenow={Math.round(lastPct)} aria-valuemin={0} aria-valuemax={100}>
-              <div className={C.barFill} style={{ width: occupancyWidth(lastPct) }} />
-            </div>
-          )}
+          <div className={C.segBar} role="img" aria-label="token breakdown">
+            {barSegments.map((seg) => (
+              <div
+                key={seg.key}
+                className={C.seg}
+                style={{ backgroundColor: seg.color, flexGrow: Math.max(1, seg.tokens), flexBasis: 0 }}
+                title={`${seg.label} ${compactTokens(seg.tokens)}`}
+              />
+            ))}
+          </div>
           <div className={C.rows}>
-            <Row label="活跃标签" value={String(diagnostics.tags.active)} />
-            <Row label="已丢标签" value={String(diagnostics.tags.dropped)} />
-            <Row label="Compartment" value={String(diagnostics.compartments)} />
-            <Row label="待处理" value={String(diagnostics.outbox.pending)} />
-            <Row label="已应用" value={String(diagnostics.outbox.applied)} />
-            <Row label="已提交" value={String(diagnostics.outbox.committed)} />
-            <Row label="已放弃" value={String(diagnostics.outbox.abandoned)} />
+            {segments.map((seg) => (
+              <div key={seg.key} className={C.row}>
+                <span className={C.catLeft}>
+                  <span className={C.dot} style={{ backgroundColor: seg.color }} />
+                  {seg.label}
+                </span>
+                <span className={C.value} title={String(seg.tokens)}>
+                  {compactTokens(seg.tokens)} ({segmentPct(seg.tokens, s.inputTokens)})
+                </span>
+              </div>
+            ))}
           </div>
+          <p className={C.footnote}>* includes Reasoning; hygiene excludes it</p>
+          {s.tailHygiene !== undefined && (
+            <Row
+              label="Hygiene"
+              value={`${s.tailHygiene.severity} · ${compactTokens(s.tailHygiene.u)} / ${compactTokens(s.tailHygiene.t)} tok`}
+            />
+          )}
         </>
       )}
       <div className={C.actions}>
-        <button type="button" className={C.btn} disabled={snapshot.state === "loading"} onClick={() => refresh({ sessionId })}>
+        <button type="button" className={C.btn} disabled={snapshot.state === "loading"} onClick={() => refreshSidebar({ sessionId })}>
           刷新
         </button>
       </div>
@@ -515,6 +662,7 @@ export function apply(ctx: Context): void {
   const sectionController = new StatusController(connection);
   const headerController = new StatusController(connection);
   const diagnosticsController = new DiagnosticsController(connection);
+  const sidebarController = new SidebarController(connection);
 
   ctx.slots.inject("settings.section", () =>
     ctx.slots.register({
@@ -549,8 +697,12 @@ export function apply(ctx: Context): void {
       order: 20,
       label: "Context",
       inject: (sessionId) => ({
-        hooks: { magicDiagnostics: diagnosticsController.store },
+        hooks: {
+          magicDiagnostics: diagnosticsController.store,
+          magicSidebar: sidebarController.store,
+        },
         refresh: (args?: { sessionId?: string }) => diagnosticsController.refresh({ sessionId: args?.sessionId ?? sessionId }),
+        refreshSidebar: (args?: { sessionId?: string }) => sidebarController.refresh({ sessionId: args?.sessionId ?? sessionId }),
       }),
     }, ContextTabView),
   );
