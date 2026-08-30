@@ -40,7 +40,8 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { createSnapshotStore, type SnapshotStore } from "@deepseek-ai/dsh-client-runtime/client";
+import { createSnapshotStore, type SnapshotStore, type UseProjection } from "@deepseek-ai/dsh-client-runtime/client";
+import type {} from "@deepseek-ai/dsh-token-meter"; // load SessionProjectionMap augmentation (contextPressure/contextBreakdown keys)
 import type { SnapshotSelectorHook } from "@deepseek-ai/dsh-client-ui-slots";
 import { IconChevronDownOutline14 } from "@deepseek-ai/dsh-client-ui-primitives";
 import type { Context } from "@deepseek-ai/cordis";
@@ -513,11 +514,13 @@ export function MagicHeaderAction({ useMagicStatus, refresh, sessionId }: MagicH
 }
 
 /* -------------------------------- conversation.view entry */
-/** Session-scope view props: standard kit (sessionId) + injected sidebar face. */
+/** Session-scope view props: standard kit (sessionId, useProjection) + injected sidebar face. */
 export interface ContextTabViewProps {
   useMagicSidebar: SnapshotSelectorHook<SidebarSnapshotState>;
   refreshSidebar: (args: { sessionId: string }) => void;
   sessionId: string;
+  /** dsh-native session projection hook — drives refresh on contextPressure change. */
+  useProjection: UseProjection;
 }
 
 /** Segment colors — ported 1:1 from the OpenCode TUI sidebar. */
@@ -576,11 +579,20 @@ function segmentPct(tokens: number, inputTokens: number): string {
  * proportional bar + category rows + hygiene line), ported from the OpenCode
  * TUI sidebar. Refresh = first open + the manual button (no polling, Q4 scope).
  */
-export function ContextTabView({ useMagicSidebar, refreshSidebar, sessionId }: ContextTabViewProps) {
+export function ContextTabView({ useMagicSidebar, refreshSidebar, sessionId, useProjection }: ContextTabViewProps) {
   const snapshot = useMagicSidebar((state) => state);
+  // Live refresh: subscribe to dsh-native contextPressure projection. Each
+  // change kicks a 150ms debounced sidebar-snapshot RPC re-fetch (the RPC
+  // data still lags 1 step; projection is the freshness trigger, not source).
+  const pressure = useProjection("contextPressure");
   useEffect(() => {
     refreshSidebar({ sessionId });
   }, [sessionId, refreshSidebar]);
+  useEffect(() => {
+    if (pressure === undefined) return;
+    const t = setTimeout(() => refreshSidebar({ sessionId }), 150);
+    return () => clearTimeout(t);
+  }, [pressure, sessionId, refreshSidebar]);
   const s = snapshot.snapshot;
   const segments = s === null ? [] : tokenSegments(s);
   // Zero-token segments claim no flex weight — only the bar prunes them; the
