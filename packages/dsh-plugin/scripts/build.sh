@@ -3,8 +3,10 @@ set -e
 EB="bunx --package esbuild esbuild"
 
 # official packages are all @deepseek-ai/* — wildcard covers harness SDK, cordis stays single
-EXT_HOST="--external:@deepseek-ai/dsh-* --external:@deepseek-ai/cordis"
-EXT_ENTRIES="--external:@deepseek-ai/dsh-* --external:@deepseek-ai/cordis"
+# native modules can't be bundled (same externals as packages/plugin build)
+EXT_NATIVE="--external:onnxruntime-node --external:onnxruntime-web --external:sharp --external:bun:sqlite --external:node:sqlite"
+EXT_HOST="--external:@deepseek-ai/dsh-* --external:@deepseek-ai/cordis $EXT_NATIVE"
+EXT_ENTRIES="--external:@deepseek-ai/dsh-* --external:@deepseek-ai/cordis $EXT_NATIVE"
 
 $EB --bundle src/index.ts --outdir=dist --platform=node --target=node20 --format=esm --splitting $EXT_HOST
 
