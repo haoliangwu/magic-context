@@ -4,7 +4,7 @@
  * not render untrusted data as HTML.
  */
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MAGIC_CONTEXT_REMOTE_NAMESPACE } from "../compat/dsh-0.1/remote-seam";
 import {
@@ -13,6 +13,9 @@ import {
   magicDiagnosticsDescriptor,
   magicStatusDescriptor,
 } from "./remote";
+
+/** The audited artifact is the shipped bundle (built from src/client/client.tsx). */
+const CLIENT_BUNDLE = join(import.meta.dir, "..", "..", "dist", "client.js");
 
 describe("Phase 5 security audit", () => {
   it("remote descriptors carry the strict namespace and no secret-adjacent fields", () => {
@@ -34,17 +37,18 @@ describe("Phase 5 security audit", () => {
     expect(parameters[0]?.codec.mode).toBe("src-json");
   });
 
-  it("the client bundle never assigns untrusted content into innerHTML", () => {
-    const client = readFileSync(
-      join(import.meta.dir, "..", "client", "client.js"),
-      "utf8",
-    );
-    // The XSS surface is dynamic HTML assignment with interpolated values.
-    expect(client).not.toMatch(/innerHTML\s*=\s*[^;]*\$\{/);
-    expect(client).not.toMatch(/insertAdjacentHTML\s*\(/);
-    // Text insertion must go through textContent / createTextNode.
-    expect(client).toMatch(/textContent/);
-  });
+  // Skip on a fresh clone where `pnpm build` has not produced the bundle yet.
+  it.skipIf(!existsSync(CLIENT_BUNDLE))(
+    "the client bundle never assigns untrusted content into innerHTML",
+    () => {
+      const client = readFileSync(CLIENT_BUNDLE, "utf8");
+      // The XSS surface is dynamic HTML assignment with interpolated values.
+      expect(client).not.toMatch(/innerHTML\s*=\s*[^;]*\$\{/);
+      expect(client).not.toMatch(/insertAdjacentHTML\s*\(/);
+      // Text insertion must go through textContent / createTextNode.
+      expect(client).toMatch(/textContent/);
+    },
+  );
 
   it("the host status payload carries no environment or credential echo", () => {
     const descriptor = magicStatusDescriptor();
