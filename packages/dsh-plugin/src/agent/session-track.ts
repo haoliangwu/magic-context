@@ -14,6 +14,7 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
+import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import { recordSessionProjectIdentity } from "@magic-context/core/features/magic-context/session-project-storage";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type { DshStorageBootstrap } from "../host/bootstrap";
@@ -83,7 +84,8 @@ export function registerSessionProjectTracking(
         const bootstrap = await deps.host.ready;
         if (bootstrap.kind !== "ok") return;
         const magicSessionId = deps.host.canonicalKey(agent.id);
-        const projectPath = sessionProjectPath(agent, deps.directory);
+        const directory = sessionProjectPath(agent, deps.directory);
+        const projectPath = resolveSessionProjectIdentity(directory);
         trackSessionProjectOnce(trackedSessions, bootstrap.db, magicSessionId, projectPath);
       } catch (error) {
         deps.log?.(
@@ -101,4 +103,20 @@ export function sessionProjectPath(
 ): string | undefined {
   const cwd = agent.session.header.cwd;
   return cwd && cwd.length > 0 ? cwd : fallbackDirectory;
+}
+
+/**
+ * Resolve the canonical project identity (git:<sha> / dir:<hash>) for the
+ * workspace directory. session_projects rows must carry the resolved identity:
+ * persisting the raw cwd would split one project across two dashboard groups
+ * (raw-path row + git:<sha> row). Mirrors knowledge-gate's
+ * resolveKnowledgeProjectPath — keep the two in sync.
+ */
+function resolveSessionProjectIdentity(directory: string | undefined): string | undefined {
+  if (!directory || directory.length === 0) return undefined;
+  try {
+    return resolveProjectIdentityForSession(directory) || undefined;
+  } catch {
+    return undefined;
+  }
 }
