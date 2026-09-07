@@ -40,7 +40,8 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { createSnapshotStore, type SnapshotStore, type UseProjection } from "@deepseek-ai/dsh-client-runtime/client";
+import { createSnapshotStore, type SnapshotStore } from "@deepseek-ai/dsh-client-store";
+import type { UseProjection } from "@deepseek-ai/dsh-api-session-controller/client";
 import type {} from "@deepseek-ai/dsh-token-meter"; // load SessionProjectionMap augmentation (contextPressure/contextBreakdown keys)
 import type { SnapshotSelectorHook } from "@deepseek-ai/dsh-client-ui-slots";
 import { IconChevronDownOutline14 } from "@deepseek-ai/dsh-client-ui-primitives";

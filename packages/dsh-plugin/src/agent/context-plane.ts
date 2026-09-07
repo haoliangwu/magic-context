@@ -43,6 +43,7 @@ import { isMagicChildSession } from "./worker";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { sessionEventsOf } from "./session-events";
 
 /** The host-service slice the context plane needs (structural view). */
 export interface ContextPlaneHostView {
@@ -132,7 +133,7 @@ function sessionLogView(
   agent: Agent,
   canonicalSessionId: string,
 ): { hasSeq(seq: number): boolean; generation: number } {
-  const events = agent.session.events;
+  const events = sessionEventsOf(agent.session);
   const seqSet = new Set<number>();
   for (const event of events) {
     if (event !== null && typeof event === "object") {
@@ -156,7 +157,7 @@ function sessionLogView(
 const COMMIT_MENTION_RE = /(?:^|[\s(`])[0-9a-f]{7,40}(?:$|[\s`)])/i;
 export function recentCommitClusterCount(agent: Agent): number {
   try {
-    const events = (agent.session as { events?: readonly unknown[] }).events ?? [];
+    const events = sessionEventsOf(agent.session);
     const texts: string[] = [];
     for (const event of events) {
       if (event === null || typeof event !== "object") continue;
@@ -387,7 +388,7 @@ export async function runContextPlaneStep(
       previewTagPayloadMessages(db, canonicalSessionId, payload.messages, deps.log);
       const view = readDshTranscript({
         session: {
-          events: agent.session.events,
+          events: sessionEventsOf(agent.session),
           surface: agent.session.surface,
           header: {},
         },
@@ -431,7 +432,7 @@ export async function runContextPlaneStep(
       );
       if (noteText !== null) {
         const noteMarker = `mc-nudge:note`;
-        const events = (agent.session as { events?: readonly unknown[] }).events ?? [];
+        const events = sessionEventsOf(agent.session);
         const alreadyInjected = events.some((event) => {
           if (event === null || typeof event !== "object") return false;
           const e = event as { data?: { source?: { plugin?: unknown; messageId?: unknown } } };

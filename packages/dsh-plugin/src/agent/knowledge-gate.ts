@@ -63,6 +63,7 @@ import type { DshStorageBootstrap } from "../host/bootstrap";
 import { trackSessionProjectOnce, sessionProjectPath } from "./session-track";
 import { maybeRunAutoSearchHint, type AutoSearchConfig } from "./auto-search";
 import { isMagicChildSession } from "./worker";
+import { sessionEventsOf } from "./session-events";
 
 /** The host-service slice the gate needs (structural view). */
 export interface KnowledgeGateHostView {
@@ -304,7 +305,7 @@ export function isMagicWatermarkOnSurface(
   session: KnowledgeSessionView,
   watermark: string,
 ): boolean {
-  const events = session.events;
+  const events = sessionEventsOf(session);
   for (const seq of session.surface.nodes) {
     const event = events[seq] as
       | { type?: string; data?: { source?: MagicMessageSource | { kind?: string } } }
