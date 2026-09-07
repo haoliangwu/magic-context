@@ -295,6 +295,36 @@ describe("deriveMutationPlan (recording pipeline)", () => {
     }
   });
 
+  it("resolves the protection floor from the 200k default when dsh has no usage limit (f319897f regression)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-transcript-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      const session = buildSession();
+      const view = viewOf(session);
+      // First pass assigns tags; no overflow state and no session_meta usage
+      // columns exist (dsh has no provider-overflow detection path).
+      deriveMutationPlan(view, { db });
+      // The floor must resolve to deriveDefaultProtectedTokens(200_000) = 16000
+      // and persist. A 0 floor collapses the protection window to the newest
+      // tie-group and compacts every older tool arc on every pre-step.
+      const row = db
+        .prepare("SELECT protected_tokens_effective FROM session_meta WHERE session_id = ?")
+        .get(view.sessionId) as { protected_tokens_effective: number | null } | undefined;
+      expect(row?.protected_tokens_effective).toBe(16000);
+      // The tiny session's whole tool mass sits inside the 16k window: a
+      // queued drop on a tool tag must be exempt (no compaction op).
+      const tags = getTagsBySession(db, view.sessionId);
+      const toolTag = tags.find((t) => t.type === "tool")!;
+      queuePendingOp(db, view.sessionId, toolTag.tagNumber, "drop", Date.now());
+      const plan = deriveMutationPlan(view, { db });
+      expect(plan).not.toBeNull();
+      expect(plan!.ops.some((op) => op.kind === "drops")).toBe(false);
+      db.close();
+    } finally {
+      await cleanupDir(dir);
+    }
+  });
+
   it("is deterministic: identical views + DB state produce identical ops", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dsh-magic-transcript-"));
     try {

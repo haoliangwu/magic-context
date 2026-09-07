@@ -180,6 +180,39 @@ export interface PlanContext {
 
 /* ────────────────────────────── event accessors ───────────────────────────── */
 
+// Keep in sync with the Context tab fallback chain (host/remote.ts
+// sidebarSnapshot): last_usage_context_limit → detected_context_limit → 200k.
+// The protection floor and the displayed window must never disagree.
+const DSH_DEFAULT_CONTEXT_LIMIT = 200_000;
+
+/**
+ * Usable-soft window for protection-floor derivation. The DSH host has no
+ * overflow detection (that is an OpenCode/Pi provider-error path), so the
+ * session_meta columns stay NULL and the chain ends at the same 200k default
+ * the Context tab renders. Without this fallback the floor resolves to 0 and
+ * the protection window collapses to the newest tie-group only — every older
+ * tool arc is compacted on every pre-step (session-f319897f regression).
+ */
+function sessionUsableSoftOf(db: Database, sessionId: string): number {
+  const overflowLimit = detectedContextLimitOf(db, sessionId);
+  if (overflowLimit !== undefined) return overflowLimit;
+  try {
+    const row = db
+      .prepare(
+        "SELECT last_usage_context_limit, detected_context_limit FROM session_meta WHERE session_id = ?",
+      )
+      .get(sessionId) as
+      | { last_usage_context_limit?: number | null; detected_context_limit?: number | null }
+      | undefined;
+    for (const value of [row?.last_usage_context_limit, row?.detected_context_limit]) {
+      if (typeof value === "number" && value > 0) return value;
+    }
+  } catch {
+    // Pre-migration database — fall through to the default.
+  }
+  return DSH_DEFAULT_CONTEXT_LIMIT;
+}
+
 /** Detected provider-proven context limit for the session, when known. */
 function detectedContextLimitOf(db: Database, sessionId: string): number | undefined {
   try {
@@ -1374,18 +1407,17 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
   // resolve the epoch floor (dsh carries no absolute override, so the floor
   // derives from usableSoft) and walk the persisted tool rows. Every dsh
   // pre-step rebuilds the wire, so each pass is epoch-resolving like a
-  // cache-busting pass upstream. usableSoft falls back to the session's
-  // detected context limit, then to the persisted epoch snapshot (or 0).
-  const usableSoft = ctx.usableSoft ?? detectedContextLimitOf(db, sessionId);
+  // cache-busting pass upstream. usableSoft resolves from the session's
+  // detected context limit, the session_meta usage columns, or the shared
+  // 200k default — never 0 (see sessionUsableSoftOf).
+  const usableSoft = ctx.usableSoft ?? sessionUsableSoftOf(db, sessionId);
   const protectionWindow = getProtectionWindowForSession(
     db,
     sessionId,
-    usableSoft !== undefined
-      ? resolveEpochFloorForPass(db, sessionId, {
-          usableSoft,
-          isCacheBustingPass: true,
-        }).floor
-      : undefined,
+    resolveEpochFloorForPass(db, sessionId, {
+      usableSoft,
+      isCacheBustingPass: true,
+    }).floor,
   );
 
   const ops: MutationOp[] = [...planTemporalMarkers(view)];
