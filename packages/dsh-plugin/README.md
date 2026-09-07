@@ -39,12 +39,15 @@ dsh-magic-context doctor --profile <name>
 
 **Production — GitHub subpath (no npm publish, verified with pnpm 11):**
 
-Pin to a tagged release for reproducibility:
+Pin to a commit SHA for reproducibility, or track the branch (the plugin
+version follows the monorepo version — `0.41.4` in lockstep with
+`@cortexkit/opencode-magic-context`; fork release tags use that scheme
+once cut):
 
 ```json
 // ~/.dsh/profiles/<name>/package.json
 {
-  "dependencies": { "@cortexkit/dsh-magic-context": "github:haoliangwu/magic-context#dsh-v0.2.0&path:packages/dsh-plugin" },
+  "dependencies": { "@cortexkit/dsh-magic-context": "github:haoliangwu/magic-context#master&path:packages/dsh-plugin" },
   "dsh": { "profile": { "bundles": ["@cortexkit/dsh-magic-context"] } }
 }
 ```
@@ -65,7 +68,7 @@ dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
 
-> Verified: `pnpm add "@cortexkit/dsh-magic-context@github:haoliangwu/magic-context#dsh-v0.2.0&path:packages/dsh-plugin"` resolves. `prepare` runs `bun run build`; if `bun` is not in the profile env, run `bun --cwd …/node_modules/@cortexkit/dsh-magic-context run build` manually.
+> Verified: `pnpm add "@cortexkit/dsh-magic-context@github:haoliangwu/magic-context#master&path:packages/dsh-plugin"` resolves. `prepare` runs `bun run build`; if `bun` is not in the profile env, run `bun --cwd …/node_modules/@cortexkit/dsh-magic-context run build` manually.
 
 **Local dev (monorepo):**
 
