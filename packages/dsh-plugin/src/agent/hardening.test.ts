@@ -71,7 +71,7 @@ describe("Phase 5 hardening", () => {
         session: { events: session.events, surface: session.surface, header: {} },
         canonicalSessionId: CANONICAL,
       });
-      const plan = deriveMutationPlan(view, { db, protectedTags: 0 })!;
+      const plan = deriveMutationPlan(view, { db })!;
       // Corrupt the LAST op: its shadowedSeqs no longer cover the node — the
       // coordinator fails closed, but earlier ops may already have applied.
       const ops = plan.ops.map((op, index) =>
@@ -102,7 +102,7 @@ describe("Phase 5 hardening", () => {
         session: { events: session.events, surface: session.surface, header: {} },
         canonicalSessionId: CANONICAL,
       });
-      const plan2 = deriveMutationPlan(view2, { db, protectedTags: 0 });
+      const plan2 = deriveMutationPlan(view2, { db });
       // Either nothing more to do or only the remaining prefix injections —
       // never a re-drop of an already-dropped message.
       if (plan2 !== null) {
@@ -137,7 +137,7 @@ describe("Phase 5 hardening", () => {
       expect(viewMs).toBeLessThan(2000);
 
       const startedPlan = performance.now();
-      deriveMutationPlan(view, { db, protectedTags: 0 });
+      deriveMutationPlan(view, { db });
       const planMs = performance.now() - startedPlan;
       expect(planMs).toBeLessThan(3000);
       db.close();
@@ -157,7 +157,7 @@ describe("Phase 5 hardening", () => {
         session: { events: session.events, surface: session.surface, header: {} },
         canonicalSessionId: CANONICAL,
       });
-      const plan = deriveMutationPlan(view, { db, protectedTags: 0 })!;
+      const plan = deriveMutationPlan(view, { db })!;
       const state = createCoordinatorState();
       const outcome = await enqueuePlan(state, host, session, plan);
       expect(outcome.status).toBe("applied");

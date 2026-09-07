@@ -87,7 +87,6 @@ function baseOpts(db: Database): CtxCommandsOptions {
     db,
     canonicalKey: (id: string) => canonicalSessionKey(HOME_HASH, id),
     resolveProjectIdentity: () => PROJECT,
-    protectedTags: 20,
   };
 }
 
