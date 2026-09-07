@@ -117,3 +117,12 @@ tests/docker/.generated/
 
 # Magic Context mints a per-project data dir stub when a session runs inside a package dir
 packages/*/.cortexkit/
+
+# BEGIN oh-my-opencode-slim clonedeps
+.slim/
+# END oh-my-opencode-slim clonedeps
+
+# Local-only agent/workspace state
+.agents/
+opencode.jsonc
+docs/mc-prompt-structure.html
