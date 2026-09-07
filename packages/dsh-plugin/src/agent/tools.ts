@@ -106,6 +106,7 @@ import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imit
 import { registerTool } from "../compat/dsh-0.1/tools";
 import { textBlock } from "../compat/dsh-0.1/session";
 import { convertDshEventsToRawMessages } from "./transcript";
+import { sessionEventsOf } from "./session-events";
 
 export type { ToolDefinition };
 
@@ -1277,7 +1278,7 @@ interface CtxExpandArgs {
  * the WHOLE log so ctx_expand can recover shadowed/compacted content.
  */
 function readRawMessagesFromAgent(agent: Agent): RawMessage[] {
-  return convertDshEventsToRawMessages(agent.session.events);
+  return convertDshEventsToRawMessages(sessionEventsOf(agent.session));
 }
 
 export function createCtxExpandTool(ctx: Context, opts: CtxToolsOptions): ToolDefinition {

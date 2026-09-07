@@ -31,6 +31,7 @@ import {
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import { magicUserMessage, type MagicMessageSource } from "../compat/dsh-0.1/session";
+import { sessionEventsOf } from "./session-events";
 
 // ponytail: shim removed exports from v0.40.1 (inline old logic for DSH parity)
 function getLastNudgeLevel(db: Database, sessionId: string) {
@@ -54,7 +55,7 @@ export function scanSessionMetrics(agent: Agent): {
 } {
   let lastInputTokens = 0;
   let contextWindow: number | undefined;
-  const events = (agent.session as { events?: readonly unknown[] }).events ?? [];
+  const events = sessionEventsOf(agent.session);
   for (const event of events) {
     if (event === null || typeof event !== "object") continue;
     const e = event as { type?: unknown; data?: unknown };
@@ -105,7 +106,7 @@ function injectNudge(
 ): void {
   // Dedup: only inject when the surface has no live mc-nudge:<kind> node.
   const marker = `mc-nudge:${kind}`;
-  const events = (agent.session as { events?: readonly unknown[] }).events ?? [];
+  const events = sessionEventsOf(agent.session);
   if (
     events.some((event) => {
       if (event === null || typeof event !== "object") return false;

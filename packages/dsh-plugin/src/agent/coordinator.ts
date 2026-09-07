@@ -31,6 +31,7 @@ import type { Session } from "@deepseek-ai/dsh-session";
 import {
   deriveEventMessage,
   magicUserMessage,
+  type SessionEvent,
 } from "../compat/dsh-0.1/session";
 import { readDshTranscript, type MutationPlan } from "./transcript";
 import {
@@ -41,6 +42,7 @@ import {
   markOutboxCommitted,
 } from "./outbox";
 import type { Database } from "@magic-context/core/shared/sqlite";
+import { sessionEventAt, sessionEventsOf } from "./session-events";
 
 export interface CoordinatorHostView {
   readonly db: Database;
@@ -74,7 +76,7 @@ export function createCoordinatorState(): CoordinatorState {
 function liveFacts(session: Session, canonicalSessionId: string): { digest: string; generation: number } {
   const view = readDshTranscript({
     session: {
-      events: session.events,
+      events: sessionEventsOf(session),
       surface: session.surface,
       header: {},
     },
@@ -155,7 +157,7 @@ function applyInsertionMerge(
   if (nodeSeq === undefined) {
     throw new Error(`magic-context: insertion op at ${op.start} outside the live surface`);
   }
-  const event = session.events[nodeSeq];
+  const event = sessionEventAt(session, nodeSeq) as SessionEvent;
   const existing = deriveEventMessage(event);
   const originalText = existing?.content
     ?.map((block) => (block.type === "text" ? block.text : ""))

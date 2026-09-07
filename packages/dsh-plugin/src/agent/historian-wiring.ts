@@ -26,6 +26,7 @@ import {
   buildCompartmentAgentPrompt,
 } from "@magic-context/core/hooks/magic-context/compartment-prompt";
 import { readDshTranscript } from "./transcript";
+import { sessionEventsOf } from "./session-events";
 import {
   createMagicSummarizeHook,
   type DshSummarizeCall,
@@ -105,7 +106,7 @@ export function readContextPressure(ctx: Context): (agent: Agent) => { projected
     if (pressure !== undefined) return pressure;
     // Fallback: derive the pressure from the session's own event log.
     try {
-      const events = (agent.session as { events?: readonly unknown[] }).events ?? [];
+      const events = sessionEventsOf(agent.session);
       let contextWindow: number | undefined;
       let projectedTokens = 0;
       for (const event of events) {
@@ -213,7 +214,7 @@ export function transcriptRawMessageProvider(
 ): RawMessageProvider {
   const view = readDshTranscript({
     session: {
-      events: agent.session.events,
+      events: sessionEventsOf(agent.session),
       surface: agent.session.surface,
       header: { cwd: agent.session.header.cwd },
     },
