@@ -22,7 +22,6 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { getCompartments } from "@magic-context/core/features/magic-context/compartment-storage";
-import { DEFAULT_PROTECTED_TAGS } from "@magic-context/core/features/magic-context/defaults";
 import { getMostRecentTaskRunAt } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
 import {
@@ -127,7 +126,6 @@ export interface CtxCommandSeams {
 
 /** Options for {@link registerCtxCommands}. */
 export interface CtxCommandsOptions extends CtxRuntimeOptions, CtxCommandSeams {
-  protectedTags?: number;
   executeThresholdPercentage?: number | { default: number; [modelKey: string]: number };
   executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
   historyBudgetPercentage?: number;
@@ -179,7 +177,6 @@ export function registerCtxStatusCommand(ctx: Context, opts: CtxCommandsOptions)
         const statusText = executeStatus(
           db,
           sessionId,
-          opts.protectedTags ?? DEFAULT_PROTECTED_TAGS,
           opts.executeThresholdPercentage,
           modelKeyOf(agent),
           opts.historyBudgetPercentage,

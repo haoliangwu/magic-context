@@ -393,9 +393,11 @@ export async function runContextPlaneStep(
         },
         canonicalSessionId,
       });
+      // usableSoft is intentionally not passed here: deriveMutationPlan
+      // self-resolves the protection floor from the session's detected
+      // context limit (see detectedContextLimitOf in transcript.ts).
       const plan = deriveMutationPlan(view, {
         db,
-        protectedTags: deps.config?.protectedTags ?? 20,
         heuristicCleanup: deps.heuristicCleanup,
       } satisfies PlanContext);
       if (plan !== null) {

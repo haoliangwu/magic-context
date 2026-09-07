@@ -89,7 +89,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       const session = buildSession();
       const host = makeHost(db);
       const view = viewOf(session);
-      const plan = deriveMutationPlan(view, { db, protectedTags: 0 })!;
+      const plan = deriveMutationPlan(view, { db })!;
       const nodesBefore = [...session.surface.nodes];
 
       const outcome = await enqueuePlan(createCoordinatorState(), host, session, plan);
@@ -118,7 +118,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       initializeDshAdapterTables(db);
       const session = buildSession();
       const host = makeHost(db);
-      const plan = deriveMutationPlan(viewOf(session), { db, protectedTags: 0 })!;
+      const plan = deriveMutationPlan(viewOf(session), { db })!;
 
       const state = createCoordinatorState();
       const first = await enqueuePlan(state, host, session, plan);
@@ -142,7 +142,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       initializeDshAdapterTables(db);
       const session = buildSession();
       const host = makeHost(db);
-      const plan = deriveMutationPlan(viewOf(session), { db, protectedTags: 0 })!;
+      const plan = deriveMutationPlan(viewOf(session), { db })!;
 
       // The session grows before the plan lands → stale input.
       session.append(
@@ -165,7 +165,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       initializeDshAdapterTables(db);
       const session = buildSession();
       const host = makeHost(db);
-      const plan = deriveMutationPlan(viewOf(session), { db, protectedTags: 0 })!;
+      const plan = deriveMutationPlan(viewOf(session), { db })!;
 
       // Manually land a replacement first: generation bumps, digest changes.
       const nodes = [...session.surface.nodes];
@@ -192,7 +192,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       const session = buildSession();
       const host = makeHost(db);
       const view = viewOf(session);
-      const plan = deriveMutationPlan(view, { db, protectedTags: 0 })!;
+      const plan = deriveMutationPlan(view, { db })!;
       // Corrupt the plan: shadowedSeqs no longer covers the replaced node.
       const broken: MutationPlan = {
         ...plan,
@@ -220,7 +220,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       initializeDshAdapterTables(db);
       const session = buildSession();
       const host = makeHost(db);
-      const planA = deriveMutationPlan(viewOf(session), { db, protectedTags: 0 })!;
+      const planA = deriveMutationPlan(viewOf(session), { db })!;
       // A second plan derived from the same (pre-apply) view.
       const planB: MutationPlan = { ...planA, opId: "op-b" };
 
@@ -246,7 +246,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       const session = buildSession();
       const host = makeHost(db);
       const view = viewOf(session);
-      const plan = deriveMutationPlan(view, { db, protectedTags: 0 })!;
+      const plan = deriveMutationPlan(view, { db })!;
       // Craft an insertion op (empty shadowedSeqs) at node 0.
       const inserted: MutationPlan = {
         ...plan,

@@ -64,6 +64,8 @@ import {
   getPendingOps,
   getTagsBySession,
 } from "@magic-context/core/features/magic-context/storage";
+import { getProtectionWindowForSession } from "@magic-context/core/features/magic-context/protection-window";
+import { getOverflowState, resolveEpochFloorForPass } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
 import type {
@@ -162,8 +164,10 @@ export interface DshOrdinalMap {
 /** Plan-derivation context (design §3). */
 export interface PlanContext {
   readonly db: Database;
-  /** Newest-N active tags exempt from pending drops (applyPendingOperations). */
-  readonly protectedTags?: number;
+  /** Usable soft context window feeding the protection-window floor
+   *  derivation (upstream token-mass model). Falls back to the persisted
+   *  epoch floor snapshot (or 0) when absent. */
+  readonly usableSoft?: number;
   /** Injectable clock; reserved for later stages (decay/nudge). Unused by this slice. */
   readonly now?: () => number;
   /** Heuristic cleanup config (Pi/OpenCode parity): routine dedup + optional
@@ -175,6 +179,16 @@ export interface PlanContext {
 }
 
 /* ────────────────────────────── event accessors ───────────────────────────── */
+
+/** Detected provider-proven context limit for the session, when known. */
+function detectedContextLimitOf(db: Database, sessionId: string): number | undefined {
+  try {
+    const detected = getOverflowState(db, sessionId).detectedContextLimit;
+    return typeof detected === "number" && detected > 0 ? detected : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 interface EventLike {
   readonly type?: unknown;
@@ -1356,7 +1370,23 @@ function planReasoningReplay(
 export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): MutationPlan | null {
   const db = ctx.db;
   const sessionId = view.sessionId;
-  const protectedTags = Math.max(0, Math.floor(ctx.protectedTags ?? 0));
+  // Upstream token-mass protection window (replaces the old newest-N count):
+  // resolve the epoch floor (dsh carries no absolute override, so the floor
+  // derives from usableSoft) and walk the persisted tool rows. Every dsh
+  // pre-step rebuilds the wire, so each pass is epoch-resolving like a
+  // cache-busting pass upstream. usableSoft falls back to the session's
+  // detected context limit, then to the persisted epoch snapshot (or 0).
+  const usableSoft = ctx.usableSoft ?? detectedContextLimitOf(db, sessionId);
+  const protectionWindow = getProtectionWindowForSession(
+    db,
+    sessionId,
+    usableSoft !== undefined
+      ? resolveEpochFloorForPass(db, sessionId, {
+          usableSoft,
+          isCacheBustingPass: true,
+        }).floor
+      : undefined,
+  );
 
   const ops: MutationOp[] = [...planTemporalMarkers(view)];
 
@@ -1381,7 +1411,7 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
       sessionId,
       db,
       recordingTargets,
-      protectedTags,
+      protectionWindow.protectedTagNumbers,
       preloadedTags,
       preloadedPendingOps,
     );
@@ -1404,7 +1434,8 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
           recordingTargets,
           messageTagNumbers,
           {
-            protectedTags,
+            protectedTagNumbers: protectionWindow.protectedTagNumbers,
+            protectedCutoff: protectionWindow.cutoff,
             caveman: cleanupCfg.caveman,
           },
           preloadedTags,
