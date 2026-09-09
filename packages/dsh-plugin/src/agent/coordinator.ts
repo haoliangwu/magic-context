@@ -27,7 +27,7 @@
  * `start` (prepend), keeping the surface contiguous.
  */
 import { randomUUID } from "node:crypto";
-import type { Session } from "@deepseek-ai/dsh-session";
+import { SessionSeq, type Session } from "@deepseek-ai/dsh-session";
 import {
   deriveEventMessage,
   magicUserMessage,
@@ -137,7 +137,7 @@ export function applyPlanOps(
     });
     const event = session.append("user/message", message, {
       surfaceOp: { op: "replace", start: startSeq, end: endSeq },
-      sourceEventSeqs: [...op.shadowedSeqs],
+      sourceEventSeqs: [...op.shadowedSeqs].map(SessionSeq),
     });
     ackSeq = event.seq;
     void db;

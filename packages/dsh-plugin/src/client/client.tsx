@@ -49,6 +49,8 @@ import type { Context } from "@deepseek-ai/cordis";
 
 /* -------------------------------------------- ui-conversation / ui-settings slot augmentations */
 import type {} from "@deepseek-ai/dsh-client-ui-conversation/client";
+import type {} from "@deepseek-ai/dsh-client-ui-renderer/client"; // load Context.slots/uiRenderer augmentation (moved from dsh-client-runtime in 0.1.2)
+import type {} from "@deepseek-ai/dsh-client-ui-session/client"; // load SessionStandardProps augmentation (sessionId/useProjection/useSession)
 import type {} from "@deepseek-ai/dsh-client-ui-settings/client";
 
 /* ------------------------------------------------ styles */

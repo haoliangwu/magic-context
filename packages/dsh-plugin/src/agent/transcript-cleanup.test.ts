@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { sessionEventsOf } from "./session-events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,7 +25,7 @@ describe("heuristic cleanup integration (Pi/OpenCode parity)", () => {
       const db = await createTestDb(join(dir, "context.db"));
       const session = buildSession();
       const view = readDshTranscript({
-        session: { events: session.events, surface: session.surface, header: { cwd: "/tmp" } },
+        session: { events: sessionEventsOf(session), surface: session.surface, header: { cwd: "/tmp" } },
         canonicalSessionId: "dsh:a1b2c3d4:sess-cleanup",
       });
       const plan = deriveMutationPlan(view, {
