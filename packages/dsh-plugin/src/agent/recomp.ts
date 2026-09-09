@@ -84,7 +84,10 @@ export const DEFAULT_CLIENT_TIMEOUT_MS = 300_000;
 export const DEFAULT_CONTEXT_LIMIT = 128_000;
 
 /** Default execute-threshold percentage for wrapup boundary planning. */
-export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
+export {
+  DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+} from "../shared/execute-threshold";
+import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "../shared/execute-threshold";
 
 /**
  * Magic historian agent ids → their registered system prompts. OpenCode loads
