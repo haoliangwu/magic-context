@@ -18,6 +18,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Service, type Context } from "@deepseek-ai/cordis";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
+import { loadPluginConfig } from "@magic-context/core/config";
 import {
   LATEST_SUPPORTED_VERSION,
   getPersistedSchemaVersion,
@@ -34,6 +35,10 @@ import type { TypertContribution } from "@deepseek-ai/dsh-typert-registry/types"
 import { MAGIC_CONTEXT_REMOTE_NAMESPACE } from "../compat/dsh-0.1/remote-seam";
 import type { MagicContextHostService } from "../index";
 import { formatDetail, MAGIC_CONTEXT_PACKAGE, resolveDshHome } from "../doctor/env";
+import {
+  DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
+  resolveExecuteThresholdPercentage,
+} from "../shared/execute-threshold";
 
 /** Wire endpoint name (client calls `magicContext/status`). */
 export const MAGIC_STATUS_METHOD = "status";
@@ -242,12 +247,16 @@ export class MagicContextRemoteService extends Service {
   async ["sidebar-snapshot"](args: { sessionId: string }): Promise<DshSidebarSnapshot> {
     // Security: bound the session id exactly like diagnostics (PLAN §11).
     const rawSessionId = String(args?.sessionId ?? "").slice(0, 512);
+    // Reflect the user-configured execute threshold (user + project
+    // magic-context.jsonc) so the Context tab matches what the agent-plane
+    // trigger enforces, instead of the hardcoded runtime default.
+    const executeThreshold = this.resolveExecuteThreshold();
     const empty: DshSidebarSnapshot = {
       sessionId: rawSessionId,
       usagePercentage: 0,
       inputTokens: 0,
       contextLimit: 200_000,
-      executeThreshold: 65,
+      executeThreshold,
       systemPromptTokens: 0,
       docsTokens: 0,
       compartmentTokens: 0,
@@ -349,7 +358,7 @@ export class MagicContextRemoteService extends Service {
         usagePercentage,
         inputTokens,
         contextLimit,
-        executeThreshold: 65, // runtime default; dsh has no per-model config
+        executeThreshold,
         systemPromptTokens: calibrated.systemTokens,
         docsTokens: calibrated.docsTokens,
         compartmentTokens: calibrated.compartmentTokens,
@@ -363,6 +372,24 @@ export class MagicContextRemoteService extends Service {
       };
     } catch {
       return { ...empty, sessionId };
+    }
+  }
+
+  /**
+   * Configured execute-threshold percentage for display (user + project
+   * magic-context.jsonc scoped to the host workspace directory — dsh has no
+   * per-model config, so a model-keyed map contributes only its `default`).
+   * Falls back to the runtime default (65) when the config is absent or
+   * unreadable; display must never fail the snapshot.
+   */
+  private resolveExecuteThreshold(): number {
+    try {
+      return (
+        resolveExecuteThresholdPercentage(loadPluginConfig(this.host.directory)) ??
+        DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE
+      );
+    } catch {
+      return DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE;
     }
   }
 }

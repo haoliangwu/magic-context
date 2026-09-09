@@ -21,6 +21,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import { setDshHarness } from "../shared/dsh-harness";
 import { loadPluginConfig, type MagicContextPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled, isDreamerRunnable, isHistorianRunnable } from "@magic-context/core/config/agent-disable";
+import { resolveExecuteThresholdPercentage } from "../shared/execute-threshold";
 import type { MagicContextHostService } from "../index";
 import { registerKnowledgeGate } from "./knowledge-gate";
 import type { KnowledgeConfig } from "./knowledge-gate";
@@ -147,15 +148,7 @@ export function bridgeMagicConfig(
   }
   if (magic === undefined) return config;
   const cfg = magic;
-  const thresholdRaw = cfg.execute_threshold_percentage;
-  const threshold: number | undefined =
-    typeof thresholdRaw === "number"
-      ? thresholdRaw
-      : typeof thresholdRaw === "object" && thresholdRaw !== null
-        ? (typeof (thresholdRaw as { default?: unknown }).default === "number"
-            ? (thresholdRaw as { default: number }).default
-            : undefined)
-        : undefined;
+  const threshold = resolveExecuteThresholdPercentage(cfg);
   const memoryCfg = cfg.memory;
   const dreamerCfg = cfg.dreamer;
   const compactionCfg = cfg.compaction;

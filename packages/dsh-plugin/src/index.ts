@@ -35,6 +35,11 @@ export interface MagicHostConfig {
 export interface MagicContextHostService {
   /** Settles once the storage bootstrap finishes (ok or refused). */
   readonly ready: Promise<DshStorageBootstrap>;
+  /**
+   * Workspace/directory identity (config migration, liveness marker, and
+   * host-plane config resolution — e.g. the sidebar execute threshold).
+   */
+  readonly directory: string;
   /** Canonical Magic session key for a DSH session. */
   canonicalKey(dshSessionId: string): string;
   /** Parse a canonical key back to the DSH-native session id. */
@@ -73,6 +78,7 @@ export function apply(ctx: Context, config: MagicHostConfig = {}): void {
   let summarizeHook: MagicSummarizeHook | undefined;
   const host: MagicContextHostService = {
     ready,
+    directory,
     canonicalKey(dshSessionId: string): string {
       return canonicalSessionKey(homeHash, dshSessionId);
     },
