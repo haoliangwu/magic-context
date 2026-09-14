@@ -75,6 +75,7 @@ import type {
   TranscriptPartKind,
 } from "@magic-context/core/shared/transcript";
 import type { KnowledgeSessionView } from "./knowledge-gate";
+import { sessionEventsOf } from "./session-events";
 import {
   deriveEventMessage,
   type SessionEvent,
@@ -809,7 +810,7 @@ export function findKnowledgeBaselineNodeIndices(
 
 /** Build the read-only transcript view (design §3). */
 export function readDshTranscript(input: DshTranscriptInput): DshTranscriptView {
-  const events = Array.isArray(input.session.events) ? input.session.events : [];
+  const events = sessionEventsOf(input.session);
   const nodes = Array.isArray(input.session.surface?.nodes)
     ? [...input.session.surface.nodes]
     : [];

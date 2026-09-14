@@ -125,7 +125,9 @@ export function createKnowledgeGateState(): KnowledgeGateState {
 /** The session surface slice the gate reads (test-friendly structural view). */
 export interface KnowledgeSessionView {
   readonly surface: { readonly nodes: readonly number[]; readonly replaceGeneration: number };
-  readonly events: readonly unknown[];
+  /** 0.1.2 hosts resolve the log via snapshotEvents() instead of a live .events array. */
+  readonly events?: readonly unknown[];
+  readonly snapshotEvents?: () => readonly unknown[];
   readonly header: { readonly cwd?: string };
 }
 
