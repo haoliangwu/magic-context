@@ -71,7 +71,9 @@ import {
   readRawSessionMessageOrdinalById,
   readSessionChunk,
   withRawMessageProvider,
+  getRawSessionTagKeysThrough,
   type RawMessageProvider,
+  type RawSessionTagKeys,
   type SessionChunk,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { describeError } from "@magic-context/core/shared/error-message";
@@ -476,9 +478,10 @@ interface PublishResult {
  * compartments + durable facts + events + the drop queue + the publication
  * floor + the staged compaction marker, then COMMITs. Any failure rolls back
  * everything — no staged intermediate state exists for the historian. Returns
- * `{ ok: false }` when the lease was lost or the transaction failed.
+ * `{ ok: false }` when the lease was lost, the pre-transaction tag-key read
+ * failed, or the transaction failed.
  */
-function publishHistorianResult(args: PublishArgs): PublishResult {
+async function publishHistorianResult(args: PublishArgs): Promise<PublishResult> {
   const { db, sessionId, leaseHolderId } = args;
   const lastNewEndMessageId = args.newCompartments[args.newCompartments.length - 1]?.endMessageId;
   const markerSummary = buildDshCompactionSummary(args.newCompartments);
@@ -490,6 +493,20 @@ function publishHistorianResult(args: PublishArgs): PublishResult {
     if (typeof event.atCompartment !== "number") return true;
     return event.atCompartment <= args.newCompartments.length;
   });
+
+  // v0.42.x core: queueDropsForCompartmentalizedMessages only stays
+  // synchronous when the tag keys are passed in, so they are resolved before
+  // the transaction opens (mirrors compartment-runner-incremental). A failure
+  // here aborts the publish with nothing written — nothing to roll back.
+  let compartmentTagKeys: RawSessionTagKeys;
+  try {
+    compartmentTagKeys = await getRawSessionTagKeysThrough(sessionId, args.lastNewEnd, { db });
+  } catch (error) {
+    args.log(
+      `[magic-context] historian publish failed reading raw tag keys: ${describeError(error).brief}`,
+    );
+    return { ok: false, persistedIds: [], eventsPublished: 0 };
+  }
 
   let published = false;
   db.exec("BEGIN IMMEDIATE");
@@ -520,7 +537,7 @@ function publishHistorianResult(args: PublishArgs): PublishResult {
         args.log(`[magic-context] failed to store compartment events: ${describeError(error).brief}`);
       }
     }
-    queueDropsForCompartmentalizedMessages(db, sessionId, args.lastNewEnd);
+    queueDropsForCompartmentalizedMessages(db, sessionId, args.lastNewEnd, compartmentTagKeys);
     recordProtectedTailPublicationFloor(db, sessionId, args.lastNewEnd + 1);
     if (lastNewEndMessageId) {
       stageDshCompactionMarker(db, sessionId, {
@@ -637,7 +654,7 @@ export async function runDshHistorian(deps: HistorianDeps): Promise<boolean> {
         return;
       }
 
-      const publish = publishHistorianResult({
+      const publish = await publishHistorianResult({
         db,
         sessionId,
         directory: deps.directory,
@@ -848,7 +865,7 @@ export function createMagicSummarizeHook(deps: MagicSummarizeDeps): SummarizeHoo
               `magic-context: summarize mini-historian failed: ${result.reason ?? "unknown"}`,
             );
           }
-          const publish = publishHistorianResult({
+          const publish = await publishHistorianResult({
             db: deps.db,
             sessionId,
             directory: deps.directory,
