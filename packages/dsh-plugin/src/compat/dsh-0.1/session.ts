@@ -85,7 +85,7 @@ export function replaceSurfaceRange(
   sourceEventSeqs: readonly number[],
 ): number {
   const event = session.append("user/message", message, {
-    surfaceOp: { op: "replace", start: SessionSeq(start), end: SessionSeq(end) },
+    surfaceOp: { op: "replace", startSeq: SessionSeq(start), endSeq: SessionSeq(end) },
     sourceEventSeqs: [...sourceEventSeqs].map(SessionSeq),
   });
   return event.seq;

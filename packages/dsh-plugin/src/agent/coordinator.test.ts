@@ -3,7 +3,7 @@ import { sessionEventsOf } from "./session-events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Session, SessionId } from "@deepseek-ai/dsh-session";
+import { Session, SessionId, SessionSeq } from "@deepseek-ai/dsh-session";
 import {
   createAssistantMessage,
   createUserMessage,
@@ -174,7 +174,7 @@ describe("SurfaceMutationCoordinator (CAS + saga)", () => {
       session.append(
         "user/message",
         createUserMessage({ content: [{ type: "text", text: "replacement" }], source: { kind: "user" } }),
-        { surfaceOp: { op: "replace", start: mid, end: mid }, sourceEventSeqs: [mid] },
+        { surfaceOp: { op: "replace", startSeq: SessionSeq(mid), endSeq: SessionSeq(mid) }, sourceEventSeqs: [SessionSeq(mid)] },
       );
       expect(session.surface.replaceGeneration).toBe(1);
       const outcome = await enqueuePlan(createCoordinatorState(), host, session, plan);

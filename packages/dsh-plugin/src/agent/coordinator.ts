@@ -136,7 +136,7 @@ export function applyPlanOps(
       digest: plan.inputDigest,
     });
     const event = session.append("user/message", message, {
-      surfaceOp: { op: "replace", start: startSeq, end: endSeq },
+      surfaceOp: { op: "replace", startSeq, endSeq },
       sourceEventSeqs: [...op.shadowedSeqs].map(SessionSeq),
     });
     ackSeq = event.seq;
@@ -171,7 +171,7 @@ function applyInsertionMerge(
     digest: plan.inputDigest,
   });
   const appended = session.append("user/message", message, {
-    surfaceOp: { op: "replace", start: nodeSeq, end: nodeSeq },
+    surfaceOp: { op: "replace", startSeq: nodeSeq, endSeq: nodeSeq },
     sourceEventSeqs: [nodeSeq],
   });
   return appended.seq;
