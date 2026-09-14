@@ -262,11 +262,16 @@ function maybeFireHistorian(
     // 同时持久化 dsh 原生 context breakdown（lag 1 step）的 token 分类，
     // 供 Context tab sidebar 渲染校准后的分段（calibrateBuckets 需非 0
     // inputTokens 才能分配 bucket）。
+    // last_usage_context_limit 记录 dsh 原生采样的 contextWindow——否则
+    // sidebar-snapshot 的解析链（last_usage_context_limit →
+    // detected_context_limit → 200k 兜底）会落到 200k，把模型真实窗口
+    // （如 DeepSeek-V4-Flash 的 1M）显示成 200.0K。
     try {
       const breakdown = historian.readBreakdown?.(agent);
       if (breakdown !== undefined) {
         updateSessionMeta(db, sessionId, {
           lastContextPercentage: percentage,
+          lastUsageContextLimit: contextWindow,
           lastInputTokens: breakdown.systemTokens + breakdown.toolsTokens + breakdown.messageTokens,
           systemPromptTokens: breakdown.systemTokens,
           // toolsTokens = tool definitions（schema），对齐 sidebar 的 Tool Defs 段；
@@ -275,7 +280,10 @@ function maybeFireHistorian(
           conversationTokens: breakdown.messageTokens,
         });
       } else {
-        updateSessionMeta(db, sessionId, { lastContextPercentage: percentage });
+        updateSessionMeta(db, sessionId, {
+          lastContextPercentage: percentage,
+          lastUsageContextLimit: contextWindow,
+        });
       }
     } catch {
       // 持久化失败不可破坏 pre-step 链（fail-open）。

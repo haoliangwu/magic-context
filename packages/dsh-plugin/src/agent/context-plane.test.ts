@@ -194,6 +194,17 @@ describe("context plane (pre-step wiring of transcript + coordinator)", () => {
       expect(fired).toHaveLength(1);
       expect(fired[0]?.sessionId).toBe("dsh:a1b2c3d4:sess-plane");
       expect(fired[0]?.provider).toBe(true);
+      // The dsh-native context window is persisted as the usage context limit
+      // so the Context tab resolves the real window instead of the 200k default.
+      const metaRow = db
+        .prepare(
+          "SELECT last_usage_context_limit, last_context_percentage FROM session_meta WHERE session_id = ?",
+        )
+        .get("dsh:a1b2c3d4:sess-plane") as
+        | { last_usage_context_limit: number | null; last_context_percentage: number | null }
+        | undefined;
+      expect(metaRow?.last_usage_context_limit).toBe(128_000);
+      expect(metaRow?.last_context_percentage).toBe(70);
       db.close();
     } finally {
       await cleanupDir(dir);
