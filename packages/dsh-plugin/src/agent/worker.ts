@@ -6,7 +6,7 @@
  * can never spawn further), an explicit tool allowlist, delegated approval
  * pinned to 'never' (captureDelegatedPolicyOverrides), and no default shell /
  * network / credential inheritance beyond what the allowlist grants. It is
- * used for the tool-requiring Dreamer/Sidekick paths.
+ * used for the tool-requiring Dreamer paths.
  *
  * RECURSION ISOLATION: the agent-plane Magic listeners (context plane,
  * knowledge gate, session tracking) must NOT process child sessions — a child

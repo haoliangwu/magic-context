@@ -97,7 +97,6 @@ export function extractLatestUserPrompt(
 
 function hasStackedAugmentation(rawText: string): boolean {
   return (
-    rawText.includes("<sidekick-augmentation>") ||
     rawText.includes("<ctx-search-hint>") ||
     rawText.includes("<ctx-search-auto>")
   );
@@ -112,7 +111,6 @@ function extractUserPromptText(text: string): string {
       .replace(/<ctx-search-hint>[\s\S]*?<\/ctx-search-hint>/g, "")
       .replace(/<ctx-search-auto>[\s\S]*?<\/ctx-search-auto>/g, "")
       .replace(/<instruction[^>]*>[\s\S]*?<\/instruction>/g, "")
-      .replace(/<sidekick-augmentation>[\s\S]*?<\/sidekick-augmentation>/g, "")
       // Generic XML/HTML tags (keep text between paired tags).
       .replace(/<\/?[a-zA-Z][^<>]*>/g, "")
       // Magic tag prefix: "§123§ ".

@@ -47,7 +47,6 @@ import {
 } from "./historian";
 import { dshDreamSeams, registerDshDreamer } from "./dreamer";
 import { createRecompSeams } from "./recomp";
-import { createSidekickSeam } from "./sidekick";
 import { createEmbedSeam } from "./embed";
 import { dshModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
 import { modelSupportsVision } from "@magic-context/core/shared/models-dev-cache";
@@ -352,7 +351,7 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
   };
   registerCtxTools(ctx, { ...runtime, ...(config.tools ?? {}) });
 
-  // Phase 4 seams: dreamer / sidekick / recomp. The seam factories need the
+  // Phase 4 seams: dreamer / recomp. The seam factories need the
   // shared DB, which the host bootstrap resolves asynchronously; fill the
   // seams lazily once `host.ready` settles (the commands read them at
   // invocation time and answer "not wired" until then).
@@ -384,11 +383,6 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     get runUpgrade() {
       return (seams.get("recomp") as ReturnType<typeof createRecompSeams> | undefined)?.runUpgrade;
     },
-    // The sidekick seam resolves the DB itself at call time (host fallback).
-    runSidekick: createSidekickSeam(ctx, {
-      canonicalKey: (dshSessionId: string) => host.canonicalKey(dshSessionId),
-      log,
-    }),
     // The embed seam receives the DB at call time (no host dependency).
     runEmbedDrain: createEmbedSeam({ log }),
   });

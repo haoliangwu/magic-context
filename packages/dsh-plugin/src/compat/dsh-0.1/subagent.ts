@@ -35,12 +35,6 @@ export const MAGIC_WORKER_READONLY_TOOLS: readonly string[] = [
   "fs_search",
 ];
 
-/** Tool allowlist for tool-requiring Sidekick workers. */
-export const MAGIC_SIDEKICK_TOOLS: readonly string[] = [
-  ...MAGIC_WORKER_READONLY_TOOLS,
-  "ctx_search",
-];
-
 /**
  * Build the one-shot spawn request for a Magic worker: depth pinned, tools
  * allowlisted, persona marker, parent-bound cancellation.

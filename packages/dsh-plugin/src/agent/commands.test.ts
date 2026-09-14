@@ -110,7 +110,6 @@ describe("registerCtxCommands (DSH /ctx-* commands)", () => {
       const dispose = registerCtxCommands(ctx, baseOpts(db));
       const names = registered.map((record) => record.name).sort();
       expect(names).toEqual([
-        "ctx-aug",
         "ctx-dream",
         "ctx-embed",
         "ctx-flush",
@@ -209,29 +208,6 @@ describe("LLM-dependent commands (guard / not-wired messages)", () => {
     }
   });
 
-  it("/ctx-aug reports usage and the not-wired sidekick runner", async () => {
-    const { db, dir } = await openDb();
-    try {
-      const { ctx, registered } = makeFakeCtx();
-      registerCtxCommands(ctx, baseOpts(db));
-      const command = findCommand(registered, "ctx-aug");
-      const agent = makeFakeAgent(SESSION_ID, "/tmp/dsh-proj");
-
-      const usage = (await command.handler(invocation(agent))) as CommandResult;
-      expect(usage.kind).toBe("error");
-      expect(usage.text).toContain("Usage `/ctx-aug <your prompt>`");
-
-      const notWired = (await command.handler(
-        invocation(agent, "why does the build fail"),
-      )) as CommandResult;
-      expect(notWired.kind).toBe("success");
-      if (notWired.kind !== "success") return;
-      expect(notWired.text).toContain("not wired");
-    } finally {
-      db.close();
-      await removeTestDir(dir);
-    }
-  });
 
   it("/ctx-recomp and /ctx-wrapup parse args and gate on compactionOff", async () => {
     expect(parseRecompArgs("")).toEqual({ kind: "full" });
