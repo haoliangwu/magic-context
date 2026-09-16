@@ -1575,6 +1575,10 @@ pub struct TransformResponse {
     /// filter search results, using the module manifest rather than its TypeScript render cache.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rendered_memory_ids: Option<Vec<i64>>,
+    /// Newest memories changefeed sequence observed while producing this response. The host
+    /// folds it into its mirror projection key so unrendered memory changes still schedule a pull.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub memory_mirror_head: Option<i64>,
     /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
     /// subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1652,6 +1656,7 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
+            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -1690,6 +1695,7 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
+            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -3229,6 +3235,7 @@ fn apply_additive_only(
             committed: commit_required,
             coverage_ordinal: None,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
+            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -6139,6 +6146,7 @@ fn apply_once(
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
+            memory_mirror_head: None,
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
             lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
             cache_ttl: None,

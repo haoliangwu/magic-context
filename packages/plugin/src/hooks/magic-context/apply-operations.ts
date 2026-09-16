@@ -9,6 +9,7 @@ import {
 import type { PendingOp, TagEntry } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared/logger";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import type { DroppedTokenReduction } from "./dropped-token-estimate";
 import type { TagTarget } from "./tag-messages";
 
 // Max characters kept from the original user content when a user-message tag
@@ -74,6 +75,8 @@ export function applyPendingOperations(
      * replay reads the frozen drop_mode, not this set.
      */
     editMarkerTagIds: ReadonlySet<number> = new Set(),
+    /** Reports only reductions that changed the live message representation. */
+    onTagReduced?: (reduction: DroppedTokenReduction) => void,
 ): boolean {
     let didMutateMessage = false;
     let admitted = false;
@@ -83,6 +86,7 @@ export function applyPendingOperations(
             admitted = true;
             startedAt = performance.now();
             const tags = preloadedTags ?? getTagsBySession(db, sessionId);
+            const tagById = new Map(tags.map((tag) => [tag.tagNumber, tag] as const));
             const tagStatusById = new Map(tags.map((tag) => [tag.tagNumber, tag.status] as const));
             const tagTypeById = new Map(tags.map((tag) => [tag.tagNumber, tag.type] as const));
             const pendingOps = preloadedPendingOps ?? getPendingOps(db, sessionId);
@@ -136,6 +140,7 @@ export function applyPendingOperations(
                             continue;
                         }
                         didMutateMessage = true;
+                        onTagReduced?.({ tagNumber: pendingOp.tagId, mode: "edit_marker" });
                         updateTagDropMode(db, sessionId, pendingOp.tagId, "edit_marker");
                         shouldPersistDrop = true;
                     } else if (skeletonWindow.has(pendingOp.tagId)) {
@@ -148,6 +153,7 @@ export function applyPendingOperations(
                         }
                         if (truncResult === "truncated") {
                             didMutateMessage = true;
+                            onTagReduced?.({ tagNumber: pendingOp.tagId, mode: "truncated" });
                         }
                         updateTagDropMode(db, sessionId, pendingOp.tagId, "truncated");
                         shouldPersistDrop = true;
@@ -161,13 +167,27 @@ export function applyPendingOperations(
                         }
                         if (dropResult === "removed") {
                             didMutateMessage = true;
+                            onTagReduced?.({ tagNumber: pendingOp.tagId, mode: "full" });
                         }
                         updateTagDropMode(db, sessionId, pendingOp.tagId, "full");
                         shouldPersistDrop = true;
                     }
                 } else if (target) {
-                    const changed = target.setContent(buildReplacementContent(pendingOp.tagId));
-                    if (changed) didMutateMessage = true;
+                    const replacement = buildReplacementContent(pendingOp.tagId);
+                    const priorContent = target.getContent?.();
+                    const changed = target.setContent(replacement);
+                    if (changed) {
+                        didMutateMessage = true;
+                        const originalCharacters =
+                            typeof priorContent === "string"
+                                ? priorContent.length
+                                : (tagById.get(pendingOp.tagId)?.byteSize ?? replacement.length);
+                        onTagReduced?.({
+                            tagNumber: pendingOp.tagId,
+                            mode: "partial",
+                            removedCharacters: Math.max(0, originalCharacters - replacement.length),
+                        });
+                    }
                     shouldPersistDrop = true;
                 } else if (!synthetic) {
                     shouldPersistDrop = true;

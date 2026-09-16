@@ -31,11 +31,12 @@ export interface RustMemoryToolRequest {
     projectPath: string;
     /** MC identity; projectRoot stays transport-only. */
     memoryProject: string;
-    action: "write" | "update" | "archive" | "merge" | "get";
+    action: "write" | "update" | "archive" | "merge" | "list" | "get";
     content?: string;
     category?: string;
     ids?: number[];
     reason?: string;
+    limit?: number;
 }
 
 export function toolCallIdFromContext(context: unknown): string | undefined {
@@ -65,6 +66,7 @@ export interface RustToolBackends {
     authorityState?: (args: {
         projectPath: string;
         projectRoot: string;
+        sessionId: string;
         domain: RustAuthorityDomain;
     }) => Promise<RustAuthorityState | null>;
     /** Route ctx_note only after notes authority reports MODULE. */

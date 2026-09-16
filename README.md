@@ -390,7 +390,9 @@ Magic Context also writes to a few other locations:
 
 ## Development
 
-**Requirements:** [Bun](https://bun.sh) ≥ 1.0
+**Requirements:** [Bun](https://bun.sh) ≥ 1.4.0
+
+Bun 1.3.x has module-evaluation and resolver error-shape differences that can turn unrelated contributor changes into noisy parallel-test and build failures (issues [#445](https://github.com/cortexkit/magic-context/issues/445) and [#446](https://github.com/cortexkit/magic-context/issues/446)). Repository gates run a version preflight so unsupported Bun releases fail with the required version instead of unrelated test errors.
 
 ```sh
 bun install         # Install dependencies

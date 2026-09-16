@@ -103,7 +103,12 @@ function resolveUserConfigDirectory(options: CreatePromptSurfaceRuntimeOptions):
     if (shared.format !== "none") return dirname(shared.path);
 
     if (options.harness) {
-        const harness = options.harness === "omp" ? "pi" : options.harness;
+        const harness =
+            options.harness === "omp"
+                ? "pi"
+                : options.harness === "opencode2"
+                  ? "opencode"
+                  : options.harness;
         // Harnesses without legacy config locations (e.g. dsh) skip the
         // legacy fallback entirely — they have no pre-shared-base config to
         // discover, so the shared base is the only user-config source.

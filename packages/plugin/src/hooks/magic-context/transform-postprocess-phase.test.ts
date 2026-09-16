@@ -60,6 +60,7 @@ import type { Channel1State } from "./ctx-reduce-nudge";
 import { estimateMessageTokens } from "./final-wire-token-estimate";
 import * as compartmentInjection from "./inject-compartments";
 import { injectM0M1, type M0HardSignals } from "./inject-compartments";
+import * as readSessionFormatting from "./read-session-formatting";
 import { snapshotTrailingBlankSourceDecisions } from "./strip-content";
 import { stripStructuralNoise } from "./strip-structural-noise";
 import {
@@ -1998,6 +1999,232 @@ describe("postprocess emergency drop accounting", () => {
         expect(result.emergencyReclaimedTokens).toBeGreaterThan(0);
         expect(result.emergency).toBe(true);
     });
+});
+
+describe("dropped-token telemetry", () => {
+    const LARGE_ARRAY_THRESHOLD = 9 * 1024 * 1024;
+
+    function largeMessageArray(sessionId: string, droppedMessage: MessageLike): MessageLike[] {
+        const payload = "large telemetry fixture ".repeat(70_000);
+        return [
+            droppedMessage,
+            ...Array.from({ length: 7 }, (_, index) => ({
+                info: {
+                    id: `large-${index}`,
+                    role: index % 2 === 0 ? "user" : "assistant",
+                    sessionID: sessionId,
+                },
+                parts: [{ type: "text", text: payload }],
+            })),
+        ] as MessageLike[];
+    }
+
+    function insertKnownToolTag(
+        sessionId: string,
+        messageId: string,
+        tagNumber: number,
+        tokenCount: number,
+    ): void {
+        insertTag(db, sessionId, messageId, "tool", 4000, tagNumber, 0, "bash", 0, null, null, {
+            tokenCount,
+            inputTokenCount: 0,
+            reasoningTokenCount: 0,
+        });
+    }
+
+    it("sums persisted output token counts for three skeletonized tags", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-dropped-token-sum";
+        const counts = [111, 222, 333];
+        const messages = counts.map((_, index) => makeToolMessage(`counted-${index + 1}`));
+        const targets = new Map<number, TagTarget>();
+        for (let index = 0; index < counts.length; index += 1) {
+            const tagNumber = index + 1;
+            insertKnownToolTag(sessionId, `counted-${tagNumber}`, tagNumber, counts[index]!);
+            queuePendingOp(db, sessionId, tagNumber, "drop", tagNumber);
+            targets.set(tagNumber, makeDropTarget(messages[index]!));
+        }
+
+        const result = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, messages, {
+                schedulerDecision: "execute",
+                schedulerDeferReason: null,
+                tags: getActiveTagsBySession(db, sessionId),
+                targets,
+            }),
+        );
+
+        expect(result.droppedTokens).toBe(666);
+        expect(getPendingOps(db, sessionId)).toEqual([]);
+    });
+
+    it("never sends a whole multi-megabyte message array to the exact tokenizer seam", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-dropped-token-no-array-tokenize";
+        const droppedMessage = makeToolMessage("small-drop");
+        const messages = largeMessageArray(sessionId, droppedMessage);
+        insertKnownToolTag(sessionId, "small-drop", 1, 41);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+        const tokenizerInputSizes: number[] = [];
+        const tokenizer = spyOn(readSessionFormatting, "estimateTokens").mockImplementation(
+            (text) => {
+                tokenizerInputSizes.push(text.length);
+                return Math.ceil(text.length / 3.5);
+            },
+        );
+
+        try {
+            expect(JSON.stringify(messages).length).toBeGreaterThan(LARGE_ARRAY_THRESHOLD);
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    schedulerDecision: "execute",
+                    schedulerDeferReason: null,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets: new Map([[1, makeDropTarget(droppedMessage)]]),
+                }),
+            );
+
+            expect(tokenizerInputSizes.filter((size) => size > LARGE_ARRAY_THRESHOLD)).toEqual([]);
+        } finally {
+            tokenizer.mockRestore();
+        }
+    });
+
+    it("keeps execute and following defer bytes pinned while draining the same operations", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-dropped-token-wire-parity";
+        const counts = [111, 222, 333];
+        const buildMessages = () =>
+            counts.map((_, index) => makeToolMessage(`parity-${index + 1}`));
+        const buildTargets = (messages: MessageLike[]) =>
+            new Map<number, TagTarget>(
+                messages.map((message, index) => [index + 1, makeDropTarget(message)]),
+            );
+        for (let index = 0; index < counts.length; index += 1) {
+            const tagNumber = index + 1;
+            insertKnownToolTag(sessionId, `parity-${tagNumber}`, tagNumber, counts[index]!);
+            queuePendingOp(db, sessionId, tagNumber, "drop", tagNumber);
+        }
+
+        const executeMessages = buildMessages();
+        const executeResult = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, executeMessages, {
+                schedulerDecision: "execute",
+                schedulerDeferReason: null,
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: buildTargets(executeMessages),
+            }),
+        );
+        const executeHash = createHash("sha256")
+            .update(JSON.stringify(executeMessages))
+            .digest("hex");
+        expect(getPendingOps(db, sessionId)).toEqual([]);
+        expect(executeResult.bustedThisPass).toBe(true);
+
+        const deferMessages = buildMessages();
+        const deferTargets = buildTargets(deferMessages);
+        expect(applyFlushedStatuses(sessionId, db, deferTargets)).toBe(true);
+        const deferResult = await runPostTransformPhase(
+            basePostTransformArgs(db, sessionId, deferMessages, {
+                schedulerDecision: "defer",
+                tags: getActiveTagsBySession(db, sessionId),
+                targets: deferTargets,
+                didMutateFromFlushedStatuses: true,
+            }),
+        );
+        const deferHash = createHash("sha256").update(JSON.stringify(deferMessages)).digest("hex");
+
+        expect(executeHash).toBe(
+            "5ae4d6ca0f7871c9c7a0d7f15f342cc6221ca3374ab7c5de1e189d115c3102ae",
+        );
+        expect(deferHash).toBe(executeHash);
+        expect(deferResult.bustedThisPass).toBe(false);
+        expect(deferResult.droppedTokens).toBe(0);
+    });
+
+    it("keeps the event loop responsive across a 10 MB pending-operation pass", async () => {
+        db = new Database(":memory:");
+        initializeDatabase(db);
+        const sessionId = "ses-dropped-token-responsive";
+        const droppedMessage = makeToolMessage("responsive-drop");
+        const messages = largeMessageArray(sessionId, droppedMessage);
+        insertKnownToolTag(sessionId, "responsive-drop", 1, 41);
+        queuePendingOp(db, sessionId, 1, "drop", 1);
+
+        const delayedResponse = async (value: unknown): Promise<unknown> => {
+            for (let turn = 0; turn < 4; turn += 1) {
+                await new Promise<void>((resolve) => setImmediate(resolve));
+            }
+            return { data: value };
+        };
+        const client = {
+            app: { agents: () => delayedResponse([{ name: "test-agent", permission: [] }]) },
+            session: {
+                get: () => delayedResponse({ agent: "test-agent", permission: [] }),
+            },
+        } as never;
+        const tickTimes: number[] = [];
+        const timer = setInterval(() => tickTimes.push(performance.now()), 5);
+        let loopTurns = 0;
+        let counting = true;
+        const countTurns = () => {
+            if (!counting) return;
+            loopTurns += 1;
+            setImmediate(countTurns);
+        };
+
+        try {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            setImmediate(countTurns);
+            const passStartedAt = performance.now();
+            await runPostTransformPhase(
+                basePostTransformArgs(db, sessionId, messages, {
+                    schedulerDecision: "execute",
+                    schedulerDeferReason: null,
+                    tags: getActiveTagsBySession(db, sessionId),
+                    targets: new Map([[1, makeDropTarget(droppedMessage)]]),
+                    client,
+                    activeAgent: "test-agent",
+                }),
+            );
+            const passFinishedAt = performance.now();
+            counting = false;
+            await new Promise<void>((resolve) => setImmediate(resolve));
+
+            expect(loopTurns).toBeGreaterThanOrEqual(4);
+            const observedTimes = [
+                passStartedAt,
+                ...tickTimes.filter((time) => time >= passStartedAt && time <= passFinishedAt),
+                passFinishedAt,
+            ].sort((left, right) => left - right);
+            let maxGapMs = 0;
+            for (let index = 1; index < observedTimes.length; index += 1) {
+                maxGapMs = Math.max(
+                    maxGapMs,
+                    (observedTimes[index] ?? 0) - (observedTimes[index - 1] ?? 0),
+                );
+            }
+            const passDurationMs = passFinishedAt - passStartedAt;
+            // The yield count above is the load-invariant proof that the pass never runs as one
+            // synchronous stretch. The timer-gap bound is wall-clock: on a loaded CI runner a 5 ms
+            // interval timer is simply not scheduled for tens of milliseconds even while the loop
+            // yields (release r1 of 0.42.4 read a 42 ms gap on a 43 ms pass), so it is asserted
+            // only under the explicit perf gate and recorded otherwise.
+            if (process.env.MC_PERF_GATE === "1") {
+                expect(maxGapMs).toBeLessThanOrEqual(Math.max(passDurationMs / 2, 20));
+            } else {
+                console.log(
+                    `dropped-token responsiveness: loopTurns=${loopTurns} maxGapMs=${maxGapMs.toFixed(1)} passMs=${passDurationMs.toFixed(1)} (perf gate off)`,
+                );
+            }
+        } finally {
+            counting = false;
+            clearInterval(timer);
+        }
+    }, 30_000);
 });
 
 describe("two-pass tool reclaim", () => {

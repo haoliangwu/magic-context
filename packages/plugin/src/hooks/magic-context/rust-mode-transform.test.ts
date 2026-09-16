@@ -2314,6 +2314,194 @@ describe("Rust mode authority adapter", () => {
         );
     });
 
+    it("resumes an interrupted multi-page mirror on later transform passes", async () => {
+        const sessionId = `rust-memory-mirror-interrupted-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const feedHead = 2_500;
+        let failSecondPage = true;
+        const cursorSamples: Array<{ cursor: number; updated_at: number }> = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "SOFT+",
+                          row_version: 10,
+                          memory_mirror_head: feedHead,
+                          rendered_memory_ids: [],
+                          native_messages: makeMessages(sessionId),
+                      }
+                    : { ok: true },
+            mirrorPull: async (args) => {
+                if (failSecondPage && args.cursor === 1_000) {
+                    failSecondPage = false;
+                    throw new Error("injected mirror page interruption");
+                }
+                const nextCursor = Math.min(feedHead, args.cursor + args.limit);
+                return {
+                    page: {
+                        domain: args.domain,
+                        cursor: args.cursor,
+                        next_cursor: nextCursor,
+                        has_more: nextCursor < feedHead,
+                        rows: [],
+                    },
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const run = async () => {
+            const messages = makeMessages(sessionId);
+            await transform.run(
+                sessionId,
+                messages,
+                { messages: [...messages] },
+                makeMeta(db, sessionId),
+            );
+            await Bun.sleep(20);
+            cursorSamples.push(
+                db
+                    .prepare(
+                        "SELECT cursor, updated_at FROM mirror_cursors WHERE domain = 'memories'",
+                    )
+                    .get() as { cursor: number; updated_at: number },
+            );
+        };
+
+        await run();
+        await run();
+        await run();
+        await run();
+
+        expect(cursorSamples[0]?.cursor).toBe(1_000);
+        expect(cursorSamples.slice(1).map((sample) => sample.cursor)).toEqual([
+            feedHead,
+            feedHead,
+            feedHead,
+        ]);
+        expect(cursorSamples[1]?.updated_at).toBeGreaterThan(cursorSamples[0]?.updated_at ?? 0);
+        expect(cursorSamples[2]?.updated_at).toBe(cursorSamples[1]?.updated_at);
+        expect(cursorSamples[3]?.updated_at).toBe(cursorSamples[2]?.updated_at);
+    });
+
+    it("uses the module feed frontier to resume without polling a caught-up mirror", async () => {
+        const sessionId = `rust-memory-mirror-frontier-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let feedHead = 1;
+        let memoryPulls = 0;
+        const servedBytes: string[] = [];
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "SOFT+",
+                          row_version: 11,
+                          memory_mirror_head: feedHead,
+                          rendered_memory_ids: [],
+                          native_messages: makeMessages(sessionId),
+                      }
+                    : { ok: true },
+            mirrorPull: async (args) => {
+                memoryPulls += 1;
+                return {
+                    page: {
+                        domain: args.domain,
+                        cursor: args.cursor,
+                        next_cursor: feedHead,
+                        has_more: false,
+                        rows: [],
+                    },
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const run = async () => {
+            const messages = makeMessages(sessionId);
+            const output = { messages: [...messages] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+            await Bun.sleep(20);
+            servedBytes.push(JSON.stringify(output.messages));
+        };
+
+        await run();
+        await run();
+        await run();
+        expect(memoryPulls).toBe(1);
+        expect(new Set(servedBytes).size).toBe(1);
+
+        feedHead = 2;
+        await run();
+        expect(memoryPulls).toBe(2);
+        expect(
+            db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
+        ).toEqual({ cursor: 2 });
+        expect(new Set(servedBytes).size).toBe(1);
+
+        await run();
+        expect(memoryPulls).toBe(2);
+    });
+
+    it("keeps defer bytes stable while one bounded memory mirror pull is in flight", async () => {
+        const sessionId = `rust-memory-mirror-cache-neutral-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        let releasePull!: () => void;
+        const pullGate = new Promise<void>((resolve) => {
+            releasePull = resolve;
+        });
+        let mirrorPullCalls = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method }) =>
+                method === "transform"
+                    ? {
+                          decision: "SOFT+",
+                          row_version: 4,
+                          memory_mirror_head: 7,
+                          rendered_memory_ids: [],
+                          native_messages: makeMessages(sessionId),
+                      }
+                    : { ok: true },
+            mirrorPull: async (args) => {
+                mirrorPullCalls += 1;
+                await pullGate;
+                return {
+                    page: {
+                        domain: args.domain,
+                        cursor: args.cursor,
+                        next_cursor: 7,
+                        has_more: false,
+                        rows: [],
+                    },
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), { moduleClient });
+        const hashes: string[] = [];
+        const run = async () => {
+            const messages = makeMessages(sessionId);
+            const output = { messages: [...messages] };
+            await transform.run(sessionId, messages, output, makeMeta(db, sessionId));
+            hashes.push(createHash("sha256").update(JSON.stringify(output.messages)).digest("hex"));
+        };
+
+        await run();
+        await run();
+        await run();
+        await run();
+        expect(mirrorPullCalls).toBe(1);
+        expect(new Set(hashes).size).toBe(1);
+
+        releasePull();
+        await Bun.sleep(20);
+        expect(
+            db.prepare("SELECT cursor FROM mirror_cursors WHERE domain = 'memories'").get(),
+        ).toEqual({ cursor: 7 });
+    });
+
     it("caches mural bytes and pulls mirrors only when the module projection moves", async () => {
         const sessionId = `rust-mural-mirror-generation-${Date.now()}`;
         sessions.push(sessionId);

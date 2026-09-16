@@ -1,907 +1,1046 @@
 {
-    "schema": 1,
-    "header": "Pull-request and ordinary master CI intentionally run only the manifest-derived TS invocation. The tag release workflow runs the Rust invocation through scripts/run-rust-hermetic-e2e.sh on an explicitly enabled private-source runner; it requires sibling path-deps (../commons and ../subconscious).",
-    "entries": [
-        {
-            "path": "tests/cache-invariants.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "shared cache-prefix replay and ctx_reduce invariants run through the mode-selected spawn seam",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/dropped-input-guard.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "the dropped-input guard must be reachable through the plugin entry OpenCode loads; shipped unreachable in v0.42.0 because the entry wrapper did not delegate tool.execute.before",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/cache-stability.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "shared defer-pass byte-stability contract runs through the mode-selected spawn seam",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/compaction-off.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "OpenCode TS harness leg",
-            "contract_refs": [
-                "TS-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/conflict-disable.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "OpenCode TS harness leg",
-            "contract_refs": [
-                "TS-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/context-limits.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "provider context-limit arithmetic is a shared behavioral contract",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/deferred-compaction-marker.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "OpenCode TS harness leg",
-            "contract_refs": [
-                "TS-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/emergency-blocking.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "pressure recording is shared; the Rust module-side producer is covered by the dedicated hermetic Broca suite",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/historian-success.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "historian-trigger/session assertions run in both modes; deterministic module-side publication is covered by the Rust producer entry",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/long-running-session.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "temporal, tagging/reduce, todo, wrapup-adjacent replay, and deterministic Rust historian publication run through the mode-selected spawn seam",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/memory-injection.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "zero-compartment project-memory injection is shared across transform modes",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/notice-loop-race.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "OpenCode 1.18.x MessageV2.latest / parentID loop-exit ordering for noReply ignored notices is a host-session contract exercised on the TS OpenCode harness",
-            "contract_refs": [
-                "TS-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/overflow-recovery.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "provider-overflow detection is shared; Rust historian completion is covered by the hermetic Broca producer suite",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/paired-session-replay.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "CI-fast unit guard for paired replay byte/value-space classification vocabulary",
-            "contract_refs": [
-                "PARITY-REPLAY"
-            ]
-        },
-        {
-            "path": "tests/pi-cache-invariants.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-cache-stability.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-compaction-off.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-conflict-disable.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-context-limits.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-cross-harness.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-deferred-compaction-marker.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-drops.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-emergency-blocking.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-historian-success.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-long-running-session.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-memory-injection.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-overflow-recovery.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-rust-degradation-arc-1.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-PI-1 covers Pi-owned JSONL/branch-entry continuation and explicit refusal seams after a mid-session external-module fault",
-            "contract_refs": [
-                "FM-PI-1",
-                "pi-rust-degradation-trace.json"
-            ]
-        },
-        {
-            "path": "tests/pi-rust-degradation-arc-4.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-PI-4 covers Pi-owned provider-proof emergency continuation and fail-closed refusal at the 95 percent boundary",
-            "contract_refs": [
-                "FM-PI-4",
-                "pi-rust-degradation-trace.json"
-            ]
-        },
-        {
-            "path": "tests/pi-session-isolation.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-short-context-overflow.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-slow-historian.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-smoke.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-subagent-behavior.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-tag-owner-collision.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-tagging.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-thinking-block-safety.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/pi-todo-synthesis.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "pi harness leg",
-            "contract_refs": [
-                "PI-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/rust-cold-start-drop-seed.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "cold TS-to-Rust restart reproduces a frozen dropped-tag seed before historian publication can supersede the sentinel",
-            "contract_refs": [
-                "RUST-E2E",
-                "COLD-START-DROP-SEED"
-            ]
-        },
-        {
-            "path": "tests/rust-ctx-reduce-roundtrip.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "agent drop queues in the module ledger, drains on the producer-backed bust, and remains proven after m0 supersedes the transient sentinel",
-            "contract_refs": [
-                "RUST-E2E",
-                "CTX-REDUCE-ROUNDTRIP",
-                "HISTORIAN-PRODUCER"
-            ]
-        },
-        {
-            "path": "tests/rust-duplicate-tool-use-id.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-fold-under-pressure.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "real content pressure lands a deterministic producer-backed fold whose materialized m0 shrinks the provider wire",
-            "contract_refs": [
-                "RUST-E2E",
-                "FOLD-UNDER-PRESSURE",
-                "HISTORIAN-PRODUCER"
-            ]
-        },
-        {
-            "path": "tests/rust-maintenance-contract.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "hermetic wrapup/recomp command drill pins durable coverage, row-version, and disposition contracts",
-            "contract_refs": [
-                "RUST-E2E",
-                "MAINTENANCE-COMMANDS"
-            ]
-        },
-        {
-            "path": "tests/rust-memory-off-parity.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "one hermetic persistent-data fixture runs memory-on/off transitions through both TS and Rust served-wire lanes",
-            "contract_refs": [
-                "RUST-E2E",
-                "MEMORY-OFF-TRANSFORM-PARITY"
-            ]
-        },
-        {
-            "path": "tests/rust-multi-frame-delta-perf.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "large provider-visible tail remains intact across recut-era one-page reuse and bounded multi-page retransmission",
-            "contract_refs": [
-                "RUST-E2E",
-                "BOUNDARY-DIVERGENCE-RECUT",
-                "RUST-SYNTHETIC-TODO-ANCHOR-MIRROR-BACK"
-            ]
-        },
-        {
-            "path": "tests/rust-park-self-heal.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "park self-heal confirms external-module exit before driving the prolonged outage, then proves the recovered process resumes real transforms",
-            "contract_refs": [
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-compaction-marker-byte-identity.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "rust-mode compaction marker advance leaves the served wire bytes identical with and without the marker; the marker only shrinks the input array",
-            "contract_refs": [
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-cold-seed-perf.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "cold-seed handler budget on an ASTRO-shaped 10k-message seed; wall-clock, so it asserts only under MC_PERF_GATE=1 and records timings otherwise",
-            "contract_refs": [
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-paired-session-replay.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "same sanitized session shape is replayed through TS and Rust provider-wire lanes and diffed pass by pass",
-            "contract_refs": [
-                "RUST-E2E",
-                "PARITY-REPLAY"
-            ]
-        },
-        {
-            "path": "tests/rust-removal-self-heal.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-smoke.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-steady-state-byte-identity.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-historian-producer.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "hermetic Broca producer publishes deterministic v2 compartments and proves outage/strict-validation failures",
-            "contract_refs": [
-                "RUST-E2E",
-                "HISTORIAN-PRODUCER"
-            ]
-        },
-        {
-            "path": "tests/rust-tail-mutation-readopt.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "existing rust-* file; hermetic Rust harness leg",
-            "contract_refs": [
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/session-isolation.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "OpenCode TS harness leg",
-            "contract_refs": [
-                "TS-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/short-context-overflow.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "OpenCode TS harness leg",
-            "contract_refs": [
-                "TS-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/slow-historian.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "historian non-blocking ordering contract is shared; deterministic Rust producer behavior is covered separately",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/smoke.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "OpenCode TS harness leg",
-            "contract_refs": [
-                "TS-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/subagent-behavior.test.ts",
-            "tier": "ts-only",
-            "invocation": {
-                "ts": true,
-                "rust": false
-            },
-            "rationale": "OpenCode TS harness leg",
-            "contract_refs": [
-                "TS-HARNESS"
-            ]
-        },
-        {
-            "path": "tests/tag-owner-collision.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "tag-owner composite identity and drop isolation are shared storage contracts",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/thinking-block-safety.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "signed-thinking replay and message-boundary safety are shared wire contracts",
-            "contract_refs": [
-                "S2-MIGRATION"
-            ]
-        },
-        {
-            "path": "tests/todo-synthesis.test.ts",
-            "tier": "both-modes",
-            "invocation": {
-                "ts": true,
-                "rust": true
-            },
-            "rationale": "synthetic todowrite state-sync, bust-time injection, anchor persistence, and defer replay are shared cache contracts",
-            "contract_refs": [
-                "S2-MIGRATION",
-                "ARCHITECTURE.md#synthetic-todowrite"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-1.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-1 confirms the external module exited after SIGKILL before exercising byte-identical LKG continuation and loud failure reporting",
-            "contract_refs": [
-                "FM-OC-1",
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-2.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-2 confirms the external module exited after SIGKILL, then pins the shipped failure threshold and park-transition token",
-            "contract_refs": [
-                "FM-OC-2",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-3.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-3 confirms the killed module exited before replacement, then pins bounded probe recovery and monotonic row versions",
-            "contract_refs": [
-                "FM-OC-3",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-4.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-4 confirms external-module exit before asserting typed fail-closed refusal at the provider-proven emergency limit",
-            "contract_refs": [
-                "FM-OC-4",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-5.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-5 SIGSTOP/SIGCONT only exercises transport timeout classification and recovery",
-            "contract_refs": [
-                "FM-OC-5",
-                "RUST-E2E"
-            ]
-        },
-        {
-            "path": "tests/rust-fm-oc-6.test.ts",
-            "tier": "rust-only",
-            "invocation": {
-                "ts": false,
-                "rust": true
-            },
-            "rationale": "FM-OC-6 confirms external-module exit, then asserts emergency refusal before LKG admission",
-            "contract_refs": [
-                "FM-OC-6",
-                "RUST-E2E",
-                "RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
-            ]
-        },
-        {
-            "path": "tests/window-overlay-reload.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "heavy dual-harness real-process lifecycle drill; run focused after overlay or Pi reload changes instead of placing it in the ordinary host-e2e load lane",
-            "contract_refs": [
-                "OVERLAY-SAME-PATH-AUTO-REFRESH",
-                "PI-EXTENSION-RELOAD"
-            ]
-        },
-        {
-            "path": "tests/opencode2/pins.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "OpenCode v2 lane: pins the captured GA host evidence (sha256) — unit-shaped, needs no host; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
-            "contract_refs": [
-                "OC2-S1"
-            ]
-        },
-        {
-            "path": "tests/opencode2/probes.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "OpenCode v2 lane: boots the real @opencode/cli@2.0.3 in the hermetic v2 runner (throwaway roots, fd guard); v1/v2 payload, hidden-agent and rpc-entry probes; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
-            "contract_refs": [
-                "OC2-S1"
-            ]
-        },
-        {
-            "path": "tests/opencode2/runner.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "OpenCode v2 lane: hermetic runner guards and handoff against the real GA host; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
-            "contract_refs": [
-                "OC2-S1"
-            ]
-        },
-        {
-            "path": "tests/opencode2/store-reader.test.ts",
-            "tier": "excluded",
-            "invocation": {
-                "ts": false,
-                "rust": false
-            },
-            "rationale": "OpenCode v2 lane: session_message reader against real v2 host writes; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
-            "contract_refs": [
-                "OC2-S1"
-            ]
-        }
-    ]
+	"schema": 1,
+	"header": "Pull-request and ordinary master CI intentionally run only the manifest-derived TS invocation. The tag release workflow runs the Rust invocation through scripts/run-rust-hermetic-e2e.sh on an explicitly enabled private-source runner; it requires sibling path-deps (../commons and ../subconscious).",
+	"entries": [
+		{
+			"path": "tests/opencode2/automatic-s3-paths.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "Automatic historian and dreamer paths run in the dedicated real GA lane",
+			"contract_refs": [
+				"R22",
+				"R36"
+			]
+		},
+		{
+			"path": "tests/opencode2/fold-s3-owner.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "Checkpoint ownership and restored-tail taxonomy run in the dedicated real GA lane",
+			"contract_refs": [
+				"I6a",
+				"I7",
+				"I8",
+				"R39"
+			]
+		},
+		{
+			"path": "tests/opencode2/marker-s3-runtime.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "Instrumented v2 marker exclusion with a real v1 control runs in the dedicated GA lane",
+			"contract_refs": [
+				"I10"
+			]
+		},
+		{
+			"path": "tests/opencode2/hidden-s3-executor.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "Real GA hidden historian publication, model/tool refusal and warming identity run in the dedicated v2 lane",
+			"contract_refs": [
+				"R34",
+				"R36",
+				"R37",
+				"R38"
+			]
+		},
+		{
+			"path": "tests/opencode2/harness-s3-identity.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "Real GA OpenCode 2 boot-time harness identity proof runs in the dedicated v2 lane",
+			"contract_refs": [
+				"R12"
+			]
+		},
+		{
+			"path": "tests/opencode2/adapters-s3-marker-policy.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "OpenCode 2 marker strategy and inverse-projection unit contracts run in the dedicated v2 lane",
+			"contract_refs": [
+				"I10"
+			]
+		},
+		{
+			"path": "tests/opencode2/adapters-s2-contracts.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "OpenCode 2 context adapters have their own hermetic lane invocation",
+			"contract_refs": [
+				"I5",
+				"I6",
+				"I9b",
+				"I14"
+			]
+		},
+		{
+			"path": "tests/opencode2/context-s2-lanes.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "Real GA OpenCode 2 context-hook lane; invoked separately from v1 TS and Rust",
+			"contract_refs": [
+				"I3",
+				"I4",
+				"I5",
+				"I6",
+				"I9b",
+				"I14",
+				"I15",
+				"I16",
+				"I16a",
+				"I17"
+			]
+		},
+		{
+			"path": "tests/opencode2/entry-s2-context.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "Real OpenCode 2 directory-load proof for the dual-loader entry",
+			"contract_refs": [
+				"I1"
+			]
+		},
+		{
+			"path": "tests/cache-invariants.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "shared cache-prefix replay and ctx_reduce invariants run through the mode-selected spawn seam",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/dropped-input-guard.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "the dropped-input guard must be reachable through the plugin entry OpenCode loads; shipped unreachable in v0.42.0 because the entry wrapper did not delegate tool.execute.before",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/cache-stability.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "shared defer-pass byte-stability contract runs through the mode-selected spawn seam",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/compaction-off.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "OpenCode TS harness leg",
+			"contract_refs": [
+				"TS-HARNESS"
+			]
+		},
+		{
+			"path": "tests/conflict-disable.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "OpenCode TS harness leg",
+			"contract_refs": [
+				"TS-HARNESS"
+			]
+		},
+		{
+			"path": "tests/context-limits.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "provider context-limit arithmetic is a shared behavioral contract",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/deferred-compaction-marker.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "OpenCode TS harness leg",
+			"contract_refs": [
+				"TS-HARNESS"
+			]
+		},
+		{
+			"path": "tests/emergency-blocking.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "pressure recording is shared; the Rust module-side producer is covered by the dedicated hermetic Broca suite",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/historian-success.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "historian-trigger/session assertions run in both modes; deterministic module-side publication is covered by the Rust producer entry",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/long-running-session.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "temporal, tagging/reduce, todo, wrapup-adjacent replay, and deterministic Rust historian publication run through the mode-selected spawn seam",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/memory-injection.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "zero-compartment project-memory injection is shared across transform modes",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/notice-loop-race.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "OpenCode 1.18.x MessageV2.latest / parentID loop-exit ordering for noReply ignored notices is a host-session contract exercised on the TS OpenCode harness",
+			"contract_refs": [
+				"TS-HARNESS"
+			]
+		},
+		{
+			"path": "tests/overflow-recovery.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "provider-overflow detection is shared; Rust historian completion is covered by the hermetic Broca producer suite",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/paired-session-replay.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "CI-fast unit guard for paired replay byte/value-space classification vocabulary",
+			"contract_refs": [
+				"PARITY-REPLAY"
+			]
+		},
+		{
+			"path": "tests/pi-cache-invariants.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-cache-stability.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-compaction-off.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-conflict-disable.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-context-limits.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-cross-harness.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-deferred-compaction-marker.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-drops.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-emergency-blocking.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-historian-success.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-long-running-session.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-memory-injection.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-overflow-recovery.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-rust-degradation-arc-1.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "FM-PI-1 covers Pi-owned JSONL/branch-entry continuation and explicit refusal seams after a mid-session external-module fault",
+			"contract_refs": [
+				"FM-PI-1",
+				"pi-rust-degradation-trace.json"
+			]
+		},
+		{
+			"path": "tests/pi-rust-degradation-arc-4.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "FM-PI-4 covers Pi-owned provider-proof emergency continuation and fail-closed refusal at the 95 percent boundary",
+			"contract_refs": [
+				"FM-PI-4",
+				"pi-rust-degradation-trace.json"
+			]
+		},
+		{
+			"path": "tests/pi-session-isolation.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-short-context-overflow.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-slow-historian.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-smoke.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-subagent-behavior.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-tag-owner-collision.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-tagging.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-thinking-block-safety.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/pi-todo-synthesis.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "pi harness leg",
+			"contract_refs": [
+				"PI-HARNESS"
+			]
+		},
+		{
+			"path": "tests/rust-cold-start-drop-seed.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "cold TS-to-Rust restart reproduces a frozen dropped-tag seed before historian publication can supersede the sentinel",
+			"contract_refs": [
+				"RUST-E2E",
+				"COLD-START-DROP-SEED"
+			]
+		},
+		{
+			"path": "tests/rust-ctx-reduce-roundtrip.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "agent drop queues in the module ledger, drains on the producer-backed bust, and remains proven after m0 supersedes the transient sentinel",
+			"contract_refs": [
+				"RUST-E2E",
+				"CTX-REDUCE-ROUNDTRIP",
+				"HISTORIAN-PRODUCER"
+			]
+		},
+		{
+			"path": "tests/rust-duplicate-tool-use-id.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "existing rust-* file; hermetic Rust harness leg",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-fold-under-pressure.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "real content pressure lands a deterministic producer-backed fold whose materialized m0 shrinks the provider wire",
+			"contract_refs": [
+				"RUST-E2E",
+				"FOLD-UNDER-PRESSURE",
+				"HISTORIAN-PRODUCER"
+			]
+		},
+		{
+			"path": "tests/rust-maintenance-contract.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "hermetic wrapup/recomp command drill pins durable coverage, row-version, and disposition contracts",
+			"contract_refs": [
+				"RUST-E2E",
+				"MAINTENANCE-COMMANDS"
+			]
+		},
+		{
+			"path": "tests/rust-memory-off-parity.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "one hermetic persistent-data fixture runs memory-on/off transitions through both TS and Rust served-wire lanes",
+			"contract_refs": [
+				"RUST-E2E",
+				"MEMORY-OFF-TRANSFORM-PARITY"
+			]
+		},
+		{
+			"path": "tests/rust-multi-frame-delta-perf.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "large provider-visible tail remains intact across recut-era one-page reuse and bounded multi-page retransmission",
+			"contract_refs": [
+				"RUST-E2E",
+				"BOUNDARY-DIVERGENCE-RECUT",
+				"RUST-SYNTHETIC-TODO-ANCHOR-MIRROR-BACK"
+			]
+		},
+		{
+			"path": "tests/rust-park-self-heal.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "park self-heal confirms external-module exit before driving the prolonged outage, then proves the recovered process resumes real transforms",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-compaction-marker-byte-identity.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "rust-mode compaction marker advance leaves the served wire bytes identical with and without the marker; the marker only shrinks the input array",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-cold-seed-perf.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "cold-seed handler budget on an ASTRO-shaped 10k-message seed; wall-clock, so it asserts only under MC_PERF_GATE=1 and records timings otherwise",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-paired-session-replay.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "same sanitized session shape is replayed through TS and Rust provider-wire lanes and diffed pass by pass",
+			"contract_refs": [
+				"RUST-E2E",
+				"PARITY-REPLAY"
+			]
+		},
+		{
+			"path": "tests/rust-removal-self-heal.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "existing rust-* file; hermetic Rust harness leg",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-smoke.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "existing rust-* file; hermetic Rust harness leg",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-steady-state-byte-identity.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "existing rust-* file; hermetic Rust harness leg",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-historian-producer.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "hermetic Broca producer publishes deterministic v2 compartments and proves outage/strict-validation failures",
+			"contract_refs": [
+				"RUST-E2E",
+				"HISTORIAN-PRODUCER"
+			]
+		},
+		{
+			"path": "tests/rust-tail-mutation-readopt.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "existing rust-* file; hermetic Rust harness leg",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/session-isolation.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "OpenCode TS harness leg",
+			"contract_refs": [
+				"TS-HARNESS"
+			]
+		},
+		{
+			"path": "tests/short-context-overflow.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "OpenCode TS harness leg",
+			"contract_refs": [
+				"TS-HARNESS"
+			]
+		},
+		{
+			"path": "tests/slow-historian.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "historian non-blocking ordering contract is shared; deterministic Rust producer behavior is covered separately",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/smoke.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "OpenCode TS harness leg",
+			"contract_refs": [
+				"TS-HARNESS"
+			]
+		},
+		{
+			"path": "tests/subagent-behavior.test.ts",
+			"tier": "ts-only",
+			"invocation": {
+				"ts": true,
+				"rust": false
+			},
+			"rationale": "OpenCode TS harness leg",
+			"contract_refs": [
+				"TS-HARNESS"
+			]
+		},
+		{
+			"path": "tests/tag-owner-collision.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "tag-owner composite identity and drop isolation are shared storage contracts",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/thinking-block-safety.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "signed-thinking replay and message-boundary safety are shared wire contracts",
+			"contract_refs": [
+				"S2-MIGRATION"
+			]
+		},
+		{
+			"path": "tests/todo-synthesis.test.ts",
+			"tier": "both-modes",
+			"invocation": {
+				"ts": true,
+				"rust": true
+			},
+			"rationale": "synthetic todowrite state-sync, bust-time injection, anchor persistence, and defer replay are shared cache contracts",
+			"contract_refs": [
+				"S2-MIGRATION",
+				"ARCHITECTURE.md#synthetic-todowrite"
+			]
+		},
+		{
+			"path": "tests/rust-fm-oc-1.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "FM-OC-1 confirms the external module exited after SIGKILL before exercising byte-identical LKG continuation and loud failure reporting",
+			"contract_refs": [
+				"FM-OC-1",
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-fm-oc-2.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "FM-OC-2 confirms the external module exited after SIGKILL, then pins the shipped failure threshold and park-transition token",
+			"contract_refs": [
+				"FM-OC-2",
+				"RUST-E2E",
+				"RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
+			]
+		},
+		{
+			"path": "tests/rust-fm-oc-3.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "FM-OC-3 confirms the killed module exited before replacement, then pins bounded probe recovery and monotonic row versions",
+			"contract_refs": [
+				"FM-OC-3",
+				"RUST-E2E",
+				"RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
+			]
+		},
+		{
+			"path": "tests/rust-fm-oc-4.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "FM-OC-4 confirms external-module exit before asserting typed fail-closed refusal at the provider-proven emergency limit",
+			"contract_refs": [
+				"FM-OC-4",
+				"RUST-E2E",
+				"RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
+			]
+		},
+		{
+			"path": "tests/rust-fm-oc-5.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "FM-OC-5 SIGSTOP/SIGCONT only exercises transport timeout classification and recovery",
+			"contract_refs": [
+				"FM-OC-5",
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-fm-oc-6.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "FM-OC-6 confirms external-module exit, then asserts emergency refusal before LKG admission",
+			"contract_refs": [
+				"FM-OC-6",
+				"RUST-E2E",
+				"RUST-SYNTHETIC-TODO-INDEPENDENT-BUST"
+			]
+		},
+		{
+			"path": "tests/rust-memory-mirror-resume.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "real-module memory-mirror resume: interrupted initial drain resumes from the module feed head, stable passes issue no pull, ctx_memory reads/writes succeed after the wedge (issue 444)",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/window-overlay-reload.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "heavy dual-harness real-process lifecycle drill; run focused after overlay or Pi reload changes instead of placing it in the ordinary host-e2e load lane",
+			"contract_refs": [
+				"OVERLAY-SAME-PATH-AUTO-REFRESH",
+				"PI-EXTENSION-RELOAD"
+			]
+		},
+		{
+			"path": "tests/opencode2/pins.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "OpenCode v2 lane: pins the captured GA host evidence (sha256) \u2014 unit-shaped, needs no host; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
+			"contract_refs": [
+				"OC2-S1"
+			]
+		},
+		{
+			"path": "tests/opencode2/probes.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "OpenCode v2 lane: boots the real @opencode/cli@2.0.3 in the hermetic v2 runner (throwaway roots, fd guard); v1/v2 payload, hidden-agent and rpc-entry probes; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
+			"contract_refs": [
+				"OC2-S1"
+			]
+		},
+		{
+			"path": "tests/opencode2/runner.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "OpenCode v2 lane: hermetic runner guards and handoff against the real GA host; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
+			"contract_refs": [
+				"OC2-S1"
+			]
+		},
+		{
+			"path": "tests/opencode2/store-reader.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "OpenCode v2 lane: session_message reader against real v2 host writes; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
+			"contract_refs": [
+				"OC2-S1"
+			]
+		}
+	]
 }

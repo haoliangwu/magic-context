@@ -337,13 +337,13 @@ function isProcessAlive(pid: number): boolean {
 }
 
 async function pollUntil(
-    predicate: () => boolean,
+    predicate: () => boolean | Promise<boolean>,
     opts: { timeoutMs: number; intervalMs?: number; label: string },
 ): Promise<void> {
     const intervalMs = opts.intervalMs ?? 100;
     const deadline = Date.now() + opts.timeoutMs;
     while (Date.now() < deadline) {
-        if (predicate()) return;
+        if (await predicate()) return;
         await sleep(intervalMs);
     }
     throw new Error(`hermetic subc: ${opts.label} did not happen within ${opts.timeoutMs}ms`);
@@ -373,6 +373,7 @@ export class HermeticSubcStack {
     private readonly runtimeDir: string;
     private readonly daemonConfigDir: string;
     private readonly daemonLogPath: string;
+    private readonly daemonFileLogPath: string;
     private readonly moduleLogPath: string;
     private readonly producerLogPath: string;
     private readonly pidFilePath: string;
@@ -384,9 +385,9 @@ export class HermeticSubcStack {
     private module: ChildProcess | null = null;
     private producer: ChildProcess | null = null;
     private killedModulePid: number | null = null;
-    private moduleRouteDropBaseline = 0;
     private killedProducerPid: number | null = null;
     private producerPid: number | null = null;
+    private catalogClient: SubcClient | null = null;
     private statusClient: SubcClient | null = null;
 
     private constructor(opts: Required<HermeticSubcOptions>) {
@@ -396,12 +397,13 @@ export class HermeticSubcStack {
         this.startTimeoutMs = opts.startTimeoutMs;
         this.startProducer = opts.startProducer;
         // The plugin's Rust client reads exactly this path (getDefaultConnectionFile
-        // in module-transport.ts). Pointing the daemon's XDG_RUNTIME_DIR here makes it
-        // write the connection file where the plugin already looks — no config knob.
+        // in module-transport.ts). The daemon derives the same run directory from its
+        // hermetic XDG_DATA_HOME, so no product configuration knob is needed.
         this.runtimeDir = join(this.dataDir, "cortexkit", "run");
         this.connectionFile = join(this.runtimeDir, "subc-connection.json");
         this.daemonConfigDir = join(this.dataDir, "cortexkit", "_hermetic-daemon-config");
         this.daemonLogPath = join(this.dataDir, "cortexkit", "_hermetic-daemon.log");
+        this.daemonFileLogPath = join(this.runtimeDir, "logs", "subc.log");
         this.moduleLogPath = join(this.dataDir, "cortexkit", "_hermetic-module.log");
         this.producerLogPath = join(this.dataDir, "cortexkit", "_hermetic-broca.log");
         this.pidFilePath = join(this.dataDir, "cortexkit", RUST_E2E_PID_FILE);
@@ -432,6 +434,7 @@ export class HermeticSubcStack {
         // this stack, not a dead predecessor, accepted the module.
         rmSync(this.connectionFile, { force: true });
         rmSync(this.daemonLogPath, { force: true });
+        rmSync(this.daemonFileLogPath, { force: true });
         rmSync(this.moduleLogPath, { force: true });
         rmSync(this.producerLogPath, { force: true });
         this.pidFileCreatedAtMs = Date.now();
@@ -451,11 +454,10 @@ export class HermeticSubcStack {
                 ...process.env,
                 XDG_RUNTIME_DIR: this.runtimeDir,
                 XDG_CONFIG_HOME: this.daemonConfigDir,
+                // The daemon derives its run artifacts, subc.log, and per-module stderr
+                // capture from the data home; keep all of them inside the hermetic tree.
+                XDG_DATA_HOME: this.dataDir,
                 SUBC_PORT: "0",
-                // The daemon's tracing layer colorizes stdout by default, which
-                // interleaves ANSI escapes THROUGH "module registered module_id=…"
-                // and defeats a substring poll. NO_COLOR makes tracing emit plain
-                // text (the registration check also strips ANSI as a backstop).
                 NO_COLOR: "1",
                 // The module connects as a plain client; clear any inherited
                 // supervised-identity vars so it does not reuse a reserved slot.
@@ -492,6 +494,14 @@ export class HermeticSubcStack {
         } else {
             delete process.env.MC_RUST_E2E_FOLD;
         }
+
+        // Catalog registration is the readiness gate; this immediate assertion only
+        // proves the daemon's file sink stayed inside the hermetic data home.
+        if (!existsSync(this.daemonFileLogPath)) {
+            throw new Error(
+                `hermetic subc: daemon log was not created under the hermetic data home: ${this.daemonFileLogPath}`,
+            );
+        }
     }
 
     private async spawnProducer(): Promise<void> {
@@ -501,6 +511,7 @@ export class HermeticSubcStack {
                 ...process.env,
                 BROCA_CONNECTION_FILE: this.connectionFile,
                 BROCA_LOG_PATH: this.producerLogPath,
+                XDG_DATA_HOME: this.dataDir,
                 SUBC_MODULE_ID: "",
                 SUBC_LAUNCH_NONCE: "",
                 NO_COLOR: "1",
@@ -582,17 +593,12 @@ export class HermeticSubcStack {
         }
     }
 
-    /**
-     * Registration is asynchronous relative to the daemon boot. The daemon logs
-     * "module registered module_id=magic-context" once the control-plane accepts
-     * it; poll that line so the first transform never races an unregistered
-     * module (which the daemon rejects terminally as unknown_module).
-     */
+    /** Wait until the registry catalog exposes the independently spawned producer. */
     private async waitForProducerRegistration(): Promise<void> {
         try {
-            await pollUntil(() => this.registrationCount(BROCA_ID) >= 1, {
+            await pollUntil(async () => (await this.registrationCount(BROCA_ID)) >= 1, {
                 timeoutMs: Math.min(this.startTimeoutMs, 10_000),
-                label: "Broca producer registration",
+                label: "Broca producer registration in catalog",
             });
         } catch (error) {
             throw new Error(
@@ -609,9 +615,9 @@ export class HermeticSubcStack {
                 await this.spawnModule();
             }
             try {
-                await pollUntil(() => this.registrationCount(MODULE_ID) >= 1, {
+                await pollUntil(async () => (await this.registrationCount(MODULE_ID)) >= 1, {
                     timeoutMs: Math.min(this.startTimeoutMs, 10_000),
-                    label: "module registration",
+                    label: "module registration in catalog",
                 });
                 return;
             } catch (error) {
@@ -628,17 +634,28 @@ export class HermeticSubcStack {
     }
 
     /**
-     * Count "module registered module_id=magic-context" lines in the daemon log.
-     * ANSI escapes are stripped first: the daemon's tracing layer can colorize
-     * output (escapes interleave through the phrase), so a raw substring count is
-     * unreliable even though NO_COLOR should suppress it. Stripping makes the poll
-     * robust regardless of the daemon's color configuration.
+     * Query the versioned registry contract. Daemon stdout is not a logging contract,
+     * and `ck module list` reports only the supervisor roster, not external modules.
      */
-    private registrationCount(moduleId: string): number {
-        if (!existsSync(this.daemonLogPath)) return 0;
-        const clean = stripAnsi(readFileSync(this.daemonLogPath, "utf8"));
-        const needle = `module registered module_id=${moduleId}`;
-        return clean.split(needle).length - 1;
+    private async registrationCount(moduleId: string): Promise<number> {
+        let client = this.catalogClient;
+        try {
+            if (!client) {
+                client = await SubcClient.connect({
+                    connectionFile: this.connectionFile,
+                    handshakeTimeoutMs: 1_000,
+                });
+                this.catalogClient = client;
+            }
+            const entries = await client.catalogList();
+            return entries.filter((entry) => entry.module_id === moduleId).length;
+        } catch {
+            client?.close();
+            if (this.catalogClient === client) this.catalogClient = null;
+            // A daemon that is not accepting catalog RPCs is not ready yet; the next
+            // poll reconnects rather than turning startup into a terminal error.
+            return 0;
+        }
     }
 
     /**
@@ -651,20 +668,17 @@ export class HermeticSubcStack {
     async restartModule(): Promise<void> {
         await this.killModuleAndWait();
         await sleep(200);
-        await this.spawnModule();
         await this.waitForFreshModuleRegistration();
     }
 
     /** Return a killed external module without restarting the OpenCode session. */
     async restoreModule(): Promise<void> {
         await sleep(200);
-        await this.spawnModule();
         await this.waitForFreshModuleRegistration();
     }
 
     /** Kill only the module process (leaving the daemon up), for fault injection. */
     killModule(): void {
-        this.moduleRouteDropBaseline = this.routeDropCount();
         const pid = this.module?.pid;
         if (pid && Number.isInteger(pid) && pid > 0) this.killedModulePid = pid;
         if (this.module && this.module.exitCode === null) {
@@ -679,8 +693,8 @@ export class HermeticSubcStack {
         const pid = this.killedModulePid;
         if (!pid) throw new Error("waitForModuleDeath called before killModule");
         await pollUntil(
-            () => !isProcessAlive(pid) && this.routeDropLogged(),
-            { timeoutMs, label: "module death and daemon route drop" },
+            async () => !isProcessAlive(pid) && (await this.registrationCount(MODULE_ID)) === 0,
+            { timeoutMs, label: "module death and catalog route removal" },
         );
     }
 
@@ -724,11 +738,15 @@ export class HermeticSubcStack {
             harness: "opencode",
             session: sessionId,
         };
-        const client = this.statusClient ?? (this.statusClient = await SubcClient.connect({
-            connectionFile: this.connectionFile,
-            identity,
-            targetKind: "tool_provider",
-        }));
+        let client = this.statusClient;
+        if (!client) {
+            client = await SubcClient.connect({
+                connectionFile: this.connectionFile,
+                identity,
+                targetKind: "tool_provider",
+            });
+            this.statusClient = client;
+        }
         let route: Awaited<ReturnType<SubcClient["routeOpen"]>> | null = null;
         try {
             route = await routeOpenWithoutAmbientConsumerIdentity(
@@ -835,48 +853,30 @@ export class HermeticSubcStack {
         ) {
             throw new Error("Rust outage drill precondition failed: magic-context is configured for supervision");
         }
-        const log = stripAnsi(this.daemonLog());
-        if (log.includes(MODULE_ID) && /supervis/.test(log)) {
-            throw new Error("Rust outage drill precondition failed: daemon reported magic-context as supervised");
-        }
+        // The empty modules map is the supervision source of truth. Daemon stdout is
+        // not a contract, and `ck module list` would only repeat this supervisor roster.
     }
 
     /**
-     * After a restart the daemon log already contains the FIRST registration
-     * line, so a plain presence check would return immediately. Wait until the
-     * registration-line COUNT grows past what was present before the restart.
+     * Prove the old route left the registry before spawning its replacement. Waiting
+     * only for presence could accept the dead module's stale catalog entry.
      */
-    private registrationTarget = 1;
-    private routeDropCount(): number {
-        const clean = stripAnsi(this.daemonLog());
-        return (
-            clean.match(
-                /route[_ ](?:gone|dropped|closed)|(?:gone|dropped|closed).*route|supervised module exited abnormally.*exit_signal=Some\(9\)/gi,
-            ) ?? []
-        ).length;
-    }
-
-    private routeDropLogged(): boolean {
-        return this.routeDropCount() > this.moduleRouteDropBaseline;
-    }
-
     private async waitForFreshModuleRegistration(): Promise<void> {
-        this.registrationTarget += 1;
-        const target = this.registrationTarget;
-        await pollUntil(() => this.registrationCount(MODULE_ID) >= target, {
+        await pollUntil(async () => (await this.registrationCount(MODULE_ID)) === 0, {
             timeoutMs: this.startTimeoutMs,
-            label: "module re-registration after restart",
+            label: "catalog absence before module re-registration",
+        });
+        await this.spawnModule();
+        await pollUntil(async () => (await this.registrationCount(MODULE_ID)) >= 1, {
+            timeoutMs: this.startTimeoutMs,
+            label: "module re-registration in catalog after restart",
         });
     }
 
     private pipeToLog(child: ChildProcess, logPath: string, _tag: string): void {
-        // Drain BOTH streams continuously: an undrained pipe fills the OS buffer
-        // and the child blocks mid-boot on a write (the exact spurious-hang
-        // real_daemon.rs documents). The ck-subc daemon logs its control-plane
-        // events (including "module registered …") to STDOUT via tracing, while
-        // ck-mc logs to STDERR — so capturing only one stream would miss the
-        // registration line the boot poll waits on. Both are folded into one log
-        // file, preserved for post-mortem when a scenario fails.
+        // Drain BOTH streams continuously so a child cannot block on a full pipe.
+        // The daemon's normal logs go to subc.log; this capture remains only for
+        // pre-subscriber eprintln failures and other post-mortem diagnostics.
         const append = (chunk: Buffer) => {
             try {
                 appendFileSync(logPath, chunk.toString());
@@ -908,6 +908,8 @@ export class HermeticSubcStack {
 
     /** Hard teardown. Safe to call more than once; never throws. */
     async stop(): Promise<void> {
+        this.catalogClient?.close();
+        this.catalogClient = null;
         this.statusClient?.close();
         this.statusClient = null;
         try {
@@ -944,10 +946,3 @@ export const __hermeticSubcTest = {
     rustE2eCargoTargetDir: RUST_E2E_CARGO_TARGET_DIR,
     stalePidAgeMs: RUST_E2E_STALE_PID_AGE_MS,
 };
-
-/** Remove ANSI/VT100 escape sequences so plain-text substring checks are reliable. */
-function stripAnsi(input: string): string {
-    // Matches CSI sequences like \x1b[32m and \x1b[0m that tracing emits for color.
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escapes are control chars by definition.
-    return input.replace(/\x1b\[[0-9;]*m/g, "");
-}

@@ -78,6 +78,10 @@ export interface PendingTransformDecision {
      */
     m0ToolSetHashNew?: string | null;
     emergency: boolean;
+    /**
+     * Nonnegative estimate persisted as `transform_decisions.dropped_tokens` for
+     * diagnostics only. It does not drive budgeting or scheduler decisions.
+     */
     droppedTokens: number;
     droppedCount: number;
     inputTokens: number;

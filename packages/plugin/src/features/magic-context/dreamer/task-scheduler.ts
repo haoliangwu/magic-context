@@ -19,6 +19,7 @@ import {
 import { evaluateTaskGate, getDreamTaskBacklogs } from "./task-gates";
 import {
     compareTaskOrder,
+    type DreamTaskBacklog,
     type DreamTaskBacklogMap,
     type DreamTaskName,
     leaseKeyFor,
@@ -55,9 +56,13 @@ export interface TaskExecOutcome {
     failureDetail?: string;
     /** Successful task detail surfaced by a manual `/ctx-dream` run. */
     detail?: string;
+    /** Run-local backlog when a task's scope differs from its next scheduled scope. */
+    backlog?: DreamTaskBacklog;
     schedulePatch?: {
         /** retrospective content watermark (max message ts scanned this run). */
         retrospectiveWatermarkMs?: number | null;
+        /** Task-local JSON state committed only after successful execution. */
+        taskStateJson?: string;
     };
 }
 
@@ -218,6 +223,7 @@ function advanceAfterRun(
         lastStatus: status,
         lastError: error,
         retryCount: 0,
+        taskStateJson: schedulePatch?.taskStateJson,
         retrospectiveWatermarkMs: schedulePatch?.retrospectiveWatermarkMs,
     });
 }
@@ -290,7 +296,7 @@ interface DomainGroupCallbacks {
      * up. Scheduled ticks leave this unset (the next tick retries anyway).
      */
     leaseWaitMs?: number;
-    onRan?: (task: DreamTaskName, detail?: string) => void;
+    onRan?: (task: DreamTaskName, detail?: string, backlog?: DreamTaskBacklog) => void;
     onFailed?: (task: DreamTaskName, error?: string) => void;
     onBusy?: (task: DreamTaskName) => void;
 }
@@ -386,7 +392,7 @@ async function runDomainGroup(
                     null,
                     outcome.schedulePatch,
                 );
-                cb?.onRan?.(due.config.task, outcome.detail);
+                cb?.onRan?.(due.config.task, outcome.detail, outcome.backlog);
             } else if (outcome.transient) {
                 recordTransientFailure(db, projectIdentity, due, finishedAt, outcome.error ?? null);
                 cb?.onFailed?.(due.config.task, outcome.failureDetail ?? outcome.error);
@@ -505,6 +511,7 @@ export async function runManualDream(
     }
 
     const groups = new Map<string, DueTask[]>();
+    const runLocalBacklogs: DreamTaskBacklogMap = {};
     for (const d of gated) {
         const kind = leaseKindFor(d.config.task);
         const arr = groups.get(kind) ?? [];
@@ -517,9 +524,10 @@ export async function runManualDream(
             runDomainGroup({ ...deps, executor: deps.executor }, group, {
                 forceGate,
                 leaseWaitMs: MANUAL_RUN_LEASE_WAIT_MS,
-                onRan: (t, detail) => {
+                onRan: (t, detail, backlog) => {
                     result.ran.push(t);
                     if (detail) result.details?.push(detail);
+                    if (backlog) runLocalBacklogs[t] = backlog;
                 },
                 onFailed: (task, error) => {
                     result.failed.push(task);
@@ -529,7 +537,10 @@ export async function runManualDream(
             }),
         ),
     );
-    result.backlogAfter = getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames);
+    result.backlogAfter = {
+        ...getDreamTaskBacklogs(deps.db, deps.projectIdentity, selectedTaskNames),
+        ...runLocalBacklogs,
+    };
     return result;
 }
 

@@ -43,7 +43,7 @@ describe("user-facing failure codes", () => {
         const entries = Object.values(USER_FACING_FAILURES);
         expect(new Set(entries.map((entry) => entry.code)).size).toBe(entries.length);
         for (const [key, entry] of Object.entries(USER_FACING_FAILURES)) {
-            expect(entry.code).toMatch(/^MC-[CHDERS]\d{2}$/);
+            expect(entry.code).toMatch(/^MC-[CHDERSM]\d{2}$/);
             expect(entry.sentence).toEndWith(".");
             expect(entry.action).toEndWith(".");
             expect(renderUserFacingFailure(key as keyof typeof USER_FACING_FAILURES)).toBe(

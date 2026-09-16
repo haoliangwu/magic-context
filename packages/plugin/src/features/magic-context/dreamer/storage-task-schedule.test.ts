@@ -11,6 +11,7 @@ import {
     getTaskScheduleStatesForProject,
     seedTaskScheduleState,
     writeTaskScheduleState,
+    writeTaskStateJson,
 } from "./storage-task-schedule";
 
 let db: Database | null = null;
@@ -68,6 +69,26 @@ describe("task_schedule_state storage", () => {
         expect(row?.nextDueAt).toBe(90000);
         expect(row?.lastStatus).toBe("completed");
         expect(row?.schedule).toBe("0 3 * * *");
+    });
+
+    it("stores task JSON state in the retired verify watermark column without changing schedule fields", () => {
+        db = freshDb();
+        seedTaskScheduleState(db, "git:abc", "curate", 1000, 500, "0 4 * * *");
+
+        writeTaskStateJson(
+            db,
+            "git:abc",
+            "curate",
+            JSON.stringify({ curate: { cursor: 2, activeCategory: "CONSTRAINTS" } }),
+        );
+
+        const row = getTaskScheduleState(db, "git:abc", "curate");
+        expect(JSON.parse(row?.taskStateJson ?? "null")).toEqual({
+            curate: { cursor: 2, activeCategory: "CONSTRAINTS" },
+        });
+        expect(row?.nextDueAt).toBe(1000);
+        expect(row?.lastRunAt).toBe(500);
+        expect(row?.schedule).toBe("0 4 * * *");
     });
 
     it("persists a disabled task as next_due_at = NULL", () => {

@@ -1,4 +1,5 @@
 import type { DreamingTask } from "../../../config/schema/magic-context";
+import type { CurateMemoryCategory } from "./curate-category-rotation";
 
 /** Memory shape the curate prompt renders (verify now has its own runner/prompt). */
 export interface CuratePromptMemory {
@@ -102,6 +103,7 @@ function renderMemoryList(memories: CuratePromptMemory[]): string {
 
 export function buildCuratePrompt(args: {
     projectPath: string;
+    category: CurateMemoryCategory;
     memories: CuratePromptMemory[];
 }): string {
     // adapted from validated shadow-trial prompt; further tuning happens in the harness
@@ -109,9 +111,11 @@ export function buildCuratePrompt(args: {
 
 **Project:** ${args.projectPath}
 
+This run covers the whole of the \`${args.category}\` category (the other categories run in later windows).
+
 The memories below are assumed ACCURATE (a separate verify task keeps them true). Your job is pool QUALITY: remove duplicates, tighten wording, and consolidate redundant entries that waste the ~6000-token injection budget. Explain each action in one line first. Do NOT mint new facts (that is the historian's job).
 
-Work ALL THREE phases below in order (A → B → C) over the whole pool. Do NOT stop after consolidating — a run that only merges and never improves or archives is incomplete.
+Work ALL THREE phases below in order (A → B → C) over this category. Do NOT stop after consolidating — a run that only merges and never improves or archives is incomplete.
 
 ### Phase A — Consolidate duplicates
 Group by category, then merge near-identical / superset-subset / same-fact-different-angle clusters into one canonical memory with \`ctx_memory(action="merge", ids=[...], content="...", category="...")\`. Preserve every unique detail; terse present tense; paths/keys verbatim. Every id in a merge MUST share the same category — the system rejects cross-category merges. If two similar memories sit in different categories they are NOT duplicates; do not archive either as a consolidation. One fact per memory.
@@ -375,6 +379,7 @@ export function buildDreamTaskPrompt(
         lastDreamAt?: string | null;
         existingDocs?: { architecture: boolean; structure: boolean };
         curate?: {
+            category: CurateMemoryCategory;
             memories: CuratePromptMemory[];
         };
     },
@@ -383,6 +388,7 @@ export function buildDreamTaskPrompt(
         case "curate":
             return buildCuratePrompt({
                 projectPath: args.projectPath,
+                category: args.curate?.category ?? "PROJECT_RULES",
                 memories: args.curate?.memories ?? [],
             });
         case "maintain-docs":

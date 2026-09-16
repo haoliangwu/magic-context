@@ -9,6 +9,10 @@ import { join } from "node:path";
 
 import { isCompactionEnabled } from "../config/agent-disable";
 import type { MagicContextConfig } from "../config/schema/magic-context";
+import {
+    getAuthorityManagedMarker,
+    getMemoryMirrorStatus,
+} from "../features/magic-context/context-authority";
 import { getMostRecentTaskRunAt } from "../features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "../features/magic-context/dreamer/task-gates";
 import {
@@ -124,6 +128,18 @@ export async function executeRustRecompRpc(
 
 export interface RustSessionStatus {
     usage?: { current_total_input_tokens?: number; context_limit_tokens?: number };
+    memory_mirror?: {
+        feed_head?: number;
+        module_live_rows?: number;
+        host_cursor?: number;
+        host_cursor_updated_at_ms?: number;
+        stalled?: boolean;
+        code?: string | null;
+    };
+    authority?: {
+        memories?: { project?: string; state?: "TS" | "PREPARING" | "MODULE" | "DRAINING" } | null;
+        notes?: { project?: string; state?: "TS" | "PREPARING" | "MODULE" | "DRAINING" } | null;
+    };
     tail_hygiene?: WireTailHygieneBaseline | null;
     boundary_present?: boolean;
     coverage_ordinal?: number | null;
@@ -678,9 +694,21 @@ export function buildStatusDetail(
         moduleStatus,
         compactionEnabled,
     );
+    const rustMode = config?.transform_mode === "rust";
+    const projectIdentity = rustMode ? resolveProjectIdentity(directory) : null;
+    const moduleMemoryAuthority = moduleStatus?.authority?.memories;
+    const moduleMemoryState = moduleMemoryAuthority?.state;
+    const moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
     const detail: StatusDetail = {
         ...base,
-        hostBackendsModuleSide: config?.transform_mode === "rust",
+        hostBackendsModuleSide: rustMode,
+        memoryMirror: rustMode ? getMemoryMirrorStatus(db, moduleFeedHead) : undefined,
+        memoryAuthorityMismatch:
+            rustMode &&
+            moduleStatus?.authority !== undefined &&
+            projectIdentity !== null &&
+            getAuthorityManagedMarker(db, projectIdentity) !== null &&
+            (moduleMemoryState === "TS" || moduleMemoryAuthority === null),
         activeProfile: typeof config?.profile === "string" ? config.profile : null,
         tagCounter: 0,
         activeTags: 0,

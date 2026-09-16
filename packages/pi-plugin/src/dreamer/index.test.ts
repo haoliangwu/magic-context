@@ -394,14 +394,84 @@ describe("Pi dreamer wiring", () => {
 			deferredBusy: [],
 			failed: [],
 			failureDetails: [],
-			details: [],
-			backlogBefore: { curate: { pending: 1, total: 1 } },
-			backlogAfter: { curate: { pending: 1, total: 1 } },
+			details: ["curate: ARCHITECTURE (1)"],
+			backlogBefore: {
+				curate: { pending: 1, total: 1, category: "ARCHITECTURE" },
+			},
+			backlogAfter: {
+				curate: { pending: 1, total: 1, category: "ARCHITECTURE" },
+			},
 		});
 
 		expect(capturedSystem).toContain(
 			"Write human-readable prose you author in: Spanish (Español).",
 		);
+	});
+
+	test("rotates the shared curate category scope in Pi prompts", async () => {
+		db = createDb();
+		const projectIdentity = "git:pi-curate-rotation";
+		const prompts: string[] = [];
+		__test.setStartDreamScheduleTimerFactory(async () => mock(() => {}));
+		__test.setPiSubagentRunnerFactory(
+			() =>
+				({
+					run: mock(async (args: { userMessage?: string }) => {
+						prompts.push(args.userMessage ?? "");
+						return { ok: true, assistantText: "curation complete" };
+					}),
+				}) as never,
+		);
+		const projectRule = insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "PROJECT_RULES",
+			content: "Pi project rule scope fixture.",
+		});
+		const architecture = insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "ARCHITECTURE",
+			content: "Pi architecture scope fixture.",
+		});
+		for (const category of [
+			"CONSTRAINTS",
+			"CONFIG_VALUES",
+			"NAMING",
+		] as const) {
+			insertMemory(db, {
+				projectPath: projectIdentity,
+				category,
+				content: `Pi ${category} scope fixture.`,
+			});
+		}
+		const opts = dreamerOptions({
+			database: db,
+			projectDir: process.cwd(),
+			projectIdentity,
+			config: DreamerConfigSchema.parse({
+				model: "test/model",
+				tasks: { curate: { schedule: "0 4 * * *" } },
+			}),
+		});
+		registerPiDreamerProject(opts);
+
+		await runPiDreamForProject(
+			projectIdentity,
+			"curate",
+			opts.registrationOwner,
+		);
+		await runPiDreamForProject(
+			projectIdentity,
+			"curate",
+			opts.registrationOwner,
+		);
+
+		expect(prompts).toHaveLength(2);
+		expect(prompts[0]).toContain("whole of the `PROJECT_RULES` category");
+		expect(prompts[0]).toContain(`[${projectRule.id}] PROJECT_RULES`);
+		expect(prompts[0]).not.toContain(`[${architecture.id}] ARCHITECTURE`);
+		expect(prompts[1]).toContain("whole of the `ARCHITECTURE` category");
+		expect(prompts[1]).toContain(`[${architecture.id}] ARCHITECTURE`);
+		expect(prompts[1]).not.toContain(`[${projectRule.id}] PROJECT_RULES`);
 	});
 
 	test("persists an OMP 18.1.11 dreamer task stream with tokens and task label", async () => {
@@ -542,7 +612,7 @@ describe("Pi dreamer wiring", () => {
 		expect(result.failed).toEqual([]);
 		expect(result.ran).toEqual(["curate"]);
 		expect(result.details).toEqual([
-			"curate: 1 memory operation applied (archive)",
+			"curate: PROJECT_RULES (1); curate: 1 memory operation applied (archive)",
 		]);
 	});
 
@@ -1119,6 +1189,12 @@ describe("Pi dreamer wiring", () => {
 		const owner = {};
 		const leaseKey = leaseKeyFor("curate", projectIdentity);
 		const blocker = "manual-lease-blocker";
+		insertMemory(db, {
+			projectPath: projectIdentity,
+			category: "PROJECT_RULES",
+			content:
+				"Keep the owner-drain lease test scoped to runnable curate work.",
+		});
 		expect(acquireLease(db, blocker, leaseKey)).toBe(true);
 		registerPiDreamerProject(
 			dreamerOptions({

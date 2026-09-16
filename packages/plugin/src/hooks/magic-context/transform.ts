@@ -144,6 +144,8 @@ import {
 } from "./transform-operations";
 import {
     abortSessionFailClosed,
+    type CompactionMarkerStrategy,
+    defaultCompactionMarkerStrategy,
     evaluateEmergencyFailClosed,
     runPostTransformPhase,
 } from "./transform-postprocess-phase";
@@ -525,6 +527,17 @@ export function scheduleTsAuthorityRecovery(args: {
 }
 
 export interface TransformDeps {
+    hiddenCompletionExecutor?: import("./compartment-runner-types").HiddenCompletionExecutor;
+    /** Host marker lifecycle; omission preserves OpenCode 1 marker writes and replay. */
+    compactionMarkerStrategy?: CompactionMarkerStrategy & {
+        setPending?: typeof import("../../features/magic-context/storage").setPendingCompactionMarkerState;
+        publish?: typeof import("./compaction-marker-manager").updateCompactionMarkerAfterPublication;
+    };
+    /** Host storage and cancellation adapters; omitted callbacks retain OpenCode 1 behavior. */
+    hostRawMessages?: typeof readRawSessionMessages;
+    hostProtectedTailBoundary?: typeof resolveOpenCodeProtectedTailBoundary;
+    hostModelFallback?: typeof findLastAssistantModelFromOpenCodeDb;
+    hostRefuse?: typeof abortSessionFailClosed;
     tagger: Tagger;
     scheduler: Scheduler;
     contextUsageMap: Map<
@@ -713,7 +726,23 @@ export interface TransformDeps {
     rustMemorySyncRequestedSessions?: Set<string>;
 }
 
+export function resolveTransformHostSeams(
+    deps: Pick<
+        TransformDeps,
+        "hostRawMessages" | "hostProtectedTailBoundary" | "hostModelFallback" | "hostRefuse"
+    >,
+) {
+    return {
+        hostRawMessages: deps.hostRawMessages ?? readRawSessionMessages,
+        hostProtectedTailBoundary:
+            deps.hostProtectedTailBoundary ?? resolveOpenCodeProtectedTailBoundary,
+        hostModelFallback: deps.hostModelFallback ?? findLastAssistantModelFromOpenCodeDb,
+        hostRefuse: deps.hostRefuse ?? abortSessionFailClosed,
+    };
+}
+
 export function createTransform(deps: TransformDeps) {
+    const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
     const rustModeTransform =
         deps.transformMode === "rust" && deps.rustModeModuleClient
@@ -766,7 +795,7 @@ export function createTransform(deps: TransformDeps) {
 
         const db = deps.db;
         if (deps.client !== undefined) {
-            scheduleReconciliation(db, sessionId, readRawSessionMessages);
+            scheduleReconciliation(db, sessionId, host.hostRawMessages);
         }
 
         const tUserMsg = performance.now();
@@ -1001,7 +1030,7 @@ export function createTransform(deps: TransformDeps) {
             fullFeatureMode &&
             !compactionOff &&
             historianRunnable &&
-            deps.client !== undefined &&
+            (deps.client !== undefined || deps.hiddenCompletionExecutor !== undefined) &&
             compartmentDirectory.length > 0;
         const fallbackModelId = deps.getFallbackModelId?.(sessionId);
 
@@ -1307,7 +1336,7 @@ export function createTransform(deps: TransformDeps) {
         // deliberately fall through to the live-usage path inside the resolver.
         let modelForBudget = deps.liveModelBySession?.get(sessionId);
         if (!modelForBudget) {
-            const recovered = findLastAssistantModelFromOpenCodeDb(sessionId);
+            const recovered = host.hostModelFallback(sessionId);
             if (recovered) {
                 modelForBudget = recovered;
                 // Seed the live map so the scheduler / notification / sidebar
@@ -1457,7 +1486,7 @@ export function createTransform(deps: TransformDeps) {
         ): ProtectedTailBoundarySnapshot | null => {
             if (!canRunCompartments) return null;
             if (_boundarySnapshotCache === undefined || emergencyTailScale) {
-                const snapshot = resolveOpenCodeProtectedTailBoundary({
+                const snapshot = host.hostProtectedTailBoundary({
                     db,
                     sessionId: resolvedSessionId,
                     mode: "transform-force",
@@ -1503,7 +1532,7 @@ export function createTransform(deps: TransformDeps) {
             }
             if (
                 !canRunCompartments ||
-                !deps.client ||
+                (!deps.client && !deps.hiddenCompletionExecutor) ||
                 !boundarySnapshot ||
                 !hasRunnableCompartmentWindow(boundarySnapshot)
             ) {
@@ -1516,6 +1545,8 @@ export function createTransform(deps: TransformDeps) {
             updateSessionMeta(db, sessionId, { compartmentInProgress: true });
             startCompartmentAgent({
                 client: deps.client,
+                hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
+                compactionMarkerStrategy: deps.compactionMarkerStrategy,
                 db,
                 sessionId,
                 historianChunkTokens: deps.getHistorianChunkTokens?.() ?? 20_000,
@@ -2080,6 +2111,8 @@ export function createTransform(deps: TransformDeps) {
         const rawGetNotifParams = deps.getNotificationParams;
         const tCompartmentPhase = performance.now();
         const compartmentPhase = await runCompartmentPhase({
+            hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
+            compactionMarkerStrategy: deps.compactionMarkerStrategy,
             canRunCompartments,
             fullFeatureMode,
             compactionOff,
@@ -2251,6 +2284,8 @@ export function createTransform(deps: TransformDeps) {
 
         const tPostProcess = performance.now();
         const postTransformResult = await runPostTransformPhase({
+            compactionMarkerStrategy:
+                deps.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy,
             sessionId,
             db,
             messages,
@@ -2445,7 +2480,7 @@ export function createTransform(deps: TransformDeps) {
                     );
                 }
                 try {
-                    await abortSessionFailClosed(deps.client, sessionId);
+                    await host.hostRefuse(deps.client, sessionId);
                 } catch (error) {
                     sessionLog(
                         sessionId,

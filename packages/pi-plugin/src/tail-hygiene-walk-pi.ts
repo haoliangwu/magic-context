@@ -16,7 +16,7 @@ const MAX_CONTENT_MEMO_ENTRIES = 100_000;
 const MAX_CONTENT_MEMO_BYTES = 64 * 1024 * 1024;
 const contentMemo = new Map<
 	string,
-	{ hash: string; tokens: number; keyBytes: number }
+	{ hash: string; tokens: number | undefined; keyBytes: number }
 >();
 let contentMemoBytes = 0;
 const FNV1A_32_OFFSET = 0x811c9dc5;
@@ -92,13 +92,13 @@ function safeStableStringify(value: unknown): string {
 function memoizedContent(
 	kind: TailHygienePartKind,
 	content: string,
-): { hash: string; tokens: number } {
+): { hash: string; tokens: number | undefined } {
 	const key = `${kind}\0${content}`;
 	const cached = contentMemo.get(key);
 	if (cached) return cached;
 	const measured = {
 		hash: fnv1a32(key),
-		tokens: kind === "excluded" ? 0 : estimateTokens(content),
+		tokens: kind === "excluded" ? 0 : undefined,
 		keyBytes: key.length * 2 + 32,
 	};
 	contentMemo.set(key, measured);
@@ -117,7 +117,11 @@ function memoizedContent(
 }
 
 function memoizedTokens(kind: TailHygienePartKind, content: string): number {
-	return memoizedContent(kind, content).tokens;
+	const measured = memoizedContent(kind, content);
+	if (measured.tokens === undefined) {
+		measured.tokens = estimateTokens(content);
+	}
+	return measured.tokens;
 }
 
 function partHash(kind: TailHygienePartKind, content: string): string {

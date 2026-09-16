@@ -13,7 +13,7 @@ import {
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { evaluateTaskGate, getDreamTaskBacklog } from "./task-gates";
-import { processedDreamTaskItems } from "./task-registry";
+import { formatDreamTaskBacklogs, processedDreamTaskItems } from "./task-registry";
 
 let db: Database | null = null;
 
@@ -136,10 +136,15 @@ describe("dream task backlog probes", () => {
             pending: 1,
             total: 1,
         });
-        expect(getDreamTaskBacklog(db, projectIdentity, "curate")).toEqual({
-            pending: 3,
-            total: 3,
+        const curateBacklog = getDreamTaskBacklog(db, projectIdentity, "curate");
+        expect(curateBacklog).toEqual({
+            pending: 2,
+            total: 2,
+            category: "PROJECT_RULES",
         });
+        expect(formatDreamTaskBacklogs({ curate: curateBacklog }, ["curate"])).toBe(
+            "- curate: PROJECT_RULES (2)",
+        );
         expect(getDreamTaskBacklog(db, projectIdentity, "compress-cues")).toEqual({
             pending: 3,
             total: 3,

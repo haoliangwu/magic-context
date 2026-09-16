@@ -49,6 +49,8 @@ export function statusSummaryFromDetail(detail: StatusDetail): UserStatusSummary
     if ((detail.loggerDiagnostics?.swallowedWriteCount ?? 0) > 0) {
         warnings.push("status_log_unavailable");
     }
+    if (detail.memoryMirror?.stalled) warnings.push("memory_mirror_stalled");
+    if (detail.memoryAuthorityMismatch) warnings.push("memory_authority_mismatch");
 
     return {
         inputTokens: detail.inputTokens,

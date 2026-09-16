@@ -18,7 +18,7 @@ function manifestWith(entries: ModeManifest["entries"]): ModeManifest {
 
 describe("mode manifest validator", () => {
     it("covers every live e2e test exactly once", () => {
-        expect(validation.files.length).toBe(73);
+        expect(validation.files.length).toBe(83);
         expect(validation.manifest.entries).toHaveLength(validation.files.length);
         expect(new Set(validation.manifest.entries.map((entry) => entry.path)).size).toBe(
             validation.files.length,
@@ -30,7 +30,7 @@ describe("mode manifest validator", () => {
         const ts = filesForMode(validation, "ts");
         const rust = filesForMode(validation, "rust");
         expect(ts).toHaveLength(44);
-        expect(rust).toHaveLength(37);
+        expect(rust).toHaveLength(38);
         expect(ts.filter((path) => path.startsWith("tests/pi-")).length).toBe(22);
         expect(filesForMode(validation, "ts", "opencode")).toHaveLength(22);
         expect(filesForMode(validation, "ts", "pi")).toHaveLength(22);
@@ -38,6 +38,15 @@ describe("mode manifest validator", () => {
             .filter((entry) => entry.tier === "excluded")
             .map((entry) => entry.path);
         expect([...excluded].sort()).toEqual([
+            "tests/opencode2/adapters-s2-contracts.test.ts",
+            "tests/opencode2/adapters-s3-marker-policy.test.ts",
+            "tests/opencode2/automatic-s3-paths.test.ts",
+            "tests/opencode2/context-s2-lanes.test.ts",
+            "tests/opencode2/entry-s2-context.test.ts",
+            "tests/opencode2/fold-s3-owner.test.ts",
+            "tests/opencode2/harness-s3-identity.test.ts",
+            "tests/opencode2/hidden-s3-executor.test.ts",
+            "tests/opencode2/marker-s3-runtime.test.ts",
             "tests/opencode2/pins.test.ts",
             "tests/opencode2/probes.test.ts",
             "tests/opencode2/runner.test.ts",

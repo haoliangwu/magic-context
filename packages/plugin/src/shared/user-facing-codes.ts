@@ -177,6 +177,16 @@ export const USER_FACING_FAILURES = {
         sentence: "Magic Context is temporarily unavailable.",
         action: "Retry in a moment.",
     },
+    memory_mirror_stalled: {
+        code: "MC-M01",
+        sentence: "Memory synchronization stopped before the host mirror caught up.",
+        action: "Send another message to resume it, or run `ck doctor drain-authority`.",
+    },
+    memory_authority_mismatch: {
+        code: "MC-M02",
+        sentence: "Memory authority is inconsistent between the host and module.",
+        action: "Run `ck doctor drain-authority` before changing Rust mode.",
+    },
 } as const;
 
 export type UserFacingFailureKey = keyof typeof USER_FACING_FAILURES;

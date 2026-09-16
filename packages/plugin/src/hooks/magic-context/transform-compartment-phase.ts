@@ -12,6 +12,10 @@ import {
     getActiveCompartmentRun,
     startCompartmentAgent,
 } from "./compartment-runner";
+import type {
+    HiddenCompartmentRunnerDeps,
+    HiddenCompletionExecutor,
+} from "./compartment-runner-types";
 import { BLOCK_UNTIL_DONE_PERCENTAGE } from "./compartment-trigger";
 import {
     type PreparedCompartmentInjection,
@@ -28,6 +32,8 @@ import { sendStatusNotification } from "./send-session-notification";
 import type { MessageLike } from "./transform-operations";
 
 interface RunCompartmentPhaseArgs {
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    compactionMarkerStrategy?: HiddenCompartmentRunnerDeps["compactionMarkerStrategy"];
     canRunCompartments: boolean;
     fullFeatureMode: boolean;
     /** Compaction-off mode (issue #266): no historian start, no 95% block,
@@ -330,7 +336,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             );
             updateSessionMeta(args.db, args.sessionId, { compartmentInProgress: false });
             compartmentInProgress = false;
-        } else if (!args.client) {
+        } else if (!args.client && !args.hiddenCompletionExecutor) {
             sessionLog(args.sessionId, "transform: cannot start compartment agent without client");
             updateSessionMeta(args.db, args.sessionId, { compartmentInProgress: false });
             compartmentInProgress = false;
@@ -338,6 +344,8 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             sessionLog(args.sessionId, "transform: compartmentInProgress flag set, starting agent");
             startCompartmentAgent({
                 client: args.client,
+                hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+                compactionMarkerStrategy: args.compactionMarkerStrategy,
                 db: args.db,
                 sessionId: args.sessionId,
                 historianChunkTokens: args.historianChunkTokens,
@@ -378,13 +386,19 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         args.contextUsage.percentage >= BLOCK_UNTIL_DONE_PERCENTAGE
     ) {
         let activeRun = getActiveCompartmentRun(args.sessionId);
-        if (!activeRun && hasEligibleHistoryForCompartment() && args.client) {
+        if (
+            !activeRun &&
+            hasEligibleHistoryForCompartment() &&
+            (args.client || args.hiddenCompletionExecutor)
+        ) {
             sessionLog(
                 args.sessionId,
                 `transform: 95% reached (${args.contextUsage.percentage.toFixed(1)}%), force-starting compartment agent and blocking`,
             );
             startCompartmentAgent({
                 client: args.client,
+                hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+                compactionMarkerStrategy: args.compactionMarkerStrategy,
                 db: args.db,
                 sessionId: args.sessionId,
                 historianChunkTokens: args.historianChunkTokens,

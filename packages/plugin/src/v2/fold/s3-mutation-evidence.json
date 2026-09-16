@@ -1,0 +1,142 @@
+[
+  {
+    "control": "same-watermark replay",
+    "expected_red": "R3a same-watermark provisional firing replays submitted SHA without materializing",
+    "captured_output": "(fail) R3a same-watermark provisional firing replays submitted SHA without materializing [1.11ms]",
+    "applied_evidence": "packages/plugin/src/v2/fold/owner.ts: during=packages/plugin/src/v2/fold/owner.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "later provisional supersession",
+    "expected_red": "R3a later provisional watermark supersedes the earlier fold",
+    "captured_output": "(fail) R3a later provisional watermark supersedes the earlier fold [0.43ms]",
+    "applied_evidence": "packages/plugin/src/v2/fold/owner.ts: during=packages/plugin/src/v2/fold/owner.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "boot actual-cut binding",
+    "expected_red": "R3a boot rebinds persisted provisional to actual cut and pins render separately",
+    "captured_output": "(fail) R3a boot rebinds persisted provisional to actual cut and pins render separately [0.56ms]",
+    "applied_evidence": "packages/plugin/src/v2/fold/owner.ts: during=packages/plugin/src/v2/fold/owner.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "cut-before-watermark refusal",
+    "expected_red": "R3a cut before provisional watermark is a HARD divergence and is not bound",
+    "captured_output": "(fail) R3a cut before provisional watermark is a HARD divergence and is not bound [0.69ms]",
+    "applied_evidence": "packages/plugin/src/v2/fold/owner.ts: during=packages/plugin/src/v2/fold/owner.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "local same-cut replay",
+    "expected_red": "R3 local same-cut replay and later-cut fresh materialization",
+    "captured_output": "(fail) R3 local same-cut replay and later-cut fresh materialization [0.64ms]",
+    "applied_evidence": "packages/plugin/src/v2/fold/owner.ts: during=packages/plugin/src/v2/fold/owner.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "render divergence notification",
+    "expected_red": "I8 mutated host render forces one HARD and never replaces the pinned identity",
+    "captured_output": "(fail) I8 mutated host render forces one HARD and never replaces the pinned identity [0.69ms]",
+    "applied_evidence": "packages/plugin/src/v2/fold/owner.ts: during=packages/plugin/src/v2/fold/owner.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "stable raw ordinals",
+    "expected_red": "R39 post-fold raw window retains pre-fold ordinals",
+    "captured_output": "(fail) R39 post-fold raw window retains pre-fold ordinals [0.36ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/store.ts: during=packages/plugin/src/v2/hooks/store.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "unarchived source restoration",
+    "expected_red": "I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail",
+    "captured_output": "(fail) I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail [2429.99ms]",
+    "applied_evidence": "packages/plugin/src/v2/fold/restore.ts: during=packages/plugin/src/v2/fold/restore.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "baseline-only host summary",
+    "expected_red": "I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail",
+    "captured_output": "(fail) I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail [2631.51ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/context.ts: during=packages/plugin/src/v2/hooks/context.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "zero host compaction requests",
+    "expected_red": "I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail",
+    "captured_output": "(fail) I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail [2724.15ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/context.ts: during=packages/plugin/src/v2/hooks/context.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "HARD rendered checkpoint update",
+    "expected_red": "I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail",
+    "captured_output": "(fail) I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail [3817.24ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/context.ts: during=packages/plugin/src/v2/hooks/context.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "all four marker counters",
+    "expected_red": "I10 real-host counters: v2 fold plus historian publication plus ten turns invoke no v1 marker members; v1 control invokes all four",
+    "captured_output": "(fail) I10 real-host counters: v2 fold plus historian publication plus ten turns invoke no v1 marker members; v1 control invokes all four [5204.21ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/context.ts: during=packages/plugin/src/v2/hooks/context.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "organic historian availability",
+    "expected_red": "R36 automatic pressure schedules one historian generate on real GA without a test hook",
+    "captured_output": "(fail) R36 automatic pressure schedules one historian generate on real GA without a test hook [18508.78ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/context.ts: during=packages/plugin/src/v2/hooks/context.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "organic dream event carrier",
+    "expected_red": "R22 automatic execution-ended event dispatches due classify through real GA generate",
+    "captured_output": "(fail) R22 automatic execution-ended event dispatches due classify through real GA generate [17018.76ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/dream-trigger.ts: during=packages/plugin/src/v2/hooks/dream-trigger.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "compress-cues executor transport",
+    "expected_red": "R38 compress-cues executes one metered generate and applies its cue on real GA",
+    "captured_output": "(fail) R38 compress-cues executes one metered generate and applies its cue on real GA [1781.51ms]",
+    "applied_evidence": "packages/plugin/src/features/magic-context/mural/compress-cues.ts: during=packages/plugin/src/features/magic-context/mural/compress-cues.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "calibrated own system",
+    "expected_red": "R33 calibration: v1 child and v2 own/session-system arms preserve prompt bytes and record validator verdicts",
+    "captured_output": "(fail) R33 calibration: v1 child and v2 own/session-system arms preserve prompt bytes and record validator verdicts [6997.13ms]",
+    "applied_evidence": "packages/plugin/src/v2/hidden-completion.ts: during=packages/plugin/src/v2/hidden-completion.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "restored defer byte stability",
+    "expected_red": "I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail",
+    "captured_output": "",
+    "applied_evidence": "packages/plugin/src/v2/fold/restore.ts: during=packages/plugin/src/v2/fold/restore.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "undefended"
+  },
+  {
+    "control": "restored defer metadata stability",
+    "expected_red": "I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail",
+    "captured_output": "(fail) I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail [2233.65ms]",
+    "applied_evidence": "packages/plugin/src/v2/fold/restore.ts: during=packages/plugin/src/v2/fold/restore.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "SOFT mutation gate",
+    "expected_red": "I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail",
+    "captured_output": "(fail) I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail [2853.10ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/context.ts: during=packages/plugin/src/v2/hooks/context.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  },
+  {
+    "control": "persisted render pin",
+    "expected_red": "I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail",
+    "captured_output": "(fail) I6a I7 I8 I9 R39 provider: host fold costs zero requests and restores unarchived tail [4257.36ms]",
+    "applied_evidence": "packages/plugin/src/v2/hooks/context.ts: during=packages/plugin/src/v2/hooks/context.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after=empty git diff --stat",
+    "outcome": "reddened"
+  }
+]

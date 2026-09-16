@@ -58,6 +58,11 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 - Contains: Hook wrappers, tool registry setup, RPC handlers, dream-timer lifecycle, conflict-warning delivery, per-session hook construction, boot quiet period enforcement, whole-server boot deadline coordination, and tool backend overrides for Rust mode.
 - Key files: `src/plugin/messages-transform.ts`, `src/plugin/event.ts`, `src/plugin/tool-registry.ts`, `src/plugin/hooks/create-session-hooks.ts`, `src/plugin/rpc-handlers.ts`, `src/plugin/dream-timer.ts`, `src/plugin/conflict-warning-hook.ts`, `src/plugin/boot-quiet.ts`, `src/plugin/boot-deadline.ts`, `src/plugin/rust-tool-backends.ts`
 
+**`src/v2/`:**
+- Purpose: Adapt the shared transform core to the OpenCode 2 host (`setup` entry, `session.hook("context")` / `compaction`, `tool.hook`) without the v1 child-session historian/dream executors.
+- Contains: v2 server entry, payload projection, GA store reader, refusal guard, Channel 2 delivery, update checks, hidden-completion executor seam over host `generate`, host-owned fold/checkpoint tracking with inert v1 markers, dream-trigger wakeups off execution events, and the absence-pinning server test.
+- Key files: `src/v2/server.ts` (built to `dist/v2/server.js` via `build:v2`), `src/v2/hooks/context.ts`, `src/v2/hooks/payload.ts`, `src/v2/store-reader.ts`, `src/v2/hooks/store.ts`, `src/v2/hooks/types.ts`, `src/v2/hooks/refusal.ts`, `src/v2/hooks/channel2.ts`, `src/v2/hooks/update-check.ts`, `src/v2/hooks/dream-trigger.ts`, `src/v2/hidden-completion.ts`, `src/v2/fold/owner.ts`, `src/v2/fold/restore.ts`, `src/v2/fold/markers.ts`, `src/v2/executor-seam-proof.md`, `src/v2/server.test.ts`
+
 **`src/hooks/`:**
 - Purpose: Hold hook implementations and hook-specific helpers.
 - Contains: The `magic-context` runtime, the auto-update checker, Desktop stripped command interception, and the Rust-mode execution adapter.
@@ -112,7 +117,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` and Rust paths are relative to the project root.
 
 **Entry Points:**
-- `src/index.ts`: Register the plugin, hidden agents (`historian`, `historian-editor`, `dreamer`), hooks, commands, tools, RPC server, dream-schedule timer, and the auto-update checker.
+- `src/index.ts`: Register the plugin, hidden agents (`historian`, `historian-editor`, `dreamer`), hooks, commands, tools, RPC server, dream-schedule timer, and the auto-update checker. Default-export both host shapes: the v1 `{ id, server }` object and the v2 `setup` lane from `src/v2/server.ts`; keep the v2 entry inert on v1 hosts (no `./server` export, no root `server.js`, pinned by `src/v2/server.test.ts`).
 - `packages/plugin/src/plugin/boot-deadline.ts`: Coordinate whole-server plugin boot initialization under a 15s deadline (`BOOT_SERVER_DEADLINE_MS`) with per-phase timing attribution and late-settling hooks adoption.
 - `src/tui/index.tsx`: Register TUI command-palette entries and the sidebar slot for OpenCode TUI.
 - `packages/cli/src/index.ts`: Unified setup/doctor/migrate entry for the separate `@cortexkit/magic-context` package.
@@ -203,7 +208,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/compaction-off-transition.ts`: Reconcile per-session compaction mode records and process off/on mode transitions.
 - `src/hooks/magic-context/child-session-spawn.ts`: Enforce child session spawn choke point with schema fence validation.
 - `src/shared/escalation-bands.ts`: Derive context limit escalation bands and threshold bounds.
-- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v82 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
+- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v84 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
 - `src/features/magic-context/message-index.ts`: FTS-backed raw-message index for `ctx_search` and orphan session sweep candidate discovery across session-scoped tables.
 - `src/features/magic-context/search.ts`: Unified retrieval over memories, raw messages, git commits, and session/smart notes, surfacing structured suppression diagnostics for visible memories, live-tail matches, and git repository availability.
 - `src/features/magic-context/session-project-storage.ts`: Persist session-to-project bindings and repair mis-scoped compartment chunk embeddings.
@@ -255,7 +260,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `crates/mc-module/src/differential_goldens.rs`: Validate in-process Rust transform outputs against TS-generated wire fixtures (DG-1..3 goldens).
 - `crates/mc-module/src/bin/mc-caveman-live-differ.rs`: Privacy-preserving stdin/stdout caveman differ binary used by live transform parity audits.
 
-**Tests:** Co-locate tests with source as `src/**/*.test.ts`, for example `src/hooks/magic-context/hook.test.ts`, `src/tools/ctx-memory/tools.test.ts`, and `src/features/magic-context/migrations-v11.test.ts`. End-to-end coverage lives in the separate `packages/e2e-tests/` workspace (including paired-session replay instruments in `packages/e2e-tests/src/paired-session-replay.ts`, differential defer replay verification in `packages/e2e-tests/scripts/pure-replay-differential.ts`, and maintenance contract drills).
+**Tests:** Co-locate tests with source as `src/**/*.test.ts`, for example `src/hooks/magic-context/hook.test.ts`, `src/tools/ctx-memory/tools.test.ts`, and `src/features/magic-context/migrations-v11.test.ts`. End-to-end coverage lives in the separate `packages/e2e-tests/` workspace (including paired-session replay instruments in `packages/e2e-tests/src/paired-session-replay.ts`, differential defer replay verification in `packages/e2e-tests/scripts/pure-replay-differential.ts`, the hermetic OpenCode 2 lane in `packages/e2e-tests/tests/opencode2/` with its runner in `packages/e2e-tests/src/opencode2-runner/`, and maintenance contract drills). OpenCode 2 lane files are excluded from the v1 manifest invocation via `packages/e2e-tests/mode-manifest.json`.
 
 ## Naming Conventions
 

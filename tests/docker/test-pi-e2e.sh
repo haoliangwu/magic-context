@@ -72,8 +72,13 @@ check "magic-context doctor --harness pi --force exits with a Doctor summary" \
 check "Pi user config created at ~/.config/cortexkit/magic-context.jsonc" \
     "test -f $HOME/.config/cortexkit/magic-context.jsonc"
 
-check "Pi settings.json registered the magic-context package" \
-    "grep -q 'pi-magic-context' $HOME/.pi/agent/settings.json"
+# The image registers the plugin as a local checkout (`/test/mc-pi`), so the
+# npm specifier must NOT be added beside it; doctor's own registration verdict
+# is the contract, not the presence of the npm string in settings.json.
+check "doctor sees the magic-context package registered (local checkout counts)" \
+    "echo \"\$DOCTOR_OUT\" | grep -q 'is registered in packages'"
+check "doctor did not add the npm entry beside the local checkout" \
+    "! grep -q 'npm:@cortexkit/pi-magic-context' $HOME/.pi/agent/settings.json"
 
 # Doctor should report Pi version meets the 0.71.0 floor (we installed
 # >= 0.71.0 in the Dockerfile).

@@ -81,6 +81,10 @@ import {
 } from "./ctx-reduce-availability";
 import type { Channel1State } from "./ctx-reduce-nudge";
 import { dropStaleReduceCalls } from "./drop-stale-reduce-calls";
+import {
+    type DroppedTokenReduction,
+    estimateDroppedTokensFromTagReductions,
+} from "./dropped-token-estimate";
 import { foldExecutesThisPass } from "./fold-execution-gate";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
 import {
@@ -826,7 +830,18 @@ export function clearPendingCompactionMarkerAfterSuccessfulDrain(args: {
     return "cas-lost-already-cleared";
 }
 
+export interface CompactionMarkerStrategy {
+    applyDeferred: typeof applyDeferredCompactionMarker;
+    reconcile: typeof reconcileMarkerRepresentation;
+}
+
+export const defaultCompactionMarkerStrategy: CompactionMarkerStrategy = {
+    applyDeferred: applyDeferredCompactionMarker,
+    reconcile: reconcileMarkerRepresentation,
+};
+
 interface RunPostTransformPhaseArgs {
+    compactionMarkerStrategy?: CompactionMarkerStrategy;
     sessionId: string;
     db: ContextDatabase;
     messages: MessageLike[];
@@ -983,6 +998,7 @@ export interface PostTransformPhaseResult {
     m0ModelKeyNew: string | null;
     m0ToolSetHashPrev: string | null;
     m0ToolSetHashNew: string | null;
+    /** Estimated nonnegative tokens removed by tag reductions first applied this pass. */
     droppedTokens: number;
     emergencyReclaimedTokens: number;
     droppedCount: number;
@@ -1494,12 +1510,7 @@ export async function runPostTransformPhase(
     let heuristicOrReasoningDidMutate = false;
     let droppedCount = 0;
     let droppedTokens = 0;
-    // Measure reduction deltas before history injection adds new prefix bytes.
-    // This is a local estimate, not a provider-reported billing token count.
-    const tokensBeforeReductions =
-        isCacheBustingPass || shouldApplyPendingOps
-            ? estimateTokens(JSON.stringify(args.messages))
-            : 0;
+    const droppedTokenReductions: DroppedTokenReduction[] = [];
     let emergencyReclaimedTokens = 0;
     let emergency = false;
     let m0M1InjectedThisPass = false;
@@ -1548,6 +1559,9 @@ export async function runPostTransformPhase(
                     : args.protectedTagIds,
                 undefined,
                 pendingOps,
+                [],
+                new Set(),
+                (reduction) => droppedTokenReductions.push(reduction),
             );
             if (pendingOpsDidMutate) {
                 rideSignals.agentDrop = true;
@@ -1661,6 +1675,10 @@ export async function runPostTransformPhase(
                     compressedTextTags:
                         cleanup.compressedTextTags + ridingCleanup.compressedTextTags,
                     mutatedTextTags: cleanup.mutatedTextTags + ridingCleanup.mutatedTextTags,
+                    droppedTokenReductions: [
+                        ...cleanup.droppedTokenReductions,
+                        ...ridingCleanup.droppedTokenReductions,
+                    ],
                 };
                 routineCleanupApplied = true;
             }
@@ -1685,6 +1703,7 @@ export async function runPostTransformPhase(
                 cleanup.mutatedTextTags;
             emergency ||= cleanup.emergencyDroppedTools > 0;
             emergencyReclaimedTokens += cleanup.emergencyReclaimedTokens;
+            droppedTokenReductions.push(...cleanup.droppedTokenReductions);
             const t7 = performance.now();
             // Typed reasoning clearing is canonical-Anthropic-only. clearOldReasoning
             // rewrites a reasoning part's `thinking`/`text` to "[cleared]"; only
@@ -1834,6 +1853,7 @@ export async function runPostTransformPhase(
                     [],
                     syntheticPendingOps,
                     editMarkerTagIds,
+                    (reduction) => droppedTokenReductions.push(reduction),
                 );
                 if (autoReclaimDidMutate) {
                     droppedCount += syntheticPendingOps.length;
@@ -1879,9 +1899,10 @@ export async function runPostTransformPhase(
     }
 
     if (isCacheBustingPass) {
-        droppedTokens = Math.max(
-            0,
-            tokensBeforeReductions - estimateTokens(JSON.stringify(args.messages)),
+        droppedTokens = estimateDroppedTokensFromTagReductions(
+            args.db,
+            args.sessionId,
+            droppedTokenReductions,
         );
     }
 
@@ -2251,12 +2272,9 @@ export async function runPostTransformPhase(
                     `compaction-marker drain: pending ordinal ${pending.ordinal} is newer than consumed boundary ${args.pendingCompartmentInjection?.compartmentEndMessage ?? "<none>"}; preserving deferred history refresh signal`,
                 );
             } else {
-                const outcome = applyDeferredCompactionMarker(
-                    args.db,
-                    args.sessionId,
-                    pending,
-                    args.sessionDirectory,
-                );
+                const outcome = (
+                    args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy
+                ).applyDeferred(args.db, args.sessionId, pending, args.sessionDirectory);
                 switch (outcome.kind) {
                     case "applied":
                     case "already-current":
@@ -2298,13 +2316,17 @@ export async function runPostTransformPhase(
     // here has state to replay; leaving it live would re-insert a synthetic
     // summary into the wire of a mode that must stay additive-only.
     if (!compactionOff) {
-        reconcileMarkerRepresentation(args.messages, persistedCompactionMarkerState, {
-            db: args.db,
-            sessionId: args.sessionId,
-            tagger: args.tagger,
-            ctxReduceAvailability: args.ctxReduceAvailability,
-            isCacheBustingPass,
-        });
+        (args.compactionMarkerStrategy ?? defaultCompactionMarkerStrategy).reconcile(
+            args.messages,
+            persistedCompactionMarkerState,
+            {
+                db: args.db,
+                sessionId: args.sessionId,
+                tagger: args.tagger,
+                ctxReduceAvailability: args.ctxReduceAvailability,
+                isCacheBustingPass,
+            },
+        );
     }
 
     const deferredHistoryDrainEligible =

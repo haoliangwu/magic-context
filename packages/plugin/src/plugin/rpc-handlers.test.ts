@@ -898,6 +898,67 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
 });
 
 describe("buildStatusDetail — Rust host paths", () => {
+    test("surfaces a frozen non-frontier memory mirror from module and host evidence", () => {
+        const db = createTestDb();
+        try {
+            db.prepare(
+                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 3726, ?)",
+            ).run(Date.now() - 40_001);
+            db.prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES ('git:status', 1, 'ARCHITECTURE', 'hash')",
+            ).run();
+
+            const detail = buildStatusDetail(
+                db,
+                "ses-rust-mirror-stall",
+                process.cwd(),
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                { memory_mirror: { feed_head: 4850 } },
+            );
+
+            expect(detail.memoryMirror).toMatchObject({
+                cursor: 3726,
+                feedHead: 4850,
+                liveRows: 1,
+                pendingRows: 1124,
+                stalled: true,
+                code: "MC-M01",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("surfaces a host marker that disagrees with module authority status", () => {
+        const db = createTestDb();
+        try {
+            const directory = process.cwd();
+            const projectIdentity = resolveProjectIdentity(directory);
+            expect(projectIdentity).not.toBeNull();
+            db.prepare(
+                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, 'store', 1)",
+            ).run(projectIdentity);
+
+            const detail = buildStatusDetail(
+                db,
+                "ses-rust-authority-mismatch",
+                directory,
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                { authority: { memories: { project: projectIdentity ?? "", state: "TS" } } },
+            );
+
+            expect(detail.memoryAuthorityMismatch).toBe(true);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("marks host paths module-side only for Rust mode", () => {
         const db = createTestDb();
         try {

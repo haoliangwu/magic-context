@@ -1378,6 +1378,9 @@ describe("runCompartmentAgent", () => {
             query: { directory: "/tmp/parent" },
         });
         expect(promptSession.mock.calls[0]?.[0]?.body.agent).toBe("historian");
+        expect(
+            db.prepare("SELECT harness FROM historian_runs WHERE session_id = ?").all("ses-1"),
+        ).toEqual([{ harness: "opencode" }]);
     });
 
     it("keeps both chunk-edge compartments when emergency recovery is armed", async () => {

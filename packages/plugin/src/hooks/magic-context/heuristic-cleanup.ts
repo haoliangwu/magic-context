@@ -13,6 +13,7 @@ import {
 import type { TagEntry } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared";
 import { applyCavemanCleanup, type CavemanCleanupConfig } from "./caveman-cleanup";
+import type { DroppedTokenReduction } from "./dropped-token-estimate";
 import {
     type EmergencyDropTag,
     estimateEmergencyDropReclaimTokens,
@@ -79,6 +80,7 @@ export function applyHeuristicCleanup(
     emergencyReclaimedTokens: number;
     compressedTextTags: number;
     mutatedTextTags: number;
+    droppedTokenReductions: DroppedTokenReduction[];
 } {
     // All work in this function short-circuits on `tag.status !== "active"`,
     // so callers can pass active-only tags without behavior change. When no
@@ -95,6 +97,7 @@ export function applyHeuristicCleanup(
     let emergencyReclaimedTokens = 0;
     let deduplicatedTools = 0;
     let droppedInjections = 0;
+    const droppedTokenReductions: DroppedTokenReduction[] = [];
 
     // ── Tiered target-headroom emergency drop (Phase 2) ──
     // Replaces the old need-blind routine age-drop + `dropAllTools` nuke. Runs
@@ -164,6 +167,10 @@ export function applyHeuristicCleanup(
                         );
                         droppedTools++;
                         emergencyDroppedTools++;
+                        droppedTokenReductions.push({
+                            tagNumber: tag.tagNumber,
+                            mode: result === "removed" ? "full" : "truncated",
+                        });
                         emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(tag);
                     }
                 }
@@ -200,15 +207,26 @@ export function applyHeuristicCleanup(
 
                 if (strippedSource.trim().length === 0) {
                     const dropResult = target.drop?.() ?? "absent";
+                    const replacement = `[dropped §${tag.tagNumber}§]`;
                     const didReplace =
-                        dropResult === "absent"
-                            ? target.setContent(`[dropped §${tag.tagNumber}§]`)
-                            : false;
+                        dropResult === "absent" ? target.setContent(replacement) : false;
                     if (dropResult === "removed" || dropResult === "absent") {
                         replaceSourceContent(db, sessionId, tag.tagNumber, "");
                         updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
                         if (dropResult === "removed" || didReplace) {
                             droppedInjections++;
+                            droppedTokenReductions.push(
+                                dropResult === "removed"
+                                    ? { tagNumber: tag.tagNumber, mode: "full" }
+                                    : {
+                                          tagNumber: tag.tagNumber,
+                                          mode: "partial",
+                                          removedCharacters: Math.max(
+                                              0,
+                                              content.length - replacement.length,
+                                          ),
+                                      },
+                            );
                         }
                     }
                 } else {
@@ -216,6 +234,11 @@ export function applyHeuristicCleanup(
                     if (didSet) {
                         replaceSourceContent(db, sessionId, tag.tagNumber, strippedSource);
                         droppedInjections++;
+                        droppedTokenReductions.push({
+                            tagNumber: tag.tagNumber,
+                            mode: "partial",
+                            removedCharacters: Math.max(0, content.length - stripped.length),
+                        });
                     }
                 }
             }
@@ -274,6 +297,10 @@ export function applyHeuristicCleanup(
                     updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
                     if (result === "removed" || result === "truncated") {
                         deduplicatedTools++;
+                        droppedTokenReductions.push({
+                            tagNumber: tag.tagNumber,
+                            mode: result === "removed" ? "full" : "truncated",
+                        });
                     }
                 }
             }
@@ -305,6 +332,12 @@ export function applyHeuristicCleanup(
             cavemanResult.compressedToFull +
             cavemanResult.compressedToUltra;
         mutatedTextTags = cavemanResult.mutatedTextTags;
+        droppedTokenReductions.push(
+            ...cavemanResult.textReductions.map((reduction) => ({
+                ...reduction,
+                mode: "partial" as const,
+            })),
+        );
     }
 
     return {
@@ -315,6 +348,7 @@ export function applyHeuristicCleanup(
         emergencyReclaimedTokens,
         compressedTextTags,
         mutatedTextTags,
+        droppedTokenReductions,
     };
 }
 

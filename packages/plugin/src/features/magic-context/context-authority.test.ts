@@ -15,6 +15,7 @@ import {
     ensureContextStoreUuid,
     ensureLiveMemoryResnapshot,
     getAuthorityManagedMarker,
+    getMemoryMirrorStatus,
     getMirrorCursor,
     getModuleNoteEvaluationBridge,
     installAuthorityManagedMarker,
@@ -154,6 +155,97 @@ function protocol(seedCalls: { bytes: number[] }): AuthorityModuleClient {
 }
 
 describe("memory authority protocol", () => {
+    test("classifies a non-frontier cursor as stalled only after the frozen interval", () => {
+        const database = db();
+        database
+            .prepare(
+                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 3726, 1000)",
+            )
+            .run();
+        database
+            .prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES ('git:mirror', 1, 'ARCHITECTURE', 'hash')",
+            )
+            .run();
+
+        expect(getMemoryMirrorStatus(database, 4850, 40_999)).toMatchObject({
+            cursor: 3726,
+            feedHead: 4850,
+            liveRows: 1,
+            pendingRows: 1124,
+            cursorAgeMs: 39_999,
+            stalled: false,
+            code: null,
+        });
+        expect(getMemoryMirrorStatus(database, 4850, 41_000)).toMatchObject({
+            cursor: 3726,
+            pendingRows: 1124,
+            cursorAgeMs: 40_000,
+            stalled: true,
+            code: "MC-M01",
+        });
+        expect(getMemoryMirrorStatus(database, 3726, 100_000)).toMatchObject({
+            pendingRows: 0,
+            stalled: false,
+            code: null,
+        });
+        database.close();
+    });
+
+    test("clears module live-row residue after memory authority drains to TypeScript", async () => {
+        const database = db();
+        installAuthorityManagedMarker(database, "/repo");
+        database
+            .prepare(
+                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES ('/repo', 7, 'ARCHITECTURE', 'hash')",
+            )
+            .run();
+        let state: AuthorityStatus["state"] = "DRAINING";
+        const module: AuthorityModuleClient = {
+            authorityStatus: async (args) => ({
+                authority:
+                    args.domain === "memories"
+                        ? { ...authority(state, 1), domain: args.domain }
+                        : { ...authority("TS", 1), domain: args.domain },
+            }),
+            authorityPrepare: async () => ({ authority: authority("MODULE", 1) }),
+            authorityDrain: async (args) => {
+                if (args.action === "finish") state = "TS";
+                return {
+                    authority: {
+                        ...authority(state, 1),
+                        captured_upper_bound: 0,
+                        coordinator_token: "residue-drain-token",
+                    },
+                };
+            },
+            mirrorPull: async (args) => ({
+                page: {
+                    domain: args.domain,
+                    cursor: args.cursor,
+                    next_cursor: args.cursor,
+                    has_more: false,
+                    rows: [],
+                },
+            }),
+        };
+
+        await drainAuthority({
+            db: database,
+            projectPath: "/repo",
+            domain: "memories",
+            module,
+            checksum: "same",
+        });
+
+        expect(
+            database.prepare("SELECT COUNT(*) AS count FROM mirror_live_memory_rows").get(),
+        ).toEqual({
+            count: 0,
+        });
+        database.close();
+    });
+
     test("declares host-path routing once for each ownership transition", () => {
         resetAuthorityRoutingObservationsForTest();
         const logSpy = spyOn(logger, "log").mockImplementation(() => {});

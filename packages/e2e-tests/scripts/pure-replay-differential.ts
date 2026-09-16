@@ -7,8 +7,10 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	rmSync,
 	symlinkSync,
+	writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +31,7 @@ type RefReplay = {
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(SCRIPT_PATH), "../../..");
 const RESULT_PREFIX = "PURE_REPLAY_RESULT=";
+const tsOnly = Bun.argv.includes("--ts-only");
 
 function valueAfter(flag: string): string | undefined {
 	const index = Bun.argv.indexOf(flag);
@@ -42,12 +45,9 @@ function fullCommit(ref: string): string {
 	}).trim();
 }
 
-async function captureCurrentCheckout(
-	ref: string,
-	commit: string,
-): Promise<RefReplay> {
+async function createReplayHarness() {
 	const { RustTestHarness } = await import("../src/rust-harness");
-	const harness = await RustTestHarness.create({
+	const options = {
 		startInTsMode: true,
 		startHistorianProducer: false,
 		providerID: "anthropic",
@@ -59,7 +59,65 @@ async function captureCurrentCheckout(
 			memory: { auto_search: { enabled: false } },
 			compressor: { enabled: false },
 		},
-	});
+	} as const;
+	if (!tsOnly) return RustTestHarness.create(options);
+
+	// TS comparisons need no native daemon. Keep the original provider route
+	// and reuse the original capture methods, not a second wire serializer.
+	process.env.MC_E2E_MODE = "ts";
+	const { TestHarness } = await import("../src/harness");
+	const harness = await TestHarness.create(options);
+	try {
+		const path = join(harness.opencode.env.configDir, "opencode.json");
+		const config = JSON.parse(readFileSync(path, "utf8"));
+		config.provider[options.providerID] = config.provider["mock-anthropic"];
+		delete config.provider["mock-anthropic"];
+		config.model = `${options.providerID}/${options.modelID}`;
+		config.small_model = config.model;
+		config.enabled_providers = [options.providerID];
+		writeFileSync(path, JSON.stringify(config, null, 2));
+		const canonicalConfig = join(
+			harness.opencode.env.configDir,
+			"cortexkit/magic-context.jsonc",
+		);
+		const userConfig = existsSync(canonicalConfig)
+			? canonicalConfig
+			: join(harness.opencode.env.configDir, "opencode/magic-context.jsonc");
+		writeFileSync(
+			userConfig,
+			readFileSync(userConfig, "utf8").replaceAll(
+				"mock-anthropic/mock-sonnet",
+				`${options.providerID}/${options.modelID}`,
+			),
+		);
+		const { createOpencodeClient } = await import("@opencode-ai/sdk");
+		await createOpencodeClient({
+			baseUrl: harness.opencode.url,
+		}).instance.dispose({
+			query: { directory: harness.opencode.env.workdir },
+			throwOnError: true,
+		});
+		return {
+			mock: harness.mock,
+			createSession: () => harness.createSession(),
+			contextDb: () => harness.contextDb(),
+			sendPrompt: (sessionId: string, text: string) =>
+				harness.sendPrompt(sessionId, text, options),
+			dispose: () => harness.dispose(),
+			mainRequests: RustTestHarness.prototype.mainRequests,
+			lastMainWireSerialized: RustTestHarness.prototype.lastMainWireSerialized,
+		};
+	} catch (error) {
+		await harness.dispose();
+		throw error;
+	}
+}
+
+async function captureCurrentCheckout(
+	ref: string,
+	commit: string,
+): Promise<RefReplay> {
+	const harness = await createReplayHarness();
 	try {
 		const sessionId = await harness.createSession();
 		const db = harness.contextDb();
@@ -151,6 +209,7 @@ function captureRef(
 		process.execPath,
 		[
 			"packages/e2e-tests/scripts/pure-replay-differential.ts",
+			...(tsOnly ? ["--ts-only"] : []),
 			"--single-ref",
 			ref,
 			"--single-commit",
@@ -218,7 +277,7 @@ if (singleRef) {
 		.filter((argument) => !argument.startsWith("--"));
 	if (refs.length !== 2) {
 		console.error(
-			"usage: bun pure-replay-differential.ts <left-ref> <right-ref>",
+			"usage: bun pure-replay-differential.ts [--ts-only] <left-ref> <right-ref>",
 		);
 		process.exit(2);
 	}

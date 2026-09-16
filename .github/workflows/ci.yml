@@ -320,7 +320,11 @@ jobs:
           # ../subconscious source. The scheduled hosted drift job below covers
           # that private-source lane; never add it to pull_request.
           cd packages/e2e-tests
+          # A validator failure must fail the job, never fall through to an empty
+          # list: `bun test` with no files runs every file in the package.
+          set -o pipefail
           files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness opencode | tr '\n' ' ')
+          if [ -z "${files// /}" ]; then echo 'mode manifest selected no files'; exit 1; fi
            echo "Running OpenCode host tests from mode manifest: $files"
            # shellcheck disable=SC2086 # The repository-controlled file list must expand into Bun arguments.
            bun test --timeout 600000 $files
@@ -376,7 +380,11 @@ jobs:
           MC_E2E_MODE: ts
         run: |
           cd packages/e2e-tests
+          # A validator failure must fail the job, never fall through to an empty
+          # list: `bun test` with no files runs every file in the package.
+          set -o pipefail
           files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness pi | tr '\n' ' ')
+          if [ -z "${files// /}" ]; then echo 'mode manifest selected no files'; exit 1; fi
            echo "Running Pi host tests from mode manifest: $files"
            # shellcheck disable=SC2086 # The repository-controlled file list must expand into Bun arguments.
            bun test --timeout 600000 $files

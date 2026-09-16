@@ -1,8 +1,16 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
     AUTHORITY_DOMAINS,
     type AuthorityState,
 } from "@magic-context/core/features/magic-context/context-authority";
+import {
+    initializeDatabase,
+    runMigrations,
+} from "@magic-context/core/features/magic-context/storage";
+import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
 import { Database } from "@magic-context/core/shared/sqlite";
 
 import {
@@ -11,6 +19,7 @@ import {
     type MigrateSessionDeps,
     type MigrateSessionSafetyModule,
     planMigrateSession,
+    runMigrateSessionCli,
 } from "./migrate-session";
 
 const databases: Array<{ close(): void }> = [];
@@ -440,6 +449,96 @@ describe("applyMigrateSession — OpenCode + context re-stamp", () => {
             directory: string;
         };
         expect(row.directory).toBe("/home/u/benchmarks");
+    });
+});
+
+describe("runMigrateSessionCli subc configuration", () => {
+    it("constructs its transport with configured subc.connection_file", async () => {
+        const root = mkdtempSync(join(tmpdir(), "mc-migrate-session-cli-"));
+        const source = join(root, "source");
+        const target = join(root, "target");
+        const configHome = join(root, "config");
+        const testDataDir = join(root, "data");
+        const opencodeDbPath = join(root, "opencode.db");
+        const configuredConnectionFile = join(root, "configured-subc.json");
+        const originalConfigHome = process.env.XDG_CONFIG_HOME;
+        const originalDataHome = process.env.XDG_DATA_HOME;
+        const originalTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+        const originalOpencodeDb = process.env.OPENCODE_DB;
+        const connectionFiles: string[] = [];
+        const callSpy = spyOn(SubcModuleTransport.prototype, "call").mockImplementation(
+            async function () {
+                connectionFiles.push(
+                    (this as unknown as { connectionFile: string }).connectionFile,
+                );
+                return { row_version: null };
+            },
+        );
+        try {
+            mkdirSync(source, { recursive: true });
+            mkdirSync(target, { recursive: true });
+            mkdirSync(join(configHome, "cortexkit"), { recursive: true });
+            writeFileSync(
+                join(configHome, "cortexkit", "magic-context.jsonc"),
+                JSON.stringify({ subc: { connection_file: configuredConnectionFile } }),
+            );
+            process.env.XDG_CONFIG_HOME = configHome;
+            process.env.XDG_DATA_HOME = testDataDir;
+            process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
+            process.env.OPENCODE_DB = opencodeDbPath;
+
+            const opencodeDb = new Database(opencodeDbPath);
+            opencodeDb.exec(`
+                CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT,
+                    directory TEXT,
+                    path TEXT,
+                    workspace_id TEXT,
+                    title TEXT
+                );
+                CREATE TABLE project (
+                    id TEXT PRIMARY KEY,
+                    worktree TEXT NOT NULL
+                );
+                INSERT INTO project (id, worktree) VALUES ('global', '/');
+            `);
+            opencodeDb
+                .prepare("INSERT INTO session (id, project_id, directory) VALUES (?, 'global', ?)")
+                .run(SID, source);
+            opencodeDb.close();
+
+            const contextDbPath = join(testDataDir, "cortexkit", "magic-context", "context.db");
+            mkdirSync(join(testDataDir, "cortexkit", "magic-context"), { recursive: true });
+            const contextDb = new Database(contextDbPath);
+            initializeDatabase(contextDb);
+            runMigrations(contextDb);
+            contextDb.close();
+
+            expect(
+                await runMigrateSessionCli([
+                    "--session",
+                    SID,
+                    "--to",
+                    target,
+                    "--memories",
+                    "leave",
+                    "--dry-run",
+                ]),
+            ).toBe(0);
+            expect(connectionFiles).toEqual([configuredConnectionFile]);
+        } finally {
+            callSpy.mockRestore();
+            if (originalConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = originalConfigHome;
+            if (originalDataHome === undefined) delete process.env.XDG_DATA_HOME;
+            else process.env.XDG_DATA_HOME = originalDataHome;
+            if (originalTestDataDir === undefined) delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
+            else process.env.MAGIC_CONTEXT_TEST_DATA_DIR = originalTestDataDir;
+            if (originalOpencodeDb === undefined) delete process.env.OPENCODE_DB;
+            else process.env.OPENCODE_DB = originalOpencodeDb;
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 });
 

@@ -147,11 +147,19 @@ run_package_tests() {
   fail_lines=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* fail" || true)
   echo "  [$label] test process exit=$status summary_pass_lines=$pass_lines summary_fail_lines=$fail_lines output_lines=$(printf '%s\n' "$output" | wc -l | tr -d ' ')"
   echo "$output"
-  if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
+  # Decide from the counts computed above, never from `echo | grep -q`: under
+  # `set -o pipefail`, grep -q exits on its first match and closes the pipe while
+  # echo is still writing the remaining lines, echo dies with SIGPIPE (141), and
+  # the pipeline reports failure for a suite that printed "4851 pass" (v0.42.5 r1).
+  # `grep -c` consumes the whole stream, so the counts carry no such race.
+  # The counts above are anchored to Bun's summary lines (`^ *N pass` / `^ *N fail`);
+  # an unanchored "N fail" also matches test names such as "keeps below-95 failures",
+  # which the old grep -q form only hid because of the SIGPIPE race.
+  if [ "$fail_lines" -gt 0 ]; then
     echo "Error: $label tests failed (fail count > 0)"
     exit 1
   fi
-  if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
+  if [ "$pass_lines" -eq 0 ]; then
     echo "Error: $label tests produced no passing-test summary (crash, timeout, or zero tests collected)"
     exit 1
   fi
@@ -216,12 +224,16 @@ run_e2e_group() {
   # This matches the dedicated test:rust-e2e script's serial invocation.
   output=$(cd "$E2E_DIR" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 --max-concurrency=1 $files 2>&1) || status=$?
   echo "$output"
-  if echo "$output" | grep -qE "[1-9][0-9]* fail"; then
+  # Same SIGPIPE-safe counting as run_package_tests (see the note there).
+  local e2e_fail e2e_pass
+  e2e_fail=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* fail" || true)
+  e2e_pass=$(printf '%s\n' "$output" | grep -cE "^ *[1-9][0-9]* pass" || true)
+  if [ "$e2e_fail" -gt 0 ]; then
     echo "Error: e2e ($mode/$label) failed (fail count > 0)"
     echo "  [e2e:$mode:$label:end] status=fail"
     return 1
   fi
-  if ! echo "$output" | grep -qE "[1-9][0-9]* pass"; then
+  if [ "$e2e_pass" -eq 0 ]; then
     echo "Error: e2e ($mode/$label) produced no passing-test summary (crash, timeout, or zero tests collected)"
     echo "  [e2e:$mode:$label:end] status=fail"
     return 1
@@ -388,8 +400,24 @@ bun scripts/version-sync.mjs "$VERSION"
 echo ""
 
 # Step 4: Commit (skip if versions were already at target)
+# Stage only what this script produced (the version sync and the regenerated
+# artifacts the lint step just checked). `git add -A` once swept unrelated files
+# edited in the checkout during the long gate phase into a release commit
+# (v0.42.4); anything else dirty at this point is a foreign change and aborts.
 echo "→ Committing version bump..."
-git add -A
+git add -- packages/plugin/package.json packages/pi-plugin/package.json packages/cli/package.json \
+  assets/magic-context.schema.json \
+  packages/plugin/src/hooks/magic-context/reference-seeds.generated.ts
+if [ -n "$(git status --porcelain --untracked-files=no | grep -v '^[MARC] ')" ]; then
+  echo "Error: unrelated modified files present at bump time; refusing to fold them into the release commit:"
+  git status --porcelain --untracked-files=no | grep -v '^[MARC] '
+  # Cargo.lock is the common one: the rust e2e lane resolves the sibling subc
+  # checkout, so a sibling release since the last reconciliation shows up here as
+  # real drift. Commit it on its own (the artifact's dependency set must be the
+  # committed lock), then re-run this script.
+  git reset -q
+  exit 1
+fi
 if git diff --cached --quiet; then
   echo "  (no changes — version already at $VERSION)"
 else

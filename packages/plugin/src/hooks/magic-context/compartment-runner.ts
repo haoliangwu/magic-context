@@ -13,7 +13,10 @@ import {
     type PartialRecompRange,
 } from "./compartment-runner-partial-recomp";
 import { executeContextRecompInternal } from "./compartment-runner-recomp";
-import type { CompartmentRunnerDeps } from "./compartment-runner-types";
+import type {
+    CompartmentRunnerDeps,
+    HiddenCompartmentRunnerDeps,
+} from "./compartment-runner-types";
 
 export interface ActiveCompartmentRun {
     promise: Promise<void>;
@@ -77,7 +80,7 @@ export function registerActiveCompartmentRun(
     return activeRun;
 }
 
-function withPublishedCallback(deps: CompartmentRunnerDeps): CompartmentRunnerDeps {
+function withPublishedCallback<T extends HiddenCompartmentRunnerDeps>(deps: T): T {
     return {
         ...deps,
         onCompartmentStatePublished: (sid) => {
@@ -88,7 +91,7 @@ function withPublishedCallback(deps: CompartmentRunnerDeps): CompartmentRunnerDe
 }
 
 function startLeaseRenewal(
-    deps: CompartmentRunnerDeps,
+    deps: HiddenCompartmentRunnerDeps,
     holderId: string,
 ): ReturnType<typeof setInterval> {
     return setInterval(() => {
@@ -110,7 +113,7 @@ function startLeaseRenewal(
 }
 
 export function startCompartmentAgent(
-    deps: CompartmentRunnerDeps,
+    deps: HiddenCompartmentRunnerDeps,
     runAgent: typeof runCompartmentAgent = runCompartmentAgent,
 ): void {
     // Intentional: this check-then-set is safe in Bun's single-threaded event loop.

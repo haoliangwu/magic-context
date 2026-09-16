@@ -25,11 +25,11 @@ export interface TaskScheduleStateRow {
     lastStatus: "completed" | "failed" | "skipped" | null;
     lastError: string | null;
     retryCount: number;
-    /** LEGACY/INERT: the old verify commit watermark. Verify now gates per-memory
-     *  on each memory's own `verified_at` (map records the file→memory mapping
-     *  first), so no global commit watermark is written. Column kept (v43) to
-     *  avoid a DROP-COLUMN migration; field kept for a faithful round-trip. Do
-     *  NOT read it for new logic. */
+    /** Task-local JSON state. Stored in the legacy/inert `last_checked_commit`
+     * column, whose verify watermark was retired, so task cursors need no schema
+     * migration. Undefined on writes preserves the stored value. */
+    taskStateJson?: string | null;
+    /** @deprecated Compatibility alias for the retired verify watermark column. */
     lastCheckedCommit?: string | null;
     /** Start of the currently open verify-broad cycle, or null when the cycle
      *  is closed. This field reuses an existing database column from schema
@@ -67,6 +67,7 @@ function toRow(r: RawRow): TaskScheduleStateRow {
         lastStatus: (r.last_status as TaskScheduleStateRow["lastStatus"]) ?? null,
         lastError: r.last_error,
         retryCount: r.retry_count ?? 0,
+        taskStateJson: r.last_checked_commit ?? null,
         lastCheckedCommit: r.last_checked_commit ?? null,
         lastBroadRunAt: r.last_broad_run_at ?? null,
         retrospectiveWatermarkMs: r.retrospective_watermark_ms ?? null,
@@ -211,10 +212,24 @@ export function writeTaskScheduleState(db: Database, row: TaskScheduleStateRow):
         row.lastStatus,
         row.lastError,
         row.retryCount,
-        row.lastCheckedCommit ?? null,
+        row.taskStateJson ?? row.lastCheckedCommit ?? null,
         row.lastBroadRunAt ?? null,
         row.retrospectiveWatermarkMs ?? null,
     );
+}
+
+/** Persist only a task's JSON state without disturbing schedule/retry fields. */
+export function writeTaskStateJson(
+    db: Database,
+    projectPath: string,
+    task: string,
+    taskStateJson: string,
+): void {
+    db.prepare(
+        `INSERT INTO task_schedule_state (project_path, task, last_checked_commit)
+         VALUES (?, ?, ?)
+         ON CONFLICT(project_path, task) DO UPDATE SET last_checked_commit = excluded.last_checked_commit`,
+    ).run(projectPath, task, taskStateJson);
 }
 
 /**

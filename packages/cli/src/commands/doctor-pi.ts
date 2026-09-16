@@ -81,7 +81,9 @@ import {
     describePiPackageEntry,
     getPiMagicContextPackageSpecifier,
     hasPiMagicContextPackage,
+    isConfiguredPiMagicContextEntry as isConfiguredPiMagicContextEntryIn,
     isPiMagicContextPackageEntry,
+    localPiMagicContextPackageDir as resolveLocalPiMagicContextPackageDir,
 } from "../lib/pi-package-entry";
 import { type PromptIO, promptIO } from "../lib/prompts";
 import { sanitizeDiagnosticEndpoint, sanitizeDiagnosticText } from "../lib/redaction";
@@ -319,18 +321,27 @@ function packagesFrom(settings: Record<string, unknown>): unknown[] {
  * <cwd>/.pi/npm/node_modules/<pkg> (project). We collect every plausible dir
  * with a package.json; the resolver stays SILENT for any that don't exist.
  */
+function localPiMagicContextPackageDir(entry: unknown): string | null {
+    return resolveLocalPiMagicContextPackageDir(entry, getPiAgentConfigDir());
+}
+
+function isConfiguredPiMagicContextEntry(entry: unknown): boolean {
+    return isConfiguredPiMagicContextEntryIn(entry, getPiAgentConfigDir());
+}
+
 function piPluginDirCandidates(packages: unknown[], cwd: string): string[] {
     const dirs: string[] = [];
     const agentDir = getPiAgentConfigDir();
 
     // Local dev-path entries: a string spec that is NOT an npm: specifier and
     // resolves to a directory on disk. Relative entries are resolved against the
-    // Pi agent dir (Pi's settings.packages base).
+    // Pi agent dir (Pi's settings.packages base). Only directories whose
+    // package.json names the magic-context plugin itself are candidates — other
+    // local extensions registered in packages[] must not be probed for the
+    // embedding runtime.
     for (const entry of packages) {
-        const spec = typeof entry === "string" ? entry.trim() : "";
-        if (!spec || spec.startsWith("npm:")) continue;
-        const resolved = isAbsolute(spec) ? spec : join(agentDir, spec);
-        dirs.push(resolved);
+        const resolved = localPiMagicContextPackageDir(entry);
+        if (resolved) dirs.push(resolved);
     }
 
     // Managed npm install roots (hoisted): <root>/node_modules/<pkg>.
@@ -851,6 +862,8 @@ async function runHealthChecks(options: {
         // persistence-capable Node WASM fallback. Resolution starts from the
         // installed plugin dir and stays silent when no tree can be inspected.
         let runtimeReported = false;
+        let firstFallback: ReturnType<typeof checkLocalEmbeddingRuntimeByResolution> | null = null;
+        const brokenWarnings: string[] = [];
         let runtimeUnverifiedReason = "no installed plugin tree found to inspect";
         for (const pluginDir of piPluginDirCandidates(packages, options.cwd)) {
             const runtime = checkLocalEmbeddingRuntimeByResolution(
@@ -878,23 +891,34 @@ async function runHealthChecks(options: {
                 break;
             }
             if (runtime.state === "wasm-fallback") {
-                add(results, "warn", formatLocalEmbeddingRuntimeWasmFallback(runtime));
-                runtimeReported = true;
-                break;
+                // Remember the best degraded candidate but keep probing: a WASM
+                // fallback in an earlier tree must not mask a later native-capable
+                // install.
+                firstFallback ??= runtime;
+                continue;
             }
             if (isLocalEmbeddingRuntimeBroken(runtime)) {
-                add(results, "warn", formatLocalEmbeddingRuntimeDoctorWarning(runtime));
-                runtimeReported = true;
-                break;
+                // Keep probing: an earlier broken candidate (e.g. a stale local
+                // dev-path tree) must not mask a healthy managed install.
+                brokenWarnings.push(
+                    `${formatLocalEmbeddingRuntimeDoctorWarning(runtime)} Candidate: ${pluginDir}`,
+                );
+                continue;
             }
             if (runtime.state === "unknown") runtimeUnverifiedReason = runtime.reason;
         }
         if (!runtimeReported) {
-            add(
-                results,
-                "warn",
-                `Embedding provider ${loadedConfig.config.embedding.provider}: selected runtime unverified (${runtimeUnverifiedReason})`,
-            );
+            if (firstFallback) {
+                add(results, "warn", formatLocalEmbeddingRuntimeWasmFallback(firstFallback));
+            } else if (brokenWarnings.length > 0) {
+                for (const warning of brokenWarnings) add(results, "warn", warning);
+            } else {
+                add(
+                    results,
+                    "warn",
+                    `Embedding provider ${loadedConfig.config.embedding.provider}: selected runtime unverified (${runtimeUnverifiedReason})`,
+                );
+            }
         }
     }
 
@@ -902,7 +926,7 @@ async function runHealthChecks(options: {
     // extensions today, but we still check for self-conflicts that the user
     // can hit (e.g. accidentally registering both an npm entry AND a local
     // dev-path entry, which causes duplicate plugin loading).
-    const piEntries = packages.filter(isPiMagicContextPackageEntry).map(describePiPackageEntry);
+    const piEntries = packages.filter(isConfiguredPiMagicContextEntry).map(describePiPackageEntry);
     if (piEntries.length > 1) {
         add(
             results,
@@ -914,7 +938,7 @@ async function runHealthChecks(options: {
     }
 
     const otherExtensions = packages
-        .filter((entry) => !isPiMagicContextPackageEntry(entry))
+        .filter((entry) => !isConfiguredPiMagicContextEntry(entry))
         .map(describePiPackageEntry);
     if (otherExtensions.length > 0) {
         add(results, "info", `Other Pi extensions registered: ${otherExtensions.join(", ")}`);

@@ -3181,6 +3181,78 @@ struct RuntimeStoreError {
     at_ms: i64,
 }
 
+const MEMORY_MIRROR_STALL_THRESHOLD_MS: u64 = 40_000;
+const MEMORY_MIRROR_STALLED_CODE: &str = "MC-M01";
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryMirrorHealthSnapshot {
+    feed_head: u64,
+    module_live_rows: u64,
+    host_cursor: u64,
+    host_cursor_updated_at_ms: u64,
+    cursor_age_ms: u64,
+    pending_rows: u64,
+    stalled: bool,
+}
+
+struct MemoryMirrorHealth {
+    feed_head: AtomicU64,
+    module_live_rows: AtomicU64,
+    host_cursor: AtomicU64,
+    host_cursor_updated_at_ms: AtomicU64,
+}
+
+impl MemoryMirrorHealth {
+    const fn new() -> Self {
+        Self {
+            feed_head: AtomicU64::new(0),
+            module_live_rows: AtomicU64::new(0),
+            host_cursor: AtomicU64::new(0),
+            host_cursor_updated_at_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn observe_frontier(&self, feed_head: i64, module_live_rows: i64) {
+        self.feed_head
+            .store(feed_head.max(0) as u64, Ordering::Relaxed);
+        self.module_live_rows
+            .store(module_live_rows.max(0) as u64, Ordering::Relaxed);
+    }
+
+    fn observe_pull(&self, cursor: i64, observed_at_ms: u64) {
+        self.host_cursor
+            .store(cursor.max(0) as u64, Ordering::Relaxed);
+        self.host_cursor_updated_at_ms
+            .store(observed_at_ms, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self, now_ms: u64) -> MemoryMirrorHealthSnapshot {
+        let feed_head = self.feed_head.load(Ordering::Relaxed);
+        let module_live_rows = self.module_live_rows.load(Ordering::Relaxed);
+        let host_cursor = self.host_cursor.load(Ordering::Relaxed);
+        let host_cursor_updated_at_ms = self.host_cursor_updated_at_ms.load(Ordering::Relaxed);
+        let cursor_age_ms = if host_cursor_updated_at_ms == 0 {
+            0
+        } else {
+            now_ms.saturating_sub(host_cursor_updated_at_ms)
+        };
+        let pending_rows = feed_head.saturating_sub(host_cursor);
+        let stalled = host_cursor_updated_at_ms > 0
+            && module_live_rows > 0
+            && pending_rows > 0
+            && cursor_age_ms >= MEMORY_MIRROR_STALL_THRESHOLD_MS;
+        MemoryMirrorHealthSnapshot {
+            feed_head,
+            module_live_rows,
+            host_cursor,
+            host_cursor_updated_at_ms,
+            cursor_age_ms,
+            pending_rows,
+            stalled,
+        }
+    }
+}
+
 /// The module handler. Holds the single store handle (opened once in `on_hello_ack`)
 /// and the per-route session bindings (route channel → {project, session}).
 pub struct McHandler {
@@ -3262,6 +3334,7 @@ pub struct McHandler {
     /// while the transport shim is upgraded, without rejecting the mutation.
     missing_facade_command_id_sessions: Mutex<HashSet<String>>,
     runtime_store_errors: Mutex<HashMap<String, RuntimeStoreError>>,
+    memory_mirror_health: MemoryMirrorHealth,
 }
 
 #[async_trait]
@@ -3832,6 +3905,7 @@ impl McHandler {
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
             runtime_store_errors: Mutex::new(HashMap::new()),
+            memory_mirror_health: MemoryMirrorHealth::new(),
         }
     }
 
@@ -4100,6 +4174,7 @@ impl McHandler {
             active_dreamer_runs: Arc::new(Mutex::new(HashSet::new())),
             missing_facade_command_id_sessions: Mutex::new(HashSet::new()),
             runtime_store_errors: Mutex::new(HashMap::new()),
+            memory_mirror_health: MemoryMirrorHealth::new(),
         }
     }
 
@@ -4690,6 +4765,54 @@ impl McHandler {
             .lock()
             .expect("config mutex")
             .effective_for_project(project_root)
+    }
+
+    fn observe_memory_mirror_frontier(&self, store: &McStore) -> Result<i64, McStoreError> {
+        let feed_head = store.changefeed_head("memories")?;
+        let live_rows = store.live_memory_row_count()?;
+        self.memory_mirror_health
+            .observe_frontier(feed_head, live_rows);
+        Ok(feed_head)
+    }
+
+    fn memory_mirror_status_value(&self, now: u64) -> Value {
+        let mirror = self.memory_mirror_health.snapshot(now);
+        json!({
+            "feed_head": mirror.feed_head,
+            "module_live_rows": mirror.module_live_rows,
+            "host_cursor": mirror.host_cursor,
+            "host_cursor_updated_at_ms": mirror.host_cursor_updated_at_ms,
+            "cursor_age_ms": mirror.cursor_age_ms,
+            "pending_rows": mirror.pending_rows,
+            "stalled": mirror.stalled,
+            "code": mirror.stalled.then_some(MEMORY_MIRROR_STALLED_CODE),
+        })
+    }
+
+    fn augment_memory_mirror_health(&self, mut report: HealthReport, now: u64) -> HealthReport {
+        let mirror = self.memory_mirror_health.snapshot(now);
+        if let Some(metrics) = report.metrics.as_mut().and_then(Value::as_object_mut) {
+            metrics.insert(
+                "memory_mirror".to_string(),
+                self.memory_mirror_status_value(now),
+            );
+        }
+        if mirror.stalled {
+            report.status = HealthStatus::Degraded;
+            let mirror_detail = format!(
+                "{MEMORY_MIRROR_STALLED_CODE} memory mirror cursor stalled: cursor={} feed_head={} pending_rows={} live_rows={} age_ms={}; send another message to resume it, or run ck doctor drain-authority",
+                mirror.host_cursor,
+                mirror.feed_head,
+                mirror.pending_rows,
+                mirror.module_live_rows,
+                mirror.cursor_age_ms,
+            );
+            report.detail = Some(match report.detail {
+                Some(detail) => format!("{detail}; {mirror_detail}"),
+                None => mirror_detail,
+            });
+        }
+        report
     }
 
     fn handler_entry_state<'a>(
@@ -6958,6 +7081,39 @@ impl McHandler {
             500,
         );
         let wrapup_active = wrapup_latch.map(|(_, rounds)| rounds);
+        if let Err(error) = self.observe_memory_mirror_frontier(store) {
+            return HandlerOutcome::Error {
+                code: "store_load_failed".to_string(),
+                message: error.to_string(),
+            };
+        }
+        let route_project_root = binding.project_root.to_string_lossy();
+        let authority_status = |domain: &str| -> Result<Value, McStoreError> {
+            Ok(
+                match store.authority_project_state_for_route(&route_project_root, domain)? {
+                    Some((project, state)) => json!({ "project": project, "state": state }),
+                    None => Value::Null,
+                },
+            )
+        };
+        let memory_authority = match authority_status("memories") {
+            Ok(authority) => authority,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "authority_status_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
+        let notes_authority = match authority_status("notes") {
+            Ok(authority) => authority,
+            Err(error) => {
+                return HandlerOutcome::Error {
+                    code: "authority_status_failed".to_string(),
+                    message: error.to_string(),
+                }
+            }
+        };
         let mut response = json!({
             "ok": true,
             "summary": summary,
@@ -6982,6 +7138,11 @@ impl McHandler {
             // `last_divergence` field so stable status reads cannot imply a fresh bust.
             "pass_trace": pass_trace,
             "runtime_store_error": self.runtime_store_error_value(&session_id),
+            "memory_mirror": self.memory_mirror_status_value(now_ms().max(0) as u64),
+            "authority": {
+                "memories": memory_authority,
+                "notes": notes_authority,
+            },
             "tail_identity_re_adopt_count": loaded.meta.tail_identity_re_adopt_count,
             "fake_compaction": {
                 "compaction_seen": descent_counters.compaction_seen,
@@ -8048,11 +8209,11 @@ impl McHandler {
         };
         let cursor = request.get("cursor").and_then(Value::as_i64).unwrap_or(0);
         let limit = request.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
-        let page = if request
+        let live_only = request
             .get("live_only")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        let page = if live_only {
             if domain != "memories" {
                 return invalid_params_error("live mirror snapshots currently support memories");
             }
@@ -8061,7 +8222,20 @@ impl McHandler {
             store.pull_changefeed(domain, cursor, limit)
         };
         match page {
-            Ok(page) => respond(json!({ "ok": true, "page": page })),
+            Ok(page) => {
+                if domain == "memories" && !live_only {
+                    if let (Ok(feed_head), Ok(live_rows)) = (
+                        store.changefeed_head("memories"),
+                        store.live_memory_row_count(),
+                    ) {
+                        self.memory_mirror_health
+                            .observe_frontier(feed_head, live_rows);
+                    }
+                    self.memory_mirror_health
+                        .observe_pull(page.next_cursor, now_ms().max(0) as u64);
+                }
+                respond(json!({ "ok": true, "page": page }))
+            }
             Err(error) => HandlerOutcome::Error {
                 code: "mirror_pull_failed".to_string(),
                 message: error.to_string(),
@@ -8510,6 +8684,12 @@ impl McHandler {
             None => return store_unavailable_error(),
         };
         let Some(session_id) = request.get("session_id").and_then(Value::as_str) else {
+            if let Err(error) = self.observe_memory_mirror_frontier(&store) {
+                return HandlerOutcome::Error {
+                    code: "store_load_failed".to_string(),
+                    message: error.to_string(),
+                };
+            }
             return match store.load("__health__") {
                 Ok(state) => respond(json!({
                     "ok": true,
@@ -8526,6 +8706,7 @@ impl McHandler {
                     },
                     "storage_versions": storage_versions_block(&store),
                     "memory_holders": self.memory_holder_metrics(),
+                    "memory_mirror": self.memory_mirror_status_value(now_ms().max(0) as u64),
                 })),
                 Err(e) => HandlerOutcome::Error {
                     code: "store_load_failed".to_string(),
@@ -9349,6 +9530,12 @@ impl McHandler {
                 retained_bytes,
             );
         let snapshot_store_ms = snapshot_store_started_at.elapsed().as_secs_f64() * 1_000.0;
+        match self.observe_memory_mirror_frontier(&store) {
+            Ok(feed_head) => response.memory_mirror_head = Some(feed_head),
+            Err(error) => {
+                eprintln!("mc-module: memory mirror frontier probe failed: {error}");
+            }
+        }
         if let Some(timings) = response.timings.as_mut() {
             timings.handler_total = handler_started_at.elapsed().as_secs_f64() * 1_000.0;
             timings.request_decode = request_decode_ms;
@@ -11334,13 +11521,31 @@ impl McHandler {
             return Err(session_unresolved_error());
         }
 
-        // Harness labels are client-supplied routing hints, not authentication. OpenCode may
-        // bypass session.resolve only after server-observed cache state or a live transform
-        // route proves that this exact session belongs to the module; wrapper token namespaces
-        // cannot satisfy that provenance check.
-        let conversation_key = if binding.harness == OPENCODE_HARNESS
-            && self.module_knows_transform_session(bound_session, &binding.project_root)
-        {
+        let route_project_root = binding.project_root.to_string_lossy().to_string();
+        let requested_project =
+            arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
+        let mut authority_route = match self.store.get() {
+            Some(store) => store
+                .authority_project_state_for_route(&route_project_root, authority_domain)
+                .map_err(|error| {
+                    eprintln!(
+                        "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
+                    );
+                    HandlerOutcome::Error {
+                        code: "authority_project_resolution_failed".to_string(),
+                        message: capability_refusal_message(authority_domain).to_string(),
+                    }
+                })?,
+            None => None,
+        };
+        // Both OpenCode entry points use server-observed transform state as the session proof.
+        // Wrapper labels and authority routes alone are insufficient: either could otherwise
+        // rebind a known project to a second root without a host session lookup.
+        let opencode_harness =
+            binding.harness == OPENCODE_HARNESS || binding.harness == "opencode2";
+        let transform_session_known =
+            self.module_knows_transform_session(bound_session, &binding.project_root);
+        let conversation_key = if opencode_harness && transform_session_known {
             bound_session.to_string()
         } else {
             match self
@@ -11365,49 +11570,49 @@ impl McHandler {
             }
         };
 
-        let route_project_root = binding.project_root.to_string_lossy().to_string();
         if bind_authority_for_write {
             if let Some(arguments) = arguments {
                 self.bind_facade_route_for_write(channel, arguments, authority_domain)?;
             }
+            if authority_route.is_none() {
+                authority_route = match self.store.get() {
+                    Some(store) => store
+                        .authority_project_state_for_route(&route_project_root, authority_domain)
+                        .map_err(|error| {
+                            eprintln!(
+                                "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
+                            );
+                            HandlerOutcome::Error {
+                                code: "authority_project_resolution_failed".to_string(),
+                                message: capability_refusal_message(authority_domain).to_string(),
+                            }
+                        })?,
+                    None => None,
+                };
+            }
         }
-        let requested_project =
-            arguments.and_then(|arguments| non_empty_string_arg(arguments, "memory_project"));
-        let memory_project_path = match self.store.get() {
-            Some(store) => match store
-                .authority_project_state_for_route(&route_project_root, authority_domain)
-            {
-                Ok(Some((authority_project, authority_state))) => {
-                    if requested_project.is_some_and(|requested| requested != authority_project) {
-                        eprintln!(
-                            "mc-module: {authority_domain} route {route_project_root} project mismatch: expected {authority_project}, received {}",
-                            requested_project.unwrap_or_default()
-                        );
-                        return Err(HandlerOutcome::Error {
-                            code: "facade_project_vocabulary_mismatch".to_string(),
-                            message: capability_refusal_message(authority_domain).to_string(),
-                        });
-                    }
-                    if bind_authority_for_write && authority_state != "MODULE" {
-                        // Reads and transforms may keep using the module identity while authority
-                        // drains, but facade mutations must retry instead of writing after ownership changes.
-                        return Err(authority_draining_error(authority_domain));
-                    }
-                    authority_project
-                }
-                // A route without an authority binding remains path-scoped. Lookup failures are
-                // retryable errors: silently using the route could read or write the wrong owner.
-                Ok(None) => route_project_root.clone(),
-                Err(error) => {
+
+        let memory_project_path = match authority_route {
+            Some((authority_project, authority_state)) => {
+                if requested_project.is_some_and(|requested| requested != authority_project) {
                     eprintln!(
-                        "mc-module: {authority_domain} project resolution failed code=authority_project_resolution_failed: {error}"
+                        "mc-module: {authority_domain} route {route_project_root} project mismatch: expected {authority_project}, received {}",
+                        requested_project.unwrap_or_default()
                     );
                     return Err(HandlerOutcome::Error {
-                        code: "authority_project_resolution_failed".to_string(),
+                        code: "facade_project_vocabulary_mismatch".to_string(),
                         message: capability_refusal_message(authority_domain).to_string(),
                     });
                 }
-            },
+                if bind_authority_for_write && authority_state != "MODULE" {
+                    // Reads and transforms may keep using the module identity while authority
+                    // drains, but facade mutations must retry instead of writing after ownership changes.
+                    return Err(authority_draining_error(authority_domain));
+                }
+                authority_project
+            }
+            // A route without an authority binding remains path-scoped. Lookup failures are
+            // retryable errors: silently using the route could read or write the wrong owner.
             None => route_project_root.clone(),
         };
         Ok(FacadeScope {
@@ -11775,6 +11980,56 @@ impl McHandler {
                     ),
                     "memories",
                 )
+            }
+            "list" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 100) as usize;
+                let category = non_empty_string_arg(args, "category");
+                match store.load_active_memories(memory_project, now_ms()) {
+                    Ok(memories) => {
+                        let rows = memories
+                            .into_iter()
+                            .filter(|memory| category.is_none_or(|value| memory.category == value))
+                            .take(limit)
+                            .collect::<Vec<_>>();
+                        if rows.is_empty() {
+                            return mcp_text_result("No active memories found.".to_string(), false);
+                        }
+                        let body = rows
+                            .iter()
+                            .map(|memory| {
+                                format!(
+                                    "Memory [ID: {}] in {} (status: {}): {}",
+                                    memory.id,
+                                    memory.category,
+                                    memory.status,
+                                    memory
+                                        .content
+                                        .split_whitespace()
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        mcp_text_result(
+                            format!(
+                                "Found {} active {}:\n\n{body}",
+                                rows.len(),
+                                if rows.len() == 1 {
+                                    "memory"
+                                } else {
+                                    "memories"
+                                }
+                            ),
+                            false,
+                        )
+                    }
+                    Err(error) => tool_error_result(format!("Error: {error}")),
+                }
             }
             "get" => {
                 let ids = memory_ids(args, "get");
@@ -12600,9 +12855,10 @@ impl ModuleHandler for McHandler {
     /// channel-0 health task, so neither the store nor a handler lock is touched here.
     async fn health(&self) -> HealthReport {
         let now = now_ms().max(0) as u64;
-        self.store_open
-            .waiting_report(now)
-            .unwrap_or_else(|| DISPATCH_HEALTH.report(now))
+        if let Some(waiting) = self.store_open.waiting_report(now) {
+            return waiting;
+        }
+        self.augment_memory_mirror_health(DISPATCH_HEALTH.report(now), now)
     }
 
     /// Record the route's {project_root, session} so the transform path can resolve the
@@ -19142,6 +19398,74 @@ mod tests {
     }
 
     #[test]
+    fn memory_mirror_health_surfaces_a_frozen_non_frontier_cursor_with_a_code() {
+        let handler = McHandler::new();
+        handler.memory_mirror_health.observe_frontier(4_850, 275);
+        handler.memory_mirror_health.observe_pull(3_726, 1_000);
+
+        let within_bound =
+            handler.augment_memory_mirror_health(DispatchHealth::new().report(40_999), 40_999);
+        assert_eq!(within_bound.status, HealthStatus::Ok);
+        assert_eq!(
+            within_bound.metrics.unwrap()["memory_mirror"]["stalled"],
+            json!(false)
+        );
+
+        let stalled =
+            handler.augment_memory_mirror_health(DispatchHealth::new().report(41_000), 41_000);
+        assert_eq!(stalled.status, HealthStatus::Degraded);
+        assert!(stalled
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("MC-M01 memory mirror cursor stalled")));
+        let metrics = stalled.metrics.unwrap();
+        assert_eq!(metrics["memory_mirror"]["feed_head"], json!(4_850));
+        assert_eq!(metrics["memory_mirror"]["host_cursor"], json!(3_726));
+        assert_eq!(metrics["memory_mirror"]["pending_rows"], json!(1_124));
+        assert_eq!(metrics["memory_mirror"]["code"], json!("MC-M01"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transform_and_session_status_publish_memory_mirror_frontier_and_authority() {
+        let (handler, store, _dir, project) =
+            handler_with_store(Arc::new(ProducerState::default()), default_test_config());
+        let project = project.to_string_lossy().to_string();
+        handler.bind_route(7, binding(&project, "ses"));
+        activate_module_authority(&store, "store", "git:mirror-status", &project, "memories");
+        insert_memory(
+            &store,
+            "git:mirror-status",
+            "ARCHITECTURE",
+            "mirror frontier fixture",
+            1,
+        );
+
+        let transformed = call_transform_request_on_channel(
+            &handler,
+            7,
+            request(vec![ck("mirror-status", 1, "hello")]),
+        )
+        .await;
+        let feed_head = store.changefeed_head("memories").unwrap();
+        assert!(feed_head > 0);
+        assert_eq!(transformed["memory_mirror_head"], json!(feed_head));
+
+        let status = call_dispatch_request_on_channel(
+            &handler,
+            7,
+            json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        assert_eq!(status["memory_mirror"]["feed_head"], json!(feed_head));
+        assert_eq!(status["memory_mirror"]["module_live_rows"], json!(1));
+        assert_eq!(status["authority"]["memories"]["state"], json!("MODULE"));
+        assert_eq!(
+            status["authority"]["memories"]["project"],
+            json!("git:mirror-status")
+        );
+    }
+
+    #[test]
     fn module_health_line_surfaces_last_historian_model_refusal() {
         let health = DispatchHealth::new();
         health.record_historian_outcome(
@@ -25528,6 +25852,88 @@ mod tests {
         )
         .await;
         assert_eq!(error_code(timeout), "session_resolve_timeout");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn opencode2_transform_route_serves_memory_without_waiting_for_session_resolve() {
+        let resolver = FakeSessionResolver::with(&[("slow-map", FakeResolve::Timeout)]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver.clone(),
+        );
+        let project_root = project.to_str().unwrap();
+        handler.bind_route(
+            7,
+            binding_with_harness(project_root, "opencode2", "slow-map"),
+        );
+        activate_module_authority(
+            &store,
+            "store",
+            "git:authority-route",
+            project_root,
+            "memories",
+        );
+        let mut first_transform = request(vec![ck("opencode2-route", 1, "hello")]);
+        first_transform["session_id"] = json!("slow-map");
+        let transformed = call_transform_request_on_channel(&handler, 7, first_transform).await;
+        assert_eq!(transformed["status"], json!("ok"));
+
+        let memory_id = insert_memory(
+            &store,
+            "git:authority-route",
+            "CONSTRAINTS",
+            "serve from module authority",
+            1,
+        );
+
+        let listed = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "list",
+                "category": "CONSTRAINTS",
+                "limit": 10,
+                "memory_project": "git:authority-route",
+            }),
+        )
+        .await;
+        assert!(tool_body(listed)["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("serve from module authority")));
+
+        let read = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "get",
+                "ids": [memory_id],
+                "memory_project": "git:authority-route",
+            }),
+        )
+        .await;
+        assert_eq!(
+            tool_body(read)["content"][0]["text"],
+            json!(format!(
+            "Memory [ID: {memory_id}] in CONSTRAINTS (status: active): serve from module authority"
+        ))
+        );
+
+        let write = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "category": "CONSTRAINTS",
+                "content": "write through module authority",
+                "memory_project": "git:authority-route",
+            }),
+        )
+        .await;
+        assert!(tool_body(write)["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Saved memory")));
+        assert_eq!(resolver.calls(), Vec::<String>::new());
     }
 
     #[tokio::test(flavor = "current_thread")]

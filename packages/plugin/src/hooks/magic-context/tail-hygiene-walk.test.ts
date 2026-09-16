@@ -3,6 +3,7 @@ import { computeProtectionWindow } from "../../features/magic-context/protection
 import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import type { TagEntry } from "../../features/magic-context/types";
 import { buildChannel1Reminder, decideChannel1 } from "./ctx-reduce-nudge";
+import * as formattingModule from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import {
     assertTailHygieneContentUnchanged,
@@ -627,6 +628,120 @@ describe("tail hygiene baseline and defer-window deltas", () => {
                 expectedSignature: measured.contentSignature,
             }),
         ).toThrow(/tail hygiene walk was not the last byte-affecting operation/i);
+    });
+});
+
+describe("tail hygiene image content memoization", () => {
+    it("hashes raw and prefixed user/tool-result images without text-tokenizing their payloads", () => {
+        const rawPayload = "A".repeat(3 * 1024 * 1024);
+        const prefixedPayload = `data:image/png;base64,${rawPayload}`;
+        const messages = [
+            message("user-image", "user", [{ type: "file", mime: "image/png", url: rawPayload }]),
+            message("tool-result-image", "assistant", [
+                { type: "file", mime: "image/png", url: prefixedPayload },
+            ]),
+        ];
+        const tokenizer = spyOn(formattingModule, "estimateTokens");
+        try {
+            const tags = [
+                tag(1, "user-image:file0", "file"),
+                tag(2, "tool-result-image:file0", "file"),
+            ];
+            const baseline = measureTailHygiene({
+                messages,
+                tags,
+                protectedTagNumbers: new Set(),
+            });
+            const measured = measureTailHygiene({
+                messages,
+                tags,
+                protectedTagNumbers: new Set([2]),
+                pendingDropTagNumbers: new Set([1]),
+            });
+            const imageParts = measured.parts.filter((part) => part.kind === "file");
+            const imagePayloadCalls = tokenizer.mock.calls.filter(
+                ([content]) => typeof content === "string" && content.includes(rawPayload),
+            );
+
+            expect(imagePayloadCalls).toHaveLength(0);
+            expect(imageParts.map(({ kind, tokens }) => ({ kind, tokens }))).toEqual([
+                { kind: "file", tokens: 1200 },
+                { kind: "file", tokens: 1200 },
+            ]);
+            expect(measured.t).toBe(baseline.t);
+            expect(measured.u).toBe(0);
+            expect(baseline.contentSignature).toBe(measured.contentSignature);
+            expect(measured.contentSignature).toBe("30a3de96");
+            expect(measured.parts.find((part) => part.tagNumber === 1)).toMatchObject({
+                queuedForDrop: true,
+                protected: false,
+            });
+            expect(measured.parts.find((part) => part.tagNumber === 2)).toMatchObject({
+                queuedForDrop: false,
+                protected: true,
+                uTokens: 0,
+            });
+        } finally {
+            tokenizer.mockRestore();
+        }
+    });
+
+    it("counts a previously hash-only file key exactly once when text accounting follows", () => {
+        const content = `data:image/png;base64,${"B".repeat(64)}`;
+        const part = { type: "file", mime: "image/png", url: content };
+        const imageMessage = message("hash-first", "user", [part]);
+        const expectedTextTokens = formattingModule.estimateTokens(content);
+        const tokenizer = spyOn(formattingModule, "estimateTokens");
+        try {
+            measureTailHygiene({
+                messages: [imageMessage],
+                tags: [tag(3, "hash-first:file0", "file")],
+                protectedTagNumbers: new Set(),
+            });
+            part.mime = "text/plain";
+            const measured = measureTailHygiene({
+                messages: [imageMessage],
+                tags: [tag(3, "hash-first:file0", "file")],
+                protectedTagNumbers: new Set(),
+            });
+            const textCalls = tokenizer.mock.calls.filter(([value]) => value === content);
+
+            expect(textCalls).toHaveLength(1);
+            expect(measured.parts[0]?.tokens).toBe(expectedTextTokens);
+        } finally {
+            tokenizer.mockRestore();
+        }
+    });
+
+    it("caches a genuine zero and keeps excluded content out of the tokenizer", () => {
+        const zeroContent = "opencode-zero-token-fixture";
+        const excludedContent = "opencode-excluded-fixture";
+        const tokenizer = spyOn(formattingModule, "estimateTokens").mockImplementation((content) =>
+            content === zeroContent ? 0 : 1,
+        );
+        try {
+            const messages = [
+                message("zero", "user", [
+                    { type: "text", text: zeroContent },
+                    { type: "thinking", thinking: excludedContent },
+                ]),
+            ];
+            const input = {
+                messages,
+                tags: [tag(4, "zero:p0", "message")],
+                protectedTagNumbers: new Set<number>(),
+            };
+            const first = measureTailHygiene(input);
+            const second = measureTailHygiene(input);
+            expect(first.parts.find((part) => part.kind === "text")?.tokens).toBe(0);
+            expect(second.parts.find((part) => part.kind === "text")?.tokens).toBe(0);
+            expect(tokenizer.mock.calls.filter(([value]) => value === zeroContent)).toHaveLength(1);
+            expect(
+                tokenizer.mock.calls.filter(([value]) => value === excludedContent),
+            ).toHaveLength(0);
+        } finally {
+            tokenizer.mockRestore();
+        }
     });
 });
 

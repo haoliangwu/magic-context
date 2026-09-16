@@ -16272,6 +16272,29 @@ impl McStore {
         })
     }
 
+    /// Return the newest sequence available to a domain mirror consumer.
+    pub fn changefeed_head(&self, domain: &str) -> Result<i64, McStoreError> {
+        validate_authority_domain(domain)?;
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(MAX(feed_seq), 0) FROM mc_changefeed WHERE domain = ?1",
+                    params![domain],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(Into::into)
+    }
+
+    /// Count current module-owned memory rows for mirror-health discrimination.
+    pub fn live_memory_row_count(&self) -> Result<i64, McStoreError> {
+        self.inner
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM mc_memories", [], |row| row.get(0))
+            })
+            .map_err(Into::into)
+    }
+
     /// Pull a bounded, ordered feed page. The cursor is a global feed sequence;
     /// filtering by domain preserves monotonic retry semantics even when domains interleave.
     pub fn pull_changefeed(

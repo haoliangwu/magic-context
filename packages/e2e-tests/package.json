@@ -4,7 +4,7 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "test": "bun test --timeout 120000",
+        "test": "bun ../../scripts/check-bun.mjs && bun test --timeout 120000",
         "test:validate-manifest": "bun test scripts/validate-mode-manifest.test.ts scripts/check-rust-prerequisites.test.ts",
         "validate-mode-manifest": "bun scripts/validate-mode-manifest.ts --mode ts",
         "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",

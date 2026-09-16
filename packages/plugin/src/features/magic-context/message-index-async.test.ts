@@ -220,7 +220,7 @@ describe("message-index-async", () => {
         const original = message("m-retry-edit", 1, "stale before retry", 1);
         const edited = message("m-retry-edit", 1, "fresh after retry", 2);
         scheduleReconciliation(db, "ses-retry-edit", () => [original]);
-        await wait(20);
+        await waitUntil(() => isSessionReconciled("ses-retry-edit"));
 
         const originalExec = db.exec.bind(db);
         let failCommit = true;
@@ -233,14 +233,16 @@ describe("message-index-async", () => {
         }) as typeof db.exec;
 
         scheduleIncrementalIndex(db, "ses-retry-edit", edited.id, edited);
-        await wait(140);
+        // The failed commit records a dirty floor asynchronously; wait for that
+        // transition instead of a fixed delay, which loses under CI load.
+        await waitUntil(() => getDirtyIndexFloor(db, "ses-retry-edit") === 1);
         expect(getDirtyIndexFloor(db, "ses-retry-edit")).toBe(1);
         expect(searchMessageIds(db, "ses-retry-edit", "stale")).toEqual(["m-retry-edit"]);
         expect(searchMessageIds(db, "ses-retry-edit", "fresh")).toEqual([]);
 
         (db as unknown as { exec: typeof db.exec }).exec = originalExec;
         scheduleReconciliation(db, "ses-retry-edit", () => [edited]);
-        await wait(20);
+        await waitUntil(() => getDirtyIndexFloor(db, "ses-retry-edit") === null);
 
         expect(getDirtyIndexFloor(db, "ses-retry-edit")).toBeNull();
         expect(searchMessageIds(db, "ses-retry-edit", "stale")).toEqual([]);

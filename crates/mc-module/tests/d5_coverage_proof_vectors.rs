@@ -2165,8 +2165,8 @@ fn d5_coverage_vectors_agree_with_owner_authored_table() {
         ),
         (
             "README.md",
-            10_140,
-            "3501567f7ea054233f2f62bae0bbfe81768616cc2cb97dfc916489ed30ae8ec2",
+            10_184,
+            "794d8a43b5af2609f282636cfd0e88f2e8ab1c192a1f1de898dd12c15f231812",
         ),
     ];
     for (path, size, digest) in expected_unchanged {

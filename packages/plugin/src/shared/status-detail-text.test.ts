@@ -157,6 +157,32 @@ describe("status detail text", () => {
         expect(summary).toContain("(MC-H01)");
     });
 
+    test("shows stalled mirror and authority mismatch codes in summary and diagnostics", () => {
+        const detail = {
+            ...STATUS_FIXTURE,
+            hostBackendsModuleSide: true,
+            memoryMirror: {
+                cursor: 3726,
+                cursorUpdatedAt: 1,
+                cursorAgeMs: 40_000,
+                liveRows: 275,
+                feedHead: 4850,
+                pendingRows: 1124,
+                stalled: true,
+                code: "MC-M01" as const,
+            },
+            memoryAuthorityMismatch: true,
+        };
+        const summary = formatStatusDetailMarkdown(detail);
+        const diagnostics = formatStatusDiagnosticsMarkdown(detail);
+
+        expect(summary).toContain("(MC-M01)");
+        expect(summary).toContain("(MC-M02)");
+        expect(diagnostics).toContain("cursor 3,726 / 4,850");
+        expect(diagnostics).toContain("stalled (MC-M01)");
+        expect(diagnostics).toContain("(MC-M02)");
+    });
+
     test("does not expose module routing in the summary", () => {
         const rustStatus = formatStatusDetailMarkdown({
             ...STATUS_FIXTURE,

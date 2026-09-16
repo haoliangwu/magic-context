@@ -50,6 +50,70 @@ function fakeTransformersModule(options?: {
     };
 }
 
+describe("WASM ONNX runtime module identity", () => {
+    test("imports the canonical resolved URL instead of a host-rewritten bare specifier", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-canonical-"));
+        const requestedSpecifiers: string[] = [];
+        const canonicalSpecifier =
+            "file:///plugin/node_modules/onnxruntime-web/dist/ort.node.min.mjs";
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false, hasNodeFilesystem: false }),
+                resolveWasmOrt: () => canonicalSpecifier,
+                importWasmOrt: async (specifier) => {
+                    requestedSpecifiers.push(specifier);
+                    return { env: { wasm: {} } };
+                },
+                importTransformersWasmFallback: async () => fakeTransformersModule(),
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(
+                await new LocalEmbeddingProvider(
+                    "Xenova/all-MiniLM-L6-v2",
+                    512,
+                    "fp32",
+                    "wasm",
+                ).initialize(),
+            ).toBe(true);
+            expect(requestedSpecifiers).toEqual([canonicalSpecifier]);
+            expect(requestedSpecifiers).not.toContain("onnxruntime-web");
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("falls back to the bare specifier when import.meta.resolve is unavailable", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-resolution-fallback-"));
+        const requestedSpecifiers: string[] = [];
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false, hasNodeFilesystem: false }),
+                // Simulate a Node/Bun host where import.meta.resolve is unavailable.
+                resolveWasmOrt: () => undefined,
+                importWasmOrt: async (specifier) => {
+                    requestedSpecifiers.push(specifier);
+                    return { env: { wasm: {} } };
+                },
+                importTransformersWasmFallback: async () => fakeTransformersModule(),
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(
+                await new LocalEmbeddingProvider(
+                    "Xenova/all-MiniLM-L6-v2",
+                    512,
+                    "fp32",
+                    "wasm",
+                ).initialize(),
+            ).toBe(true);
+            expect(requestedSpecifiers).toEqual(["onnxruntime-web"]);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+});
+
 // Part A of issue #128: classify the PERMANENT "native runtime not installed"
 // failure so the provider degrades once (one actionable log line) instead of
 // re-importing transformers and re-spamming the cryptic resolver error on every

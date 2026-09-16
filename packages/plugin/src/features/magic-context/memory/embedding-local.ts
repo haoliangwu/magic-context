@@ -194,11 +194,20 @@ function startLockHeartbeat(lockPath: string): () => void {
 
 type TransformersModule = Record<string, unknown>;
 
+type WasmOrtModule = {
+    env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
+    default?: unknown;
+};
+
+type ImportWasmOrtModule = (specifier: string) => Promise<WasmOrtModule>;
+
 type LocalEmbeddingRuntimeMode = "native" | "wasm" | "disabled";
 
 type LocalEmbeddingTestHooks = {
     host?: () => LocalEmbeddingHost;
     injectWasmOrt?: () => Promise<boolean>;
+    resolveWasmOrt?: () => string | undefined;
+    importWasmOrt?: ImportWasmOrtModule;
     importTransformers?: () => Promise<TransformersModule>;
     importTransformersWasmFallback?: () => Promise<TransformersModule>;
     importTransformersNodeWasmFallback?: () => Promise<TransformersModule>;
@@ -206,25 +215,38 @@ type LocalEmbeddingTestHooks = {
     log?: (message: string, data?: unknown) => void;
 };
 
+const ONNX_RUNTIME_WEB_SPECIFIER = "onnxruntime-web";
+
 let localEmbeddingRuntimeMode: LocalEmbeddingRuntimeMode = "native";
 let localEmbeddingProcessFailure: EmbeddingFailure | null = null;
 let wasmRuntimeInjected = false;
 let localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
+let resolveWasmOrtForRuntime = (): string | undefined => {
+    try {
+        return typeof import.meta.resolve === "function"
+            ? import.meta.resolve(ONNX_RUNTIME_WEB_SPECIFIER)
+            : undefined;
+    } catch {
+        return undefined;
+    }
+};
+const importWasmOrtModule = async (specifier: string): Promise<WasmOrtModule> =>
+    (await import(specifier)) as WasmOrtModule;
+let importWasmOrtModuleForRuntime: ImportWasmOrtModule = importWasmOrtModule;
 let importWasmOrtForRuntime = async (): Promise<{
-    module: {
-        env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
-        default?: unknown;
-    };
+    module: WasmOrtModule;
     entryPath: string;
 }> => {
     const { createRequire: createRequireFn } = await import("node:module");
     const requireFn = createRequireFn(import.meta.url);
-    const ortEntry = requireFn.resolve("onnxruntime-web");
+    const ortEntry = requireFn.resolve(ONNX_RUNTIME_WEB_SPECIFIER);
+
+    // Resolve before importing because a host loader may rewrite a bare
+    // specifier with a reload tag; a second query-free import of the same file
+    // would otherwise create another identity and register the CPU backend twice.
+    const ortSpecifier = resolveWasmOrtForRuntime() ?? ONNX_RUNTIME_WEB_SPECIFIER;
     return {
-        module: (await import("onnxruntime-web")) as {
-            env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
-            default?: unknown;
-        },
+        module: await importWasmOrtModuleForRuntime(ortSpecifier),
         entryPath: ortEntry,
     };
 };
@@ -312,6 +334,8 @@ export function getLocalEmbeddingNativeMemoryStats(): LocalEmbeddingNativeMemory
 export function __setLocalEmbeddingTestHooks(hooks: LocalEmbeddingTestHooks): void {
     localEmbeddingHostForRuntime = hooks.host ?? (() => ({ isElectron: false, isBun: false }));
     injectWasmOrtForRuntime = hooks.injectWasmOrt ?? injectWasmOrt;
+    resolveWasmOrtForRuntime = hooks.resolveWasmOrt ?? resolveWasmOrtForRuntimeDefault;
+    importWasmOrtModuleForRuntime = hooks.importWasmOrt ?? importWasmOrtModuleForRuntimeDefault;
     importTransformersForRuntime = hooks.importTransformers ?? importTransformersForRuntimeDefault;
     importTransformersWasmFallbackForRuntime =
         hooks.importTransformersWasmFallback ?? importTransformersWasmFallbackForRuntimeDefault;
@@ -329,6 +353,8 @@ export function __resetLocalEmbeddingForTests(): void {
     localEmbeddingProcessFailure = null;
     wasmRuntimeInjected = false;
     localEmbeddingHostForRuntime = currentLocalEmbeddingHost;
+    resolveWasmOrtForRuntime = resolveWasmOrtForRuntimeDefault;
+    importWasmOrtModuleForRuntime = importWasmOrtModuleForRuntimeDefault;
     importWasmOrtForRuntime = importWasmOrtForRuntimeDefault;
     importTransformersForRuntime = importTransformersForRuntimeDefault;
     importTransformersWasmFallbackForRuntime = importTransformersWasmFallbackForRuntimeDefault;
@@ -340,6 +366,8 @@ export function __resetLocalEmbeddingForTests(): void {
     loadedLocalEmbeddingRuntimes.clear();
 }
 
+const resolveWasmOrtForRuntimeDefault = resolveWasmOrtForRuntime;
+const importWasmOrtModuleForRuntimeDefault = importWasmOrtModuleForRuntime;
 const importWasmOrtForRuntimeDefault = importWasmOrtForRuntime;
 const importTransformersForRuntimeDefault = importTransformersForRuntime;
 const importTransformersWasmFallbackForRuntimeDefault = importTransformersWasmFallbackForRuntime;

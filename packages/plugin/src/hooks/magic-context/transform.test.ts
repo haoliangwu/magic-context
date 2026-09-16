@@ -578,15 +578,27 @@ describe("createTransform", () => {
 
         const rows = db
             .prepare(
-                `SELECT message_id, materialize_reason
+                `SELECT message_id, decision, materialize_reason
                    FROM transform_decisions
                   WHERE session_id = ?
                   ORDER BY rowid`,
             )
-            .all(sessionId) as Array<{ message_id: string; materialize_reason: string | null }>;
+            .all(sessionId) as Array<{
+            message_id: string;
+            decision: string;
+            materialize_reason: string | null;
+        }>;
         expect(rows).toEqual([
-            { message_id: "decision-response-a", materialize_reason: "first_render" },
-            { message_id: "decision-response-b", materialize_reason: "model_change" },
+            {
+                message_id: "decision-response-a",
+                decision: "execute",
+                materialize_reason: "first_render",
+            },
+            {
+                message_id: "decision-response-b",
+                decision: "execute",
+                materialize_reason: "model_change",
+            },
         ]);
         expect(rows[0]?.materialize_reason).not.toBe(rows[1]?.materialize_reason);
     });

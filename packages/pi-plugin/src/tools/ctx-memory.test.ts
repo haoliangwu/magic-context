@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { writeTaskStateJson } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
 	getMemoryById,
@@ -141,6 +142,60 @@ describe("createCtxMemoryTool", () => {
 			expect(text).toContain("ID | CATEGORY");
 			expect(text).toContain("VERIFY");
 			expect(text).toContain("Use the shared formatter.");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("refuses a dreamer mutation outside the persisted curate category scope", async () => {
+		const db = createTestDb();
+		try {
+			const ctx = fakeContext("ses-curate-category-scope") as never;
+			const projectIdentity = resolveProjectIdentity(
+				(ctx as { cwd: string }).cwd,
+			);
+			insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "PROJECT_RULES",
+				content: "Keep Pi curation category-scoped.",
+			});
+			const architecture = insertMemory(db, {
+				projectPath: projectIdentity,
+				category: "ARCHITECTURE",
+				content: "The Pi facade delegates to the shared task runner.",
+			});
+			writeTaskStateJson(
+				db,
+				projectIdentity,
+				"curate",
+				JSON.stringify({
+					curate: { cursor: 0, activeCategory: "PROJECT_RULES" },
+				}),
+			);
+			const dreamer = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: true,
+			});
+
+			const result = await dreamer.execute(
+				"call-out-of-scope",
+				{
+					action: "update",
+					ids: [architecture.id],
+					content: "The Pi facade and shared task runner rotate together.",
+				},
+				new AbortController().signal,
+				undefined,
+				ctx,
+			);
+
+			expect(result.isError).toBe(true);
+			expect(result.content[0]?.text).toContain("outside the scoped category");
+			expect(getMemoryById(db, architecture.id)?.content).toBe(
+				"The Pi facade delegates to the shared task runner.",
+			);
 		} finally {
 			closeQuietly(db);
 		}

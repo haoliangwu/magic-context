@@ -13,6 +13,7 @@
  * happens:
  * - OpenCode plugin: relies on the default ("opencode") — no setHarness call
  *   needed
+ * - OpenCode 2 plugin: calls `setHarness("opencode2")` before opening the database
  * - Pi-compatible plugin: resolves the host and calls `setHarness("pi" | "omp")` before opening the database
  * - DSH plugin: calls `setHarness("dsh")` before opening the database
  *
@@ -20,7 +21,7 @@
  * boot-time constant per plugin instance. Cross-harness leakage is a
  * correctness bug, not a feature.
  */
-export type HarnessId = "opencode" | "pi" | "omp" | "dsh";
+export type HarnessId = "opencode" | "opencode2" | "pi" | "omp" | "dsh";
 
 let currentHarness: HarnessId = "opencode";
 let harnessLocked = false;

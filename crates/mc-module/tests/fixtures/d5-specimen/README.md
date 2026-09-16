@@ -63,7 +63,7 @@ Regenerate from the two private inputs:
 
 ```sh
 python3 packages/plugin/scripts/gen-d5-specimen-fixture.py \
-  /path/to/d5-specimen.db \
+  $HOME/.local/share/cortexkit/magic-context/specimens/d5-specimen.db \
   /path/to/13610-req-body
 ```
 

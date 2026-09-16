@@ -1,7 +1,7 @@
 /**
  * DSH harness identity boundary (merged from adapter-api/harness.ts).
  *
- * Core declares HarnessId = "opencode" | "pi" | "dsh" (shared/harness.ts).
+ * Core declares HarnessId = "opencode" | "opencode2" | "pi" | "omp" | "dsh" (shared/harness.ts).
  * This module:
  *  1. declares DSH harness identity as runtime string "dsh";
  *  2. crosses closed-union via setDshHarness -> core setHarness("dsh");

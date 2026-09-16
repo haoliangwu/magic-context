@@ -23,6 +23,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path, { join } from "node:path";
+import { loadPluginConfig } from "@magic-context/core/config";
 import type { AuthorityModuleClient } from "@magic-context/core/features/magic-context/context-authority";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
@@ -31,7 +32,10 @@ import {
     selectRelocatableMemoryIds,
 } from "@magic-context/core/features/magic-context/memory/relocate-memory";
 import { bumpProjectMemoryEpoch } from "@magic-context/core/features/magic-context/storage-project-state";
-import { SubcModuleTransport } from "@magic-context/core/hooks/magic-context/module-transport";
+import {
+    getDefaultSubcConnectionFile,
+    SubcModuleTransport,
+} from "@magic-context/core/hooks/magic-context/module-transport";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
@@ -649,7 +653,10 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         }
         const deps = realDeps(opencodeDb, contextDb);
         const plan = planMigrateSession(sessionId, expandedTo, deps);
-        const transport = new SubcModuleTransport();
+        const loaded = loadPluginConfig(plan.currentDirectory ?? plan.targetDirectory);
+        const transport = new SubcModuleTransport(
+            loaded.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+        );
         const safety = await assertMigrateSessionIsSafeToRehome({
             plan,
             contextDb: contextDb as DatabaseType,

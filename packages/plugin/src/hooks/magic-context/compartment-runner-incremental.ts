@@ -64,7 +64,7 @@ import { updateCompactionMarkerAfterPublication } from "./compaction-marker-mana
 import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
-import type { CompartmentRunnerDeps } from "./compartment-runner-types";
+import type { HiddenCompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
     HISTORIAN_BOUNDARY_HEALING_SLACK,
@@ -113,7 +113,7 @@ export function clearHistorianAlertState(sessionId: string): void {
     lastHistorianAlertBySession.delete(sessionId);
 }
 
-export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<void> {
+export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Promise<void> {
     const {
         client,
         db,
@@ -148,7 +148,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 : null;
         recordHistorianRun(db, {
             sessionId,
-            harness: "opencode",
+            harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
             subagentInvocationId: invocationId,
             runKind: telemetry.runKind ?? "incremental",
             status: telemetry.status ?? "failed",
@@ -491,7 +491,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         });
 
         // Intentional: session.get failure is non-fatal — we fall back to deps.directory
-        const parentSessionResponse = await client.session
+        const parentSessionResponse = await client?.session
             .get({ path: { id: sessionId } })
             .catch(() => null);
         const parentSession = normalizeSDKResponse(
@@ -516,6 +516,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         retainDrainReservationForRetryThrottle = true;
         const validatedPass = await runValidatedHistorianPass({
             client,
+            hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
             db,
             parentSessionId: sessionId,
             sessionDirectory,
@@ -525,6 +526,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             sequenceOffset,
             dumpLabelBase: `incremental-${sessionId}-${chunk.startIndex}-${chunk.endIndex}`,
             timeoutMs: historianTimeoutMs,
+            maxOutputTokens: deps.historianMaxOutputTokens,
             model: deps.model,
             fallbackModelId: deps.fallbackModelId,
             fallbackModels: deps.fallbackModels,
@@ -796,11 +798,15 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
             if (!isWrapupInProgress(db, sessionId)) clearEmergencyRecovery(db, sessionId);
             drainReservation = null;
             if (deferMarkerApplication && lastNewEndMessageId) {
-                setPendingCompactionMarkerState(db, sessionId, {
-                    ordinal: lastCompartmentEnd,
-                    endMessageId: lastNewEndMessageId,
-                    publishedAt: Date.now(),
-                });
+                (deps.compactionMarkerStrategy?.setPending ?? setPendingCompactionMarkerState)(
+                    db,
+                    sessionId,
+                    {
+                        ordinal: lastCompartmentEnd,
+                        endMessageId: lastNewEndMessageId,
+                        publishedAt: Date.now(),
+                    },
+                );
             }
             db.exec("COMMIT");
             published = true;
@@ -836,7 +842,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
         if (deferMarkerApplication) {
             deps.onDeferredMarkerPending?.(sessionId);
         } else {
-            updateCompactionMarkerAfterPublication(
+            (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(
                 db,
                 sessionId,
                 lastCompartmentEnd,
@@ -985,7 +991,7 @@ export async function runCompartmentAgent(deps: CompartmentRunnerDeps): Promise<
                 const stored = insertPrimerCandidates(db, [
                     {
                         projectPath: promotionProjectIdentity,
-                        harness: "opencode",
+                        harness: deps.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
                         sessionId,
                         question: candidate.question,
                         sourceCompartmentStart: startC?.startMessage,

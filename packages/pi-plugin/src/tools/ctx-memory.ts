@@ -34,6 +34,11 @@
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import {
+	curateCategoryForMemoryCategory,
+	getActiveCurateCategory,
+	getCurateCategoryScopeRefusal,
+} from "@magic-context/core/features/magic-context/dreamer/curate-category-rotation";
+import {
 	assessCurateMutationSafety,
 	recordCurateSafetyRefusal,
 } from "@magic-context/core/features/magic-context/dreamer/curate-memory-safety";
@@ -409,6 +414,27 @@ export function createCtxMemoryTool(
 				);
 			}
 			await deps.ensureProjectRegistered?.(ctx.cwd, deps.db);
+			const activeCurateCategory = dreamerAllowed
+				? getActiveCurateCategory(deps.db, projectIdentity)
+				: null;
+			if (activeCurateCategory) {
+				const scopeRefusal = getCurateCategoryScopeRefusal({
+					scope: activeCurateCategory,
+					action: params.action,
+					requestedCategory: params.category,
+					ids: [
+						...(params.ids ?? []),
+						...(Number.isInteger(params.superseded_by)
+							? [params.superseded_by as number]
+							: []),
+					],
+					categoryForId: (id) => {
+						const category = getMemoryById(deps.db, id)?.category;
+						return category ? curateCategoryForMemoryCategory(category) : null;
+					},
+				});
+				if (scopeRefusal) return err(scopeRefusal);
+			}
 			const workspaceIdentitySet = resolveWorkspaceIdentitySet(
 				deps.db,
 				projectIdentity,
@@ -577,9 +603,15 @@ export function createCtxMemoryTool(
 				const limit = normalizeLimit(params.limit);
 				const filtered = getMemoriesByProject(deps.db, projectIdentity);
 				const category = params.category;
-				const filtered2 = category
-					? filtered.filter((m) => m.category === category)
-					: filtered;
+				const filtered2 = activeCurateCategory
+					? filtered.filter(
+							(memory) =>
+								curateCategoryForMemoryCategory(memory.category) ===
+								activeCurateCategory,
+						)
+					: category
+						? filtered.filter((memory) => memory.category === category)
+						: filtered;
 				return ok(formatMemoryList(filtered2.slice(0, limit)));
 			}
 

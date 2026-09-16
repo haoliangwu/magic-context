@@ -90,6 +90,7 @@ export interface AuthorityModuleClient {
         project: string;
         projectRoot?: string;
         domain: AuthorityDomain;
+        sessionId?: string;
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
     authorityDrain?(args: Record<string, unknown>): Promise<AuthorityDrainResponse>;
@@ -823,6 +824,16 @@ export async function drainAuthority(args: {
         if (finished.state !== "TS") {
             throw new Error("memory authority drain did not reactivate TypeScript ownership");
         }
+        if (args.domain === "memories") {
+            // These rows only describe the module-owned read model. Once TypeScript owns the
+            // project again they are not consulted, and retaining them can make a later mirror
+            // replay treat stale module identities as current.
+            withPrivilegedWriter(args.db, () => {
+                args.db
+                    .prepare("DELETE FROM mirror_live_memory_rows WHERE module_project = ?")
+                    .run(args.projectPath);
+            });
+        }
         // A project marker fences both authority domains. Remove it only after neither
         // domain remains module-owned; a one-domain drain must not reopen the other domain.
         const remaining = await Promise.all(
@@ -871,6 +882,61 @@ function chunkRowsForFrame<T>(rows: readonly T[]): T[][] {
     }
     if (current.length > 0) chunks.push(current);
     return chunks;
+}
+
+export interface MemoryMirrorStatus {
+    cursor: number;
+    cursorUpdatedAt: number | null;
+    cursorAgeMs: number | null;
+    liveRows: number;
+    feedHead: number | null;
+    pendingRows: number | null;
+    stalled: boolean;
+    code: "MC-M01" | null;
+}
+
+export const MEMORY_MIRROR_STALL_THRESHOLD_MS = 40_000;
+
+export function getMemoryMirrorStatus(
+    db: Database,
+    feedHead?: number | null,
+    nowMs = Date.now(),
+): MemoryMirrorStatus {
+    const cursorRow = db
+        .prepare("SELECT cursor, updated_at FROM mirror_cursors WHERE domain = 'memories'")
+        .get() as { cursor?: number; updated_at?: number } | undefined;
+    const liveRow = db.prepare("SELECT COUNT(*) AS count FROM mirror_live_memory_rows").get() as
+        | { count?: number }
+        | undefined;
+    const cursor = typeof cursorRow?.cursor === "number" ? cursorRow.cursor : 0;
+    const cursorUpdatedAt =
+        typeof cursorRow?.updated_at === "number" && cursorRow.updated_at > 0
+            ? cursorRow.updated_at
+            : null;
+    const cursorAgeMs =
+        cursorUpdatedAt === null ? null : Math.max(0, Math.floor(nowMs - cursorUpdatedAt));
+    const liveRows = typeof liveRow?.count === "number" ? liveRow.count : 0;
+    const resolvedFeedHead =
+        typeof feedHead === "number" && Number.isSafeInteger(feedHead) && feedHead >= 0
+            ? feedHead
+            : null;
+    const pendingRows = resolvedFeedHead === null ? null : Math.max(0, resolvedFeedHead - cursor);
+    const stalled =
+        liveRows > 0 &&
+        pendingRows !== null &&
+        pendingRows > 0 &&
+        cursorAgeMs !== null &&
+        cursorAgeMs >= MEMORY_MIRROR_STALL_THRESHOLD_MS;
+    return {
+        cursor,
+        cursorUpdatedAt,
+        cursorAgeMs,
+        liveRows,
+        feedHead: resolvedFeedHead,
+        pendingRows,
+        stalled,
+        code: stalled ? "MC-M01" : null,
+    };
 }
 
 export function getMirrorCursor(db: Database, domain: AuthorityDomain): number {
@@ -2428,7 +2494,9 @@ export function pullMemoryMirrorOnce(args: {
         db: args.db,
         module: args.module,
         domain: "memories",
-        limit: args.limit,
+        // A page is capped at 1,000 rows by both protocol peers. Using that cap keeps the
+        // bounded transform ride-along at at most 20 requests for a 20,000-row backlog.
+        limit: args.limit ?? 1000,
         pageBudget: args.pageBudget ?? TRANSFORM_MEMORY_MIRROR_PAGE_BUDGET,
     })
         .then((result) => ({ ...result, cuePoolVersion: result.cursor }))

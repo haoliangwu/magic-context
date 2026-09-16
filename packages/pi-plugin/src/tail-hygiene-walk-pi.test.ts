@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeProtectionWindow } from "@magic-context/core/features/magic-context/protection-window";
@@ -15,6 +15,7 @@ import {
 	decideChannel1,
 	evaluateChannel2,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
+import * as formattingModule from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import { PI_CTX_REDUCE_KEEP } from "./heuristic-cleanup-pi";
 import {
 	assertPiTailHygieneContentUnchanged,
@@ -835,6 +836,188 @@ describe("TS/Pi/module differential hygiene corpus", () => {
 				fixture.expected.band,
 			);
 			expect(measured.u).toBeLessThanOrEqual(measured.t);
+		}
+	});
+});
+
+describe("Pi image content memoization", () => {
+	it("hashes raw and prefixed user/tool images without text-tokenizing their payloads", () => {
+		const rawPayload = "A".repeat(3 * 1024 * 1024);
+		const prefixedPayload = `data:image/png;base64,${rawPayload}`;
+		const messages = [
+			{
+				role: "user",
+				content: [{ type: "image", data: rawPayload, mimeType: "image/png" }],
+			},
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "image-call",
+						name: "read",
+						arguments: { path: "image-fixture" },
+					},
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "image-call",
+				toolName: "read",
+				content: [
+					{ type: "image", data: prefixedPayload, mimeType: "image/png" },
+				],
+			},
+		];
+		const tokenizer = spyOn(formattingModule, "estimateTokens");
+		try {
+			const stableId = withStableIds(messages, [
+				"user-image",
+				"tool-owner",
+				"tool-result",
+			]);
+			const tags = [
+				tag(1, "user-image:file0", "file"),
+				tag(2, "image-call", "tool", { toolOwnerMessageId: "tool-owner" }),
+			];
+			const baseline = measurePiTailHygiene({
+				messages,
+				tags,
+				protectedTagNumbers: new Set(),
+				stableId,
+			});
+			const measured = measurePiTailHygiene({
+				messages,
+				tags,
+				protectedTagNumbers: new Set([2]),
+				pendingDropTagNumbers: new Set([1]),
+				stableId,
+			});
+			const imageParts = measured.parts.filter(
+				(part) => part.kind === "file" || part.kind === "toolOutput",
+			);
+			const imagePayloadCalls = tokenizer.mock.calls.filter(
+				([content]) =>
+					typeof content === "string" && content.includes(rawPayload),
+			);
+
+			expect(imagePayloadCalls).toHaveLength(0);
+			expect(imageParts.map(({ kind, tokens }) => ({ kind, tokens }))).toEqual([
+				{ kind: "file", tokens: 1200 },
+				{ kind: "toolOutput", tokens: 1200 },
+			]);
+			expect(measured.t).toBe(baseline.t);
+			expect(measured.u).toBe(0);
+			expect(baseline.contentSignature).toBe(measured.contentSignature);
+			expect(measured.contentSignature).toBe("721a4413");
+			expect(measured.parts.find((part) => part.tagNumber === 1)).toMatchObject(
+				{
+					queuedForDrop: true,
+					protected: false,
+				},
+			);
+			expect(
+				measured.parts
+					.filter((part) => part.tagNumber === 2)
+					.every((part) => part.protected && part.uTokens === 0),
+			).toBe(true);
+		} finally {
+			tokenizer.mockRestore();
+		}
+	});
+
+	it("counts a tool-output key once when an image hash is requested first", () => {
+		const content = `data:image/png;base64,${"B".repeat(64)}`;
+		const messages = [
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						id: "hash-first-call",
+						name: "read",
+						arguments: { path: "hash-first" },
+					},
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "hash-first-call",
+				toolName: "read",
+				content: [
+					{ type: "image", data: content, mimeType: "image/png" },
+					{ type: "text", text: content },
+				],
+			},
+		];
+		const expectedTextTokens = formattingModule.estimateTokens(content);
+		const tokenizer = spyOn(formattingModule, "estimateTokens");
+		try {
+			const measured = measurePiTailHygiene({
+				messages,
+				tags: [
+					tag(3, "hash-first-call", "tool", {
+						toolOwnerMessageId: "hash-first-owner",
+					}),
+				],
+				protectedTagNumbers: new Set(),
+				stableId: withStableIds(messages, [
+					"hash-first-owner",
+					"hash-first-result",
+				]),
+			});
+			const textCalls = tokenizer.mock.calls.filter(
+				([value]) => value === content,
+			);
+			const toolOutputParts = measured.parts.filter(
+				(part) => part.kind === "toolOutput",
+			);
+
+			expect(textCalls).toHaveLength(1);
+			expect(toolOutputParts.map((part) => part.tokens)).toEqual([
+				1200,
+				expectedTextTokens,
+			]);
+		} finally {
+			tokenizer.mockRestore();
+		}
+	});
+
+	it("caches a genuine zero and keeps excluded content out of the tokenizer", () => {
+		const zeroContent = "pi-zero-token-fixture";
+		const excludedContent = "pi-excluded-fixture";
+		const tokenizer = spyOn(
+			formattingModule,
+			"estimateTokens",
+		).mockImplementation((content) => (content === zeroContent ? 0 : 1));
+		try {
+			const messages = [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: zeroContent },
+						{ type: "thinking", thinking: excludedContent },
+					],
+				},
+			];
+			const input = {
+				messages,
+				tags: [tag(4, "zero:p0", "message")],
+				protectedTagNumbers: new Set<number>(),
+				stableId: withStableIds(messages, ["zero"]),
+			};
+			const first = measurePiTailHygiene(input);
+			const second = measurePiTailHygiene(input);
+			expect(first.parts.find((part) => part.kind === "text")?.tokens).toBe(0);
+			expect(second.parts.find((part) => part.kind === "text")?.tokens).toBe(0);
+			expect(
+				tokenizer.mock.calls.filter(([value]) => value === zeroContent),
+			).toHaveLength(1);
+			expect(
+				tokenizer.mock.calls.filter(([value]) => value === excludedContent),
+			).toHaveLength(0);
+		} finally {
+			tokenizer.mockRestore();
 		}
 	});
 });

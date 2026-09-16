@@ -67,6 +67,11 @@ export function formatStatusDiagnosticsMarkdown(detail: StatusDetail): string {
         `- **${formatCacheTtlDisplay({ value: detail.cacheTtl, source: detail.cacheTtlSource ?? "session", modelKey: detail.cacheTtlModelKey })}**; ${formatCacheLane(detail)}`,
         `- **Historian:** ${[historianState, ...historianDetails].join("; ")}`,
         ...(detail.hostBackendsModuleSide ? [`- ${RUST_MODE_HOST_PATHS_LINE}`] : []),
+        ...(detail.memoryMirror
+            ? [
+                  `- **Memory mirror:** cursor ${formatCount(detail.memoryMirror.cursor)} / ${detail.memoryMirror.feedHead === null ? "unknown" : formatCount(detail.memoryMirror.feedHead)}; ${formatCount(detail.memoryMirror.liveRows)} live rows; ${detail.memoryMirror.stalled ? `stalled (${detail.memoryMirror.code})` : "advancing or caught up"}`,
+              ]
+            : []),
         `- **Memory:** ${formatCount(detail.memoryCount)} active; ${formatCount(detail.memoryBlockCount)} injected`,
         `- **Tags:** ${formatCount(detail.activeTags)} active, ${formatCount(detail.droppedTags)} dropped; ${formatCount(detail.pendingOpsCount)} pending drops`,
         `- **Execute threshold:** ${detail.executeThreshold.toFixed(1)}%${detail.executeThresholdClamped ? " (clamped)" : ""}`,
@@ -79,6 +84,12 @@ export function formatStatusDiagnosticsMarkdown(detail: StatusDetail): string {
     }
     if (detail.lastTransformError) {
         lines.push(`- **Warning:** ${renderUserFacingFailure("transform_update_failed")}`);
+    }
+    if (detail.memoryMirror?.stalled) {
+        lines.push(`- **Warning:** ${renderUserFacingFailure("memory_mirror_stalled")}`);
+    }
+    if (detail.memoryAuthorityMismatch) {
+        lines.push(`- **Warning:** ${renderUserFacingFailure("memory_authority_mismatch")}`);
     }
 
     return lines.join("\n");

@@ -258,6 +258,8 @@ export interface RustModeModuleClient extends ModuleStateSyncClient {
         project: string;
         /** Bound route root for this authority query. */
         projectRoot?: string;
+        /** Existing OpenCode session route used by host tools. */
+        sessionId?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }>;
     authorityPrepare?(args: Record<string, unknown>): Promise<{ authority: AuthorityStatus }>;
@@ -821,6 +823,14 @@ function responseValue(response: unknown): Record<string, unknown> {
 }
 
 function mirrorProjectionKey(response: Record<string, unknown>): string | null {
+    const memoryMirrorHead = response.memory_mirror_head;
+    if (
+        typeof memoryMirrorHead === "number" &&
+        Number.isSafeInteger(memoryMirrorHead) &&
+        memoryMirrorHead >= 0
+    ) {
+        return JSON.stringify(["memory-feed", memoryMirrorHead]);
+    }
     const rowVersion = response.row_version;
     if (typeof rowVersion !== "number" || !Number.isSafeInteger(rowVersion) || rowVersion < 0) {
         return null;
@@ -828,6 +838,8 @@ function mirrorProjectionKey(response: Record<string, unknown>): string | null {
     const renderedMemoryIds = Array.isArray(response.rendered_memory_ids)
         ? response.rendered_memory_ids
         : [];
+    // Older modules do not publish the feed frontier. Keep their legacy projection trigger
+    // rather than polling on every pass; current modules use the exact feed sequence above.
     return JSON.stringify([
         rowVersion,
         response.boundary_id ?? null,

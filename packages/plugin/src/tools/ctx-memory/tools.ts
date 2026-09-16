@@ -2,6 +2,11 @@ import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { DREAMER_AGENT } from "../../agents/dreamer";
 import { getAuthorityManagedMarker } from "../../features/magic-context/context-authority";
 import {
+    curateCategoryForMemoryCategory,
+    getActiveCurateCategory,
+    getCurateCategoryScopeRefusal,
+} from "../../features/magic-context/dreamer/curate-category-rotation";
+import {
     assessCurateMutationSafety,
     recordCurateSafetyRefusal,
 } from "../../features/magic-context/dreamer/curate-memory-safety";
@@ -50,7 +55,7 @@ import {
     toolCallIdFromContext,
 } from "../../plugin/rust-tool-backends";
 import { sessionLog } from "../../shared/logger";
-import { renderCapabilityRefusal } from "../../shared/user-facing-codes";
+import { renderCapabilityRefusal, renderUserFacingFailure } from "../../shared/user-facing-codes";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_TOOL_NAME, DEFAULT_SEARCH_LIMIT } from "./constants";
 import {
@@ -100,6 +105,10 @@ function memoryAuthorityRefusal(args: CtxMemoryArgs): string {
     const isMutation =
         args.action !== undefined && ["write", "update", "archive", "merge"].includes(args.action);
     return renderCapabilityRefusal(isMutation ? "memory_write" : "memory_access");
+}
+
+function memoryAuthorityMismatchRefusal(): string {
+    return renderUserFacingFailure("memory_authority_mismatch");
 }
 
 function moduleMemoryText(response: unknown, args: CtxMemoryArgs): string | null {
@@ -501,6 +510,28 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                 return "Error: Could not resolve project identity for memory action.";
             }
             await deps.ensureProjectRegistered?.(toolContext.directory, deps.db);
+            const activeCurateCategory =
+                toolContext.agent === DREAMER_AGENT
+                    ? getActiveCurateCategory(deps.db, projectPath)
+                    : null;
+            if (activeCurateCategory) {
+                const scopeRefusal = getCurateCategoryScopeRefusal({
+                    scope: activeCurateCategory,
+                    action: args.action,
+                    requestedCategory: args.category,
+                    ids: [
+                        ...(args.ids ?? []),
+                        ...(Number.isInteger(args.superseded_by)
+                            ? [args.superseded_by as number]
+                            : []),
+                    ],
+                    categoryForId: (id) => {
+                        const category = getMemoryById(deps.db, id)?.category;
+                        return category ? curateCategoryForMemoryCategory(category) : null;
+                    },
+                });
+                if (scopeRefusal) return scopeRefusal;
+            }
             const curatePreflight =
                 toolContext.agent === DREAMER_AGENT
                     ? preflightCurateMutation({
@@ -511,7 +542,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     : { skip: null, successor: null };
             if (curatePreflight.skip) return curatePreflight.skip;
 
-            if (args.action !== "list") {
+            {
                 const marker = getAuthorityManagedMarker(deps.db, projectPath);
                 let authorityState: "TS" | "PREPARING" | "MODULE" | "DRAINING" | null = null;
                 try {
@@ -519,6 +550,7 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         (await deps.rustToolBackends?.authorityState?.({
                             projectPath,
                             projectRoot: toolContext.directory,
+                            sessionId: toolContext.sessionID,
                             domain: "memories",
                         })) ?? null;
                 } catch (error) {
@@ -560,11 +592,16 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                                     | "update"
                                     | "archive"
                                     | "merge"
+                                    | "list"
                                     | "get",
                                 content: moduleArgs.content,
                                 category: moduleArgs.category,
                                 ids: moduleArgs.ids,
                                 reason: moduleArgs.reason,
+                                limit:
+                                    moduleArgs.action === "list"
+                                        ? normalizeLimit(moduleArgs.limit)
+                                        : undefined,
                             }),
                             moduleArgs,
                         );
@@ -576,6 +613,9 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                         sessionLog(toolContext.sessionID, "ctx_memory capability refusal", error);
                         return memoryAuthorityRefusal(args);
                     }
+                }
+                if (marker && (authorityState === null || authorityState === "TS")) {
+                    return memoryAuthorityMismatchRefusal();
                 }
                 if (marker || authorityState === "PREPARING" || authorityState === "DRAINING") {
                     return memoryAuthorityRefusal(args);
@@ -702,9 +742,15 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
             if (args.action === "list") {
                 const limit = normalizeLimit(args.limit);
                 const category = normalizeCategory(args.category);
-                const memories = filterByCategory(
-                    getMemoriesByProject(deps.db, projectPath),
-                    category,
+                const allMemories = getMemoriesByProject(deps.db, projectPath);
+                const memories = (
+                    activeCurateCategory
+                        ? allMemories.filter(
+                              (memory) =>
+                                  curateCategoryForMemoryCategory(memory.category) ===
+                                  activeCurateCategory,
+                          )
+                        : filterByCategory(allMemories, category)
                 ).slice(0, limit);
 
                 return formatMemoryList(memories);

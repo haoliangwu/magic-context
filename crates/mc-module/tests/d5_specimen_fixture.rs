@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 const DB_SHA256: &str = "f589668287f41abaeb2a6526ee6d6f9d162e7ed80b1650f1ca5ec0a45984b8c0";
 const CAPTURE_SHA256: &str = "766c26e1fab1129e0866e275c22d79e111a4382140f4334095279c46f26f526b";
-const INDEX_SHA256: &str = "ce56864aea0091c5635845d839e41df791a81c711467a9191ad9e4489dd6e272";
+const INDEX_SHA256: &str = "6fabae55b1f1679fc72c40e1577e14c36d4c16d419b76aeaeb66628caa867b9c";
 const CANONICAL_VECTORS_SHA256: &str =
     "8fc5b1b90997378941534bd5a0d88bebd6b10282f030ad25315612d77285f012";
 const DIGEST_PLACEHOLDER: &str = "<computed-by-slice-0>";
@@ -606,6 +606,9 @@ fn d5_fixture_index_pins_every_sibling_and_scans_for_secrets() {
             name,
             "canonical-json-vectors-v1.json"
                 | "redeem-vectors-v1.json"
+                | "scope-open-vectors-v1.json"
+                | "capacity-estimate-vectors-v1.json"
+                | "output-identity-vectors-v1.json"
                 | "coverage-proof-vectors-v1.json"
                 | "aggregate-preimages-v1.json"
         ) {
@@ -615,6 +618,13 @@ fn d5_fixture_index_pins_every_sibling_and_scans_for_secrets() {
                     "hand-written independent canonical-form vectors"
                 }
                 "redeem-vectors-v1.json" => "owner-authored D5 redeem contract vectors",
+                "scope-open-vectors-v1.json" => "owner-authored D5 scope.open contract vectors",
+                "capacity-estimate-vectors-v1.json" => {
+                    "owner-authored D5 capacity contract vectors"
+                }
+                "output-identity-vectors-v1.json" => {
+                    "owner-authored D5 returned-message output identity vectors"
+                }
                 "coverage-proof-vectors-v1.json" => {
                     "owner-authored D5 coverage-proof contract vectors"
                 }
@@ -1017,12 +1027,19 @@ fn d5_fixture_preserves_measured_tail_geometry_without_private_text() {
 
 #[test]
 fn d5_fixture_private_source_run_rejection_when_available() {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("repository root");
-    let db_path =
-        repo_root.join(".cortexkit/alfonso/reviews/d5-uncovered-tail-2026-09-11/d5-specimen.db");
+    // The private source store lives outside the repository: `.cortexkit/` is hydrated into
+    // every worker worktree, and a 438 MB specimen copied per launch was measured as the
+    // dominant per-worktree cost. Override with MC_D5_SPECIMEN_DB; the default is the
+    // operator data directory.
+    let db_path = std::env::var_os("MC_D5_SPECIMEN_DB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".local/share/cortexkit/magic-context/specimens/d5-specimen.db")
+            })
+        })
+        .expect("HOME or MC_D5_SPECIMEN_DB");
     if !db_path.is_file() {
         eprintln!(
             "SKIP d5_fixture_private_source_run_rejection_when_available: private source DB absent"

@@ -69,7 +69,8 @@ const SERIAL_LANE_MAX_WAITERS_PER_SESSION = 8;
 const SERIAL_LANE_MIN_REMAINING_MS = 25;
 const CANONICAL_ROOT_CACHE_MAX_ENTRIES = 256;
 
-function getDefaultConnectionFile(): string {
+/** Platform connection file used when resolved configuration has no subc block. */
+export function getDefaultSubcConnectionFile(): string {
     return join(getDataDir(), "cortexkit", "run", "subc-connection.json");
 }
 
@@ -290,12 +291,12 @@ export class SubcModuleTransport {
     }
 
     constructor(
-        connectionFile?: string,
+        connectionFile: string,
         moduleId = DEFAULT_MODULE_ID,
         requestTimeoutMs = MODULE_SEND_TIMEOUT_MS,
         routeSessionPrefix = "",
     ) {
-        this.connectionFile = connectionFile ?? getDefaultConnectionFile();
+        this.connectionFile = connectionFile;
         this.moduleId = moduleId;
         this.requestTimeoutMs = requestTimeoutMs;
         this.routeSessionPrefix = routeSessionPrefix;
@@ -735,12 +736,15 @@ export class SubcModuleTransport {
         context_store_uuid: string;
         project: string;
         projectRoot?: string;
+        sessionId?: string;
         domain: "memories" | "notes";
     }): Promise<{ authority: AuthorityStatus | null }> {
         this.authorityProjectRoot = args.project;
-        const { projectRoot, ...body } = args;
+        const { projectRoot, sessionId, ...body } = args;
         const response = await this.authorityRequest(
-            args.project,
+            // A tool call already has a real session route. Reusing it avoids asking the
+            // daemon to resolve the project identity as though it were an OpenCode session.
+            sessionId ?? args.project,
             projectRoot ?? this.bindRootForAuthority(),
             "authority.status",
             body,

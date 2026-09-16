@@ -139,13 +139,17 @@ export class V2StoreReader {
             return this.all(sessionID, cut ? cut.seq - 1 : -1);
         })();
     }
+    /** Full retained source is needed to restore unarchived rows hidden by a host cut. */
+    history(sessionID: string): StoreRow[] {
+        return this.all(sessionID, -1);
+    }
     private all(sessionID: string, after: number, type?: MessageType): StoreRow[] {
         const rows: StoreRow[] = [];
         for (;;) {
             const page = this.page(sessionID, { after, type });
             rows.push(...page.rows);
-            if (page.rows.length < 100) return rows;
-            after = page.cursor!;
+            if (page.rows.length < 100 || page.cursor === undefined) return rows;
+            after = page.cursor;
         }
     }
 }

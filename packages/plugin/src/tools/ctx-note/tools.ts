@@ -347,6 +347,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     notesAuthority = await deps.rustToolBackends.authorityState({
                         projectPath: projectIdentity,
                         projectRoot: toolContext.directory,
+                        sessionId,
                         domain: "notes",
                     });
                 } catch (error) {

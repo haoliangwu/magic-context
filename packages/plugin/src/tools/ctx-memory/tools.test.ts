@@ -19,6 +19,7 @@ import {
     setMemoryClassification,
 } from "../../features/magic-context";
 import { takeCurateSafetyRefusalCount } from "../../features/magic-context/dreamer/curate-memory-safety";
+import { writeTaskStateJson } from "../../features/magic-context/dreamer/storage-task-schedule";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -413,10 +414,15 @@ describe("createCtxMemoryTools", () => {
                 { action: "update", ids: [1], content: "module update" },
                 { action: "archive", ids: [1] },
                 { action: "merge", ids: [1, 2], content: "module merge" },
+                { action: "list", limit: 5 },
                 { action: "get", ids: [1] },
             ] as const;
             for (const request of actions) {
-                const result = await moduleTools.ctx_memory.execute(request, toolContext());
+                const context =
+                    request.action === "list"
+                        ? dreamerToolContext("/repo/project", "ses-memory")
+                        : toolContext();
+                const result = await moduleTools.ctx_memory.execute(request, context);
                 expect(result).toContain(`module ${request.action}`);
             }
             expect(routed.map((request) => request.action)).toEqual([
@@ -424,6 +430,7 @@ describe("createCtxMemoryTools", () => {
                 "update",
                 "archive",
                 "merge",
+                "list",
                 "get",
             ]);
             expect(routed.every((request) => request.memoryProject === "/repo/project")).toBe(true);
@@ -485,6 +492,36 @@ describe("createCtxMemoryTools", () => {
             );
             expect(result).not.toContain(authorityError);
             expect(result).not.toContain(content);
+            expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
+        });
+
+        it("reports a durable authority mismatch instead of a transient read or write retry", async () => {
+            db.prepare(
+                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, ?, ?)",
+            ).run("/repo/project", "store-1", Date.now());
+            for (const authorityState of [null, "TS"] as const) {
+                const moduleTools = createCtxMemoryTools({
+                    db,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    rustToolBackends: {
+                        authorityState: async () => authorityState,
+                    },
+                });
+                const read = await moduleTools.ctx_memory.execute(
+                    { action: "get", ids: [1] },
+                    toolContext(),
+                );
+                const write = await moduleTools.ctx_memory.execute(
+                    { action: "write", category: "CONSTRAINTS", content: "must not write" },
+                    toolContext(),
+                );
+                expect(read).toBe(
+                    "Memory authority is inconsistent between the host and module. Run `ck doctor drain-authority` before changing Rust mode. (MC-M02)",
+                );
+                expect(write).toBe(read);
+            }
             expect(getMemoriesByProject(db, "/repo/project")).toHaveLength(0);
         });
 
@@ -1058,6 +1095,41 @@ describe("createCtxMemoryTools", () => {
         expect(result).toBe(`Error: Memory with ID ${foreignShared.id} was not found.`);
         expect(getMemoryById(db, own.id)?.status).toBe("active");
         expect(getMemoryById(db, foreignShared.id)?.status).toBe("active");
+    });
+
+    it("refuses a dreamer mutation outside the persisted curate category scope", async () => {
+        const projectRule = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "PROJECT_RULES",
+            content: "Keep category-scoped curation deterministic.",
+        });
+        const architecture = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE",
+            content: "The scheduler owns the dreamer task registry.",
+        });
+        writeTaskStateJson(
+            db,
+            "/repo/project",
+            "curate",
+            JSON.stringify({ curate: { cursor: 0, activeCategory: "PROJECT_RULES" } }),
+        );
+
+        const result = await tools.ctx_memory.execute(
+            {
+                action: "update",
+                ids: [architecture.id],
+                content: "The shared scheduler owns the dreamer task registry.",
+            },
+            dreamerToolContext("/repo/project"),
+        );
+
+        expect(result).toContain("memory ID");
+        expect(result).toContain("outside the scoped category");
+        expect(getMemoryById(db, architecture.id)?.content).toBe(
+            "The scheduler owns the dreamer task registry.",
+        );
+        expect(getMemoryById(db, projectRule.id)?.status).toBe("active");
     });
 
     it("REJECTS merging memories from DIFFERENT categories (structural guard)", async () => {

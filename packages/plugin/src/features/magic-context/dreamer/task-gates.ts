@@ -8,6 +8,7 @@ import {
 import { getPendingSmartNotes } from "../storage-notes";
 import { countPrimerCandidatesForProject, getActivePrimers } from "../storage-primers";
 import { getUserMemoryCandidates } from "../user-memory/storage-user-memory";
+import { peekCurateCategoryScope } from "./curate-category-rotation";
 import { getTaskScheduleState } from "./storage-task-schedule";
 import {
     CANONICAL_DREAM_TASKS,
@@ -52,19 +53,20 @@ export function countActiveMemories(db: Database, projectPath: string): number {
 export function countLiveMemories(
     db: Database,
     projectPath: string,
-    options: { unclassifiedOnly?: boolean } = {},
+    options: { unclassifiedOnly?: boolean; category?: string } = {},
 ): number {
     const unclassified = options.unclassifiedOnly && hasMemoryClassifiedAtColumn(db);
-    const row = db
-        .prepare<[string, number], { cnt: number }>(
-            `SELECT COUNT(*) AS cnt
-               FROM memories
-              WHERE project_path = ?
-                AND status IN ('active','permanent')
-                AND (expires_at IS NULL OR expires_at > ?)
-                ${unclassified ? "AND classified_at IS NULL" : ""}`,
-        )
-        .get(projectPath, Date.now());
+    const sql = `SELECT COUNT(*) AS cnt
+                   FROM memories
+                  WHERE project_path = ?
+                    AND status IN ('active','permanent')
+                    AND (expires_at IS NULL OR expires_at > ?)
+                    ${unclassified ? "AND classified_at IS NULL" : ""}`;
+    const row = options.category
+        ? db
+              .prepare<[string, number, string], { cnt: number }>(`${sql} AND category = ?`)
+              .get(projectPath, Date.now(), options.category)
+        : db.prepare<[string, number], { cnt: number }>(sql).get(projectPath, Date.now());
     return row?.cnt ?? 0;
 }
 
@@ -264,8 +266,19 @@ export function getDreamTaskBacklog(
             return { pending, total };
         }
         case "curate": {
-            const total = countLiveMemories(db, projectPath);
-            return { pending: total, total };
+            const categories = db
+                .prepare<[string, number], { category: string }>(
+                    `SELECT category FROM memories
+                      WHERE project_path = ?
+                        AND status IN ('active','permanent')
+                        AND (expires_at IS NULL OR expires_at > ?)`,
+                )
+                .all(projectPath, Date.now());
+            const scope = peekCurateCategoryScope(db, projectPath, categories);
+            const total = scope?.memories.length ?? 0;
+            return scope
+                ? { pending: total, total, category: scope.category }
+                : { pending: 0, total: 0 };
         }
         case "compress-cues": {
             const total = countLiveMemories(db, projectPath);

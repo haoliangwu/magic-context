@@ -254,15 +254,31 @@ if [[ $(date +%s) -ge $DEADLINE ]]; then
 fi
 
 # Sanity: the run succeeded, so every leg uploaded its asset. Confirm the count
-# before publishing (a defensive check, not a wait — the run is already green).
-ASSET_COUNT=$(gh release view "$TAG" --repo cortexkit/magic-context --json assets --jq '.assets | length' 2>/dev/null || echo "0")
-# A full run produces 25 assets (6 platforms × installers/sigs + latest.json).
-# A floor of 24 catches an architecture split (which yields ~12-14), the failure
-# mode where the matrix legs landed on two separate releases. The single
-# create-release job now prevents that, but keep the count as a backstop.
+# before publishing. A full run produces 25 assets (6 platforms × installers/sigs
+# + latest.json). A floor of 24 catches an architecture split (which yields
+# ~12-14), the failure mode where the matrix legs landed on two separate
+# releases. The single create-release job now prevents that, but keep the count
+# as a backstop.
+#
+# The release API can lag the workflow conclusion: the run's last job undrafts
+# the release, and a read taken seconds later has returned an incomplete asset
+# list for a release that was in fact complete (dashboard-v0.16.0 read 0 of 25
+# and this script declared a failure while the release was already published).
+# So re-read for a bounded window before deciding, and never let a failed read
+# masquerade as "0 assets" — print the API error instead.
 MIN_ASSETS=24
+ASSET_COUNT=0
+for _ in $(seq 1 12); do
+  if ASSET_JSON=$(gh api "repos/cortexkit/magic-context/releases/tags/$TAG" --jq '.assets | length' 2>&1); then
+    ASSET_COUNT="$ASSET_JSON"
+    [[ "$ASSET_COUNT" -ge "$MIN_ASSETS" ]] && break
+  else
+    echo "  (release read failed, retrying: $ASSET_JSON)"
+  fi
+  sleep 10
+done
 if [[ "$ASSET_COUNT" -lt "$MIN_ASSETS" ]]; then
-  echo "  ⚠ Workflow succeeded but only $ASSET_COUNT/$MIN_ASSETS assets are attached."
+  echo "  ⚠ Workflow succeeded but only $ASSET_COUNT/$MIN_ASSETS assets are attached after a 2-minute re-read window."
   echo "  → https://github.com/cortexkit/magic-context/releases/tag/$TAG"
   exit 1
 fi

@@ -1,5 +1,8 @@
+import type { TokenTotals } from "../../features/magic-context/subagent-token-capture";
 import type { PluginContext } from "../../plugin/types";
+import type { HarnessId } from "../../shared/harness";
 import type { ModelInput } from "../../shared/model-resolution";
+import type { PromptArgs } from "../../shared/model-suggestion-retry";
 import type { Database } from "../../shared/sqlite";
 import type { ParsedEvent } from "./compartment-parser";
 import type {
@@ -55,8 +58,78 @@ export interface RecompProgress {
     note?: string;
 }
 
-export interface CompartmentRunnerDeps {
-    client: PluginContext["client"];
+export class HiddenCompletionRefusal extends Error {
+    constructor(
+        readonly code:
+            | "hidden_model_unsupported"
+            | "hidden_tools_unsupported"
+            | "hidden_prompt_unrecognized"
+            | "unsupported_transport",
+        message: string,
+        readonly terminal = false,
+    ) {
+        super(`${code}: ${message}`);
+        this.name = "HiddenCompletionRefusal";
+    }
+}
+
+export interface HiddenRunIdentity {
+    parentSessionId?: string;
+    parentInvocationId?: number | null;
+    agent: string;
+    kind: "historian" | "historian-editor" | "dreamer-task";
+    system: string;
+    model?: ModelInput;
+    configuredModels?: readonly ModelInput[];
+    timeoutMs: number;
+    maxOutputTokens?: number;
+    title: string;
+    directory: string;
+    metadata?: Record<string, unknown>;
+}
+
+export interface HiddenRunHandle {
+    id: string;
+    childSessionId?: string;
+}
+
+export interface HiddenCompletion {
+    text: string | null;
+    reasoning?: string | null;
+    usage: TokenTotals;
+    lengthCapped: boolean;
+    /** Original host messages are retained only by transports that expose them. */
+    messages?: unknown[];
+    providerId?: string;
+    modelId?: string;
+}
+
+export interface HiddenCompletionExecutor {
+    readonly capabilities: { tools: boolean; harness: HarnessId };
+    open(run: HiddenRunIdentity): Promise<HiddenRunHandle>;
+    attempt(handle: HiddenRunHandle, request: PromptArgs): Promise<void>;
+    /** Kept separate from prompt settlement so read failures never resend a historian prompt. */
+    collect(handle: HiddenRunHandle, limit: number): Promise<HiddenCompletion>;
+    close(
+        handle: HiddenRunHandle | null,
+        settlement: {
+            promptSettled: boolean;
+            privacySensitive: boolean;
+            context: string;
+            log: (message: string) => void;
+        },
+    ): Promise<void>;
+}
+
+export interface CompartmentRunnerDeps<
+    Client extends PluginContext["client"] | undefined = PluginContext["client"],
+> {
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    compactionMarkerStrategy?: {
+        setPending?: typeof import("../../features/magic-context/storage").setPendingCompactionMarkerState;
+        publish?: typeof import("./compaction-marker-manager").updateCompactionMarkerAfterPublication;
+    };
+    client: Client;
     db: Database;
     sessionId: string;
     /**
@@ -151,6 +224,10 @@ export interface CompartmentRunnerDeps {
     forceKeepLastCompartment?: boolean;
 }
 
+export type HiddenCompartmentRunnerDeps = CompartmentRunnerDeps<
+    PluginContext["client"] | undefined
+>;
+
 export interface CandidateCompartment {
     sequence: number;
     startMessage: number;
@@ -174,6 +251,7 @@ export interface CandidateCompartment {
 }
 
 export interface HistorianRunResult {
+    refusal?: HiddenCompletionRefusal;
     ok: boolean;
     result?: string;
     error?: string;

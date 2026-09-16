@@ -149,6 +149,19 @@ export interface SidebarSnapshot {
 export interface StatusDetail extends SidebarSnapshot {
     /** True when Rust authority has rerouted host tool and historian paths to the module. */
     hostBackendsModuleSide?: boolean;
+    /** Host cursor compared with the module changefeed frontier. */
+    memoryMirror?: {
+        cursor: number;
+        cursorUpdatedAt: number | null;
+        cursorAgeMs: number | null;
+        liveRows: number;
+        feedHead: number | null;
+        pendingRows: number | null;
+        stalled: boolean;
+        code: "MC-M01" | null;
+    };
+    /** A durable host marker whose live module status no longer reports module ownership. */
+    memoryAuthorityMismatch?: boolean;
     /** User-owned model profile selected for this project, or null for the base config. */
     activeProfile: string | null;
     tagCounter: number;

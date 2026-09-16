@@ -32,7 +32,11 @@ import {
 } from "./storage-task-schedule";
 import { createDreamTaskExecutor } from "./task-executor";
 import { type DreamTaskProgress, leaseKeyFor } from "./task-registry";
-import { type DreamTaskRuntimeConfig, runDueTasksForProject } from "./task-scheduler";
+import {
+    type DreamTaskRuntimeConfig,
+    runDueTasksForProject,
+    runManualDream,
+} from "./task-scheduler";
 
 let db: Database | null = null;
 
@@ -232,20 +236,20 @@ describe("createDreamTaskExecutor — curate", () => {
         }
     });
 
-    test("runs whole-pool curation without verification gate or watermark patch", async () => {
+    test("scopes curation to one category without verification data from another", async () => {
         db = freshDb();
         const project = "/repo/project";
-        const first = insertMemory(db, {
+        const architecture = insertMemory(db, {
             projectPath: project,
             category: "ARCHITECTURE",
             content: "First memory uses src/first.ts because it is load-bearing.",
         });
-        const second = insertMemory(db, {
+        const projectRule = insertMemory(db, {
             projectPath: project,
             category: "PROJECT_RULES",
             content: "Second memory is a project workflow rule.",
         });
-        recordMemoryVerifications(db, first.id, ["src/first.ts"], Date.now());
+        recordMemoryVerifications(db, architecture.id, ["src/first.ts"], Date.now());
         let capturedPrompt = "";
         const client = {
             session: {
@@ -277,17 +281,149 @@ describe("createDreamTaskExecutor — curate", () => {
             leaseKey: leaseKeyFor("curate", project),
         });
 
-        expect(result).toEqual({ status: "completed", schedulePatch: undefined });
+        expect(result.status).toBe("completed");
         expect(capturedPrompt).toContain("## Task: Curate Project Memory Pool (hygiene)");
-        expect(capturedPrompt).toContain(first.content);
-        expect(capturedPrompt).toContain(second.content);
-        expect(capturedPrompt).toContain("Mapped files: src/first.ts");
+        expect(capturedPrompt).toContain(
+            "whole of the `PROJECT_RULES` category (the other categories run in later windows)",
+        );
+        expect(capturedPrompt).toContain(`[${projectRule.id}] PROJECT_RULES`);
+        expect(capturedPrompt).not.toContain(`[${architecture.id}] ARCHITECTURE`);
+        expect(capturedPrompt).not.toContain("Mapped files: src/first.ts");
         expect(capturedPrompt).toContain(
             "global user profile describes the operator and is never a substitute",
         );
         expect(capturedPrompt).not.toContain("### Global user profile");
         expect(capturedPrompt).not.toContain('ctx_memory(action="verified"');
         expect(capturedPrompt).not.toContain("verified_files");
+    });
+
+    test("rotates five successful runs in taxonomy order and keeps each prompt ID-scoped", async () => {
+        db = freshDb();
+        const project = "/repo/curate-rotation";
+        const categories = [
+            "PROJECT_RULES",
+            "ARCHITECTURE",
+            "CONSTRAINTS",
+            "CONFIG_VALUES",
+            "NAMING",
+        ] as const;
+        const expectedIds = new Map<string, number[]>();
+        for (const category of categories) {
+            const first = insertMemory(db, {
+                projectPath: project,
+                category,
+                content: `${category} first scoped fixture.`,
+            });
+            const second = insertMemory(db, {
+                projectPath: project,
+                category,
+                content: `${category} second scoped fixture.`,
+            });
+            expectedIds.set(category, [first.id, second.id]);
+        }
+
+        const prompts: string[] = [];
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: `rotation-${prompts.length}` } })),
+                prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+                    prompts.push(args.body?.parts?.[0]?.text ?? "");
+                    return {};
+                }),
+                messages: mock(async () => ({ data: assistantMessages("curation complete") })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const config: DreamTaskRuntimeConfig = {
+            task: "curate",
+            schedule: "0 4 * * 0",
+            timeoutMinutes: 20,
+        };
+
+        for (const category of categories) {
+            const result = await runManualDream({
+                db,
+                projectIdentity: project,
+                tasks: [config],
+                executor,
+                task: "curate",
+            });
+            expect(result.failed).toEqual([]);
+            const prompt = prompts.at(-1) ?? "";
+            const promptIds = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]));
+            expect(prompt).toContain(`whole of the \`${category}\` category`);
+            expect(promptIds.sort((left, right) => left - right)).toEqual(
+                [...(expectedIds.get(category) ?? [])].sort((left, right) => left - right),
+            );
+        }
+        expect(prompts).toHaveLength(5);
+    });
+
+    test("retries the failed category and skips an empty category in the same window", async () => {
+        db = freshDb();
+        const project = "/repo/curate-retry-skip";
+        const architecture = insertMemory(db, {
+            projectPath: project,
+            category: "ARCHITECTURE",
+            content: "Architecture remains the retry scope.",
+        });
+        const prompts: string[] = [];
+        let attempts = 0;
+        const client = {
+            session: {
+                list: mock(async () => ({ data: [] })),
+                create: mock(async () => ({ data: { id: `retry-${attempts}` } })),
+                prompt: mock(async (args: { body?: { parts?: Array<{ text?: string }> } }) => {
+                    prompts.push(args.body?.parts?.[0]?.text ?? "");
+                    attempts += 1;
+                    if (attempts === 1) throw new Error("provider request timed out");
+                    return {};
+                }),
+                messages: mock(async () => ({ data: assistantMessages("curation complete") })),
+                delete: mock(async () => ({})),
+            },
+        };
+        const executor = createDreamTaskExecutor({
+            client: client as never,
+            sessionDirectory: project,
+            openOpenCodeDb: () => null,
+        });
+        const config: DreamTaskRuntimeConfig = {
+            task: "curate",
+            schedule: "0 4 * * 0",
+            timeoutMinutes: 20,
+        };
+
+        const failed = await runManualDream({
+            db,
+            projectIdentity: project,
+            tasks: [config],
+            executor,
+            task: "curate",
+        });
+        const retried = await runManualDream({
+            db,
+            projectIdentity: project,
+            tasks: [config],
+            executor,
+            task: "curate",
+        });
+
+        expect(failed.failed).toEqual(["curate"]);
+        expect(retried.ran).toEqual(["curate"]);
+        expect(prompts).toHaveLength(2);
+        for (const prompt of prompts) {
+            expect(prompt).toContain("whole of the `ARCHITECTURE` category");
+            expect([...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) => Number(match[1]))).toEqual([
+                architecture.id,
+            ]);
+        }
     });
 
     test("archives expired active memories before curation without expiring permanent rows", async () => {
@@ -500,17 +636,26 @@ describe("createDreamTaskExecutor — curate", () => {
             },
         );
 
-        expect(result).toEqual({
+        expect(result).toMatchObject({
             status: "completed",
-            detail: "curate: refused 1 unsafe mutation(s)",
+            detail: "curate: ARCHITECTURE (1); curate: refused 1 unsafe mutation(s)",
+            backlog: { category: "ARCHITECTURE", pending: 1, total: 1 },
         });
         expect(progress).toContainEqual(
-            expect.objectContaining({ task: "curate", processed: 1, refused: 1 }),
+            expect.objectContaining({
+                task: "curate",
+                category: "ARCHITECTURE",
+                total: 1,
+                processed: 1,
+                refused: 1,
+            }),
         );
         const tasks = JSON.parse(getDreamRuns(db, project)[0]?.tasks_json ?? "[]") as Array<{
             progress?: string;
         }>;
-        expect(tasks[0]?.progress).toBe("curate: refused 1 unsafe mutation(s)");
+        expect(tasks[0]?.progress).toBe(
+            "curate: ARCHITECTURE (1); curate: refused 1 unsafe mutation(s)",
+        );
     });
 
     test("rejects a textual pseudo-tool-call and retries with the fallback model", async () => {
@@ -562,9 +707,10 @@ describe("createDreamTaskExecutor — curate", () => {
         );
 
         expect(promptCalls).toBe(2);
-        expect(result).toEqual({
+        expect(result).toMatchObject({
             status: "completed",
-            detail: "curate: 1 memory operation applied (archive)",
+            detail: "curate: PROJECT_RULES (1); curate: 1 memory operation applied (archive)",
+            backlog: { category: "PROJECT_RULES", pending: 1, total: 1 },
         });
     });
 
@@ -2037,3 +2183,45 @@ test("createDreamTaskExecutor surfaces host-refused verify counts", async () => 
     };
     expect(task.progress).toContain("refused 1");
 });
+
+for (const task of ["curate", "map-memories", "verify", "verify-broad"] as const) {
+    test(`tools:false refuses ${task} before dispatch and records a failed dream run`, async () => {
+        db = freshDb();
+        const project = `/repo/hidden-${task}`;
+        const open = mock(async () => {
+            throw new Error("unexpected hidden dispatch");
+        });
+        const executor = createDreamTaskExecutor({
+            sessionDirectory: project,
+            parentSessionId: "existing-user-session",
+            openOpenCodeDb: () => null,
+            hiddenCompletionExecutor: {
+                capabilities: { tools: false, harness: "opencode2" },
+                open,
+                async attempt() {
+                    throw new Error("unexpected prompt");
+                },
+                async collect() {
+                    throw new Error("unexpected read");
+                },
+                async close() {},
+            },
+        });
+        const result = await executor(
+            { task, schedule: "0 4 * * 0", timeoutMinutes: 20 },
+            {
+                db,
+                projectIdentity: project,
+                holderId: `holder-${task}`,
+                leaseKey: leaseKeyFor(task, project),
+            },
+        );
+        expect(result).toMatchObject({ status: "failed", transient: false });
+        expect(open).toHaveBeenCalledTimes(0);
+        const rows = getDreamRuns(db, project);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.tasks_failed).toBe(1);
+        expect(rows[0]!.tasks_succeeded).toBe(0);
+        expect(JSON.stringify(rows[0])).toContain("requires tools");
+    });
+}

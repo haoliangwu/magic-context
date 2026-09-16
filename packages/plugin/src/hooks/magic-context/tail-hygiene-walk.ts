@@ -82,7 +82,7 @@ interface ToolPartIdentity {
 
 interface ContentMemoEntry {
     hash: string;
-    tokens: number;
+    tokens: number | undefined;
     keyBytes: number;
 }
 
@@ -113,7 +113,7 @@ function memoizedContent(kind: TailHygienePartKind, content: string): ContentMem
     if (cached) return cached;
     const measured = {
         hash: fnv1a32(key),
-        tokens: kind === "excluded" ? 0 : estimateTokens(content),
+        tokens: kind === "excluded" ? 0 : undefined,
         keyBytes: key.length * 2 + 32,
     };
     contentMemo.set(key, measured);
@@ -129,6 +129,14 @@ function memoizedContent(kind: TailHygienePartKind, content: string): ContentMem
         contentMemo.delete(oldest);
     }
     return measured;
+}
+
+function memoizedTokens(kind: TailHygienePartKind, content: string): number {
+    const measured = memoizedContent(kind, content);
+    if (measured.tokens === undefined) {
+        measured.tokens = estimateTokens(content);
+    }
+    return measured.tokens;
 }
 
 function safeStableStringify(value: unknown): string {
@@ -490,8 +498,8 @@ function fileContentAndTokens(part: Record<string, unknown>): { content: string;
         };
     }
     const content = firstString(part, ["content", "text", "source", "url"]);
-    const memo = memoizedContent("file", content);
-    return { content, tokens: memo.tokens };
+    const tokens = memoizedTokens("file", content);
+    return { content, tokens };
 }
 
 function contentSignature(parts: readonly TailHygienePartMeasurement[]): string {
@@ -613,13 +621,13 @@ export function measureTailHygiene(input: {
                     parts.push(excludedSnapshot(`${key}\0excluded`, part));
                     continue;
                 }
-                const memo = memoizedContent("text", content);
+                const tokens = memoizedTokens("text", content);
                 const tag = attribution.messageTags.get(`${message.info.id}:p${partIndex}`);
                 const measured = snapshot({
                     key: `${key}\0text`,
                     kind: "text",
                     content,
-                    tokens: memo.tokens,
+                    tokens,
                     tag,
                     protectedNumbers: attribution.protectedNumbers,
                     pendingDropTagNumbers,
@@ -660,12 +668,12 @@ export function measureTailHygiene(input: {
                 const tag = attribution.toolTagsByPart.get(part);
                 const inputText = toolInputText(part);
                 if (inputText !== null) {
-                    const memo = memoizedContent("toolInput", inputText);
+                    const tokens = memoizedTokens("toolInput", inputText);
                     const measured = snapshot({
                         key: `${key}\0toolInput`,
                         kind: "toolInput",
                         content: inputText,
-                        tokens: memo.tokens,
+                        tokens,
                         tag,
                         protectedNumbers: attribution.protectedNumbers,
                         pendingDropTagNumbers,
@@ -680,12 +688,12 @@ export function measureTailHygiene(input: {
                     if (isDropSentinel(output)) {
                         parts.push(excludedSnapshot(`${key}\0excludedOutput`, output));
                     } else {
-                        const memo = memoizedContent("toolOutput", output);
+                        const tokens = memoizedTokens("toolOutput", output);
                         const measured = snapshot({
                             key: `${key}\0toolOutput`,
                             kind: "toolOutput",
                             content: output,
-                            tokens: memo.tokens,
+                            tokens,
                             tag,
                             protectedNumbers: attribution.protectedNumbers,
                             pendingDropTagNumbers,

@@ -81,9 +81,11 @@ test("v2_loads_via_exports_map and session_message_reader real host writes", asy
 		const plugins = await client.plugin.list({
 			location: { directory: host.cwd },
 		});
-		expect(JSON.stringify(plugins)).toContain(
-			"@cortexkit/opencode-magic-context",
-		);
+		// Both loaders now share the v1 plugin id through the additive union entry.
+		expect(
+			plugins.data.find((plugin) => plugin.id === "opencode-magic-context")
+				?.state.status,
+		).toBe("active");
 		expect(host.stdout() + host.stderr()).toContain(
 			"@cortexkit/opencode-magic-context v2 setup",
 		);

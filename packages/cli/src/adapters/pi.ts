@@ -10,7 +10,10 @@ import {
     getPiUserExtensionsPath,
 } from "../lib/paths";
 import { detectPiBinary, PI_PACKAGE_SOURCE, runPiCommand } from "../lib/pi-helpers";
-import { isPiMagicContextPackageEntry } from "../lib/pi-package-entry";
+import {
+    isConfiguredPiMagicContextEntry,
+    isPiMagicContextPackageEntry,
+} from "../lib/pi-package-entry";
 import type {
     HarnessAdapter,
     HarnessConfigPaths,
@@ -34,7 +37,8 @@ export class PiAdapter implements HarnessAdapter {
         const settings = readPiSettings();
         if (!settings) return false;
         const packages = (settings.packages ?? []) as unknown[];
-        return packages.some((entry) => isPiMagicContextPackageEntry(entry));
+        const agentDir = getPiAgentConfigDir();
+        return packages.some((entry) => isConfiguredPiMagicContextEntry(entry, agentDir));
     }
 
     getConfigPaths(): HarnessConfigPaths {
@@ -55,7 +59,12 @@ export class PiAdapter implements HarnessAdapter {
                 ? (settings.packages as unknown[])
                 : [];
 
-            const idx = packages.findIndex((entry) => isPiMagicContextPackageEntry(entry));
+            // A local checkout of the plugin is already a registered identity; adding the
+            // npm specifier beside it would make Pi load the plugin twice.
+            const agentDir = getPiAgentConfigDir();
+            const idx = packages.findIndex((entry) =>
+                isConfiguredPiMagicContextEntry(entry, agentDir),
+            );
             if (idx === -1) {
                 packages.push(PI_PACKAGE_SOURCE);
                 settings.packages = packages;

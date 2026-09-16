@@ -1,0 +1,804 @@
+{
+  "clean": [
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-clean",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "prompt-settled-log",
+      "historian: prompt completed (attempt 1/3)"
+    ],
+    [
+      "messages",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>",
+          "limit": 50
+        }
+      }
+    ],
+    [
+      "messages-result-and-usage",
+      [
+        {
+          "info": {
+            "role": "assistant",
+            "time": {
+              "created": 1
+            },
+            "finish_reason": "stop",
+            "tokens": {
+              "input": 20,
+              "output": 7,
+              "cache": {
+                "read": 2,
+                "write": 3
+              }
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "<compartment start=\"1\" end=\"2\" title=\"Summary\"><p1>Both messages preserved.</p1></compartment>"
+            }
+          ]
+        }
+      ]
+    ],
+    [
+      "retire-delete",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ]
+  ],
+  "transient": [
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-transient",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "prompt-settled-log",
+      "historian: prompt completed (attempt 2/3)"
+    ],
+    [
+      "messages",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>",
+          "limit": 50
+        }
+      }
+    ],
+    [
+      "messages-result-and-usage",
+      [
+        {
+          "info": {
+            "role": "assistant",
+            "time": {
+              "created": 1
+            },
+            "finish_reason": "stop",
+            "tokens": {
+              "input": 20,
+              "output": 7,
+              "cache": {
+                "read": 2,
+                "write": 3
+              }
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "<compartment start=\"1\" end=\"2\" title=\"Summary\"><p1>Both messages preserved.</p1></compartment>"
+            }
+          ]
+        }
+      ]
+    ],
+    [
+      "retire-archive",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "time": {
+            "archived": 1700000000000
+          }
+        }
+      }
+    ]
+  ],
+  "validation-repair-editor": [
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-validation-repair-editor",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "prompt-settled-log",
+      "historian: prompt completed (attempt 1/3)"
+    ],
+    [
+      "messages",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>",
+          "limit": 50
+        }
+      }
+    ],
+    [
+      "messages-result-and-usage",
+      [
+        {
+          "info": {
+            "role": "assistant",
+            "time": {
+              "created": 1
+            },
+            "finish_reason": "stop",
+            "tokens": {
+              "input": 20,
+              "output": 7,
+              "cache": {
+                "read": 2,
+                "write": 3
+              }
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "not a compartment"
+            }
+          ]
+        }
+      ]
+    ],
+    [
+      "retire-delete",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-validation-repair-editor",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-2"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second\n\nYour previous XML response was invalid and cannot be persisted.\nValidation error: Historian returned no usable compartments.\nReturn a corrected full XML response for the same existing state and new messages.\nDo not skip any displayed raw ordinal or displayed raw range, even if the message looks trivial.\nEvery displayed message range must belong to exactly one compartment unless it is intentionally left in one trailing suffix marked by <unprocessed_from>.\n\nPrevious invalid XML:\nnot a compartment",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "prompt-settled-log",
+      "historian: prompt completed (attempt 1/3)"
+    ],
+    [
+      "messages",
+      {
+        "path": {
+          "id": "child-2"
+        },
+        "query": {
+          "directory": "<directory>",
+          "limit": 50
+        }
+      }
+    ],
+    [
+      "messages-result-and-usage",
+      [
+        {
+          "info": {
+            "role": "assistant",
+            "time": {
+              "created": 1
+            },
+            "finish_reason": "stop",
+            "tokens": {
+              "input": 20,
+              "output": 7,
+              "cache": {
+                "read": 2,
+                "write": 3
+              }
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "<compartment start=\"1\" end=\"2\" title=\"Summary\"><p1>Both messages preserved.</p1></compartment>"
+            }
+          ]
+        }
+      ]
+    ],
+    [
+      "retire-delete",
+      {
+        "path": {
+          "id": "child-2"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-validation-repair-editor",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-3"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian-editor",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "This is a historian draft. Clean it up following the rules in your system prompt.\n\n<draft>\n<compartment start=\"1\" end=\"2\" title=\"Summary\"><p1>Both messages preserved.</p1></compartment>\n</draft>\n\nReturn the cleaned draft as valid XML matching the original structure.",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "prompt-settled-log",
+      "historian: prompt completed (attempt 1/3)"
+    ],
+    [
+      "messages",
+      {
+        "path": {
+          "id": "child-3"
+        },
+        "query": {
+          "directory": "<directory>",
+          "limit": 50
+        }
+      }
+    ],
+    [
+      "messages-result-and-usage",
+      [
+        {
+          "info": {
+            "role": "assistant",
+            "time": {
+              "created": 1
+            },
+            "finish_reason": "stop",
+            "tokens": {
+              "input": 20,
+              "output": 7,
+              "cache": {
+                "read": 2,
+                "write": 3
+              }
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "<compartment start=\"1\" end=\"2\" title=\"Summary\"><p1>Both messages preserved.</p1></compartment>"
+            }
+          ]
+        }
+      ]
+    ],
+    [
+      "retire-delete",
+      {
+        "path": {
+          "id": "child-3"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ]
+  ],
+  "fallback-model": [
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-fallback-model",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "retire-archive",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "time": {
+            "archived": 1700000000000
+          }
+        }
+      }
+    ],
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-fallback-model",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-2"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "alternate"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "prompt-settled-log",
+      "historian: prompt completed (attempt 1/3)"
+    ],
+    [
+      "messages",
+      {
+        "path": {
+          "id": "child-2"
+        },
+        "query": {
+          "directory": "<directory>",
+          "limit": 50
+        }
+      }
+    ],
+    [
+      "messages-result-and-usage",
+      [
+        {
+          "info": {
+            "role": "assistant",
+            "time": {
+              "created": 1
+            },
+            "finish_reason": "stop",
+            "tokens": {
+              "input": 20,
+              "output": 7,
+              "cache": {
+                "read": 2,
+                "write": 3
+              }
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "<compartment start=\"1\" end=\"2\" title=\"Summary\"><p1>Both messages preserved.</p1></compartment>"
+            }
+          ]
+        }
+      ]
+    ],
+    [
+      "retire-delete",
+      {
+        "path": {
+          "id": "child-2"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ]
+  ],
+  "length-capped-reasoning": [
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-length-capped-reasoning",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "prompt-settled-log",
+      "historian: prompt completed (attempt 1/3)"
+    ],
+    [
+      "messages",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>",
+          "limit": 50
+        }
+      }
+    ],
+    [
+      "messages-result-and-usage",
+      [
+        {
+          "info": {
+            "role": "assistant",
+            "time": {
+              "created": 1
+            },
+            "finish_reason": "length",
+            "tokens": {
+              "input": 20,
+              "output": 7,
+              "cache": {
+                "read": 2,
+                "write": 3
+              }
+            }
+          },
+          "parts": [
+            {
+              "type": "reasoning",
+              "text": "<compartment start=\"1\" end=\"2\" title=\"Summary\"><p1>Both messages preserved.</p1></compartment>"
+            }
+          ]
+        }
+      ]
+    ],
+    [
+      "retire-delete",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ]
+  ],
+  "aborted": [
+    [
+      "create",
+      {
+        "body": {
+          "parentID": "parent-aborted",
+          "title": "magic-context-compartment"
+        },
+        "query": {
+          "directory": "<directory>"
+        }
+      }
+    ],
+    [
+      "prompt",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "agent": "historian",
+          "model": {
+            "providerID": "mock",
+            "modelID": "primary"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "Messages 1-2:\n1: U: first\n2: A: second",
+              "synthetic": true
+            }
+          ]
+        },
+        "signal": "<AbortSignal>"
+      }
+    ],
+    [
+      "retire-archive",
+      {
+        "path": {
+          "id": "child-1"
+        },
+        "query": {
+          "directory": "<directory>"
+        },
+        "body": {
+          "time": {
+            "archived": 1700000000000
+          }
+        }
+      }
+    ]
+  ]
+}

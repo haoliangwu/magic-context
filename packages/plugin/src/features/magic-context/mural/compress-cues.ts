@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
-import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import { createV1HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-historian";
+import {
+    type HiddenCompletionExecutor,
+    HiddenCompletionRefusal,
+    type HiddenRunHandle,
+} from "../../../hooks/magic-context/compartment-runner-types";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
-import {
-    extractLatestAssistantText,
-    hasLengthCappedOutput,
-} from "../../../shared/assistant-message-extractor";
-import { teardownChildSession } from "../../../shared/child-session-teardown";
+
 import { describeError } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
@@ -26,6 +27,7 @@ import {
     providerOutputFailureFromInvalidManifest,
 } from "../dreamer/provider-output-failure";
 import { getMemoriesByProject, type Memory } from "../memory";
+import { recordChildInvocation } from "../subagent-token-capture";
 import {
     buildCompressCuesPrompt,
     COMPRESS_CUES_SYSTEM_PROMPT,
@@ -88,7 +90,8 @@ const CONSECUTIVE_TIMEOUT_LIMIT = 2;
 
 export interface CompressCuesArgs {
     db: Database;
-    client: PluginContext["client"];
+    client?: PluginContext["client"];
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     projectIdentity: string;
     parentSessionId: string | undefined;
     sessionDirectory: string;
@@ -345,6 +348,10 @@ async function compressOneChunk(
     signal: AbortSignal,
 ): Promise<ChunkOutcome> {
     let agentSessionId: string | null = null;
+    let handle: HiddenRunHandle | null = null;
+    const executor =
+        args.hiddenCompletionExecutor ??
+        createV1HiddenCompletionExecutor(args.client, args.db, args.sessionDirectory);
     let promptSettled = false;
     const startedAt = Date.now();
     try {
@@ -353,22 +360,23 @@ async function compressOneChunk(
             memories: chunk.map(toPromptMemory),
         });
 
-        const createResponse = await createChildSessionWithFence({
-            client: args.client,
-            db: args.db,
+        handle = await executor.open({
             parentSessionId: args.parentSessionId,
+            agent: DREAMER_CLASSIFIER_AGENT,
+            kind: "dreamer-task",
+            system: COMPRESS_CUES_SYSTEM_PROMPT,
+            model: args.model,
+            configuredModels: [...(args.model ? [args.model] : []), ...(args.fallbackModels ?? [])],
+            timeoutMs: sliceMs,
             title: "magic-context-dream-compress-cues",
             directory: args.sessionDirectory,
+            metadata: { task: "compress-cues" },
         });
-        const created = shared.normalizeSDKResponse(
-            createResponse,
-            null as { id?: string } | null,
-            {
-                preferResponseOnMissingData: true,
-            },
-        );
-        agentSessionId = typeof created?.id === "string" ? created.id : null;
+        agentSessionId = handle.id || null;
         if (!agentSessionId) throw new Error("Could not create compress-cues session.");
+        // The retry callbacks close over the opened run; bind it once so the closures
+        // see the resolved handle rather than the nullable slot it was assigned to.
+        const opened = handle;
 
         const run = await shared.promptSyncWithValidatedOutputRetry(
             args.client,
@@ -383,24 +391,22 @@ async function compressOneChunk(
                 },
             },
             {
+                transport: Object.assign(
+                    (request: import("../../../shared/model-suggestion-retry").PromptArgs) =>
+                        executor.attempt(opened, request),
+                    { childSessionId: opened.childSessionId },
+                ),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:compress-cues",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: agentSessionId as string },
-                        query: { directory: args.sessionDirectory, limit: 50 },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
-                },
-                validateOutput: (messages) => {
-                    if (hasLengthCappedOutput(messages)) {
+                fetchOutput: () => executor.collect(opened, 50),
+                validateOutput: (completion) => {
+                    const messages = completion.messages ?? [];
+                    if (completion.lengthCapped) {
                         throw new Error("compress-cues returned length-capped output");
                     }
-                    const text = extractLatestAssistantText(messages);
+                    const text = completion.text;
                     if (!text) throw new Error("compress-cues returned no output");
                     // Fail-closed root parse: a missing/truncated <cues> root rejects
                     // the whole chunk here (no partial apply from a truncated reply).
@@ -419,6 +425,20 @@ async function compressOneChunk(
             },
         );
         promptSettled = true;
+        if (args.hiddenCompletionExecutor && args.parentSessionId) {
+            recordChildInvocation({
+                db: args.db,
+                parentSessionId: args.parentSessionId,
+                harness: executor.capabilities.harness,
+                subagent: "dreamer",
+                task: "compress-cues",
+                startedAt,
+                status: "completed",
+                tokens: run.output.usage,
+                providerId: run.output.providerId,
+                modelId: run.output.modelId,
+            });
+        }
 
         return args.moduleRoute
             ? await applyCuesThroughModule(args, chunk, run.validated, signal)
@@ -432,7 +452,12 @@ async function compressOneChunk(
         // A chunk failure is not fatal to the run: other chunks still compress,
         // and this chunk's memories stay NULL and are retried next run. Rethrow
         // only on abort (lease lost / deadline) so the scheduler records it.
-        if (signal.aborted || error instanceof DreamerProviderOutputFailureError) throw error;
+        if (
+            signal.aborted ||
+            error instanceof HiddenCompletionRefusal ||
+            error instanceof DreamerProviderOutputFailureError
+        )
+            throw error;
         // Classify the failure so the run loop can drive the consecutive-timeout
         // circuit breaker. The measured elapsed time lets the operator compare
         // how long the model actually ran against the slice it was given.
@@ -446,10 +471,7 @@ async function compressOneChunk(
             },
         };
     } finally {
-        await teardownChildSession({
-            client: args.client,
-            sessionId: agentSessionId,
-            sessionDirectory: args.sessionDirectory,
+        await executor.close(handle, {
             promptSettled,
             privacySensitive: true,
             context: "[dreamer] compress-cues",

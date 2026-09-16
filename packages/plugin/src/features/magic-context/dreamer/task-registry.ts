@@ -8,6 +8,8 @@
  * concurrently while memory-mutating tasks serialize. See lease.ts + the A+B spec.
  */
 
+import type { CurateMemoryCategory } from "./curate-category-rotation";
+
 export const CANONICAL_DREAM_TASKS = [
     // map-memories runs BEFORE verify (it records the file mappings verify gates
     // on) and shares the memory lease, so it leads the canonical order.
@@ -27,12 +29,33 @@ export const CANONICAL_DREAM_TASKS = [
 
 export type DreamTaskName = (typeof CANONICAL_DREAM_TASKS)[number];
 
+export const DREAM_TASK_CAPABILITIES: Record<DreamTaskName, { requiresTools: boolean }> = {
+    // A single manifest is not a tool-free task: mapping and verification need
+    // read-only tools to inspect backing code before they can change memory state.
+    "map-memories": { requiresTools: true },
+    verify: { requiresTools: true },
+    "verify-broad": { requiresTools: true },
+    curate: { requiresTools: true },
+    // mural/compress-cues.ts is a zero-tool transform; its child transport
+    // still needs substitution before the generate executor can dispatch it.
+    "compress-cues": { requiresTools: false },
+    "classify-memories": { requiresTools: false },
+    retrospective: { requiresTools: true },
+    "maintain-docs": { requiresTools: true },
+    "evaluate-smart-notes": { requiresTools: true },
+    "review-user-memories": { requiresTools: true },
+    "promote-primers": { requiresTools: true },
+    "refresh-primers": { requiresTools: true },
+};
+
 /** Cheap, read-only work counts for one Dreamer task. */
 export interface DreamTaskBacklog {
     /** Items selected by the task's current backlog predicate. */
     pending: number;
     /** Total items in the task's candidate pool. */
     total: number;
+    /** Curate's one-category scope for this run/window. */
+    category?: CurateMemoryCategory;
 }
 
 /** Backlog counts keyed by canonical task name. */
@@ -47,6 +70,9 @@ export function formatDreamTaskBacklogs(
         .filter((task) => backlogs[task] !== undefined)
         .map((task) => {
             const backlog = backlogs[task];
+            if (task === "curate" && backlog?.category) {
+                return `- curate: ${backlog.category} (${backlog.pending})`;
+            }
             return `- ${task}: ${backlog?.pending ?? 0} pending / ${backlog?.total ?? 0} total`;
         })
         .join("\n");
@@ -58,6 +84,8 @@ export interface DreamTaskProgress {
     processed: number;
     total: number;
     startedAt: number;
+    /** Curate's one-category scope. */
+    category?: CurateMemoryCategory;
     /** Update/archive verdicts refused by host-side verification safety gates during the current run. */
     refused?: number;
 }
@@ -69,6 +97,7 @@ export interface DreamTaskRunBacklog {
     pendingAtEnd: number;
     totalAtEnd: number;
     processed: number;
+    category?: CurateMemoryCategory;
 }
 
 /** Use the decrease in the persisted backlog between the start and end snapshots as the per-run progress count, clamped to zero when the backlog does not decrease. */

@@ -6,7 +6,11 @@ import type { ModelInput } from "./model-resolution";
 import { sanitizeDiagnosticText } from "./redaction";
 import { parseProviderModel, toModelEntry } from "./resolve-fallbacks";
 
-type Client = ReturnType<typeof createOpencodeClient>;
+type Client = ReturnType<typeof createOpencodeClient> | undefined;
+
+export type PromptTransport = ((args: PromptArgs) => Promise<void>) & {
+    readonly childSessionId?: string;
+};
 
 /** Max time to wait for the best-effort child-session abort HTTP call before
  *  giving up on its response (the abort still proceeds server-side). Keeps a
@@ -50,6 +54,7 @@ export interface PromptAttemptInfo {
 }
 
 export interface PromptRetryOptions {
+    transport?: PromptTransport;
     timeoutMs?: number;
     /** External abort signal — cancels the in-flight LLM prompt immediately when aborted */
     signal?: AbortSignal;
@@ -200,6 +205,7 @@ async function promptWithTimeout(
     args: PromptArgs,
     timeoutMs: number,
     signal?: AbortSignal,
+    transport?: PromptTransport,
 ): Promise<void> {
     // Bail immediately if the caller's signal is already aborted (e.g.
     // lease loss before this attempt was scheduled). Per spec
@@ -218,23 +224,29 @@ async function promptWithTimeout(
     signal?.addEventListener("abort", onExternalAbort);
 
     try {
-        await client.session.prompt({
-            ...args,
-            signal: controller.signal,
-        } as Parameters<typeof client.session.prompt>[0]);
+        const request = { ...args, signal: controller.signal };
+        if (transport) await transport(request);
+        else {
+            if (!client) throw new Error("Hidden completion transport is unavailable");
+            await client.session.prompt(request as Parameters<typeof client.session.prompt>[0]);
+        }
     } catch (error) {
         if (signal?.aborted) {
             // External abort (e.g. dreamer lease loss): the child run loop is an
             // independent SERVER-SIDE fiber — cancelling our client fetch alone
             // leaves it looping the LLM forever (issue #154). Force-stop it.
-            await abortChildRun(client, args.path.id);
+            if (!transport || transport.childSessionId) {
+                await abortChildRun(client, transport?.childSessionId ?? args.path.id);
+            }
             throw new Error("prompt aborted by external signal");
         }
         if (controller.signal.aborted) {
             // Our timeout fired. Same problem: abort the server-side run loop, not
             // just our fetch, or the child keeps re-calling the LLM past the
             // timeout (uncancellable by the user's ESC — issue #154).
-            await abortChildRun(client, args.path.id);
+            if (!transport || transport.childSessionId) {
+                await abortChildRun(client, transport?.childSessionId ?? args.path.id);
+            }
             throw new Error(`prompt timed out after ${timeoutMs}ms`);
         }
         throw error;
@@ -251,6 +263,7 @@ async function promptWithTimeout(
  * a failure here must not mask the original timeout/abort error.
  */
 async function abortChildRun(client: Client, sessionId: string): Promise<void> {
+    if (!client) return;
     try {
         // Bound the abort call: it's best-effort cleanup, and if the abort
         // endpoint itself stalls (the runner is wedged) an unbounded await here
@@ -342,6 +355,7 @@ function throwWithPromptFailure(
     failedAttempts: FailedAttempt[],
     args: PromptArgs,
     timeoutMs: number,
+    transport?: PromptTransport,
 ): never {
     const error =
         legacyError instanceof Error ? legacyError : new Error(extractMessage(legacyError));
@@ -357,7 +371,7 @@ function throwWithPromptFailure(
         modelsTried: failedAttempts.map((failure) => failure.attempt.label),
         providerError,
         timeoutMs: failureClass === "provider_timeout" ? timeoutMs : null,
-        childSessionId: args.path.id || null,
+        childSessionId: transport ? (transport.childSessionId ?? null) : args.path.id || null,
     });
     throw error;
 }
@@ -374,6 +388,7 @@ async function attemptOnce(
     signal: AbortSignal | undefined,
     callContext: string,
     label: string,
+    transport?: PromptTransport,
 ): Promise<void> {
     // Keep this snapshot separate from the object passed to the client. A
     // failed prompt facade may rewrite its request body before rejecting; the
@@ -381,7 +396,7 @@ async function attemptOnce(
     const originalBody = { ...args.body };
     const attemptArgs = copyPromptArgs(args, originalBody);
     try {
-        await promptWithTimeout(client, attemptArgs, timeoutMs, signal);
+        await promptWithTimeout(client, attemptArgs, timeoutMs, signal, transport);
         return;
     } catch (error) {
         // If non-retryable (abort, overflow, timeout), bubble up immediately.
@@ -411,6 +426,7 @@ async function attemptOnce(
             }),
             timeoutMs,
             signal,
+            transport,
         );
     }
 }
@@ -460,6 +476,7 @@ export async function promptSyncWithModelSuggestionRetry(
             options.signal,
             callContext,
             explicitPrimaryLabel,
+            options.transport,
         );
         return;
     } catch (error) {
@@ -496,7 +513,15 @@ export async function promptSyncWithModelSuggestionRetry(
         });
 
         try {
-            await attemptOnce(client, attemptArgs, timeoutMs, options.signal, callContext, label);
+            await attemptOnce(
+                client,
+                attemptArgs,
+                timeoutMs,
+                options.signal,
+                callContext,
+                label,
+                options.transport,
+            );
             log(
                 `[${callContext}] fallback succeeded with ${label} (attempt ${i + 2}/${fallbacks.length + 1})`,
             );
@@ -533,7 +558,15 @@ async function attemptAndValidate<TOutput, TValidated>(
     options: ValidatedPromptRetryOptions<TOutput, TValidated>,
 ): Promise<ValidatedPromptRetryResult<TOutput, TValidated>> {
     try {
-        await attemptOnce(client, args, timeoutMs, signal, callContext, attempt.label);
+        await attemptOnce(
+            client,
+            args,
+            timeoutMs,
+            signal,
+            callContext,
+            attempt.label,
+            options.transport,
+        );
     } catch (error) {
         throw {
             error,
@@ -615,11 +648,23 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
         firstError = failure.error;
         lastError = failure.error;
         if (isNonRetryable(failure.error, options.signal)) {
-            throwWithPromptFailure(failure.error, failedAttempts, args, timeoutMs);
+            throwWithPromptFailure(
+                failure.error,
+                failedAttempts,
+                args,
+                timeoutMs,
+                options.transport,
+            );
         }
 
         if (fallbacks.length === 0) {
-            throwWithPromptFailure(failure.error, failedAttempts, args, timeoutMs);
+            throwWithPromptFailure(
+                failure.error,
+                failedAttempts,
+                args,
+                timeoutMs,
+                options.transport,
+            );
         }
 
         log(
@@ -669,7 +714,13 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
             failedAttempts.push(failure);
             lastError = failure.error;
             if (isNonRetryable(failure.error, options.signal)) {
-                throwWithPromptFailure(failure.error, failedAttempts, args, timeoutMs);
+                throwWithPromptFailure(
+                    failure.error,
+                    failedAttempts,
+                    args,
+                    timeoutMs,
+                    options.transport,
+                );
             }
 
             const remaining = fallbacks.length - i - 1;
@@ -689,5 +740,6 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
         failedAttempts,
         args,
         timeoutMs,
+        options.transport,
     );
 }
