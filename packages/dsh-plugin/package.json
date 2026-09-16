@@ -2,7 +2,7 @@
   "name": "@cortexkit/dsh-magic-context",
   "version": "0.42.0",
   "type": "module",
-  "description": "Magic Context — DeepSeek Harness adapter (Host / Agent / Client + profile bundle). Loads the shared Magic SQLite store and registers ctx_* tools, /ctx-* commands, knowledge injection, historian/dreamer scheduling, compaction policy, and the Typert Remote surface for the DSH client.",
+  "description": "Magic Context \u2014 DeepSeek Harness adapter (Host / Agent / Client + profile bundle). Loads the shared Magic SQLite store and registers ctx_* tools, /ctx-* commands, knowledge injection, historian/dreamer scheduling, compaction policy, and the Typert Remote surface for the DSH client.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
@@ -28,7 +28,7 @@
   ],
   "scripts": {
     "build": "bash scripts/build.sh",
-    "prepare": "bun run build 2>&1 | head -n 20; test -f dist/index.js || (echo '[dsh-magic-context] prepare: dist missing — run bun run build manually' >&2; exit 0)",
+    "prepare": "bun run build 2>&1 | head -n 20; test -f dist/index.js || (echo '[dsh-magic-context] prepare: dist missing \u2014 run bun run build manually' >&2; exit 0)",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "clean": "rm -rf dist"

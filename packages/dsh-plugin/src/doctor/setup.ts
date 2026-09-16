@@ -146,7 +146,8 @@ export async function runDshSetup(
 
   // 2. DSH install + system standard preset.
   const located = locateDshInstall({ dshHome, dshInstallDir, stockPresetPath, env });
-  if (located.stockPresetPath === undefined) {
+  const stockSource = located.stockPresetPath;
+  if (stockSource === undefined) {
     steps.push({
       status: "fail",
       title: "DSH install / system standard preset",
@@ -154,7 +155,7 @@ export async function runDshSetup(
         `Could not locate the system standard preset ` +
         `(${DSH_COMPAT_EXPECTED_VERSION} expected). Probed:\n` +
         located.tried.map((candidate) => `  - ${candidate}`).join("\n") +
-        `\nFix: install DSH ${DSH_COMPAT_EXPECTED_VERSION}, or pass ` +
+        `\nFix: install dsh ${DSH_COMPAT_EXPECTED_VERSION} on PATH, or pass ` +
         `--dsh-install <dir> / --stock-preset <file>.`,
     });
     failed = true;
@@ -162,16 +163,16 @@ export async function runDshSetup(
     steps.push({
       status: "ok",
       title: "DSH install / system standard preset",
-      detail: located.stockPresetPath,
+      detail: stockSource,
     });
   }
 
   // 3. Contract scan (fail closed — nothing is written on a mismatch).
   let stockEntries: Record<string, unknown>[] | undefined;
-  if (!failed && located.stockPresetPath !== undefined) {
+  if (!failed && stockSource !== undefined) {
     try {
       stockEntries = parseEntryListYaml(
-        readFileSync(located.stockPresetPath, "utf8"),
+        readFileSync(stockSource, "utf8"),
       );
       const layoutIssue = scanStockPresetLayout(stockEntries);
       if (layoutIssue !== undefined) {
@@ -179,7 +180,7 @@ export async function runDshSetup(
           status: "fail",
           title: "Stock preset contract scan",
           detail:
-            `${located.stockPresetPath}: ${layoutIssue}. The guarded patch cannot ` +
+            `${stockSource}: ${layoutIssue}. The guarded patch cannot ` +
             `be applied — refusing to generate magic-standard (fail closed). ` +
             `Fix: check that the DSH install matches ${DSH_COMPAT_EXPECTED_VERSION}.`,
         });
@@ -188,27 +189,27 @@ export async function runDshSetup(
         steps.push({
           status: "ok",
           title: "Stock preset contract scan",
-          detail: `${located.stockPresetPath}: compaction group + compaction-basic match the expected layout.`,
+          detail: `${stockSource}: compaction group + compaction-basic match the expected layout.`,
         });
       }
     } catch (error) {
       steps.push({
         status: "fail",
         title: "Stock preset contract scan",
-        detail: `${located.stockPresetPath}: ${describeError(error).brief}`,
+        detail: `${stockSource}: ${describeError(error).brief}`,
       });
       failed = true;
     }
   }
 
   // 4. Generate the thin preset (atomic, 0600).
-  if (!failed && stockEntries !== undefined && located.stockPresetPath !== undefined) {
+  if (!failed && stockEntries !== undefined && stockSource !== undefined) {
     try {
       const presetDir = magicStandardDir(dshHome);
       const presetYamlPath = magicStandardPresetYamlPath(dshHome);
       const agentCordisPath = magicStandardAgentCordisPath(dshHome);
       const thinEntries = buildThinPresetEntries({
-        stockPresetPath: located.stockPresetPath,
+        stockPresetPath: stockSource,
         magicEngineEntry: magicEntryPath("compaction"),
         includeEntry: magicEntryPath("preset-include"),
         magicRows: [

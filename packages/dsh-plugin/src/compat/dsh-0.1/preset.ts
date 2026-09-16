@@ -144,6 +144,10 @@ export function buildThinPresetEntries(opts: MagicThinPresetOptions): Record<str
         // The include plugin resolves `path` with `new URL(path, baseUrl)`;
         // a Windows drive path ("D:\…") parses as a `D:` scheme and fails.
         // `pathToFileURL` yields the scheme-file form on every platform.
+        //
+        // The target MUST live inside a node_modules tree that holds the
+        // stock plugins: the stock file's bare package-name rows resolve from
+        // this file's directory walk.
         path: pathToFileURL(opts.stockPresetPath).href,
         patches,
       },

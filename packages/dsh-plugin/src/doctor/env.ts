@@ -36,15 +36,29 @@ export const MAGIC_CONTEXT_PACKAGE = "@cortexkit/dsh-magic-context";
 export const LEGACY_MAGIC_CONTEXT_PACKAGE = "dsh-magic-context";
 
 /** The exact DSH release this adapter's compat layer (compat/dsh-0.1) pins. */
-export const DSH_COMPAT_EXPECTED_VERSION = "0.1.1-rc.2";
+export const DSH_COMPAT_EXPECTED_VERSION = "0.1.5-rc.2";
 
 /** Installed-package identity of the DSH runtime. */
 export const DSH_PACKAGE = "@deepseek-ai/dsh";
 
-/** System preset directory inside a dsh install. */
+/** System preset directory inside a dsh install (0.1.2-era layout). */
 export const STOCK_PRESET_REL = join(
   "config",
   "agent-presets",
+  "standard",
+  "agent.cordis.yml",
+);
+
+/**
+ * System preset path in the 0.1.5+ layout: the stock composition ships in the
+ * sibling `@deepseek-ai/dsh-agent-presets` package next to the `dsh` package
+ * inside the same node_modules tree. The include target MUST live there —
+ * the stock file's bare package-name rows resolve from the include target's
+ * directory walk, which only reaches siblings inside a node_modules tree.
+ */
+export const STOCK_PRESET_REL_V2 = join(
+  "dsh-agent-presets",
+  "presets",
   "standard",
   "agent.cordis.yml",
 );
@@ -126,6 +140,11 @@ export function locateDshInstall(
     const stock = join(candidate, STOCK_PRESET_REL);
     if (isDshInstallRoot(candidate) && existsSync(stock)) {
       return { dshInstallDir: candidate, stockPresetPath: stock, tried };
+    }
+    // 0.1.5+ layout: sibling dsh-agent-presets package in the same tree.
+    const stockV2 = join(dirname(candidate), STOCK_PRESET_REL_V2);
+    if (isDshInstallRoot(candidate) && existsSync(stockV2)) {
+      return { dshInstallDir: candidate, stockPresetPath: stockV2, tried };
     }
   }
   return { tried };
@@ -283,10 +302,8 @@ export function stringFlag(
   return typeof value === "string" ? value : undefined;
 }
 
-/** Absolute path of one bundled entry file (`dist/entries/<name>.js`) of THIS package. */
-export function magicEntryPath(
-  entry: "agent" | "compaction" | "commands" | "tools" | "remote" | "preset-include",
-): string {
+/** Package root of THIS package, located by walking up from this module. */
+function magicPackageRoot(): string {
   let dir = dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 12 && dir !== dirname(dir); depth += 1) {
     const manifest = join(dir, "package.json");
@@ -297,7 +314,7 @@ export function magicEntryPath(
           parsed.name === MAGIC_CONTEXT_PACKAGE ||
           parsed.name === LEGACY_MAGIC_CONTEXT_PACKAGE
         ) {
-          return join(dir, "dist", "entries", `${entry}.js`);
+          return dir;
         }
       } catch {
         // Unparseable manifest — keep walking up.
@@ -309,3 +326,12 @@ export function magicEntryPath(
     `cannot locate ${MAGIC_CONTEXT_PACKAGE} package root from ${import.meta.url}`,
   );
 }
+
+/** Absolute path of one bundled entry file (`dist/entries/<name>.js`) of THIS package. */
+export function magicEntryPath(
+  entry: "agent" | "compaction" | "commands" | "tools" | "remote" | "preset-include",
+): string {
+  return join(magicPackageRoot(), "dist", "entries", `${entry}.js`);
+}
+
+

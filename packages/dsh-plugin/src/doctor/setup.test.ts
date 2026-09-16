@@ -59,6 +59,19 @@ function writeStockPreset(installDir: string, overrides: (rows: Record<string, u
   return file;
 }
 
+/** 0.1.5+ layout: the stock preset lives in the sibling dsh-agent-presets package. */
+function writeStockPresetV2(installDir: string): string {
+  mkdirSync(installDir, { recursive: true });
+  writeFileSync(
+    join(installDir, "package.json"),
+    JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.1.5-rc.2" }),
+  );
+  const file = join(installDir, "..", "dsh-agent-presets", "presets", "standard", "agent.cordis.yml");
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, yamlDump(stockLayout(), { schema: entryListSchema }));
+  return file;
+}
+
 interface TestEnv {
   root: string;
   dshHome: string;
@@ -246,6 +259,35 @@ describe("dsh-magic-context setup (Phase 2 slice C)", () => {
       expect(report.generatedFiles).toEqual([]);
       expect(existsSync(magicStandardAgentCordisPath(env.dshHome))).toBe(false);
       expect(existsSync(join(env.configHome, "cortexkit", "magic-context.jsonc"))).toBe(false);
+    } finally {
+      delete process.env.XDG_CONFIG_HOME;
+      await cleanup(env.root);
+    }
+  });
+
+  it("locates the 0.1.5 sibling dsh-agent-presets layout and includes it in-tree", async () => {
+    const env = makeEnv();
+    process.env.XDG_CONFIG_HOME = env.configHome;
+    try {
+      // <root>/install/node_modules/@deepseek-ai/{dsh, dsh-agent-presets}
+      const dshPkgDir = join(env.installDir, "node_modules", "@deepseek-ai", "dsh");
+      const stock = writeStockPresetV2(dshPkgDir);
+      const report = await runDshSetup([], {
+        dshHome: env.dshHome,
+        dshInstallDir: dshPkgDir,
+        env: { ...process.env, PATH: "/nonexistent-path" },
+      });
+      expect(report.exitCode).toBe(0);
+      const installStep = report.steps.find((step) => step.title.includes("DSH install"));
+      expect(installStep?.status).toBe("ok");
+      expect(installStep?.detail).toBe(stock);
+      // The include row must point INTO the node_modules tree (the stock
+      // file's bare package-name rows resolve from its directory walk).
+      const entries = parseEntryListYaml(
+        readFileSync(magicStandardAgentCordisPath(env.dshHome), "utf8"),
+      );
+      const include = entries[0] as { config: { path: string } };
+      expect(include.config.path).toBe(pathToFileURL(stock).href);
     } finally {
       delete process.env.XDG_CONFIG_HOME;
       await cleanup(env.root);
