@@ -91,13 +91,13 @@ dsh plugin --profile <name> remove @cortexkit/dsh-magic-context
 ## 兼容
 
 - DSH `0.1.1-rc.2` 精确匹配（升级前先跑 `doctor` 契约门）
-- Magic Context 共享 schema `v81`
+- Magic Context 共享 schema `v84`
 
 ## 问答
 
 **问：同时用 Pi / OpenCode 和 DSH 并想共享 memory，版本需要一致吗？**
 
-需要。所有 harness 共用同一 SQLite `~/.local/share/cortexkit/magic-context/context.db`，库有版本（当前 `schema v81`，即 `LATEST_SUPPORTED_VERSION`）。新版本会前向迁移 DB，旧版本会因 schema fence 拒绝打开而 fail-closed。如需跨 `pi` / `opencode` / `dsh` 共享记忆，请保持 `@cortexkit/*-magic-context` 版本同步（同一 monorepo tag），以保证 schema 一致。`doctor` 会报告当前 schema 与适配上限。
+需要。所有 harness 共用同一 SQLite `~/.local/share/cortexkit/magic-context/context.db`，库有版本（当前 `schema v84`，即 `LATEST_SUPPORTED_VERSION`）。新版本会前向迁移 DB，旧版本会因 schema fence 拒绝打开而 fail-closed。如需跨 `pi` / `opencode` / `dsh` 共享记忆，请保持 `@cortexkit/*-magic-context` 版本同步（同一 monorepo tag），以保证 schema 一致。`doctor` 会报告当前 schema 与适配上限。
 
 **问：版本不一致会怎样？**
 

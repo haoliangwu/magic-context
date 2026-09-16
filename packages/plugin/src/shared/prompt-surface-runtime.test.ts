@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -165,5 +165,101 @@ describe("prompt-surface runtime", () => {
         );
         expect(guidance.preset).toBe("light");
         expect(warnings).toEqual([]);
+    });
+});
+
+describe("prompt-surface user config directory resolution per harness", () => {
+    const savedEnv: Record<string, string | undefined> = {};
+    let configHome: string;
+    let homeDir: string;
+    const guidanceContent = "## Magic Context\n\nLegacy-resolved guidance";
+
+    /** Point XDG_CONFIG_HOME/HOME at temp dirs, seed legacy configs, no shared config. */
+    function isolateWithLegacyConfigs(): void {
+        configHome = tempDir();
+        homeDir = tempDir();
+        // No $XDG_CONFIG_HOME/cortexkit/magic-context.* → the shared base is
+        // absent, so the harness legacy-fallback branch decides the outcome.
+        const opencodeDir = join(configHome, "opencode");
+        const piAgentDir = join(homeDir, ".pi", "agent");
+        mkdirSync(opencodeDir, { recursive: true });
+        mkdirSync(piAgentDir, { recursive: true });
+        for (const directory of [opencodeDir, piAgentDir]) {
+            writeFileSync(join(directory, "magic-context.jsonc"), "{}");
+            writeFileSync(join(directory, "guidance.md"), guidanceContent);
+        }
+        process.env.XDG_CONFIG_HOME = configHome;
+        process.env.HOME = homeDir;
+    }
+
+    beforeEach(() => {
+        savedEnv.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
+        savedEnv.HOME = process.env.HOME;
+        isolateWithLegacyConfigs();
+    });
+
+    afterEach(() => {
+        process.env.XDG_CONFIG_HOME = savedEnv.XDG_CONFIG_HOME;
+        process.env.HOME = savedEnv.HOME;
+    });
+
+    const legacyOverrideConfig = {
+        default: "full" as const,
+        guidance_override_path: "guidance.md",
+    };
+
+    it("falls back to the OpenCode legacy config directory", () => {
+        const warnings: string[] = [];
+        const runtime = createPromptSurfaceRuntime({
+            harness: "opencode",
+            warn: (warning) => warnings.push(warning),
+        });
+
+        expect(
+            runtime.resolveGuidance(legacyOverrideConfig, "provider/model").primaryOverride,
+        ).toBe(guidanceContent);
+        expect(warnings).toEqual([]);
+    });
+
+    it("maps opencode2 onto the OpenCode legacy config directory", () => {
+        const warnings: string[] = [];
+        const runtime = createPromptSurfaceRuntime({
+            harness: "opencode2",
+            warn: (warning) => warnings.push(warning),
+        });
+
+        expect(
+            runtime.resolveGuidance(legacyOverrideConfig, "provider/model").primaryOverride,
+        ).toBe(guidanceContent);
+        expect(warnings).toEqual([]);
+    });
+
+    it("maps omp onto the Pi legacy config directory", () => {
+        const warnings: string[] = [];
+        const runtime = createPromptSurfaceRuntime({
+            harness: "omp",
+            warn: (warning) => warnings.push(warning),
+        });
+
+        expect(
+            runtime.resolveGuidance(legacyOverrideConfig, "provider/model").primaryOverride,
+        ).toBe(guidanceContent);
+        expect(warnings).toEqual([]);
+    });
+
+    it("dsh skips legacy fallbacks and uses only the shared base", () => {
+        const warnings: string[] = [];
+        const runtime = createPromptSurfaceRuntime({
+            harness: "dsh",
+            warn: (warning) => warnings.push(warning),
+        });
+
+        // Neither the OpenCode nor the Pi legacy config exists for dsh: the
+        // shared base is the only user-config source, so the relative
+        // guidance override cannot resolve from any legacy directory.
+        const selection = runtime.resolveGuidance(legacyOverrideConfig, "provider/model");
+        expect(selection.primaryOverride).toBeUndefined();
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain("could not be read");
     });
 });
