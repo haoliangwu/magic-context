@@ -12,12 +12,14 @@ import {
   createUserMessage,
   type ContentBlock,
   type Message,
+  type ToolResultMessage,
   type UserMessage,
 } from "@deepseek-ai/dsh-llm";
 import {
   Session,
   SessionSeq,
   type SessionEvent,
+  type SessionEventMap,
   type SessionId,
 } from "@deepseek-ai/dsh-session";
 import {
@@ -62,6 +64,31 @@ export function magicUserMessage(
     content: [textBlock(content), ...extraBlocks],
     source,
   });
+}
+
+/**
+ * Same-type tool/result rewrite (B2): clone the CURRENT tool/result event's
+ * data verbatim (turn/step/error/meta and the message's id/source/role) and
+ * swap in the mutated content blocks. dsh-session's `assertToolResultRewrite`
+ * (lib/types/surface.js) permits a tool/result replace ONLY over exactly one
+ * current tool/result node and ONLY message-content changes — cloning the
+ * original envelope trivially satisfies both, and keeping the ORIGINAL
+ * message id preserves the tagger's tool-tag composite binding across the
+ * write-back (no tag-number churn, no cache bust on the next pass).
+ */
+export function magicToolResultRewrite(
+  originalEvent: SessionEvent,
+  mutatedBlocks: readonly ContentBlock[],
+): SessionEventMap["tool/result"] {
+  const original = originalEvent.data as unknown as SessionEventMap["tool/result"];
+  const originalMessage = original.message as ToolResultMessage;
+  return {
+    ...original,
+    message: {
+      ...originalMessage,
+      content: [...mutatedBlocks],
+    } as ToolResultMessage,
+  } as SessionEventMap["tool/result"];
 }
 
 /** Append a user-role surface message and return its seq. */

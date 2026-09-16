@@ -8,11 +8,14 @@
  *   inputDigest  — the live transcript still matches the plan's input;
  *   generation   — the surface generation still matches the plan's snapshot.
  *
- * Each op becomes ONE official DSH surface transaction:
- * `session.append("user/message", magicUserMessage(replacement), {
- *    surfaceOp: { op: "replace", start: <seq>, end: <seq> },
- *    sourceEventSeqs: [...shadowedSeqs] })` — the official validator is the
+ * Each op becomes ONE official DSH surface transaction, dispatched by the
+ * op's SAME-TYPE surface event (B2): user/message rows → `magicUserMessage`
+ * appends, tool/result rows → `magicToolResultRewrite` appends (content-only
+ * rewrite, clone-preserving the original envelope) — both with
+ * `{ surfaceOp: { op: "replace", start: <seq>, end: <seq> },
+ *    sourceEventSeqs: [...shadowedSeqs] }`. The official validator is the
  * ultimate fail-closed guard (range validity, shadow coverage, markers).
+ * assistant/message ops are never emitted (the host cannot replace them).
  *
  * Saga ordering (PLAN §3.2): SQLite pending → DSH append → SQLite
  * applied(ackSeq) → committed. Crash recovery is the outbox's job
@@ -28,8 +31,10 @@
  */
 import { randomUUID } from "node:crypto";
 import { SessionSeq, type Session } from "@deepseek-ai/dsh-session";
+import type { ContentBlock } from "@deepseek-ai/dsh-llm";
 import {
   deriveEventMessage,
+  magicToolResultRewrite,
   magicUserMessage,
   type SessionEvent,
 } from "../compat/dsh-0.1/session";
@@ -128,21 +133,49 @@ export function applyPlanOps(
         `magic-context: plan op [${op.start}, ${op.end}) shadowedSeqs ${JSON.stringify(actual)} does not cover the live surface nodes ${JSON.stringify(expected)}`,
       );
     }
-    const message = magicUserMessage(op.replacement, {
-      kind: "plugin",
-      plugin: "magic-context",
-      messageId: `mc-op:${plan.opId}`,
-      revision: String(plan.generation),
-      digest: plan.inputDigest,
-    });
-    const event = session.append("user/message", message, {
-      surfaceOp: { op: "replace", startSeq, endSeq },
-      sourceEventSeqs: [...op.shadowedSeqs].map(SessionSeq),
-    });
-    ackSeq = event.seq;
+    if (op.surfaceType === "tool/result") {
+      // Same-type tool rewrite. The host's assertToolResultRewrite allows a
+      // tool/result replace ONLY over exactly one current tool/result node and
+      // ONLY content changes — the constructor clones the original event data
+      // (turn/step/message id/source/error/meta preserved) and swaps in the
+      // plan's mutated blocks, which trivially satisfies the fold check.
+      const originalEvent = sessionEventAt(session, startSeq) as SessionEvent;
+      const data = magicToolResultRewrite(
+        originalEvent,
+        op.replacement as readonly ContentBlock[],
+      );
+      const event = session.append("tool/result", data, {
+        surfaceOp: { op: "replace", startSeq, endSeq },
+        sourceEventSeqs: [...op.shadowedSeqs].map(SessionSeq),
+      });
+      ackSeq = event.seq;
+    } else {
+      // user/message same-type rewrite (assistant/message ops are never
+      // emitted — deriveMutationPlan skips them; see transcript.ts).
+      const message = magicUserMessage(replacementText(op), {
+        kind: "plugin",
+        plugin: "magic-context",
+        messageId: `mc-op:${plan.opId}`,
+        revision: String(plan.generation),
+        digest: plan.inputDigest,
+      });
+      const event = session.append("user/message", message, {
+        surfaceOp: { op: "replace", startSeq, endSeq },
+        sourceEventSeqs: [...op.shadowedSeqs].map(SessionSeq),
+      });
+      ackSeq = event.seq;
+    }
     void db;
   }
   return { ackSeq };
+}
+
+/** Flat text for user/temporal ops (blocks union is only used by tool rows). */
+function replacementText(op: MutationPlan["ops"][number]): string {
+  if (typeof op.replacement === "string") return op.replacement;
+  return op.replacement
+    .map((block) => (block.type === "text" && typeof block.text === "string" ? block.text : ""))
+    .join("\n");
 }
 
 /** Merge a temporal marker into the node at `start` (prepend). */

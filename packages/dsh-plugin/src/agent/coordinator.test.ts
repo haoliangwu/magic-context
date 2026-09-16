@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Session, SessionId, SessionSeq } from "@deepseek-ai/dsh-session";
 import {
   createAssistantMessage,
+  createToolResultMessage,
   createUserMessage,
 } from "../compat/dsh-0.1/session";
 import { createTestDb } from "../test-utils";
@@ -18,6 +19,9 @@ import {
   type CoordinatorHostView,
 } from "./coordinator";
 import { getOutboxRecord, initializeDshAdapterTables } from "./outbox";
+import { queuePendingOp } from "@magic-context/core/features/magic-context/storage-ops";
+import { getTagsBySession } from "@magic-context/core/features/magic-context/storage";
+import { sessionEventAt } from "./session-events";
 
 const CANONICAL = "dsh:a1b2c3d4:sess-coord";
 
@@ -82,6 +86,145 @@ async function cleanupDir(dir: string, db?: Database): Promise<void> {
 }
 
 describe("SurfaceMutationCoordinator (CAS + saga)", () => {
+  it("applies a tool/result drop as a same-type single-node replace through the real fold", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-coord-"));
+    try {
+      const db = await createTestDb(join(dir, "context.db"));
+      initializeDshAdapterTables(db);
+      const session = Session.create(SessionId("sess-coord-tool"));
+      session.append(
+        "user/message",
+        createUserMessage({ content: [{ type: "text", text: "hello" }], source: { kind: "user" } }),
+        { surfaceOp: "append" },
+      );
+      session.append(
+        "assistant/message",
+        {
+          turn: 1,
+          step: 1,
+          message: createAssistantMessage({
+            content: [
+              { type: "text", text: "let me check" },
+              { type: "tool-call", id: "call-1", name: "read_file", arguments: '{"path":"a.ts"}' },
+            ],
+            provider: "deepseek",
+            model: "deepseek-chat",
+            source: { kind: "model" },
+          }),
+        },
+        { surfaceOp: "append" },
+      );
+      const originalToolSeq = session.append(
+        "tool/result",
+        {
+          turn: 1,
+          step: 1,
+          message: createToolResultMessage({
+            callId: "call-1",
+            content: [{ type: "text", text: "file contents" }],
+            isError: false,
+          }),
+        },
+        { surfaceOp: "append" },
+      ).seq;
+      // Push call-1's tool tag outside the protection window (small usableSoft
+      // floor + newer tool mass), so the queued drop replays into an op.
+      const ctx = { db, usableSoft: 3_000 };
+      const appendToolPair = (callId: string, outputLen: number) => {
+        session.append(
+          "assistant/message",
+          {
+            turn: 2,
+            step: 1,
+            message: createAssistantMessage({
+              content: [
+                { type: "text", text: `pair ${callId}` },
+                { type: "tool-call", id: callId, name: "read_file", arguments: "{}" },
+              ],
+              provider: "deepseek",
+              model: "deepseek-chat",
+              source: { kind: "model" },
+            }),
+          },
+          { surfaceOp: "append" },
+        );
+        session.append(
+          "tool/result",
+          {
+            turn: 2,
+            step: 1,
+            message: createToolResultMessage({
+              callId,
+              content: [{ type: "text", text: "x".repeat(outputLen) }],
+              isError: false,
+            }),
+          },
+          { surfaceOp: "append" },
+        );
+      };
+      appendToolPair("call-big-1", 25_000);
+      appendToolPair("call-big-2", 1000);
+      appendToolPair("call-big-3", 1000);
+      appendToolPair("call-big-4", 1000);
+
+      const view = readDshTranscript({
+        session: { events: sessionEventsOf(session), surface: session.surface, header: {} },
+        canonicalSessionId: CANONICAL,
+      });
+      deriveMutationPlan(view, ctx); // assign tags
+      const tags = getTagsBySession(db, view.sessionId);
+      const oldestTool = tags.filter((t) => t.type === "tool").sort((a, b) => a.tagNumber - b.tagNumber)[0]!;
+      queuePendingOp(db, view.sessionId, oldestTool.tagNumber, "drop", Date.now());
+
+      const plan = deriveMutationPlan(view, ctx)!;
+      const dropOp = plan.ops.find(
+        (op) => op.kind === "drops" && op.surfaceType === "tool/result",
+      );
+      expect(dropOp).toBeDefined();
+      // Single-node, same-type geometry (startSeq === endSeq on the wire).
+      expect(dropOp!.start).toBe(dropOp!.end - 1);
+      expect(dropOp!.shadowedSeqs.length).toBe(1);
+      expect(dropOp!.shadowedSeqs[0]).toBe(originalToolSeq);
+
+      const nodesBefore = [...session.surface.nodes];
+      const outcome = await enqueuePlan(createCoordinatorState(), makeHost(db), session, plan);
+      expect(outcome.status).toBe("applied");
+      // The tool node was replaced by a NEW tool/result node (same-type) —
+      // generation bumped per op, other nodes untouched.
+      expect(session.surface.replaceGeneration).toBe(plan.ops.length);
+      const originalMessage = (sessionEventAt(session, originalToolSeq) as {
+        data: { message: { id: string } };
+      }).data.message;
+      // Locate the replacement of the call-1 row: the surface node whose
+      // tool/result event preserved the original message id (prefix embeds of
+      // the big pairs carry THEIR ids).
+      const replacementSeq = session.surface.nodes.find((seq) => {
+        if (nodesBefore.includes(seq)) return false;
+        const event = sessionEventAt(session, seq) as {
+          type?: string;
+          data?: { message?: { id?: string } };
+        };
+        return event.type === "tool/result" && event.data?.message?.id === originalMessage.id;
+      })!;
+      expect(replacementSeq).toBeDefined();
+      const newEvent = sessionEventAt(session, replacementSeq) as {
+        type: string;
+        data: {
+          message: { id: string; content: Array<{ content: Array<{ text: string }> }> };
+        };
+      };
+      expect(newEvent.type).toBe("tool/result");
+      // magicToolResultRewrite preserved the original message id + identity;
+      // only the output text was sentinelized.
+      expect(newEvent.data.message.id).toBe(originalMessage.id);
+      expect(JSON.stringify(newEvent.data.message.content)).toContain(
+        `[dropped \u00a7${oldestTool.tagNumber}\u00a7]`,
+      );
+      db.close();
+    } finally {
+      await cleanupDir(dir);
+    }
+  });
   it("applies a plan through the official surface transaction and commits the saga", async () => {
     const dir = mkdtempSync(join(tmpdir(), "dsh-magic-coord-"));
     try {

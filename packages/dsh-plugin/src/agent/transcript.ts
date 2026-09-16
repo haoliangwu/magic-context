@@ -6,13 +6,21 @@
  * design doc `docs/phase3-design.md` §3 / §9.9-9.12:
  *
  *   1. `readDshTranscript` — the model-visible transcript (surface nodes →
- *      core `RawMessage[]`), with a reversible event-seq ↔ ordinal map.
+ *      core `RawMessage[]`, ONE per surface event — no tool-result folding),
+ *      with a reversible event-seq ↔ ordinal map.
  *   2. `deriveMutationPlan` — runs the shared core pipeline stages
  *      (temporal markers → tagTranscript → applyPendingOperations →
  *      applyFlushedStatuses → reasoning replay) through a RECORDING
  *      transcript/target layer, producing `MutationOp`s that the coordinator
  *      slice (C) will apply through the surface CAS. This module NEVER
  *      mutates the view's messages or any source array (D4).
+ *
+ * B2 (cache/role semantics): each dirty message coalesces into ONE same-type
+ * replace op (user rows → user/message, tool rows → tool/result); assistant
+ * rows produce no ops (host rejects assistant/message replaces). Pure tag
+ * prefixes on the current INCOMPLETE turn are gated — they land only once the
+ * turn's `turn/end` is seen. Plan ids are deterministic digests so the
+ * outbox CAS dedups crash-retried plans.
  *
  * Recording design: `RecordingPart` wraps each RawMessage part and records
  * every content mutation (`from` → `to`) on its owning `RecordingMessage`;
@@ -35,9 +43,10 @@
  *     cache-classification slice (§6); the official `classifyPlan` replaces
  *     it at integration.
  */
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
+import type { ContentBlock } from "@deepseek-ai/dsh-llm";
 import {
   applyFlushedStatuses,
   applyPendingOperations,
@@ -112,7 +121,23 @@ export interface DshTranscriptView {
   readonly generation: number;
   readonly messages: readonly RawMessage[];
   readonly surfaceNodes: readonly number[];
+  /**
+   * Highest turn number with a seen `turn/end` (0 when none). A message
+   * belongs to a completed turn iff its stamped turn >= 1 and <= currentTurn;
+   * messages stamped `0` (pre-turn, no turn/start seen) are always treated as
+   * completed. See the completed-turn gate in `deriveMutationPlan`.
+   */
+  readonly currentTurn: number;
 }
+
+/**
+ * The surface event type a view message derives from. Same-type surface
+ * replacements (B2) keep each row's role on the wire: user rows rewrite as
+ * user/message, tool rows as tool/result. assistant/message rows never
+ * produce ops — `assertProvenance` (dsh-session/lib/types/surface.js) makes an
+ * assistant/message replace impossible on 0.1.5-rc.2 (see deriveMutationPlan).
+ */
+export type SurfaceType = "user/message" | "assistant/message" | "tool/result";
 
 export type MutationKind =
   | "tags"
@@ -139,8 +164,18 @@ export interface MutationOp {
   /** Surface node range [start, end) (pre-replacement indices into view.surfaceNodes). */
   readonly start: number;
   readonly end: number;
-  /** Replacement text: the full Magic-rendered content of the user-role message. */
-  readonly replacement: string;
+  /**
+   * Replacement payload, union:
+   *  - flat string for temporal-marker merge ops (insertion),
+   *  - structured content blocks for same-type ops (B2). tool/result ops
+   *    carry exactly one cloned tool-result block whose inner content was
+   *    mutated (the host's `assertToolResultRewrite` allows only message
+   *    content changes). user/message ops carry the flat rendered text (their
+   *    parts are text-only, so flat == single text block).
+   */
+  readonly replacement: string | readonly ContentBlock[];
+  /** Same-type surface event type of the shadowed row (B2). */
+  readonly surfaceType: SurfaceType;
   readonly cacheClass: CacheClass;
   readonly reason: string;
   /** DSH event seqs of every shadowed surface node (sourceEventSeqs coverage). */
@@ -257,7 +292,7 @@ function sha256Hex(value: string): string {
 
 /* ───────────────────────────── message conversion ─────────────────────────── */
 
-/** `synth-user-` prefix for synthetic tail user messages (design §9.9). */
+/** `synth-user-` prefix for synthetic tail user messages (legacy fold; B2 walk no longer produces these — kept for callers). */
 export const SYNTH_USER_ID_PREFIX = "synth-user-";
 
 function isSyntheticUserMessage(message: RawMessage): boolean {
@@ -441,6 +476,12 @@ export interface DshMessageSpan {
 
 /** Non-enumerable span marker attached to view messages (digest-invisible). */
 export const DSH_MESSAGE_SPAN_KEY = "__dshMessageNodeSpan";
+/** Non-enumerable surface event type of the view message (B2 same-type ops). */
+export const DSH_SURFACE_TYPE_KEY = "__dshSurfaceType";
+/** Non-enumerable turn number the view message belongs to (B2 gate). */
+export const DSH_TURN_KEY = "__dshTurn";
+/** Non-enumerable ORIGINAL dsh content blocks (renderBlocks block-preserving source). */
+export const DSH_CONTENT_BLOCKS_KEY = "__dshContentBlocks";
 /** Non-enumerable knowledge-baseline marker attached to view messages. */
 export const DSH_KNOWLEDGE_KEY = "__dshKnowledgeBaseline";
 /** Non-enumerable skill-catalog marker attached to view messages. */
@@ -459,6 +500,26 @@ export function messageNodeSpan(message: RawMessage): DshMessageSpan | null {
 /** True when the view message is a Magic-context knowledge baseline (m0/m1). */
 export function isKnowledgeBaselineMessage(message: RawMessage): boolean {
   return (message as unknown as Record<string, unknown>)[DSH_KNOWLEDGE_KEY] === true;
+}
+
+/** The surface event type a view message derives from (B2 same-type ops). */
+export function messageSurfaceType(message: RawMessage): SurfaceType {
+  const type = (message as unknown as Record<string, unknown>)[DSH_SURFACE_TYPE_KEY];
+  return type === "user/message" || type === "assistant/message" || type === "tool/result"
+    ? type
+    : "user/message";
+}
+
+/** Turn number the view message belongs to (0 = pre-turn / no turn/start seen). */
+export function messageTurn(message: RawMessage): number {
+  const turn = (message as unknown as Record<string, unknown>)[DSH_TURN_KEY];
+  return typeof turn === "number" ? turn : 0;
+}
+
+/** ORIGINAL dsh content blocks the view message was derived from (renderBlocks source). */
+export function messageContentBlocks(message: RawMessage): readonly unknown[] {
+  const blocks = (message as unknown as Record<string, unknown>)[DSH_CONTENT_BLOCKS_KEY];
+  return Array.isArray(blocks) ? (blocks as unknown[]) : [];
 }
 
 /** True when the view message is a DSH skill-catalog reminder (dsh-tool-skill). */
@@ -500,6 +561,10 @@ export function isDurableInjectedMessage(message: RawMessage): boolean {
 interface DshWalkResult {
   readonly messages: RawMessage[];
   readonly spans: ReadonlyArray<DshMessageSpan | null>;
+  readonly turns: ReadonlyArray<number>;
+  readonly blocks: ReadonlyArray<readonly unknown[]>;
+  readonly surfaceTypes: ReadonlyArray<SurfaceType>;
+  readonly completedTurn: number;
   readonly knowledgeOrdinals: ReadonlySet<number>;
   readonly skillCatalogOrdinals: ReadonlySet<number>;
   readonly agentInstructionsOrdinals: ReadonlySet<number>;
@@ -511,12 +576,28 @@ interface DshWalkResult {
 /**
  * Shared walk. With `surfaceNodes` (surface order iteration) it produces the
  * model-visible messages; with null it walks the whole log in seq order (the
- * pure Pi-mirror conversion). Both keep tool-result folding consistent with
- * their own adjacency notion.
+ * pure Pi-mirror conversion).
+ *
+ * B2 per-node mapping: every surface-eligible event becomes ONE message row
+ * carrying its own surface event type (user/message → user row,
+ * assistant/message → assistant row, tool/result → tool row). There is no
+ * result-folding: the surface keeps the assistant tool-call node and its
+ * tool/result node adjacent, so the LLM API always sees a valid
+ * assistant-`tool_calls` → tool sequence, and same-type ops can rewrite each
+ * row without flattening roles into user rows (the old flatten-to-user-role
+ * behavior that caused the re-acknowledgment loop + per-step cache busts).
+ *
+ * Turn stamping: each message is stamped with the turn of the OPEN
+ * `turn/start` at its own event seq (`openTurnAt(seq)` — the same positional
+ * rule for every event type; assistant/tool events are not read for their
+ * `data.turn`). `completedTurn` is the highest turn with a seen `turn/end` —
+ * the gate in `deriveMutationPlan` leans on it.
  */
 function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] | null): DshWalkResult {
   const eventBySeq = new Map<number, EventLike>();
   const toolNameByCallId = new Map<string, string>();
+  const turnStartBySeq = new Map<number, number>();
+  const turnEndBySeq = new Map<number, number>();
   for (const raw of events) {
     const event = asEvent(raw);
     if (!event) continue;
@@ -529,6 +610,10 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
       if (typeof callId === "string" && callId.length > 0 && typeof name === "string") {
         toolNameByCallId.set(callId, name);
       }
+    } else if (event.type === "turn/start" && data && typeof data.turn === "number") {
+      turnStartBySeq.set(seq, data.turn);
+    } else if (event.type === "turn/end" && data && typeof data.turn === "number") {
+      turnEndBySeq.set(data.turn, seq);
     }
   }
 
@@ -541,96 +626,35 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
           .map(asEvent)
           .filter((event): event is EventLike => event !== null);
 
+  /** Open turn at an event seq: the latest turn/start at or before it, unless already closed. */
+  const openTurnAt = (seq: number): number => {
+    let open = 0;
+    let openStart = -1;
+    for (const [startSeq, turn] of turnStartBySeq) {
+      if (startSeq <= seq && startSeq > openStart) {
+        openStart = startSeq;
+        const closeSeq = turnEndBySeq.get(turn);
+        open = closeSeq !== undefined && closeSeq <= seq ? 0 : turn;
+      }
+    }
+    return open;
+  };
+
   const messages: RawMessage[] = [];
   const spans: Array<DshMessageSpan | null> = [];
+  const turns: number[] = [];
+  const blocks: Array<readonly unknown[]> = [];
+  const surfaceTypes: SurfaceType[] = [];
   const knowledgeOrdinals = new Set<number>();
   const skillCatalogOrdinals = new Set<number>();
   const agentInstructionsOrdinals = new Set<number>();
   const dshSystemPromptOrdinals = new Set<number>();
   const ordinalToSeq = new Map<number, number>();
   const seqToOrdinal = new Map<number, number>();
-
-  let pendingParts: unknown[] = [];
-  let pendingSeqs: number[] = [];
-  let pendingStartIndex: number | null = null;
-  let pendingFirstId: string | null = null;
-  let pendingFirstSeq = -1;
-  let pendingFirstTime: number | undefined = undefined;
-
-  // An assistant message carrying tool-call blocks is held back until its
-  // tool results arrive: folding the results into the next user message must
-  // ALSO fold the tool-call assistant node, otherwise the surface keeps an
-  // assistant `tool_calls` block with no following `role=tool` message and
-  // the LLM API rejects the sequence (insufficient tool messages).
-  let pendingAssistant:
-    | { nodeIndex: number; seq: number; parts: unknown[]; createdAt: number | null; id: string }
-    | null = null;
-
-  const resetPending = (): void => {
-    pendingParts = [];
-    pendingSeqs = [];
-    pendingStartIndex = null;
-    pendingFirstId = null;
-    pendingFirstSeq = -1;
-    pendingFirstTime = undefined;
-    pendingAssistant = null;
-  };
-
-  /** Push one assistant message as-is (orphan tool-call / normal path). */
-  const pushAssistant = (item: {
-    nodeIndex: number;
-    seq: number;
-    parts: unknown[];
-    createdAt: number | null;
-    id: string;
-  }): void => {
-    const ordinal = messages.length + 1;
-    messages.push({
-      ordinal,
-      id: item.id,
-      role: "assistant",
-      parts: item.parts,
-      createdAt: item.createdAt,
-      version: item.seq >= 0 ? item.seq : null,
-    });
-    spans.push(
-      surfaceNodes !== null
-        ? { nodeStart: item.nodeIndex, nodeEnd: item.nodeIndex + 1, seqs: [item.seq] }
-        : null,
-    );
-    ordinalToSeq.set(ordinal, item.seq);
-    if (item.seq >= 0) seqToOrdinal.set(item.seq, ordinal);
-  };
-
-  const flushSynthetic = (): void => {
-    if (pendingParts.length === 0 && pendingAssistant === null) return;
-    const ordinal = messages.length + 1;
-    const seqs = [
-      ...(pendingAssistant === null ? [] : [pendingAssistant.seq]),
-      ...pendingSeqs,
-    ];
-    const start = Math.min(
-      pendingStartIndex ?? Number.POSITIVE_INFINITY,
-      pendingAssistant?.nodeIndex ?? Number.POSITIVE_INFINITY,
-    );
-    if (!Number.isFinite(start)) throw new Error("fold flush without any covered node");
-    messages.push({
-      ordinal,
-      id: `${SYNTH_USER_ID_PREFIX}${pendingFirstId ?? "tail"}`,
-      role: "user",
-      parts: [...(pendingAssistant?.parts ?? []), ...pendingParts],
-      createdAt: pendingFirstTime ?? null,
-      version: pendingFirstSeq >= 0 ? pendingFirstSeq : null,
-    });
-    spans.push(
-      surfaceNodes !== null
-        ? { nodeStart: start, nodeEnd: start + seqs.length, seqs: [...seqs] }
-        : null,
-    );
-    if (pendingFirstSeq >= 0) ordinalToSeq.set(ordinal, pendingFirstSeq);
-    for (const s of seqs) seqToOrdinal.set(s, ordinal);
-    resetPending();
-  };
+  let completedTurn = 0;
+  for (const [turn, endSeq] of turnEndBySeq) {
+    if (turn > completedTurn) completedTurn = turn;
+  }
 
   for (let nodeIndex = 0; nodeIndex < ordered.length; nodeIndex += 1) {
     const event = ordered[nodeIndex];
@@ -642,104 +666,72 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
     if (!message) continue; // e.g. empty-content assistant/message
     const record = message as unknown as Record<string, unknown>;
     const seq = seqOf(event);
-
-    if (type === "assistant/message") {
-      if (pendingParts.length > 0) flushSynthetic();
-      const parts = assistantParts(record, surfaceNodes !== null, toolNameByCallId);
-      const hasToolCalls = parts.some(
-        (part) => isRecord(part) && part.type === "tool" && typeof part.callID === "string",
-      );
-      if (hasToolCalls) {
-        // Hold the tool-call assistant until its results arrive; the fold
-        // (into the next user / synthetic tail) will include this node.
-        pendingAssistant = {
-          nodeIndex,
-          seq,
-          parts,
-          createdAt: timeOf(event) ?? null,
-          id: String(message.id),
-        };
-        continue;
-      }
-      // Orphan tool-call assistant (no results followed): keep as-is.
-      if (pendingAssistant !== null) {
-        pushAssistant(pendingAssistant);
-        pendingAssistant = null;
-      }
-      pushAssistant({ nodeIndex, seq, parts, createdAt: timeOf(event) ?? null, id: String(message.id) });
-      continue;
-    }
+    const ordinal = messages.length + 1;
+    const createdAt = timeOf(event) ?? null;
+    const turn = openTurnAt(seq);
 
     if (type === "user/message") {
-      // An orphan tool-call assistant (no results) stays as its own message.
-      if (pendingAssistant !== null && pendingParts.length === 0) {
-        pushAssistant(pendingAssistant);
-        pendingAssistant = null;
-      }
-      const ordinal = messages.length + 1;
-      const start =
-        surfaceNodes !== null
-          ? Math.min(
-              pendingStartIndex ?? Number.POSITIVE_INFINITY,
-              pendingAssistant?.nodeIndex ?? Number.POSITIVE_INFINITY,
-              nodeIndex,
-            )
-          : nodeIndex;
-      const knowledge = isKnowledgeMessage(record);
-      const skillCatalog = isSkillCatalogMessage(record);
-      const agentInstructions = isAgentInstructionsMessage(record);
-      const dshSystemPrompt = isDshSystemPromptMessage(record);
+      const contentBlocks = Array.isArray(record.content) ? (record.content as unknown[]) : [];
       messages.push({
         ordinal,
         id: String(message.id),
         role: "user",
-        parts: [
-          ...(pendingAssistant?.parts ?? []),
-          ...pendingParts,
-          ...userTextParts(record.content),
-        ],
-        createdAt: timeOf(event) ?? null,
+        parts: userTextParts(record.content),
+        createdAt,
         version: seq >= 0 ? seq : null,
       });
-      spans.push(
-        surfaceNodes !== null
-          ? {
-              nodeStart: start,
-              nodeEnd: nodeIndex + 1,
-              seqs: [...(pendingAssistant === null ? [] : [pendingAssistant.seq]), ...pendingSeqs, seq],
-            }
-          : null,
-      );
-      ordinalToSeq.set(ordinal, seq);
-      for (const s of [...(pendingAssistant === null ? [] : [pendingAssistant.seq]), ...pendingSeqs, seq]) {
-        seqToOrdinal.set(s, ordinal);
-      }
-      if (knowledge) knowledgeOrdinals.add(ordinal);
-      if (skillCatalog) skillCatalogOrdinals.add(ordinal);
-      if (agentInstructions) agentInstructionsOrdinals.add(ordinal);
-      if (dshSystemPrompt) dshSystemPromptOrdinals.add(ordinal);
-      resetPending();
-      continue;
+      blocks.push(contentBlocks);
+    } else if (type === "assistant/message") {
+      const contentBlocks = Array.isArray(record.content) ? (record.content as unknown[]) : [];
+      const parts = assistantParts(record, surfaceNodes !== null, toolNameByCallId);
+      messages.push({
+        ordinal,
+        id: String(message.id),
+        role: "assistant",
+        parts,
+        createdAt,
+        version: seq >= 0 ? seq : null,
+      });
+      blocks.push(contentBlocks);
+    } else {
+      // tool/result — its own row (B2; no folding into a user message).
+      const contentBlocks = Array.isArray(record.content) ? (record.content as unknown[]) : [];
+      messages.push({
+        ordinal,
+        id: String(message.id),
+        role: "tool",
+        parts: toolResultParts(record, toolNameByCallId),
+        createdAt,
+        version: seq >= 0 ? seq : null,
+      });
+      blocks.push(contentBlocks);
     }
 
-    // tool/result — folded into the next user (or synthetic tail user).
-    pendingParts.push(...toolResultParts(record, toolNameByCallId));
-    pendingSeqs.push(seq);
-    if (pendingStartIndex === null) pendingStartIndex = nodeIndex;
-    if (pendingFirstId === null) pendingFirstId = String(message.id);
-    if (pendingFirstSeq < 0) pendingFirstSeq = seq;
-    if (pendingFirstTime === undefined) pendingFirstTime = timeOf(event);
+    spans.push(
+      surfaceNodes !== null ? { nodeStart: nodeIndex, nodeEnd: nodeIndex + 1, seqs: [seq] } : null,
+    );
+    turns.push(turn);
+    surfaceTypes.push(type as SurfaceType);
+
+    const knowledge = type === "user/message" && isKnowledgeMessage(record);
+    const skillCatalog = type === "user/message" && isSkillCatalogMessage(record);
+    const agentInstructions = type === "user/message" && isAgentInstructionsMessage(record);
+    const dshSystemPrompt = type === "user/message" && isDshSystemPromptMessage(record);
+    if (knowledge) knowledgeOrdinals.add(ordinal);
+    if (skillCatalog) skillCatalogOrdinals.add(ordinal);
+    if (agentInstructions) agentInstructionsOrdinals.add(ordinal);
+    if (dshSystemPrompt) dshSystemPromptOrdinals.add(ordinal);
+    ordinalToSeq.set(ordinal, seq);
+    if (seq >= 0) seqToOrdinal.set(seq, ordinal);
   }
 
-  if (pendingAssistant !== null && pendingParts.length === 0) {
-    // Tail orphan tool-call assistant (no results) — keep as-is.
-    pushAssistant(pendingAssistant);
-    pendingAssistant = null;
-  }
-  if (pendingParts.length > 0 || pendingAssistant !== null) flushSynthetic();
   return {
     messages,
     spans,
+    turns,
+    blocks,
+    surfaceTypes,
+    completedTurn,
     knowledgeOrdinals,
     skillCatalogOrdinals,
     agentInstructionsOrdinals,
@@ -752,9 +744,9 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
 /**
  * Pure conversion of a DSH event log into core `RawMessage[]` (Pi-mirror
  * mapping; see module doc). Ordinals are 1-based and monotonic over message
- * events only; tool-results fold into the following user message; a dangling
- * tool-result tail becomes a synthetic user (`synth-user-` prefix). Assistant
- * thinking is dropped here (the VIEW keeps it for the reasoning stage).
+ * events only; tool results and assistant tool-call rows each get their own
+ * message (B2 per-node mapping — no folding). Assistant thinking is dropped
+ * here (the VIEW keeps it for the reasoning stage).
  */
 export function convertDshEventsToRawMessages(events: readonly unknown[]): RawMessage[] {
   return walkDshLog(events, null).messages;
@@ -763,9 +755,7 @@ export function convertDshEventsToRawMessages(events: readonly unknown[]): RawMe
 /**
  * Reversible DSH event seq ↔ ordinal map for a log (or, with `surfaceNodes`,
  * for the surface view). `ordinalToSeq` maps each message to its own event
- * seq (synthetic users map to their first folded tool-result seq);
- * `seqToOrdinal` maps every contributing event seq (tool-result seqs fold
- * into the containing message's ordinal) back to its ordinal.
+ * seq; `seqToOrdinal` maps every contributing event seq back to its ordinal.
  */
 export function buildDshOrdinalMap(
   events: readonly unknown[],
@@ -826,6 +816,22 @@ export function readDshTranscript(input: DshTranscriptInput): DshTranscriptView 
         configurable: true,
       });
     }
+    const surfaceType = walk.surfaceTypes[i] ?? "user/message";
+    Object.defineProperty(message, DSH_SURFACE_TYPE_KEY, {
+      value: surfaceType,
+      enumerable: false,
+      configurable: true,
+    });
+    Object.defineProperty(message, DSH_TURN_KEY, {
+      value: walk.turns[i] ?? 0,
+      enumerable: false,
+      configurable: true,
+    });
+    Object.defineProperty(message, DSH_CONTENT_BLOCKS_KEY, {
+      value: walk.blocks[i] ?? [],
+      enumerable: false,
+      configurable: true,
+    });
     if (walk.knowledgeOrdinals.has(message.ordinal)) {
       Object.defineProperty(message, DSH_KNOWLEDGE_KEY, {
         value: true,
@@ -866,6 +872,7 @@ export function readDshTranscript(input: DshTranscriptInput): DshTranscriptView 
         : 0,
     messages: walk.messages,
     surfaceNodes: nodes,
+    currentTurn: walk.completedTurn,
   };
 }
 
@@ -886,6 +893,28 @@ function maxEventSeq(events: readonly unknown[]): number {
 const DROPPED_SENTINEL_PATTERN = /^\[dropped\s+\u00a7\d+\u00a7\]$/;
 
 export type RecordingPartField = "text" | "output" | "input" | "sentinel" | "reasoning";
+
+/** A well-formed tag prefix injection (`§N§ `) — the tagger's only text mutation shape. */
+const TAG_PREFIX_PATTERN = /^\u00a7\d+\u00a7\s/;
+
+/** Block kind for renderBlocks block↔part pairing (same eligibility as the walk). */
+type RenderBlockKind = "text" | "tool-call" | "tool-result" | "thinking" | "ineligible";
+
+function classifyBlockKind(block: Record<string, unknown>): RenderBlockKind {
+  switch (block.type) {
+    case "text":
+      return "text";
+    case "tool-call":
+      return "tool-call";
+    case "tool-result":
+      return "tool-result";
+    case "reasoning":
+    case "thinking":
+      return "thinking";
+    default:
+      return "ineligible";
+  }
+}
 
 /** One recorded content change: which part went from what to what. */
 export interface MutationRecord {
@@ -1057,13 +1086,25 @@ export class RecordingMessage implements TranscriptMessage {
   readonly parts: RecordingPart[] = [];
   readonly span: DshMessageSpan | null;
   readonly mutations: MutationRecord[] = [];
+  /** Same-type surface event type of the message's row (B2). */
+  readonly surfaceType: SurfaceType;
+  /** Turn the message belongs to (0 = pre-turn); gate input for B2. */
+  readonly turn: number;
+  /** ORIGINAL dsh content blocks the row was derived from (renderBlocks). */
+  readonly contentBlocks: readonly unknown[];
 
   constructor(
     info: { id?: string; role: string; sessionId?: string },
     span: DshMessageSpan | null,
+    surfaceType: SurfaceType,
+    turn: number,
+    contentBlocks: readonly unknown[],
   ) {
     this.info = info;
     this.span = span;
+    this.surfaceType = surfaceType;
+    this.turn = turn;
+    this.contentBlocks = contentBlocks;
   }
 
   addPart(raw: unknown): RecordingPart {
@@ -1074,6 +1115,18 @@ export class RecordingMessage implements TranscriptMessage {
 
   isDirty(): boolean {
     return this.mutations.length > 0;
+  }
+
+  /**
+   * True when every mutation is a tagger prefix injection on a text part
+   * (field "text", new value starts with a well-formed `§N§ ` prefix). This is
+   * DISCRIMINATED from heuristic/caveman text edits (whose `to` never carries
+   * the prefix — caveman compresses from the persisted original and writes the
+   * bare compressed text) and from drops/reasoning (sentinels/fields).
+   */
+  onlyTagPrefixDirty(): boolean {
+    if (this.mutations.length === 0) return false;
+    return this.mutations.every((record) => record.field === "text" && TAG_PREFIX_PATTERN.test(record.to));
   }
 
   /** Coalesced op kind: the "worst" of this message's mutations (drops > reasoning > tags). */
@@ -1117,6 +1170,76 @@ export class RecordingMessage implements TranscriptMessage {
       .map((part) => part.render())
       .filter((value): value is string => value !== null && value.length > 0)
       .join("\n\n");
+  }
+
+  /**
+   * Block-preserving render (B2): clone the ORIGINAL dsh content blocks of the
+   * message and overlay the recorded per-part mutations, so a pure tag-prefix
+   * mutation yields the original blocks with ONLY the first text block prefixed
+   * `§N§ ` — roles, tool-call blocks, and every other block preserved verbatim.
+   *
+   * Parts map to blocks in eligible order (text/tool-call/tool-result/reasoning
+   * — the same filter the walk used to build the parts), so a part's recorded
+   * final state is applied to its owning original block:
+   *   - text part       → block text = mutated text;
+   *   - tool-call part  → block `arguments` = JSON.stringify(mutated input);
+   *   - tool-result part→ block inner content = [text(mutated output)];
+   *   - thinking part   → dropped when the reasoning stage cleared it,
+   *                       otherwise kept verbatim.
+   * Non-eligible blocks (image/file/unknown, dropped from the parts by the
+   * walk) pass through untouched.
+   */
+  renderBlocks(): ContentBlock[] {
+    const out: ContentBlock[] = [];
+    let partIndex = 0;
+    for (const block of this.contentBlocks) {
+      if (!isRecord(block)) {
+        out.push(block as unknown as ContentBlock);
+        continue;
+      }
+      const kind = classifyBlockKind(block);
+      if (kind === "ineligible") {
+        out.push(block as unknown as ContentBlock);
+        continue;
+      }
+      if (kind === "thinking") {
+        const part = this.parts[partIndex];
+        partIndex += 1;
+        // Existing replay logic drops cleared reasoning entirely.
+        const reasoningCleared = this.mutations.some(
+          (record) =>
+            record.partIndex === part?.partIndex &&
+            record.field === "reasoning" &&
+            record.to === "[cleared]",
+        );
+        if (!reasoningCleared) out.push(block as unknown as ContentBlock);
+        continue;
+      }
+      const part = this.parts[partIndex];
+      partIndex += 1;
+      if (kind === "text") {
+        if (part === undefined) {
+          // Pairing miss (malformed/multi-block row): fail open — keep the
+          // original block untouched; the pre-step message loop has no
+          // try/catch, so renderBlocks must never throw.
+          out.push(block as unknown as ContentBlock);
+          continue;
+        }
+        out.push({ ...block, text: part.getText() ?? "" } as unknown as ContentBlock);
+      } else if (kind === "tool-call") {
+        out.push({
+          ...block,
+          arguments: JSON.stringify(part?.getToolInput() ?? {}),
+        } as unknown as ContentBlock);
+      } else if (kind === "tool-result" && this.surfaceType === "tool/result") {
+        // One block per tool row; the recorded payload IS the mutated output.
+        const text = part?.getText() ?? "";
+        out.push({ ...block, content: [{ type: "text", text }] } as unknown as ContentBlock);
+      } else {
+        out.push(block as unknown as ContentBlock);
+      }
+    }
+    return out;
   }
 }
 
@@ -1211,6 +1334,9 @@ function buildRecordingTranscript(
     const message = new RecordingMessage(
       { id: raw.id, role: raw.role, sessionId: view.sessionId },
       messageNodeSpan(raw),
+      messageSurfaceType(raw),
+      messageTurn(raw),
+      messageContentBlocks(raw),
     );
     for (const part of raw.parts) message.addPart(part);
     messages.push(message);
@@ -1286,6 +1412,9 @@ function planTemporalMarkers(view: DshTranscriptView): MutationOp[] {
               start: span.nodeStart,
               end: span.nodeStart,
               replacement: marker,
+              // Insertion ops have no shadowed node; the coordinator merges
+              // them into the node at `start` (a user row) as a user/message.
+              surfaceType: "user/message",
               cacheClass: minimalCacheClassForOp(
                 { start: span.nodeStart, end: span.nodeStart },
                 view.surfaceNodes.length,
@@ -1483,13 +1612,31 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
     const baseline = baselineNodeIndices(view);
     for (const message of transcript.messages) {
       if (!message.isDirty()) continue;
+      // B2: assistant/message rows can never be rewritten — the DSH host's
+      // assertProvenance (dsh-session/lib/types/surface.js) rejects ANY
+      // assistant/message event carrying sourceEventSeqs, and a replace
+      // without them leaves the shadowed node uncovered. Skip their ops so
+      // the model's own replies stay byte-identical on the surface (no role
+      // corruption, no re-render, no cache bust). THIS IS A HOST CONSTRAINT
+      // DEVIATION from the B2 brief (assistant same-type replace "officially
+      // supported" is not true on @deepseek-ai/dsh-session@0.1.5-rc.2).
+      if (message.surfaceType === "assistant/message") continue;
+      // B2 completed-turn gate: a message with ONLY tag-prefix dirt that still
+      // belongs to the current INCOMPLETE turn (its turn/end not yet seen)
+      // produces no op — the tag is assigned and persisted, the prefix lands
+      // once the turn completes (message.turn <= view.currentTurn). Drops /
+      // pending ops / flushed statuses / caveman dirt (anything not pure
+      // tag-prefix) still produce ops immediately — no gate for those.
+      if (message.onlyTagPrefixDirty() && message.turn > view.currentTurn) continue;
       const span = message.span;
       if (span === null || span.seqs.length === 0) continue; // no surface coverage
       ops.push({
         kind: message.opKind(),
         start: span.nodeStart,
         end: span.nodeEnd,
-        replacement: message.render(),
+        replacement:
+          message.surfaceType === "tool/result" ? message.renderBlocks() : message.render(),
+        surfaceType: message.surfaceType,
         cacheClass: minimalCacheClassForOp(
           { start: span.nodeStart, end: span.nodeEnd },
           view.surfaceNodes.length,
@@ -1504,11 +1651,44 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
   if (ops.length === 0) return null;
   ops.sort((left, right) => left.start - right.start || left.end - right.end);
   return {
-    opId: randomUUID(),
+    opId: planOpId(view, ops),
     sessionId: view.sessionId,
     sourceWatermark: view.sourceWatermark,
     inputDigest: view.inputDigest,
     generation: view.generation,
     ops,
   };
+}
+
+/**
+ * Deterministic plan id (B2): a sha256 digest over
+ * {sessionId, generation, inputDigest, ops:[{start, end, shadowedSeqs,
+ * surfaceType, digest-of-render}]}, formatted `mc-<24 hex>`. Re-deriving the
+ * same view + DB state yields the same id, so a crash-retried plan dedups on
+ * the outbox opId CAS; any content/generation change yields a different id.
+ * (Keeps a same-render-but-new-plan from re-applying and re-busting the
+ * provider cache on every pre-step.)
+ */
+function planOpId(view: DshTranscriptView, ops: readonly MutationOp[]): string {
+  const digest = createHash("sha256")
+    .update(view.sessionId, "utf8")
+    .update("\0", "utf8")
+    .update(String(view.generation), "utf8")
+    .update("\0", "utf8")
+    .update(view.inputDigest, "utf8")
+    .update("\0", "utf8");
+  for (const op of ops) {
+    digest.update(
+      JSON.stringify([
+        op.kind,
+        op.start,
+        op.end,
+        op.shadowedSeqs,
+        op.surfaceType,
+        op.replacement,
+      ]),
+      "utf8",
+    );
+  }
+  return `mc-${digest.digest("hex").slice(0, 24)}`;
 }
