@@ -33,7 +33,11 @@ import {
   readDshTranscript,
   type PlanContext,
 } from "./transcript";
-import { updateSessionMeta } from "@magic-context/core/features/magic-context/storage";
+import {
+  incrementHistorianFailure,
+  updateSessionMeta,
+} from "@magic-context/core/features/magic-context/storage";
+import { describeError } from "@magic-context/core/shared/error-message";
 import { checkDshCompartmentTrigger } from "./historian";
 import { maybeNudgeChannels } from "./nudge";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
@@ -297,8 +301,17 @@ function maybeFireHistorian(
         contextWindow,
       });
     }
-  } catch {
-    // The trigger must never break the pre-step chain (fail-open).
+  } catch (error) {
+    // The trigger must never break the pre-step chain (fail-open) — but a
+    // PERSISTENT failure here silently stalls the whole reclaim loop (the
+    // fire path constructs the provider / summarize call before the run's
+    // own telemetry exists). Record it so the stall is diagnosable from
+    // session_meta (historian_last_error / historian_failure_count).
+    try {
+      incrementHistorianFailure(db, sessionId, `historian fire path: ${describeError(error).brief}`);
+    } catch {
+      // Diagnostics must never break the pre-step chain either.
+    }
   }
 }
 

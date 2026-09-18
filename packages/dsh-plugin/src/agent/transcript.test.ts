@@ -27,6 +27,7 @@ import {
   isDurableInjectedMessage,
   isKnowledgeBaselineMessage,
   isSkillCatalogBaselineMessage,
+  messageIdToSeqIndex,
   readDshTranscript,
   RecordingMessage,
   type DshTranscriptView,
@@ -720,5 +721,50 @@ describe("temporal gap markers (Magic temporal-awareness parity)", () => {
     } finally {
       await rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("messageIdToSeqIndex (F1 clamp support)", () => {
+  it("indexes every message-bearing event, incl. system/message snapshots the projection skips", () => {
+    const session = Session.create(SessionId("sess-mid"));
+    const user1 = createUserMessage({
+      content: [{ type: "text", text: "hello" }],
+      source: { kind: "user" },
+    });
+    session.append("user/message", user1, { surfaceOp: "append" });
+    const systemId = "22222222-2222-4222-8222-222222222222";
+    session.append(
+      "system/message",
+      {
+        turn: 1,
+        step: 1,
+        message: {
+          id: systemId,
+          role: "system",
+          content: [{ type: "text", text: "You are DeepSeek Harness." }],
+          source: { kind: "system" },
+        },
+      },
+      { surfaceOp: "append" },
+    );
+    const assistant1 = createAssistantMessage({
+      content: [{ type: "text", text: "hi" }],
+      provider: "deepseek",
+      model: "deepseek-chat",
+      source: { kind: "model" },
+    });
+    session.append(
+      "assistant/message",
+      { turn: 1, step: 1, message: assistant1 },
+      { surfaceOp: "append" },
+    );
+    // Log-only tool/call: NOT message-bearing for the index.
+    session.append("tool/call", { turn: 1, step: 1, callId: "c1", name: "t", arguments: "{}" });
+
+    const index = messageIdToSeqIndex(sessionEventsOf(session));
+    expect(index.get(user1.id!)).toBe(0);
+    expect(index.get(systemId)).toBe(1);
+    expect(index.get(assistant1.id!)).toBe(2);
+    expect(index.has("c1")).toBe(false);
   });
 });

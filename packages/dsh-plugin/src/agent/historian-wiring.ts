@@ -25,7 +25,7 @@ import {
   COMPARTMENT_AGENT_SYSTEM_PROMPT,
   buildCompartmentAgentPrompt,
 } from "@magic-context/core/hooks/magic-context/compartment-prompt";
-import { readDshTranscript } from "./transcript";
+import { readDshTranscript, messageIdToSeqIndex } from "./transcript";
 import { sessionEventsOf } from "./session-events";
 import {
   createMagicSummarizeHook,
@@ -207,14 +207,32 @@ export function createLlmSummarizeCall(
   };
 }
 
+/** Direction for clamping a range edge onto the nearest projected ordinal. */
+export type OrdinalClampDirection = "at-or-after" | "at-or-before";
+
+/**
+ * Transcript-backed provider with edge clamping for compaction ranges: dsh
+ * re-injects system-prompt snapshots as `system/message` surface nodes, and
+ * the host compaction range may legitimately start or end on one — a node
+ * the projection never turns into an ordinal row. `readMessageOrdinalClamped`
+ * resolves such ids to the nearest projected ordinal in the given direction.
+ */
+export type TranscriptRawMessageProvider = RawMessageProvider & {
+  readonly readMessageOrdinalClamped: (
+    messageId: string,
+    direction: OrdinalClampDirection,
+  ) => number | null;
+};
+
 /** Transcript-backed RawMessageProvider for one live session (read-only). */
 export function transcriptRawMessageProvider(
   agent: Agent,
   canonicalSessionId: string,
-): RawMessageProvider {
+): TranscriptRawMessageProvider {
+  const events = sessionEventsOf(agent.session);
   const view = readDshTranscript({
     session: {
-      events: sessionEventsOf(agent.session),
+      events,
       surface: agent.session.surface,
       header: { cwd: agent.session.header.cwd },
     },
@@ -222,11 +240,35 @@ export function transcriptRawMessageProvider(
   });
   const byId = new Map(view.messages.map((message) => [message.id, message]));
   const ordinalById = new Map(view.messages.map((message, index) => [message.id, index + 1]));
+  const seqById = messageIdToSeqIndex(events);
   return {
     readMessages: () => [...view.messages],
     readMessageById: (messageId: string) => byId.get(messageId) ?? null,
     readMessageOrdinalById: (messageId: string) => ordinalById.get(messageId) ?? null,
     getMessageCount: () => view.messages.length,
+    readMessageOrdinalClamped: (messageId: string, direction: OrdinalClampDirection) => {
+      const direct = ordinalById.get(messageId);
+      if (direct !== undefined) return direct;
+      const seq = seqById.get(messageId);
+      if (seq === undefined) return null;
+      // view.messages is ordinal-ordered; each message.version is its event seq.
+      const seqAt = (index: number): number | null => {
+        const version = view.messages[index]?.version;
+        return typeof version === "number" ? version : null;
+      };
+      if (direction === "at-or-after") {
+        for (let i = 0; i < view.messages.length; i += 1) {
+          const version = seqAt(i);
+          if (version !== null && version >= seq) return i + 1;
+        }
+        return null;
+      }
+      for (let i = view.messages.length - 1; i >= 0; i -= 1) {
+        const version = seqAt(i);
+        if (version !== null && version <= seq) return i + 1;
+      }
+      return null;
+    },
   };
 }
 

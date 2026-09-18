@@ -25,6 +25,8 @@ import {
 import { createTestDb } from "../test-utils";
 import { getDshCompactionMarker, initializeDshAdapterTables } from "./outbox";
 import { readDshTranscript } from "./transcript";
+import { transcriptRawMessageProvider } from "./historian-wiring";
+import { getHistorianFailureState } from "@magic-context/core/features/magic-context/storage";
 import {
   applyDshCompactionMarkerIfCovered,
   checkDshCompartmentTrigger,
@@ -101,6 +103,55 @@ function providerOf(session: Session): RawMessageProvider {
     canonicalSessionId: SESSION_ID,
   });
   return { readMessages: () => view.messages };
+}
+
+/** Fixed id for the leading system-prompt snapshot in F1 tests. */
+const LEADING_SYSTEM_MESSAGE_ID = "11111111-1111-4111-8111-111111111111";
+
+/** A DSH session whose FIRST surface event is a system/message snapshot
+ *  (dsh re-injects the system prompt this way), followed by the standard
+ *  5 user/assistant turns → projected ordinals 1..10. */
+function buildSessionWithLeadingSystem(): Session {
+  const session = Session.create(SessionId(DSH_SESSION_ID));
+  session.append(
+    "system/message",
+    {
+      turn: 1,
+      step: 1,
+      message: {
+        id: LEADING_SYSTEM_MESSAGE_ID,
+        role: "system",
+        content: [{ type: "text", text: "You are DeepSeek Harness." }],
+        source: { kind: "system" },
+      },
+    },
+    { surfaceOp: "append" },
+  );
+  for (let turn = 1; turn <= 5; turn += 1) {
+    session.append(
+      "user/message",
+      createUserMessage({
+        content: [{ type: "text", text: `question ${turn}` }],
+        source: { kind: "user" },
+      }),
+      { surfaceOp: "append" },
+    );
+    session.append(
+      "assistant/message",
+      {
+        turn,
+        step: 1,
+        message: createAssistantMessage({
+          content: [{ type: "text", text: `answer ${turn}` }],
+          provider: "deepseek",
+          model: "deepseek-chat",
+          source: { kind: "model" },
+        }),
+      },
+      { surfaceOp: "append" },
+    );
+  }
+  return session;
 }
 
 /** A fingerprint-less boundary (skips staleness validation) that makes the
@@ -724,6 +775,159 @@ describe("createMagicSummarizeHook (Magic 压缩策略)", () => {
       ).rejects.toThrow(/mini-historian failed: llm call failed/);
       expect(getCompartments(db, SESSION_ID)).toHaveLength(0);
       expect(acquireCompartmentLease(db, SESSION_ID, "lease-probe")).not.toBeNull();
+      db.close();
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  // ── F1: compaction ranges may start on system/message snapshots ──
+  // Production failure (session bfb9fc42): dsh re-injects the system prompt as
+  // a system/message surface node, every host compaction range started on
+  // one, and the unprojected id made the hook throw "summarize range
+  // unresolvable" — 12/12 compactions failed, history never folded.
+  it("F1: range starting on a system/message snapshot clamps to the first projected ordinal", async () => {
+    const env = makeEnv();
+    try {
+      const db = await createTestDb(env.dbPath);
+      initializeDshAdapterTables(db);
+      const session = buildSessionWithLeadingSystem();
+      const provider = transcriptRawMessageProvider(
+        { session } as unknown as Agent,
+        SESSION_ID,
+      );
+      const view = provider.readMessages();
+      // Full coverage staged over the projected ordinals 1..10.
+      appendCompartments(db, SESSION_ID, [
+        {
+          sequence: 0,
+          startMessage: 1,
+          endMessage: 10,
+          startMessageId: view[0]!.id,
+          endMessageId: view[9]!.id,
+          title: "whole",
+          content: "Narrative summary of 1-10.",
+          p1: "Narrative summary of 1-10.",
+          p2: "Condensed 1-10.",
+          p3: "Outcome 1-10.",
+          p4: "Anchor 1-10.",
+          importance: 50,
+          episodeType: "design",
+        },
+      ]);
+      let summarizeCalls = 0;
+      const hook = createMagicSummarizeHook({
+        db,
+        sessionId: SESSION_ID,
+        ctx: {},
+        provider,
+        summarize: async () => {
+          summarizeCalls += 1;
+          return "";
+        },
+        directory: "C:/work/project",
+        leaseHolderId: "lease-hook",
+      });
+      // The host compaction range starts on the system/message snapshot.
+      const result = await hook(
+        {
+          messages: [
+            { id: LEADING_SYSTEM_MESSAGE_ID, role: "system", content: [] },
+            ...view.map((m) => ({ id: m.id, role: m.role, content: [] })),
+          ] as never,
+        },
+        fakeAgent,
+      );
+      expect(summarizeCalls).toBe(0);
+      const text = result.summary[0]!.text;
+      expect(text).toContain("Narrative summary of 1-10.");
+      db.close();
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  // ── F2: a seed resume resets the surface ordinal space ──
+  it("F2: stale dead-space coverage is cleared and the mini-historian restarts from 1", async () => {
+    const env = makeEnv();
+    try {
+      const db = await createTestDb(env.dbPath);
+      initializeDshAdapterTables(db);
+      const session = buildSession();
+      const provider = transcriptRawMessageProvider(
+        { session } as unknown as Agent,
+        SESSION_ID,
+      );
+      // Stale coverage from a PREVIOUS ordinal space (seed resume): the end
+      // anchor no longer exists in the current surface view.
+      appendCompartments(db, SESSION_ID, [
+        {
+          sequence: 0,
+          startMessage: 1,
+          endMessage: 10,
+          startMessageId: "dead-space-start-id",
+          endMessageId: "dead-space-end-id",
+          title: "stale",
+          content: "Stale pre-seed summary.",
+          p1: "Stale pre-seed summary.",
+          p2: "Stale.",
+          p3: "Stale.",
+          p4: "Stale.",
+          importance: 50,
+          episodeType: "design",
+        },
+      ]);
+      let summarizeCalls = 0;
+      const hook = createMagicSummarizeHook({
+        db,
+        sessionId: SESSION_ID,
+        ctx: {},
+        provider,
+        summarize: async () => {
+          summarizeCalls += 1;
+          return validHistorianXml(
+            [
+              { start: 1, end: 3, title: "fresh-a" },
+              { start: 4, end: 7, title: "fresh-b" },
+              { start: 8, end: 10, title: "fresh-c" },
+            ],
+            11,
+          );
+        },
+        directory: "C:/work/project",
+        leaseHolderId: "lease-hook",
+      });
+      const result = await hook({ messages: inputMessages(session) as never }, fakeAgent);
+      expect(summarizeCalls).toBe(1);
+      // Stale compartment replaced by the fresh space.
+      const compartments = getCompartments(db, SESSION_ID);
+      expect(compartments).toHaveLength(3);
+      expect(compartments.some((c) => c.endMessageId === "dead-space-end-id")).toBe(false);
+      expect(compartments[2]!.endMessage).toBe(10);
+      const text = result.summary[0]!.text;
+      expect(text).toContain("Narrative summary of 1-3.");
+      expect(text).not.toContain("Stale pre-seed summary.");
+      db.close();
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  // ── F3: silent fire-path failures must leave a trace ──
+  it("F3: runDshHistorian records a missing-summarize wiring failure in session_meta", async () => {
+    const env = makeEnv();
+    try {
+      const db = await createTestDb(env.dbPath);
+      initializeDshAdapterTables(db);
+      const session = buildSession();
+      const ok = await runDshHistorian({
+        ...historianDeps(db, session),
+        summarize: undefined as unknown as DshSummarizeCall,
+      });
+      expect(ok).toBe(false);
+      const failure = getHistorianFailureState(db, SESSION_ID);
+      expect(failure.failureCount).toBe(1);
+      expect(failure.lastError ?? "").toContain("summarize");
       db.close();
     } finally {
       await env.cleanup();

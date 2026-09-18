@@ -33,6 +33,8 @@ import {
   buildCompartmentBlock,
   getCompartments,
   getLastCompartmentEndMessage,
+  getLastCompartmentEndMessageId,
+  replaceAllCompartments,
   getSessionFacts,
   type Compartment,
   type SessionFact,
@@ -42,6 +44,7 @@ import { acquireCompartmentLease, isCompartmentLeaseHeld, releaseCompartmentLeas
 import { promoteSessionFactsDurable } from "@magic-context/core/features/magic-context/memory/promotion";
 import {
   getOverflowState,
+  incrementHistorianFailure,
   recordProtectedTailPublicationFloor,
   updateSessionMeta,
 } from "@magic-context/core/features/magic-context/storage";
@@ -296,12 +299,51 @@ interface HistPassResult {
   readonly llmText?: string;
 }
 
+/**
+ * (F2) Resolve the stored compartment coverage end in the CURRENT provider
+ * view. A seed resume (`session/end-seed`) or a dsh native compaction resets
+ * the surface ordinal space, leaving stored compartments in a dead space —
+ * detected by the last compartment's end message id no longer resolving in
+ * the current view. Stale coverage is cleared (the seed / native summary
+ * already represents that history on the surface) and coverage restarts at
+ * 0. A resolvable id re-bases the stored end to the current space (heals
+ * ordinal drift). Surface replaces are content-only and preserve message
+ * ids, so an unresolvable end id always means the anchor left the surface.
+ * MUST be called inside a `withRawMessageProvider` scope (resolution routes
+ * through the core's provider registry, including its readMessages-scan
+ * fallback for minimal providers).
+ */
+function resolveEffectiveCompartmentEnd(
+  db: Database,
+  sessionId: string,
+  log: (message: string) => void,
+): number {
+  const lastEndId = getLastCompartmentEndMessageId(db, sessionId);
+  if (lastEndId === null || lastEndId.length === 0) return 0;
+  const resolved = readRawSessionMessageOrdinalById(sessionId, lastEndId);
+  if (resolved !== null) return resolved;
+  const staleEnd = getLastCompartmentEndMessage(db, sessionId);
+  log(
+    `[magic-context] historian: compartment space reset detected for ${sessionId} ` +
+      `(end message ${lastEndId} no longer in the surface view, stored end=${staleEnd}); ` +
+      `clearing stale compartments and restarting coverage`,
+  );
+  replaceAllCompartments(db, sessionId, []);
+  return 0;
+}
+
 /** One chunk pass: read → summarize → validate → (publish is separate). Never throws. */
 async function runHistorianPassCore(args: HistPassArgs): Promise<HistPassResult> {
   const { db, sessionId, provider, summarize } = args;
   const log = args.log;
 
-  const priorCompartments = getCompartments(db, sessionId);
+  // (F2) ordinal-space guard FIRST: a stale (dead-space) compartment set
+  // would otherwise wedge every future pass at a no-op offset.
+  const effectivePriorEnd = resolveEffectiveCompartmentEnd(db, sessionId, log);
+  let priorCompartments = getCompartments(db, sessionId);
+  if (effectivePriorEnd === 0 && priorCompartments.length > 0) {
+    priorCompartments = [];
+  }
   const existingValidationError = validateStoredCompartments(priorCompartments);
   if (existingValidationError) {
     return {
@@ -311,8 +353,7 @@ async function runHistorianPassCore(args: HistPassArgs): Promise<HistPassResult>
     };
   }
 
-  const offset =
-    priorCompartments.length > 0 ? priorCompartments[priorCompartments.length - 1]!.endMessage + 1 : 1;
+  const offset = effectivePriorEnd + 1;
 
   // Protected-tail boundary: prefer the trigger-resolved snapshot; a
   // fingerprint-less snapshot (tests / default) skips the staleness check
@@ -606,10 +647,31 @@ export async function runDshHistorian(deps: HistorianDeps): Promise<boolean> {
   const holderId = deps.leaseHolderId ?? `${DEFAULT_LEASE_HOLDER_PREFIX}:${sessionId}`;
   if (typeof deps.summarize !== "function") {
     log(`[magic-context] historian: missing summarize call for ${sessionId}`);
+    // (F3) this bail used to leave NO trace — a missing wiring piece stalled
+    // the reclaim loop silently for whole sessions.
+    try {
+      incrementHistorianFailure(db, sessionId, "historian wiring: missing summarize call");
+    } catch {
+      // Recording must not turn a bail into a crash.
+    }
     return false;
   }
 
-  const lease = acquireCompartmentLease(db, sessionId, holderId);
+  let lease: ReturnType<typeof acquireCompartmentLease>;
+  try {
+    lease = acquireCompartmentLease(db, sessionId, holderId);
+  } catch (error) {
+    // (F3) a lease-acquire crash vanished into the void fire-and-forget
+    // caller with no record; persist it so the stall is diagnosable.
+    const brief = describeError(error).brief;
+    log(`[magic-context] historian: lease acquisition crashed for ${sessionId}: ${brief}`);
+    try {
+      incrementHistorianFailure(db, sessionId, `lease acquisition: ${brief}`);
+    } catch {
+      // Diagnostics must never break the fire-and-forget contract.
+    }
+    return false;
+  }
   if (lease === null) {
     log(`[magic-context] historian: compartment lease busy for ${sessionId}`);
     return false;
@@ -821,13 +883,29 @@ export function createMagicSummarizeHook(deps: MagicSummarizeDeps): SummarizeHoo
 
     // Range resolution (first/last message ids → raw ordinals) runs INSIDE the
     // provider scope: the transcript-backed provider must be registered for
-    // `readRawSessionMessageOrdinalById`. Fail-closed when unresolvable.
+    // `readRawSessionMessageOrdinalById`. Range edges may sit on non-projected
+    // surface messages (dsh re-injects system-prompt snapshots as
+    // system/message surface nodes the projection skips) — clamp those edges
+    // inward to the nearest projected ordinal instead of failing. Fail-closed
+    // only when even clamping cannot resolve the range.
     const firstId = String(messages[0]!.id);
     const lastId = String(messages[messages.length - 1]!.id);
+    const clampingProvider = deps.provider as RawMessageProvider & {
+      readMessageOrdinalClamped?: (
+        messageId: string,
+        direction: "at-or-after" | "at-or-before",
+      ) => number | null;
+    };
 
     return withRawMessageProvider(sessionId, deps.provider, async () => {
-      const firstOrdinal = readRawSessionMessageOrdinalById(sessionId, firstId);
-      const lastOrdinal = readRawSessionMessageOrdinalById(sessionId, lastId);
+      const firstOrdinal =
+        readRawSessionMessageOrdinalById(sessionId, firstId) ??
+        clampingProvider.readMessageOrdinalClamped?.(firstId, "at-or-after") ??
+        null;
+      const lastOrdinal =
+        readRawSessionMessageOrdinalById(sessionId, lastId) ??
+        clampingProvider.readMessageOrdinalClamped?.(lastId, "at-or-before") ??
+        null;
       if (firstOrdinal === null || lastOrdinal === null || lastOrdinal < firstOrdinal) {
         throw new Error(
           `magic-context: summarize range unresolvable for ${sessionId} (messages ${firstId}..${lastId})`,
@@ -836,7 +914,9 @@ export function createMagicSummarizeHook(deps: MagicSummarizeDeps): SummarizeHoo
       // Coverage: stored compartments are contiguous from ordinal 1
       // (validateStoredCompartments invariant), so the range is fully covered
       // iff the last compartment's endMessage reaches the range's last ordinal.
-      const lastCompartmentEnd = getLastCompartmentEndMessage(deps.db, sessionId);
+      // (F2) the end is resolved against the CURRENT view — a seed resume
+      // that reset the ordinal space clears stale coverage first.
+      const lastCompartmentEnd = resolveEffectiveCompartmentEnd(deps.db, sessionId, log);
       let rawOutput: string | undefined;
       if (lastCompartmentEnd < lastOrdinal) {
         // Mini-historian: one synchronous pass over [lastCompartmentEnd+1, lastOrdinal].

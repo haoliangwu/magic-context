@@ -774,6 +774,44 @@ export function dshSeqForOrdinal(
   return buildDshOrdinalMap(events, surfaceNodes).ordinalToSeq.get(ordinal);
 }
 
+/**
+ * id → event seq for EVERY message-bearing event — user/assistant/tool rows
+ * AND `system/message` (which the surface projection skips as a
+ * non-ordinal row). The compaction summarize hook uses this to clamp
+ * range edges that land on non-projected surface messages: dsh re-injects
+ * system-prompt snapshots as `system/message` surface nodes and the surface
+ * contract lets a compaction range shadow them, so a range may legitimately
+ * start or end on one.
+ */
+export function messageIdToSeqIndex(events: readonly unknown[]): ReadonlyMap<string, number> {
+  const map = new Map<string, number>();
+  for (const raw of events) {
+    const event = asEvent(raw);
+    if (!event) continue;
+    const type = event.type;
+    if (
+      type !== "user/message" &&
+      type !== "assistant/message" &&
+      type !== "tool/result" &&
+      type !== "system/message"
+    ) {
+      continue;
+    }
+    const data = dataOf(event);
+    const message =
+      data !== null && isRecord(data.message) ? (data.message as Record<string, unknown>) : null;
+    const id =
+      typeof data?.id === "string" && data.id.length > 0
+        ? data.id
+        : typeof message?.id === "string" && message.id.length > 0
+          ? message.id
+          : undefined;
+    const seq = seqOf(event);
+    if (id !== undefined && seq >= 0 && !map.has(id)) map.set(id, seq);
+  }
+  return map;
+}
+
 /** Surface node indices occupied by Magic-context knowledge messages (m0/m1). */
 export function findKnowledgeBaselineNodeIndices(
   events: readonly unknown[],
