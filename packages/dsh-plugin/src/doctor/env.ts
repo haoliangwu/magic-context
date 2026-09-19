@@ -18,15 +18,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
   readdirSync,
   realpathSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
 } from "node:fs";
-import { randomBytes } from "node:crypto";
 import { describeError } from "@magic-context/core/shared/error-message";
 
 /** npm package identity of this adapter (checked against profile bundles). */
@@ -41,8 +36,8 @@ export const DSH_COMPAT_EXPECTED_VERSION = "0.1.5-rc.2";
 /** Installed-package identity of the DSH runtime. */
 export const DSH_PACKAGE = "@deepseek-ai/dsh";
 
-/** System preset directory inside a dsh install (0.1.2-era layout). */
-export const STOCK_PRESET_REL = join(
+/** System preset path inside a dsh install (0.1.2-era layout). */
+const STOCK_PRESET_REL = join(
   "config",
   "agent-presets",
   "standard",
@@ -52,11 +47,9 @@ export const STOCK_PRESET_REL = join(
 /**
  * System preset path in the 0.1.5+ layout: the stock composition ships in the
  * sibling `@deepseek-ai/dsh-agent-presets` package next to the `dsh` package
- * inside the same node_modules tree. The include target MUST live there —
- * the stock file's bare package-name rows resolve from the include target's
- * directory walk, which only reaches siblings inside a node_modules tree.
+ * inside the same node_modules tree.
  */
-export const STOCK_PRESET_REL_V2 = join(
+const STOCK_PRESET_REL_V2 = join(
   "dsh-agent-presets",
   "presets",
   "standard",
@@ -204,46 +197,12 @@ export function agentPresetsRoot(dshHome: string): string {
   return join(dshHome, ".agent-presets");
 }
 
-/** `$DSH_HOME/.agent-presets/magic-standard` — this adapter's thin preset. */
+/** `$DSH_HOME/.agent-presets/magic-standard` — the legacy thin preset root. */
 export function magicStandardDir(dshHome: string): string {
   return join(agentPresetsRoot(dshHome), "magic-standard");
 }
 
-export function magicStandardAgentCordisPath(dshHome: string): string {
-  return join(magicStandardDir(dshHome), "agent.cordis.yml");
-}
-
-export function magicStandardPresetYamlPath(dshHome: string): string {
-  return join(magicStandardDir(dshHome), "preset.yml");
-}
-
 // ── file helpers ────────────────────────────────────────────────────────────
-
-/**
- * Atomic write: write a temp file in the target directory, then rename over
- * the target (same-filesystem rename is atomic on POSIX and Windows). Mode is
- * applied to the temp file before rename so the target never exists with
- * looser permissions (0600 for generated secrets/config).
- */
-export function writeFileAtomic(
-  target: string,
-  content: string,
-  mode = 0o600,
-): void {
-  const dir = dirname(target);
-  mkdirSync(dir, { recursive: true });
-  const tmp = join(
-    dir,
-    `.${target.split(/[\\/]/).pop()}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`,
-  );
-  writeFileSync(tmp, content, { encoding: "utf8", mode });
-  try {
-    renameSync(tmp, target);
-  } catch (error) {
-    rmSync(tmp, { force: true });
-    throw error;
-  }
-}
 
 /**
  * Tiny flag parser for the bin scripts: `--name` (value `true`), `--name=value`
@@ -329,7 +288,7 @@ function magicPackageRoot(): string {
 
 /** Absolute path of one bundled entry file (`dist/entries/<name>.js`) of THIS package. */
 export function magicEntryPath(
-  entry: "agent" | "compaction" | "commands" | "tools" | "remote" | "preset-include",
+  entry: "agent" | "compaction" | "commands" | "tools" | "remote",
 ): string {
   return join(magicPackageRoot(), "dist", "entries", `${entry}.js`);
 }

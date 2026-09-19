@@ -90,17 +90,30 @@ export class MagicCompactionEngine extends BasicCompactionEngine {
   protected readonly magicSummarize?: SummarizeHook;
 
   constructor(ctx: Context, config: BasicCompactionConfig & { summarize?: SummarizeHook }) {
-    super(ctx, { ...config, auto: config.auto ?? true });
-    this.magicSummarize = config.summarize;
+    // Strip the hook before handing config to the stock engine: its schema
+    // rejects unknown keys, and the hook is our seam, not its business.
+    const { summarize, ...stockConfig } = config;
+    super(ctx, { ...stockConfig, auto: stockConfig.auto ?? true });
+    this.magicSummarize = summarize;
   }
 
-  override summarize(
+  override async summarize(
     input: SummarizationInput,
     agent: Agent,
     signal?: AbortSignal,
   ): Promise<SummaryResult> {
-    const hook = this.magicSummarize ?? readHostSummarizeHook(this.ctx);
+    const host = readHostService(this.ctx);
+    const hook = this.magicSummarize ?? readHostSummarizeHook(host);
     if (hook === undefined) {
+      if (host === undefined) {
+        // No Magic Context host in this composition (a sibling profile that
+        // shares the patched shipped preset without MC mounted): degrade to
+        // the stock engine behavior — the patched row must stay safe
+        // wherever it loads (ADR 0001).
+        return super.summarize(input, agent, signal);
+      }
+      // MC composition, but the agent plane has not wired the hook yet —
+      // fail closed and loudly instead of silently stock-compacting.
       throw new Error(
         "magic-context: compaction summarize hook unavailable (agent plane not wired?)",
       );
@@ -109,11 +122,16 @@ export class MagicCompactionEngine extends BasicCompactionEngine {
   }
 }
 
+/** The host service on `ctx`, when this composition mounts Magic Context. */
+function readHostService(ctx: Context): unknown {
+  return ctx.get("magicContextHost");
+}
+
 /** Read the hook the agent plane registered on the host service (if any). */
-function readHostSummarizeHook(ctx: Context): SummarizeHook | undefined {
-  const host = ctx.get("magicContextHost") as
+function readHostSummarizeHook(host: unknown): SummarizeHook | undefined {
+  const typed = host as
     | { summarizeHook?: () => unknown }
     | undefined;
-  const hook = host?.summarizeHook?.();
+  const hook = typed?.summarizeHook?.();
   return typeof hook === "function" ? (hook as SummarizeHook) : undefined;
 }

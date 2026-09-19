@@ -15,7 +15,6 @@
     "./commands": "./dist/entries/commands.js",
     "./tools": "./dist/entries/tools.js",
     "./remote": "./dist/entries/remote.js",
-    "./preset-include": "./dist/entries/preset-include.js",
     "./client": "./dist/client.js",
     "./package.json": "./package.json"
   },

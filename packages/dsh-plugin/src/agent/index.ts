@@ -341,8 +341,8 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     log,
   });
 
-  // Tools + commands: registered on the agent plane (visible to every session
-  // joining the magic-standard preset); the host service supplies the shared
+  // Tools + commands: registered on the agent plane (host-plane row — visible
+  // to every session of every preset); the host service supplies the shared
   // DB and canonical session-key derivation.
   const runtime = {
     canonicalKey: (dshSessionId: string) => host.canonicalKey(dshSessionId),

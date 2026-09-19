@@ -70,6 +70,7 @@ const css = [
   ".ckmc-value{color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-mono);min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
   ".ckmc-valueOk{color:var(--dsw-alias-state-success-primary)}",
   ".ckmc-valueErr{color:var(--dsw-alias-label-error)}",
+  ".ckmc-valueWarn{color:var(--dsw-alias-label-secondary)}",
   ".ckmc-hint{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);margin:8px 0 0}",
   ".ckmc-btn{min-height:24px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:0 0;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:11px;line-height:16px;padding:2px 8px}",
   ".ckmc-btn:hover{color:var(--dsw-alias-label-primary)}",
@@ -108,6 +109,7 @@ const C = {
   value: "ckmc-value",
   valueOk: "ckmc-valueOk",
   valueErr: "ckmc-valueErr",
+  valueWarn: "ckmc-valueWarn",
   hint: "ckmc-hint",
   btn: "ckmc-btn",
   actions: "ckmc-actions",
@@ -137,7 +139,8 @@ export interface MagicStatus {
     readonly detail?: string;
   };
   readonly config: { readonly path: string; readonly exists: boolean };
-  readonly preset: { readonly dir: string; readonly exists: boolean };
+  /** Shipped-preset patch state (ADR 0001): patched/total distinct preset ids. */
+  readonly preset: { readonly patched: number; readonly total: number; readonly legacy?: string };
   readonly sessionId?: string | null;
 }
 
@@ -370,7 +373,7 @@ function storageText(status: MagicStatus): string {
   return reason + (status.storage.detail !== undefined && status.storage.detail !== "" ? ` · ${status.storage.detail}` : "");
 }
 
-type RowTone = "ok" | "err" | "plain";
+type RowTone = "ok" | "err" | "warn" | "plain";
 
 interface RowSpec {
   readonly label: string;
@@ -380,7 +383,7 @@ interface RowSpec {
 
 /** One label/value row, tone-colored value; plain rows keep the neutral mono text. */
 function Row({ label, value, tone = "plain" }: RowSpec) {
-  const cls = tone === "plain" ? C.value : tone === "ok" ? `${C.value} ${C.valueOk}` : `${C.value} ${C.valueErr}`;
+  const cls = tone === "plain" ? C.value : tone === "ok" ? `${C.value} ${C.valueOk}` : tone === "err" ? `${C.value} ${C.valueErr}` : `${C.value} ${C.valueWarn}`;
   return (
     <div className={C.row}>
       <span className={C.label}>{label}</span>
@@ -390,12 +393,29 @@ function Row({ label, value, tone = "plain" }: RowSpec) {
 }
 
 /* ------------------------------------------------ status rows */
+
+/** Shipped-preset patch row (ADR 0001): patched/total + optional legacy note. */
+function presetRow(preset: MagicStatus["preset"]): RowSpec {
+  const p = preset ?? { patched: 0, total: 0 };
+  const unpatched = p.total - p.patched;
+  let tone: RowTone = "ok";
+  let value = `patched ${p.patched}/${p.total}`;
+  if (unpatched > 0) {
+    tone = "err";
+    value = `stock ${unpatched} unpatched`;
+  } else if (p.legacy !== undefined) {
+    tone = "warn";
+  }
+  if (p.legacy !== undefined) value = `${value} · legacy ${p.legacy}`;
+  return { label: "preset", value, tone };
+}
+
 function summaryRows(status: MagicStatus): RowSpec[] {
   return [
     { label: "harness", value: "dsh", tone: "ok" },
     { label: "storage", value: storageText(status), tone: status.storage && status.storage.ok ? "ok" : "err" },
     { label: "config", value: status.config && status.config.exists ? "present" : "missing", tone: status.config && status.config.exists ? "ok" : "err" },
-    { label: "preset", value: status.preset && status.preset.exists ? "generated" : "missing", tone: status.preset && status.preset.exists ? "ok" : "err" },
+    presetRow(status.preset),
     { label: "session", value: status.sessionId !== undefined && status.sessionId !== null ? status.sessionId : "—" },
   ];
 }

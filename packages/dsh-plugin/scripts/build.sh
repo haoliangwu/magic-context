@@ -14,7 +14,7 @@ $EB --bundle src/index.ts --outdir=dist --platform=node --target=node20 --format
 $EB --bundle src/doctor/cli.ts --outdir=dist --platform=node --target=node20 --format=esm --external:@deepseek-ai/cordis \
   || $EB --bundle src/doctor/cli.ts --outdir=dist --platform=node --target=node20 --format=esm --external:@deepseek-ai/cordis --external:js-yaml --external:@deepseek-ai/cordis-plugin-include
 
-$EB --bundle src/entries/agent.ts src/entries/compaction.ts src/entries/commands.ts src/entries/tools.ts src/entries/remote.ts src/entries/preset-include.ts \
+$EB --bundle src/entries/agent.ts src/entries/compaction.ts src/entries/commands.ts src/entries/tools.ts src/entries/remote.ts \
   --outdir=dist/entries --platform=node --target=node20 --format=esm --splitting $EXT_ENTRIES
 
 # client bundle: classic-script __ModuleLoader__ factory shape (see scripts/build-client.mjs)

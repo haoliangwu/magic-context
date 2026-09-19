@@ -1,22 +1,21 @@
 # @cortexkit/dsh-magic-context
 
-DeepSeek Harness (DSH) 上的 Magic Context — 长会话不丢失历史，且始终在上下文窗口内。
+DeepSeek Harness (DSH) 上的 Magic Context — 长编码会话始终在上下文窗口内，且不丢失历史。本该撑爆窗口的会话可以一直跑下去：模型学到的所有东西（持久记忆、分段摘要、可搜索的原始历史）依然可达。
 
-持久 DSH 插件（Host / Agent / Client 三面 + profile bundle），复用 Magic Context 共享 SQLite（`harness='dsh'` 行隔离），为 DSH 带来 `ctx_*` 工具、`/ctx-*` 命令、知识注入（m0/m1）、historian/dreamer 与 Magic 压缩策略。
+以原生 DSH 插件形态安装，对**所有 agent preset** 生效——无需任何 preset 级配置。`ctx_*` 工具、`/ctx-*` 命令、知识注入、historian/dreamer 与 Magic 压缩策略全部 host 平面挂载。
 
 > 本包为 [cortexkit/magic-context](https://github.com/cortexkit/magic-context) 单仓单包形态（MIT）。  
 > **致谢：** 原社区移植来自 [xiaohj233/dsh-magic-context](https://github.com/xiaohj233/dsh-magic-context)，本包为其延续，`adapter-api` 已合并，不再单独发布。
 
-- **共享存储。** 单 SQLite `~/.local/share/cortexkit/magic-context/context.db`，`harness='dsh'` 隔离，与 OpenCode（`opencode`）和 Pi（`pi`）共存。
+- **共享存储。** 单 SQLite `~/.local/share/cortexkit/magic-context/context.db`，`harness='dsh'` 隔离，与 OpenCode、Pi 共存，无需额外数据库，跨 harness 记忆直接可用。
 - **完整能力。** `ctx_reduce` / `ctx_expand` / `ctx_memory` / `ctx_search` / `ctx_note`，`/ctx-status` / `/ctx-recomp` / `/ctx-wrapup` / `/ctx-embed`，auto-search、`§N§` 标签、衰减渲染、smart-drops。
-- **DSH 原生。** Host（`cordis` bundle）、Agent（`magic-standard` thin preset）、Client（状态卡），支持 `link:` 本地开发。
+- **DSH 原生，零配置挂载。** Host（`cordis` bundle）+ Agent（host 平面行，每个 preset）+ Client（状态卡）。启动自愈**原地改写** shipped presets 的压缩行（ADR 0001）——重启 DSH 即完成挂载。
 
 ```sh
 # 以 web（生产）/ mc（开发）为例
 dsh plugin --profile web install link:/path/to/magic-context/packages/dsh-plugin
-dsh-magic-context setup --profile web   # 生成 magic-standard 预设
-dsh-magic-context doctor --profile web  # 5/5 ok（liveness 警告可忽略）
-# 重启 DSH 并选择 magic-standard
+# 重启 DSH：每个 preset 都获得 Magic 表面；状态面板的 preset 行显示
+# "patched 3/3" 即 shipped presets 补丁到位
 ```
 
 ## 安装
@@ -33,7 +32,6 @@ dsh-magic-context doctor --profile web  # 5/5 ok（liveness 警告可忽略）
 
 ```sh
 dsh plugin --profile <name> install
-dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
 
@@ -53,7 +51,6 @@ dsh plugin --profile <name> install
 pnpm --filter @cortexkit/dsh-magic-context run build
 # 或：pnpm --cwd ~/.dsh/profiles/<name>/node_modules/@cortexkit/dsh-magic-context run build
 # （prepare 尝试 pnpm run build；底层仍需 bun）
-dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
 
@@ -64,12 +61,12 @@ dsh-magic-context doctor --profile <name>
 ```sh
 bun run --cwd packages/dsh-plugin build
 dsh plugin --profile <name> install link:/absolute/path/to/magic-context/packages/dsh-plugin
-dsh-magic-context setup --profile <name>
-# 全局预设指向 file:///…/magic-context/packages/dsh-plugin/dist/entries/*
-# 多 profile 共享同一 file://，无漂移
+# 重启 host：启动自愈（ADR 0001）从本包模块上下文解析
+# @deepseek-ai/dsh-agent-presets，把 shipped 的 compaction-basic 行改写为
+# file://…/dist/entries/compaction.js（tmp+rename 原子写；绝不原地写 pnpm 硬链接）
 ```
 
-重启 DSH，新会话选择 `magic-standard`。首次会话自动创建共享 SQLite。
+重启 DSH — 每个 preset 都能以 host 平面挂载 Magic 表面；shipped presets 的压缩行指向 `file://…/magic-context/packages/dsh-plugin/dist/entries/compaction.js`。首次会话自动创建共享 SQLite。`setup` 是 doctor 的只读报告别名。
 
 ## 功能
 
@@ -86,11 +83,11 @@ dsh-magic-context setup --profile <name>
 dsh plugin --profile <name> remove @cortexkit/dsh-magic-context
 ```
 
-移除 `bundles` 后重启 DSH。共享 SQLite 与 `dsh_*` 适配数据有意保留（跨 harness）；不再需要时手动删除 `~/.dsh/.agent-presets/magic-standard/`。
+移除 `bundles` 后重启 DSH。共享 SQLite 与 `dsh_*` 适配数据有意保留（跨 harness）；遗留的 `~/.dsh/.agent-presets/magic-standard/` thin preset 由启动自愈先做形状校验再删除。移除后 shipped presets 的已改写行会指向不存在的路径，直到 preset 文件轮换（ADR 0001 —— 单用户部署下可接受；`doctor` 会报告该状态）。
 
 ## 兼容
 
-- DSH `0.1.1-rc.2` 精确匹配（升级前先跑 `doctor` 契约门）
+- DSH `0.1.5-rc.2`（升级前先跑 `doctor` 契约门；布局变化时启动自愈的锚点链 fail-open）
 - Magic Context 共享 schema `v84`
 
 ## 问答

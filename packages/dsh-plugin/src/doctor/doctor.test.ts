@@ -24,16 +24,17 @@ import {
   runDshDoctor,
   scanLivenessMarkers,
 } from "./doctor";
-import { runDshSetup } from "./setup";
+import {
+  patchShippedPresets,
+  rewriteCompactionRowText,
+} from "../host/preset-patch";
 import {
   DSH_COMPAT_EXPECTED_VERSION,
   MAGIC_CONTEXT_PACKAGE,
-  magicEntryPath,
-  magicStandardAgentCordisPath,
   magicStandardDir,
 } from "./env";
 
-/** Minimal stand-in for the stock standard preset layout (same as setup.test). */
+/** Minimal stand-in for a stock preset entry list (compaction group included). */
 function stockLayout(): Record<string, unknown>[] {
   return [
     { id: "persona", name: "@deepseek-ai/dsh-persona", config: { text: "x" } },
@@ -52,17 +53,36 @@ function stockLayout(): Record<string, unknown>[] {
   ];
 }
 
-/** Fake dsh install: package.json + the system standard preset. */
+/** Fake dsh install: package.json + the 0.1.5-era stock preset layout. */
 function fakeInstall(installDir: string, version = DSH_COMPAT_EXPECTED_VERSION): string {
   mkdirSync(installDir, { recursive: true });
   writeFileSync(
     join(installDir, "package.json"),
     JSON.stringify({ name: "@deepseek-ai/dsh", version }),
   );
-  const stock = join(installDir, "config", "agent-presets", "standard", "agent.cordis.yml");
+  const stock = join(installDir, "..", "dsh-agent-presets", "presets", "standard", "agent.cordis.yml");
   mkdirSync(dirname(stock), { recursive: true });
   writeFileSync(stock, yamlDump(stockLayout(), { schema: entryListSchema }));
   return stock;
+}
+
+/** Fake `@deepseek-ai/dsh-agent-presets` package with shipped presets. */
+function fakeAgentPresetsPackage(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({ name: "@deepseek-ai/dsh-agent-presets", version: "0.1.5-rc.2" }),
+  );
+  const presetsDir = join(dir, "presets");
+  mkdirSync(presetsDir, { recursive: true });
+  for (const id of ["standard", "cordis"]) {
+    mkdirSync(join(presetsDir, id), { recursive: true });
+    writeFileSync(
+      join(presetsDir, id, "agent.cordis.yml"),
+      yamlDump(stockLayout(), { schema: entryListSchema }),
+    );
+  }
+  return presetsDir;
 }
 
 function fakeProfile(dshHome: string, name: string, bundles: string[]): void {
@@ -108,7 +128,7 @@ function byId(report: Awaited<ReturnType<typeof runDshDoctor>>): Map<string, Awa
   return new Map(report.checks.map((check) => [check.id, check]));
 }
 
-describe("dsh-magic-context doctor (Phase 2 slice C)", () => {
+describe("dsh-magic-context doctor (ADR 0001 model)", () => {
   it("classifies a healthy shared DB open as ok", async () => {
     await withTestDb(async ({ dir }) => {
       const dbPath = join(dir, "ok", "context.db");
@@ -177,58 +197,51 @@ describe("dsh-magic-context doctor (Phase 2 slice C)", () => {
     }
   });
 
-  it("reports ok across the full checklist on a clean environment", async () => {
+  it("reports ok across the full checklist on a patched environment", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
       fakeInstall(env.installDir);
       fakeProfile(env.dshHome, "web", [MAGIC_CONTEXT_PACKAGE]);
-      const setup = await runDshSetup([], {
+      const agentPresetsDir = join(env.root, "agent-presets-pkg");
+      const presetsDir = fakeAgentPresetsPackage(agentPresetsDir);
+      // Boot self-heal already patched the shipped files (applied state).
+      patchShippedPresets({ agentPresetsDir, warn: () => {} });
+      expect(existsSync(presetsDir)).toBe(true);
+      // Doctor only reports config (setup no longer writes): a pre-existing
+      // valid config keeps the config-load check ok.
+      mkdirSync(join(env.configHome, "cortexkit"), { recursive: true });
+      writeFileSync(
+        join(env.configHome, "cortexkit", "magic-context.jsonc"),
+        '{\n  "enabled": true\n}\n',
+        "utf8",
+      );
+
+      // Pre-create the shared DB so the shared-db check classifies ok. The
+      // core caches handles by path: keep this handle open (do NOT close it)
+      // or the doctor's reopen would see a closed cached handle.
+      const dbPath = join(env.root, "storage", "context.db");
+      const pre = await openDatabaseAsync({ dbPath });
+      expect(pre).not.toBeNull();
+
+      const report = await runDshDoctor([], {
         dshHome: env.dshHome,
         dshInstallDir: env.installDir,
+        agentPresetsDir,
+        directory: env.work,
+        storageDirOverride: join(env.root, "storage"),
+        dbPathOverride: dbPath,
       });
-      expect(setup.exitCode).toBe(0);
-      // The doctor's preset check verifies the include row names this
-      // package's no-write entry (dist/entries/preset-include.js). Ensure the
-      // built file exists for the test run (dist is not git-tracked). Save any
-      // existing content and RESTORE it afterwards — deleting the file outright
-      // destroys a real build done before the test run, breaking later E2E.
-      const includeEntryPath = magicEntryPath("preset-include");
-      mkdirSync(dirname(includeEntryPath), { recursive: true });
-      const originalEntry =
-        existsSync(includeEntryPath) ? readFileSync(includeEntryPath, "utf8") : null;
-      writeFileSync(includeEntryPath, "export default class {}\n");
-      try {
-        // Pre-create the shared DB so the shared-db check classifies ok. The
-        // core caches handles by path: keep this handle open (do NOT close it)
-        // or the doctor's reopen would see a closed cached handle; the doctor
-        // itself closes the handle after classifying.
-        const dbPath = join(env.root, "storage", "context.db");
-        const pre = await openDatabaseAsync({ dbPath });
-        expect(pre).not.toBeNull();
-
-        const report = await runDshDoctor([], {
-          dshHome: env.dshHome,
-          dshInstallDir: env.installDir,
-          directory: env.work,
-          storageDirOverride: join(env.root, "storage"),
-          dbPathOverride: dbPath,
-        });
-        expect(report.exitCode).toBe(0);
-        const checks = byId(report);
-        expect(checks.get("dsh-version")?.status).toBe("ok");
-        expect(checks.get("bundle-install.web")?.status).toBe("ok");
-        expect(checks.get("preset-generated")?.status).toBe("ok");
-        expect(checks.get("shared-db")?.status).toBe("ok");
-        expect(checks.get("liveness-markers")?.status).toBe("ok");
-        expect(checks.get("config-load")?.status).toBe("ok");
-      } finally {
-        if (originalEntry !== null) {
-          writeFileSync(includeEntryPath, originalEntry);
-        } else {
-          rmSync(includeEntryPath, { force: true });
-        }
-      }
+      expect(report.exitCode).toBe(0);
+      const checks = byId(report);
+      expect(checks.get("dsh-version")?.status).toBe("ok");
+      expect(checks.get("bundle-install.web")?.status).toBe("ok");
+      expect(checks.get("preset-patch.standard")?.status).toBe("ok");
+      expect(checks.get("preset-patch.cordis")?.status).toBe("ok");
+      expect(checks.get("legacy-preset")?.status).toBe("ok");
+      expect(checks.get("shared-db")?.status).toBe("ok");
+      expect(checks.get("liveness-markers")?.status).toBe("ok");
+      expect(checks.get("config-load")?.status).toBe("ok");
     } finally {
       delete process.env.XDG_CONFIG_HOME;
       await cleanup(env.root);
@@ -277,57 +290,125 @@ describe("dsh-magic-context doctor (Phase 2 slice C)", () => {
     }
   });
 
-  it("fails the preset check when magic-standard was never generated", async () => {
+  it("reports stock shipped presets as ok (heal applies at next host boot)", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
       fakeInstall(env.installDir);
       fakeProfile(env.dshHome, "web", [MAGIC_CONTEXT_PACKAGE]);
+      const agentPresetsDir = join(env.root, "agent-presets-pkg");
+      fakeAgentPresetsPackage(agentPresetsDir);
       const report = await runDshDoctor([], {
         dshHome: env.dshHome,
         dshInstallDir: env.installDir,
+        agentPresetsDir,
         directory: env.work,
         profile: "web",
       });
-      const preset = byId(report).get("preset-generated");
-      expect(preset?.status).toBe("fail");
-      expect(existsSync(magicStandardDir(env.dshHome))).toBe(false);
+      const standard = byId(report).get("preset-patch.standard");
+      expect(standard?.status).toBe("ok");
+      expect(standard?.detail).toContain("stock engine");
+      expect(byId(report).get("legacy-preset")?.status).toBe("ok");
+      expect(report.exitCode).toBe(0);
     } finally {
       delete process.env.XDG_CONFIG_HOME;
       await cleanup(env.root);
     }
   });
 
-  it("fails the preset check when the include row uses the raw include (write-back regression)", async () => {
+  it("fails the preset-patch check on a rotted MC entry URL", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
       fakeInstall(env.installDir);
       fakeProfile(env.dshHome, "web", [MAGIC_CONTEXT_PACKAGE]);
-      const setup = await runDshSetup([], {
+      const agentPresetsDir = join(env.root, "agent-presets-pkg");
+      const presetsDir = fakeAgentPresetsPackage(agentPresetsDir);
+      // The file was patched against an OLD MC install; the entry path moved.
+      const file = join(presetsDir, "standard", "agent.cordis.yml");
+      const text = readFileSync(file, "utf8");
+      const rewrite = rewriteCompactionRowText(text, "file:///rotten/entries/compaction.js");
+      writeFileSync(file, rewrite.patched, "utf8");
+      const report = await runDshDoctor([], {
         dshHome: env.dshHome,
         dshInstallDir: env.installDir,
+        agentPresetsDir,
+        directory: env.work,
+        profile: "web",
       });
-      expect(setup.exitCode).toBe(0);
-      // Simulate a preset generated by an old setup (or manually edited): the
-      // include row names the raw include plugin again.
-      const agentCordisPath = magicStandardAgentCordisPath(env.dshHome);
-      const entries = yamlLoad(readFileSync(agentCordisPath, "utf8"), {
+      const standard = byId(report).get("preset-patch.standard");
+      expect(standard?.status).toBe("fail");
+      expect(standard?.detail).toContain("stale entry path");
+      expect(report.exitCode).toBe(1);
+    } finally {
+      delete process.env.XDG_CONFIG_HOME;
+      await cleanup(env.root);
+    }
+  });
+
+  it("warns (not fails) on a contract-mismatched shipped preset", async () => {
+    const env = makeEnv();
+    process.env.XDG_CONFIG_HOME = env.configHome;
+    try {
+      fakeInstall(env.installDir);
+      fakeProfile(env.dshHome, "web", [MAGIC_CONTEXT_PACKAGE]);
+      const agentPresetsDir = join(env.root, "agent-presets-pkg");
+      const presetsDir = fakeAgentPresetsPackage(agentPresetsDir);
+      // dsh renamed the compaction group id.
+      const file = join(presetsDir, "standard", "agent.cordis.yml");
+      const entries = yamlLoad(readFileSync(file, "utf8"), {
         schema: entryListSchema,
       }) as Record<string, unknown>[];
-      const includeRow = entries.find((row) => row.id === "magic-include-standard");
-      expect(includeRow).toBeDefined();
-      includeRow!.name = "@deepseek-ai/cordis-plugin-include";
-      writeFileSync(agentCordisPath, yamlDump(entries, { schema: entryListSchema }));
+      const group = entries.find((row) => row.id === "compaction");
+      (group as { id: string }).id = "compaction-v2";
+      writeFileSync(file, yamlDump(entries, { schema: entryListSchema }));
+
+      const report = await runDshDoctor([], {
+        dshHome: env.dshHome,
+        dshInstallDir: env.installDir,
+        agentPresetsDir,
+        directory: env.work,
+        profile: "web",
+      });
+      const standard = byId(report).get("preset-patch.standard");
+      expect(standard?.status).toBe("warn");
+      expect(standard?.detail).toContain("Stock compaction keeps running");
+      expect(report.exitCode).toBe(0);
+    } finally {
+      delete process.env.XDG_CONFIG_HOME;
+      await cleanup(env.root);
+    }
+  });
+
+  it("warns about a legacy magic-standard preset (absent → ok)", async () => {
+    const env = makeEnv();
+    process.env.XDG_CONFIG_HOME = env.configHome;
+    try {
+      fakeInstall(env.installDir);
+      fakeProfile(env.dshHome, "web", [MAGIC_CONTEXT_PACKAGE]);
+      // Legacy thin preset that IS verifiably MC-generated.
+      const legacyDir = magicStandardDir(env.dshHome);
+      mkdirSync(legacyDir, { recursive: true });
+      writeFileSync(
+        join(legacyDir, "agent.cordis.yml"),
+        [
+          `- id: magic-include-standard`,
+          `  name: 'file:///mc/dist/entries/preset-include.js'`,
+          `  config:`,
+          `    path: 'file:///stock/agent.cordis.yml'`,
+          `    patches: []`,
+          ``,
+        ].join("\n"),
+      );
       const report = await runDshDoctor([], {
         dshHome: env.dshHome,
         dshInstallDir: env.installDir,
         directory: env.work,
         profile: "web",
       });
-      const preset = byId(report).get("preset-generated");
-      expect(preset?.status).toBe("fail");
-      expect(preset?.detail).toContain("truncates the shipped stock preset");
+      const legacy = byId(report).get("legacy-preset");
+      expect(legacy?.status).toBe("warn");
+      expect(legacy?.detail).toContain("verifiably");
     } finally {
       delete process.env.XDG_CONFIG_HOME;
       await cleanup(env.root);

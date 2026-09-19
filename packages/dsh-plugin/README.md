@@ -1,22 +1,21 @@
 # @cortexkit/dsh-magic-context
 
-Magic Context for DeepSeek Harness (DSH) — keep long sessions inside the context window without losing history.
+Magic Context for DeepSeek Harness (DSH) — keep long coding sessions inside the context window without losing history. Sessions that would blow the window keep running, with everything the model has learned still reachable: durable memories, compartment summaries, and searchable raw history.
 
-A persistent DSH plugin (Host / Agent / Client + profile bundle) that shares the Magic Context SQLite (`harness='dsh'` row isolation) and brings `ctx_*` tools, `/ctx-*` commands, knowledge injection (m0/m1), historian/dreamer, and the Magic compaction policy to DSH.
+It installs as a native DSH plugin and works on **every agent preset** — no preset-specific setup. `ctx_*` tools, `/ctx-*` commands, knowledge injection, historian/dreamer, and the Magic compaction policy mount host-wide.
 
 > Single-package port inside the [cortexkit/magic-context](https://github.com/cortexkit/magic-context) monorepo (MIT).  
 > **Credit:** original community port by [xiaohj233/dsh-magic-context](https://github.com/xiaohj233/dsh-magic-context) — this package is a direct continuation with `adapter-api` merged into one package and `harness='dsh'` support upstreamed.
 
-- **Shared store.** One SQLite at `~/.local/share/cortexkit/magic-context/context.db`, `harness='dsh'` isolated — works alongside OpenCode (`opencode`) and Pi (`pi`) without extra DB.
+- **Shared store.** One SQLite at `~/.local/share/cortexkit/magic-context/context.db`, `harness='dsh'` isolated — works alongside OpenCode and Pi with no extra DB, and cross-harness memories just work.
 - **Full Magic Context surface.** `ctx_reduce` / `ctx_expand` / `ctx_memory` / `ctx_search` / `ctx_note`, `/ctx-status` / `/ctx-recomp` / `/ctx-wrapup` / `/ctx-embed`, auto-search, `§N§` tags, decay rendering, smart-drops.
-- **DSH-native.** Host (`cordis` bundle), Agent (preset `magic-standard`), Client (status card) — thin preset, `link:`-friendly for local dev.
+- **DSH-native, zero-config mounting.** Host (`cordis` bundle) + agent plane (host-row, every preset) + client (status card). The boot-time self-heal patches the compaction row of the **shipped** presets in place (ADR 0001) — restart DSH and it is mounted.
 
 ```sh
 # from a DSH profile (e.g. web = prod, mc = dev)
 dsh plugin --profile web install link:/path/to/magic-context/packages/dsh-plugin
-dsh-magic-context setup --profile web   # generates magic-standard preset
-dsh-magic-context doctor --profile web  # 5/5 ok (liveness warn is harmless)
-# then restart DSH and select magic-standard preset
+# restart DSH — every preset gets the Magic surface; the status panel's
+# "preset" row shows "patched 3/3" when the shipped presets are patched
 ```
 
 ## Install
@@ -33,7 +32,6 @@ dsh-magic-context doctor --profile web  # 5/5 ok (liveness warn is harmless)
 
 ```sh
 dsh plugin --profile <name> install
-dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
 
@@ -64,7 +62,6 @@ The exact key is printed by pnpm in `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED` — c
 
 ```sh
 dsh plugin --profile <name> install
-dsh-magic-context setup --profile <name>
 dsh-magic-context doctor --profile <name>
 ```
 
@@ -76,12 +73,14 @@ dsh-magic-context doctor --profile <name>
 # inside magic-context monorepo
 bun run --cwd packages/dsh-plugin build
 dsh plugin --profile <name> install link:/absolute/path/to/magic-context/packages/dsh-plugin
-dsh-magic-context setup --profile <name>
-# global preset now points at file:///…/magic-context/packages/dsh-plugin/dist/entries/*
-# both profiles share the same file:// — no per-profile drift
+# restart the host: the boot-time self-heal (ADR 0001) resolves
+# @deepseek-ai/dsh-agent-presets from THIS package's module context and patches
+# the shipped compaction-basic rows to file://…/dist/entries/compaction.js
+# (tmp+rename atomic writes; pnpm hardlinks are never written in place)
 ```
 
-Restart DSH and select `magic-standard` for new sessions. First session creates the shared SQLite if missing.
+Restart DSH — every preset now mounts the Magic surface host-wide, and the
+shipped presets' compaction rows point at `file://…/magic-context/packages/dsh-plugin/dist/entries/compaction.js`. First session creates the shared SQLite if missing. `setup` is a report-only alias of `doctor`.
 
 ## Features
 
@@ -98,11 +97,11 @@ Full feature table and constraints: see repository `README.md` and `ARCHITECTURE
 dsh plugin --profile <name> remove @cortexkit/dsh-magic-context
 ```
 
-Remove the `bundles` entry and restart DSH. Shared SQLite and `dsh_*` adapter rows are intentionally preserved (cross-harness data); remove `~/.dsh/.agent-presets/magic-standard/` manually if unneeded.
+Remove the `bundles` entry and restart DSH. Shared SQLite and `dsh_*` adapter rows are intentionally preserved (cross-harness data); any legacy `~/.dsh/.agent-presets/magic-standard/` thin preset is shape-verified and removed by the boot self-heal. Removing the package leaves the patched shipped-preset rows pointing at a missing path until the preset files rotate (ADR 0001 — accepted for single-user deploys; `doctor` reports the state).
 
 ## Compatibility
 
-- DSH `0.1.1-rc.2` exact-rc (run `doctor` contract gate before upgrading)
+- DSH `0.1.5-rc.2` (run `doctor` contract gate before upgrading; the boot heal's anchor chain fail-opens on layout changes)
 - Magic Context shared schema `v84` (this package's `LATEST_SUPPORTED_VERSION`)
 
 ## Q&A

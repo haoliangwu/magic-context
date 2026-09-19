@@ -15,7 +15,6 @@
  */
 import { Buffer } from "node:buffer";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { Service, type Context } from "@deepseek-ai/cordis";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
 import { loadPluginConfig } from "@magic-context/core/config";
@@ -35,6 +34,11 @@ import type { TypertContribution } from "@deepseek-ai/dsh-typert-registry/types"
 import { MAGIC_CONTEXT_REMOTE_NAMESPACE } from "../compat/dsh-0.1/remote-seam";
 import type { MagicContextHostService } from "../index";
 import { formatDetail, MAGIC_CONTEXT_PACKAGE, resolveDshHome } from "../doctor/env";
+import {
+  detectLegacyMagicStandard,
+  scanPresetPatchStates,
+  summarizePresetPatchStates,
+} from "./preset-patch";
 import {
   DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
   resolveExecuteThresholdPercentage,
@@ -103,7 +107,8 @@ export interface MagicStatus {
     readonly detail?: string;
   };
   readonly config: { readonly path: string; readonly exists: boolean };
-  readonly preset: { readonly dir: string; readonly exists: boolean };
+  /** Shipped-preset patch state (ADR 0001): patched/total distinct preset ids. */
+  readonly preset: { readonly patched: number; readonly total: number; readonly legacy?: string };
   readonly sessionId?: string | null;
 }
 
@@ -148,13 +153,31 @@ export class MagicContextRemoteService extends Service {
     })();
     const home = resolveDshHome();
     const configPath = resolveCortexKitUserConfigPath();
-    const presetDir = join(home, ".agent-presets", "magic-standard");
+    // Shipped-preset patch state (ADR 0001): READ-ONLY scan, same anchor chain
+    // as the boot heal but status never writes. Guarded — a missing roster
+    // service or anchor degrades to the next tier and never throws.
+    const preset = (() => {
+      let roster: unknown;
+      try {
+        roster = this.ctx.get("agentPresets");
+      } catch {
+        roster = undefined;
+      }
+      const scan = scanPresetPatchStates({
+        roster,
+        baseUrl: this.ctx.baseUrl,
+        warn: () => {},
+      });
+      const legacy =
+        detectLegacyMagicStandard(home).state === "present" ? "magic-standard" : undefined;
+      return summarizePresetPatchStates(scan, legacy);
+    })();
     return {
       package: MAGIC_CONTEXT_PACKAGE,
       harness: "dsh",
       storage,
       config: { path: configPath, exists: existsSync(configPath) },
-      preset: { dir: presetDir, exists: existsSync(join(presetDir, "agent.cordis.yml")) },
+      preset,
       ...(args.sessionId === undefined ? {} : { sessionId: args.sessionId }),
     };
   }

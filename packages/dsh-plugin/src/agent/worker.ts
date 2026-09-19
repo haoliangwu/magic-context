@@ -14,7 +14,7 @@
  * turn would re-enter the full Magic pipeline. `isMagicChildSession` is the
  * single gate: header `origin === 'subagent'` or a persisted delegation
  * depth ≥ 1. This matches §5.10: Magic's per-session machinery applies to the
- * Magic-marked (top-level magic-standard) tree, while children run with
+ * Magic-marked (top-level, host-mounted) agent tree, while children run with
  * official semantics.
  */
 import type { Context } from "@deepseek-ai/cordis";

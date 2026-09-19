@@ -16,6 +16,11 @@ import {
   bootstrapDshStorage,
   type DshStorageBootstrap,
 } from "./host/bootstrap";
+import {
+  patchShippedPresets,
+  removeLegacyMagicStandard,
+} from "./host/preset-patch";
+import { resolveDshHome } from "./doctor/env";
 import { canonicalSessionKey, parseDshSessionKey } from "./shared/dsh-harness";
 
 /** Cordis plugin name (loader diagnostics). */
@@ -67,6 +72,43 @@ export type MagicSummarizeHook = (
 
 /** Register the host service on `ctx` (idempotent per fiber). */
 export function apply(ctx: Context, config: MagicHostConfig = {}): void {
+  // Boot-time self-heal (ADR 0001): OWNER of all writes. Runs synchronously
+  // before any session can mount an unpatched preset — compaction cannot be
+  // replaced from the host plane, so the shipped presets are patched in place
+  // (tmp+rename atomic). Fail-open: any unexpected error is one warning line
+  // and never breaks boot.
+  try {
+    // Anchor enrichment: the live roster instance knows the agent-presets
+    // copy THIS composition actually loaded (its `resolvedRoots` system entry
+    // is the shipped preset root, resolved from the roster module's real
+    // location). Our own `require.resolve` anchor is realpathed to this
+    // package's install (the repo under a dev symlink), which can differ from
+    // the composition's copy — pass both, the patcher verifies and dedups.
+    let roster: unknown;
+    try {
+      roster = ctx.get("agentPresets");
+    } catch {
+      roster = undefined; // service not registered in this composition
+    }
+    const heal = patchShippedPresets({ roster, baseUrl: ctx.baseUrl });
+    for (const file of heal.patched) {
+      ctx.logger?.info?.(`[dsh-magic-context] shipped preset patched: ${file}`);
+    }
+    if (heal.files.length === 0) {
+      ctx.logger?.info?.(
+        "[dsh-magic-context] no shipped presets carry compaction-basic; patch skipped",
+      );
+    }
+    const legacy = removeLegacyMagicStandard(resolveDshHome());
+    if (legacy.removed) {
+      ctx.logger?.info?.("[dsh-magic-context] legacy magic-standard preset removed");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.logger?.warn?.(
+      `[dsh-magic-context] boot self-heal failed (continuing): ${message}`,
+    );
+  }
   const directory = config.directory ?? process.cwd();
   const homeHash = config.homeHash ?? defaultHomeHash();
   const ready = bootstrapDshStorage({

@@ -1,15 +1,26 @@
-# dsh-magic-context — host bundle patch.
+# dsh-magic-context — profile bundle patch.
 #
-# Mounts the HOST-plane rows of the Magic adapter. The AGENT-plane rows are
-# mounted per session by the generated thin preset
-# (`$DSH_HOME/.agent-presets/magic-standard/agent.cordis.yml`), which includes
-# the stock preset and inserts the Magic rows into it.
+# HOST-PLANE rows, mounted process-globally by the profile bundle (ADR 0001).
+# The AGENT plane gets Magic Context through these host rows on every preset:
+# dsh's scope admission lets untagged host-plane listeners receive every
+# agent's agent/pre-step events, and tool/command registrations are global
+# layers — so every preset, shipped or user-authored, mounts the Magic surface.
+#
+# Compaction is the one thing that cannot be done from the host plane: it must
+# be a row inside each preset's isolated `compaction` realm, and shipped preset
+# ids cannot be shadowed from roster roots. It is therefore patched IN PLACE in
+# the shipped preset files by the boot-time self-heal in the host entry
+# (`src/host/preset-patch.ts`, tmp+rename atomic writes) — NOT by user-root
+# presets in `~/.agent-presets/`.
 #
 # Rows here (host plane, process-global):
-#   - magic-host:  boots the shared SQLite + provides ctx.magicContextHost
-#                  (bootstrap, canonical session keys, liveness marker)
-#   - magic-remote: the `magicContext/status` Typert endpoint for the Web
-#                  client (settings card / header action)
+#   - magic-host:       boots the shared SQLite + provides ctx.magicContextHost
+#                       (bootstrap, canonical session keys, liveness marker)
+#   - dsh-magic-context: the agent surface (memory gate, ctx_* tools, context
+#                       plane, guidance), mounted host-wide instead of inside a
+#                       preset — every agent of every preset gets it
+#   - magic-remote:     the `magicContext/status` Typert endpoint for the Web
+#                       client (settings card / header action)
 #
 # Removing the package from the profile's bundles reverts everything (no
 # persistent side effects beyond the shared Magic DB, which is harness-shared
@@ -18,6 +29,10 @@
     - id: magic-host
       name: '@cortexkit/dsh-magic-context'
       inject: []
+
+    - id: dsh-magic-context
+      name: '@cortexkit/dsh-magic-context/agent'
+      inject: [magicContextHost]
 
     - id: magic-remote
       name: '@cortexkit/dsh-magic-context/remote'

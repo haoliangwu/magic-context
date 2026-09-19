@@ -15,4 +15,3 @@ export * from "./commands";
 export * from "./subagent";
 export * from "./remote-seam";
 export * from "./liveness";
-export * from "./preset";

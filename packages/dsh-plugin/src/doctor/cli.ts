@@ -3,8 +3,9 @@
  * doctor/cli — `dsh-magic-context` bin entry.
  *
  * Subcommands:
- *   setup    locate DSH + generate the magic-standard thin preset + bootstrap
- *            the user config (see ./setup)
+ *   setup    diagnostics report; the boot-time self-heal in the host entry
+ *            owns all writes (shipped-preset patch + config bootstrap are
+ *            gone — see ./setup for the report-only model)
  *   doctor   run the adapter checklist (see ./doctor)
  *   --version / -v
  *

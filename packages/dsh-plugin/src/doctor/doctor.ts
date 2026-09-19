@@ -1,19 +1,20 @@
 /**
- * doctor/doctor — `dsh-magic-context doctor` (Phase 2 slice C).
+ * doctor/doctor — `dsh-magic-context doctor` (ADR 0001 model).
  *
- * Checklist (each item reports ok/warn/fail + a fix hint):
- *   1. DSH version vs the compatibility expectation (exact rc 0.1.0-rc.6);
+ * Strictly DIAGNOSTICS-ONLY: the boot-time self-heal in the host entry owns
+ * every write; doctor never mutates a file. Checklist:
+ *   1. DSH version vs the compatibility expectation (exact rc 0.1.5-rc.2);
  *   2. bundle install state (profile package.json `dsh.profile.bundles`);
- *   3. magic-standard preset generated + stock layout still contract-valid
- *      (re-runs scanStockPresetLayout against the stock file the include row
- *      points at, and applyMagicPatches as a dry-run);
+ *   3. shipped-preset patch state per preset file (applied / stock /
+ *      contract-mismatch / MC-path-rotted — read-only scan of the resolved
+ *      `@deepseek-ai/dsh-agent-presets` package) + legacy magic-standard
+ *      detection;
  *   4. shared DB: storage dir location + openDatabaseAsync result
  *      classification (schema fence / migration guard / fatal) + liveness
  *      marker scan;
  *   5. config loading (loadPluginConfigDetailed loadOutcome classification).
  */
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { fileURLToPath, pathToFileURL } from "node:url";
 import { join } from "node:path";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
 import { readJsoncFile } from "@magic-context/core/shared/jsonc-parser";
@@ -27,12 +28,15 @@ import {
   openDatabaseAsync,
 } from "@magic-context/core/features/magic-context/storage-db";
 import type { Database } from "@magic-context/core/shared/sqlite";
-import {
-  applyMagicPatches,
-  scanStockPresetLayout,
-} from "../compat/dsh-0.1/preset";
 import type { RpcPortFileRecord } from "../compat/dsh-0.1/liveness";
 import { describeError } from "@magic-context/core/shared/error-message";
+import {
+  AGENT_PRESETS_PACKAGE,
+  currentCompactionEntryUrl,
+  detectLegacyMagicStandard,
+  resolveAgentPresetsDir,
+  scanPresetPatchStates,
+} from "../host/preset-patch";
 import {
   DSH_COMPAT_EXPECTED_VERSION,
   DSH_PACKAGE,
@@ -40,15 +44,10 @@ import {
   LEGACY_MAGIC_CONTEXT_PACKAGE,
   MAGIC_CONTEXT_PACKAGE,
   locateDshInstall,
-  magicEntryPath,
-  magicStandardAgentCordisPath,
-  magicStandardDir,
-  magicStandardPresetYamlPath,
   parseFlags,
   resolveDshHome,
   stringFlag,
 } from "./env";
-import { parseEntryListYaml } from "./setup";
 
 export type CheckStatus = "ok" | "warn" | "fail";
 
@@ -75,6 +74,8 @@ export interface DshDoctorOptions {
   readonly directory?: string;
   /** Restrict the bundle check to one profile name. */
   readonly profile?: string;
+  /** Agent-presets package dir override (tests / `--agent-presets`). */
+  readonly agentPresetsDir?: string;
   /** Storage dir override (tests). */
   readonly storageDirOverride?: string;
   /** Shared DB path override (tests). */
@@ -350,103 +351,90 @@ export async function runDshDoctor(
     }
   }
 
-  // 3. magic-standard preset generated + layout still contract-valid.
-  const presetDir = magicStandardDir(dshHome);
-  const agentCordisPath = magicStandardAgentCordisPath(dshHome);
-  const presetYamlPath = magicStandardPresetYamlPath(dshHome);
-  if (!existsSync(agentCordisPath) || !existsSync(presetYamlPath)) {
+  // 3. Shipped-preset patch state (ADR 0001) + legacy magic-standard.
+  const agentPresetsDir =
+    options.agentPresetsDir ??
+    stringFlag(flags, "agent-presets") ??
+    resolveAgentPresetsDir();
+  if (agentPresetsDir === undefined) {
     checks.push({
-      id: "preset-generated",
-      title: "magic-standard preset",
-      status: "fail",
+      id: "preset-patch",
+      title: "Shipped-preset patch state",
+      status: "warn",
       detail:
-        `${presetDir} is missing (${existsSync(presetYamlPath) ? "" : "preset.yml, "}` +
-        `${existsSync(agentCordisPath) ? "" : "agent.cordis.yml"}).`,
-      fix: "Run `dsh-magic-context setup` to generate the thin preset.",
+        `Could not resolve ${AGENT_PRESETS_PACKAGE} from this module's context ` +
+        `(the profile node_modules that holds this package), so no shipped ` +
+        `preset is patched yet.`,
+      fix: "Verify the bundle is installed into the profile; the boot-time self-heal patches the shipped presets on the next host start.",
     });
   } else {
-    let presetStatus: CheckStatus = "ok";
-    let presetDetail = `${presetDir}: generated.`;
-    try {
-      const thinEntries = parseEntryListYaml(readFileSync(agentCordisPath, "utf8"));
-      const includeRow = thinEntries.find((row) => row.id === "magic-include-standard");
-      const includeConfig = includeRow?.config as
-        | { path?: unknown; patches?: unknown }
-        | undefined;
-      // The generated include path is a file:// URL (setup emits it that way
-      // so Windows drive paths survive the loader's URL resolution); convert
-      // it back to a filesystem path before reading.
-      const includePath =
-        typeof includeConfig?.path === "string" && includeConfig.path.startsWith("file:")
-          ? fileURLToPath(includeConfig.path)
-          : includeConfig?.path;
-      if (
-        includeRow === undefined ||
-        typeof includePath !== "string" ||
-        !existsSync(includePath)
-      ) {
-        presetStatus = "fail";
-        presetDetail = `${agentCordisPath}: the include row is missing or its stock path no longer exists.`;
-      } else if (includeRow.name === "@deepseek-ai/cordis-plugin-include") {
-        // Regression guard: the raw include inherits the loader's write-back,
-        // which truncates the SHIPPED stock composition to `[]` the first time
-        // a session ends (dsh-agent-presets' PresetTree documents this exact
-        // hazard). setup must emit our no-write entry instead.
-        presetStatus = "fail";
-        presetDetail =
-          `${agentCordisPath}: the include row still uses the raw ` +
-          `@deepseek-ai/cordis-plugin-include, which truncates the shipped ` +
-          `stock preset on the first agent teardown (loader write-back).`;
-      } else {
-        // The include row must mount the shipped stock file through OUR
-        // no-write entry (dist/entries/preset-include.js).
-        const expectedIncludeEntry = pathToFileURL(
-          magicEntryPath("preset-include"),
-        ).href;
-        const entryFile =
-          typeof includeRow.name === "string" && includeRow.name.startsWith("file:")
-            ? fileURLToPath(includeRow.name)
-            : includeRow.name;
-        if (
-          includeRow.name !== expectedIncludeEntry ||
-          typeof entryFile !== "string" ||
-          !existsSync(entryFile)
-        ) {
-          presetStatus = "fail";
-          presetDetail =
-            `${agentCordisPath}: the include row does not name this package's ` +
-            `no-write entry (${expectedIncludeEntry})` +
-            `${typeof entryFile === "string" && existsSync(entryFile) ? "" : " and the entry file is missing"}.`;
-        } else {
-          // Re-run the contract scan against the STOCK file the include row
-          // references, then prove the guarded patch still applies (dry run).
-          const stockEntries = parseEntryListYaml(readFileSync(includePath, "utf8"));
-          const layoutIssue = scanStockPresetLayout(stockEntries);
-          if (layoutIssue !== undefined) {
-            presetStatus = "fail";
-            presetDetail =
-              `${includePath}: stock layout changed (${layoutIssue}) — the ` +
-              `guarded patch no longer applies; the generated preset is stale.`;
-          } else {
-            applyMagicPatches(stockEntries, { stockPresetPath: includePath });
-            presetDetail =
-              `${presetDir}: valid; stock layout at ${includePath} re-scanned ` +
-              `and the guarded patch applies cleanly.`;
-          }
-        }
+    // Read-only scan: doctor never writes — the boot self-heal does.
+    const scan = scanPresetPatchStates({ agentPresetsDir, warn: () => {} });
+    const currentUrl = currentCompactionEntryUrl();
+    if (scan.files.length === 0) {
+      checks.push({
+        id: "preset-patch",
+        title: "Shipped-preset patch state",
+        status: "ok",
+        detail:
+          `${join(agentPresetsDir, "presets")}: no shipped preset carries a ` +
+          `compaction-basic row (nothing to patch).`,
+      });
+    } else {
+      for (const file of scan.files) {
+        const status: CheckStatus =
+          file.state === "applied" || file.state === "stock"
+            ? "ok"
+            : file.state === "contract-mismatch"
+              ? "warn"
+              : "fail";
+        const detailByState: Record<string, string> = {
+          applied: `patched: compaction-basic now mounts ${currentUrl} with config { auto: true }.`,
+          stock: `stock engine; the boot-time self-heal patches it when the host mounts.`,
+          "contract-mismatch": `${file.issue}. Stock compaction keeps running; the rest of Magic Context is unaffected.`,
+          "mc-path-rotted": `${file.issue} — the preset mounts a stale entry path.`,
+        };
+        checks.push({
+          id: `preset-patch.${file.presetId}`,
+          title: `Shipped-preset patch state — ${file.presetId}`,
+          status,
+          detail: `${file.path}: ${detailByState[file.state] ?? file.state}.`,
+          fix: status === "ok"
+            ? undefined
+            : status === "fail"
+              ? "Restart the host so the boot self-heal rewrites the current entry URL (or reinstall the bundle)."
+              : "Check the composition against the expected compaction-group shape.",
+        });
       }
-    } catch (error) {
-      presetStatus = "fail";
-      presetDetail = `${agentCordisPath}: ${describeError(error).brief}`;
     }
+  }
+
+  // 3b. Legacy magic-standard cleanup state (diagnostics only).
+  const legacy = detectLegacyMagicStandard(dshHome);
+  if (legacy.state === "absent") {
     checks.push({
-      id: "preset-generated",
-      title: "magic-standard preset",
-      status: presetStatus,
-      detail: presetDetail,
-      fix: presetStatus === "ok"
-        ? undefined
-        : "Run `dsh-magic-context setup` to regenerate (it fails closed on a layout mismatch).",
+      id: "legacy-preset",
+      title: "Legacy magic-standard preset",
+      status: "ok",
+      detail: `${legacy.dir}: absent.`,
+    });
+  } else if (legacy.state === "present") {
+    checks.push({
+      id: "legacy-preset",
+      title: "Legacy magic-standard preset",
+      status: "warn",
+      detail:
+        `${legacy.dir} is verifiably a Magic Context-generated thin preset; ` +
+        `the boot-time self-heal deletes it on the next host start.`,
+    });
+  } else {
+    checks.push({
+      id: "legacy-preset",
+      title: "Legacy magic-standard preset",
+      status: "warn",
+      detail:
+        `${legacy.dir} exists but is NOT verifiably Magic Context-generated ` +
+        `(${legacy.reason}); left alone.`,
     });
   }
 
