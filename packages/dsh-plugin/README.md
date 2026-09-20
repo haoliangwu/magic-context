@@ -38,7 +38,7 @@ dsh-magic-context doctor --profile <name>
 **Production — GitHub subpath (no npm publish, verified with pnpm 11):**
 
 Pin to a commit SHA for reproducibility, or track the branch (the plugin
-version follows the monorepo version — `0.42.5` in lockstep with
+version follows the monorepo version — `0.42.6` in lockstep with
 `@cortexkit/opencode-magic-context`; fork release tags use that scheme
 once cut):
 
@@ -102,7 +102,7 @@ Remove the `bundles` entry and restart DSH. Shared SQLite and `dsh_*` adapter ro
 ## Compatibility
 
 - DSH `0.1.5-rc.2` (run `doctor` contract gate before upgrading; the boot heal's anchor chain fail-opens on layout changes)
-- Magic Context shared schema `v84` (this package's `LATEST_SUPPORTED_VERSION`)
+- Magic Context shared schema `v85` (this package's `LATEST_SUPPORTED_VERSION`)
 
 ## Q&A
 
@@ -119,7 +119,7 @@ key 必须和报错信息里的完全一致。`github:...` 和 `git+https://...`
 
 **Q: I use Pi / OpenCode and DSH together and want to share memories. Do versions need to match?**
 
-Yes — all harnesses share one SQLite at `~/.local/share/cortexkit/magic-context/context.db`. The DB is versioned (`schema v84` at `LATEST_SUPPORTED_VERSION`); a newer plugin migrates the DB forward, an older one will fail the schema fence and refuse to open it. If you share memories across `pi` / `opencode` / `dsh`, keep their `@cortexkit/*-magic-context` versions in sync (same monorepo tag) so they agree on the schema. `doctor` reports the schema version and the adapter ceiling.
+Yes — all harnesses share one SQLite at `~/.local/share/cortexkit/magic-context/context.db`. The DB is versioned (`schema v85` at `LATEST_SUPPORTED_VERSION`); a newer plugin migrates the DB forward, an older one will fail the schema fence and refuse to open it. If you share memories across `pi` / `opencode` / `dsh`, keep their `@cortexkit/*-magic-context` versions in sync (same monorepo tag) so they agree on the schema. `doctor` reports the schema version and the adapter ceiling.
 
 **Q: What happens on a version mismatch?**
 
