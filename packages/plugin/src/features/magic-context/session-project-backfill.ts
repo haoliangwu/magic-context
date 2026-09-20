@@ -306,7 +306,21 @@ export async function runSessionProjectBackfill(
     let afterSessionId: string | null = null;
 
     for (;;) {
-        const sourcePage = await readPage(afterSessionId, SESSION_PAGE_SIZE);
+        let sourcePage: readonly SessionProjectBackfillSession[];
+        try {
+            sourcePage = await readPage(afterSessionId, SESSION_PAGE_SIZE);
+        } catch (error) {
+            try {
+                if (!markBackfillRetryPending(db, harness, holderId, now())) {
+                    log("[session-projects] backfill lease changed before failure cleanup");
+                }
+            } catch (releaseError) {
+                log(
+                    `[session-projects] failed to make backfill lease retryable after discovery failed: ${releaseError}`,
+                );
+            }
+            throw error;
+        }
         if (sourcePage.length === 0) break;
         afterSessionId = sourcePage.at(-1)?.sessionId ?? afterSessionId;
         const page = dedupeSessions(sourcePage).filter((session) => {

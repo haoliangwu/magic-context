@@ -33,7 +33,11 @@ import {
 import { pruneNestedConfigLeaf } from "./prune-config-leaf";
 import { loadRawConfigFile } from "./raw-loader";
 import { stripRemovedAgentConfig } from "./removed-agent-config";
-import { type MagicContextConfig, MagicContextConfigSchema } from "./schema/magic-context";
+import {
+    type MagicContextConfig,
+    MagicContextConfigSchema,
+    PROTECTED_TOKENS_MIN,
+} from "./schema/magic-context";
 import { resolveTransformMode } from "./transform-mode";
 import { substituteConfigVariables } from "./variable";
 
@@ -323,6 +327,18 @@ function redactConfigValue(value: unknown): string {
 
 let warnedProtectedTagsDeprecation = false;
 
+/**
+ * Specific warning for a protected_tokens value that is a number below the
+ * schema minimum. The generic "invalid value (number 20), using default
+ * undefined" message is true but unhelpful: it does not say the value is in the
+ * wrong unit (a leftover protected_tags tag count), and "using default
+ * undefined" reads like a bug. This branch fires ONLY for `number < min`;
+ * every other invalid value (wrong type, above max) keeps the generic message.
+ */
+export function formatProtectedTokensBelowMinWarning(value: number): string {
+    return `protected_tokens is a token floor (minimum ${PROTECTED_TOKENS_MIN}, default derived from the context window); ${value} looks like the old protected_tags count. Remove the key to use the default, or set a token count such as 16000.`;
+}
+
 export function resetProtectedTagsDeprecationWarningForTest(): void {
     warnedProtectedTagsDeprecation = false;
 }
@@ -483,6 +499,20 @@ export function parsePluginConfig(
         delete patched[key];
         const defaultVal = (defaults as unknown as Record<string, unknown>)[key];
         const reason = customMessagesByKey.get(key);
+        // A numeric protected_tokens below the schema minimum is almost always a
+        // leftover protected_tags tag count (10–30) renamed by hand. Replace the
+        // generic invalid-leaf message with one that names the unit mismatch.
+        // Scoped precisely to `number < min` so wrong-type and above-max values
+        // still get the generic message.
+        const invalidRawValue = rawConfig[key];
+        if (
+            key === "protected_tokens" &&
+            typeof invalidRawValue === "number" &&
+            invalidRawValue < PROTECTED_TOKENS_MIN
+        ) {
+            warnings.push(formatProtectedTokensBelowMinWarning(invalidRawValue));
+            continue;
+        }
         warnings.push(
             `"${key}": invalid value (${redactConfigValue(rawConfig[key])}), using default ${JSON.stringify(defaultVal)}.${reason ? ` ${reason}` : ""}`,
         );

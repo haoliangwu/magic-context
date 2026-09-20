@@ -63,7 +63,7 @@ Tool: [120] U: Can we rename the handler?
 | `action` | `write`, `read`, `update`, `dismiss`. |
 | `content` | Text for `write` / `update`. |
 | `surface_condition` | Creates a **smart note** (hidden until an external condition is true). |
-| `note_id` | Target for `update` / `dismiss`. |
+| `note_ids` | Targets: exactly one id for `update`, one to fifty for `dismiss`; ignored by `write` / `read`. |
 | `filter` | For `read`: `all`, `active`, `pending`, `ready`, `dismissed`. |
 | `limit` / `offset` | Page `read` results (newest first). |
 

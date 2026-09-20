@@ -30,7 +30,10 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { log } from "../../shared/logger";
-import { resolveOpenCodeDbPath } from "../../shared/opencode-db-path";
+import {
+    assertOpenCodeStoreGeneration,
+    resolveOpenCodeDbPath,
+} from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 
@@ -183,6 +186,12 @@ function getWritableOpenCodeDb(): Database {
         );
     }
     const db = new Database(dbPath);
+    try {
+        assertOpenCodeStoreGeneration(db, "v1", dbPath);
+    } catch (error) {
+        closeQuietly(db);
+        throw error;
+    }
     // busy_timeout BEFORE journal_mode=WAL: setting WAL can need the file lock, so
     // with the timeout installed first a cold-open while OpenCode holds the lock
     // waits up to 5s instead of throwing SQLITE_BUSY immediately.

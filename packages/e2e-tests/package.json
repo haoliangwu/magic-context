@@ -1,28 +1,30 @@
 {
-    "name": "@cortexkit/opencode-magic-context-e2e",
-    "version": "0.0.0",
-    "private": true,
-    "type": "module",
-    "scripts": {
-        "test": "bun ../../scripts/check-bun.mjs && bun test --timeout 120000",
-        "test:validate-manifest": "bun test scripts/validate-mode-manifest.test.ts scripts/check-rust-prerequisites.test.ts",
-        "validate-mode-manifest": "bun scripts/validate-mode-manifest.ts --mode ts",
-        "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",
-        "test:rust-e2e": "bun test --timeout 600000 --max-concurrency=1 tests/rust-*.test.ts",
-        "mutation:rust-historian": "bun scripts/run-rust-historian-producer-mutation.ts",
-        "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts",
-        "mutation:paired-replay": "bun scripts/run-paired-replay-mutation.ts",
-        "measure:mid-turn-ab": "bun scripts/run-mid-turn-prefix-ab.ts",
-        "measure:native-memory": "bun scripts/capture-heap-long-session.ts",
-        "replay:transform-wire-parity": "bun scripts/replay-transform-wire-parity.ts"
-    },
-    "dependencies": {
-        "@cortexkit/subc-client": "0.4.1",
-        "@opencode-ai/sdk": "^1.15.13"
-    },
-    "devDependencies": {
-        "@types/bun": "latest",
-        "bun-types": "^1.3.11",
-        "typescript": "^5.6.0"
-    }
+  "name": "@cortexkit/opencode-magic-context-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun ../../scripts/check-bun.mjs && bun test --timeout 120000",
+    "test:validate-manifest": "bun test scripts/validate-mode-manifest.test.ts scripts/check-rust-prerequisites.test.ts",
+    "validate-mode-manifest": "bun scripts/validate-mode-manifest.ts --mode ts",
+    "adjudicate:thinking-block": "bash scripts/adjudicate-thinking-block.sh",
+    "test:rust-e2e": "bun test --timeout 600000 --max-concurrency=1 tests/rust-*.test.ts",
+    "mutation:rust-historian": "bun scripts/run-rust-historian-producer-mutation.ts",
+    "mutation:rust-ctx-reduce": "bun scripts/run-rust-ctx-reduce-mutation.ts",
+    "mutation:paired-replay": "bun scripts/run-paired-replay-mutation.ts",
+    "measure:mid-turn-ab": "bun scripts/run-mid-turn-prefix-ab.ts",
+    "measure:native-memory": "bun scripts/capture-heap-long-session.ts",
+    "replay:transform-wire-parity": "bun scripts/replay-transform-wire-parity.ts"
+  },
+  "dependencies": {
+    "@cortexkit/subc-client": "0.4.1",
+    "@opencode-ai/sdk": "^1.15.13"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^18.2.6",
+    "@opencode/client": "2.0.5",
+    "@types/bun": "latest",
+    "bun-types": "^1.3.11",
+    "typescript": "^5.6.0"
+  }
 }

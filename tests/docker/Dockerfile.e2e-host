@@ -28,9 +28,9 @@ RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && node --version \
     && bun --version
 
-RUN curl -fsSL https://opencode.ai/install | bash \
-    && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
-    && opencode --version
+COPY install-opencode.sh /usr/local/bin/install-opencode.sh
+RUN install-opencode.sh \
+    && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode
 
 # Pi's package is installed globally so the e2e runner can resolve the same CLI
 # entry point that a normal user installation provides. Its per-user settings

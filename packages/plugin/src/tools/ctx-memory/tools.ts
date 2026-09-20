@@ -76,7 +76,7 @@ function isMemoryCategory(value: string): value is MemoryCategory {
 }
 
 function normalizeLimit(limit?: number): number {
-    if (typeof limit !== "number" || !Number.isFinite(limit)) {
+    if (typeof limit !== "number" || !Number.isFinite(limit) || limit === 0) {
         return DEFAULT_SEARCH_LIMIT;
     }
 
@@ -515,16 +515,21 @@ function createCtxMemoryTool(deps: CtxMemoryToolDeps): ToolDefinition {
                     ? getActiveCurateCategory(deps.db, projectPath)
                     : null;
             if (activeCurateCategory) {
+                const usesCategory = ["write", "update", "merge", "list"].includes(args.action);
+                const usesIds = ["update", "archive", "merge", "get"].includes(args.action);
+                const usesSuccessor = args.action === "update" || args.action === "archive";
                 const scopeRefusal = getCurateCategoryScopeRefusal({
                     scope: activeCurateCategory,
                     action: args.action,
-                    requestedCategory: args.category,
-                    ids: [
-                        ...(args.ids ?? []),
-                        ...(Number.isInteger(args.superseded_by)
-                            ? [args.superseded_by as number]
-                            : []),
-                    ],
+                    requestedCategory: usesCategory ? args.category : undefined,
+                    ids: usesIds
+                        ? [
+                              ...(args.ids ?? []),
+                              ...(usesSuccessor && Number.isInteger(args.superseded_by)
+                                  ? [args.superseded_by as number]
+                                  : []),
+                          ]
+                        : [],
                     categoryForId: (id) => {
                         const category = getMemoryById(deps.db, id)?.category;
                         return category ? curateCategoryForMemoryCategory(category) : null;

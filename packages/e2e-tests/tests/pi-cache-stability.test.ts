@@ -414,7 +414,7 @@ describe("pi cache stability", () => {
         );
     }, 180_000);
 
-    it("materializes queued text drops only on an execute pass, preserving defer-pass prefix stability", async () => {
+    it("materializes queued text drops on a force-band bust, preserving defer-pass prefix stability", async () => {
         await withPiHarness(
             {
                 modelContextLimit: 20_000,
@@ -440,8 +440,8 @@ describe("pi cache stability", () => {
                         usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
-                        text: "high pressure marker for next transform",
-                        usage: { input_tokens: 14_000, output_tokens: 5, cache_creation_input_tokens: 0 },
+                        text: "force-band marker for next transform",
+                        usage: { input_tokens: 18_000, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
                         text: "after materialization",
@@ -490,7 +490,7 @@ describe("pi cache stability", () => {
                     `dropped §${dropTag}§`,
                 );
 
-                await h.sendPrompt("third turn sees prior high usage and executes drops", {
+                await h.sendPrompt("third turn sees prior force-band usage and applies drops", {
                     timeoutMs: 60_000,
                     continueSession: true,
                 });
@@ -554,8 +554,8 @@ describe("pi cache stability", () => {
                         usage: { input_tokens: 500, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
-                        text: "high usage before materialization",
-                        usage: { input_tokens: 14_000, output_tokens: 5, cache_creation_input_tokens: 0 },
+                        text: "force-band usage before materialization",
+                        usage: { input_tokens: 18_000, output_tokens: 5, cache_creation_input_tokens: 0 },
                     },
                     {
                         text: "after tool drop",
@@ -582,7 +582,7 @@ describe("pi cache stability", () => {
                 );
                 queueDrop(h, first.sessionId!, toolTag);
 
-                await h.sendPrompt("record high usage for the next execute pass", {
+                await h.sendPrompt("record force-band usage for the next bust", {
                     timeoutMs: 60_000,
                     continueSession: true,
                 });

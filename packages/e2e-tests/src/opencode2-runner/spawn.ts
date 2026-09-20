@@ -14,7 +14,12 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
-import { MockProvider } from "../mock-provider/server";
+import { pinMockAgents } from "../mock-routing";
+import { MockProvider, type MockResponse } from "../mock-provider/server";
+import {
+	awaitPluginActivation,
+	type PluginActivationClient,
+} from "./plugin-activation";
 
 export const OPENCODE2_NO_BACKGROUND_SERVICE_FLAG: string = "--standalone";
 export const ROOT_KEYS = [
@@ -24,10 +29,14 @@ export const ROOT_KEYS = [
 	"XDG_STATE_HOME",
 	"XDG_CACHE_HOME",
 ] as const;
-export const CLI = resolve(
-	import.meta.dir,
-	"../../../plugin/node_modules/.bin/opencode2",
-);
+// The GA CLI is a devDependency of packages/plugin. Bun's isolated linker puts its
+// bin under the package's own node_modules; the hoisted linker (the release e2e
+// container installs with --linker=hoisted) puts it under the workspace root. Take
+// whichever exists so the lane does not depend on the linker choice.
+export const CLI = [
+	resolve(import.meta.dir, "../../../plugin/node_modules/.bin/opencode2"),
+	resolve(import.meta.dir, "../../../../node_modules/.bin/opencode2"),
+].find((candidate) => existsSync(candidate)) ?? resolve(import.meta.dir, "../../../plugin/node_modules/.bin/opencode2");
 export const PLUGIN = resolve(import.meta.dir, "../../../plugin");
 const groups = new Set<number>();
 function killGroup(pid: number): void {
@@ -46,11 +55,13 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 		process.exit(1);
 	});
 }
-export function isolation(): {
+export interface OpenCode2Isolation {
 	root: string;
 	env: NodeJS.ProcessEnv;
 	cwd: string;
-} {
+}
+
+export function isolation(): OpenCode2Isolation {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "mc-opencode2-")));
 	const env: NodeJS.ProcessEnv = {
 		PATH: process.env.PATH,
@@ -73,7 +84,7 @@ export function assertIsolation(root: string, env: NodeJS.ProcessEnv): void {
 	if (env.OPENCODE_DB !== "opencode2.db")
 		throw new Error("OPENCODE_DB must be opencode2.db before boot");
 	// The five private roots are the safety boundary (AFT playbook:46-48,62).
-	// GA CLI 2.0.3 also honours OPENCODE_DB as observed by the placement probe.
+	// GA CLI 2.0.5 also honours OPENCODE_DB as observed by the placement probe.
 	const base = realpathSync(root);
 	for (const key of ROOT_KEYS) {
 		const value = env[key];
@@ -138,45 +149,116 @@ export function handoff(
 	return match ? { url: match[1]!, password: match[2]! } : undefined;
 }
 
+/** OpenCode 2.0.5 removed awaitActivation; inventory is authoritative and plugin.updated invalidates it. */
+export async function waitForPluginActive(
+	client: PluginActivationClient,
+	directory: string,
+	pluginID = "opencode-magic-context",
+	timeoutMs = 20_000,
+): Promise<void> {
+	await awaitPluginActivation(client, directory, pluginID, timeoutMs);
+}
+
+
+export interface OpenCode2SpawnOptions {
+	probePlugin?: string;
+	providerID?: string;
+	probeStandalone?: boolean;
+	defaultModelID?: string;
+	additionalModelIDs?: string[];
+	mockResponse?: MockResponse;
+	extraConfig?: Record<string, unknown>;
+	magicContextConfig?: Record<string, unknown>;
+	includeMagicContext?: boolean;
+	modelContextLimit?: number;
+	modelOutputLimit?: number;
+	existingIsolation?: OpenCode2Isolation;
+	existingMock?: { mock: MockProvider; baseURL: string };
+}
+
 /** Event-driven, bounded startup; no readiness polling. CLI contract: AFT playbook:54-64. */
-export async function spawnOpencode2(
-	options: {
-		probePlugin?: string;
-		providerID?: string;
-		probeStandalone?: boolean;
-	} = {},
-) {
+export async function spawnOpencode2(options: OpenCode2SpawnOptions = {}) {
 	const providerID = options.providerID ?? "openai";
-	const fixture = isolation();
+	const fixture = options.existingIsolation ?? isolation();
 	const snapshotReason = activeV1Host()
 		? "live snapshot skipped: active v1 opencode serve writes operator store"
 		: undefined;
 	const before = snapshotReason ? undefined : snapshotLive();
 	assertIsolation(fixture.root, fixture.env);
-	if (!existsSync(join(PLUGIN, "dist/v2/server.js"))) {
+	if (
+		options.includeMagicContext !== false &&
+		!existsSync(join(PLUGIN, "dist/v2/server.js"))
+	) {
 		throw new Error("Build the plugin before booting v2");
 	}
-	const mock = new MockProvider();
-	const provider = await mock.start(); // Existing mock explicitly binds 127.0.0.1 and captures parsed wire bodies.
+	const mock = options.existingMock?.mock ?? new MockProvider();
+	const provider = options.existingMock ?? await mock.start(); // Existing mock explicitly binds 127.0.0.1 and captures parsed wire bodies.
+	// 2.0.5 title generation hits the mock on session.create, before tests
+	// install matchers, and uses a host title model rather than mock-model.
+	mock.setDefault({
+		text: "fixture reply",
+		usage: { input_tokens: 100, output_tokens: 10 },
+	});
+	if (options.mockResponse) mock.setDefault(options.mockResponse);
+	const defaultModelID = options.defaultModelID ?? "mock-model";
+	const modelIDs = new Set([
+		defaultModelID,
+		...(options.additionalModelIDs ?? []),
+	]);
 	writeFileSync(
 		join(fixture.cwd, "opencode.json"),
 		JSON.stringify({
-			plugins: [PLUGIN, ...(options.probePlugin ? [options.probePlugin] : [])],
-			model: `${providerID}/mock-model`,
+			...options.extraConfig,
+			plugins: [
+				...(options.includeMagicContext === false ? [] : [PLUGIN]),
+				...(options.probePlugin ? [options.probePlugin] : []),
+			],
+			model: `${providerID}/${defaultModelID}`,
 			compaction: { auto: true, buffer: 1024, keep: { tokens: 1024 } },
 			providers: {
 				[providerID]: {
 					settings: { baseURL: provider.baseURL, apiKey: "mock-key" },
-					models: {
-						"mock-model": {
-							name: "Mock",
-							limit: { context: 16000, output: 1024 },
-						},
-					},
+					models: Object.fromEntries(
+						[...modelIDs].map((id) => [
+							id,
+							{
+								name: id,
+								limit: {
+									// 2.0.5 required() is unchanged, but 16k minus a 32k output
+									// makes the first-request ceiling negative. Ordinary turns
+									// stay large; fold scenarios pass 16k/1024 explicitly.
+									context: options.modelContextLimit ?? 200_000,
+									output: options.modelOutputLimit ?? 32768,
+								},
+							},
+						]),
+					),
 				},
 			},
 		}),
 	);
+	if (options.magicContextConfig !== undefined) {
+		const configDir = join(fixture.env.XDG_CONFIG_HOME!, "cortexkit");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "magic-context.jsonc"),
+			JSON.stringify(
+				{
+					auto_update: false,
+					execute_threshold_percentage: 40,
+					history_budget_percentage: 0.15,
+					embedding: { provider: "off" },
+					...pinMockAgents(
+						options.magicContextConfig,
+						`${providerID}/${defaultModelID}`,
+						"opencode2",
+					),
+				},
+				null,
+				2,
+			),
+		);
+	}
 	// serve owns its server directly; --standalone is a TUI/run flag, not a serve option.
 	const child = spawn(
 		CLI,
@@ -204,7 +286,10 @@ export async function spawnOpencode2(
 	const exited = new Promise<void>((resolveExit) =>
 		child.once("close", () => resolveExit()),
 	);
-	const stop = async () => {
+	let hostStopped = false;
+	const stopHost = async () => {
+		if (hostStopped) return;
+		hostStopped = true;
 		let safetyError: unknown;
 		try {
 			if (child.pid && child.exitCode === null && child.signalCode === null)
@@ -215,9 +300,15 @@ export async function spawnOpencode2(
 		if (child.pid) killGroup(child.pid);
 		await exited;
 		if (child.pid) groups.delete(child.pid);
-		await mock.stop();
 		if (before) assertLiveUnchanged(before);
 		if (safetyError) throw safetyError;
+	};
+	const stop = async () => {
+		try {
+			await stopHost();
+		} finally {
+			await mock.stop();
+		}
 	};
 	try {
 		const ready = await new Promise<{ url: string; password: string }>(
@@ -253,6 +344,8 @@ export async function spawnOpencode2(
 			...fixture,
 			snapshotReason,
 			mock,
+			mockBaseURL: provider.baseURL,
+			stopHost,
 			stop,
 			stdout: () => stdout,
 			stderr: () => stderr,
@@ -264,12 +357,12 @@ export async function spawnOpencode2(
 }
 
 function activeV1Host(): boolean {
-	const result = spawnSync("pgrep", ["-f", "opencode serve"], {
+	const result = spawnSync("pgrep", ["-alf", "opencode"], {
 		encoding: "utf8",
 	});
 	if (result.error || (result.status !== 0 && result.status !== 1))
-		throw new Error("Cannot determine whether a live v1 host owns the store");
-	return result.status === 0;
+		throw new Error("Cannot determine whether a live OpenCode host owns the store");
+	return result.status === 0 && result.stdout.split("\n").some((line) => /\bserve\b/.test(line));
 }
 
 export function assertOpenPaths(

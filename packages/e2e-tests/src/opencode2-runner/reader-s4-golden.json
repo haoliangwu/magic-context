@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "contract": "I11",
+  "v1": {
+    "rawSha256": "6d4d3f742375174e2475816e05450451c061df66b19e69924cb6502290b81035",
+    "chunkText": "[1] U: Plan the host-aware reader.\n[2] A: I will inspect both stores.\n[3] U: Keep v1 bytes stable.\n[4] A: Both lanes now agree.",
+    "markerRows": [
+      {
+        "id": "marker-summary"
+      }
+    ]
+  },
+  "v2": {
+    "chunkText": "[1] U: Plan the host-aware reader.\n[2] A: I will inspect both stores.\n[3] U: Keep v1 bytes stable.\n[4] A: Both lanes now agree.",
+    "hostCompactionRows": [
+      {
+        "id": "host-checkpoint",
+        "summary": "host-owned"
+      }
+    ],
+    "markerRows": []
+  },
+  "common": {
+    "messageIds": ["u1", "a1", "u2", "a2"],
+    "ordinals": [1, 2, 3, 4],
+    "messageCount": 4,
+    "tokenEstimate": 44
+  }
+}

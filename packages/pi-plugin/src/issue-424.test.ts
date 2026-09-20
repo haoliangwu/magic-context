@@ -19,6 +19,8 @@ registerIssue424CapacityTests(
 		xml,
 		holderId,
 		historianChunkTokens,
+		historianContextLimit,
+		maxOutputTokens,
 	}) => {
 		const prompts: string[] = [];
 		await runPiHistorian({
@@ -34,6 +36,8 @@ registerIssue424CapacityTests(
 			},
 			historianModel: "test/model",
 			historianChunkTokens,
+			historianContextLimit,
+			maxOutputTokens,
 			boundarySnapshot: boundary,
 			compartmentLeaseHolderId: holderId,
 			memoryEnabled: false,

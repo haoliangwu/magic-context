@@ -335,7 +335,7 @@ describe("long-running Pi Magic Context session", () => {
             }
             // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
-            // Phase 4: ctx_reduce queues a real drop; the next execute materializes a dropped shell and suppresses cleanup nudges.
+            // Phase 4: ctx_reduce queues a real drop; the next force pass materializes a dropped shell and suppresses cleanup nudges.
             const reduceTarget = await h.waitFor(
                 () => {
                     const row = h
@@ -351,7 +351,7 @@ describe("long-running Pi Magic Context session", () => {
             emitToolOnce(h, /^ctx_reduce$/, { drop: String(reduceTarget) });
             await send(`turn 13: drop old Pi assistant tag ${reduceTarget} with ctx_reduce`, "pi phase 4 after ctx_reduce");
             await send("turn 14: pressure after Pi ctx_reduce so pending op applies next", "pi phase 4 pressure", FORCE_CLEANUP_USAGE);
-            await send("turn 15: materialize Pi ctx_reduce pending op", "pi phase 4 materialize");
+            await send("turn 15: force-bust and materialize Pi ctx_reduce pending op", "pi phase 4 materialize");
             await h.waitFor(() => {
                 const row = h.contextDb().prepare("SELECT status FROM tags WHERE session_id = ? AND tag_number = ? AND harness = 'pi'").get(sessionId, reduceTarget) as { status: string } | null;
                 return row?.status === "dropped";

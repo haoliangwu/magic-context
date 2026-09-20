@@ -784,6 +784,54 @@ describe("loadPiConfig", () => {
 		});
 	});
 
+	describe("protected_tokens below-minimum warning", () => {
+		it("emits the specific token-floor warning for a numeric value below the schema minimum", () => {
+			const cwd = makeTempRoot("mc-pi-belowmin-cwd-");
+			const home = makeTempRoot("mc-pi-belowmin-home-");
+			withHome(home);
+			writeUserConfig(home, JSON.stringify({ protected_tokens: 20 }));
+
+			const result = loadPiConfig({ cwd });
+			const warnings = result.warnings.join("\n");
+			expect(warnings).toContain("protected_tokens is a token floor");
+			expect(warnings).not.toContain('"protected_tokens": invalid value');
+		});
+
+		it("keeps the generic type message for a string value", () => {
+			const cwd = makeTempRoot("mc-pi-belowmin-str-cwd-");
+			const home = makeTempRoot("mc-pi-belowmin-str-home-");
+			withHome(home);
+			writeUserConfig(home, JSON.stringify({ protected_tokens: "20" }));
+
+			const result = loadPiConfig({ cwd });
+			const warnings = result.warnings.join("\n");
+			expect(warnings).toContain('"protected_tokens": invalid value');
+			expect(warnings).not.toContain("protected_tokens is a token floor");
+		});
+
+		it("keeps the generic above-max message for a value above the maximum", () => {
+			const cwd = makeTempRoot("mc-pi-belowmin-max-cwd-");
+			const home = makeTempRoot("mc-pi-belowmin-max-home-");
+			withHome(home);
+			writeUserConfig(home, JSON.stringify({ protected_tokens: 2_000_000 }));
+
+			const result = loadPiConfig({ cwd });
+			const warnings = result.warnings.join("\n");
+			expect(warnings).toContain('"protected_tokens": invalid value');
+			expect(warnings).not.toContain("protected_tokens is a token floor");
+		});
+
+		it("emits no warning when the key is absent", () => {
+			const cwd = makeTempRoot("mc-pi-belowmin-absent-cwd-");
+			const home = makeTempRoot("mc-pi-belowmin-absent-home-");
+			withHome(home);
+			writeUserConfig(home, JSON.stringify({}));
+
+			const result = loadPiConfig({ cwd });
+			expect(result.warnings).toEqual([]);
+		});
+	});
+
 	describe("protected_tags deprecation", () => {
 		it("accepts protected_tags: 20 with loud deprecation warning and behavior identical to absent", () => {
 			const cwd = makeTempRoot("mc-pi-dep-cwd-");

@@ -4,7 +4,7 @@ import type { Database } from "bun:sqlite";
 export function pinMockAgents(
   overrides: Record<string, unknown> = {},
   model: string,
-  harness: "opencode" | "pi" = "opencode",
+  harness: "opencode" | "opencode2" | "pi" | "omp" = "opencode",
 ): Record<string, unknown> {
   const result = { ...overrides };
   for (const name of ["historian", "dreamer"]) {

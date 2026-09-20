@@ -312,11 +312,12 @@ describe("auto-update-checker/index", () => {
         checkerMocks.getLatestVersion.mockImplementation(async () => "0.15.6");
 
         const { createAutoUpdateCheckerHook } = await freshIndexImport();
+        const storageDir = makeTempStorageDir();
         const { ctx, showToast } = createCtx();
         createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
             showStartupToast: false,
             initDelayMs: 0,
-            storageDir: makeTempStorageDir(),
+            storageDir,
         });
         await waitForCalls(showToast);
 
@@ -334,6 +335,69 @@ describe("auto-update-checker/index", () => {
                 duration: 8000,
             },
         });
+        const state = JSON.parse(
+            readFileSync(join(storageDir, "last-update-check.json"), "utf-8"),
+        ) as Record<string, unknown>;
+        expect(state.updaterPinnedSpec).toBe(`${PACKAGE_NAME}@0.15.6`);
+        expect(state.updaterPinnedAt).toBeNumber();
+    });
+
+    test("continues auto-update from the exact spec written by the previous update", async () => {
+        let entry = PACKAGE_NAME;
+        let currentVersion = "0.15.5";
+        let latestVersion = "0.15.6";
+        checkerMocks.findPluginEntry.mockImplementation(() => ({
+            entry,
+            pinnedVersion: entry === PACKAGE_NAME ? null : currentVersion,
+            isPinned: entry !== PACKAGE_NAME,
+            configPath: "/config/opencode.jsonc",
+        }));
+        checkerMocks.getCachedVersion.mockImplementation(() => currentVersion);
+        checkerMocks.getLatestVersion.mockImplementation(async () => latestVersion);
+        checkerMocks.preparePluginUpdate.mockImplementation(async (...args: unknown[]) => ({
+            spec: `${PACKAGE_NAME}@${String(args[2])}`,
+            configPaths: ["/config/opencode.jsonc", "/config/tui.jsonc"],
+        }));
+
+        const logSpy = spyOn(logger, "log");
+        const { createAutoUpdateCheckerHook } = await freshIndexImport();
+        const storageDir = makeTempStorageDir();
+        const first = createCtx();
+        createAutoUpdateCheckerHook(
+            first.ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
+            {
+                showStartupToast: false,
+                initDelayMs: 0,
+                checkIntervalMs: 0,
+                storageDir,
+            },
+        );
+        await waitForCalls(first.showToast);
+
+        entry = `${PACKAGE_NAME}@0.15.6`;
+        currentVersion = "0.15.6";
+        latestVersion = "0.15.7";
+        const second = createCtx();
+        createAutoUpdateCheckerHook(
+            second.ctx as Parameters<typeof createAutoUpdateCheckerHook>[0],
+            {
+                showStartupToast: false,
+                initDelayMs: 0,
+                checkIntervalMs: 0,
+                storageDir,
+            },
+        );
+        await waitForCalls(second.showToast);
+
+        expect(checkerMocks.preparePluginUpdate).toHaveBeenCalledTimes(2);
+        expect(checkerMocks.preparePluginUpdate.mock.calls[1]?.[2]).toBe("0.15.7");
+        expect(logSpy).toHaveBeenCalledWith(
+            "[auto-update-checker] Version was pinned by the updater; continuing auto-update",
+        );
+        const state = JSON.parse(
+            readFileSync(join(storageDir, "last-update-check.json"), "utf-8"),
+        ) as Record<string, unknown>;
+        expect(state.updaterPinnedSpec).toBe(`${PACKAGE_NAME}@0.15.7`);
     });
 
     test("leaves explicit @latest untouched and logs the active-package risk", async () => {
@@ -439,10 +503,127 @@ describe("auto-update-checker/index", () => {
             body: {
                 title: "Magic Context 0.15.6",
                 message:
-                    "v0.15.6 available. Version is pinned; update your OpenCode plugin config to upgrade.",
+                    "v0.15.6 available. This version was pinned by you; update your OpenCode plugin config to upgrade.",
                 variant: "info",
                 duration: 8000,
             },
+        });
+        expect(checkerMocks.preparePluginUpdate).not.toHaveBeenCalled();
+    });
+
+    test("treats an edited exact pin as user-authored", async () => {
+        const storageDir = makeTempStorageDir();
+        writeFileSync(
+            join(storageDir, "last-update-check.json"),
+            JSON.stringify({
+                lastCheckedMs: 0,
+                updaterPinnedSpec: `${PACKAGE_NAME}@0.15.4`,
+                updaterPinnedAt: Date.now(),
+            }),
+        );
+        checkerMocks.findPluginEntry.mockImplementation(() => ({
+            entry: `${PACKAGE_NAME}@0.15.5`,
+            pinnedVersion: "0.15.5",
+            isPinned: true,
+            configPath: "/config/opencode.jsonc",
+        }));
+        checkerMocks.getCachedVersion.mockImplementation(() => "0.15.5");
+        checkerMocks.getLatestVersion.mockImplementation(async () => "0.15.6");
+        const logSpy = spyOn(logger, "log");
+        const { createAutoUpdateCheckerHook } = await freshIndexImport();
+        const { ctx, showToast } = createCtx();
+
+        createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+            showStartupToast: false,
+            initDelayMs: 0,
+            storageDir,
+        });
+        await waitForCalls(showToast);
+
+        expect(showToast).toHaveBeenCalledWith({
+            body: {
+                title: "Magic Context 0.15.6",
+                message:
+                    "v0.15.6 available. This version was pinned by you; update your OpenCode plugin config to upgrade.",
+                variant: "info",
+                duration: 8000,
+            },
+        });
+        expect(logSpy).toHaveBeenCalledWith(
+            "[auto-update-checker] Version was pinned by you; skipping auto-update",
+        );
+        expect(checkerMocks.preparePluginUpdate).not.toHaveBeenCalled();
+    });
+
+    test("fails closed for pinned entries when provenance is absent or has the old shape", async () => {
+        checkerMocks.findPluginEntry.mockImplementation(() => ({
+            entry: `${PACKAGE_NAME}@0.15.5`,
+            pinnedVersion: "0.15.5",
+            isPinned: true,
+            configPath: "/config/opencode.jsonc",
+        }));
+        checkerMocks.getCachedVersion.mockImplementation(() => "0.15.5");
+        checkerMocks.getLatestVersion.mockImplementation(async () => "0.15.6");
+        const { createAutoUpdateCheckerHook } = await freshIndexImport();
+
+        for (const stateShape of ["absent", "old"] as const) {
+            const storageDir = makeTempStorageDir();
+            if (stateShape === "old") {
+                writeFileSync(
+                    join(storageDir, "last-update-check.json"),
+                    JSON.stringify({ lastCheckedMs: 0 }),
+                );
+            }
+            const { ctx, showToast } = createCtx();
+            createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+                showStartupToast: false,
+                initDelayMs: 0,
+                storageDir,
+            });
+            await waitForCalls(showToast);
+            expect(showToast.mock.calls[0]?.[0]).toEqual({
+                body: expect.objectContaining({
+                    message: expect.stringContaining("pinned by you"),
+                }),
+            });
+        }
+        expect(checkerMocks.preparePluginUpdate).not.toHaveBeenCalled();
+    });
+
+    test("auto-update false wins over updater-owned pin provenance", async () => {
+        const spec = `${PACKAGE_NAME}@0.15.5`;
+        const storageDir = makeTempStorageDir();
+        writeFileSync(
+            join(storageDir, "last-update-check.json"),
+            JSON.stringify({
+                lastCheckedMs: 0,
+                updaterPinnedSpec: spec,
+                updaterPinnedAt: Date.now(),
+            }),
+        );
+        checkerMocks.findPluginEntry.mockImplementation(() => ({
+            entry: spec,
+            pinnedVersion: "0.15.5",
+            isPinned: true,
+            configPath: "/config/opencode.jsonc",
+        }));
+        checkerMocks.getCachedVersion.mockImplementation(() => "0.15.5");
+        checkerMocks.getLatestVersion.mockImplementation(async () => "0.15.6");
+        const { createAutoUpdateCheckerHook } = await freshIndexImport();
+        const { ctx, showToast } = createCtx();
+
+        createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+            showStartupToast: false,
+            autoUpdate: false,
+            initDelayMs: 0,
+            storageDir,
+        });
+        await waitForCalls(showToast);
+
+        expect(showToast.mock.calls[0]?.[0]).toEqual({
+            body: expect.objectContaining({
+                message: "v0.15.6 available. Auto-update is disabled.",
+            }),
         });
         expect(checkerMocks.preparePluginUpdate).not.toHaveBeenCalled();
     });

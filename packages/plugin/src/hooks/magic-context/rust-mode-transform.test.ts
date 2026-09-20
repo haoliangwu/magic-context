@@ -3765,7 +3765,10 @@ describe("Rust mode authority adapter", () => {
             makeMeta(db, sessionId),
         );
 
-        const deltaPages = requestBodies.filter((body) => "transform_page_id" in body);
+        const deltaFinalPage = requestBodies.findLast((body) => body.tail_delta !== undefined)!;
+        const deltaPages = requestBodies.filter(
+            (body) => body.transform_page_id === deltaFinalPage.transform_page_id,
+        );
         expect(deltaPages.length).toBeGreaterThan(1);
         expect(
             deltaPages.every(
@@ -5976,6 +5979,132 @@ describe("delta prefix-mutation guard", () => {
             },
         ]);
         expect(transform.getState(sessionId).consecutiveFailures).toBe(0);
+    });
+});
+
+describe("Rust silent transform resend", () => {
+    const abortableSilence = (signal?: AbortSignal): Promise<never> =>
+        new Promise((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason ?? new Error("aborted")), {
+                once: true,
+            });
+        });
+
+    it("serves the pass from one resend after a healthy probe and logs it once", async () => {
+        const sessionId = `rust-silent-resend-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        input[0]!.info.model = { providerID: "test-provider", modelID: "test-model" };
+        const transformBodies: Record<string, unknown>[] = [];
+        let healthProbes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, body, signal }) => {
+                if (method === "session.status") {
+                    healthProbes += 1;
+                    return { ok: true };
+                }
+                if (method !== "transform") return { ok: true };
+                const request = body as Record<string, unknown>;
+                transformBodies.push(request);
+                if (request.resend !== true) return abortableSilence(signal);
+                return {
+                    decision: "SOFT+",
+                    served_from: "transform",
+                    native_messages: structuredClone(input),
+                };
+            },
+        };
+        const transform = createRustModeTransform(makeDeps(db, moduleClient), {
+            moduleClient,
+            moduleTimeoutMs: 100,
+            silentResendAfterMsForTests: 10,
+            healthProbeTimeoutMsForTests: 20,
+        });
+        const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            const output = { messages: [...input] as unknown[] };
+            await transform.run(sessionId, input, output, makeMeta(db, sessionId));
+
+            expect(output.messages).toEqual(input);
+            expect(healthProbes).toBe(1);
+            expect(transformBodies).toHaveLength(2);
+            expect(transformBodies[0]!.resend).toBeUndefined();
+            expect(transformBodies[1]!.resend).toBe(true);
+            expect(transformBodies[1]!.original_attempt_id).toBe(transformBodies[0]!.attempt_id);
+            expect(transformBodies[1]!.attempt_id).not.toBe(transformBodies[0]!.attempt_id);
+            const resendLogs = logSpy.mock.calls.filter(
+                ([loggedSession, message]) =>
+                    loggedSession === sessionId &&
+                    String(message).startsWith("rust silent resend "),
+            );
+            expect(resendLogs).toHaveLength(1);
+            expect(String(resendLogs[0]![1])).toContain(
+                `original_attempt=${transformBodies[0]!.attempt_id}`,
+            );
+            expect(String(resendLogs[0]![1])).toContain(
+                `resend_attempt=${transformBodies[1]!.attempt_id}`,
+            );
+        } finally {
+            logSpy.mockRestore();
+        }
+    });
+
+    it("does not resend when the health probe fails and preserves the refusal", async () => {
+        const sessionId = `rust-silent-probe-failure-${Date.now()}`;
+        sessions.push(sessionId);
+        const db = makeDb();
+        installRawProvider(sessionId);
+        const input = makeMessages(sessionId);
+        input[0]!.info.model = { providerID: "test-provider", modelID: "test-model" };
+        let transformCalls = 0;
+        let healthProbes = 0;
+        const moduleClient: RustModeModuleClient = {
+            call: async ({ method, signal }) => {
+                if (method === "session.status") {
+                    healthProbes += 1;
+                    throw new Error("probe unavailable");
+                }
+                if (method !== "transform") return { ok: true };
+                transformCalls += 1;
+                return abortableSilence(signal);
+            },
+        };
+        const deps = makeDeps(db, moduleClient);
+        deps.contextUsageMap.set(sessionId, {
+            usage: { percentage: 96, inputTokens: 122_880 },
+            updatedAt: Date.now(),
+        });
+        recordOverflowDetected(
+            db,
+            sessionId,
+            128_000,
+            "test-provider/test-model",
+            "provider_overflow",
+        );
+        const transform = createRustModeTransform(deps, {
+            moduleClient,
+            moduleTimeoutMs: 50,
+            silentResendAfterMsForTests: 10,
+            healthProbeTimeoutMsForTests: 20,
+        });
+
+        await expect(
+            transform.run(
+                sessionId,
+                input,
+                { messages: [...input] as unknown[] },
+                makeMeta(db, sessionId),
+            ),
+        ).rejects.toEqual(
+            expect.objectContaining({
+                name: "EmergencyFailClosedError",
+                message: ENGINE_RECONNECTING_USER_MESSAGE,
+            }),
+        );
+        expect(healthProbes).toBe(1);
+        expect(transformCalls).toBe(1);
     });
 });
 

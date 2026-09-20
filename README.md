@@ -111,7 +111,7 @@ If you cannot run the wizard, add this to `opencode.jsonc`:
 }
 ```
 
-> **Plugin updates:** A bare plugin entry is pinned to the downloaded exact version before restart so OpenCode does not remove the active package mid-session. To deliberately keep it unpinned after removing a version, write `@latest` explicitly.
+> **Plugin updates:** A bare plugin entry is pinned to the downloaded exact version before restart so OpenCode does not remove the active package mid-session. Magic Context records the exact spec written by its updater and advances that updater-owned pin on later checks. Any other exact spec is treated as pinned by you and is not changed. Because provenance is keyed to the exact spec string, manually changing the entry to the same spec the updater last wrote is indistinguishable from the updater's pin and will be advanced. To opt out, set `auto_update: false` or pin any other exact version. To deliberately stay unpinned, write `@latest` explicitly (OpenCode may remove an unpinned active package mid-session).
 
 Then create `magic-context.jsonc` with the OpenCode historian setting:
 
@@ -330,7 +330,7 @@ It reads directly from Magic Context's SQLite database. No extra server, no API.
 
 Settings live in `magic-context.jsonc`. Most settings have sensible defaults, but the active harness's historian model (`historian.opencode.model`, `historian.pi.model`, or `historian.omp.model`) is required for history compacting; project config merges on top of user-wide settings. For the full reference — cache TTL tuning, per-model execute thresholds, historian and dreamer model selection, embedding providers, memory settings, and prompt-surface presets (`full`/`light`) — see **[CONFIGURATION.md](./CONFIGURATION.md)** or the **[configuration reference on docs.cortexkit.io](https://docs.cortexkit.io/magic-context/reference/configuration/)**.
 
-> **Note on per-model settings (OpenCode/Pi/OMP):** settings that route per model — like `prompt_surface.models` — apply to the injected guidance block. Tool descriptions are registered once per process by the current (v1) plugin API and follow the default preset; per-model tool descriptions arrive with the OpenCode v2 plugin API once the SDK stabilizes ([#260](https://github.com/cortexkit/magic-context/issues/260)).
+> **Note on per-model settings:** `prompt_surface.models` always routes the injected guidance block. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow `prompt_surface.default`). OpenCode 2 rewrites the five `ctx_*` descriptions per request from the draft model.
 
 **Config locations** (one shared CortexKit location, project overrides user):
 1. `<project-root>/.cortexkit/magic-context.jsonc`

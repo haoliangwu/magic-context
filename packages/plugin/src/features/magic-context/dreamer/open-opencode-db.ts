@@ -1,6 +1,7 @@
 import { getErrorMessage } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
 import {
+    assertOpenCodeStoreGeneration,
     claimOpenCodeDbDiagnosticOnce,
     clearOpenCodeDbReadFailure,
     openCodeDbPathExists,
@@ -28,6 +29,12 @@ export function openOpenCodeDb(): Database | null {
     }
     try {
         const db = new Database(dbPath, { readonly: true });
+        try {
+            assertOpenCodeStoreGeneration(db, "v1", dbPath);
+        } catch (error) {
+            db.close();
+            throw error;
+        }
         db.exec("PRAGMA busy_timeout = 5000");
         clearOpenCodeDbReadFailure();
         return db;

@@ -17,8 +17,8 @@ import { StringDecoder } from "node:string_decoder";
 import {
   childEnv,
   createPiIsolatedEnv,
-  PI_CLI,
   PI_RELOAD_EXTENSION,
+  resolvePiHostInvocation,
   type PiIsolatedEnv,
   type PiRunnerOptions,
   writeConfigs,
@@ -218,7 +218,7 @@ export class PiRpcClient {
   private stderr = "";
 
   constructor(options: PiRpcClientOptions) {
-    this.env = options.env ?? createPiIsolatedEnv();
+    this.env = options.env ?? createPiIsolatedEnv(undefined, options.host);
     this.options = { ...options, env: this.env };
     this.protocol.onEvent((event) => {
       if (event.type === "extension_error") this.extensionErrors.push(event);
@@ -233,10 +233,15 @@ export class PiRpcClient {
     if (this.process) throw new Error("Pi RPC client already started");
     writeConfigs(this.env, this.options);
 
+    const host = this.options.host ?? "pi";
+    const invocation = resolvePiHostInvocation(host);
+    const discoveryArgs = host === "omp"
+      ? ["--no-skills", "--no-rules"]
+      : ["--no-skills", "--no-prompt-templates", "--no-themes"];
     this.process = spawn(
-      "bun",
+      invocation.command,
       [
-        PI_CLI,
+        ...invocation.prefixArgs,
         "--mode",
         "rpc",
         "--no-extensions",
@@ -248,11 +253,9 @@ export class PiRpcClient {
         this.env.pluginDir,
         "--extension",
         PI_RELOAD_EXTENSION,
-        "--no-skills",
-        "--no-prompt-templates",
-        "--no-themes",
+        ...discoveryArgs,
         "--model",
-        "anthropic/claude-haiku-4-5",
+        host === "omp" ? "mock/mock-model" : "anthropic/claude-haiku-4-5",
         "--api-key",
         "test-key-not-real",
       ],

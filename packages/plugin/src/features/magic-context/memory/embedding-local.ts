@@ -195,7 +195,12 @@ function startLockHeartbeat(lockPath: string): () => void {
 type TransformersModule = Record<string, unknown>;
 
 type WasmOrtModule = {
-    env?: { wasm?: { wasmPaths?: string | Record<string, string> } };
+    env?: {
+        wasm?: {
+            numThreads?: number;
+            wasmPaths?: string | Record<string, string>;
+        };
+    };
     default?: unknown;
 };
 
@@ -392,9 +397,13 @@ async function injectWasmOrt(): Promise<boolean> {
     try {
         const { module: ortWeb, entryPath } = await importWasmOrtForRuntime();
 
-        // Prefer package-local assets so first use works offline instead of
-        // requiring the default CDN path.
         if (ortWeb.env?.wasm) {
+            // ORT's WASM worker threads can spin between runs and cannot currently
+            // be terminated. A single thread keeps the host event loop idle.
+            ortWeb.env.wasm.numThreads = 1;
+
+            // Prefer package-local assets so first use works offline instead of
+            // requiring the default CDN path.
             ortWeb.env.wasm.wasmPaths = `${pathToFileURL(dirname(entryPath)).href}/`;
         }
 

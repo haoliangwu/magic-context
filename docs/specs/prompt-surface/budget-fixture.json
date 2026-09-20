@@ -37,34 +37,34 @@
   ],
   "fullMeasurements": {
     "guidance": {
-      "primary-full-reduce-memory-on": { "chars": 8752, "tokens": 2008 },
-      "primary-full-reduce-memory-off": { "chars": 7717, "tokens": 1749 },
+      "primary-full-reduce-memory-on": { "chars": 8697, "tokens": 1998 },
+      "primary-full-reduce-memory-off": { "chars": 7662, "tokens": 1739 },
       "primary-full-no-reduce-memory-on": { "chars": 6484, "tokens": 1489 },
       "primary-full-no-reduce-memory-off": { "chars": 5449, "tokens": 1230 },
-      "primary-full-reduce-dreamer-off": { "chars": 8423, "tokens": 1931 },
-      "primary-full-reduce-temporal-off": { "chars": 8317, "tokens": 1901 },
-      "primary-full-reduce-caveman-on": { "chars": 9367, "tokens": 2134 },
-      "primary-full-reduce-language-on": { "chars": 8952, "tokens": 2054 },
+      "primary-full-reduce-dreamer-off": { "chars": 8368, "tokens": 1921 },
+      "primary-full-reduce-temporal-off": { "chars": 8262, "tokens": 1891 },
+      "primary-full-reduce-caveman-on": { "chars": 9312, "tokens": 2124 },
+      "primary-full-reduce-language-on": { "chars": 8897, "tokens": 2044 },
       "subagent-reduce": { "chars": 693, "tokens": 187 }
     },
     "toolDescriptions": {
-      "ctx_reduce": { "chars": 1335, "tokens": 318 },
+      "ctx_reduce": { "chars": 1269, "tokens": 304 },
       "ctx_expand": { "chars": 1586, "tokens": 395 },
-      "ctx_note": { "chars": 1569, "tokens": 392 },
+      "ctx_note": { "chars": 1547, "tokens": 387 },
       "ctx_memory": { "chars": 980, "tokens": 234 },
       "ctx_search": { "chars": 1663, "tokens": 402 }
     },
     "serializedParameterSchemas": {
       "ctx_reduce": { "chars": 91, "tokens": 31 },
       "ctx_expand": { "chars": 791, "tokens": 177 },
-      "ctx_note": { "chars": 1574, "tokens": 378 },
+      "ctx_note": { "chars": 1499, "tokens": 359 },
       "ctx_memory": { "chars": 912, "tokens": 216 },
       "ctx_search": { "chars": 777, "tokens": 184 },
-      "totalTokens": 986
+      "totalTokens": 967
     },
-    "builtInProviderVisibleTotal": 4735
+    "builtInProviderVisibleTotal": 4687
   },
-  "mutableProseBaseline": 3749,
+  "mutableProseBaseline": 3720,
   "integerLightCeiling": 1825,
   "includedSurfaces": [
     "The primary built-in full guidance section for the exact feature variant above.",

@@ -3,11 +3,14 @@ import { join } from "node:path";
 import { readJsoncFile } from "./jsonc-parser";
 import { log } from "./logger";
 import { getOpenCodeConfigPaths } from "./opencode-config-dir";
+import type { OpenCodeHostGeneration } from "./opencode-db-path";
 
 interface OpenCodeConfig {
     compaction?: {
         auto?: boolean;
         prune?: boolean;
+        keep?: { tokens?: number };
+        buffer?: number;
     };
     // OpenCode allows plugins as plain strings or [name, options] tuples.
     plugin?: Array<string | [string, unknown]>;
@@ -62,6 +65,8 @@ export interface ConflictResult {
 export interface ResolvedCompaction {
     auto: boolean;
     prune: boolean;
+    keepTokens?: number;
+    buffer?: number;
 }
 
 /**
@@ -92,6 +97,7 @@ export interface ResolvedCompaction {
 export interface DetectConflictsOptions {
     compactionEnabled?: boolean;
     resolvedCompaction?: ResolvedCompaction;
+    hostGeneration?: OpenCodeHostGeneration;
 }
 
 /**
@@ -113,6 +119,7 @@ export function detectConflicts(
     options?: DetectConflictsOptions,
 ): ConflictResult {
     const compactionEnabled = options?.compactionEnabled ?? true;
+    const hostGeneration = options?.hostGeneration ?? "v1";
     const conflicts: ConflictResult["conflicts"] = {
         compactionAuto: false,
         compactionPrune: false,
@@ -129,7 +136,8 @@ export function detectConflicts(
     // wrongly disabling the plugin for users whose auto=false lives in a layer
     // the file reader cannot see). When the resolved fetch failed, fall back to
     // the file-based check unchanged.
-    let compactionResult = options?.resolvedCompaction ?? checkCompaction(directory);
+    let compactionResult =
+        options?.resolvedCompaction ?? checkCompaction(directory, hostGeneration);
     // OPENCODE_DISABLE_AUTOCOMPACT short-circuits BOTH arms: it is the first,
     // cheapest check and is correct regardless of which arm produced the value.
     // (checkCompaction already applies it internally for the file arm; this
@@ -141,7 +149,7 @@ export function detectConflicts(
     // compaction-off mode the user has explicitly handed the window to native
     // compaction (or nothing), so compaction.auto=true / prune=true are the
     // intended state, not a plugin-disabling conflict.
-    if (compactionEnabled && compactionResult.auto) {
+    if (hostGeneration === "v1" && compactionEnabled && compactionResult.auto) {
         conflicts.compactionAuto = true;
         reasons.push(
             options?.resolvedCompaction
@@ -149,7 +157,7 @@ export function detectConflicts(
                 : "OpenCode auto-compaction is enabled (compaction.auto=true)",
         );
     }
-    if (compactionEnabled && compactionResult.prune) {
+    if (hostGeneration === "v1" && compactionEnabled && compactionResult.prune) {
         conflicts.compactionPrune = true;
         reasons.push(
             options?.resolvedCompaction
@@ -192,7 +200,10 @@ export function detectConflicts(
         hasConflict: reasons.length > 0,
         reasons,
         conflicts,
-        nativeCompaction: { auto: compactionResult.auto, prune: compactionResult.prune },
+        nativeCompaction: {
+            auto: compactionResult.auto,
+            prune: hostGeneration === "v1" ? compactionResult.prune : false,
+        },
     };
 }
 
@@ -221,6 +232,8 @@ interface ResolvedCompactionBlock {
     compaction?: {
         auto?: boolean;
         prune?: boolean;
+        keep?: { tokens?: number };
+        buffer?: number;
     };
 }
 
@@ -249,6 +262,7 @@ interface ResolvedCompactionBlock {
 export async function resolveCompactionForBoot(
     client: OpencodeConfigClientLike,
     timeoutMs = 2_000,
+    hostGeneration: OpenCodeHostGeneration = "v1",
 ): Promise<ResolvedCompaction | null> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -276,6 +290,28 @@ export async function resolveCompactionForBoot(
         // The SDK's generated `Config` type has no `compaction` key, so read it
         // defensively from the runtime response.
         const compaction = (result?.data as ResolvedCompactionBlock | undefined)?.compaction;
+        if (hostGeneration === "v2") {
+            if (typeof compaction?.auto !== "boolean") {
+                log(
+                    `[magic-context] conflict-detector: resolved v2 config carried no explicit compaction.auto (${JSON.stringify(compaction) ?? "absent"}); falling back to file-based detection`,
+                );
+                return null;
+            }
+            const keepTokens = compaction.keep?.tokens;
+            const buffer = compaction.buffer;
+            if (
+                (keepTokens !== undefined && (!Number.isInteger(keepTokens) || keepTokens < 0)) ||
+                (buffer !== undefined && (!Number.isInteger(buffer) || buffer < 0))
+            ) {
+                return null;
+            }
+            return {
+                auto: compaction.auto,
+                prune: false,
+                ...(keepTokens === undefined ? {} : { keepTokens }),
+                ...(buffer === undefined ? {} : { buffer }),
+            };
+        }
         // Explicit booleans only. An absent block (or non-boolean values) means
         // the response shape did not carry the resolved state — fall back to the
         // file arm rather than resolving to the plugin-disabling default.
@@ -293,28 +329,30 @@ export async function resolveCompactionForBoot(
     }
 }
 
-function checkCompaction(directory: string): { auto: boolean; prune: boolean } {
+function checkCompaction(
+    directory: string,
+    hostGeneration: OpenCodeHostGeneration,
+): ResolvedCompaction {
     if (process.env.OPENCODE_DISABLE_AUTOCOMPACT) {
         return { auto: false, prune: false };
     }
 
     // Check project-level config first (higher precedence)
-    const projectResult = readProjectCompaction(directory);
+    const projectResult = readProjectCompaction(directory, hostGeneration);
     if (projectResult.resolved) return projectResult;
 
     // Fall back to user-level config
-    const userResult = readUserCompaction();
+    const userResult = readUserCompaction(hostGeneration);
     if (userResult.resolved) return userResult;
 
     // Default: OpenCode has compaction enabled by default
     return { auto: true, prune: false };
 }
 
-function readProjectCompaction(directory: string): {
-    auto: boolean;
-    prune: boolean;
-    resolved: boolean;
-} {
+function readProjectCompaction(
+    directory: string,
+    hostGeneration: OpenCodeHostGeneration,
+): ResolvedCompaction & { resolved: boolean } {
     // .opencode/ config has higher precedence
     const dotOcJsonc = join(directory, ".opencode", "opencode.jsonc");
     const dotOcJson = join(directory, ".opencode", "opencode.json");
@@ -323,8 +361,12 @@ function readProjectCompaction(directory: string): {
 
     if (dotOcConfig?.compaction) {
         const c = dotOcConfig.compaction;
-        if (c.auto !== undefined || c.prune !== undefined) {
-            return { auto: c.auto === true, prune: c.prune === true, resolved: true };
+        if (
+            c.auto !== undefined ||
+            (hostGeneration === "v1" && c.prune !== undefined) ||
+            (hostGeneration === "v2" && (c.keep?.tokens !== undefined || c.buffer !== undefined))
+        ) {
+            return resolvedCompactionBlock(c, hostGeneration);
         }
     }
 
@@ -336,15 +378,21 @@ function readProjectCompaction(directory: string): {
 
     if (rootConfig?.compaction) {
         const c = rootConfig.compaction;
-        if (c.auto !== undefined || c.prune !== undefined) {
-            return { auto: c.auto === true, prune: c.prune === true, resolved: true };
+        if (
+            c.auto !== undefined ||
+            (hostGeneration === "v1" && c.prune !== undefined) ||
+            (hostGeneration === "v2" && (c.keep?.tokens !== undefined || c.buffer !== undefined))
+        ) {
+            return resolvedCompactionBlock(c, hostGeneration);
         }
     }
 
     return { auto: false, prune: false, resolved: false };
 }
 
-function readUserCompaction(): { auto: boolean; prune: boolean; resolved: boolean } {
+function readUserCompaction(
+    hostGeneration: OpenCodeHostGeneration,
+): ResolvedCompaction & { resolved: boolean } {
     try {
         const paths = getOpenCodeConfigPaths({ binary: "opencode" });
         const config =
@@ -353,14 +401,35 @@ function readUserCompaction(): { auto: boolean; prune: boolean; resolved: boolea
 
         if (config?.compaction) {
             const c = config.compaction;
-            if (c.auto !== undefined || c.prune !== undefined) {
-                return { auto: c.auto === true, prune: c.prune === true, resolved: true };
+            if (
+                c.auto !== undefined ||
+                (hostGeneration === "v1" && c.prune !== undefined) ||
+                (hostGeneration === "v2" &&
+                    (c.keep?.tokens !== undefined || c.buffer !== undefined))
+            ) {
+                return resolvedCompactionBlock(c, hostGeneration);
             }
         }
     } catch {
         // Intentional: config read is best-effort
     }
     return { auto: false, prune: false, resolved: false };
+}
+
+function resolvedCompactionBlock(
+    block: NonNullable<OpenCodeConfig["compaction"]>,
+    hostGeneration: OpenCodeHostGeneration,
+): ResolvedCompaction & { resolved: true } {
+    if (hostGeneration === "v2") {
+        return {
+            auto: block.auto !== false,
+            prune: false,
+            resolved: true,
+            ...(typeof block.keep?.tokens === "number" ? { keepTokens: block.keep.tokens } : {}),
+            ...(typeof block.buffer === "number" ? { buffer: block.buffer } : {}),
+        };
+    }
+    return { auto: block.auto === true, prune: block.prune === true, resolved: true };
 }
 
 // --- DCP detection ---

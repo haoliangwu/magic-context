@@ -2232,6 +2232,29 @@ export function registerProjectInObservationMode(
     return snapshotFor(registration);
 }
 
+export function unregisterProjectShadowEmbedding(projectIdentity: string): void {
+    const shadow = shadowRegistrations.get(projectIdentity);
+    shadowRegistrations.delete(projectIdentity);
+    dbForShadowQueue.delete(projectIdentity);
+    pendingShadowBackfills.delete(projectIdentity);
+    for (let index = shadowQueue.length - 1; index >= 0; index -= 1) {
+        if (shadowQueue[index].projectIdentity === projectIdentity) shadowQueue.splice(index, 1);
+    }
+    for (const scope of ["memory", "commit", "chunk"] as const) {
+        const key = `${projectIdentity}:${scope}`;
+        shadowBackfillLastIds.delete(key);
+        shadowBackfillStopReasons.delete(key);
+        shadowBackfillLastWriteOutcomes.delete(key);
+    }
+    // Production always constructs a distinct shadow instance, but a test factory
+    // (or a future cache) can hand out the same object as the primary. Disposing
+    // that shared instance would take the primary lane down with the shadow.
+    const primaryProvider = projectRegistrations.get(projectIdentity)?.provider ?? null;
+    if (shadow?.provider && shadow.provider !== primaryProvider) {
+        disposeProvider(shadow.provider);
+    }
+}
+
 export function unregisterProjectEmbedding(projectIdentity: string): void {
     const prior = projectRegistrations.get(projectIdentity);
     const shadow = shadowRegistrations.get(projectIdentity);

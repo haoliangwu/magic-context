@@ -148,6 +148,26 @@ describe("prompt-surface runtime", () => {
         );
     });
 
+    it("honors model routes for tool text when a model key is supplied", () => {
+        const runtime = createPromptSurfaceRuntime({
+            userConfigDirectory: tempDir(),
+            warn: () => undefined,
+        });
+        const config = {
+            default: "full" as const,
+            models: { "provider/light": "light" as const },
+        };
+        const processScoped = runtime.resolveRegistration(config);
+        const perModel = runtime.resolveRegistration(config, "provider/light");
+
+        expect(processScoped.preset).toBe("full");
+        expect(processScoped.descriptionFor("ctx_search", "Full search")).toBe("Full search");
+        expect(perModel.preset).toBe("light");
+        expect(perModel.descriptionFor("ctx_search", "Full search")).toBe(
+            LIGHT_TOOL_DESCRIPTIONS.ctx_search,
+        );
+    });
+
     it("serves built-in light descriptions without a fallback notice", () => {
         const warnings: string[] = [];
         const runtime = createPromptSurfaceRuntime({

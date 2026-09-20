@@ -5,10 +5,12 @@ on:
     # train/** runs the same checks on a train branch before it is fast-forwarded
     # onto master; required status checks on master are satisfied by that run.
     branches: [master, main, "train/**"]
-  # This private-source drift leg runs only on the default branch's scheduled
-  # workflow revision, never against untrusted branch code.
+  # This private-source drift leg runs only on the default branch's workflow
+  # revision, never against untrusted branch code: nightly, or by hand on master
+  # so a fix to the leg itself can be verified without waiting for the cron.
   schedule:
     - cron: "17 3 * * *"
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -17,7 +19,7 @@ env:
 #
 #   check-plugin, check-pi-plugin                          (unit tests + lint + typecheck, parallel)
 #                  ↓
-#   e2e-opencode, e2e-pi                                   (Docker install + smoke, parallel — gated by unit)
+#   e2e-opencode, e2e-opencode2, e2e-pi                    (Docker install + smoke, parallel — gated by unit)
 #                  ↓
 #   e2e-host-opencode, e2e-host-pi                         (host behavior suite from packages/e2e-tests, parallel — gated by Docker)
 #
@@ -190,6 +192,26 @@ jobs:
 
       - name: Run E2E
         run: docker run --rm --platform linux/amd64 mc-e2e-opencode
+
+  e2e-opencode2:
+    name: E2E (OpenCode 2.0.5, Docker)
+    runs-on: ubuntu-latest
+    needs: [check-plugin]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      # The wrapper is the single local/CI entrypoint. It builds the publishable
+      # plugin, fails if Docker or opencode2 is missing, and runs the exact-pinned
+      # GA host through a real transform, host fold, database check, and TUI boot.
+      - name: Run pinned OpenCode 2 container lane
+        run: tests/docker/opencode2/run.sh
 
   e2e-pi:
     name: E2E (Pi, Docker)
@@ -391,9 +413,10 @@ jobs:
 
   rust-e2e-preflight:
     name: Rust hermetic E2E drift credential preflight
-    # Scheduled workflows use the default branch. This prevents the private-source
-    # App token from being exposed to untrusted branch code.
-    if: ${{ github.event_name == 'schedule' }}
+    # Scheduled workflows use the default branch, and a manual dispatch is only
+    # honoured on master. Both keep the private-source App token away from
+    # untrusted branch code.
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -454,12 +477,16 @@ jobs:
           owner: cortexkit
           repositories: subconscious,commons
 
+      # actions/checkout refuses a path outside $GITHUB_WORKSPACE (the scheduled drift
+      # run failed on exactly that), so the siblings land inside the workspace and are
+      # linked to the ../ paths the Rust workspace and the hermetic harness expect.
+      # Same shape as release.yml.
       - name: Check out commons
         uses: actions/checkout@v5
         with:
           repository: cortexkit/commons
           token: ${{ steps.cortexkit-ci-token.outputs.token }}
-          path: ../commons
+          path: .siblings/commons
           persist-credentials: false
 
       - name: Check out subconscious
@@ -467,8 +494,17 @@ jobs:
         with:
           repository: cortexkit/subconscious
           token: ${{ steps.cortexkit-ci-token.outputs.token }}
-          path: ../subconscious
+          path: .siblings/subconscious
           persist-credentials: false
+
+      - name: Link siblings at the expected relative paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
+          ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
+          test -f "$GITHUB_WORKSPACE/../commons/Cargo.toml"
+          test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
 
       - name: Record private sibling revisions
         shell: bash
@@ -485,7 +521,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          digest="$(sha256sum Cargo.lock ../commons/Cargo.lock ../subconscious/Cargo.lock | sha256sum | awk '{print $1}')"
+          # commons is a library workspace with no committed Cargo.lock; key on its
+          # Cargo.toml instead (release.yml does the same).
+          digest="$(sha256sum Cargo.lock ../commons/Cargo.toml ../subconscious/Cargo.lock | sha256sum | awk '{print $1}')"
           echo "key=rust-hermetic-${RUNNER_OS}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Restore ck-subc and ckdev-mc-e2e Cargo target cache
@@ -507,6 +545,13 @@ jobs:
 
       - name: Build OpenCode plugin
         run: bun run --cwd packages/plugin build
+
+      # The hermetic manifest includes Pi-mode suites that load the Pi dist;
+      # local checkouts always carry it from build:dists, fresh CI checkouts
+      # never do (release.yml learned this on its first live run; this leg
+      # learned it on its first manual dispatch).
+      - name: Build Pi plugin
+        run: bun run --cwd packages/pi-plugin build
 
       - name: Build ck-subc and ckdev-mc-e2e, then run Rust hermetic e2e
         run: scripts/run-rust-hermetic-e2e.sh

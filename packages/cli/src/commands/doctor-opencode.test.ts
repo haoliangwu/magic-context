@@ -20,6 +20,7 @@ import { runV22BackfillCommands } from "../lib/v22-backfill-commands";
 import {
     checkUserMemoriesDreamerCompatibility,
     collectNpmReleaseAgeWarnings,
+    describeAutoUpdateStall,
     describeOpenCodeDatabaseDoctorCheck,
     getUserNpmrcPath,
     isPinnedOpenCodePluginSpecifier,
@@ -571,6 +572,43 @@ describe("doctor OpenCode pinned plugin schema fence", () => {
             }),
         );
         expect(findings).not.toContainEqual(expect.objectContaining({ status: "pass" }));
+    });
+});
+
+describe("doctor OpenCode auto-update status", () => {
+    const spec = `${OPENCODE_PLUGIN_NAME}@0.42.5`;
+
+    it("attributes a matching persisted spec to the updater", () => {
+        const storageDir = makeTempDir("mc-auto-update-doctor-");
+        writeFileSync(
+            join(storageDir, "last-update-check.json"),
+            JSON.stringify({
+                lastCheckedMs: Date.now(),
+                updaterPinnedSpec: spec,
+                updaterPinnedAt: Date.now(),
+            }),
+        );
+
+        expect(describeAutoUpdateStall(spec, true, storageDir)).toBe(
+            `auto-update: stalled — config pinned to ${spec} (by updater)`,
+        );
+    });
+
+    it("attributes a different or absent persisted spec to the user", () => {
+        const storageDir = makeTempDir("mc-auto-update-doctor-");
+        writeFileSync(
+            join(storageDir, "last-update-check.json"),
+            JSON.stringify({
+                lastCheckedMs: Date.now(),
+                updaterPinnedSpec: `${OPENCODE_PLUGIN_NAME}@0.42.4`,
+                updaterPinnedAt: Date.now(),
+            }),
+        );
+
+        expect(describeAutoUpdateStall(spec, true, storageDir)).toBe(
+            `auto-update: stalled — config pinned to ${spec} (by you)`,
+        );
+        expect(describeAutoUpdateStall(spec, false, storageDir)).toBeNull();
     });
 });
 

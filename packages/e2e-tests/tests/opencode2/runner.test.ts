@@ -1,22 +1,14 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { OpenCode } from "../../../plugin/node_modules/@opencode/client/dist/promise/client.js";
+import { OpenCode } from "@opencode/client";
 import {
 	gaDatabasePath,
 	V2StoreReader,
 } from "../../../plugin/src/v2/store-reader";
-import {
-	assertIsolation,
-	assertLiveUnchanged,
-	assertOpenPaths,
-	handoff,
-	isolation,
-	ROOT_KEYS,
-	snapshotLive,
-	spawnOpencode2,
-} from "../../src/opencode2-runner/spawn";
+import { awaitPluginActivation } from "../../src/opencode2-runner/plugin-activation";
+import { ROOT_KEYS, assertIsolation, assertLiveUnchanged, assertOpenPaths, handoff, isolation, snapshotLive, spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
 
 test("hermetic_v2_runner environment refuses unsafe roots before boot", () => {
 	const fixture = isolation();
@@ -63,6 +55,36 @@ test("handoff requires ordered URL and password", () => {
 		),
 	).toEqual({ url: "http://127.0.0.1:123", password: "secret" });
 });
+test("plugin activation rejects a failed plugin with the host error before its deadline", async () => {
+	const pluginRoot = mkdtempSync(join(tmpdir(), "mc-oc2-broken-plugin-"));
+	writeFileSync(
+		join(pluginRoot, "index.js"),
+		'export default { id: "broken-activation", setup() { throw new Error("deliberate broken plugin fixture"); } };\n',
+	);
+	const host = await spawnOpencode2({
+		probePlugin: pluginRoot,
+		includeMagicContext: false,
+	});
+	try {
+		const client = OpenCode.make({
+			baseUrl: host.url,
+			headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` },
+		});
+		await client.session.create({
+			location: { directory: host.cwd },
+			model: { providerID: "openai", id: "mock-model" },
+		});
+		const started = Date.now();
+		await expect(
+			awaitPluginActivation(client, host.cwd, "broken-activation", 5_000),
+		).rejects.toThrow("deliberate broken plugin fixture");
+		expect(Date.now() - started).toBeLessThan(5_000);
+	} finally {
+		await host.stop();
+		rmSync(pluginRoot, { recursive: true, force: true });
+	}
+}, 30_000);
+
 test("v2_loads_via_exports_map and session_message_reader real host writes", async () => {
 	const host = await spawnOpencode2();
 	try {
@@ -71,13 +93,11 @@ test("v2_loads_via_exports_map and session_message_reader real host writes", asy
 			headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` },
 		});
 		const session = await client.session.create({
+			title: "v2 runner fixture",
 			location: { directory: host.cwd },
 			model: { providerID: "openai", id: "mock-model" },
 		});
-		await client.plugin.awaitActivation(
-			{ location: { directory: host.cwd } },
-			{ signal: AbortSignal.timeout(15000) },
-		);
+		await waitForPluginActive(client, host.cwd);
 		const plugins = await client.plugin.list({
 			location: { directory: host.cwd },
 		});

@@ -28,6 +28,17 @@ export interface PiSessionApi {
 }
 
 const PI_CODING_AGENT_MODULE = "@earendil-works/pi-coding-agent";
+const OMP_CODING_AGENT_MODULE = "@oh-my-pi/pi-coding-agent";
+const CODING_AGENT_MODULES = [
+	PI_CODING_AGENT_MODULE,
+	OMP_CODING_AGENT_MODULE,
+] as const;
+const CODING_AGENT_MODULE_LABEL = CODING_AGENT_MODULES.join(" or ");
+const CODING_AGENT_PACKAGE_NAMES = new Set<string>(CODING_AGENT_MODULES);
+
+function isCodingAgentPackageName(name: unknown): name is string {
+	return typeof name === "string" && CODING_AGENT_PACKAGE_NAMES.has(name);
+}
 
 // Script-like entries: explicit JS/TS extensions, or no extension at all
 // (bin-style entry scripts such as an extensionless `dist/cli`). Anything
@@ -106,11 +117,11 @@ function findPackageRoot(startDir: string): FoundPackage | null {
 	let dir = startDir;
 	while (dir !== dirname(dir)) {
 		const pkg = readManifest(join(dir, "package.json"));
-		if (pkg?.name === PI_CODING_AGENT_MODULE) {
+		if (isCodingAgentPackageName(pkg?.name)) {
 			if (basename(dir) === "dist") {
 				const parentDir = dirname(dir);
 				const parentPkg = readManifest(join(parentDir, "package.json"));
-				if (parentPkg?.name === PI_CODING_AGENT_MODULE) {
+				if (parentPkg?.name === pkg.name) {
 					return { dir: parentDir, pkg: parentPkg };
 				}
 			}
@@ -252,7 +263,7 @@ export const defaultLoaders: ModuleLoader[] = [
 				// a virtual module, or absent), so the message names the path
 				// actually walked instead of interpolating `undefined`.
 				throw new Error(
-					`Could not locate ${PI_CODING_AGENT_MODULE} package.json from ${entry}`,
+					`Could not locate ${CODING_AGENT_MODULE_LABEL} package.json from ${entry}`,
 				);
 			}
 			const entryPath = resolveManifestEntry(found);
@@ -262,7 +273,17 @@ export const defaultLoaders: ModuleLoader[] = [
 			// matching source file; if none exists, refuse to silently select
 			// stale build output and fall through to the next loader.
 			if (TS_ENTRY_PATTERN.test(entry)) {
+				// Some source-distributed hosts (notably OMP) declare a TypeScript
+				// export directly. Build-output targets still map to their source
+				// counterpart first so stale dist files can never win.
 				const srcEntry = toSourceEntry(entryPath, found.dir);
+				if (
+					!srcEntry &&
+					TS_ENTRY_PATTERN.test(entryPath) &&
+					existsSync(entryPath)
+				) {
+					return await import(pathToFileURL(entryPath).href);
+				}
 				if (srcEntry && existsSync(srcEntry)) {
 					return await import(pathToFileURL(srcEntry).href);
 				}
@@ -276,6 +297,10 @@ export const defaultLoaders: ModuleLoader[] = [
 	{
 		name: "Bare import",
 		load: async () => await import(/* @vite-ignore */ PI_CODING_AGENT_MODULE),
+	},
+	{
+		name: "Bare import (OMP)",
+		load: async () => await import(/* @vite-ignore */ OMP_CODING_AGENT_MODULE),
 	},
 ];
 
@@ -303,7 +328,7 @@ export async function resolvePiCodingAgentModule(
 			}
 		}
 		throw new Error(
-			`Failed to resolve ${PI_CODING_AGENT_MODULE} via all strategies:\n` +
+			`Failed to resolve a Pi/OMP coding-agent module (${CODING_AGENT_MODULE_LABEL}) via all strategies:\n` +
 				errors
 					.map((e, i) => `  - ${activeLoaders[i].name}: ${e.message || e}`)
 					.join("\n") +

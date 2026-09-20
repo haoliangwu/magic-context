@@ -401,7 +401,10 @@ export function loadSessionDecisions(
         if (
             typeof row.harness === "string" &&
             row.harness !== session.harness &&
-            !(session.harness === "pi" && row.harness === "omp")
+            !(
+                session.harness === "pi" &&
+                (row.harness === "omp" || row.harness === "opencode")
+            )
         ) {
             return undefined;
         }

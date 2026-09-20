@@ -6,6 +6,8 @@ import {
 import {
 	type EmbeddingFeatures,
 	registerProjectEmbedding,
+	registerProjectShadowEmbedding,
+	unregisterProjectShadowEmbedding,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
@@ -13,6 +15,8 @@ import {
 	handleUntrustedLoad,
 	isConfigLoadUntrusted,
 } from "@magic-context/core/plugin/embedding-bootstrap-helpers";
+import { resolveEmbeddingRouting } from "@magic-context/core/plugin/embedding-routing";
+import { log } from "@magic-context/core/shared/logger";
 import { loadPiConfigDetailed } from "./config";
 
 interface RegistrationFingerprint {
@@ -76,6 +80,15 @@ export async function ensureProjectRegisteredFromPiDirectory(
 		return;
 	}
 
+	const routing = await resolveEmbeddingRouting({
+		config: detailed.config,
+		projectRoot: directory,
+		session: `bootstrap:${projectIdentity}`,
+	});
+	for (const warning of routing.warnings) {
+		log(`[magic-context] ${warning}`);
+	}
+
 	const features: EmbeddingFeatures = {
 		memoryEnabled: detailed.config.memory.enabled,
 		gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
@@ -83,16 +96,43 @@ export async function ensureProjectRegisteredFromPiDirectory(
 	registerProjectEmbedding(
 		db,
 		projectIdentity,
-		detailed.config.embedding,
+		routing.primary,
 		features,
 		directory,
 	);
-	const fingerprintPaths = configCandidatePaths(
-		directory,
-		detailed.loadedFromPaths,
-	);
-	registrationFingerprints.set(projectIdentity, {
-		paths: fingerprintPaths,
-		fingerprint: configFingerprint(fingerprintPaths),
-	});
+	if (routing.shadow) {
+		registerProjectShadowEmbedding(
+			db,
+			projectIdentity,
+			routing.shadow,
+			directory,
+		);
+	} else {
+		unregisterProjectShadowEmbedding(projectIdentity);
+	}
+	// Only failed daemon discovery can recover without a configuration change.
+	const configuredProvider = detailed.config.embedding.provider;
+	const canDiscover =
+		Boolean(detailed.config.subc) &&
+		(configuredProvider === "synapse"
+			? Boolean(detailed.config.embedding.fallback_provider)
+			: configuredProvider !== "off" &&
+				detailed.config.shadow_embedding?.enabled === true);
+	const discoveryFailed =
+		canDiscover &&
+		(configuredProvider === "synapse"
+			? routing.primary.provider !== "synapse"
+			: routing.shadow === null);
+	if (!discoveryFailed) {
+		const fingerprintPaths = configCandidatePaths(
+			directory,
+			detailed.loadedFromPaths,
+		);
+		registrationFingerprints.set(projectIdentity, {
+			paths: fingerprintPaths,
+			fingerprint: configFingerprint(fingerprintPaths),
+		});
+	} else {
+		registrationFingerprints.delete(projectIdentity);
+	}
 }

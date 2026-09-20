@@ -1092,7 +1092,7 @@
       "upload_kind": "lineage",
       "caller_kind": "lineage_ticket_bound",
       "ticket_present": true,
-      "request_bytes_base64": "eyJvcCI6ImxpbmVhZ2UucHV0IiwidXBsb2FkX2lkIjoibGluZWFnZS11cGxvYWQtYXV0aG9yaXphdGlvbiIsInNlcSI6MCwiYnl0ZXMiOiJlQT09In0=",
+      "request_bytes_base64": "eyJvcCI6InB1dCIsInVwbG9hZF9pZCI6ImxpbmVhZ2UtdXBsb2FkLWF1dGhvcml6YXRpb24iLCJzZXEiOjAsImJ5dGVzIjoiZUE9PSJ9",
       "expected": {
         "kind": "authorized",
         "refusal": null
@@ -1104,7 +1104,7 @@
       "upload_kind": "lineage",
       "caller_kind": "lineage_ticket_bound",
       "ticket_present": true,
-      "request_bytes_base64": "eyJvcCI6ImxpbmVhZ2UuZmluaXNoIiwidXBsb2FkX2lkIjoibGluZWFnZS11cGxvYWQtYXV0aG9yaXphdGlvbiIsImRpZ2VzdCI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEifQ==",
+      "request_bytes_base64": "eyJvcCI6ImZpbmlzaCIsInVwbG9hZF9pZCI6ImxpbmVhZ2UtdXBsb2FkLWF1dGhvcml6YXRpb24iLCJkaWdlc3QiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIn0=",
       "expected": {
         "kind": "authorized",
         "refusal": null
@@ -1156,7 +1156,7 @@
       "upload_kind": "capacity",
       "caller_kind": "lineage_ticket_bound",
       "ticket_present": true,
-      "request_bytes_base64": "eyJvcCI6ImxpbmVhZ2UucHV0IiwidXBsb2FkX2lkIjoiY2FwYWNpdHktdXBsb2FkLWF1dGhvcml6YXRpb24iLCJzZXEiOjAsImJ5dGVzIjoiZUE9PSJ9",
+      "request_bytes_base64": "eyJvcCI6InB1dCIsInVwbG9hZF9pZCI6ImNhcGFjaXR5LXVwbG9hZC1hdXRob3JpemF0aW9uIiwic2VxIjowLCJieXRlcyI6ImVBPT0ifQ==",
       "expected": {
         "kind": "refused",
         "refusal": {
@@ -1176,7 +1176,7 @@
       "upload_kind": "capacity",
       "caller_kind": "lineage_ticket_bound",
       "ticket_present": true,
-      "request_bytes_base64": "eyJvcCI6ImxpbmVhZ2UuZmluaXNoIiwidXBsb2FkX2lkIjoiY2FwYWNpdHktdXBsb2FkLWF1dGhvcml6YXRpb24iLCJkaWdlc3QiOiIxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIn0=",
+      "request_bytes_base64": "eyJvcCI6ImZpbmlzaCIsInVwbG9hZF9pZCI6ImNhcGFjaXR5LXVwbG9hZC1hdXRob3JpemF0aW9uIiwiZGlnZXN0IjoiMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMSJ9",
       "expected": {
         "kind": "refused",
         "refusal": {

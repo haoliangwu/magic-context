@@ -163,20 +163,26 @@ function twoCompartmentHistorianXml(): string {
 </output>`;
 }
 
-function client(output = historianXml()): PluginContext["client"] {
+function client(
+    output = historianXml(),
+    beforeHistorianCollect?: () => void,
+): PluginContext["client"] {
     return {
         session: {
             get: mock(async () => ({ data: { directory: "/tmp/wrapup-runner" } })),
             create: mock(async () => ({ data: { id: `child-${Math.random()}` } })),
             prompt: mock(async () => ({})),
-            messages: mock(async () => ({
-                data: [
-                    {
-                        info: { role: "assistant", time: { created: 1 } },
-                        parts: [{ type: "text", text: output }],
-                    },
-                ],
-            })),
+            messages: mock(async () => {
+                beforeHistorianCollect?.();
+                return {
+                    data: [
+                        {
+                            info: { role: "assistant", time: { created: 1 } },
+                            parts: [{ type: "text", text: output }],
+                        },
+                    ],
+                };
+            }),
             delete: mock(async () => ({})),
         },
     } as unknown as PluginContext["client"];
@@ -210,12 +216,13 @@ async function runWithLease(args: {
     refreshBoundarySnapshot?: Parameters<typeof runCompartmentAgent>[0]["refreshBoundarySnapshot"];
     historianChunkTokens?: number;
     output?: string;
+    beforeHistorianCollect?: () => void;
 }) {
     const holderId = `holder-${Math.random()}`;
     expect(acquireCompartmentLease(args.db, args.sessionId, holderId)).not.toBeNull();
     try {
         await runCompartmentAgent({
-            client: client(args.output),
+            client: client(args.output, args.beforeHistorianCollect),
             db: args.db,
             sessionId: args.sessionId,
             historianChunkTokens: args.historianChunkTokens ?? 10_000,
@@ -283,6 +290,38 @@ describe("runCompartmentAgent wrapup controls", () => {
             } finally {
                 closeQuietly(db);
             }
+        }
+    });
+
+    it("refuses to mint a compartment whose raw boundary disappeared during the historian run", async () => {
+        const db = createDb();
+        const sessionId = "ses-boundary-disappeared";
+        const messages = rawMessages(3);
+        const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+        try {
+            await withProviderMessages(sessionId, messages, () =>
+                runWithLease({
+                    db,
+                    sessionId,
+                    snapshot: wrapupSnapshot(db, sessionId),
+                    forceKeepLastCompartment: true,
+                    forceDrainQuota: true,
+                    beforeHistorianCollect: () => {
+                        messages.splice(0, 1);
+                    },
+                }),
+            );
+
+            expect(getCompartments(db, sessionId)).toHaveLength(0);
+            expect(logSpy).toHaveBeenCalledWith(
+                sessionId,
+                expect.stringContaining(
+                    "historian publish refused: sequence=0 side=start missing_id=m-1",
+                ),
+            );
+        } finally {
+            logSpy.mockRestore();
+            closeQuietly(db);
         }
     });
 

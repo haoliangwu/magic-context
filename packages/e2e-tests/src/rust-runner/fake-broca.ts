@@ -156,7 +156,12 @@ const provider = await SubcProvider.connect({
             const run: RunRecord = { runId, sessionId, output: deterministicOutput(prompt) };
             runs.set(runId, run);
             latestRunBySession.set(sessionId, runId);
-            log(`session.send run_id=${runId} session=${sessionId} system_bytes=${system.length} prompt_bytes=${prompt.length}`);
+            const truncationMarkers = (
+                prompt.match(/tokens truncated by Magic Context to fit the historian window/g) ?? []
+            ).length;
+            log(
+                `session.send run_id=${runId} session=${sessionId} system_bytes=${system.length} prompt_bytes=${prompt.length} truncation_markers=${truncationMarkers}`,
+            );
             return jsonBytes({ run_id: runId });
         }
         if (method === "session.subscribe") {

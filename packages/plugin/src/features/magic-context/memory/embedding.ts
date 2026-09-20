@@ -43,6 +43,7 @@ export {
     type ShadowEmbeddingMeasurementCohort,
     sweepAllRegisteredProjects,
     unregisterProjectEmbedding,
+    unregisterProjectShadowEmbedding,
 } from "../project-embedding-registry";
 
 const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {

@@ -1241,8 +1241,15 @@ describe("createDreamTaskExecutor — map-memories disposition", () => {
             });
 
             expect(promptCalls).toBe(1);
-            expect(getTaskScheduleState(db, project, task.task)).toMatchObject({
-                lastRunAt: startedAt + MAP_BATCH_FLOOR_MS - 60_000,
+            const scheduleState = getTaskScheduleState(db, project, task.task);
+            // last_run_at records the START of the last successful run — the
+            // "changed since" cutoff the scheduler's gates compare against — not
+            // the completion moment. The banked deadline is therefore later than
+            // the recorded value, and the recorded value is no earlier than the
+            // run start (`now`, the clock the scheduler was invoked with).
+            expect(scheduleState?.lastRunAt).toBeGreaterThanOrEqual(startedAt);
+            expect(scheduleState?.lastRunAt).toBeLessThan(startedAt + MAP_BATCH_FLOOR_MS - 60_000);
+            expect(scheduleState).toMatchObject({
                 lastStatus: "completed",
                 retryCount: 0,
             });

@@ -71,6 +71,7 @@ import {
 } from "./shared/conflict-detector";
 import { getMagicContextStorageDir } from "./shared/data-path";
 import { registerExitAbort, unregisterExitAbort } from "./shared/exit-abort-registry";
+import { setHarness } from "./shared/harness";
 import { setKeepSubagents } from "./shared/keep-subagents";
 import { flushLogger, log } from "./shared/logger";
 import {
@@ -109,6 +110,13 @@ const server: Plugin = async (ctx) => {
     // 500ms; a synchronous filesystem or SQLite stall before that timer fires
     // otherwise recreates the reporter's "no Magic Context lines" symptom.
     emitBootEnteringBreadcrumb(process.pid, ctx.directory, log, flushLogger);
+
+    // Lock the harness before the first database write. "opencode" is already
+    // the default, so this is a fence, not a change: if anything in this process
+    // has locked a different value first (the v2 setup lane running on a v1
+    // host), this throws at boot instead of letting the seat tag every
+    // session-scoped row under the wrong harness.
+    setHarness("opencode");
 
     const configStartedAt = performance.now();
     beginBootQuietPeriod();

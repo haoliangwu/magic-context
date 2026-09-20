@@ -51,7 +51,8 @@ ENV PATH="/root/.bun/bin:$PATH"
 
 # OpenCode (official curl|bash install), so the OpenCode setup/doctor path has a
 # real binary to detect and a real ~/.config/opencode to edit.
-RUN curl -fsSL https://opencode.ai/install | bash
+COPY tests/docker/install-opencode.sh /usr/local/bin/install-opencode.sh
+RUN install-opencode.sh
 ENV PATH="/root/.opencode/bin:$PATH"
 
 # Pi coding agent, so the Pi setup/doctor path (`--harness pi`) has a real

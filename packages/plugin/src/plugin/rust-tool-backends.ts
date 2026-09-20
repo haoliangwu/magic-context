@@ -19,7 +19,7 @@ export interface RustNoteToolRequest {
     filter?: "all" | "active" | "pending" | "ready" | "dismissed";
     limit?: number;
     offset?: number;
-    noteId?: number;
+    /** Exactly one id for update, one to fifty for dismiss. */
     noteIds?: number[];
 }
 

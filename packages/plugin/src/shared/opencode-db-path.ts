@@ -3,6 +3,25 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
 export type OpenCodeDbPathSource = "OPENCODE_DB" | "channel" | "default" | "discovered";
+export type OpenCodeHostGeneration = "v1" | "v2";
+export type OpenCodeStoreGeneration = OpenCodeHostGeneration | "unknown";
+
+export interface ResolveOpenCodeDbPathOptions {
+    dataHome?: string;
+    channel?: string;
+    env?: NodeJS.ProcessEnv;
+}
+
+export function openCodeHostGenerationFromVersion(
+    version: string | null | undefined,
+): OpenCodeHostGeneration {
+    const major = Number.parseInt(version?.match(/\d+/)?.[0] ?? "", 10);
+    return Number.isFinite(major) && major >= 2 ? "v2" : "v1";
+}
+
+export interface OpenCodeStoreSchemaDatabase {
+    prepare(sql: string): { all(...params: unknown[]): unknown[] };
+}
 
 export interface OpenCodeDbPathResolution {
     path: string;
@@ -24,16 +43,22 @@ let cachedResolution: CachedResolution | null = null;
 let lastReadFailure: OpenCodeDbReadFailure | null = null;
 const claimedDiagnostics = new Set<string>();
 
-function openCodeDataDir(): string {
-    return join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode");
+function openCodeDataDir(env: NodeJS.ProcessEnv = process.env, dataHome?: string): string {
+    return join(dataHome ?? env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode");
 }
 
-function environmentKey(dataDir: string): string {
+function environmentKey(
+    dataDir: string,
+    hostGeneration: OpenCodeHostGeneration,
+    channel: string | undefined,
+    env: NodeJS.ProcessEnv,
+): string {
     return [
+        hostGeneration,
         dataDir,
-        process.env.OPENCODE_DB ?? "",
-        process.env.OPENCODE_DISABLE_CHANNEL_DB ?? "",
-        process.env.OPENCODE_CHANNEL ?? "",
+        env.OPENCODE_DB ?? "",
+        env.OPENCODE_DISABLE_CHANNEL_DB ?? "",
+        channel ?? env.OPENCODE_CHANNEL ?? "",
     ].join("\0");
 }
 
@@ -81,8 +106,11 @@ function discoverOpenCodeDb(dataDir: string): OpenCodeDbPathResolution {
     return { path: existing.path, source: "discovered", channel };
 }
 
-function resolveFresh(dataDir: string): OpenCodeDbPathResolution {
-    const explicit = process.env.OPENCODE_DB;
+function resolveV1Fresh(
+    dataDir: string,
+    env: NodeJS.ProcessEnv = process.env,
+): OpenCodeDbPathResolution {
+    const explicit = env.OPENCODE_DB;
     if (explicit !== undefined && explicit.length > 0) {
         if (explicit === ":memory:") {
             return { path: explicit, source: "OPENCODE_DB", channel: null };
@@ -94,12 +122,12 @@ function resolveFresh(dataDir: string): OpenCodeDbPathResolution {
         };
     }
 
-    const disableChannelDb = process.env.OPENCODE_DISABLE_CHANNEL_DB;
+    const disableChannelDb = env.OPENCODE_DISABLE_CHANNEL_DB;
     if (disableChannelDb === "1" || disableChannelDb === "true") {
         return { path: join(dataDir, "opencode.db"), source: "default", channel: null };
     }
 
-    const channel = process.env.OPENCODE_CHANNEL;
+    const channel = env.OPENCODE_CHANNEL;
     if (channel !== undefined && channel.length > 0) {
         return { path: channelPath(dataDir, channel), source: "channel", channel };
     }
@@ -107,10 +135,59 @@ function resolveFresh(dataDir: string): OpenCodeDbPathResolution {
     return discoverOpenCodeDb(dataDir);
 }
 
-/** Resolve an explicit DB override first, then channel paths; discover candidates when the compiled channel is unknown. */
-export function resolveOpenCodeDbPath(): OpenCodeDbPathResolution {
-    const dataDir = openCodeDataDir();
-    const key = environmentKey(dataDir);
+/** Match OpenCode 2's filename table and strip path separators from custom channels. */
+export function sourceOpenCodeDatabaseFilename(
+    hostGeneration: OpenCodeHostGeneration,
+    channel: string,
+    env: NodeJS.ProcessEnv = process.env,
+): string {
+    if (hostGeneration === "v1") {
+        const explicit = env.OPENCODE_DB;
+        if (explicit !== undefined && explicit.length > 0) return explicit;
+        if (env.OPENCODE_DISABLE_CHANNEL_DB === "1" || env.OPENCODE_DISABLE_CHANNEL_DB === "true") {
+            return "opencode.db";
+        }
+        return ["latest", "beta", "prod"].includes(channel)
+            ? "opencode.db"
+            : `opencode-${channel}.db`;
+    }
+
+    return (
+        env.OPENCODE_DB ??
+        (["latest", "dev", "beta", "next", "prod"].includes(channel) ||
+        env.OPENCODE_DISABLE_CHANNEL_DB === "1" ||
+        env.OPENCODE_DISABLE_CHANNEL_DB === "true"
+            ? "opencode.db"
+            : `opencode-${channel.replace(/[^a-zA-Z0-9._-]/g, "")}.db`)
+    );
+}
+
+function resolveV2Fresh(
+    dataDir: string,
+    channel: string,
+    env: NodeJS.ProcessEnv,
+): OpenCodeDbPathResolution {
+    const filename = sourceOpenCodeDatabaseFilename("v2", channel, env);
+    const explicit = env.OPENCODE_DB !== undefined;
+    return {
+        path: filename === ":memory:" ? filename : join(dataDir, filename),
+        source: explicit ? "OPENCODE_DB" : env.OPENCODE_CHANNEL ? "channel" : "default",
+        channel: explicit ? null : channel,
+    };
+}
+
+/**
+ * Resolve the store for one host generation. The default is the historical v1
+ * resolver, including candidate discovery and all existing diagnostic text.
+ */
+export function resolveOpenCodeDbPath(
+    hostGeneration: OpenCodeHostGeneration = "v1",
+    options: ResolveOpenCodeDbPathOptions = {},
+): OpenCodeDbPathResolution {
+    const env = options.env ?? process.env;
+    const dataDir = openCodeDataDir(env, options.dataHome);
+    const channel = options.channel ?? env.OPENCODE_CHANNEL;
+    const key = environmentKey(dataDir, hostGeneration, channel, env);
     if (
         cachedResolution?.key === key &&
         (!cachedResolution.existed || existsSync(cachedResolution.resolution.path))
@@ -119,13 +196,67 @@ export function resolveOpenCodeDbPath(): OpenCodeDbPathResolution {
         // An absent result is re-probed so a DB created after plugin boot is detected.
     }
 
-    const resolution = resolveFresh(dataDir);
+    const resolution =
+        hostGeneration === "v2"
+            ? resolveV2Fresh(dataDir, channel ?? "latest", env)
+            : resolveV1Fresh(dataDir, env);
     cachedResolution = {
         key,
         resolution,
         existed: resolution.path !== ":memory:" && existsSync(resolution.path),
     };
     return resolution;
+}
+
+function schemaTableNames(
+    db: OpenCodeStoreSchemaDatabase,
+    schema: "main" | "oc_backfill" = "main",
+): Set<string> {
+    const rows = db
+        .prepare(
+            `SELECT name FROM ${schema}.sqlite_master WHERE type = 'table' AND name IN ('message', 'part', 'session', 'project', 'session_message')`,
+        )
+        .all() as Array<{ name?: unknown }>;
+    return new Set(rows.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])));
+}
+
+/**
+ * Detect the persisted host schema.
+ *
+ * `session_message` does NOT identify v2: OpenCode 1.18.x ships that table beside `message`
+ * and `part` (verified against a live 1.18.30 store, pinned in this module's tests). Only the
+ * ABSENCE of the v1 message tables identifies a v2 store, so a v1 host is never mistaken for
+ * a v2 one. A store carrying neither is a host that has not written its schema yet.
+ */
+export function detectOpenCodeStoreGeneration(
+    db: OpenCodeStoreSchemaDatabase,
+    schema: "main" | "oc_backfill" = "main",
+): OpenCodeStoreGeneration {
+    const tables = schemaTableNames(db, schema);
+    const hasV1Messages = tables.has("message") && tables.has("part");
+    if (hasV1Messages) return "v1";
+    if (tables.has("session_message")) return "v2";
+    if (tables.has("session") || tables.has("project")) return "v1";
+    return "unknown";
+}
+
+/** Refuse before a generation-specific query can read the other host's schema. */
+export function assertOpenCodeStoreGeneration(
+    db: OpenCodeStoreSchemaDatabase,
+    expected: OpenCodeHostGeneration,
+    path: string,
+    schema: "main" | "oc_backfill" = "main",
+): void {
+    const actual = detectOpenCodeStoreGeneration(db, schema);
+    if (actual === expected) return;
+    // A store with none of these tables has no schema YET — a host that has not written its
+    // first row, or a fresh data directory. That is "nothing to read", not a conflicting host,
+    // and readers have always treated it as empty. Refusing here made every reader throw before
+    // OpenCode created its tables, which is how this guard took down 15 host e2e tests.
+    if (actual === "unknown") return;
+    throw new Error(
+        `OpenCode store generation mismatch at ${path}: expected ${expected}, found ${actual}; refusing generation-specific database access`,
+    );
 }
 
 export function openCodeDbPathExists(

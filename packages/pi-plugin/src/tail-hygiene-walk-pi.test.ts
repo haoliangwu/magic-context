@@ -1,4 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeProtectionWindow } from "@magic-context/core/features/magic-context/protection-window";
@@ -464,6 +465,70 @@ describe("Pi baseline persistence and defer deltas", () => {
 		expect(effectivePiTailHygiene(defer).u).toBeLessThanOrEqual(
 			effectivePiTailHygiene(defer).t,
 		);
+	});
+
+	it("counts an appended tool output after it ages out of the protected suffix", () => {
+		const baseMessages = [textMessage("user", "base text")];
+		const baseTags = [tag(1, "base:p0", "message")];
+		const reminder =
+			"\n\n<system-reminder>\nHousekeeping backlog: spent tool outputs are reclaimable.\n</system-reminder>";
+		const appended = toolArc(
+			"tool-delta",
+			"call-delta",
+			"read",
+			{ path: "new" },
+			`${"reclaimable tool output ".repeat(1_000)}${reminder}`,
+		);
+		const messages = [...baseMessages, ...appended.messages];
+		const tags = [...baseTags, { ...appended.tag, tagNumber: 2 }];
+		const stableId = withStableIds(messages, [
+			"base",
+			"tool-delta",
+			"tool-delta-result",
+		]);
+		const sha256 = (value: unknown): string =>
+			createHash("sha256").update(JSON.stringify(value)).digest("hex");
+		const prefixSha = sha256(baseMessages);
+		const servedArraySha = sha256(messages);
+		const baseline = refreshPiTailHygieneBaseline({
+			messages: baseMessages,
+			tags: baseTags,
+			protectedTagNumbers: new Set([1]),
+			stableId: withStableIds(baseMessages, ["base"]),
+			cacheBusting: true,
+		});
+		const protectedDefer = refreshPiTailHygieneBaseline({
+			messages,
+			tags,
+			protectedTagNumbers: new Set([1, 2]),
+			stableId,
+			cacheBusting: false,
+			previous: baseline,
+		});
+		const agedDefer = refreshPiTailHygieneBaseline({
+			messages,
+			tags,
+			protectedTagNumbers: new Set([1]),
+			stableId,
+			cacheBusting: false,
+			previous: protectedDefer,
+		});
+		const measuredAged = measurePiTailHygiene({
+			messages,
+			tags,
+			protectedTagNumbers: new Set([1]),
+			stableId,
+		});
+
+		expect(effectivePiTailHygiene(protectedDefer).u).toBe(0);
+		expect(effectivePiTailHygiene(agedDefer)).toEqual({
+			u: measuredAged.u,
+			t: measuredAged.t,
+		});
+		expect(sha256(baseMessages)).toBe(prefixSha);
+		expect(sha256(messages)).toBe(servedArraySha);
+		expect(JSON.stringify(baseMessages)).not.toContain("Housekeeping backlog");
+		expect(JSON.stringify(messages.at(-1))).toContain("Housekeeping backlog");
 	});
 
 	it("advances the protection boundary additively without changing generation", () => {
@@ -1038,19 +1103,21 @@ describe("Pi hygiene walk performance", () => {
 			});
 			return performance.now() - start;
 		};
-		const p95Of = (samples: number[]) => {
+		const medianOf = (samples: number[]) => {
 			const sorted = [...samples].sort((left, right) => left - right);
-			return (
-				sorted[Math.ceil(sorted.length * 0.95) - 1] ?? Number.POSITIVE_INFINITY
-			);
+			return sorted[Math.floor(sorted.length / 2)] ?? Number.POSITIVE_INFINITY;
 		};
 		// The content memo is keyed on the rendered text, so a walk over unchanged
 		// content must skip tokenization while a walk over fresh content pays it.
 		// A shared CI runner cannot promise an absolute millisecond budget (the
 		// memoized walk read 2.7ms locally and 19ms on a loaded runner), so the
 		// invariant is the ratio between the unmemoized and memoized walks measured
-		// in the same process, which load scales equally. The absolute ceiling is
-		// kept behind MC_PERF_GATE for machines that opt into wall-clock budgets.
+		// in the same process, which load scales equally. The ratio compares
+		// medians: a p95 over a 2ms memoized walk is one scheduler stall away from
+		// any value (a release gate at load 46 read memoized p95 57ms against
+		// unmemoized 143ms), while the median of 25 samples is not. The absolute
+		// ceiling is kept behind MC_PERF_GATE for machines that opt into wall-clock
+		// budgets.
 		const base = "token ".repeat(250_000);
 		const unmemoized: number[] = [];
 		for (let iteration = 0; iteration < 8; iteration += 1) {
@@ -1060,12 +1127,13 @@ describe("Pi hygiene walk performance", () => {
 		const memoized: number[] = [];
 		for (let iteration = 0; iteration < 25; iteration += 1)
 			memoized.push(walk(base));
-		const unmemoizedP95 = p95Of(unmemoized);
-		const p95 = p95Of(memoized);
+		const unmemoizedMedian = medianOf(unmemoized);
+		const memoizedMedian = medianOf(memoized);
 		console.log(
-			`pi-tail-hygiene-walk 250k-token unmemoized p95=${unmemoizedP95.toFixed(3)}ms memoized p95=${p95.toFixed(3)}ms`,
+			`pi-tail-hygiene-walk 250k-token unmemoized p50=${unmemoizedMedian.toFixed(3)}ms memoized p50=${memoizedMedian.toFixed(3)}ms`,
 		);
-		expect(p95).toBeLessThan(unmemoizedP95 / 5);
-		if (process.env.MC_PERF_GATE === "1") expect(p95).toBeLessThan(15);
+		expect(memoizedMedian).toBeLessThan(unmemoizedMedian / 5);
+		if (process.env.MC_PERF_GATE === "1")
+			expect(memoizedMedian).toBeLessThan(15);
 	});
 });

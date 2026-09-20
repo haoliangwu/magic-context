@@ -13,7 +13,10 @@ export function rawMessages(
     const ordinals = new Map(history.filter(isRawRow).map((row, index) => [row.id, index + 1]));
     return rows.filter(isRawRow).map((row) => ({
         id: row.id,
-        ordinal: ordinals.get(row.id)!,
+        // A row outside the supplied history has no ordinal; 0 is never a live ordinal,
+        // so a caller that windowed without passing full history fails visibly rather
+        // than inheriting a neighbour's tag identity.
+        ordinal: ordinals.get(row.id) ?? 0,
         role: row.type === "assistant" ? "assistant" : "user",
         createdAt: row.data.time?.created,
         parts:

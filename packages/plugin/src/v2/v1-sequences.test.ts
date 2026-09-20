@@ -138,7 +138,7 @@ test("v1 six lifecycle sequences are byte-identical to master", async () => {
             );
             captures[scenario] = events;
         }
-        const bytes = JSON.stringify(captures, null, 2) + "\n";
+        const bytes = `${JSON.stringify(captures, null, 2)}\n`;
         if (process.env.MC_RECORD_V1_SEQUENCES === "1") writeFileSync(golden, bytes);
         else expect(bytes).toBe(readFileSync(golden, "utf8"));
     } finally {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
 	mkdirSync,
 	mkdtempSync,
@@ -352,5 +353,174 @@ describe("Pi cache-bust analyzer meter", () => {
 		expect(rows[1].comparableRead).toBe(10_470);
 		expect(rows[1].verdict).toBe("STABLE");
 		expect(rows[1].attribution).toBe("identical digest");
+	});
+});
+
+
+describe("Pi cache-bust analyzer context.db join and attribution", () => {
+	function setupBustFixture(options: {
+		sessionId: string;
+		decisionRow?: {
+			tsMs: number;
+			decision: string;
+			droppedCount: number;
+			droppedTokens?: number;
+			messageId?: string;
+		};
+		assistant2Id?: string;
+	}) {
+		const sessionRoot = temporaryDirectory("pi-cache-db-session-");
+		const storageDir = temporaryDirectory("pi-cache-db-ledger-");
+		const bodiesDir = join(
+			import.meta.dir,
+			"test-fixtures",
+			"cache-bust-bodies",
+			"pi-llm-debugging",
+		);
+		const sessionId = options.sessionId;
+		const a2Id = options.assistant2Id ?? "a2";
+
+		writeJsonl(sessionRoot, "--project--", "session.jsonl", [
+			{ type: "session", id: sessionId },
+			assistant("a1", "2026-09-04T10:00:00Z", {
+				input: 20,
+				cacheRead: 10_000,
+				cacheWrite: 0,
+			}),
+			assistant(a2Id, "2026-09-04T10:00:02Z", {
+				input: 20,
+				cacheRead: 100,
+				cacheWrite: 0,
+			}),
+		]);
+
+		capturePiServedArray(sessionId, [{ role: "user", content: "before" }], {
+			storageDir,
+			now: new Date("2026-09-04T09:59:59Z"),
+		});
+		capturePiServedArray(sessionId, [{ role: "user", content: "after" }], {
+			storageDir,
+			now: new Date("2026-09-04T10:00:01Z"),
+		});
+		flushPiServedArrayLedger();
+
+		const db = new Database(join(storageDir, "context.db"));
+		db.run(
+			"CREATE TABLE transform_decisions (session_id TEXT, harness TEXT, message_id TEXT, ts_ms INTEGER, decision TEXT, materialized INTEGER, materialize_reason TEXT, emergency INTEGER, dropped_tokens INTEGER, dropped_count INTEGER, input_tokens INTEGER)",
+		);
+		if (options.decisionRow) {
+			db.run(
+				"INSERT INTO transform_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				[
+					sessionId,
+					"pi",
+					options.decisionRow.messageId ?? a2Id,
+					options.decisionRow.tsMs,
+					options.decisionRow.decision,
+					0,
+					null,
+					0,
+					options.decisionRow.droppedTokens ?? 500,
+					options.decisionRow.droppedCount,
+					1_000,
+				],
+			);
+		}
+		db.close();
+
+		return { sessionRoot, storageDir, bodiesDir, sessionId };
+	}
+
+	test("attributes a bust request to the nearest-preceding MC pass row in context.db 1 s before request", () => {
+		const fixture = setupBustFixture({
+			sessionId: "pi-bust-1s-before",
+			decisionRow: {
+				tsMs: Date.parse("2026-09-04T10:00:01Z"), // 1s before 10:00:02Z request
+				decision: "execute",
+				droppedCount: 50,
+			},
+		});
+
+		const run = Bun.spawnSync([
+			process.execPath,
+			join(import.meta.dir, "analyze-pi-cache-busts.ts"),
+			"--session",
+			fixture.sessionId,
+			"--pi-dir",
+			fixture.sessionRoot,
+			"--ledger-dir",
+			fixture.storageDir,
+			"--bodies-dir",
+			fixture.bodiesDir,
+			"--all-rows",
+		]);
+
+		expect(run.exitCode).toBe(0);
+		const output = run.stdout.toString();
+		expect(output).toContain("accounted_drop_applied");
+		expect(output).not.toContain("no_mc_pass_row");
+	});
+
+	test("attributes to nearest-preceding pass even when Pi rows carry synthesized or detached message IDs", () => {
+		const fixture = setupBustFixture({
+			sessionId: "pi-bust-detached-id",
+			assistant2Id: "line-42", // synthesized / detached ID in JSONL
+			decisionRow: {
+				messageId: "turn-resolved-target", // different ID in transform_decisions
+				tsMs: Date.parse("2026-09-04T10:00:01Z"), // 1s before 10:00:02Z request
+				decision: "execute",
+				droppedCount: 16,
+			},
+		});
+
+		const run = Bun.spawnSync([
+			process.execPath,
+			join(import.meta.dir, "analyze-pi-cache-busts.ts"),
+			"--session",
+			fixture.sessionId,
+			"--pi-dir",
+			fixture.sessionRoot,
+			"--ledger-dir",
+			fixture.storageDir,
+			"--bodies-dir",
+			fixture.bodiesDir,
+			"--all-rows",
+		]);
+
+		expect(run.exitCode).toBe(0);
+		const output = run.stdout.toString();
+		expect(output).toContain("accounted_drop_applied");
+		expect(output).not.toContain("no_mc_pass_row");
+	});
+
+	test("negative: reports no_mc_pass_row when no MC pass exists within the request's pass window", () => {
+		// Decision row is 60 seconds before request (outside the 30s pass window)
+		const fixture = setupBustFixture({
+			sessionId: "pi-bust-outside-window",
+			decisionRow: {
+				tsMs: Date.parse("2026-09-04T09:59:00Z"), // 62s before request
+				decision: "execute",
+				droppedCount: 50,
+			},
+		});
+
+		const run = Bun.spawnSync([
+			process.execPath,
+			join(import.meta.dir, "analyze-pi-cache-busts.ts"),
+			"--session",
+			fixture.sessionId,
+			"--pi-dir",
+			fixture.sessionRoot,
+			"--ledger-dir",
+			fixture.storageDir,
+			"--bodies-dir",
+			fixture.bodiesDir,
+			"--all-rows",
+		]);
+
+		expect(run.exitCode).toBe(0);
+		const output = run.stdout.toString();
+		expect(output).toContain("no_mc_pass_row");
+		expect(output).not.toContain("accounted_drop_applied");
 	});
 });

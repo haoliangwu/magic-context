@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { OpenCode } from "../../../plugin/node_modules/@opencode/client/dist/promise/client.js";
-import { spawnOpencode2 } from "../../src/opencode2-runner/spawn";
+import { OpenCode } from "@opencode/client";
+import { spawnOpencode2, waitForPluginActive } from "../../src/opencode2-runner/spawn";
 
 test("I1 s2 dual-loader directory entry activates on the real GA host", async () => {
 	const host = await spawnOpencode2();
@@ -13,10 +13,7 @@ test("I1 s2 dual-loader directory entry activates on the real GA host", async ()
 			location: { directory: host.cwd },
 			model: { providerID: "openai", id: "mock-model" },
 		});
-		await client.plugin.awaitActivation(
-			{ location: { directory: host.cwd } },
-			{ signal: AbortSignal.timeout(15000) },
-		);
+		await waitForPluginActive(client, host.cwd);
 		host.mock.setDefault({
 			text: "s2 reply",
 			usage: { input_tokens: 100, output_tokens: 10 },
@@ -24,7 +21,7 @@ test("I1 s2 dual-loader directory entry activates on the real GA host", async ()
 		await client.session.prompt({ sessionID: session.id, text: "s2 prompt" });
 		await client.session.wait(
 			{ sessionID: session.id },
-			{ signal: AbortSignal.timeout(20000) },
+			{ signal: AbortSignal.timeout(20_000) },
 		);
 		expect(
 			host.mock

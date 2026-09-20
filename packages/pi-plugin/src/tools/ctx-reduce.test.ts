@@ -74,6 +74,26 @@ async function callDrop(args: {
 }
 
 describe("Pi ctx_reduce tool", () => {
+	it("refuses empty drop filler without queuing a phantom command", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reduce-empty";
+		try {
+			seedTags(db, sessionId, [{ tagNumber: 1, messageId: "m1" }]);
+			const omitted = await callDrop({
+				db,
+				sessionId,
+				drop: undefined as never,
+			});
+			const empty = await callDrop({ db, sessionId, drop: "" });
+			expect(empty.text).toBe(omitted.text);
+			expect(empty.isError).toBe(true);
+			expect(empty.text).toContain("'drop' must be provided");
+			expect(getPendingOps(db, sessionId)).toHaveLength(0);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("queues a drop for a known active tag", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-reduce-1";

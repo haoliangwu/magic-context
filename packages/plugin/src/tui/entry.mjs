@@ -33,4 +33,14 @@ if (!mod) {
     }
 }
 
-export default mod.default;
+const v1 = mod.default;
+
+async function setup(context) {
+    const v2 = await import("../v2/tui/index.ts");
+    return v2.setup(context);
+}
+
+// OpenCode 1.18.30's TUI loader reads only id/server/tui and ignores setup
+// (packages/opencode/src/plugin/shared.ts:272-304). OpenCode 2.0.3 validates
+// id/setup and ignores tui, so one object safely serves both package loaders.
+export default { id: v1.id, tui: v1.tui, setup };

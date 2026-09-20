@@ -813,9 +813,9 @@ export function refreshTailHygieneBaseline(input: {
     ) {
         const part = measured.parts[index];
         turnDeltaT += part.tokens;
-        // The canonical window always contains the newest tool-tag groups, so a newly
-        // appended attributed output grows total mass T without growing reclaimable mass U.
-        if (part.kind !== "toolOutput") turnDeltaU += part.uTokens;
+        // Tool-output tokens are not reclaimable while their parts are protected. As new
+        // outputs extend the measured tail, include outputs that have aged out of protection.
+        if (part.kind !== "toolOutput" || !part.protected) turnDeltaU += part.uTokens;
     }
     return {
         ...input.previous,

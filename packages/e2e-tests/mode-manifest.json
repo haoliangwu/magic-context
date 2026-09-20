@@ -43,18 +43,18 @@
 			]
 		},
 		{
-			"path": "tests/opencode2/hidden-s3-executor.test.ts",
+			"path": "tests/opencode2/hidden-child-ga.test.ts",
 			"tier": "excluded",
 			"invocation": {
 				"ts": false,
 				"rust": false
 			},
-			"rationale": "Real GA hidden historian publication, model/tool refusal and warming identity run in the dedicated v2 lane",
+			"rationale": "Real GA reusable hidden-child prompt, model, usage, title, reuse and retirement proof runs in the dedicated v2 lane",
 			"contract_refs": [
-				"R34",
 				"R36",
-				"R37",
-				"R38"
+				"R44",
+				"R44a",
+				"R44b"
 			]
 		},
 		{
@@ -522,7 +522,11 @@
 				"ts": true,
 				"rust": false
 			},
-			"rationale": "pi harness leg",
+			"hosts": [
+				"pi",
+				"omp"
+			],
+			"rationale": "shared Pi-family smoke contract runs unchanged on Pi and OMP",
 			"contract_refs": [
 				"PI-HARNESS"
 			]
@@ -598,6 +602,19 @@
 			"contract_refs": [
 				"RUST-E2E",
 				"COLD-START-DROP-SEED"
+			]
+		},
+		{
+			"path": "tests/rust-cold-seed-tag-surface.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "a cold state-sync seed renders every tag on its first coordinating HARD, replays byte-identically, and appends without rewriting the stable prefix",
+			"contract_refs": [
+				"RUST-E2E",
+				"COLD-SEED-TAG-SURFACE"
 			]
 		},
 		{
@@ -712,6 +729,18 @@
 				"rust": true
 			},
 			"rationale": "cold-seed handler budget on an ASTRO-shaped 10k-message seed; wall-clock, so it asserts only under MC_PERF_GATE=1 and records timings otherwise",
+			"contract_refs": [
+				"RUST-E2E"
+			]
+		},
+		{
+			"path": "tests/rust-dangling-boundary-seed.test.ts",
+			"tier": "rust-only",
+			"invocation": {
+				"ts": false,
+				"rust": true
+			},
+			"rationale": "a compartment whose boundary message id is absent from the raw store must not park the rust cold seed; the boundary resolves from its neighbours and a clean session's served bytes stay byte-identical",
 			"contract_refs": [
 				"RUST-E2E"
 			]
@@ -833,7 +862,11 @@
 				"ts": true,
 				"rust": false
 			},
-			"rationale": "OpenCode TS harness leg",
+			"hosts": [
+				"opencode",
+				"opencode2"
+			],
+			"rationale": "shared OpenCode smoke contract runs unchanged on OpenCode 1 and OpenCode 2",
 			"contract_refs": [
 				"TS-HARNESS"
 			]
@@ -1013,9 +1046,22 @@
 				"ts": false,
 				"rust": false
 			},
-			"rationale": "OpenCode v2 lane: boots the real @opencode/cli@2.0.3 in the hermetic v2 runner (throwaway roots, fd guard); v1/v2 payload, hidden-agent and rpc-entry probes; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
+			"rationale": "OpenCode v2 lane: boots the real @opencode/cli@2.0.5 in the hermetic v2 runner (throwaway roots, fd guard); v1/v2 payload, hidden-agent and rpc-entry probes; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
 			"contract_refs": [
 				"OC2-S1"
+			]
+		},
+		{
+			"path": "tests/opencode2/prompt-surface-s6.test.ts",
+			"tier": "excluded",
+			"invocation": {
+				"ts": false,
+				"rust": false
+			},
+			"rationale": "OpenCode v2 lane: per-model ctx_* description rewrite and draft-authoritative model tracking on the real GA host; the v2 lane runs from its own invocation (bun test tests/opencode2) and joins the release gates when the v2 hooks slice lands, not through the v1 mode-selected spawn seam",
+			"contract_refs": [
+				"R42",
+				"R43"
 			]
 		},
 		{

@@ -1481,7 +1481,7 @@ describe("createTransform", () => {
         expect(messages[2].parts).toEqual([{ type: "text", text: "" }]);
     });
 
-    it("applies pending drop operations when scheduler executes", async () => {
+    it("applies pending drop operations on an explicit flush", async () => {
         //#given
         useTempDataHome("context-transform-ops-");
         const shouldExecute = mock<Scheduler["shouldExecute"]>(() => "defer");
@@ -1490,6 +1490,7 @@ describe("createTransform", () => {
             string,
             import("./ctx-reduce-nudge").Channel1State
         >();
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -1501,7 +1502,7 @@ describe("createTransform", () => {
             ]),
             db: openDatabase(),
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -1535,7 +1536,9 @@ describe("createTransform", () => {
             });
         }
         queuePendingOp(db, "ses-1", 1, "drop");
+        pendingMaterializationSessions.add("ses-1");
         queuePendingOp(db, "ses-1", 2, "drop");
+        pendingMaterializationSessions.add("ses-1");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [
@@ -1880,6 +1883,7 @@ describe("createTransform", () => {
         const scheduler: Scheduler = { shouldExecute: mock(() => "execute" as const) };
         const db = openDatabase();
         updateSessionMeta(db, "ses-sub-drop", { isSubagent: true });
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -1891,7 +1895,7 @@ describe("createTransform", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -1910,6 +1914,7 @@ describe("createTransform", () => {
 
         await transform({}, { messages: firstPass });
         queuePendingOp(db, "ses-sub-drop", 2, "drop", Date.now());
+        pendingMaterializationSessions.add("ses-sub-drop");
 
         const secondPass: TestMessage[] = [
             {
@@ -2136,6 +2141,7 @@ describe("createTransform", () => {
         let decision: "defer" | "execute" = "defer";
         const scheduler: Scheduler = { shouldExecute: mock(() => decision) };
         const db = openDatabase();
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -2147,7 +2153,7 @@ describe("createTransform", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -2197,6 +2203,7 @@ describe("createTransform", () => {
         );
         expect(firstTag?.tagNumber).toBe(1);
         queuePendingOp(db, sessionId, 1, "drop");
+        pendingMaterializationSessions.add(sessionId);
 
         decision = "execute";
         await transform({}, { messages });
@@ -2341,6 +2348,7 @@ describe("createTransform", () => {
         useTempDataHome("context-transform-multipart-");
         const scheduler: Scheduler = { shouldExecute: mock(() => "execute" as const) };
         const tagger = createTagger();
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger,
             scheduler,
@@ -2352,7 +2360,7 @@ describe("createTransform", () => {
             ]),
             db: openDatabase(),
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -2381,6 +2389,7 @@ describe("createTransform", () => {
 
         const db = openDatabase();
         queuePendingOp(db, "ses-multi", 1, "drop");
+        pendingMaterializationSessions.add("ses-multi");
 
         const secondPass: TestMessage[] = [
             {
@@ -2407,6 +2416,7 @@ describe("createTransform", () => {
         useTempDataHome("context-transform-thinking-");
         const shouldExecute = mock<Scheduler["shouldExecute"]>(() => "defer");
         const scheduler: Scheduler = { shouldExecute };
+        const pendingMaterializationSessions = new Set<string>();
         const transform = createTransform({
             tagger: createTagger(),
             scheduler,
@@ -2418,7 +2428,7 @@ describe("createTransform", () => {
             ]),
             db: openDatabase(),
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions,
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: 0,
@@ -2445,6 +2455,7 @@ describe("createTransform", () => {
         const db = openDatabase();
         const assistantTextTag = 2;
         queuePendingOp(db, "ses-think", assistantTextTag, "drop");
+        pendingMaterializationSessions.add("ses-think");
         shouldExecute.mockImplementation(() => "execute");
 
         const secondPass: TestMessage[] = [
@@ -3837,7 +3848,7 @@ describe("live transform protected-token window", () => {
             ]),
             db,
             historyRefreshSessions: new Set<string>(),
-            pendingMaterializationSessions: new Set<string>(),
+            pendingMaterializationSessions: new Set([options.sessionId]),
             lastHeuristicsTurnId: new Map<string, string>(),
             clearReasoningAge: 50,
             protectedTokens: options.protectedTokens,

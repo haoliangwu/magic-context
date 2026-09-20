@@ -2,6 +2,8 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import type { HostHarness } from "../src/host-harness";
+import { OpenCode2TestHarness } from "../src/opencode2-harness";
 
 /**
  * Phase 1 smoke — verifies the harness is wired correctly:
@@ -10,24 +12,17 @@ import { TestHarness } from "../src/harness";
  *   its SQLite DB.
  */
 
-let h: TestHarness;
+const selectedHost = process.env.MC_E2E_HOST ?? "opencode";
+if (selectedHost !== "opencode" && selectedHost !== "opencode2") {
+    throw new Error(`smoke.test.ts requires MC_E2E_HOST=opencode|opencode2, got ${selectedHost}`);
+}
+
+let h: HostHarness;
+let serverUrl: string;
 
 beforeAll(async () => {
-    h = await TestHarness.create();
-});
-
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("e2e smoke", () => {
-    it("mock server and opencode serve are reachable", () => {
-        expect(h.opencode.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
-    });
-
-    it("sends a prompt, mock captures it, plugin initializes its DB", async () => {
-        h.mock.reset();
-        h.mock.setDefault({
+    const options = {
+        mockDefault: {
             text: "response from mock",
             usage: {
                 input_tokens: 100,
@@ -35,8 +30,25 @@ describe("e2e smoke", () => {
                 cache_creation_input_tokens: 100,
                 cache_read_input_tokens: 0,
             },
-        });
+        },
+    };
+    const created = selectedHost === "opencode2"
+        ? await OpenCode2TestHarness.create(options)
+        : await TestHarness.create(options);
+    h = created;
+    serverUrl = created.opencode.url;
+});
 
+afterAll(async () => {
+    await h?.dispose();
+});
+
+describe(`${selectedHost} e2e smoke`, () => {
+    it("mock server and host are reachable", () => {
+        expect(serverUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    });
+
+    it("sends a prompt, mock captures it, plugin initializes its DB", async () => {
         const sessionId = await h.createSession();
         await h.sendPrompt(sessionId, "hi there");
 
@@ -53,7 +65,7 @@ describe("e2e smoke", () => {
         // distinguish.
         await h.waitFor(
             () => {
-                const hits = h.mock.requests().filter((r) => {
+                const hits = h.requests().filter((r) => {
                     const body = JSON.stringify(r.body);
                     if (!body.includes("hi there")) return false;
                     // Skip OpenCode's internal small-model agents.
@@ -68,7 +80,7 @@ describe("e2e smoke", () => {
             { timeoutMs: 10_000, label: "main-agent request captured" },
         );
 
-        const requests = h.mock.requests();
+        const requests = h.requests();
         expect(requests.length).toBeGreaterThanOrEqual(1);
 
         // The assertion that matters is that the PLUGIN touched the outgoing
@@ -88,7 +100,7 @@ describe("e2e smoke", () => {
                     !b.includes("Compress the conversation history"),
             );
         expect(mainAgentBody, "main-agent request not captured").toBeDefined();
-        expect(mainAgentBody).toContain("Magic Context");
+        expect(mainAgentBody).toMatch(/Magic Context|<session-history>/);
 
         // Plugin created its DB and ran the transform (at least one tag persisted).
         await h.waitFor(() => h.hasContextDb(), { timeoutMs: 5000, label: "context.db created" });

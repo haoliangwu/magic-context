@@ -74,7 +74,7 @@ function memoryGuidanceBlock(memoryEnabled: boolean): string {
 const BASE_INTRO = (
     memoryEnabled: boolean,
 ): string => `Messages and tool outputs are tagged with §N§ identifiers (e.g., §1§, §42§).
-Use \`ctx_reduce\` to mark spent tagged content as discardable and reclaim space. Marking is NOT an immediate delete — it queues the content, which stays fully visible until space is actually needed (as soon as the next turn if you're already under pressure, much later if not), so mark a tool output as soon as you're done with it rather than hoarding the call for the end of the turn. The newest token-mass window stays protected until displaced. Syntax: "3-5", "1,2,9", or "1-5,8,12-15".
+Use \`ctx_reduce\` to mark spent tagged content as discardable and reclaim space. Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later. Mark a tool output as soon as you're done with it rather than hoarding the call for the end of the turn. The newest token-mass window stays protected until displaced. Syntax: "3-5", "1,2,9", or "1-5,8,12-15".
 Do not announce or narrate \`ctx_reduce\` drops — just call the tool silently. Saying "I'll drop these outputs" wastes tokens the user does not care about.
 ${CTX_NOTE_GUIDANCE}
 ${memoryGuidanceBlock(memoryEnabled)}Use \`ctx_search\` to search across project memories, indexed git commits, and this session's full conversation history (including compacted parts) from one query.

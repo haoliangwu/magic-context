@@ -1,0 +1,270 @@
+import { jsx } from "@opentui/solid/jsx-runtime";
+import type { SidebarSnapshot, StatusDetail } from "../../shared/rpc-types";
+import {
+    closeRpc,
+    getCompartmentCount,
+    initRpcClient,
+    loadSidebarSnapshot,
+    loadStatusDetail,
+    requestRecomp,
+} from "../../tui/data/context-db";
+import {
+    type SocketNotification,
+    startNotificationSocket,
+    stopNotificationSocket,
+} from "../../tui/data/notification-socket";
+import type { V2SidebarState, V2TuiContext } from "./types";
+
+const SIDEBAR_REFRESH_MS = 1_000;
+const inflight = new Set<string>();
+const refreshedAt = new Map<string, number>();
+
+function compactTokens(value: number): string {
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+    if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
+    return String(value);
+}
+
+function sidebarText(snapshot: SidebarSnapshot | undefined): string {
+    if (!snapshot) return "Magic Context · loading…";
+    const pressure =
+        snapshot.contextLimit > 0
+            ? `${snapshot.usagePercentage.toFixed(1)}% · ${compactTokens(snapshot.inputTokens)}/${compactTokens(snapshot.contextLimit)}`
+            : `${compactTokens(snapshot.inputTokens)} tokens`;
+    const historian = snapshot.historianRunning ? "running" : "idle";
+    return [
+        "Magic Context",
+        `Context ${pressure}`,
+        `Historian ${historian} · C:${snapshot.compartmentCount}`,
+        `Memories ${snapshot.memoryBlockCount}/${snapshot.memoryCount} · Q:${snapshot.pendingOpsCount}`,
+        ...(snapshot.lastTransformError ? [`Warning: ${snapshot.lastTransformError}`] : []),
+    ].join("\n");
+}
+
+function statusText(detail: StatusDetail): string {
+    const context =
+        detail.contextLimit > 0
+            ? `${detail.usagePercentage.toFixed(1)}% (${compactTokens(detail.inputTokens)}/${compactTokens(detail.contextLimit)} tokens)`
+            : `${compactTokens(detail.inputTokens)} tokens`;
+    return [
+        `Context: ${context}`,
+        `Historian: ${detail.historianRunning ? "running" : "idle"}`,
+        `Compartments: ${detail.compartmentCount}`,
+        `Memories: ${detail.memoryBlockCount} injected / ${detail.memoryCount} stored`,
+        `Pending reductions: ${detail.pendingOpsCount}`,
+        `Harness: opencode2`,
+        ...(detail.lastTransformError ? [`Warning: ${detail.lastTransformError}`] : []),
+    ].join("\n");
+}
+
+function currentSessionID(context: V2TuiContext): string | null {
+    const route = context.ui.router.current();
+    return route.type === "session" && route.sessionID ? route.sessionID : null;
+}
+
+function eventSessionID(event: unknown): string | undefined {
+    if (typeof event !== "object" || event === null) return undefined;
+    const record = event as Record<string, unknown>;
+    const data =
+        typeof record.data === "object" && record.data !== null
+            ? (record.data as Record<string, unknown>)
+            : record;
+    for (const key of ["sessionID", "sessionId", "id"]) {
+        if (typeof data[key] === "string") return data[key];
+    }
+    const info = data.info;
+    if (typeof info === "object" && info !== null) {
+        const nested = info as Record<string, unknown>;
+        if (typeof nested.sessionID === "string") return nested.sessionID;
+        if (typeof nested.id === "string") return nested.id;
+    }
+    return undefined;
+}
+
+type JsxFactory = (type: string, props: Record<string, unknown>) => unknown;
+
+export async function setupWithJsx(context: V2TuiContext, jsx: JsxFactory): Promise<() => void> {
+    const directory = context.location?.directory ?? context.data.location.default().directory;
+    initRpcClient(directory);
+    const [sidebar, updateSidebar] = context.storage.memory<V2SidebarState>(
+        "magic-context.sidebar.v2",
+        { initial: { snapshots: {} } },
+    );
+
+    const refresh = async (sessionID: string, force = false): Promise<void> => {
+        if (!sessionID || inflight.has(sessionID)) return;
+        const now = Date.now();
+        if (!force && now - (refreshedAt.get(sessionID) ?? 0) < SIDEBAR_REFRESH_MS) return;
+        refreshedAt.set(sessionID, now);
+        inflight.add(sessionID);
+        try {
+            const snapshot = await loadSidebarSnapshot(sessionID, directory);
+            updateSidebar((draft) => {
+                draft.snapshots[sessionID] = snapshot;
+            });
+            context.renderer.requestRender();
+        } finally {
+            inflight.delete(sessionID);
+        }
+    };
+
+    const showStatus = async (diagnostics = false, target = currentSessionID(context)) => {
+        if (!target) {
+            context.ui.toast.show({ message: "No active session", variant: "warning" });
+            return false;
+        }
+        const result = await loadStatusDetail(target, directory);
+        if (currentSessionID(context) !== target) return false;
+        if (!result.ok) {
+            context.ui.toast.show({
+                message: "Magic Context status is unavailable",
+                variant: "warning",
+            });
+            return false;
+        }
+        await context.ui.dialog.alert({
+            title: diagnostics ? "Magic Context diagnostics" : "Magic Context status",
+            message: statusText(result.detail),
+        });
+        return true;
+    };
+
+    const showRecomp = async (target = currentSessionID(context)) => {
+        if (!target) {
+            context.ui.toast.show({ message: "No active session", variant: "warning" });
+            return false;
+        }
+        const count = await getCompartmentCount(target, directory);
+        if (currentSessionID(context) !== target) return false;
+        if (!count.ok) {
+            context.ui.toast.show({ message: "Unable to load recomp details", variant: "error" });
+            return false;
+        }
+        const confirmed = await context.ui.dialog.confirm({
+            title: "Recomp confirmation",
+            message: [
+                count.count === 0
+                    ? "This session has no compartments yet; recomp will build them from raw history."
+                    : `This session has ${count.count} compartments.`,
+                "Recomp rebuilds compressed history and can consume significant tokens.",
+            ].join("\n\n"),
+            label: { confirm: "Run recomp", cancel: "Cancel" },
+        });
+        if (!confirmed) return true;
+        const requested = await requestRecomp(target);
+        context.ui.toast.show({
+            message: requested
+                ? "Recomp requested; historian will start shortly"
+                : "Recomp request failed",
+            variant: requested ? "info" : "error",
+        });
+        if (requested) void refresh(target, true);
+        return requested;
+    };
+
+    const unregisterSlot = context.ui.slot({
+        append: "sidebar.content",
+        render: ({ sessionID }) => {
+            void refresh(sessionID);
+            return jsx("text", { children: sidebarText(sidebar.snapshots[sessionID]) });
+        },
+    });
+
+    try {
+        context.keymap.layer(() => ({
+            mode: "global",
+            commands: [
+                {
+                    id: "magic-context.status",
+                    title: "Magic Context: Status",
+                    group: "Magic Context",
+                    palette: true,
+                    slash: { name: "ctx-status", arguments: true },
+                    run: async (input) => {
+                        await showStatus(input?.trim().toLowerCase() === "diagnostics");
+                    },
+                },
+                {
+                    id: "magic-context.recomp",
+                    title: "Magic Context: Recomp",
+                    group: "Magic Context",
+                    palette: true,
+                    slash: { name: "ctx-recomp" },
+                    run: async () => {
+                        await showRecomp();
+                    },
+                },
+            ],
+        }));
+    } catch (error) {
+        if (!(error instanceof Error) || error.message !== "Keymap.Provider is missing")
+            throw error;
+        console.warn(
+            "[magic-context] OpenCode 2.0.5 keymap.layer is unavailable during plugin setup; /ctx-status and /ctx-recomp were not registered",
+        );
+    }
+
+    const stopListening = context.data.listen(({ details }) => {
+        const sessionID = eventSessionID(details);
+        if (sessionID) void refresh(sessionID, true);
+    });
+
+    const handleNotification = async (notification: SocketNotification): Promise<boolean> => {
+        const target = notification.sessionId ?? currentSessionID(context);
+        if (notification.sessionId && notification.sessionId !== currentSessionID(context))
+            return false;
+        if (notification.type === "toast") {
+            const payload = notification.payload;
+            context.ui.toast.show({
+                title: typeof payload.title === "string" ? payload.title : undefined,
+                message: String(payload.message ?? ""),
+                variant:
+                    payload.variant === "success" ||
+                    payload.variant === "warning" ||
+                    payload.variant === "error"
+                        ? payload.variant
+                        : "info",
+                duration: typeof payload.duration === "number" ? payload.duration : undefined,
+            });
+            return true;
+        }
+        if (notification.type !== "action") return false;
+        if (notification.payload.action === "show-status-dialog") {
+            return showStatus(notification.payload.diagnostics === true, target);
+        }
+        if (notification.payload.action === "show-recomp-dialog") return showRecomp(target);
+        if (notification.payload.action === "refresh-sidebar" && target) {
+            await refresh(target, true);
+            return true;
+        }
+        if (notification.payload.action === "show-result-dialog") {
+            await context.ui.dialog.alert({
+                title: String(notification.payload.title ?? "Magic Context"),
+                message: String(notification.payload.message ?? ""),
+            });
+            return true;
+        }
+        return false;
+    };
+
+    startNotificationSocket({
+        getSessionId: () => currentSessionID(context),
+        onNotification: handleNotification,
+    });
+    console.info("[magic-context] @cortexkit/opencode-magic-context v2 TUI setup");
+
+    return () => {
+        unregisterSlot();
+        stopListening();
+        stopNotificationSocket();
+        closeRpc();
+        inflight.clear();
+        refreshedAt.clear();
+    };
+}
+
+export async function setup(context: V2TuiContext): Promise<() => void> {
+    return setupWithJsx(context, jsx);
+}
+
+export default { id: "opencode-magic-context", setup };

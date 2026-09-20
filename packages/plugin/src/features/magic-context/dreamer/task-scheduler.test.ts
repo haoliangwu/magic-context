@@ -324,6 +324,31 @@ describe("task-scheduler — runDueTasksForProject", () => {
         expect(state?.nextDueAt).toBeGreaterThan(now);
     });
 
+    it("advances last_run_at from the run START on completion (not completion time)", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.now();
+        const tasks = [cfg("verify", "0 3 * * *")];
+        planDueTasks(db, PROJECT, tasks, now);
+        forceDue(db, "verify", now);
+
+        // Slow executor: a long run makes the start↔finish gap visible, so the
+        // assertion can discriminate run-start from run-completion advancement.
+        const executor = async (): Promise<TaskExecOutcome> => {
+            await new Promise((r) => setTimeout(r, 200));
+            return { status: "completed" };
+        };
+        const before = Date.now();
+        await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
+        const after = Date.now();
+        const state = getTaskScheduleState(db, PROJECT, "verify");
+        expect(state?.lastStatus).toBe("completed");
+        // last_run_at reflects the run START (~before), not the completion (~after):
+        // a message landing mid-run is newer than the cutoff and re-triggers next slot.
+        expect(state?.lastRunAt).toBeGreaterThanOrEqual(before);
+        expect(state?.lastRunAt).toBeLessThan(after - 150);
+    });
+
     it("skips a due task whose gate fails (no active memories) and advances it", async () => {
         db = freshDb();
         // No memories → verify gate fails.

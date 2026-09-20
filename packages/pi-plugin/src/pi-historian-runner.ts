@@ -96,7 +96,10 @@ import {
 import { renderMemoryBlock } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { onNoteTrigger } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { persistFilteredNoise } from "@magic-context/core/hooks/magic-context/persist-filtered-noise";
-import { producerWindowFailureReason } from "@magic-context/core/hooks/magic-context/producer-window-guard";
+import {
+	fitAtomicHistorianSourceToProducerWindow,
+	producerWindowFailureReason,
+} from "@magic-context/core/hooks/magic-context/producer-window-guard";
 import {
 	createDefaultBoundarySnapshotForTests,
 	describeBoundaryDiagnostics,
@@ -738,14 +741,28 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				sessionCompartments: priorCompartments,
 			});
 
+			const fittedAtomicSource = chunk.oversizeAtomicUnit
+				? fitAtomicHistorianSourceToProducerWindow({
+						text: chunk.text,
+						resultBoundaries: chunk.toolResultBoundaries,
+						contextLimitTokens: historianContextLimit,
+						maxOutputTokens,
+					})
+				: null;
 			const chunkText = chunk.oversizeAtomicUnit
-				? chunk.text
+				? (fittedAtomicSource?.text ?? chunk.text)
 				: truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
 			const producerSourceTokens = estimateTokens(chunkText);
 			if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
 				sessionLog(
 					sessionId,
 					`historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
+				);
+			}
+			if (fittedAtomicSource && fittedAtomicSource.removedTokens > 0) {
+				sessionLog(
+					sessionId,
+					`historian pathological component split: range=${chunk.startIndex}-${chunk.endIndex} resultBoundary=${fittedAtomicSource.splitBoundaryOrdinal ?? "midpoint"} removedTokens=${fittedAtomicSource.removedTokens} producerSourceTokens=${producerSourceTokens} producerInputLimitTokens=${fittedAtomicSource.producerInputLimitTokens ?? "unknown"}`,
 				);
 			}
 			const producerWindowFailure = producerWindowFailureReason({

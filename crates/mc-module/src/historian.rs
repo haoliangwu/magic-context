@@ -1558,7 +1558,17 @@ fn persist_idle_model_unresolvable_detail(
     unreachable!("the model-unresolvable CAS loop returns from every attempt")
 }
 
-pub(crate) const PRODUCER_WINDOW_REFUSAL_MARGIN_PERCENT: usize = 15;
+/// Provider tokenizers can count slightly above our estimator. A live historian
+/// request missed the provider wall by one token, so keep a 3% admission reserve.
+pub(crate) const PRODUCER_WINDOW_ESTIMATOR_MARGIN_PERCENT: usize = 3;
+
+pub(crate) fn producer_input_token_limit(
+    context_limit_tokens: Option<usize>,
+    max_output_tokens: u32,
+) -> Option<usize> {
+    let usable_input_tokens = context_limit_tokens?.saturating_sub(max_output_tokens as usize);
+    Some(usable_input_tokens.saturating_mul(100 - PRODUCER_WINDOW_ESTIMATOR_MARGIN_PERCENT) / 100)
+}
 
 pub(crate) fn producer_window_failure_reason(
     producer_source_tokens: usize,
@@ -1570,14 +1580,13 @@ pub(crate) fn producer_window_failure_reason(
         return None;
     }
     let usable_input_tokens = context_limit_tokens.saturating_sub(max_output_tokens as usize);
-    let source_scaled = (producer_source_tokens as u128).saturating_mul(100);
-    let refusal_scaled = (usable_input_tokens as u128)
-        .saturating_mul((100 + PRODUCER_WINDOW_REFUSAL_MARGIN_PERCENT) as u128);
-    if source_scaled < refusal_scaled {
+    let producer_input_limit_tokens =
+        producer_input_token_limit(Some(context_limit_tokens), max_output_tokens)?;
+    if producer_source_tokens <= producer_input_limit_tokens {
         return None;
     }
     Some(format!(
-        "producer_source_exceeds_window producer_source_tokens={producer_source_tokens} usable_input_tokens={usable_input_tokens} context_limit_tokens={context_limit_tokens} max_output_tokens={max_output_tokens} refusal_margin=0.15"
+        "producer_source_exceeds_window producer_source_tokens={producer_source_tokens} usable_input_tokens={usable_input_tokens} producer_input_limit_tokens={producer_input_limit_tokens} context_limit_tokens={context_limit_tokens} max_output_tokens={max_output_tokens} estimator_margin=0.03"
     ))
 }
 
@@ -2850,7 +2859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn producer_window_guard_refuses_two_x_and_admits_one_point_zero_five_x() {
+    async fn producer_window_guard_reserves_estimator_margin_before_spawn() {
         let refused_dir = tempfile::tempdir().unwrap();
         let refused_store = store(refused_dir.path());
         seed_prior_compartment(&refused_store);
@@ -2877,7 +2886,7 @@ mod tests {
         assert_eq!(refused_state.failure_backoff_at_ms, Some(999));
         assert_eq!(
             refused_state.last_failure.as_deref(),
-            Some("producer_source_exceeds_window producer_source_tokens=20000 usable_input_tokens=10000 context_limit_tokens=11000 max_output_tokens=1000 refusal_margin=0.15")
+            Some("producer_source_exceeds_window producer_source_tokens=20000 usable_input_tokens=10000 producer_input_limit_tokens=9700 context_limit_tokens=11000 max_output_tokens=1000 estimator_margin=0.03")
         );
 
         let admitted_dir = tempfile::tempdir().unwrap();
@@ -2890,7 +2899,7 @@ mod tests {
             &chunk,
             &prior,
         );
-        admitted_request.producer_source_tokens = 10_500;
+        admitted_request.producer_source_tokens = 9_699;
         admitted_request.historian_context_limit_tokens = Some(11_000);
         admitted_request.max_output_tokens = 1_000;
         let mut admitted_producer = ScriptedProducer::default()
@@ -2903,6 +2912,11 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(admitted_producer.observed_starts.len(), 1);
+
+        assert_eq!(
+            producer_window_failure_reason(10_000, Some(11_000), 1_000).as_deref(),
+            Some("producer_source_exceeds_window producer_source_tokens=10000 usable_input_tokens=10000 producer_input_limit_tokens=9700 context_limit_tokens=11000 max_output_tokens=1000 estimator_margin=0.03")
+        );
     }
 
     #[tokio::test]

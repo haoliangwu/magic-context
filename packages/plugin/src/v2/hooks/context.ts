@@ -21,8 +21,15 @@ import { setRawMessageProvider } from "../../hooks/magic-context/read-session-ch
 import { preloadTokenizer } from "../../hooks/magic-context/read-session-formatting";
 import { createTransform, type TransformDeps } from "../../hooks/magic-context/transform";
 import { maybeSendUpgradeReminder } from "../../hooks/magic-context/upgrade-reminder";
+import { detectConflicts } from "../../shared/conflict-detector";
 import { getDataDir } from "../../shared/data-path";
 import { resolveHistorianModel } from "../../shared/model-resolution";
+import type { PromptSurfaceConfig } from "../../shared/prompt-surface";
+import {
+    ACTIVE_TOOL_IDS,
+    createPromptSurfaceRuntime,
+    type PromptSurfaceRuntime,
+} from "../../shared/prompt-surface-runtime";
 import { pushNotification } from "../../shared/rpc-notifications";
 import { v2CompactionMarkerStrategy } from "../fold/markers";
 import { FoldOwner, foldDigest } from "../fold/owner";
@@ -31,6 +38,7 @@ import { createV2HiddenCompletionExecutor } from "../hidden-completion";
 import { gaDatabasePath, V2StoreReader } from "../store-reader";
 import { deliverPendingChannel2, isAdmittedSynthetic } from "./channel2";
 import { startDreamTrigger } from "./dream-trigger";
+import { HiddenChildHook, registerHiddenChildAgents } from "./hidden-child";
 import { adaptPayload, HEAD_IDS } from "./payload";
 import { interruptBeforeProvider, V2ContextRefusal } from "./refusal";
 import { rawMessages } from "./store";
@@ -53,32 +61,124 @@ export function createHostSeams(
                 ...args,
                 cacheNamespace: `opencode2:${args.sessionId}`,
             }),
+        // Draft-backed: v2 never reconstructs the live model from message.updated.
         hostModelFallback: (sessionID) => liveModels.get(sessionID) ?? null,
         hostRefuse: (_client, sessionID) =>
             interruptBeforeProvider(context.session, sessionID as SessionContext["sessionID"]),
     };
 }
 
+function toolResultText(result: { content?: unknown } | undefined): string {
+    const content = result?.content ?? (result as { output?: unknown } | undefined)?.output;
+    if (typeof content === "string") return content;
+    if (content && typeof content === "object" && !Array.isArray(content)) {
+        const record = content as { text?: unknown; value?: unknown };
+        if (typeof record.text === "string") return record.text;
+        if (typeof record.value === "string") return record.value;
+        return "";
+    }
+    if (!Array.isArray(content)) return "";
+    return content
+        .map((part) => {
+            if (typeof part === "string") return part;
+            if (!part || typeof part !== "object") return "";
+            const record = part as { type?: unknown; text?: unknown; value?: unknown };
+            if (typeof record.text === "string") return record.text;
+            if (typeof record.value === "string") return record.value;
+            return "";
+        })
+        .filter(Boolean)
+        .join("\n");
+}
+
+/** Accept both a raw model array and the 2.0.5 `{ data }` list payload. */
+export function catalogModels(listed: unknown): Array<{
+    id: string;
+    providerID: string;
+    limit: { context: number };
+}> {
+    const rows = Array.isArray(listed)
+        ? listed
+        : listed && typeof listed === "object" && Array.isArray((listed as { data?: unknown }).data)
+          ? (listed as { data: unknown[] }).data
+          : [];
+    return rows.flatMap((row) => {
+        if (!row || typeof row !== "object") return [];
+        const model = row as {
+            id?: unknown;
+            providerID?: unknown;
+            limit?: { context?: unknown };
+        };
+        if (typeof model.id !== "string" || typeof model.providerID !== "string") return [];
+        const contextLimit = model.limit?.context;
+        if (typeof contextLimit !== "number" || !Number.isFinite(contextLimit)) return [];
+        return [{ id: model.id, providerID: model.providerID, limit: { context: contextLimit } }];
+    });
+}
+
+/** Rewrite Magic Context ctx_* tool descriptions for this draft's model. */
+export function applyV2PromptSurfaceTools(
+    draft: SessionContext,
+    runtime: PromptSurfaceRuntime,
+    config: PromptSurfaceConfig | undefined,
+): void {
+    if (!draft.tools) return;
+    const modelKey = `${draft.model.providerID}/${draft.model.id}`;
+    const registration = runtime.resolveRegistration(config, modelKey);
+    for (const id of ACTIVE_TOOL_IDS) {
+        const tool = draft.tools[id];
+        if (!tool) continue;
+        tool.description = registration.descriptionFor(id, tool.description);
+    }
+}
+
 export async function registerContext(context: V2Context) {
     const directory = context.location.directory;
     const config = loadPluginConfigDetailed(directory).config;
     if (!config.enabled || !isCompactionEnabled(config)) return;
+    const conflicts = detectConflicts(directory, {
+        compactionEnabled: true,
+        hostGeneration: "v2",
+    });
+    if (conflicts.hasConflict) {
+        console.warn(
+            `[magic-context] v2 setup disabled by conflicting context hooks: ${conflicts.reasons.join("; ")}`,
+        );
+        return;
+    }
     const folds = new FoldOwner(context.storage);
     const limits = new Map<string, number>();
     const queriedModels = new Set<string>();
+    // Draft-authoritative model/variant/agent. Not the v1 event-driven map.
     const liveModels: NonNullable<TransformDeps["liveModelBySession"]> = new Map();
-    // Bind the host's generate once: the executor's closure runs after this
-    // presence check and must call the same method with the session as receiver.
-    const hostGenerate = context.session.generate?.bind(context.session);
-    const hiddenCompletionExecutor = hostGenerate
-        ? await createV2HiddenCompletionExecutor(
-              {
-                  hook: (name, callback) => context.session.hook(name, callback),
-                  generate: (input, options) => hostGenerate(input, options),
-              },
-              (sessionID) => liveModels.get(sessionID) ?? null,
-          )
-        : undefined;
+    const promptSurfaceRuntime = createPromptSurfaceRuntime({
+        harness: "opencode2",
+        directory,
+        warn: (message) => console.warn(`[magic-context] config warning: ${message}`),
+    });
+    let db: ReturnType<typeof openDatabase> | undefined;
+    try {
+        db = openDatabase() ?? undefined;
+    } catch {
+        // The primary context hook retains the existing fail-closed storage path.
+        // Hidden work remains unavailable for this plugin instance when durable storage cannot open.
+    }
+    const hiddenChildHook = new HiddenChildHook();
+    await registerHiddenChildAgents(context.agent);
+    let hiddenAgentsReady: Promise<void> | undefined;
+    const hiddenCompletionExecutor =
+        db && isDatabasePersisted(db)
+            ? await createV2HiddenCompletionExecutor(context.session, {
+                  db,
+                  projectIdentity: resolveProjectIdentity(directory) ?? directory,
+                  hook: hiddenChildHook,
+                  ensureAgent: () => (hiddenAgentsReady ??= context.agent.reload()),
+                  openReader: () =>
+                      new V2StoreReader(
+                          gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
+                      ),
+              })
+            : undefined;
     const dreamTrigger =
         hiddenCompletionExecutor && config.dreamer && !config.dreamer.disable
             ? startDreamTrigger(context, {
@@ -102,22 +202,15 @@ export async function registerContext(context: V2Context) {
     let toolDuties: ReturnType<typeof createToolExecuteAfterHook> | undefined;
     await context.tool.hook("execute.before", (draft) => assertExecutableToolInput(draft.input));
     await context.tool.hook("execute.after", async (draft) => {
-        if (!db || draft.status !== "completed") return;
+        if (!db) return;
+        if (draft.status && draft.status !== "completed") return;
         try {
             toolDuties ??= createToolExecuteAfterHook({ db, channel1StateBySession: channel1 });
-            const content = draft.result?.content;
-            const text =
-                typeof content === "string"
-                    ? content
-                    : Array.isArray(content)
-                      ? content
-                            .filter((part) => part.type === "text")
-                            .map((part) => part.text)
-                            .join("\n")
-                      : "";
+            const text = toolResultText(draft.result);
             const output = { output: text };
             await toolDuties({ ...draft, args: draft.input }, output);
             if (draft.result && output.output !== text) {
+                const content = draft.result.content;
                 if (typeof content === "string") draft.result.content = output.output;
                 else if (Array.isArray(content) && output.output.startsWith(text))
                     content.push({ type: "text", text: output.output.slice(text.length) });
@@ -146,7 +239,6 @@ export async function registerContext(context: V2Context) {
         getCount: (sessionID: string) => read(sessionID).length,
     });
     let transform: ReturnType<typeof createTransform> | undefined;
-    let db: ReturnType<typeof openDatabase> | undefined;
     const refuseIfUnsafe = async (draft: SessionContext): Promise<boolean> => {
         let unsafe = false;
         try {
@@ -164,10 +256,8 @@ export async function registerContext(context: V2Context) {
                 const tokens = latest?.data.tokens;
                 const modelKey = `${draft.model.providerID}/${draft.model.id}`;
                 if (!queriedModels.has(modelKey)) {
-                    const catalog = await context.catalog.model.list({
-                        location: context.location,
-                    });
-                    for (const model of catalog.data)
+                    const catalog = await Promise.resolve(context.model.list());
+                    for (const model of catalogModels(catalog))
                         limits.set(`${model.providerID}/${model.id}`, model.limit.context);
                     queriedModels.add(modelKey);
                 }
@@ -187,7 +277,8 @@ export async function registerContext(context: V2Context) {
             } finally {
                 reader.close();
             }
-        } catch {
+        } catch (error) {
+            console.warn("[magic-context] v2 refuseIfUnsafe", error);
             unsafe = true;
         }
         if (unsafe) await interruptBeforeProvider(context.session, draft.sessionID);
@@ -245,6 +336,28 @@ export async function registerContext(context: V2Context) {
         }
     });
     await context.session.hook("context", async (draft) => {
+        if (hiddenChildHook.apply(draft)) return;
+        liveModels.set(draft.sessionID, {
+            providerID: draft.model.providerID,
+            modelID: draft.model.id,
+        });
+        variants.set(draft.sessionID, draft.model.variant);
+        agents.set(draft.sessionID, draft.agent);
+        applyV2PromptSurfaceTools(draft, promptSurfaceRuntime, config.prompt_surface);
+        if (context.tool.transform) {
+            const modelKey = `${draft.model.providerID}/${draft.model.id}`;
+            const registration = promptSurfaceRuntime.resolveRegistration(
+                config.prompt_surface,
+                modelKey,
+            );
+            await context.tool.transform((editor) => {
+                for (const id of ACTIVE_TOOL_IDS) {
+                    editor.update(id, (tool) => {
+                        tool.description = registration.descriptionFor(id, tool.description);
+                    });
+                }
+            });
+        }
         let postFold = false;
         try {
             if (await refuseIfUnsafe(draft)) return;
@@ -391,6 +504,14 @@ export async function registerContext(context: V2Context) {
             const mapped = adaptPayload(draft, admitted);
             await transform({}, mapped);
             mapped.commit();
+            if (db) {
+                await deliverPendingChannel2(
+                    context,
+                    db,
+                    draft.sessionID,
+                    channel1.get(draft.sessionID),
+                );
+            }
             if (checkpoint && submitted !== undefined) {
                 const head = draft.messages.find((message) => message.id === HEAD_IDS[0]);
                 const baseline = head?.content.find((part) => part.type === "text")?.text;

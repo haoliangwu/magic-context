@@ -5,10 +5,10 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { OpenCode } from "../../../plugin/node_modules/@opencode/client/dist/promise/client.js";
+import { OpenCode } from "@opencode/client";
 import { gaDatabasePath, V2StoreReader } from "../../../plugin/src/v2/store-reader";
 import { rawMessages } from "../../../plugin/src/v2/hooks/store";
-import { spawnOpencode2 } from "../../src/opencode2-runner/spawn";
+import { spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
 
 const sha = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 for (const mode of ["local", "provider"] as const) {
@@ -16,7 +16,7 @@ for (const mode of ["local", "provider"] as const) {
         const root = mkdtempSync(join(tmpdir(), "mc-s3-fold-"));
         const build = await Bun.build({ entrypoints: [join(import.meta.dir, "fold-s3-probe.ts")], outdir: root, naming: "index.js", target: "node", format: "esm", define: { "process.env.NODE_ENV": '"production"' }, external: ["bun:sqlite", "node:sqlite"] });
         if (!build.success) throw new Error(build.logs.join("\n"));
-        const host = await spawnOpencode2({ probePlugin: root });
+        const host = await spawnOpencode2({ probePlugin: root, modelContextLimit: 16_000, modelOutputLimit: 1024 });
         const trace = join(host.cwd, "s3-fold.jsonl");
         try {
             const configDir = join(host.env.XDG_CONFIG_HOME!, "cortexkit");
@@ -28,7 +28,7 @@ for (const mode of ["local", "provider"] as const) {
             writeFileSync(configPath, JSON.stringify(config));
             const client = OpenCode.make({ baseUrl: host.url, headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` } });
             const session = await client.session.create({ location: { directory: host.cwd }, model: { providerID: "openai", id: "mock-model" } });
-            await client.plugin.awaitActivation({ location: { directory: host.cwd } });
+            await waitForPluginActive(client, host.cwd);
             const turn = async (text: string) => {
                 await client.session.prompt({ sessionID: session.id, text });
                 await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(20000) });

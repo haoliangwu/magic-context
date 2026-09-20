@@ -5,7 +5,7 @@ import { CTX_NOTE_LIGHT_DESCRIPTION } from "../light-descriptions";
 import { CTX_NOTE_DESCRIPTION } from "./constants";
 
 const NOTE_IDS_DESCRIPTION =
-    "One to fifty note ids for 'dismiss' only; do not combine with note_id.";
+    "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'.";
 
 const pluginSchemaSource = readFileSync(resolve(import.meta.dir, "tools.ts"), "utf8");
 const piSchemaSource = readFileSync(
@@ -17,8 +17,8 @@ const rustSchemaSource = readFileSync(
     "utf8",
 );
 
-describe("ctx_note multi-dismiss schema parity", () => {
-    it("keeps the changed schema fields byte-identical across TS, Pi, and Rust", () => {
+describe("ctx_note note_ids schema parity", () => {
+    it("keeps the single id field byte-identical across TS, Pi, and Rust", () => {
         for (const source of [pluginSchemaSource, piSchemaSource, rustSchemaSource]) {
             expect(source).toContain(NOTE_IDS_DESCRIPTION);
         }
@@ -27,15 +27,25 @@ describe("ctx_note multi-dismiss schema parity", () => {
         expect(piSchemaSource).toContain(
             "Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })",
         );
-        expect(piSchemaSource).toContain("maximum: Number.MAX_SAFE_INTEGER");
         expect(piSchemaSource).toContain("maxItems: 50");
         expect(rustSchemaSource).toContain(
             '"minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }',
         );
     });
 
-    it("mentions the array form once in each description preset", () => {
-        expect(CTX_NOTE_DESCRIPTION.match(/\bnote_ids\b/g)).toHaveLength(1);
-        expect(CTX_NOTE_LIGHT_DESCRIPTION.match(/\bnote_ids\b/g)).toHaveLength(1);
+    it("declares no note_id scalar on any lane", () => {
+        // A second id field is what made required-all tool surfaces fail every
+        // call with filler in both (issue 460); the schema must not grow it back.
+        for (const source of [pluginSchemaSource, piSchemaSource]) {
+            expect(source).not.toMatch(/note_id\??:\s/);
+        }
+        expect(rustSchemaSource).not.toContain('"note_id": {');
+    });
+
+    it("mentions the id field in each description preset", () => {
+        expect(CTX_NOTE_DESCRIPTION.match(/\bnote_ids\b/g)?.length ?? 0).toBeGreaterThan(0);
+        expect(CTX_NOTE_LIGHT_DESCRIPTION.match(/\bnote_ids\b/g)?.length ?? 0).toBeGreaterThan(0);
+        expect(CTX_NOTE_DESCRIPTION).not.toMatch(/\bnote_id\b/);
+        expect(CTX_NOTE_LIGHT_DESCRIPTION).not.toMatch(/\bnote_id\b/);
     });
 });

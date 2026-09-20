@@ -3,23 +3,27 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { OpenCode } from "../../../plugin/node_modules/@opencode/client/dist/promise/client.js";
+import { OpenCode } from "@opencode/client";
 import { seedTaskScheduleState } from "../../../plugin/src/features/magic-context/dreamer/storage-task-schedule";
 import { resolveProjectIdentity } from "../../../plugin/src/features/magic-context/memory/project-identity";
 import { insertMemory } from "../../../plugin/src/features/magic-context/memory";
-import { spawnOpencode2 } from "../../src/opencode2-runner/spawn";
+import { spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
 
 async function fixture(config: unknown) {
     const observer = mkdtempSync(join(tmpdir(), "mc-s3-events-"));
     writeFileSync(join(observer, "index.js"), `import {appendFileSync} from 'node:fs'; import {join} from 'node:path';
 export default {id:'s3-events',setup(context){ process.env.MAGIC_CONTEXT_LOG_PATH=join(context.location.directory,'mc.log'); const control=new AbortController(); void (async()=>{for await(const event of context.event.subscribe({signal:control.signal})) appendFileSync(join(context.location.directory,'events.jsonl'),JSON.stringify(event)+'\\n');})(); return ()=>control.abort(); }};`);
-    const host = await spawnOpencode2({ probePlugin: observer });
+    const host = await spawnOpencode2({
+        probePlugin: observer,
+        modelContextLimit: 16_000,
+        modelOutputLimit: 1024,
+    });
     const directory = join(host.env.XDG_CONFIG_HOME!, "cortexkit");
     mkdirSync(directory, { recursive: true });
     writeFileSync(join(directory, "magic-context.jsonc"), JSON.stringify(config));
     const client = OpenCode.make({ baseUrl: host.url, headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` } });
     const session = await client.session.create({ location: { directory: host.cwd }, model: { providerID: "openai", id: "mock-model" } });
-    await client.plugin.awaitActivation({ location: { directory: host.cwd } });
+    await waitForPluginActive(client, host.cwd);
     const turn = async (text: string) => {
         await client.session.prompt({ sessionID: session.id, text });
         await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(20000) });

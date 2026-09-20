@@ -27,6 +27,11 @@ import {
     listShadowBackfillStalls,
 } from "@magic-context/core/features/magic-context/shadow-backfill-state";
 import { getLiveMigrationBlockingProcesses } from "@magic-context/core/features/magic-context/storage-db";
+import {
+    AUTO_UPDATE_CHECK_STATE_FILENAME,
+    isUpdaterPinnedSpec,
+    readAutoUpdateCheckState,
+} from "@magic-context/core/shared/auto-update-provenance";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import {
@@ -38,8 +43,10 @@ import {
     formatOpenCodeDbDoctorLine,
     type OpenCodeDbPathResolution,
     openCodeDbPathExists,
+    openCodeHostGenerationFromVersion,
     resolveOpenCodeDbPath,
 } from "@magic-context/core/shared/opencode-db-path";
+import { Database } from "@magic-context/core/shared/sqlite";
 import { ensureTuiPluginEntry } from "@magic-context/core/shared/tui-config";
 import { parse, stringify } from "comment-json";
 import {
@@ -93,6 +100,10 @@ import {
 } from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
 import { reportAuthorityMarkers } from "./doctor-authority";
+import {
+    formatDanglingCompartmentBoundary,
+    listDanglingCompartmentBoundaries,
+} from "./doctor-compartment-boundaries";
 import { clearPluginCache } from "./doctor-opencode-cache";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
@@ -251,6 +262,17 @@ function getSelfVersion(): string {
 export function isPinnedOpenCodePluginSpecifier(specifier: string): boolean {
     if (specifier === PLUGIN_NAME || specifier === PLUGIN_ENTRY_WITH_VERSION) return false;
     return specifier.startsWith(`${PLUGIN_NAME}@`);
+}
+
+export function describeAutoUpdateStall(
+    specifier: string,
+    autoUpdateEnabled: boolean,
+    storageDir = getMagicContextStorageDir(),
+): string | null {
+    if (!autoUpdateEnabled || !isPinnedOpenCodePluginSpecifier(specifier)) return null;
+    const state = readAutoUpdateCheckState(join(storageDir, AUTO_UPDATE_CHECK_STATE_FILENAME));
+    const owner = isUpdaterPinnedSpec(state, specifier) ? "updater" : "you";
+    return `auto-update: stalled — config pinned to ${specifier} (by ${owner})`;
 }
 
 export function getUserNpmrcPath(): string {
@@ -800,9 +822,43 @@ export async function runDoctor(
         );
     }
 
-    const openCodeDbCheck = describeOpenCodeDatabaseDoctorCheck(resolveOpenCodeDbPath());
+    const hostGeneration = openCodeHostGenerationFromVersion(activeInstallation.version);
+    const openCodeDbResolution = resolveOpenCodeDbPath(hostGeneration);
+    const openCodeDbCheck = describeOpenCodeDatabaseDoctorCheck(openCodeDbResolution);
     if (openCodeDbCheck.ok) pass(openCodeDbCheck.message);
     else fail(openCodeDbCheck.message);
+
+    if (openCodeDbCheck.ok) {
+        let contextDb: ReturnType<typeof openExistingContextDatabase> = null;
+        let sessionDb: Database | null = null;
+        try {
+            contextDb = openExistingContextDatabase(authorityDbPath, { readonly: true });
+            if (contextDb) {
+                sessionDb = new Database(openCodeDbResolution.path, {
+                    readonly: true,
+                    fileMustExist: true,
+                });
+                const dangling = listDanglingCompartmentBoundaries(contextDb, sessionDb);
+                if (dangling.length === 0) {
+                    pass("Compartment boundary ids resolve in the OpenCode session store");
+                } else {
+                    warn(`${dangling.length} compartment(s) have dangling OpenCode boundary ids`);
+                    for (const boundary of dangling) {
+                        log.warn(`  ${formatDanglingCompartmentBoundary(boundary)}`);
+                    }
+                }
+            } else {
+                log.info("Compartment boundary check: no context database found");
+            }
+        } catch (error) {
+            warn(
+                `Compartment boundary check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        } finally {
+            sessionDb?.close();
+            contextDb?.close();
+        }
+    }
 
     // 1b. CLI vs npm latest
     const selfVersion = getSelfVersion();
@@ -828,6 +884,7 @@ export async function runDoctor(
     }
 
     // 3. Check magic-context.jsonc exists + parses + loads through schema
+    let autoUpdateEnabled = true;
     if (existsSync(paths.magicContextConfig)) {
         pass(`Magic Context config: ${paths.magicContextConfig}`);
         // 3a. Validate JSONC parses (with config-variable substitution)
@@ -858,6 +915,7 @@ export async function runDoctor(
         // load and report them without bailing on the doctor run.
         try {
             const result = loadPluginConfig(process.cwd());
+            autoUpdateEnabled = result.auto_update !== false;
             const warnings = result.configWarnings ?? [];
             if (warnings.length > 0) {
                 warn(
@@ -1099,6 +1157,13 @@ export async function runDoctor(
     }
 
     // 4. Check plugin is in opencode.json
+    const reportedAutoUpdateStalls = new Set<string>();
+    const reportAutoUpdateStall = (specifier: string): void => {
+        const message = describeAutoUpdateStall(specifier, autoUpdateEnabled);
+        if (!message || reportedAutoUpdateStalls.has(message)) return;
+        reportedAutoUpdateStalls.add(message);
+        warn(message);
+    };
     if (paths.opencodeConfigFormat !== "none") {
         try {
             const raw = readFileSync(paths.opencodeConfig, "utf-8");
@@ -1158,7 +1223,8 @@ export async function runDoctor(
                     const isPinned = isPinnedOpenCodePluginSpecifier(oldEntryStr);
 
                     if (isPinned && !options.force) {
-                        // Warn but don't change — user intentionally pinned
+                        reportAutoUpdateStall(oldEntryStr);
+                        // Without --force, doctor reports pin ownership but leaves the config unchanged.
                         warn(
                             `Plugin pinned to ${oldEntryStr} in ${configName} — use 'doctor --force' to upgrade`,
                         );
@@ -1293,6 +1359,7 @@ export async function runDoctor(
                 } else {
                     const tuiPinned = isPinnedOpenCodePluginSpecifier(tuiEntryStr);
                     if (tuiPinned && !options.force) {
+                        reportAutoUpdateStall(tuiEntryStr);
                         warn(
                             `TUI plugin pinned to ${tuiEntryStr} — use 'doctor --force' to upgrade`,
                         );

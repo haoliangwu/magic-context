@@ -206,17 +206,18 @@ function advanceAfterRun(
     status: "completed" | "failed" | "skipped",
     error: string | null,
     schedulePatch?: TaskExecOutcome["schedulePatch"],
+    startedAt?: number,
 ): void {
     writeTaskScheduleState(db, {
         projectPath: projectIdentity,
         task: due.config.task,
-        // last_run_at means "last SUCCESSFUL run" — the cutoff for "changed since"
-        // gates (maintain-docs). A failed or skipped run did NOT process the
-        // work, so the cutoff must NOT advance past it (mirrors v1, where
-        // last_dream_at only advanced when a task succeeded).
+        // last_run_at = the start of the last SUCCESSFUL run — the cutoff for
+        // "changed since" gates. A message/compartment that landed DURING the run
+        // (after the start) is newer than the cutoff, so it re-triggers the gate next
+        // slot instead of being silently skipped. Failed/skipped runs never advance it.
         lastRunAt:
             status === "completed"
-                ? finishedAt
+                ? (startedAt ?? finishedAt)
                 : readLastRunAt(db, projectIdentity, due.config.task),
         nextDueAt: nextDueAtMs(due.config.schedule, finishedAt, due.scheduledAt),
         schedule: due.config.schedule,
@@ -369,6 +370,7 @@ async function runDomainGroup(
             }
 
             let outcome: TaskExecOutcome;
+            const startedAt = Date.now();
             try {
                 outcome = await executor(due.config, {
                     db,
@@ -391,6 +393,7 @@ async function runDomainGroup(
                     "completed",
                     null,
                     outcome.schedulePatch,
+                    startedAt,
                 );
                 cb?.onRan?.(due.config.task, outcome.detail, outcome.backlog);
             } else if (outcome.transient) {

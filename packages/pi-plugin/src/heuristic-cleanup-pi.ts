@@ -46,6 +46,7 @@ import {
 	applyCavemanCleanup,
 	type CavemanCleanupConfig,
 } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
+import type { DroppedTokenReduction } from "@magic-context/core/hooks/magic-context/dropped-token-estimate";
 import {
 	type EmergencyDropTag,
 	planEmergencyDrop,
@@ -113,6 +114,7 @@ export interface PiHeuristicCleanupResult {
 	emergencyDroppedTools: number;
 	compressedTextTags: number;
 	mutatedTextTags: number;
+	droppedTokenReductions: DroppedTokenReduction[];
 }
 
 /**
@@ -335,6 +337,7 @@ export function applyPiHeuristicCleanup(
 	let deduplicatedTools = 0;
 	let droppedInjections = 0;
 	let droppedStaleReduceCalls = 0;
+	const droppedTokenReductions: DroppedTokenReduction[] = [];
 
 	// ── Pass 1: tiered target-headroom emergency drop ─────────────────
 	// Replaces the old need-blind aged-drop + dropAllTools nuke. Runs only when
@@ -409,6 +412,10 @@ export function applyPiHeuristicCleanup(
 						);
 						droppedTools++;
 						emergencyDroppedTools++;
+						droppedTokenReductions.push({
+							tagNumber: tag.tagNumber,
+							mode: skeleton ? "truncated" : "full",
+						});
 					}
 				}
 			}).immediate();
@@ -489,6 +496,10 @@ export function applyPiHeuristicCleanup(
 						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 						if (dropResult === "removed" || didReplace) {
 							droppedInjections++;
+							droppedTokenReductions.push({
+								tagNumber: tag.tagNumber,
+								mode: "full",
+							});
 						}
 					}
 				} else {
@@ -500,7 +511,17 @@ export function applyPiHeuristicCleanup(
 							tag.messageId,
 						)
 					) {
-						if (target.setContent(stripped)) droppedInjections++;
+						if (target.setContent(stripped)) {
+							droppedInjections++;
+							droppedTokenReductions.push({
+								tagNumber: tag.tagNumber,
+								mode: "partial",
+								removedCharacters: Math.max(
+									0,
+									content.length - stripped.length,
+								),
+							});
+						}
 					}
 				}
 			}
@@ -546,6 +567,10 @@ export function applyPiHeuristicCleanup(
 					updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 					if (result === "removed" || result === "truncated") {
 						deduplicatedTools++;
+						droppedTokenReductions.push({
+							tagNumber: tag.tagNumber,
+							mode: "full",
+						});
 					}
 				}
 			}
@@ -578,6 +603,15 @@ export function applyPiHeuristicCleanup(
 			cavemanResult.compressedToFull +
 			cavemanResult.compressedToUltra;
 		mutatedTextTags = cavemanResult.mutatedTextTags;
+		if (cavemanResult.textReductions) {
+			for (const r of cavemanResult.textReductions) {
+				droppedTokenReductions.push({
+					tagNumber: r.tagNumber,
+					mode: "partial",
+					removedCharacters: r.removedCharacters,
+				});
+			}
+		}
 	}
 
 	return {
@@ -588,6 +622,7 @@ export function applyPiHeuristicCleanup(
 		emergencyDroppedTools,
 		compressedTextTags,
 		mutatedTextTags,
+		droppedTokenReductions,
 	};
 }
 

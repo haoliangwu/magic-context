@@ -480,6 +480,59 @@ describe("detectConflicts", () => {
         });
     });
 
+    describe("OpenCode 2 compaction ownership", () => {
+        it("keeps MC enabled when host auto-compaction is on and never reads v1 prune", () => {
+            const previous = process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            const resolved = {
+                auto: true,
+                get prune(): boolean {
+                    throw new Error("v2 must not read compaction.prune");
+                },
+                keepTokens: 4_096,
+                buffer: 1_024,
+            };
+            const result = detectConflicts(projectDir, {
+                compactionEnabled: true,
+                hostGeneration: "v2",
+                resolvedCompaction: resolved,
+            });
+            expect(result.hasConflict).toBe(false);
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.conflicts.compactionPrune).toBe(false);
+            expect(result.nativeCompaction).toEqual({ auto: true, prune: false });
+            if (previous === undefined) delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            else process.env.OPENCODE_DISABLE_AUTOCOMPACT = previous;
+        });
+
+        it("reads the GA v2 auto, keep.tokens, and buffer shape", async () => {
+            const result = await resolveCompactionForBoot(
+                {
+                    config: {
+                        get: async () => ({
+                            data: {
+                                compaction: {
+                                    auto: true,
+                                    keep: { tokens: 4_096 },
+                                    buffer: 1_024,
+                                    prune: true,
+                                },
+                            },
+                        }),
+                    },
+                },
+                2_000,
+                "v2",
+            );
+            expect(result).toEqual({
+                auto: true,
+                prune: false,
+                keepTokens: 4_096,
+                buffer: 1_024,
+            });
+        });
+    });
+
     // --- Resolved-config arm (issue #309) ---
     // The plugin boot now consumes the host's RESOLVED config
     // (ctx.client.config.get()) instead of re-deriving compaction from files.

@@ -7,17 +7,22 @@ import { PiTestHarness } from "../src/pi-harness";
 // `agent_end` in single-shot mode. Today `pi --print` exits immediately after
 // the parent turn, which makes those async features intentionally out of scope.
 
+const selectedHost = process.env.MC_E2E_HOST ?? "pi";
+if (selectedHost !== "pi" && selectedHost !== "omp") {
+    throw new Error(`pi-smoke.test.ts requires MC_E2E_HOST=pi|omp, got ${selectedHost}`);
+}
+
 let h: PiTestHarness;
 
 beforeAll(async () => {
-    h = await PiTestHarness.create();
+    h = await PiTestHarness.create({ host: selectedHost });
 });
 
 afterAll(async () => {
-    await h.dispose();
+    await h?.dispose();
 });
 
-describe("pi smoke", () => {
+describe(`${selectedHost} smoke`, () => {
     it("plugin loads, no crash, and tools are registered", async () => {
         h.mock.reset();
         h.mock.setDefault({

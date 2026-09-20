@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 const DB_SHA256: &str = "f589668287f41abaeb2a6526ee6d6f9d162e7ed80b1650f1ca5ec0a45984b8c0";
 const CAPTURE_SHA256: &str = "766c26e1fab1129e0866e275c22d79e111a4382140f4334095279c46f26f526b";
-const INDEX_SHA256: &str = "6fabae55b1f1679fc72c40e1577e14c36d4c16d419b76aeaeb66628caa867b9c";
+const INDEX_SHA256: &str = "dc9b6c50efdce01b31007e80eac51d53083f2946d5fa6bae79b01bb9e712239a";
 const CANONICAL_VECTORS_SHA256: &str =
     "8fc5b1b90997378941534bd5a0d88bebd6b10282f030ad25315612d77285f012";
 const DIGEST_PLACEHOLDER: &str = "<computed-by-slice-0>";
@@ -610,6 +610,7 @@ fn d5_fixture_index_pins_every_sibling_and_scans_for_secrets() {
                 | "capacity-estimate-vectors-v1.json"
                 | "output-identity-vectors-v1.json"
                 | "coverage-proof-vectors-v1.json"
+                | "d5-inherited-transfer-vectors-v1.json"
                 | "aggregate-preimages-v1.json"
         ) {
             assert_eq!(entry["derived"], Value::Bool(false));
@@ -627,6 +628,9 @@ fn d5_fixture_index_pins_every_sibling_and_scans_for_secrets() {
                 }
                 "coverage-proof-vectors-v1.json" => {
                     "owner-authored D5 coverage-proof contract vectors"
+                }
+                "d5-inherited-transfer-vectors-v1.json" => {
+                    "owner-authored D5 inherited-member transfer vectors"
                 }
                 "aggregate-preimages-v1.json" => {
                     "independently derived R17.4 CE1 aggregate preimages"

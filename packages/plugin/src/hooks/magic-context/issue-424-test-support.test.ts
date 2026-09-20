@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
+import { buildCompartmentAgentPrompt } from "./compartment-prompt";
 import { validateHistorianOutput } from "./compartment-runner-validation";
 import { issue424Fixture } from "./issue-424-fixture";
 import {
@@ -10,7 +12,8 @@ import {
     resolveProtectedTailBoundary,
     resolveWrapupProtectedTailBoundary,
 } from "./protected-tail-boundary";
-import { setRawMessageProvider } from "./read-session-chunk";
+import { readSessionChunk, setRawMessageProvider } from "./read-session-chunk";
+import { estimateTokens } from "./read-session-formatting";
 import type { RawMessage } from "./read-session-raw";
 import {
     buildToolArcs,
@@ -46,6 +49,132 @@ export function registerIssue424Tests(
         }
     }
     describe(`issue 424 ${harness} boundary evidence`, () => {
+        test("consecutive completed arcs stop after the one that crosses the formatted budget", () => {
+            const raw: RawMessage[] = [
+                {
+                    ordinal: 1,
+                    id: "m1",
+                    role: "user",
+                    parts: [{ type: "text", text: "Inspect each target." }],
+                },
+            ];
+            const entries: Array<Record<string, unknown>> = [
+                {
+                    type: "message",
+                    id: "m1",
+                    message: { role: "user", content: "Inspect each target." },
+                },
+            ];
+            for (let i = 0; i < 260; i++) {
+                const callID = `chain-${i}`;
+                const description = `Inspect target ${i}: ${"detail ".repeat(950)}`;
+                raw.push({
+                    ordinal: raw.length + 1,
+                    id: `m${raw.length + 1}`,
+                    role: "assistant",
+                    parts: [
+                        {
+                            type: "tool",
+                            callID,
+                            tool: "read",
+                            state: { input: { description }, status: "running" },
+                        },
+                    ],
+                });
+                entries.push({
+                    type: "message",
+                    id: `m${entries.length + 1}`,
+                    message: {
+                        role: "assistant",
+                        stopReason: "toolUse",
+                        content: [
+                            {
+                                type: "toolCall",
+                                id: callID,
+                                name: "read",
+                                arguments: { description },
+                            },
+                        ],
+                    },
+                });
+                raw.push({
+                    ordinal: raw.length + 1,
+                    id: `m${raw.length + 1}`,
+                    role: "user",
+                    parts: [
+                        {
+                            type: "tool",
+                            callID,
+                            tool: "read",
+                            state: { output: `result ${i}`, status: "completed" },
+                        },
+                    ],
+                });
+                entries.push({
+                    type: "message",
+                    id: `m${entries.length + 1}`,
+                    message: {
+                        role: "toolResult",
+                        toolCallId: callID,
+                        toolName: "read",
+                        content: [{ type: "text", text: `result ${i}` }],
+                    },
+                });
+            }
+            const converted = convert({ raw, entries } as ReturnType<typeof issue424Fixture>);
+            const arcs = buildToolArcs(converted);
+            const sessionId = `issue424-chain-cap-${harness}`;
+            const dispose = setRawMessageProvider(sessionId, { readMessages: () => converted });
+            try {
+                const uncapped = readSessionChunk(sessionId, 1_000_000, 2, converted.length + 1);
+                expect(estimateTokens(uncapped.text)).toBeGreaterThan(230_145);
+                const budget = 50_000;
+                let lo = 0;
+                let hi = arcs.length - 1;
+                while (lo < hi) {
+                    const mid = (lo + hi) >> 1;
+                    const end = arcs[mid]?.resOrdinal;
+                    if (end === null || end === undefined) throw new Error("missing completed arc");
+                    const prefix = readSessionChunk(sessionId, 1_000_000, 2, end + 1);
+                    if (estimateTokens(prefix.text) > budget) hi = mid;
+                    else lo = mid + 1;
+                }
+                const expectedResult = arcs[lo]?.resOrdinal;
+                expect(expectedResult).not.toBeNull();
+                expect(expectedResult).toBeDefined();
+                const chunk = readSessionChunk(sessionId, budget, 2, converted.length + 1);
+                expect(chunk.endIndex).toBe(expectedResult!);
+                expect(chunk.hasMore).toBe(true);
+                expect(estimateTokens(chunk.text)).toBeGreaterThan(budget);
+            } finally {
+                dispose();
+            }
+        });
+
+        test("unclamped issue 424 producer prompts retain their byte hash", () => {
+            const raw = convert(issue424Fixture(6, 1));
+            const sessionId = `issue424-byte-pin-${harness}`;
+            const dispose = setRawMessageProvider(sessionId, { readMessages: () => raw });
+            try {
+                const chunk = readSessionChunk(sessionId, 32_000, 2, raw.length + 1);
+                const prompt = buildCompartmentAgentPrompt({
+                    seedExamples: "",
+                    sessionReferences: "",
+                    projectMemory: "",
+                    inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunk.text}`,
+                    memoryEnabled: false,
+                });
+                const hash = createHash("sha256").update(prompt).digest("hex");
+                expect(hash).toBe(
+                    harness === "pi"
+                        ? "8e5867276872c4e24a37016ed5141f3195ffe562d92a1280c9bbbe13327b81a5"
+                        : "19d7318a95db472ee08f24bfcc3b3f9d5cb094d458f1ac16590bff6655fcbde1",
+                );
+            } finally {
+                dispose();
+            }
+        });
+
         test("300 parallel batches with steering inside batches already progress below force pressure", () => {
             const raw = convert(issue424Fixture());
             const boundary = resolve(raw, "ordinary");

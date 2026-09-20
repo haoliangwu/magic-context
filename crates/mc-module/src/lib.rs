@@ -68,16 +68,16 @@ use cortexkit_store_types::{sqlite_store_path, Isolation, StorageBackend, Storag
 use mc_store::TagNumberRow;
 use mc_store::{
     canonical_root, validate_state_import_compartments, AuthoritySeedRow, DeferredExecuteState,
-    FacadeMutationOutcome, HistorianChunkRange, HistorianDecision, HistorianPhase,
-    HistorianRecentDecision, InsertMemoryInput, LoadedState, MappingUpdate, McStore, McStoreError,
-    McTagRow, ModuleDropSeedRow, ModuleMemoryMutationRow, ModuleMemoryRow, ModuleStateSyncError,
-    ModuleStateSyncRequest, ModuleStripSeedRow, ModuleWorkspaceMemberRow, ModuleWorkspaceRow,
-    NoteCasOutcome, NoteDismissOutcome, NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed,
-    NoteWriteInput, PendingAgentDrop, PendingAgentDropSeedRow, PendingCompactionMarkerState,
-    RecordWrapupCommandOutcome, StateImportError, StateImportPreflight, StateImportValidationError,
-    StoredChunkTranscript, StoredCompartment, StoredMemoryMutation, StoredNote,
-    TodoStateSetOutcome, UserHintSeedRow, VerificationUpdate, WrapupCommandRecord,
-    LATEST_MIGRATION_VERSION,
+    FacadeMemoryMutationError, FacadeMutationOutcome, HistorianChunkRange, HistorianDecision,
+    HistorianPhase, HistorianRecentDecision, HostMemoryIdentityAck, InsertMemoryInput, LoadedState,
+    MappingUpdate, McStore, McStoreError, McTagRow, ModuleDropSeedRow, ModuleMemoryMutationRow,
+    ModuleMemoryRow, ModuleStateSyncError, ModuleStateSyncRequest, ModuleStripSeedRow,
+    ModuleWorkspaceMemberRow, ModuleWorkspaceRow, NoteCasOutcome, NoteDismissOutcome,
+    NoteEvaluationInput, NoteInput, NoteNudgeAnchorSeed, NoteWriteInput, PendingAgentDrop,
+    PendingAgentDropSeedRow, PendingCompactionMarkerState, RecordWrapupCommandOutcome,
+    StateImportError, StateImportPreflight, StateImportValidationError, StoredChunkTranscript,
+    StoredCompartment, StoredMemoryMutation, StoredNote, TodoStateSetOutcome, UserHintSeedRow,
+    VerificationUpdate, WrapupCommandRecord, LATEST_MIGRATION_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -1919,6 +1919,7 @@ impl ModuleMemoryWire {
             .unwrap_or_else(|| mc_store::compute_normalized_memory_hash(&self.content));
         ModuleMemoryRow {
             id: self.id,
+            host_row_id: Some(self.id),
             project_path,
             category: self.category,
             content: self.content,
@@ -8200,6 +8201,55 @@ impl McHandler {
         }
     }
 
+    fn handle_mirror_memory_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some(module_row_id) = request.get("module_row_id").and_then(Value::as_i64) else {
+            return invalid_params_error("mirror.memory requires module_row_id");
+        };
+        match store.pull_memory_changefeed_row(module_row_id) {
+            Ok(row) => respond(json!({ "ok": true, "row": row })),
+            Err(error) => HandlerOutcome::Error {
+                code: "mirror_memory_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn handle_memory_identity_ack_value(&self, request: &Value) -> HandlerOutcome {
+        let Some(store) = self.store.get() else {
+            return store_unavailable_error();
+        };
+        let Some(project) = request.get("project").and_then(Value::as_str) else {
+            return invalid_params_error("memory.identity.ack requires project");
+        };
+        let Some(rows) = request.get("rows").and_then(Value::as_array) else {
+            return invalid_params_error("memory.identity.ack requires rows");
+        };
+        let acknowledgements = rows
+            .iter()
+            .map(|row| {
+                Some(HostMemoryIdentityAck {
+                    module_row_id: row.get("module_row_id")?.as_i64()?,
+                    host_row_id: row.get("context_row_id")?.as_i64()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(acknowledgements) = acknowledgements else {
+            return invalid_params_error(
+                "memory.identity.ack rows require module_row_id and context_row_id",
+            );
+        };
+        match store.acknowledge_host_memory_ids(project, &acknowledgements) {
+            Ok(acknowledged) => respond(json!({ "ok": true, "acknowledged": acknowledged })),
+            Err(error) => HandlerOutcome::Error {
+                code: "memory_identity_ack_failed".to_string(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     fn handle_mirror_pull_value(&self, request: &Value) -> HandlerOutcome {
         let Some(store) = self.store.get() else {
             return store_unavailable_error();
@@ -8817,6 +8867,24 @@ impl McHandler {
         let request_decode_started_at = Instant::now();
         let mut delta_expand_ms = 0.0;
         const REQUEST_OBSERVED_KEY: &str = "request_observed_at_ms";
+        let request_attempt_id = request
+            .get("attempt_id")
+            .and_then(Value::as_str)
+            .filter(|attempt_id| !attempt_id.is_empty())
+            .map(|attempt_id| attempt_id.chars().take(128).collect::<String>())
+            .unwrap_or_else(|| {
+                format!(
+                    "legacy-{}-{}",
+                    request
+                        .get(REQUEST_OBSERVED_KEY)
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    request
+                        .get("full_array_fingerprint")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                )
+            });
         let request_observed_to_handler = request
             .get(REQUEST_OBSERVED_KEY)
             .and_then(Value::as_u64)
@@ -8910,6 +8978,10 @@ impl McHandler {
                 };
             }
         };
+        let pass_now = now_ms();
+        let trace_received_started_at = Instant::now();
+        let _ = store.trace_pass_received(&parsed.session_id, &request_attempt_id, pass_now);
+        let trace_received_ms = trace_received_started_at.elapsed().as_secs_f64() * 1_000.0;
         apply_claude_code_config_controls(&mut parsed, &binding.config, serializer_profile);
         parsed
             .prompt_surface_tool_descriptions
@@ -9008,7 +9080,6 @@ impl McHandler {
                     };
                 }
             };
-        let pass_now = now_ms();
         match serializer_profile {
             Some(SerializerProfile::OpencodeAiSdk) => {
                 if let Some((data_url, content_hash)) = host_mural_artifact(parsed.mural.as_ref()) {
@@ -9060,12 +9131,6 @@ impl McHandler {
             HISTORIAN_SIDE_CHANNEL_DRAIN_PER_KIND,
         );
         let side_channel_drain_ms = side_channel_drain_started_at.elapsed().as_secs_f64() * 1_000.0;
-        // This trace is intentionally outside the fenced cache-state commit: a rejected
-        // pass must still leave a durable breadcrumb, and a trace failure must never
-        // change the transform result.
-        let trace_received_started_at = Instant::now();
-        let _ = store.trace_pass_received(&parsed.session_id, pass_now);
-        let trace_received_ms = trace_received_started_at.elapsed().as_secs_f64() * 1_000.0;
         let hostless_usable_soft = parsed
             .geometry
             .as_ref()
@@ -9221,7 +9286,12 @@ impl McHandler {
                         },
                     );
             }
-            let _ = store.trace_pass_rejected(&parsed.session_id, &message, now_ms());
+            let _ = store.trace_pass_rejected(
+                &parsed.session_id,
+                &request_attempt_id,
+                &message,
+                now_ms(),
+            );
             HandlerOutcome::Error {
                 code: code.to_string(),
                 message,
@@ -9502,7 +9572,7 @@ impl McHandler {
         );
         let native_attach_ms = native_attach_started_at.elapsed().as_secs_f64() * 1_000.0;
         let trace_complete_started_at = Instant::now();
-        let _ = store.trace_pass_completed(&parsed.session_id, now_ms());
+        let _ = store.trace_pass_completed(&parsed.session_id, &request_attempt_id, now_ms());
         let trace_complete_ms = trace_complete_started_at.elapsed().as_secs_f64() * 1_000.0;
         let response_observation_started_at = Instant::now();
         self.record_response_observation(&parsed.session_id, now_ms());
@@ -11741,6 +11811,7 @@ impl McHandler {
             }
             reply.push_str(&ctx_reduce_held_reply(&deferred));
         }
+        reply.push_str(" Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later.");
         mcp_text_result(reply, false)
     }
 
@@ -11752,7 +11823,7 @@ impl McHandler {
         let Some(action) = string_arg(args, "action") else {
             return invalid_params_error("ctx_memory requires an action");
         };
-        if let Err(error) = validate_memory_id_arguments(args)
+        if let Err(error) = validate_memory_id_arguments(args, action)
             .and_then(|_| validate_string_cap(args, "content", MAX_MEMORY_CONTENT_BYTES))
             .and_then(|_| validate_string_cap(args, "reason", MAX_SHORT_FIELD_BYTES))
         {
@@ -11775,6 +11846,43 @@ impl McHandler {
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
+        let id_lane = match memory_id_lane(args) {
+            Ok(lane) => lane,
+            Err(error) => return tool_error_result(format!("Error: {error}.")),
+        };
+        let module_request_ids = memory_ids(args, action);
+        let requested_host_ids = host_memory_ids(args);
+        let mut host_id_by_module = HashMap::new();
+        if id_lane == MemoryIdLane::Host {
+            if module_request_ids.len() != requested_host_ids.len() {
+                return tool_error_result(
+                    "Error: host memory ids must accompany every translated module id.".to_string(),
+                );
+            }
+            for (module_id, host_id) in module_request_ids
+                .iter()
+                .copied()
+                .zip(requested_host_ids.iter().copied())
+            {
+                let acknowledged = store
+                    .get_memory_full(module_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|memory| memory.host_row_id);
+                if acknowledged != Some(host_id) {
+                    return tool_error_result(format!(
+                        "Error: memory id {host_id} has no module mapping yet — it was written seconds ago or the mirror is behind; retry or use the id shown in <project-memory>."
+                    ));
+                }
+                host_id_by_module.insert(module_id, host_id);
+            }
+        } else if !requested_host_ids.is_empty() {
+            return tool_error_result("Error: host_ids require memory_id_lane 'host'.".to_string());
+        }
+        let request_context = MemoryFacadeRequestContext {
+            lane: id_lane,
+            host_id_by_module,
+        };
         if is_mutation {
             if let Err(error) = store.enforce_facade_project_vocabulary(
                 facade_scope.route_project_root.as_str(),
@@ -11839,10 +11947,20 @@ impl McHandler {
                                     metadata_json: None,
                                     now_ms: now_ms(),
                                 })
-                                .map_err(|error| error.to_string())?;
-                            facade_text_response(
-                                format!("Saved memory [ID: {id}] in {category}."),
+                                .map_err(|error| {
+                                    request_context.render_mutation_error(
+                                        FacadeMemoryMutationError::Storage(error),
+                                    )
+                                })?;
+                            let text = if id_lane == MemoryIdLane::Host {
+                                format!("Saved memory in {category}. Its id will appear in <project-memory> on the next pass.")
+                            } else {
+                                format!("Saved memory [ID: {id}] in {category}.")
+                            };
+                            mcp_memory_result(
+                                text,
                                 false,
+                                json!({ "action": "write", "module_id": id, "category": category }),
                             )
                         },
                     ),
@@ -11850,11 +11968,12 @@ impl McHandler {
                 )
             }
             "update" => {
-                let category =
-                    match memory_tool::validate_update_category(string_arg(args, "category")) {
-                        Ok(category) => category,
-                        Err(error) => return tool_error_result(format!("Error: {error}.")),
-                    };
+                let category = match memory_tool::validate_update_category(non_empty_string_arg(
+                    args, "category",
+                )) {
+                    Ok(category) => category,
+                    Err(error) => return tool_error_result(format!("Error: {error}.")),
+                };
                 let Some(id) = single_memory_id(args, "update") else {
                     return tool_error_result(
                         "Error: provide exactly one memory id when action is 'update'.",
@@ -11883,12 +12002,22 @@ impl McHandler {
                                     category,
                                     now_ms(),
                                 )
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| format!("memory {id} was not found"))?;
+                                .map_err(|error| request_context.render_mutation_error(error))?;
+                            let rendered_id = if id_lane == MemoryIdLane::Host {
+                                request_context
+                                    .host_id_by_module
+                                    .get(&memory.id)
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        "translated host memory identity disappeared".to_string()
+                                    })?
+                            } else {
+                                memory.id
+                            };
                             facade_text_response(
                                 format!(
-                                    "Updated memory [ID: {}] in {}.",
-                                    memory.id, memory.category
+                                    "Updated memory [ID: {rendered_id}] in {}.",
+                                    memory.category
                                 ),
                                 false,
                             )
@@ -11904,7 +12033,7 @@ impl McHandler {
                         "Error: provide at least one memory id when action is 'archive'.",
                     );
                 }
-                let reason = string_arg(args, "reason");
+                let reason = non_empty_string_arg(args, "reason");
                 facade_command_outcome(
                     store.with_facade_command(
                         facade_scope.route_project_root.as_str(),
@@ -11917,16 +12046,32 @@ impl McHandler {
                         |tx| {
                             let archived = tx
                                 .archive_memories(memory_project, &ids, reason, now_ms())
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| "memories could not be archived".to_string())?;
+                                .map_err(|error| request_context.render_mutation_error(error))?;
                             if archived.is_empty() {
                                 facade_text_response(
                                     "No active memories needed archiving.".to_string(),
                                     false,
                                 )
                             } else {
+                                let rendered_ids = if id_lane == MemoryIdLane::Host {
+                                    archived
+                                        .iter()
+                                        .map(|id| {
+                                            request_context
+                                                .host_id_by_module
+                                                .get(id)
+                                                .copied()
+                                                .ok_or_else(|| {
+                                                    "translated host memory identity disappeared"
+                                                        .to_string()
+                                                })
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?
+                                } else {
+                                    archived
+                                };
                                 facade_text_response(
-                                    format!("Archived memory IDs [{}].", join_i64s(&archived)),
+                                    format!("Archived memory IDs [{}].", join_i64s(&rendered_ids)),
                                     false,
                                 )
                             }
@@ -11936,6 +12081,12 @@ impl McHandler {
                 )
             }
             "merge" => {
+                let category = match memory_tool::validate_update_category(non_empty_string_arg(
+                    args, "category",
+                )) {
+                    Ok(category) => category,
+                    Err(error) => return tool_error_result(format!("Error: {error}.")),
+                };
                 let Some(ids) = merge_ids(args) else {
                     return tool_error_result(
                         "Error: provide target_id plus source_ids, or at least two ids when action is 'merge'.",
@@ -11956,7 +12107,7 @@ impl McHandler {
                         action,
                         command_id.as_deref(),
                         |tx| {
-                            let (memory, superseded_ids) = tx
+                            let (mut memory, superseded_ids) = tx
                                 .merge_memories_canonical(
                                     memory_project,
                                     &ids,
@@ -11964,17 +12115,64 @@ impl McHandler {
                                     Some(conversation_key),
                                     now_ms(),
                                 )
-                                .map_err(|error| error.to_string())?
-                                .ok_or_else(|| "memories could not be merged".to_string())?;
-                            facade_text_response(
+                                .map_err(|error| request_context.render_mutation_error(error))?;
+                            if category.is_some_and(|category| category != memory.category) {
+                                memory = tx
+                                    .update_memory_content(
+                                        memory_project,
+                                        memory.id,
+                                        content,
+                                        category,
+                                        now_ms(),
+                                    )
+                                    .map_err(|error| request_context.render_mutation_error(error))?;
+                            }
+                            let rendered_inputs = if id_lane == MemoryIdLane::Host {
+                                requested_host_ids.clone()
+                            } else {
+                                ids.clone()
+                            };
+                            let rendered_superseded = if id_lane == MemoryIdLane::Host {
+                                superseded_ids
+                                    .iter()
+                                    .filter_map(|id| {
+                                        request_context.host_id_by_module.get(id).copied()
+                                    })
+                                    .collect::<Vec<_>>()
+                            } else {
+                                superseded_ids.clone()
+                            };
+                            let text = if id_lane == MemoryIdLane::Host {
+                                match memory.host_row_id {
+                                    Some(host_id) => format!(
+                                        "Merged memories [{}] into canonical memory [ID: {host_id}] in {}; superseded [{}].",
+                                        join_i64s(&rendered_inputs),
+                                        memory.category,
+                                        join_i64s(&rendered_superseded)
+                                    ),
+                                    None => format!(
+                                        "Merged memories [{}] into a canonical memory in {}. Its id will appear in <project-memory> on the next pass.",
+                                        join_i64s(&rendered_inputs), memory.category
+                                    ),
+                                }
+                            } else {
                                 format!(
                                     "Merged memories [{}] into canonical memory [ID: {}] in {}; superseded [{}].",
-                                    join_i64s(&ids),
+                                    join_i64s(&rendered_inputs),
                                     memory.id,
                                     memory.category,
-                                    join_i64s(&superseded_ids)
-                                ),
+                                    join_i64s(&rendered_superseded)
+                                )
+                            };
+                            mcp_memory_result(
+                                text,
                                 false,
+                                json!({
+                                    "action": "merge",
+                                    "canonical_module_id": memory.id,
+                                    "superseded_module_ids": superseded_ids,
+                                    "category": memory.category,
+                                }),
                             )
                         },
                     ),
@@ -11985,6 +12183,7 @@ impl McHandler {
                 let limit = args
                     .get("limit")
                     .and_then(Value::as_u64)
+                    .filter(|value| *value > 0)
                     .unwrap_or(20)
                     .clamp(1, 100) as usize;
                 let category = non_empty_string_arg(args, "category");
@@ -11998,12 +12197,21 @@ impl McHandler {
                         if rows.is_empty() {
                             return mcp_text_result("No active memories found.".to_string(), false);
                         }
+                        let pending_host_id = id_lane == MemoryIdLane::Host
+                            && rows.iter().any(|memory| memory.host_row_id.is_none());
                         let body = rows
                             .iter()
                             .map(|memory| {
+                                let prefix = if id_lane == MemoryIdLane::Host {
+                                    memory.host_row_id.map_or_else(
+                                        || "Memory".to_string(),
+                                        |id| format!("Memory [ID: {id}]"),
+                                    )
+                                } else {
+                                    format!("Memory [ID: {}]", memory.id)
+                                };
                                 format!(
-                                    "Memory [ID: {}] in {} (status: {}): {}",
-                                    memory.id,
+                                    "{prefix} in {} (status: {}): {}",
                                     memory.category,
                                     memory.status,
                                     memory
@@ -12015,9 +12223,14 @@ impl McHandler {
                             })
                             .collect::<Vec<_>>()
                             .join("\n");
+                        let mirror_note = if pending_host_id {
+                            "\nNote: one or more memory ids are waiting for the host mirror; retry after the next pass."
+                        } else {
+                            ""
+                        };
                         mcp_text_result(
                             format!(
-                                "Found {} active {}:\n\n{body}",
+                                "Found {} active {}:\n\n{body}{mirror_note}",
                                 rows.len(),
                                 if rows.len() == 1 {
                                     "memory"
@@ -12028,7 +12241,10 @@ impl McHandler {
                             false,
                         )
                     }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
+                    Err(error) => tool_error_result(format!(
+                        "Error: {}",
+                        request_context.render_store_error(error)
+                    )),
                 }
             }
             "get" => {
@@ -12041,20 +12257,34 @@ impl McHandler {
                             .collect::<std::collections::HashMap<_, _>>();
                         let lines = ids
                             .iter()
-                            .map(|id| match by_id.get(id) {
-                                Some(memory) => format!(
-                                    "Memory [ID: {}] in {} (status: {}): {}",
-                                    memory.id, memory.category, memory.status, memory.content
-                                ),
-                                None => {
-                                    format!("id {id}: not found or not visible from this project")
+                            .map(|id| {
+                                let rendered_id = if id_lane == MemoryIdLane::Host {
+                                    request_context
+                                        .host_id_by_module
+                                        .get(id)
+                                        .copied()
+                                        .expect("host lane ids were validated before facade dispatch")
+                                } else {
+                                    *id
+                                };
+                                match by_id.get(id) {
+                                    Some(memory) => format!(
+                                        "Memory [ID: {rendered_id}] in {} (status: {}): {}",
+                                        memory.category, memory.status, memory.content
+                                    ),
+                                    None => format!(
+                                        "id {rendered_id}: not found or not visible from this project"
+                                    ),
                                 }
                             })
                             .collect::<Vec<_>>()
                             .join("\n\n");
                         mcp_text_result(lines, false)
                     }
-                    Err(error) => tool_error_result(format!("Error: {error}")),
+                    Err(error) => tool_error_result(format!(
+                        "Error: {}",
+                        request_context.render_tool_error(error)
+                    )),
                 }
             }
             _ => tool_error_result("Error: Unknown ctx_memory action.".to_string()),
@@ -12072,7 +12302,10 @@ impl McHandler {
         if let Err(error) = validate_string_cap(args, "query", MAX_QUERY_BYTES) {
             return tool_error_result(format!("Error: {error}."));
         }
-        let limit = usize_arg(args, "limit").unwrap_or(8).clamp(1, 25);
+        let limit = usize_arg(args, "limit")
+            .filter(|value| *value > 0)
+            .unwrap_or(8)
+            .clamp(1, 25);
         let sources = facade_search_sources(args);
         let facade_scope = match self
             .resolve_facade_scope(channel, Some(args), "memories", false)
@@ -12087,18 +12320,32 @@ impl McHandler {
         };
         let memory_project = facade_scope.memory_project_path.as_str();
         let conversation_key = facade_scope.conversation_key.as_str();
-        let visible_memory_ids = match store.load(conversation_key) {
-            Ok(state) => state
-                .meta
-                .rendered_memory_ids
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
+        let state = match store.load(conversation_key) {
+            Ok(state) => state,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
         let include_memories = facade_scope.memory_enabled && sources.memory;
         let workspace_membership = match store.resolve_workspace_membership(memory_project) {
             Ok(membership) => membership,
             Err(error) => return tool_error_result(format!("Error: {error}")),
+        };
+        let host_backed_memory_ids = !state.meta.last_serializer_profile.is_empty()
+            && state.meta.last_serializer_profile != "claude-code-anthropic";
+        let visible_memory_ids = if host_backed_memory_ids {
+            let paths = workspace_membership
+                .as_ref()
+                .map(|workspace| workspace.union_identities.clone())
+                .unwrap_or_else(|| vec![memory_project.to_string()]);
+            match store.module_memory_ids_for_host_ids(&paths, &state.meta.rendered_memory_ids) {
+                Ok(mapped) => mapped.values().copied().collect::<BTreeSet<_>>(),
+                Err(error) => return tool_error_result(format!("Error: {error}")),
+            }
+        } else {
+            state
+                .meta
+                .rendered_memory_ids
+                .into_iter()
+                .collect::<BTreeSet<_>>()
         };
 
         if include_memories {
@@ -12175,12 +12422,11 @@ impl McHandler {
             None => return store_unavailable_error(),
         };
         let session_id = facade_scope.conversation_key.as_str();
-        if args.get("message").is_some() {
-            // Ordinal 0 is a real message on the Claude Code leg (its chunk
-            // transcripts store 0-based ordinals), so the domain is non-negative.
-            let Some(message) = i64_arg(args, "message").filter(|value| *value >= 0) else {
-                return tool_error_result("Error: message must be a non-negative integer.");
-            };
+        let expand_mode = match resolve_ctx_expand_mode(args) {
+            Ok(mode) => mode,
+            Err(error) => return tool_error_result(error),
+        };
+        if let CtxExpandMode::Message(message) = expand_mode {
             if let Some(raw_message) =
                 self.cached_expand_messages(session_id)
                     .and_then(|messages| {
@@ -12211,21 +12457,16 @@ impl McHandler {
                 Err(error) => tool_error_result(format!("Error: {error}")),
             };
         }
-        let Some(start) = i64_arg(args, "start") else {
+        let CtxExpandMode::Range {
+            start,
+            end,
+            verbose,
+        } = expand_mode
+        else {
             return tool_error_result(
                 "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
             );
         };
-        let Some(end) = i64_arg(args, "end") else {
-            return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
-            );
-        };
-        if start < 0 || end < start {
-            return tool_error_result(
-                "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end).",
-            );
-        }
         let last_compacted_ordinal = match store.last_compacted_ordinal(session_id) {
             Ok(ordinal) => ordinal,
             Err(error) => return tool_error_result(format!("Error: {error}")),
@@ -12259,7 +12500,7 @@ impl McHandler {
             Ok(transcripts) => transcripts,
             Err(error) => return tool_error_result(format!("Error: {error}")),
         };
-        if args.get("verbose").and_then(Value::as_bool) == Some(true) {
+        if verbose {
             let durable_messages = durable_expand_messages(&transcripts);
             let rendered = self
                 .cached_expand_messages(session_id)
@@ -12434,39 +12675,36 @@ impl McHandler {
         let action = string_arg(args, "action")
             .or_else(|| non_empty_string_arg(args, "content").map(|_| "write"))
             .unwrap_or("read");
-        let has_note_id = args.contains_key("note_id");
-        let has_note_ids = args.contains_key("note_ids");
-        if has_note_id && has_note_ids {
-            return tool_error_result(
-                "Error: 'note_id' and 'note_ids' cannot be used together; provide one or the other.",
-            );
-        }
-        if has_note_ids && action != "dismiss" {
-            return tool_error_result("Error: 'note_ids' is only valid when action is 'dismiss'.");
-        }
-        let note_ids = if action == "dismiss" && has_note_ids {
-            let Some(values) = args.get("note_ids").and_then(Value::as_array) else {
-                return tool_error_result(
-                    "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
-                );
-            };
-            if !(1..=50).contains(&values.len()) {
-                return tool_error_result(
-                    "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
-                );
-            }
-            let mut parsed = Vec::with_capacity(values.len());
-            for value in values {
-                let Some(note_id) = value.as_i64().filter(|id| *id > 0) else {
-                    return tool_error_result(
-                        "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.",
-                    );
+        // `note_ids` is the only id field, on the model-facing schema and on
+        // the TS adapter's internal wire alike. `write` and `read` never read
+        // it: tool surfaces that require every declared property make the
+        // model send filler there (issue 460), and filler on an action that
+        // does not use the field must not fail the call. `update` addresses
+        // exactly one note; `dismiss` takes one to fifty.
+        let note_ids = match action {
+            "update" | "dismiss" => {
+                let max = if action == "update" { 1 } else { 50 };
+                let error = if action == "update" {
+                    "Error: 'note_ids' must contain exactly one positive integer id when action is 'update'."
+                } else {
+                    "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'."
                 };
-                parsed.push(note_id);
+                let Some(values) = args.get("note_ids").and_then(Value::as_array) else {
+                    return tool_error_result(error);
+                };
+                if !(1..=max).contains(&values.len()) {
+                    return tool_error_result(error);
+                }
+                let mut parsed = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(note_id) = value.as_i64().filter(|id| *id > 0) else {
+                        return tool_error_result(error);
+                    };
+                    parsed.push(note_id);
+                }
+                Some(parsed)
             }
-            Some(parsed)
-        } else {
-            None
+            _ => None,
         };
         let is_mutation = matches!(action, "write" | "update" | "dismiss");
         let facade_scope = match self
@@ -12674,11 +12912,10 @@ impl McHandler {
                 )
             }
             "update" => {
-                let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
-                    return tool_error_result(
-                        "Error: 'note_id' is required when action is 'update'.",
-                    );
-                };
+                let note_id = note_ids
+                    .as_deref()
+                    .and_then(|ids| ids.first().copied())
+                    .unwrap_or(0);
                 let content = string_arg(args, "content");
                 let condition = string_arg(args, "surface_condition")
                     .map(str::trim)
@@ -12747,7 +12984,9 @@ impl McHandler {
             }
             "dismiss" => {
                 let resolution = string_arg(args, "content");
-                if let Some(note_ids) = note_ids.as_deref() {
+                let ids = note_ids.as_deref().unwrap_or(&[]);
+                if ids.len() > 1 {
+                    let note_ids = ids;
                     return facade_command_outcome(
                         store.with_facade_command(
                             facade_scope.route_project_root.as_str(),
@@ -12789,11 +13028,7 @@ impl McHandler {
                         "notes",
                     );
                 }
-                let Some(note_id) = i64_arg(args, "note_id").filter(|id| *id > 0) else {
-                    return tool_error_result(
-                        "Error: 'note_id' is required when action is 'dismiss'.",
-                    );
-                };
+                let note_id = ids[0];
                 facade_command_outcome(
                     store.with_facade_command(
                         facade_scope.route_project_root.as_str(),
@@ -12942,6 +13177,8 @@ impl McHandler {
                 | "authority.drain_flip"
                 | "authority.drain_finish" => self.handle_authority_drain_value(&request, method),
                 "mirror.pull" => self.handle_mirror_pull_value(&request),
+                "mirror.memory" => self.handle_mirror_memory_value(&request),
+                "memory.identity.ack" => self.handle_memory_identity_ack_value(&request),
                 "guidance.get" => self.handle_guidance_value(channel, &request),
                 "manifest.get" => self.handle_prompt_surface_manifest_value(channel, &request),
                 "dreamer.run_task" => self.handle_dreamer_run_task(channel, &request).await,
@@ -14542,6 +14779,15 @@ fn mcp_text_result(text: String, is_error: bool) -> HandlerOutcome {
     }))
 }
 
+fn mcp_memory_result(text: String, is_error: bool, operation: Value) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error,
+        "memory_operation": operation,
+    }))
+    .map_err(|error| error.to_string())
+}
+
 fn tool_error_result(message: impl Into<String>) -> HandlerOutcome {
     mcp_text_result(message.into(), true)
 }
@@ -14674,16 +14920,33 @@ fn validate_string_cap(
     Ok(())
 }
 
-fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String> {
-    for key in ["id", "target_id"] {
-        if let Some(value) = args.get(key) {
+fn validate_memory_id_arguments(args: &Map<String, Value>, action: &str) -> Result<(), String> {
+    // Validate only the identifier arguments used by the selected action. Some
+    // callers populate every declared identifier field with placeholder values;
+    // checking or combining unused fields could fail a valid call or select the
+    // wrong record.
+    let ids_len = args.get("ids").and_then(Value::as_array).map(Vec::len);
+    let (scalar_keys, array_keys): (&[&str], &[&str]) = match action {
+        "update" | "archive" | "get" if args.contains_key("ids") => (&[], &["ids"]),
+        "update" | "archive" | "get" => (&["id"], &[]),
+        "merge" if ids_len.is_some_and(|len| len >= 2) => (&[], &["ids"]),
+        "merge" if args.contains_key("target_id") || args.contains_key("source_ids") => {
+            (&["target_id"], &["source_ids"])
+        }
+        "merge" => (&["id"], &["ids"]),
+        // write/list do not address memories; id-shaped placeholders are inert.
+        _ => return Ok(()),
+    };
+
+    for key in scalar_keys {
+        if let Some(value) = args.get(*key) {
             if value.as_i64().is_none_or(|id| id <= 0) {
                 return Err(format!("'{key}' must be a positive 64-bit integer"));
             }
         }
     }
-    for key in ["ids", "source_ids"] {
-        if let Some(value) = args.get(key) {
+    for key in array_keys {
+        if let Some(value) = args.get(*key) {
             let Some(values) = value.as_array() else {
                 return Err(format!(
                     "'{key}' must be an array of positive 64-bit integers"
@@ -14702,12 +14965,14 @@ fn validate_memory_id_arguments(args: &Map<String, Value>) -> Result<(), String>
             }
         }
     }
-    if let (Some(target), Some(sources)) = (
-        args.get("target_id").and_then(Value::as_i64),
-        args.get("source_ids").and_then(Value::as_array),
-    ) {
-        if sources.iter().any(|source| source.as_i64() == Some(target)) {
-            return Err("merge target must not appear in source_ids".to_string());
+    if scalar_keys.contains(&"target_id") && array_keys.contains(&"source_ids") {
+        if let (Some(target), Some(sources)) = (
+            args.get("target_id").and_then(Value::as_i64),
+            args.get("source_ids").and_then(Value::as_array),
+        ) {
+            if sources.iter().any(|source| source.as_i64() == Some(target)) {
+                return Err("merge target must not appear in source_ids".to_string());
+            }
         }
     }
     Ok(())
@@ -14755,6 +15020,46 @@ fn usize_arg(args: &Map<String, Value>, key: &str) -> Option<usize> {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum CtxExpandMode {
+    Message(i64),
+    Range { start: i64, end: i64, verbose: bool },
+}
+
+fn resolve_ctx_expand_mode(args: &Map<String, Value>) -> Result<CtxExpandMode, String> {
+    let message = i64_arg(args, "message");
+    let start = i64_arg(args, "start");
+    let end = i64_arg(args, "end");
+    let message_present = args.get("message").is_some();
+    let message_valid = message.filter(|value| *value >= 0);
+    let range_valid = match (start, end) {
+        (Some(start), Some(end)) if start >= 0 && end >= start => Some((start, end)),
+        _ => None,
+    };
+    let filler_pair = matches!((start, end), (Some(0), Some(0)));
+    let range_named = range_valid.filter(|_| !filler_pair);
+
+    if let Some(message) = message_valid {
+        if range_named.is_none() {
+            return Ok(CtxExpandMode::Message(message));
+        }
+    }
+    if message_present && message_valid.is_none() && range_named.is_none() {
+        return Err("Error: message must be a non-negative integer.".to_string());
+    }
+    if let Some((start, end)) = range_valid {
+        return Ok(CtxExpandMode::Range {
+            start,
+            end,
+            verbose: args.get("verbose").and_then(Value::as_bool) == Some(true),
+        });
+    }
+    Err(
+        "Error: provide either message=<ordinal>, or start and end (non-negative integers, start <= end)."
+            .to_string(),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
 struct FacadeSearchSources {
     memory: bool,
     message: bool,
@@ -14776,6 +15081,13 @@ fn facade_search_sources(args: &Map<String, Value>) -> FacadeSearchSources {
             note: true,
         };
     };
+    if values.is_empty() {
+        return FacadeSearchSources {
+            memory: true,
+            message: true,
+            note: true,
+        };
+    }
     FacadeSearchSources {
         memory: values.iter().any(|value| value.as_str() == Some("memory")),
         message: values.iter().any(|value| value.as_str() == Some("message")),
@@ -15721,37 +16033,43 @@ fn render_notes(
         ""
     };
     format!(
-        "{body}{anchor_hint}\n\nTo dismiss a stale note: ctx_note(action=\"dismiss\", note_id=N)"
+        "{body}{anchor_hint}\n\nTo dismiss a stale note: ctx_note(action=\"dismiss\", note_ids=[N])"
     )
 }
 
 // The facade never panics on agent input; an absent or malformed id stays a typed tool error.
 fn single_memory_id(args: &Map<String, Value>, action: &str) -> Option<i64> {
-    if let Some(id) = i64_arg(args, "id") {
-        return Some(id);
-    }
     let ids = memory_ids(args, action);
     ids.first().copied().filter(|_| ids.len() == 1)
 }
 
-fn memory_ids(args: &Map<String, Value>, _action: &str) -> Vec<i64> {
+fn memory_ids(args: &Map<String, Value>, action: &str) -> Vec<i64> {
+    if matches!(action, "update" | "archive" | "get") {
+        if let Some(values) = args.get("ids").and_then(Value::as_array) {
+            return dedup_i64s(values.iter().filter_map(Value::as_i64).collect());
+        }
+    }
+
     let mut ids = Vec::new();
     if let Some(id) = i64_arg(args, "id") {
         ids.push(id);
     }
     if let Some(values) = args.get("ids").and_then(Value::as_array) {
-        for value in values {
-            if let Some(id) = value.as_i64() {
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-            }
-        }
+        ids.extend(values.iter().filter_map(Value::as_i64));
     }
-    ids
+    dedup_i64s(ids)
 }
 
 fn merge_ids(args: &Map<String, Value>) -> Option<Vec<i64>> {
+    if let Some(ids) = args
+        .get("ids")
+        .and_then(Value::as_array)
+        .filter(|ids| ids.len() >= 2)
+    {
+        let ids = dedup_i64s(ids.iter().filter_map(Value::as_i64).collect());
+        return (ids.len() >= 2).then_some(ids);
+    }
+
     let ids = if let Some(target_id) = i64_arg(args, "target_id") {
         let mut ids = vec![target_id];
         ids.extend(
@@ -15777,6 +16095,112 @@ fn join_i64s(ids: &[i64]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryIdLane {
+    Module,
+    Host,
+}
+
+struct MemoryFacadeRequestContext {
+    lane: MemoryIdLane,
+    host_id_by_module: HashMap<i64, i64>,
+}
+
+impl MemoryFacadeRequestContext {
+    fn rendered_id(&self, module_id: i64, known_host_id: Option<i64>) -> Option<i64> {
+        match self.lane {
+            MemoryIdLane::Module => Some(module_id),
+            MemoryIdLane::Host => self
+                .host_id_by_module
+                .get(&module_id)
+                .copied()
+                .or(known_host_id),
+        }
+    }
+
+    fn render_mutation_error(&self, error: FacadeMemoryMutationError) -> String {
+        match error {
+            FacadeMemoryMutationError::Storage(error) => error,
+            FacadeMemoryMutationError::Unavailable { id } => {
+                self.rendered_id(id, None).map_or_else(
+                    || "memory was not found".to_string(),
+                    |id| format!("memory {id} was not found"),
+                )
+            }
+            FacadeMemoryMutationError::DuplicateContent { id, host_id } => {
+                self.rendered_id(id, host_id).map_or_else(
+                    || "memory content already exists".to_string(),
+                    |id| format!("memory content already exists as ID {id}"),
+                )
+            }
+            FacadeMemoryMutationError::InvalidMerge => "memories could not be merged".to_string(),
+        }
+    }
+
+    fn render_store_error(&self, error: McStoreError) -> String {
+        match error {
+            McStoreError::MemoryDuplicateContent { id } => self.rendered_id(id, None).map_or_else(
+                || "memory content already exists".to_string(),
+                |id| format!("memory content already exists as ID {id}"),
+            ),
+            error => error.to_string(),
+        }
+    }
+
+    fn render_tool_error(&self, error: memory_tool::MemoryToolError) -> String {
+        match error {
+            memory_tool::MemoryToolError::Store(error) => {
+                format!("store: {}", self.render_store_error(error))
+            }
+            memory_tool::MemoryToolError::DuplicateSourceId { id } => {
+                self.rendered_id(id, None).map_or_else(
+                    || "duplicate source memory id".to_string(),
+                    |id| format!("duplicate source memory id {id}"),
+                )
+            }
+            memory_tool::MemoryToolError::NotFound { id } => {
+                self.rendered_id(id, None).map_or_else(
+                    || "memory was not found".to_string(),
+                    |id| format!("memory {id} was not found"),
+                )
+            }
+            memory_tool::MemoryToolError::Inactive { id, status } => {
+                self.rendered_id(id, None).map_or_else(
+                    || format!("memory is not mutable in status {status}"),
+                    |id| format!("memory {id} is not mutable in status {status}"),
+                )
+            }
+            memory_tool::MemoryToolError::Superseded { id, superseded_by } => {
+                let id = self.rendered_id(id, None);
+                let superseded_by = self.rendered_id(superseded_by, None);
+                match (id, superseded_by) {
+                    (Some(id), Some(superseded_by)) => {
+                        format!("memory {id} was superseded by {superseded_by}")
+                    }
+                    (Some(id), None) => format!("memory {id} was superseded"),
+                    _ => "memory was superseded".to_string(),
+                }
+            }
+            error => error.to_string(),
+        }
+    }
+}
+
+fn memory_id_lane(args: &Map<String, Value>) -> Result<MemoryIdLane, String> {
+    match string_arg(args, "memory_id_lane") {
+        None | Some("module") => Ok(MemoryIdLane::Module),
+        Some("host") => Ok(MemoryIdLane::Host),
+        Some(_) => Err("memory_id_lane must be 'host' or 'module'".to_string()),
+    }
+}
+
+fn host_memory_ids(args: &Map<String, Value>) -> Vec<i64> {
+    args.get("host_ids")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default()
 }
 
 fn parse_tag_range_string(input: &str) -> Result<Vec<u64>, String> {
@@ -16540,7 +16964,7 @@ fn ctx_expand_description() -> String {
 }
 
 fn ctx_note_description() -> String {
-    "Save or inspect durable session notes for future follow-ups. Dismiss one note with note_id or 1–50 with note_ids, never both. surface_condition is accepted and recorded, but condition evaluation arrives later on this leg.".to_string()
+    "Save or inspect durable session notes for future follow-ups. update changes one note (note_ids=[N]); dismiss retires 1–50 (note_ids). surface_condition is accepted and recorded, but condition evaluation arrives later on this leg.".to_string()
 }
 
 fn ctx_memory_schema() -> Value {
@@ -16638,8 +17062,7 @@ fn ctx_note_schema() -> Value {
         "properties": {
             "action": { "type": "string", "enum": ["write", "read", "update", "dismiss"], "description": "Operation to perform. Defaults to write when content is provided, otherwise read." },
             "content": { "type": "string", "maxLength": 65536, "description": "Note text for write/update, or optional dismissal resolution when action is dismiss." },
-            "note_id": { "type": "integer", "minimum": 1, "description": "Note id for update or dismiss." },
-            "note_ids": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }, "description": "One to fifty note ids for 'dismiss' only; do not combine with note_id." },
+            "note_ids": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 }, "description": "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'." },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25, "description": "Maximum active notes to return." },
             "offset": { "type": "integer", "minimum": 0, "default": 0, "description": "Skip this many newest notes in each section." },
             "filter": { "type": "string", "enum": ["all", "active", "pending", "ready", "dismissed"], "description": "Optional read filter. Defaults to active session notes plus ready smart notes." },
@@ -19061,7 +19484,7 @@ mod tests {
         content: &str,
         now: i64,
     ) -> i64 {
-        store
+        let id = store
             .insert_memory(InsertMemoryInput {
                 project_path: project,
                 route_project_root: None,
@@ -19074,7 +19497,17 @@ mod tests {
                 metadata_json: None,
                 now_ms: now,
             })
-            .unwrap()
+            .unwrap();
+        store
+            .acknowledge_host_memory_ids(
+                project,
+                &[HostMemoryIdentityAck {
+                    module_row_id: id,
+                    host_row_id: id,
+                }],
+            )
+            .unwrap();
+        id
     }
 
     fn activate_module_authority(
@@ -23849,6 +24282,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn request_trace_ring_records_attempt_lifecycle_and_caps_at_thirty_two() {
+        let producer = Arc::new(ProducerState::default());
+        let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
+
+        for index in 0..35 {
+            let mut input = request(vec![ck("m1", 1, "hello")]);
+            input["attempt_id"] = json!(format!("attempt-{index}"));
+            let response = call_transform_request(&handler, input).await;
+            assert_eq!(response["status"], "ok");
+        }
+
+        let trace = store.load_pass_trace("ses").unwrap().unwrap();
+        assert_eq!(trace.request_history.len(), 32);
+        assert_eq!(
+            trace.request_history.first().unwrap().attempt_id,
+            "attempt-3"
+        );
+        assert_eq!(
+            trace.request_history.last().unwrap().attempt_id,
+            "attempt-34"
+        );
+        assert!(trace.request_history.iter().all(|request| {
+            request.outcome == "completed"
+                && request
+                    .completed_at_ms
+                    .is_some_and(|completed| completed >= request.received_at_ms)
+        }));
+
+        store
+            .trace_pass_received("ses", "attempt-stalled", now_ms())
+            .unwrap();
+        let status = call_dispatch_request(
+            &handler,
+            json!({ "method": "session.status", "v": 1, "session_id": "ses" }),
+        )
+        .await;
+        let history = status["pass_trace"]["request_history"]
+            .as_array()
+            .expect("session.status exposes request history");
+        assert_eq!(history.len(), 32);
+        assert_eq!(history.last().unwrap()["attempt_id"], "attempt-stalled");
+        assert_eq!(
+            history.last().unwrap()["received_at_ms"],
+            json!(
+                store
+                    .load_pass_trace("ses")
+                    .unwrap()
+                    .unwrap()
+                    .request_history
+                    .last()
+                    .unwrap()
+                    .received_at_ms
+            )
+        );
+        assert_eq!(history.last().unwrap()["completed_at_ms"], Value::Null);
+        assert_eq!(history.last().unwrap()["outcome"], "received");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn repeated_rejects_increment_trace_and_overwrite_last_error() {
         let producer = Arc::new(ProducerState::default());
         let (handler, store, _dir, _project) = handler_with_store(producer, default_test_config());
@@ -23946,6 +24438,22 @@ mod tests {
         assert_eq!(status["epochs"]["state_sync_deltas"], json!(true));
         assert_eq!(status["pass_trace"]["receive_count"], 1);
         assert_eq!(status["pass_trace"]["reject_count"], 1);
+        assert_eq!(
+            status["pass_trace"]["request_history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(status["pass_trace"]["request_history"][0]["attempt_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("legacy-"));
+        assert_eq!(
+            status["pass_trace"]["request_history"][0]["outcome"],
+            "rejected"
+        );
+        assert!(status["pass_trace"]["request_history"][0]["completed_at_ms"].is_number());
         assert_eq!(
             status["pass_trace"]["last_reject_error"],
             json!("live-source ordinals not strictly increasing")
@@ -24663,7 +25171,7 @@ mod tests {
             "ctx_note",
             json!({
                 "action": "update",
-                "note_id": note_id,
+                "note_ids": [note_id],
                 "surface_condition": "when the replacement path exists",
                 "compiled_provider": "retina-local-fs",
                 "compiled_config": "{\"kind\":\"path_exists\",\"path\":\"new\"}",
@@ -24708,16 +25216,11 @@ mod tests {
     }
 
     #[test]
-    fn ctx_note_schema_pins_the_multi_dismiss_contract() {
+    fn ctx_note_schema_declares_one_id_field() {
         let properties = ctx_note_schema()["properties"].clone();
-        assert_eq!(
-            properties["note_id"],
-            json!({
-                "type": "integer",
-                "minimum": 1,
-                "description": "Note id for update or dismiss."
-            })
-        );
+        // A second scalar id field is what made required-all tool surfaces fail
+        // every call with filler in both (issue 460).
+        assert!(properties.get("note_id").is_none());
         assert_eq!(
             properties["note_ids"],
             json!({
@@ -24725,7 +25228,7 @@ mod tests {
                 "minItems": 1,
                 "maxItems": 50,
                 "items": { "type": "integer", "minimum": 1, "maximum": 9007199254740991_i64 },
-                "description": "One to fifty note ids for 'dismiss' only; do not combine with note_id."
+                "description": "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'."
             })
         );
     }
@@ -24945,13 +25448,13 @@ mod tests {
         let _ = call_facade(
             &handler,
             "ctx_note",
-            json!({"action": "update", "note_id": note_id, "content": "remember the updated lattice"}),
+            json!({"action": "update", "note_ids": [note_id], "content": "remember the updated lattice"}),
         )
         .await;
         let _ = call_facade(
             &handler,
             "ctx_note",
-            json!({"action": "dismiss", "note_id": note_id, "content": "finished"}),
+            json!({"action": "dismiss", "note_ids": [note_id], "content": "finished"}),
         )
         .await;
         let dismissed_search = tool_text(
@@ -25000,7 +25503,7 @@ mod tests {
             call_facade(
                 &handler,
                 "ctx_note",
-                json!({"action": "dismiss", "note_id": 3}),
+                json!({"action": "dismiss", "note_ids": [3]}),
             )
             .await,
         );
@@ -26389,7 +26892,6 @@ mod tests {
                 vec![
                     "action",
                     "content",
-                    "note_id",
                     "note_ids",
                     "limit",
                     "offset",
@@ -26693,6 +27195,405 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn host_memory_lane_translates_overlap_ids_and_never_mutates_the_raw_module_row() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(project, "opencode", "token"));
+
+        for index in 1..=7 {
+            assert_eq!(
+                insert_memory(
+                    &store,
+                    project,
+                    "CONSTRAINTS",
+                    &format!("memory-{index}"),
+                    index,
+                ),
+                index
+            );
+        }
+        store
+            .acknowledge_host_memory_ids(
+                project,
+                &[
+                    HostMemoryIdentityAck {
+                        module_row_id: 1,
+                        host_row_id: 2,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 2,
+                        host_row_id: 102,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 3,
+                        host_row_id: 4,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 4,
+                        host_row_id: 104,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 5,
+                        host_row_id: 6,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 6,
+                        host_row_id: 106,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: 7,
+                        host_row_id: 7,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let get = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "get",
+                "ids": [1],
+                "host_ids": [2],
+                "memory_id_lane": "host",
+            }),
+        )
+        .await;
+        assert_eq!(
+            tool_text(get),
+            "Memory [ID: 2] in CONSTRAINTS (status: active): memory-1"
+        );
+
+        let raw_overlap = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "get",
+                "ids": [2],
+                "host_ids": [2],
+                "memory_id_lane": "host",
+            }),
+        )
+        .await;
+        assert!(tool_text(raw_overlap).contains("memory id 2 has no module mapping yet"));
+
+        let update = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update",
+                "ids": [1],
+                "host_ids": [2],
+                "memory_id_lane": "host",
+                "content": "updated-host-two",
+            }),
+        )
+        .await;
+        assert_eq!(tool_text(update), "Updated memory [ID: 2] in CONSTRAINTS.");
+        assert_eq!(
+            store.get_memory_full(1).unwrap().unwrap().content,
+            "updated-host-two"
+        );
+        assert_eq!(
+            store.get_memory_full(2).unwrap().unwrap().content,
+            "memory-2"
+        );
+
+        let archive = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "archive",
+                "ids": [3],
+                "host_ids": [4],
+                "memory_id_lane": "host",
+            }),
+        )
+        .await;
+        assert_eq!(tool_text(archive), "Archived memory IDs [4].");
+        assert_eq!(
+            store.get_memory_full(3).unwrap().unwrap().status,
+            "archived"
+        );
+        assert_eq!(store.get_memory_full(4).unwrap().unwrap().status, "active");
+
+        let merge = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "merge",
+                "ids": [5, 7],
+                "host_ids": [6, 7],
+                "memory_id_lane": "host",
+                "content": "merged-host-six",
+            }),
+        )
+        .await;
+        assert!(!tool_text(merge).contains("ID: 8"));
+        assert_eq!(
+            store.get_memory_full(6).unwrap().unwrap().content,
+            "memory-6"
+        );
+
+        let write = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "write",
+                "memory_id_lane": "host",
+                "host_ids": [],
+                "ids": [],
+                "category": "CONSTRAINTS",
+                "content": "fresh host write",
+            }),
+        )
+        .await;
+        let body = tool_body(write);
+        assert!(body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("id will appear in <project-memory>"));
+        assert!(body["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .find("ID:")
+            .is_none());
+        assert!(body["memory_operation"]["module_id"].as_i64().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_host_identity_does_not_grant_foreign_write_ownership() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "opencode", "token"),
+        );
+        let id = insert_memory(&store, "git:foreign", "CONSTRAINTS", "foreign pinned", 1);
+        store
+            .acknowledge_host_memory_ids(
+                "git:foreign",
+                &[HostMemoryIdentityAck {
+                    module_row_id: id,
+                    host_row_id: 901,
+                }],
+            )
+            .unwrap();
+        let other = insert_memory(
+            &store,
+            "git:foreign",
+            "CONSTRAINTS",
+            "other foreign pinned",
+            2,
+        );
+        store
+            .acknowledge_host_memory_ids(
+                "git:foreign",
+                &[HostMemoryIdentityAck {
+                    module_row_id: other,
+                    host_row_id: 902,
+                }],
+            )
+            .unwrap();
+        let get = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "get", "ids": [id], "host_ids": [901],
+                "memory_id_lane": "host"
+            }),
+        )
+        .await;
+        let get_text = tool_text(get);
+        assert!(
+            get_text.contains("id 901: not found or not visible"),
+            "{get_text}"
+        );
+        assert!(!get_text.contains(&format!("id {id}:")), "{get_text}");
+
+        for action in ["update", "archive", "merge"] {
+            let ids = if action == "merge" {
+                vec![id, other]
+            } else {
+                vec![id]
+            };
+            let host_ids = if action == "merge" {
+                vec![901, 902]
+            } else {
+                vec![901]
+            };
+            let result = call_facade(
+                &handler,
+                "ctx_memory",
+                json!({
+                    "action": action, "ids": ids, "host_ids": host_ids,
+                    "memory_id_lane": "host", "content": "must not write"
+                }),
+            )
+            .await;
+            let text = tool_text(result);
+            eprintln!("host ownership probe {action}: {text}");
+            assert!(!text.contains("Updated memory"), "{text}");
+            assert!(!text.contains("Archived memory IDs"), "{text}");
+            assert!(!text.contains("Merged memories"), "{text}");
+            assert!(
+                text.contains("901"),
+                "host id missing from {action} error: {text}"
+            );
+            assert!(
+                !text.contains(&format!("memory {id} was not found")),
+                "raw module id escaped from {action}: {text}"
+            );
+            let row = store.get_memory_full(id).unwrap().unwrap();
+            assert_eq!(row.content, "foreign pinned");
+            assert_eq!(row.status, "active");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_host_ownership_error_must_not_expose_module_id() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        handler.bind_route(
+            7,
+            binding_with_harness(project.to_str().unwrap(), "opencode", "token"),
+        );
+        let id = insert_memory(&store, "git:foreign", "CONSTRAINTS", "foreign pinned", 1);
+        store
+            .acknowledge_host_memory_ids(
+                "git:foreign",
+                &[HostMemoryIdentityAck {
+                    module_row_id: id,
+                    host_row_id: 901,
+                }],
+            )
+            .unwrap();
+        let result = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update", "ids": [id], "host_ids": [901],
+                "memory_id_lane": "host", "content": "must not write"
+            }),
+        )
+        .await;
+        let text = tool_text(result);
+        assert!(text.contains("memory 901 was not found"), "{text}");
+        assert!(
+            !text.contains(&format!("memory {id} was not found")),
+            "raw module id escaped: {text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_memory_lane_translates_constraint_error_ids() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(project, "opencode", "token"));
+
+        let target = insert_memory(&store, project, "CONSTRAINTS", "target", 1);
+        let duplicate = insert_memory(&store, project, "CONSTRAINTS", "duplicate", 2);
+        let source = insert_memory(&store, project, "CONSTRAINTS", "source", 3);
+        store
+            .acknowledge_host_memory_ids(
+                project,
+                &[
+                    HostMemoryIdentityAck {
+                        module_row_id: target,
+                        host_row_id: 901,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: duplicate,
+                        host_row_id: 902,
+                    },
+                    HostMemoryIdentityAck {
+                        module_row_id: source,
+                        host_row_id: 903,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let update = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "update", "ids": [target], "host_ids": [901],
+                "memory_id_lane": "host", "content": "duplicate"
+            }),
+        )
+        .await;
+        let update_text = tool_text(update);
+        assert!(
+            update_text.contains("memory content already exists as ID 902"),
+            "{update_text}"
+        );
+        assert!(
+            !update_text.contains(&format!("ID {duplicate}")),
+            "raw duplicate module id escaped: {update_text}"
+        );
+
+        let merge = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({
+                "action": "merge", "ids": [target, source], "host_ids": [901, 903],
+                "memory_id_lane": "host", "content": "duplicate"
+            }),
+        )
+        .await;
+        let merge_text = tool_text(merge);
+        assert!(
+            merge_text.contains("memory content already exists as ID 902"),
+            "{merge_text}"
+        );
+        assert!(
+            !merge_text.contains(&format!("ID {duplicate}")),
+            "raw duplicate module id escaped: {merge_text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_code_memory_lane_keeps_module_ids_byte_for_byte() {
+        let producer = Arc::new(ProducerState::default());
+        let resolver =
+            FakeSessionResolver::with(&[("token", FakeResolve::Hit("session".to_string()))]);
+        let (handler, store, _dir, project) =
+            handler_with_store_and_resolver(producer, default_test_config(), resolver);
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding_with_harness(project, "claude-code", "token"));
+        assert_eq!(
+            insert_memory(&store, project, "CONSTRAINTS", "claude row", 1),
+            1
+        );
+
+        let get = call_facade(
+            &handler,
+            "ctx_memory",
+            json!({ "action": "get", "ids": [1] }),
+        )
+        .await;
+        assert_eq!(
+            tool_text(get),
+            "Memory [ID: 1] in CONSTRAINTS (status: active): claude row"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn memory_facade_routes_all_authority_actions_into_store_and_changefeed() {
         let producer = Arc::new(ProducerState::default());
         let resolver =
@@ -26962,7 +27863,7 @@ mod tests {
             "note-update",
             json!({
                 "action": "update",
-                "note_id": 1,
+                "note_ids": [1],
                 "content": "updated note",
                 "command_id": "note-update"
             }),
@@ -26982,7 +27883,7 @@ mod tests {
             "note-dismiss",
             json!({
                 "action": "dismiss",
-                "note_id": 1,
+                "note_ids": [1],
                 "command_id": "note-dismiss"
             }),
         )
@@ -27382,8 +28283,8 @@ mod tests {
         }
         for arguments in [
             json!({"action": "write", "content": "late"}),
-            json!({"action": "update", "note_id": note.id, "content": "late"}),
-            json!({"action": "dismiss", "note_id": note.id}),
+            json!({"action": "update", "note_ids": [note.id], "content": "late"}),
+            json!({"action": "dismiss", "note_ids": [note.id]}),
         ] {
             assert_eq!(
                 error_code(call_facade(&handler, "ctx_note", arguments).await),
@@ -28184,20 +29085,30 @@ mod tests {
             add_before,
             "additive writes must not append mutation-log rows"
         );
-        assert!(store
+        let new_memory = store
             .load_active_memories(additive_project_root, now_ms())
             .unwrap()
-            .iter()
-            .any(|memory| {
-                memory.content == "new additive memory"
-                    && store
-                        .get_memory_full(memory.id)
-                        .unwrap()
-                        .unwrap()
-                        .source_session_id
-                        .as_deref()
-                        == Some(additive_scope)
-            }));
+            .into_iter()
+            .find(|memory| memory.content == "new additive memory")
+            .expect("facade write stored the additive memory");
+        assert_eq!(
+            store
+                .get_memory_full(new_memory.id)
+                .unwrap()
+                .unwrap()
+                .source_session_id
+                .as_deref(),
+            Some(additive_scope)
+        );
+        store
+            .acknowledge_host_memory_ids(
+                additive_project_root,
+                &[HostMemoryIdentityAck {
+                    module_row_id: new_memory.id,
+                    host_row_id: new_memory.id,
+                }],
+            )
+            .unwrap();
         let add_delta = call_transform_request_on_channel(&handler, 9, add_req).await;
         assert_eq!(add_delta["action"], "SOFT");
         assert!(synthetic_text(&add_delta, 1).contains("<new-memories>"));
@@ -35201,6 +36112,7 @@ mod tests {
                 history_budget_tokens: 60_000.0,
                 covered_system_messages: &[],
                 memory_enabled: true,
+                host_backed_memory_ids: false,
                 memory_budget_tokens: 8_000.0,
                 user_profile_budget_tokens: 4_000.0,
                 inject_docs: true,
@@ -35457,6 +36369,447 @@ mod tests {
         for property in ["message", "start", "end"] {
             assert_eq!(schema["properties"][property]["minimum"], json!(0));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_expand_required_all_filler_matches_clean_call_for_every_mode() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, _store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+
+        let range_clean =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 1, "end": 3})).await);
+        let range_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 1, "end": 3, "message": 0, "verbose": false}),
+            )
+            .await,
+        );
+        assert_eq!(range_filler, range_clean);
+
+        let verbose_clean = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 1, "end": 3, "verbose": true}),
+            )
+            .await,
+        );
+        let verbose_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 1, "end": 3, "verbose": true, "message": 0}),
+            )
+            .await,
+        );
+        assert_eq!(verbose_filler, verbose_clean);
+
+        let message_clean =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 2})).await);
+        let message_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"message": 2, "start": 0, "end": 0, "verbose": false}),
+            )
+            .await,
+        );
+        assert_eq!(message_filler, message_clean);
+
+        let zero_message_clean =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"message": 0})).await);
+        let zero_message_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"message": 0, "start": 0, "end": 0, "verbose": false}),
+            )
+            .await,
+        );
+        assert_eq!(zero_message_filler, zero_message_clean);
+
+        let zero_range_clean =
+            tool_text(call_facade(&handler, "ctx_expand", json!({"start": 0, "end": 10})).await);
+        let zero_range_filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_expand",
+                json!({"start": 0, "end": 10, "message": 0, "verbose": false}),
+            )
+            .await,
+        );
+        assert_eq!(zero_range_filler, zero_range_clean);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_search_required_all_filler_matches_clean_call() {
+        let resolver = FakeSessionResolver::with(&[("token", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+        let project = project.to_str().unwrap();
+        handler.bind_route(7, binding(project, "token"));
+        insert_memory(
+            &store,
+            project,
+            "CONSTRAINTS",
+            "Needle alpha should appear",
+            10,
+        );
+        insert_memory(
+            &store,
+            project,
+            "CONSTRAINTS",
+            "Needle bravo should appear",
+            20,
+        );
+        insert_memory(
+            &store,
+            project,
+            "CONSTRAINTS",
+            "Needle charlie should appear",
+            30,
+        );
+
+        let clean =
+            tool_text(call_facade(&handler, "ctx_search", json!({"query": "Needle"})).await);
+        let filler = tool_text(
+            call_facade(
+                &handler,
+                "ctx_search",
+                json!({"query": "Needle", "sources": [], "limit": 0}),
+            )
+            .await,
+        );
+        assert_eq!(filler, clean);
+        assert!(clean.contains("Found 3 results"), "{clean}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_memory_required_all_filler_matches_clean_call_for_every_action() {
+        let setup = || {
+            let resolver =
+                FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+            handler_with_store_and_resolver(
+                Arc::new(ProducerState::default()),
+                default_test_config(),
+                resolver,
+            )
+        };
+        let filler_ids = |ids: Value| {
+            json!({
+                "ids": ids,
+                "id": 1,
+                "target_id": 1,
+                "source_ids": [1],
+                "memory_project": "",
+                "limit": 0,
+                "reason": ""
+            })
+        };
+        let mut mismatches = Vec::new();
+        let mut check = |action: &'static str, filler: &str, clean: &str| {
+            if filler != clean {
+                mismatches.push(action);
+            }
+        };
+
+        let (write_clean_handler, _store, _dir, _project) = setup();
+        let (write_filler_handler, _store, _dir, _project) = setup();
+        let write_clean = tool_text(
+            call_facade(
+                &write_clean_handler,
+                "ctx_memory",
+                json!({
+                    "action": "write",
+                    "category": "PROJECT_RULES",
+                    "content": "Same standalone fact."
+                }),
+            )
+            .await,
+        );
+        let mut write_filler = filler_ids(json!([0]));
+        write_filler["action"] = json!("write");
+        write_filler["category"] = json!("PROJECT_RULES");
+        write_filler["content"] = json!("Same standalone fact.");
+        let write_filler =
+            tool_text(call_facade(&write_filler_handler, "ctx_memory", write_filler).await);
+        check("write", &write_filler, &write_clean);
+        assert!(write_clean.contains("Saved memory"), "{write_clean}");
+
+        let (update_clean_handler, update_clean_store, _dir, update_clean_project) = setup();
+        let (update_filler_handler, update_filler_store, _dir, update_filler_project) = setup();
+        let update_clean_project = update_clean_project.to_str().unwrap();
+        let update_filler_project = update_filler_project.to_str().unwrap();
+        insert_memory(
+            &update_clean_store,
+            update_clean_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let update_clean_id = insert_memory(
+            &update_clean_store,
+            update_clean_project,
+            "ARCHITECTURE",
+            "Original fact.",
+            20,
+        );
+        insert_memory(
+            &update_filler_store,
+            update_filler_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let update_filler_id = insert_memory(
+            &update_filler_store,
+            update_filler_project,
+            "ARCHITECTURE",
+            "Original fact.",
+            20,
+        );
+        let update_clean = tool_text(
+            call_facade(
+                &update_clean_handler,
+                "ctx_memory",
+                json!({
+                    "action": "update",
+                    "ids": [update_clean_id],
+                    "content": "Updated fact."
+                }),
+            )
+            .await,
+        );
+        let mut update_filler = filler_ids(json!([update_filler_id]));
+        update_filler["action"] = json!("update");
+        update_filler["content"] = json!("Updated fact.");
+        update_filler["category"] = json!("");
+        let update_filler =
+            tool_text(call_facade(&update_filler_handler, "ctx_memory", update_filler).await);
+        check("update", &update_filler, &update_clean);
+
+        let (archive_clean_handler, archive_clean_store, _dir, archive_clean_project) = setup();
+        let (archive_filler_handler, archive_filler_store, _dir, archive_filler_project) = setup();
+        let archive_clean_project = archive_clean_project.to_str().unwrap();
+        let archive_filler_project = archive_filler_project.to_str().unwrap();
+        insert_memory(
+            &archive_clean_store,
+            archive_clean_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let archive_clean_id = insert_memory(
+            &archive_clean_store,
+            archive_clean_project,
+            "PROJECT_RULES",
+            "Archive this fact.",
+            20,
+        );
+        insert_memory(
+            &archive_filler_store,
+            archive_filler_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let archive_filler_id = insert_memory(
+            &archive_filler_store,
+            archive_filler_project,
+            "PROJECT_RULES",
+            "Archive this fact.",
+            20,
+        );
+        let archive_clean = tool_text(
+            call_facade(
+                &archive_clean_handler,
+                "ctx_memory",
+                json!({"action": "archive", "ids": [archive_clean_id]}),
+            )
+            .await,
+        );
+        let mut archive_filler = filler_ids(json!([archive_filler_id]));
+        archive_filler["action"] = json!("archive");
+        archive_filler["content"] = json!("");
+        archive_filler["category"] = json!("");
+        let archive_filler =
+            tool_text(call_facade(&archive_filler_handler, "ctx_memory", archive_filler).await);
+        check("archive", &archive_filler, &archive_clean);
+
+        let (merge_clean_handler, merge_clean_store, _dir, merge_clean_project) = setup();
+        let (merge_filler_handler, merge_filler_store, _dir, merge_filler_project) = setup();
+        let merge_clean_project = merge_clean_project.to_str().unwrap();
+        let merge_filler_project = merge_filler_project.to_str().unwrap();
+        insert_memory(
+            &merge_clean_store,
+            merge_clean_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let merge_clean_id_1 = insert_memory(
+            &merge_clean_store,
+            merge_clean_project,
+            "PROJECT_RULES",
+            "Merge source one.",
+            20,
+        );
+        let merge_clean_id_2 = insert_memory(
+            &merge_clean_store,
+            merge_clean_project,
+            "PROJECT_RULES",
+            "Merge source two.",
+            30,
+        );
+        insert_memory(
+            &merge_filler_store,
+            merge_filler_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let merge_filler_id_1 = insert_memory(
+            &merge_filler_store,
+            merge_filler_project,
+            "PROJECT_RULES",
+            "Merge source one.",
+            20,
+        );
+        let merge_filler_id_2 = insert_memory(
+            &merge_filler_store,
+            merge_filler_project,
+            "PROJECT_RULES",
+            "Merge source two.",
+            30,
+        );
+        let merge_clean = tool_text(
+            call_facade(
+                &merge_clean_handler,
+                "ctx_memory",
+                json!({
+                    "action": "merge",
+                    "ids": [merge_clean_id_1, merge_clean_id_2],
+                    "content": "Merged standalone fact.",
+                    "category": "ARCHITECTURE"
+                }),
+            )
+            .await,
+        );
+        let mut merge_filler = filler_ids(json!([merge_filler_id_1, merge_filler_id_2]));
+        merge_filler["action"] = json!("merge");
+        merge_filler["content"] = json!("Merged standalone fact.");
+        merge_filler["category"] = json!("ARCHITECTURE");
+        let merge_filler =
+            tool_text(call_facade(&merge_filler_handler, "ctx_memory", merge_filler).await);
+        check("merge", &merge_filler, &merge_clean);
+        check(
+            "merge-category",
+            if merge_clean.contains("in ARCHITECTURE") {
+                "present"
+            } else {
+                "missing"
+            },
+            "present",
+        );
+
+        let (get_handler, get_store, _dir, get_project) = setup();
+        let get_project = get_project.to_str().unwrap();
+        insert_memory(
+            &get_store,
+            get_project,
+            "PROJECT_RULES",
+            "Unchanged control.",
+            10,
+        );
+        let get_id = insert_memory(
+            &get_store,
+            get_project,
+            "PROJECT_RULES",
+            "Get this fact.",
+            20,
+        );
+        let get_clean = tool_text(
+            call_facade(
+                &get_handler,
+                "ctx_memory",
+                json!({"action": "get", "ids": [get_id]}),
+            )
+            .await,
+        );
+        let mut get_filler = filler_ids(json!([get_id]));
+        get_filler["action"] = json!("get");
+        get_filler["content"] = json!("");
+        get_filler["category"] = json!("");
+        let get_filler = tool_text(call_facade(&get_handler, "ctx_memory", get_filler).await);
+        check("get", &get_filler, &get_clean);
+
+        let (list_handler, list_store, _dir, list_project) = setup();
+        let list_project = list_project.to_str().unwrap();
+        for (offset, label) in ["one", "two", "three"].into_iter().enumerate() {
+            insert_memory(
+                &list_store,
+                list_project,
+                "PROJECT_RULES",
+                &format!("List filler {label}."),
+                10 + i64::try_from(offset).unwrap(),
+            );
+        }
+        let list_clean =
+            tool_text(call_facade(&list_handler, "ctx_memory", json!({"action": "list"})).await);
+        let mut list_filler = filler_ids(json!([1]));
+        list_filler["action"] = json!("list");
+        list_filler["content"] = json!("");
+        list_filler["category"] = json!("");
+        let list_filler = tool_text(call_facade(&list_handler, "ctx_memory", list_filler).await);
+        check("list", &list_filler, &list_clean);
+
+        assert!(
+            mismatches.is_empty(),
+            "required-all output drifted for: {}",
+            mismatches.join(", ")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ctx_reduce_empty_drop_filler_is_refused_without_queuing() {
+        let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+        let (handler, store, _dir, _project) = handler_with_store_and_resolver(
+            Arc::new(ProducerState::default()),
+            default_test_config(),
+            resolver,
+        );
+
+        let omitted = tool_text(call_facade(&handler, "ctx_reduce", json!({})).await);
+        let empty = tool_text(call_facade(&handler, "ctx_reduce", json!({"drop": ""})).await);
+        assert_eq!(empty, omitted);
+        assert!(empty.contains("'drop' must be provided"), "{empty}");
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
+
+        let append = handler.handle_agent_drops_value(
+            7,
+            json!({
+                "method": "agent_drops.append",
+                "session_id": "ses",
+                "drop": "",
+                "command_id": "empty-drop-cmd",
+            }),
+        );
+        let (code, message) = error_frame(append);
+        assert_eq!(code, "bad_request");
+        assert!(
+            message.contains("'drop' must be a nonempty string"),
+            "{message}"
+        );
+        assert!(store.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 }
 

@@ -4,13 +4,9 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { OpenCode } from "../../../plugin/node_modules/@opencode/client/dist/promise/client.js";
+import { OpenCode } from "@opencode/client";
 import { MockProvider } from "../../src/mock-provider/server";
-import {
-	assertIsolation,
-	isolation,
-	spawnOpencode2,
-} from "../../src/opencode2-runner/spawn";
+import { assertIsolation, isolation, spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
 
 const root = resolve(import.meta.dir, "../../src/opencode2-runner");
 const sha = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -138,10 +134,7 @@ test("payload_identity_probe records real v1 and v2 provider bodies", async () =
 			location: { directory: host.cwd },
 			model: { providerID: "anthropic", id: "mock-model" },
 		});
-		await client.plugin.awaitActivation(
-			{ location: { directory: host.cwd } },
-			{ signal: AbortSignal.timeout(15000) },
-		);
+		await waitForPluginActive(client, host.cwd);
 		host.mock.setDefault({
 			text: "probe reply",
 			usage: { input_tokens: 100, output_tokens: 10 },
@@ -199,7 +192,7 @@ test("payload_identity_probe records real v1 and v2 provider bodies", async () =
 					hidden_agent_surface_probe: {
 						verdict: "session.create with explicit model, then session.prompt",
 						evidence:
-							"@opencode/client@2.0.3 dist/promise/client.d.ts:22-25,32-54; dist/promise/generated/types.d.ts SessionCreateInput. AgentEditor exposes list/get/default/update/remove, no add; GA plugin-promise-session.d.ts:105 exposes create/prompt.",
+							"@opencode/client@2.0.5 dist/promise/client.d.ts:22-25,32-54; dist/promise/generated/types.d.ts SessionCreateInput. AgentEditor exposes list/get/default/update/remove, no add; GA plugin-promise-session.d.ts:105 exposes create/prompt.",
 					},
 					rpc_entry_absence_probe: {
 						verdict: "tolerated; no stub",
@@ -207,7 +200,7 @@ test("payload_identity_probe records real v1 and v2 provider bodies", async () =
 							"ga/plugin-host.js:13-29; executed Host.resolve for both name and directory targets in server.test.ts",
 					},
 					cli: {
-						version: "2.0.3",
+						version: "2.0.5",
 						standalone:
 							"serve --standalone exits 1: Unrecognized flag: --standalone in command opencode serve. Runner uses direct serve --port 0 with private roots.",
 						evidence:

@@ -3,10 +3,16 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { HostCapabilities, PiHostHarness } from "./host-harness";
 import { assertHistorianMockRouting } from "./mock-routing";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { prepareContextDatabase } from "./prepare-context-db";
-import { createPiIsolatedEnv, type PiIsolatedEnv, type PiRunResult } from "./pi-runner/spawn";
+import {
+  createPiIsolatedEnv,
+  type PiIsolatedEnv,
+  type PiRunnerHost,
+  type PiRunResult,
+} from "./pi-runner/spawn";
 import {
   PiRpcClient,
   type PiMessage,
@@ -17,6 +23,7 @@ import {
 } from "./pi-runner/rpc-client";
 
 export interface PiTestHarnessOptions {
+  host?: PiRunnerHost;
   magicContextConfig?: Record<string, unknown>;
   piSettingsExtra?: Record<string, unknown>;
   modelContextLimit?: number;
@@ -38,7 +45,15 @@ const DEFAULT_MOCK_RESPONSE: MockResponse = {
   },
 };
 
-export class PiTestHarness {
+export class PiTestHarness implements PiHostHarness {
+  readonly host: PiRunnerHost;
+  readonly harnessId: PiRunnerHost;
+  readonly capabilities: HostCapabilities = {
+    childSessions: false,
+    nativeCompact: true,
+    sessionRemove: false,
+    steerDelivery: true,
+  };
   readonly mock: MockProvider;
   readonly env: PiIsolatedEnv;
 
@@ -47,7 +62,14 @@ export class PiTestHarness {
   private contextDbCached: Database | null = null;
   private turns: PiRunResult[] = [];
 
-  private constructor(mock: MockProvider, rpc: PiRpcClient, expectMagicContext: boolean) {
+  private constructor(
+    host: PiRunnerHost,
+    mock: MockProvider,
+    rpc: PiRpcClient,
+    expectMagicContext: boolean,
+  ) {
+    this.host = host;
+    this.harnessId = host;
     this.mock = mock;
     this.rpc = rpc;
     this.env = rpc.env;
@@ -58,7 +80,8 @@ export class PiTestHarness {
     const mock = new MockProvider();
     await mock.start();
     mock.setDefault(options.mockDefault ?? DEFAULT_MOCK_RESPONSE);
-    const env = createPiIsolatedEnv(options.sharedDataDir);
+    const host = options.host ?? "pi";
+    const env = createPiIsolatedEnv(options.sharedDataDir, host);
     if (options.workdir) env.workdir = options.workdir;
     if (options.magicContextConfig?.enabled !== false) {
       try {
@@ -69,6 +92,7 @@ export class PiTestHarness {
       }
     }
     const rpc = new PiRpcClient({
+      host,
       env,
       mockProviderURL: PiTestHarness.mockBaseURL(mock),
       magicContextConfig: options.magicContextConfig,
@@ -79,11 +103,11 @@ export class PiTestHarness {
     try {
       await rpc.start();
     } catch (error) {
-      await mock.stop();
+      await Promise.allSettled([rpc.shutdown(), mock.stop()]);
       throw error;
     }
 
-    return new PiTestHarness(mock, rpc, options.magicContextConfig?.enabled !== false);
+    return new PiTestHarness(host, mock, rpc, options.magicContextConfig?.enabled !== false);
   }
 
   /**
@@ -113,10 +137,41 @@ export class PiTestHarness {
     return parts.join(" ");
   }
 
+  async createSession(): Promise<string> {
+    let state = await this.getState();
+    if (!state.sessionId) {
+      await this.newSession();
+      state = await this.getState();
+    }
+    if (!state.sessionId) throw new Error(`${this.host} did not report a session id`);
+    return state.sessionId;
+  }
+
   async sendPrompt(
     text: string,
-    options: { timeoutMs?: number; continueSession?: boolean; images?: unknown[] } = {},
+    options?: { timeoutMs?: number; continueSession?: boolean; images?: unknown[] },
+  ): Promise<PiRunResult>;
+  async sendPrompt(
+    sessionId: string,
+    text: string,
+    options?: { timeoutMs?: number; continueSession?: boolean; images?: unknown[] },
+  ): Promise<PiRunResult>;
+  async sendPrompt(
+    sessionOrText: string,
+    textOrOptions: string | { timeoutMs?: number; continueSession?: boolean; images?: unknown[] } = {},
+    contractOptions: { timeoutMs?: number; continueSession?: boolean; images?: unknown[] } = {},
   ): Promise<PiRunResult> {
+    const contractCall = typeof textOrOptions === "string";
+    const text = contractCall ? textOrOptions : sessionOrText;
+    const options = contractCall ? contractOptions : textOrOptions;
+    if (contractCall) {
+      const state = await this.getState();
+      if (state.sessionId !== sessionOrText) {
+        throw new Error(
+          `${this.host} prompt targeted session ${sessionOrText}, but the active session is ${state.sessionId ?? "missing"}`,
+        );
+      }
+    }
     // Default bumped from 60s → 180s. Pi historian + ctx_search work spawn a
     // `pi --print` subprocess that calls the mock provider over HTTP, which on
     // GitHub-hosted ubuntu runners is ~3-5x slower than local hardware. 180s
@@ -141,12 +196,16 @@ export class PiTestHarness {
         });
       }
     });
-    // Pi 0.83 emits agent_end before extension-triggered continuations. Only
-    // agent_settled closes the run, including any ceiling-nudge steer; an end
-    // event for a different user/custom message cannot complete this prompt.
+    // Pi emits agent_settled after extension-triggered continuations. OMP's RPC
+    // protocol has no equivalent event, so its submitted agent_end is terminal.
     const agentEnd = this.rpc.waitForEvent(
-      (event) => submittedTurnEnded && event.type === "agent_settled",
-      { timeoutMs, label: "submitted turn agent_settled" },
+      (event) =>
+        submittedTurnEnded &&
+        event.type === (this.host === "omp" ? "agent_end" : "agent_settled"),
+      {
+        timeoutMs,
+        label: this.host === "omp" ? "submitted turn agent_end" : "submitted turn agent_settled",
+      },
     );
 
     try {
@@ -165,14 +224,10 @@ export class PiTestHarness {
       const sessionId = typeof state.sessionId === "string" ? state.sessionId : null;
       // Extension diagnostics may arrive before this turn's event listener, so
       // require the durable session row rather than trusting a successful model reply.
-      if (this.expectMagicContext) {
-        if (!sessionId) throw new Error("Pi did not report a session id for Magic Context verification");
-        const processed = this
-          .contextDb()
-          .prepare("SELECT 1 FROM session_meta WHERE session_id = ?")
-          .get(sessionId);
-        if (!processed) throw new Error(`Pi Magic Context did not process session ${sessionId}`);
+      if (!sessionId && this.expectMagicContext) {
+        throw new Error(`${this.host} did not report a session id for Magic Context verification`);
       }
+      if (sessionId) this.assertMagicContextProcessed(sessionId);
       const result: PiRunResult = {
         sessionId,
         events: events as Array<Record<string, unknown>>,
@@ -190,6 +245,15 @@ export class PiTestHarness {
     } finally {
       unsubscribe();
     }
+  }
+
+  assertMagicContextProcessed(sessionId: string): void {
+    if (!this.expectMagicContext) return;
+    const processed = this
+      .contextDb()
+      .prepare("SELECT 1 FROM session_meta WHERE session_id = ? AND harness = ?")
+      .get(sessionId, this.harnessId);
+    if (!processed) throw new Error(`${this.host} Magic Context did not process session ${sessionId}`);
   }
 
   private static mockBaseURL(mock: MockProvider): string {
@@ -314,7 +378,18 @@ export class PiTestHarness {
     return existsSync(this.contextDbPath());
   }
 
-  countTags(sessionId: string, harness = "pi"): number {
+  countCompartments(sessionId: string, harness = this.harnessId): number {
+    try {
+      const row = this.contextDb()
+        .prepare("SELECT COUNT(*) AS n FROM compartments WHERE session_id = ? AND harness = ?")
+        .get(sessionId, harness) as { n: number } | null;
+      return row?.n ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  countTags(sessionId: string, harness = this.harnessId): number {
     try {
       const row = this.contextDb()
         .prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id = ? AND harness = ?")
@@ -325,7 +400,7 @@ export class PiTestHarness {
     }
   }
 
-  countPendingOps(sessionId: string, harness = "pi"): number {
+  countPendingOps(sessionId: string, harness = this.harnessId): number {
     try {
       const row = this.contextDb()
         .prepare("SELECT COUNT(*) AS n FROM pending_ops WHERE session_id = ? AND harness = ?")
@@ -336,15 +411,19 @@ export class PiTestHarness {
     }
   }
 
-  countDroppedTags(sessionId: string, harness = "pi"): number {
+  countTagsByStatus(sessionId: string, status: string, harness = this.harnessId): number {
     try {
       const row = this.contextDb()
-        .prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id = ? AND harness = ? AND status = 'dropped'")
-        .get(sessionId, harness) as { n: number } | null;
+        .prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id = ? AND harness = ? AND status = ?")
+        .get(sessionId, harness, status) as { n: number } | null;
       return row?.n ?? 0;
     } catch {
       return 0;
     }
+  }
+
+  countDroppedTags(sessionId: string, harness = this.harnessId): number {
+    return this.countTagsByStatus(sessionId, "dropped", harness);
   }
 
   async waitFor<T>(
@@ -366,13 +445,36 @@ export class PiTestHarness {
     throw new Error(`waitFor timed out after ${timeoutMs}ms${opts.label ? ` (${opts.label})` : ""}`);
   }
 
+  async waitForMockQuiescence(opts: { quietMs?: number; label?: string } = {}): Promise<void> {
+    const quietMs = opts.quietMs ?? 250;
+    let stableRequestCount: number | null = null;
+    let quietSince = 0;
+    await this.waitFor(
+      () => {
+        const requests = this.mock.requests();
+        if (requests.some((request) => request.responseCompletedAt === undefined)) {
+          stableRequestCount = null;
+          return false;
+        }
+        if (stableRequestCount !== requests.length) {
+          stableRequestCount = requests.length;
+          quietSince = Date.now();
+          return false;
+        }
+        return Date.now() - quietSince >= quietMs;
+      },
+      { intervalMs: Math.min(50, quietMs), label: opts.label ?? "mock provider quiescence" },
+    );
+  }
+
   requests() {
     return this.mock.requests();
   }
 
   assertHistorianRequestsUseMock(): void {
     if (this.expectMagicContext && this.hasContextDb()) {
-      assertHistorianMockRouting(this.contextDb(), "pi", "anthropic/claude-haiku-4-5");
+      const model = this.host === "omp" ? "mock/mock-model" : "anthropic/claude-haiku-4-5";
+      assertHistorianMockRouting(this.contextDb(), this.harnessId, model);
     }
   }
 

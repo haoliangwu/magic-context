@@ -4,9 +4,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import ts from "../../../plugin/node_modules/typescript";
-import { OpenCode } from "../../../plugin/node_modules/@opencode/client/dist/promise/client.js";
+import { OpenCode } from "@opencode/client";
 import { TestHarness } from "../../src/harness";
-import { spawnOpencode2 } from "../../src/opencode2-runner/spawn";
+import { spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
 import { gaDatabasePath, V2StoreReader } from "../../../plugin/src/v2/store-reader";
 
 const names = ["applyDeferredCompactionMarker", "reconcileMarkerRepresentation", "setPendingCompactionMarkerState", "updateCompactionMarkerAfterPublication"];
@@ -48,7 +48,7 @@ async function until(predicate: () => boolean) { const end = Date.now()+15000; w
 
 test("I10 real-host counters: v2 fold plus historian publication plus ten turns invoke no v1 marker members; v1 control invokes all four", async () => {
     const fixture = await instrument();
-    const host = await spawnOpencode2();
+    const host = await spawnOpencode2({ modelContextLimit: 16_000, modelOutputLimit: 1024 });
     try {
         const path = join(host.cwd, "opencode.json");
         const config = JSON.parse(readFileSync(path, "utf8")); config.plugins = [fixture.root]; writeFileSync(path, JSON.stringify(config));
@@ -56,7 +56,7 @@ test("I10 real-host counters: v2 fold plus historian publication plus ten turns 
         writeFileSync(join(directory, "magic-context.jsonc"), JSON.stringify({ auto_update: false, protected_tokens: 4000, memory: { enabled: false }, dreamer: { disable: true }, historian: { two_pass: false } }));
         const client = OpenCode.make({ baseUrl: host.url, headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` } });
         const session = await client.session.create({ location: { directory: host.cwd }, model: { providerID: "openai", id: "mock-model" } });
-        await client.plugin.awaitActivation({ location: { directory: host.cwd } });
+        await waitForPluginActive(client, host.cwd);
         const turn = async (text: string) => { await client.session.prompt({ sessionID: session.id, text }); await client.session.wait({ sessionID: session.id }, { signal: AbortSignal.timeout(25000) }); };
         host.mock.setDefault({ text: "source answer", usage });
         for (let index=0;index<8;index++) await turn(`marker-source-${index} ${"bounded history ".repeat(700)}`);

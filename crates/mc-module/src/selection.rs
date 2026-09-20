@@ -975,26 +975,8 @@ fn select_agent_drops(
         if frozen.contains(id) || !live_ids.contains(id) || ctx.block_is_protected(id) {
             continue;
         }
-        let first_applied = ctx.first_applied_agent_drop_ids.contains(id);
-        // A context already at its execute ceiling is an independent/natural bust
-        // opportunity. It must drain every queued row; the one-self-bust rule only
-        // applies while this pass would bust solely because of a newly selected drop.
-        let natural_bust = ctx.pass_already_busting
-            || (ctx.pass_class == PassClass::Execute
-                && ctx.ceiling_tokens > 0.0
-                && ctx.current_total_input_tokens >= ctx.ceiling_tokens);
-        let can_ride = natural_bust
-            || (first_applied
-                && ctx.agent_drop_ids.iter().any(|other| {
-                    other != id
-                        && !ctx.first_applied_agent_drop_ids.contains(other)
-                        && live_ids.contains(other)
-                        && !frozen.contains(other)
-                        && !ctx.block_is_protected(other)
-                        && ctx.agent_drop_command_ids.get(other)
-                            != ctx.agent_drop_command_ids.get(id)
-                }));
-        if first_applied && !can_ride {
+        // Queued drops consume permission; neither pressure nor another command creates it.
+        if !ctx.pass_already_busting {
             continue;
         }
         out.push(ReductionDecision {
@@ -1247,15 +1229,10 @@ pub(crate) fn select_reductions_with_outcome(
             !incomplete_arc_ids.contains(*arc_id) && !reasoning_ineligible_arcs.contains(*arc_id)
         })
     };
-    // Only agent drops that survive the same arc guards as final emission price
-    // automatic cleanup. An open or reasoning-exempt arc cannot supply a ride.
+    // Apply the same arc guards to queued drops as to automatic reductions.
     let mut agent_decisions = Vec::new();
     select_agent_drops(ctx, &live_ids, frozen_keys, &mut agent_decisions);
     agent_decisions.retain(|decision| arc_allows_reduction(&decision.target_id));
-    let mut ride_context = ctx.clone();
-    ride_context.supersession_ride_available |= !agent_decisions.is_empty();
-    ride_context.pass_already_busting |= !agent_decisions.is_empty();
-    let ctx = &ride_context;
     let two_pass_batch_can_apply = two_pass_batch_can_apply(ctx);
     let reasoning_adjacency_collapse_arcs = reasoning_adjacency_collapse_arc_ids(items);
     // A running call has no completed/errored result and is never reclaimable. This
@@ -1814,6 +1791,7 @@ mod tests {
         ctx.first_applied_agent_drop_ids.insert("drop".to_string());
         ctx.current_total_input_tokens = 100.0;
         ctx.ceiling_tokens = 100.0;
+        ctx.pass_already_busting = true;
 
         let selected =
             select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
@@ -1821,6 +1799,7 @@ mod tests {
         assert_eq!(selected[0].target_id, "drop");
 
         ctx.current_total_input_tokens = 99.0;
+        ctx.pass_already_busting = false;
         let held = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(held.is_empty());
     }
@@ -3401,13 +3380,30 @@ mod tests {
     }
 
     #[test]
-    fn agent_drop_ids_reduce_directly() {
+    fn execute_at_ceiling_cannot_originate_agent_drop() {
+        let items = vec![
+            tool_call("c1", 1, "read", serde_json::json!({}), 50),
+            tool_result("c1", 1, "read", 300),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.pass_already_busting = false;
+        ctx.supersession_ride_available = false;
+        ctx.ceiling_tokens = 65000.0;
+        ctx.current_total_input_tokens = 65000.0;
+        ctx.agent_drop_ids = vec![result_block_id("c1")];
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(out.is_empty(), "execute alone must hold queued drops");
+    }
+
+    #[test]
+    fn agent_drop_ids_reduce_directly_on_priced_pass() {
         let items = vec![
             tool_call("c1", 1, "read", serde_json::json!({}), 50),
             tool_result("c1", 1, "read", 300),
         ];
         let mut ctx = base_ctx(PassClass::Execute);
         ctx.agent_drop_ids = vec![result_block_id("c1")];
+        ctx.pass_already_busting = true;
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(out
             .iter()
@@ -3440,7 +3436,7 @@ mod tests {
     }
 
     #[test]
-    fn different_command_first_application_is_a_single_ride_opportunity() {
+    fn different_commands_wait_for_a_single_ride_opportunity() {
         let items = vec![
             SelItem {
                 id: "held#0".to_string(),
@@ -3471,6 +3467,9 @@ mod tests {
             .insert("new#0".to_string(), "command-b".to_string());
         ctx.first_applied_agent_drop_ids
             .insert("held#0".to_string());
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(out.is_empty());
+        ctx.pass_already_busting = true;
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert_eq!(
             out.iter()

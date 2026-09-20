@@ -9,13 +9,17 @@ export const MANIFEST_PATH = resolve(E2E_ROOT, "mode-manifest.json");
 const TEST_GLOB = "tests/**/*.test.ts";
 
 export const TIERS = ["both-modes", "ts-only", "rust-only", "excluded"] as const;
+export const HOSTS = ["opencode", "opencode2", "pi", "omp"] as const;
 export type Tier = (typeof TIERS)[number];
 export type Mode = "ts" | "rust";
+export type Host = (typeof HOSTS)[number];
+export type HarnessSelection = "all" | Host;
 
 export interface ModeManifestEntry {
     path: string;
     tier: Tier;
     invocation: { ts: boolean; rust: boolean };
+    hosts: Host[];
     rationale: string;
     contract_refs: string[];
 }
@@ -48,13 +52,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function defaultHosts(path: string): Host[] {
+    if (path.startsWith("tests/opencode2/")) return ["opencode2"];
+    if (path.startsWith("tests/pi-")) return ["pi"];
+    return ["opencode"];
+}
+
 function validateEntry(value: unknown, index: number): ModeManifestEntry {
     if (!isRecord(value)) throw new Error(`entry ${index} is not an object`);
-    const expectedKeys = ["path", "tier", "invocation", "rationale", "contract_refs"];
+    const requiredKeys = ["path", "tier", "invocation", "rationale", "contract_refs"];
+    const allowedKeys = [...requiredKeys, "hosts"];
     const actualKeys = Object.keys(value).sort();
-    if (actualKeys.join("\0") !== expectedKeys.slice().sort().join("\0")) {
+    if (
+        requiredKeys.some((key) => !actualKeys.includes(key)) ||
+        actualKeys.some((key) => !allowedKeys.includes(key))
+    ) {
         throw new Error(
-            `entry ${index} must contain exactly ${expectedKeys.join(", ")}; got ${actualKeys.join(", ")}`,
+            `entry ${index} must contain ${requiredKeys.join(", ")} and optional hosts; got ${actualKeys.join(", ")}`,
         );
     }
 
@@ -74,6 +88,15 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
         typeof invocation.rust !== "boolean"
     ) {
         throw new Error(`entry ${index} has invalid invocation; expected {ts:boolean,rust:boolean}`);
+    }
+    const hosts = value.hosts ?? defaultHosts(path);
+    if (
+        !Array.isArray(hosts) ||
+        hosts.length === 0 ||
+        hosts.some((host) => typeof host !== "string" || !HOSTS.includes(host as Host)) ||
+        new Set(hosts).size !== hosts.length
+    ) {
+        throw new Error(`entry ${index} has invalid hosts; expected unique values from ${HOSTS.join(", ")}`);
     }
     const rationale = value.rationale;
     if (typeof rationale !== "string" || rationale.trim().length === 0) {
@@ -108,6 +131,7 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
         path,
         tier: typedTier,
         invocation: { ts: invocation.ts, rust: invocation.rust },
+        hosts: [...hosts] as Host[],
         rationale,
         contract_refs: [...contractRefs] as string[],
     };
@@ -163,22 +187,18 @@ export function validateModeManifest(): ValidationResult {
 export function filesForMode(
     validation: ValidationResult,
     mode: Mode,
-    harness: "all" | "opencode" | "pi" = "all",
+    harness: HarnessSelection = "all",
 ): string[] {
     return validation.manifest.entries
         .filter((entry) => entry.invocation[mode])
-        .filter((entry) => {
-            if (harness === "all") return true;
-            const isPi = entry.path.startsWith("tests/pi-");
-            return harness === "pi" ? isPi : !isPi;
-        })
+        .filter((entry) => harness === "all" || entry.hosts.includes(harness))
         .map((entry) => entry.path)
         .sort();
 }
 
-function parseArgs(args: string[]): { mode?: Mode; harness: "all" | "opencode" | "pi" } {
+function parseArgs(args: string[]): { mode?: Mode; harness: HarnessSelection } {
     let mode: Mode | undefined;
-    let harness: "all" | "opencode" | "pi" = "all";
+    let harness: HarnessSelection = "all";
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
         if (arg === "--mode") {
@@ -187,12 +207,14 @@ function parseArgs(args: string[]): { mode?: Mode; harness: "all" | "opencode" |
             mode = value;
         } else if (arg === "--harness") {
             const value = args[++index];
-            if (value !== "all" && value !== "opencode" && value !== "pi") {
-                throw new Error("--harness must be all, opencode, or pi");
+            if (value !== "all" && !HOSTS.includes(value as Host)) {
+                throw new Error(`--harness must be all or one of ${HOSTS.join(", ")}`);
             }
-            harness = value;
+            harness = value as HarnessSelection;
         } else if (arg === "--help" || arg === "-h") {
-            console.log("Usage: validate-mode-manifest.ts [--mode ts|rust] [--harness all|opencode|pi]");
+            console.log(
+                "Usage: validate-mode-manifest.ts [--mode ts|rust] [--harness all|opencode|opencode2|pi|omp]",
+            );
             process.exit(0);
         } else {
             throw new Error(`unknown argument: ${arg}`);

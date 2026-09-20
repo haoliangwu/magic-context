@@ -123,6 +123,8 @@ pub struct M0ComposeInputs<'a> {
     pub covered_system_messages: &'a [String],
     /// Disabled memory removes both project memories and the user-profile memory block.
     pub memory_enabled: bool,
+    /// Host-backed profiles expose context.db ids; Claude Code remains module-native.
+    pub host_backed_memory_ids: bool,
     /// Maximum token estimate for the grouped project-memory block.
     pub memory_budget_tokens: f64,
     /// Maximum token estimate for the user-profile block.
@@ -464,18 +466,31 @@ pub(crate) fn compose_m0_from_store_timed(
             revision: MemoryRevision::default(),
         }
     };
-    let source_name_by_id = membership
+    let source_name_by_module_id = membership
         .as_ref()
         .map(|value| workspace_source_names(&snapshot.memories, value))
         .unwrap_or_else(HashMap::new);
     let selected_memories = trim_memories_to_budget(
         snapshot.memories,
         membership.as_ref(),
-        &source_name_by_id,
+        &source_name_by_module_id,
         inputs.memory_budget_tokens,
         estimate_tokens,
     );
-    let rendered_memory_ids: Vec<i64> = selected_memories.iter().map(|memory| memory.id).collect();
+    let mut rendered_memories = selected_memories.clone();
+    if inputs.host_backed_memory_ids {
+        for memory in &mut rendered_memories {
+            memory.id = memory.host_row_id.unwrap_or(0);
+        }
+    }
+    let source_name_by_id = membership
+        .as_ref()
+        .map(|value| workspace_source_names(&rendered_memories, value))
+        .unwrap_or_else(HashMap::new);
+    let rendered_memory_ids: Vec<i64> = rendered_memories
+        .iter()
+        .filter_map(|memory| (memory.id > 0).then_some(memory.id))
+        .collect();
     let max_memory_id = snapshot.revision.max_memory_id;
     let memory_mutation_cursor = snapshot.revision.mutation_cursor;
 
@@ -524,7 +539,7 @@ pub(crate) fn compose_m0_from_store_timed(
             user_profile: &user_profile,
             covered_system_messages: inputs.covered_system_messages,
             compartments: &decay_compartments,
-            memories: &selected_memories,
+            memories: &rendered_memories,
             source_name_by_id: &source_name_by_id,
             history_budget_tokens: inputs.history_budget_tokens,
             decay_pressure_multiplier: 1.0,
@@ -675,6 +690,7 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            host_backed_memory_ids: false,
             memory_budget_tokens: 15_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: false,
@@ -731,6 +747,7 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -764,6 +781,7 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: false,
@@ -792,6 +810,7 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -841,6 +860,7 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: false,
+            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -881,6 +901,7 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -933,6 +954,7 @@ mod tests {
             history_budget_tokens: 300.0,
             covered_system_messages: &[],
             memory_enabled: false,
+            host_backed_memory_ids: false,
             memory_budget_tokens: 0.0,
             user_profile_budget_tokens: 0.0,
             inject_docs: false,
@@ -1179,6 +1201,136 @@ mod tests {
     }
 
     #[test]
+    fn host_backed_m0_uses_acknowledged_host_ids_and_hides_unacknowledged_module_ids() {
+        let fixture = FixtureBuilder::store();
+        let store = &fixture.store;
+        store
+            .seed_memory(1, "git:proj", "CONSTRAINTS", "stable", 50)
+            .unwrap();
+        let project_directory = fixture.dir.path().to_str().unwrap();
+        let module = compose_m0_from_store(
+            store,
+            &M0ComposeInputs {
+                session_id: "ses",
+                project_path: "git:proj",
+                project_directory,
+                now_ms: 0,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+                host_backed_memory_ids: false,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
+                inject_docs: false,
+                temporal_awareness: true,
+                mural: None,
+            },
+            no_estimate,
+        )
+        .unwrap();
+        let pending = compose_m0_from_store(
+            store,
+            &M0ComposeInputs {
+                session_id: "ses",
+                project_path: "git:proj",
+                project_directory,
+                now_ms: 0,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+                host_backed_memory_ids: true,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
+                inject_docs: false,
+                temporal_awareness: true,
+                mural: None,
+            },
+            no_estimate,
+        )
+        .unwrap();
+        assert!(!pending.m0_bytes.contains("#1:"));
+        assert!(pending.m0_bytes.contains("waiting for the host mirror"));
+        assert!(pending.rendered_memory_ids.is_empty());
+
+        let feed_head_before_ack = store.changefeed_head("memories").unwrap();
+        store
+            .acknowledge_host_memory_ids(
+                "git:proj",
+                &[mc_store::HostMemoryIdentityAck {
+                    module_row_id: 1,
+                    host_row_id: 101,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            store.changefeed_head("memories").unwrap(),
+            feed_head_before_ack,
+            "host identity acknowledgements must not create mirror feedback rows"
+        );
+        let host = compose_m0_from_store(
+            store,
+            &M0ComposeInputs {
+                session_id: "ses",
+                project_path: "git:proj",
+                project_directory,
+                now_ms: 0,
+                history_budget_tokens: 60_000.0,
+                covered_system_messages: &[],
+                memory_enabled: true,
+                host_backed_memory_ids: true,
+                memory_budget_tokens: 8_000.0,
+                user_profile_budget_tokens: 4_000.0,
+                inject_docs: false,
+                temporal_awareness: true,
+                mural: None,
+            },
+            no_estimate,
+        )
+        .unwrap();
+        assert_eq!(host.m0_bytes, module.m0_bytes.replace("#1:", "#101:"));
+        assert_eq!(host.rendered_memory_ids, vec![101]);
+    }
+
+    #[test]
+    fn review_claude_code_m0_identity_pin() {
+        let fixture = FixtureBuilder::store();
+        fixture
+            .store
+            .seed_memory(1, "git:proj", "CONSTRAINTS", "stable", 50)
+            .unwrap();
+        let inputs = M0ComposeInputs {
+            session_id: "ses",
+            project_path: "git:proj",
+            project_directory: fixture.dir.path().to_str().unwrap(),
+            now_ms: 0,
+            history_budget_tokens: 60_000.0,
+            covered_system_messages: &[],
+            memory_enabled: true,
+            host_backed_memory_ids: false,
+            memory_budget_tokens: 8_000.0,
+            user_profile_budget_tokens: 4_000.0,
+            inject_docs: false,
+            temporal_awareness: true,
+            mural: None,
+        };
+        let before = compose_m0_from_store(&fixture.store, &inputs, no_estimate).unwrap();
+        assert!(before.m0_bytes.contains("#1:"));
+        fixture
+            .store
+            .acknowledge_host_memory_ids(
+                "git:proj",
+                &[mc_store::HostMemoryIdentityAck {
+                    module_row_id: 1,
+                    host_row_id: 901,
+                }],
+            )
+            .unwrap();
+        let after = compose_m0_from_store(&fixture.store, &inputs, no_estimate).unwrap();
+        assert_eq!(before.m0_bytes, after.m0_bytes);
+        assert_eq!(after.rendered_memory_ids, vec![1]);
+    }
+
+    #[test]
     fn determinism_same_inputs_same_bytes() {
         let fixture = FixtureBuilder::store();
         let dir = &fixture.dir;
@@ -1197,6 +1349,7 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
+            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,

@@ -259,6 +259,51 @@ function runCargo(
 }
 
 /**
+ * Resolve the sibling daemon source to build from.
+ *
+ * The sibling checkout on a developer box is another seat's live working tree, and
+ * that tree is mid-edit whenever its owner is working: a release gate on 2026-09-18
+ * failed on `E0433 cannot find type Sha256` in subconscious's ck.rs, an edit SUBC
+ * had not committed yet. Building the daemon from the sibling's COMMITTED HEAD in
+ * a detached scratch worktree makes the gate depend on a revision, not on whoever
+ * has an editor open. The scratch worktree is keyed on the sha so a repeat build
+ * reuses it, and the shared e2e target directory keeps Cargo's cache warm. In CI
+ * the sibling is a fresh checkout and HEAD is the working tree, so this is a no-op
+ * there beyond the extra worktree.
+ */
+function committedSiblingSource(subconsciousRoot: string): { root: string; sha: string } {
+    const head = spawnSync("git", ["-C", subconsciousRoot, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+    });
+    const sha = head.status === 0 ? head.stdout.trim() : "";
+    if (!/^[0-9a-f]{40}$/.test(sha)) {
+        // Not a git checkout (a tarball or vendored copy): build what is there.
+        return { root: subconsciousRoot, sha: "working-tree" };
+    }
+    const scratchRoot = join(dirname(RUST_E2E_CARGO_TARGET_DIR), "subconscious-src");
+    const stamp = join(scratchRoot, ".mc-e2e-sha");
+    if (existsSync(stamp) && readFileSync(stamp, "utf8").trim() === sha) {
+        return { root: scratchRoot, sha };
+    }
+    spawnSync("git", ["-C", subconsciousRoot, "worktree", "remove", "--force", scratchRoot], {
+        stdio: "ignore",
+    });
+    rmSync(scratchRoot, { recursive: true, force: true });
+    const added = spawnSync(
+        "git",
+        ["-C", subconsciousRoot, "worktree", "add", "--detach", scratchRoot, sha],
+        { encoding: "utf8" },
+    );
+    if (added.status !== 0) {
+        throw new Error(
+            `failed to stage the sibling daemon source at ${sha} (git worktree add): ${added.stderr}`,
+        );
+    }
+    writeFileSync(stamp, `${sha}\n`);
+    return { root: scratchRoot, sha };
+}
+
+/**
  * Build the module and daemon from their current workspaces, incrementally.
  *
  * `ck-mc` links protocol/client path dependencies from the sibling workspace, so
@@ -305,14 +350,15 @@ export async function buildHermeticBinaries(subconsciousRoot: string): Promise<B
         }
 
         const ckSubcRelease = join(RUST_E2E_CARGO_TARGET_DIR, "release/ck-subc");
+        const daemonSource = committedSiblingSource(subconsciousRoot);
         const daemonBuild = await runCargo(
             ["build", "--release", "-p", "subc-core", "--bins"],
-            subconsciousRoot,
+            daemonSource.root,
             cargoEnv,
         );
         if (!daemonBuild.ok || !existsSync(ckSubcRelease)) {
             throw new Error(
-                `failed to build ck-subc (cargo build --release -p subc-core --bins in ${subconsciousRoot}):\n${daemonBuild.stderr.slice(-4000)}`,
+                `failed to build ck-subc (cargo build --release -p subc-core --bins in ${daemonSource.root} at ${daemonSource.sha}):\n${daemonBuild.stderr.slice(-4000)}`,
             );
         }
 
@@ -542,6 +588,9 @@ export class HermeticSubcStack {
                 NO_COLOR: "1",
                 SUBC_MODULE_ID: MODULE_ID,
                 SUBC_LAUNCH_NONCE: "",
+                // Keep module config hermetic too. ConfigCache reloads this path on
+                // each transform, so tests can write explicit Rust-only settings.
+                XDG_CONFIG_HOME: join(this.dataDir, "module-config"),
                 // The module opens its store under this data home — the SAME dir
                 // opencode uses, matching production's shared cortexkit layout.
                 XDG_DATA_HOME: this.dataDir,

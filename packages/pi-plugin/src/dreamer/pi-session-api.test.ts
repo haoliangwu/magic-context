@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it, mock } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
@@ -14,6 +15,7 @@ import {
 } from "./pi-session-api";
 
 const PI_SPEC = "@earendil-works/pi-coding-agent";
+const OMP_SPEC = "@oh-my-pi/pi-coding-agent";
 
 /** A fixture module whose listAll returns a unique marker, so tests can tell
  * WHICH copy of pi-coding-agent was resolved through the public API. */
@@ -128,8 +130,32 @@ describe("loadDefaultPiSessionApi", () => {
 	describe("default loader order", () => {
 		it('first default loader is "Resolve from running Pi binary entry" (prefer the running Pi version)', () => {
 			const names = defaultLoaders.map((l) => l.name);
-			expect(names[0]).toBe("Resolve from running Pi binary entry");
-			expect(names).toContain("Bare import");
+			expect(names).toEqual([
+				"Resolve from running Pi binary entry",
+				"Bare import",
+				"Bare import (OMP)",
+			]);
+		});
+
+		it("loads the OMP package through the final bare-import fallback", () => {
+			const resolverUrl = new URL("./pi-session-api.ts", import.meta.url).href;
+			const script = `
+				import { mock } from "bun:test";
+				mock.module(${JSON.stringify(OMP_SPEC)}, () => ({
+					SessionManager: { listAll: async () => ["omp-bare-import"] },
+				}));
+				const resolver = await import(${JSON.stringify(resolverUrl)});
+				const ompLoader = resolver.defaultLoaders.find(
+					(loader) => loader.name === "Bare import (OMP)",
+				);
+				if (!ompLoader) throw new Error("OMP bare-import loader missing");
+				const api = await resolver.loadDefaultPiSessionApi([ompLoader]);
+				process.stdout.write(JSON.stringify(await api.listSessions()));
+			`;
+			const output = execFileSync(process.execPath, ["-e", script], {
+				encoding: "utf8",
+			});
+			expect(JSON.parse(output)).toEqual(["omp-bare-import"]);
 		});
 
 		it("resolves through a bin-shim symlink when argv[1] is the shim path", async () => {
@@ -180,6 +206,81 @@ describe("loadDefaultPiSessionApi", () => {
 	});
 
 	describe("running-Pi resolver layouts", () => {
+		it("resolves the session APIs from the running OMP package", async () => {
+			const dir = createTestTempDir("omp-running-package-").dir;
+			const pkgRoot = join(dir, "node_modules", "@oh-my-pi", "pi-coding-agent");
+			writeFixturePackage(pkgRoot, {
+				manifest: {
+					name: OMP_SPEC,
+					version: "18.2.1",
+					exports: {
+						".": {
+							types: "./dist/types/index.d.ts",
+							import: "./src/index.ts",
+						},
+					},
+				},
+				files: {
+					"dist/cli.js": "// OMP binary entry\n",
+					"src/index.ts": fixtureModule("running-omp-18.2.1"),
+				},
+			});
+
+			await withArgv1(join(pkgRoot, "dist", "cli.js"), async () => {
+				clearCachedModule();
+				const api = await loadDefaultPiSessionApi([defaultLoaders[0]]);
+				expect(await api.listSessions()).toEqual(["running-omp-18.2.1"]);
+			});
+		}, 30000);
+
+		it("loads an OMP manifest whose export already points to TypeScript source", async () => {
+			const dir = createTestTempDir("omp-source-package-").dir;
+			const pkgRoot = join(dir, "pi-coding-agent");
+			writeFixturePackage(pkgRoot, {
+				manifest: {
+					name: OMP_SPEC,
+					exports: {
+						".": {
+							types: "./dist/types/index.d.ts",
+							import: "./src/index.ts",
+						},
+					},
+				},
+				files: {
+					"src/cli.ts": "// OMP source entry\n",
+					"src/index.ts": fixtureModule("running-omp-source"),
+				},
+			});
+
+			await withArgv1(join(pkgRoot, "src", "cli.ts"), async () => {
+				clearCachedModule();
+				const api = await loadDefaultPiSessionApi([defaultLoaders[0]]);
+				expect(await api.listSessions()).toEqual(["running-omp-source"]);
+			});
+		}, 30000);
+
+		it("maps a TypeScript dist export to its source counterpart before importing", async () => {
+			const dir = createTestTempDir("omp-typescript-dist-").dir;
+			const pkgRoot = join(dir, "pi-coding-agent");
+			writeFixturePackage(pkgRoot, {
+				manifest: {
+					name: OMP_SPEC,
+					exports: { ".": { import: "./dist/index.mts" } },
+				},
+				files: {
+					"src/cli.ts": "// OMP source entry\n",
+					"src/index.mts": fixtureModule("fresh-typescript-source"),
+					"dist/index.mts": fixtureModule("stale-typescript-dist"),
+				},
+			});
+
+			await withArgv1(join(pkgRoot, "src", "cli.ts"), async () => {
+				clearCachedModule();
+				const api = await loadDefaultPiSessionApi([defaultLoaders[0]]);
+				expect(await api.listSessions()).toEqual(["fresh-typescript-source"]);
+			});
+		}, 30000);
+
 		it("prefers the running Pi over a stale extension-tree copy", async () => {
 			const dir = createTestTempDir("pi-running-vs-stale-").dir;
 			const pkgRoot = join(
@@ -498,7 +599,7 @@ describe("loadDefaultPiSessionApi", () => {
 
 			expect(error).not.toBeNull();
 			expect(error?.message).toContain(
-				"Failed to resolve @earendil-works/pi-coding-agent via all strategies",
+				"Failed to resolve a Pi/OMP coding-agent module (@earendil-works/pi-coding-agent or @oh-my-pi/pi-coding-agent) via all strategies",
 			);
 			expect(error?.message).toContain("- First: Cannot find module");
 			expect(error?.message).toContain(
@@ -524,7 +625,7 @@ describe("loadDefaultPiSessionApi", () => {
 				}
 				expect(error).not.toBeNull();
 				expect(error?.message).toContain(
-					"Could not locate @earendil-works/pi-coding-agent package.json from",
+					"Could not locate @earendil-works/pi-coding-agent or @oh-my-pi/pi-coding-agent package.json from",
 				);
 				expect(error?.message).toContain(process.execPath);
 				expect(error?.message).not.toContain("from undefined");

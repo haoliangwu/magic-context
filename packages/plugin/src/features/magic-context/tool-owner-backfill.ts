@@ -45,7 +45,10 @@
 
 import { existsSync } from "node:fs";
 import { log } from "../../shared/logger";
-import { resolveOpenCodeDbPath } from "../../shared/opencode-db-path";
+import {
+    assertOpenCodeStoreGeneration,
+    resolveOpenCodeDbPath,
+} from "../../shared/opencode-db-path";
 import type { Database } from "../../shared/sqlite";
 
 /**
@@ -152,6 +155,7 @@ export function runToolOwnerBackfill(db: Database): BackfillResult {
     const escapedDbPath = opencodeDbPath.replaceAll("'", "''");
     db.exec(`ATTACH '${escapedDbPath}' AS oc_backfill`);
     try {
+        assertOpenCodeStoreGeneration(db, "v1", opencodeDbPath, "oc_backfill");
         backfillToolOwnersInChunks(db, result);
     } finally {
         // DETACH is safe even if ATTACH partially failed; SQLite

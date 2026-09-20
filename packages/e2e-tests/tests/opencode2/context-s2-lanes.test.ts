@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { OpenCode } from "../../../plugin/node_modules/@opencode/client/dist/promise/client.js";
+import { OpenCode } from "@opencode/client";
 import { queuePendingOp } from "../../../plugin/src/features/magic-context/storage";
 import {
 	applyEditMarkerToInput,
@@ -18,7 +18,7 @@ import {
 	gaDatabasePath,
 	V2StoreReader,
 } from "../../../plugin/src/v2/store-reader";
-import { spawnOpencode2 } from "../../src/opencode2-runner/spawn";
+import { spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
 
 const sha = (value: unknown) =>
 	createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -51,12 +51,15 @@ export default { id: 's2-observer', async setup(context) {
             async execute(input) { return { content: 'fixture edit completed' }; }
         });
     });
-    if (${largeTool}) await context.tool.transform(editor => {
-        editor.remove('read');
-        editor.add({name:'read',description:'Read fixture',options:{codemode:false},input:{type:'object',properties:{path:{type:'string'}},required:['path']},
-            async execute() { return {content:Array.from({length:1500},(_,i)=>'word'+i).join(' ')}; }
+    if (${largeTool}) {
+        await context.tool.transform(editor => {
+            editor.remove('read');
+            editor.add({id:'read',name:'read',description:'Read fixture',options:{codemode:false},input:{type:'object',properties:{path:{type:'string'}},required:['path']},
+                async execute() { return {content:Array.from({length:1500},(_,i)=>'word'+i).join(' ')}; }
+            });
         });
-    });
+
+    }
     for (const kind of ['context', 'title', 'compaction']) await context.session.hook(kind, draft => {
         if (kind === 'context' && ${Boolean(fixedMessages)}) draft.messages.splice(0, draft.messages.length, ...${JSON.stringify(fixedMessages ?? [])});
         appendFileSync(${JSON.stringify(trace)}, JSON.stringify({kind, sessionID:draft.sessionID, messages:draft.messages})+'\\n');
@@ -85,7 +88,7 @@ test("I3 context_hook_once_per_round_trip; I5 m1_sentinel_id_recognized; I6 soft
 			location: { directory: host.cwd },
 			model: { providerID: "openai", id: "mock-model" },
 		});
-		await client.plugin.awaitActivation({ location: { directory: host.cwd } });
+		await waitForPluginActive(client, host.cwd);
 		let steps = 0;
 		host.mock.addMatcher((body) => {
 			if (body.model !== "mock-model")
@@ -222,7 +225,10 @@ test("I4 context_hook_never_fires_for_title_or_compaction_agents", async () => {
 }, 60000);
 
 test("I17 fail_closed_v2 refuses provider-proven 95 percent before any further model request", async () => {
-	const host = await spawnOpencode2();
+	const host = await spawnOpencode2({
+		modelContextLimit: 16_000,
+		modelOutputLimit: 1024,
+	});
 	try {
 		const client = clientFor(host);
 		const session = await client.session.create({
@@ -358,6 +364,7 @@ test("I16 dropped_input_guard_v2 refuses both argument surfaces with a real Erro
 			location: { directory: host.cwd },
 			model: { providerID: "openai", id: "mock-model" },
 		});
+		await waitForPluginActive(client, host.cwd);
 		let step = 0;
 		host.mock.addMatcher((body) => {
 			if (body.model !== "mock-model")
@@ -408,13 +415,18 @@ test("I16 dropped_input_guard_v2 refuses both argument surfaces with a real Erro
 
 test("I15 channel2_via_synthetic uses a recorded admission id at the tool batch boundary", async () => {
 	const capture = observer(false, false, true);
-	const host = await spawnOpencode2({ probePlugin: capture.plugin });
+	const host = await spawnOpencode2({
+		probePlugin: capture.plugin,
+		modelContextLimit: 16_000,
+		modelOutputLimit: 1024,
+	});
 	try {
 		const client = clientFor(host);
 		const session = await client.session.create({
 			location: { directory: host.cwd },
 			model: { providerID: "openai", id: "mock-model" },
 		});
+		await waitForPluginActive(client, host.cwd);
 		let step = 0;
 		let seeded = false;
 		host.mock.addMatcher((body) => {
@@ -622,7 +634,7 @@ test("I14 host-capability probe: remove and compact exist on the runner-owned cl
 			location: { directory: host.cwd },
 			model: { providerID: "openai", id: "mock-model" },
 		});
-		await client.plugin.awaitActivation({ location: { directory: host.cwd } });
+		await waitForPluginActive(client, host.cwd);
 		expect(
 			capture.frames().find((frame) => frame.kind === "surface")?.eventMethods,
 		).toEqual(["subscribe"]);

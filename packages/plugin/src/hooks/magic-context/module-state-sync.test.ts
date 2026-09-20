@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -26,6 +27,7 @@ import { flushLogger, getLogFilePath } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
+    __moduleStateSyncTest,
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
     loadModuleWatermarks,
@@ -54,6 +56,7 @@ afterEach(() => {
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
     resetCompartmentMirrorCursorsForTest();
+    __moduleStateSyncTest.setBoundaryDiagnosticObserver(null);
     if (originalLogPath === undefined) delete process.env.MAGIC_CONTEXT_LOG_PATH;
     else process.env.MAGIC_CONTEXT_LOG_PATH = originalLogPath;
 });
@@ -856,6 +859,152 @@ describe("module compartment ordinal serialization", () => {
         expect(body.compartments).toEqual([
             expect.objectContaining({ start_message: 2, end_message: 3 }),
         ]);
+    });
+
+    it("repairs dangling boundaries without refusing the entire cold seed", async () => {
+        useTempDataHome("module-state-sync-dangling-boundary-");
+        const sessionId = "ses-dangling-boundary";
+        createOpenCodeDb(
+            sessionId,
+            Array.from({ length: 8 }, (_, index) => ({
+                id: `m${index + 1}`,
+                role: index % 2 === 0 ? "user" : "assistant",
+            })),
+        );
+        const db = createContextDb();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "missing-first-start",
+                endMessageId: "m2",
+                title: "First",
+                content: "first",
+            },
+            {
+                sequence: 1,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "m3",
+                endMessageId: "m3",
+                title: "Prior",
+                content: "prior",
+            },
+            {
+                sequence: 2,
+                startMessage: 4,
+                endMessage: 5,
+                startMessageId: "missing-interior-start",
+                endMessageId: "m5",
+                title: "Incident",
+                content: "incident",
+            },
+            {
+                sequence: 3,
+                startMessage: 6,
+                endMessage: 7,
+                startMessageId: "m6",
+                endMessageId: "missing-interior-end",
+                title: "End repair",
+                content: "end repair",
+            },
+            {
+                sequence: 4,
+                startMessage: 8,
+                endMessage: 8,
+                startMessageId: "m8",
+                endMessageId: "m8",
+                title: "Next",
+                content: "next",
+            },
+            {
+                sequence: 5,
+                startMessage: 9,
+                endMessage: 9,
+                startMessageId: "missing-both-start",
+                endMessageId: "missing-both-end",
+                title: "Skipped",
+                content: "skipped",
+            },
+        ]);
+
+        const boundaryDiagnostics: string[] = [];
+        __moduleStateSyncTest.setBoundaryDiagnosticObserver((message) => {
+            boundaryDiagnostics.push(message);
+        });
+        const payload = await buildModuleStateSyncPayload({
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            force: true,
+        });
+
+        expect(payload).toBeObject();
+        if (!payload || typeof payload !== "object") throw new Error("expected state-sync payload");
+        expect(payload.params.compartments).toEqual([
+            expect.objectContaining({ sequence: 0, start_message: 1, end_message: 2 }),
+            expect.objectContaining({ sequence: 1, start_message: 3, end_message: 3 }),
+            expect.objectContaining({ sequence: 2, start_message: 4, end_message: 5 }),
+            expect.objectContaining({ sequence: 3, start_message: 6, end_message: 7 }),
+            expect.objectContaining({ sequence: 4, start_message: 8, end_message: 8 }),
+        ]);
+
+        expect(boundaryDiagnostics).toContain(
+            "state-sync boundary repaired session=ses-dangling-boundary sequence=0 side=start missing_id=missing-first-start resolved_ordinal=1 method=raw_store_first_ordinal",
+        );
+        expect(boundaryDiagnostics).toContain(
+            "state-sync boundary repaired session=ses-dangling-boundary sequence=2 side=start missing_id=missing-interior-start resolved_ordinal=4 method=previous_compartment_end_plus_one",
+        );
+        expect(boundaryDiagnostics).toContain(
+            "state-sync boundary repaired session=ses-dangling-boundary sequence=3 side=end missing_id=missing-interior-end resolved_ordinal=7 method=next_compartment_start_minus_one",
+        );
+        expect(boundaryDiagnostics).toContain(
+            "state-sync compartment skipped session=ses-dangling-boundary sequence=5 missing_start_id=missing-both-start missing_end_id=missing-both-end method=both_boundaries_dangling",
+        );
+    });
+
+    it("pins clean compartment seed bytes when every boundary still resolves", async () => {
+        useTempDataHome("module-state-sync-clean-boundary-");
+        const sessionId = "ses-clean-boundary";
+        createOpenCodeDb(sessionId, [
+            { id: "m1", role: "user" },
+            { id: "m2", role: "assistant" },
+            { id: "m3", role: "user" },
+        ]);
+        const db = createContextDb();
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                title: "Clean one",
+                content: "first clean summary",
+            },
+            {
+                sequence: 1,
+                startMessage: 3,
+                endMessage: 3,
+                startMessageId: "m3",
+                endMessageId: "m3",
+                title: "Clean two",
+                content: "second clean summary",
+            },
+        ]);
+
+        db.prepare("UPDATE compartments SET created_at = 1234 WHERE session_id = ?").run(sessionId);
+        const payload = await buildModuleStateSyncPayload({
+            state: syncState(),
+            pass: { db, sessionId, nowMs: 1 },
+            force: true,
+        });
+        expect(payload).toBeObject();
+        if (!payload || typeof payload !== "object") throw new Error("expected state-sync payload");
+        const digest = createHash("sha256")
+            .update(JSON.stringify(payload.params.compartments))
+            .digest("hex");
+        expect(digest).toBe("48b79d5c8864fbbc6ffb9c639e5ae058c3f99f81d67ff7bc917ecd8552abe1bf");
     });
 
     it("keeps canonical ordinal drift fail-loud when the wire resolver finds a conflict", async () => {

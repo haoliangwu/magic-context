@@ -77,6 +77,8 @@ Both plugins write to the same SQLite database at `~/.local/share/cortexkit/magi
 
 Project memories therefore flow across OpenCode, Pi, and OMP, while per-session state remains scoped to the OpenCode, Pi, or OMP runtime.
 
+> **OpenCode 2 hidden runs:** historian and text-only Dreamer work runs on the resolved `historian.opencode` / `dreamer.opencode` model chain in reusable unparented sessions. This keeps the user's session model and token accounting untouched while preserving the calibrated system/user prompt and request options. OpenCode 2 currently exposes no plugin removal API, so one root titled **Magic Context historian** and, when needed, one titled **Magic Context dreamer** remain visible per project. Failed and incompatible-host-generation roots can also remain. List them with `npx @cortexkit/magic-context@latest doctor list-hidden-sessions`; remove unwanted roots manually in OpenCode. Magic Context never deletes them.
+
 For semantic search to work cross-harness, every host resolves embedding config per project identity on each retrieval path. Keep the effective `embedding` block consistent across OpenCode, Pi, and OMP for the same project.
 
 ### Trusted-group shared storage
@@ -123,7 +125,7 @@ Both setup wizards add this automatically.
 
 Model keys use the same progressive, case-sensitive lookup walk as `cache_ttl`: exact `provider/model` keys, less-specific model variants, then the literal `provider/*` wildcard and `default`. The first slash separates the provider; additional slashes remain part of the model ID. Missing provider/model components fall back to `default`.
 
-> **OpenCode/Pi/OMP v1 limitation:** per-model routing in `models` applies to the guidance block only. Tool descriptions are registered once per process by the v1 plugin API, so they always follow `prompt_surface.default`. Per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes (tracked in [#260](https://github.com/cortexkit/magic-context/issues/260)).
+> **OpenCode 1.x, Pi, and OMP limitation:** per-model routing in `models` applies to the guidance block only. Tool descriptions are registered once per process by those hosts, so they always follow `prompt_surface.default`. OpenCode 2 rewrites the five `ctx_*` tool descriptions on every `context` pass from the same resolver, keyed on the draft model.
 
 `guidance_override_path` and `tool_descriptions` are user-level only. A project may select `default` and `models`, but repository-supplied guidance files and tool-description text are stripped with a warning.
 
@@ -152,6 +154,9 @@ npx @cortexkit/magic-context@latest doctor
 npx @cortexkit/magic-context@latest doctor --harness opencode
 npx @cortexkit/magic-context@latest doctor --harness pi
 npx @cortexkit/magic-context@latest doctor --harness omp
+
+# Read-only inventory of reusable/retired OpenCode 2 hidden-run roots
+npx @cortexkit/magic-context@latest doctor list-hidden-sessions
 ```
 
 The OpenCode doctor checks: installation, CLI version vs npm latest, plugin registration (preserves local dev paths), `magic-context.jsonc` parses + loads through the schema, conflicts (compaction, DCP, OMO hooks), TUI sidebar configuration, embedding endpoint, shared-DB existence + `PRAGMA integrity_check` + row counts, plugin npm cache, and historian debug dumps.
@@ -186,10 +191,13 @@ Per-model overrides for mixed-model workflows:
 {
   "cache_ttl": {
     "default": "5m",
-    "anthropic/claude-opus-4-6": "60m"
+    "anthropic/claude-opus-4-6": "60m",
+    "anthropic/*": "never"
   }
 }
 ```
+
+Keys are matched from most to least specific: the exact `provider/model`, the bare model ID, progressively shorter dash-prefixes of the model ID (`claude-opus-4-6` also matches a `claude-opus-4` entry), then the provider wildcard `provider/*`, then `default`. A more specific entry always wins over a wildcard, so the example above keeps `60m` for Opus 4.6 and applies `never` to every other Anthropic model. Harness provider aliases resolve to the canonical name first, so one entry covers the same model on OpenCode, Pi and OMP.
 
 Supported formats: `"30s"`, `"5m"`, `"1h"`.
 
@@ -218,7 +226,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `language` | `string` | unset | User-config-only output language for Magic Context generated prose and primary guidance, as a 2-letter ISO 639-1 code, for example `"tr"`, `"es"`, or `"pt"`. Structural tokens stay in English. |
 | `cache_ttl` | `string` or `object` | `"5m"` | Time after a response before applying pending ops. String or per-model map. |
 | `output_reserve` | `number` or `object` | automatic | User-config-only output-token reservation override. `0` disables reservation; supports per-model maps. See below. |
-| `protected_tokens` | absolute integer (4,000–1,000,000) | derived | Token floor protected from automatic reclaim. When omitted, derives as `clamp(round(0.05 × usableSoft), min(16,000, round(0.08 × usableSoft)), 64,000)`. Project config may only raise the resolved user-or-derived floor. |
+| `protected_tokens` | absolute integer (4,000–1,000,000) | derived | Token floor protected from automatic reclaim. This is a token count, not a tag count — values below 4,000 are rejected with a pointer message. When omitted, derives as `clamp(round(0.05 × usableSoft), min(16,000, round(0.08 × usableSoft)), 64,000)`. Project config may only raise the resolved user-or-derived floor. |
 | `toast_duration_ms` | `number` (0–60000) | `5000` | TUI toast lifetime for Magic Context notifications in milliseconds. Increase this if toasts disappear too quickly, or set to `0` to disable Magic Context toasts entirely. |
 | `execute_threshold_percentage` | `number` (20–90) or `object` | `65` | Context usage that forces queued ops to execute. Capped at 90% of the output-reserved safe window, leaving about 10% for in-turn input growth. Supports per-model maps. |
 | `execute_threshold_tokens` | `object` (per-model map) | — | **Optional absolute-tokens variant of `execute_threshold_percentage`.** Per-model map (e.g. `{ "default": 150000, "github-copilot/gpt-5.2-codex": 40000 }`). When set for a model, overrides the percentage-based threshold for that model. Clamped to `90% × context_limit` with a warn log. Requires a resolvable context limit — falls through to percentage if unavailable. See below. |
@@ -228,7 +236,7 @@ Higher-tier models with longer cache windows benefit from a longer TTL. Setting 
 | `compaction.enabled` | `boolean` | `true` | When `false`, use compaction-off mode: keep Magic Context's knowledge layer and let native compaction (or nothing) own the context window. Boot-resolved; restart after changing it. See below. |
 | `commit_cluster_trigger` | `object` | See below | Controls the commit-cluster historian trigger. |
 | `system_prompt_injection` | `object` | See below | Controls whether and where Magic Context augments the system prompt; lets you opt specific agents out. |
-| `keep_subagents` | `boolean` | `false` | Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, memory-migration) instead of deleting them on success, so their full transcript stays in the host session store for inspection. Kept sessions accumulate until cleared manually — leave `false` for normal use. |
+| `keep_subagents` | `boolean` | `false` | OpenCode 1 debug option: keep child sessions instead of deleting them on success. On OpenCode 2 the host does not expose removal to plugins, so reusable historian/Dreamer roots are always retained and this option has no effect on them; use `doctor list-hidden-sessions` and remove unwanted roots manually. |
 | `todowrite` | `object` | See below | **Pi only.** Controls Magic Context's built-in `todowrite` tool and persistent task overlay. OpenCode has its own built-in `todowrite`, so this setting has no effect there. |
 | `sqlite` | `object` | See below | Per-connection SQLite tuning for Magic Context's own `context.db`. |
 | `storage.enforce_private_permissions` | `boolean` | `true` | User-config-only. Keep owner-only `0700` directories and `0600` files. Set `false` only for an externally managed trusted-group deployment; Magic Context will never re-tighten storage permissions. |

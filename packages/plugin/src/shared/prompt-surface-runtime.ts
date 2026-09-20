@@ -80,6 +80,7 @@ export interface PromptSurfaceRegistrationSelection {
 export interface PromptSurfaceRuntime {
     resolveRegistration: (
         config: PromptSurfaceConfig | undefined,
+        modelKey?: string,
     ) => PromptSurfaceRegistrationSelection;
     resolveGuidance: (
         config: PromptSurfaceConfig | undefined,
@@ -191,11 +192,12 @@ export function createPromptSurfaceRuntime(
     };
 
     return {
-        resolveRegistration(config) {
-            // OpenCode and Pi expose one immutable provider tool map per host
-            // registration. Model routes are intentionally ignored here: only the
-            // registration owner's default and user-tier overrides can choose text.
-            const { preset } = resolvePromptSurface(config, undefined);
+        resolveRegistration(config, modelKey) {
+            // OpenCode 1.x and Pi expose one immutable provider tool map per host
+            // registration, so callers omit modelKey and only the default preset
+            // can choose text. OpenCode 2 rewrites draft.tools per request and
+            // passes the draft model so the same resolver honors model routes.
+            const { preset } = resolvePromptSurface(config, modelKey);
 
             const overrides = config?.tool_descriptions ?? {};
             for (const [toolId, description] of Object.entries(overrides)) {

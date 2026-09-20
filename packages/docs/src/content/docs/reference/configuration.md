@@ -50,11 +50,11 @@ Select the full or light built-in prompt preset. Model routes use the same progr
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `prompt_surface` | object | — | Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. On OpenCode and Pi, per-model routing applies to the guidance block only: tool descriptions are registered once per process, so they follow the default preset (a v1 plugin-surface limitation; per-model tool descriptions are planned for the OpenCode v2 plugin API once the SDK stabilizes). |
-| `prompt_surface.default` | `"full"` \\| `"light"` | `"full"` | Fallback prompt-surface preset ("full" or "light"). |
-| `prompt_surface.models` | map<string, `"full"` \\| `"light"`> | — | Literal per-model routing. Keys are bare model IDs, provider/model, or provider/*; matching is case-sensitive and preserves additional slashes in model IDs. |
+| `prompt_surface` | object | — | Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/\* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_\* descriptions per request from the draft model. |
+| `prompt_surface.default` | `"full"` \| `"light"` | `"full"` | Fallback prompt-surface preset ("full" or "light"). |
+| `prompt_surface.models` | map<string, `"full"` \| `"light"`> | — | Literal per-model routing. Keys are bare model IDs, provider/model, or provider/\*; matching is case-sensitive and preserves additional slashes in model IDs. |
 | `prompt_surface.guidance_override_path` | string | — | USER-LEVEL ONLY path to a complete primary guidance section. Relative paths resolve from the user config file. |
-| `prompt_surface.tool_descriptions` | map<string, string> | — | USER-LEVEL ONLY top-level description overrides keyed by ctx_* tool ID; parameter schemas and descriptions are unchanged. |
+| `prompt_surface.tool_descriptions` | map<string, string> | — | USER-LEVEL ONLY top-level description overrides keyed by ctx_\* tool ID; parameter schemas and descriptions are unchanged. |
 
 ## Context management
 
@@ -62,9 +62,9 @@ When and how aggressively Magic Context manages the session's context window. Pe
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `cache_ttl` | string \\| map<string, string> | `"5m"` | How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "model-id": "10m" }). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body). |
-| `output_reserve` | number (0–) \\| map<string, number (0–)> | — | User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. Takes precedence over every derived source: an explicit value here always wins against catalog output limits, provider window-geometry facts, and the 25%-of-context fallback (usable window = context window minus this reserve). When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged. |
-| `execute_threshold_percentage` | number (20–90) \\| map<string, number (20–90)> | `65` | Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, "provider/model": 45 }). Values above 90 are rejected because the runtime caps at 90% of the output-reserved safe window (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE |
+| `cache_ttl` | string \| map<string, string> | `"5m"` | How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/\*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/\* wildcard, then default). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body). |
+| `output_reserve` | number (0–) \| map<string, number (0–)> | — | User-only output-token reservation override. Number or per-model object ({ default: 16384, "provider/model": 8192 }); 0 disables reservation. Takes precedence over every derived source: an explicit value here always wins against catalog output limits, provider window-geometry facts, and the 25%-of-context fallback (usable window = context window minus this reserve). When unset, Magic Context reserves the catalog output limit (capped at 25% of context) for shared-window providers and keeps proven separate-quota Google/Gemini windows unchanged. |
+| `execute_threshold_percentage` | number (20–90) \| map<string, number (20–90)> | `65` | Context percentage that forces queued operations to execute. Number or per-model object ({ default: 65, "provider/model": 45 }). Values above 90 are rejected because the runtime caps at 90% of the output-reserved safe window (MAX_EXECUTE_THRESHOLD). Default: DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE |
 | `execute_threshold_tokens` | object | — | Absolute token thresholds per model. When matched, overrides execute_threshold_percentage for that model. Accepts `default` for all models or per-model keys. Values above 90% × context_limit are clamped with a warning log. Min 5_000, max 2_000_000. |
 | `execute_threshold_tokens.default` | number (5000–2000000) | — |  |
 | `protected_tokens` | integer (4000–1000000) | — | Positive integer token floor to protect from automatic reclaim (min: 4_000, max: 1_000_000). When omitted, the derived default is clamp(round(0.05 × usableSoft), min(16_000, round(0.08 × usableSoft)), 64_000). |
@@ -94,30 +94,30 @@ The background agent that condenses old conversation into compact history.
 | `historian.tools` | map<string, boolean> | — | Tool enable/disable overrides |
 | `historian.disable` | boolean | — | Disable this agent |
 | `historian.description` | string | — | Agent description |
-| `historian.mode` | `"subagent"` \\| `"primary"` \\| `"all"` | — | Agent mode (subagent, primary, or all) |
+| `historian.mode` | `"subagent"` \| `"primary"` \| `"all"` | — | Agent mode (subagent, primary, or all) |
 | `historian.color` | string | — | Hex color for the agent (e.g. '#a1b2c3') |
 | `historian.maxSteps` | number | — | Maximum tool-call steps per invocation |
 | `historian.permission` | object | — | Per-tool permission overrides |
-| `historian.permission.edit` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `historian.permission.bash` | `"ask"` \\| `"allow"` \\| `"deny"` \\| map<string, `"ask"` \\| `"allow"` \\| `"deny"`> | — |  |
-| `historian.permission.webfetch` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `historian.permission.doom_loop` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `historian.permission.external_directory` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
+| `historian.permission.edit` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
+| `historian.permission.bash` | `"ask"` \| `"allow"` \| `"deny"` \| map<string, `"ask"` \| `"allow"` \| `"deny"`> | — |  |
+| `historian.permission.webfetch` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
+| `historian.permission.doom_loop` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
+| `historian.permission.external_directory` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
 | `historian.maxTokens` | number | — | Maximum output tokens |
 | `historian.opencode` | object | — | Strict OpenCode model-resolution block. It accepts no Pi vocabulary. |
-| `historian.opencode.model` | string \\| object | — | Primary OpenCode model entry. |
-| `historian.opencode.fallback_models` | string \\| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `historian.opencode.model` | string \| object | — | Primary OpenCode model entry. |
+| `historian.opencode.fallback_models` | string \| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
 | `historian.opencode.variant` | string | — | OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
 | `historian.pi` | object | — | Strict Pi model-resolution block. It accepts no OpenCode vocabulary. |
-| `historian.pi.model` | string \\| object | — | Primary Pi model entry. |
-| `historian.pi.fallback_models` | string \\| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
-| `historian.pi.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
+| `historian.pi.model` | string \| object | — | Primary Pi model entry. |
+| `historian.pi.fallback_models` | string \| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `historian.pi.thinking_level` | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `historian.omp` | object | — | Strict OMP model-resolution block. It accepts no OpenCode vocabulary. |
-| `historian.omp.model` | string \\| object | — | Primary OMP model entry. |
-| `historian.omp.fallback_models` | string \\| object[] | — | Ordered fallback OMP entries. |
-| `historian.omp.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` \\| `"inherit"` \\| `"auto"` | — | OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
+| `historian.omp.model` | string \| object | — | Primary OMP model entry. |
+| `historian.omp.fallback_models` | string \| object[] | — | Ordered fallback OMP entries. |
+| `historian.omp.thinking_level` | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` \| `"inherit"` \| `"auto"` | — | OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `historian.two_pass` | boolean | `false` | Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false) |
-| `historian.disallowed_tools` | `"*"` \\| `"read"` \\| `"aft_outline"` \\| `"aft_zoom"` \\| `"aft_search"`[] | `[]` | OpenCode only. Tools to REMOVE from the historian's default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use ["*"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: []) |
+| `historian.disallowed_tools` | `"\*"` \| `"read"` \| `"aft_outline"` \| `"aft_zoom"` \| `"aft_search"`[] | `[]` | OpenCode only. Tools to REMOVE from the historian's default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use ["\*"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: []) |
 | `historian_timeout_ms` | number (60000–) | `600000` | Timeout for each historian prompt call in milliseconds (default: 600000) |
 | `commit_cluster_trigger` | object | — | Commit-cluster trigger: fire historian when enough commit clusters accumulate in the unsummarized tail |
 | `commit_cluster_trigger.enabled` | boolean | `true` | Enable commit-cluster based historian triggering (default: true) |
@@ -143,19 +143,19 @@ Durable project memory, semantic search, and recall features. OpenAI-compatible 
 | `memory.git_commit_indexing.since_days` | number (7–3650) | `365` | Days of HEAD history to index (min: 7, max: 3650, default: 365) |
 | `memory.git_commit_indexing.max_commits` | number (100–20000) | `2000` | Max commits kept per project; oldest evicted (min: 100, max: 20000, default: 2000) |
 | `embedding` | object | — | Embedding provider configuration |
-| `embedding.provider` | `"local"` \\| `"openai-compatible"` \\| `"off"` \\| `"synapse"` | `"local"` | Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings. |
-| `embedding.fallback_provider` | `"local"` \\| `"openai-compatible"` \\| `"off"` | — | Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid. |
+| `embedding.provider` | `"local"` \| `"openai-compatible"` \| `"off"` \| `"synapse"` | `"local"` | Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings. |
+| `embedding.fallback_provider` | `"local"` \| `"openai-compatible"` \| `"off"` | — | Fallback provider for the Synapse lane. Required when provider is 'synapse'; local, openai-compatible, and off are valid. |
 | `embedding.model` | string | — | Embedding model name. Required for openai-compatible, ignored for local. |
 | `embedding.endpoint` | string | — | API endpoint URL. Required when provider is openai-compatible. |
 | `embedding.api_key` | string | — | API key for remote embedding provider (optional) |
 | `embedding.input_type` | string | — | Default input_type for stored/indexed (passage) embeddings in the request body. Required by some openai-compatible providers (e.g. NVIDIA NIM). Omitted from the request when unset. |
 | `embedding.query_input_type` | string | — | Optional input_type for query (search) embeddings on asymmetric models (e.g. NVIDIA NIM 'query'). When unset, query embeddings use embedding.input_type. Passage/stored content always uses embedding.input_type. |
-| `embedding.query_instruction` | string \\| boolean | — | OpenAI-compatible query prefix override. A string is prepended verbatim to search queries; false disables the built-in model-family instruction. Qwen3-Embedding, gte-Qwen instruct, e5 instruct, and Nomic families have built-in recipes. Query-only changes do not re-embed stored content. User-level only; project values are ignored. |
+| `embedding.query_instruction` | string \| boolean | — | OpenAI-compatible query prefix override. A string is prepended verbatim to search queries; false disables the built-in model-family instruction. Qwen3-Embedding, gte-Qwen instruct, e5 instruct, and Nomic families have built-in recipes. Query-only changes do not re-embed stored content. User-level only; project values are ignored. |
 | `embedding.document_prefix` | string | — | OpenAI-compatible stored-document prefix override, prepended verbatim. Defaults to the model-family recipe (empty for Qwen3/gte/e5 instruct; 'search_document: ' for Nomic). Changing it changes stored vectors and triggers re-embedding. User-level only; project values are ignored. |
 | `embedding.truncate` | string | — | Optional truncate mode sent in the embedding request body (e.g. NVIDIA NIM accepts 'NONE' \| 'START' \| 'END'). Omitted from the request when unset. |
 | `embedding.max_input_tokens` | integer (–9007199254740991) | — | Optional maximum input tokens for chunk embeddings. Defaults conservatively to 512 when omitted. |
-| `embedding.local_runtime` | `"auto"` \\| `"native"` \\| `"wasm"` | `"auto"` | Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Set 'native' only to prefer speed while accepting that pre-1.4.0 Bun crash risk, or 'wasm' to avoid loading the native addon. |
-| `embedding.local_dtype` | `"auto"` \\| `"fp32"` \\| `"fp16"` \\| `"q8"` \\| `"int8"` \\| `"uint8"` \\| `"q4"` \\| `"bnb4"` \\| `"q4f16"` \\| `"q2"` \\| `"q2f16"` \\| `"q1"` \\| `"q1f16"` | — | Local provider only: ONNX model dtype passed to the transformers.js feature-extraction pipeline. Accepts the @huggingface/transformers DataType strings (auto, fp32, fp16, q8, int8, uint8, q4, bnb4, q4f16, q2, q2f16, q1, q1f16). Omitted keeps today's behavior (fp32). A non-default value changes the produced vectors and folds into the embedding model identity, so switching dtype re-embeds rather than mixing vector spaces. Useful for selecting a quantized variant (e.g. q8) of a larger multilingual model to cut memory and CPU cost; see issue #259. |
+| `embedding.local_runtime` | `"auto"` \| `"native"` \| `"wasm"` | `"auto"` | Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Set 'native' only to prefer speed while accepting that pre-1.4.0 Bun crash risk, or 'wasm' to avoid loading the native addon. |
+| `embedding.local_dtype` | `"auto"` \| `"fp32"` \| `"fp16"` \| `"q8"` \| `"int8"` \| `"uint8"` \| `"q4"` \| `"bnb4"` \| `"q4f16"` \| `"q2"` \| `"q2f16"` \| `"q1"` \| `"q1f16"` | — | Local provider only: ONNX model dtype passed to the transformers.js feature-extraction pipeline. Accepts the @huggingface/transformers DataType strings (auto, fp32, fp16, q8, int8, uint8, q4, bnb4, q4f16, q2, q2f16, q1, q1f16). Omitted keeps today's behavior (fp32). A non-default value changes the produced vectors and folds into the embedding model identity, so switching dtype re-embeds rather than mixing vector spaces. Useful for selecting a quantized variant (e.g. q8) of a larger multilingual model to cut memory and CPU cost; see issue #259. |
 
 ## Background agents
 
@@ -170,46 +170,46 @@ Off-hours maintenance through Dreamer.
 | `dreamer.tools` | map<string, boolean> | — | Tool enable/disable overrides |
 | `dreamer.disable` | boolean | — | Disable this agent |
 | `dreamer.description` | string | — | Agent description |
-| `dreamer.mode` | `"subagent"` \\| `"primary"` \\| `"all"` | — | Agent mode (subagent, primary, or all) |
+| `dreamer.mode` | `"subagent"` \| `"primary"` \| `"all"` | — | Agent mode (subagent, primary, or all) |
 | `dreamer.color` | string | — | Hex color for the agent (e.g. '#a1b2c3') |
 | `dreamer.maxSteps` | number | — | Maximum tool-call steps per invocation |
 | `dreamer.permission` | object | — | Per-tool permission overrides |
-| `dreamer.permission.edit` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `dreamer.permission.bash` | `"ask"` \\| `"allow"` \\| `"deny"` \\| map<string, `"ask"` \\| `"allow"` \\| `"deny"`> | — |  |
-| `dreamer.permission.webfetch` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `dreamer.permission.doom_loop` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
-| `dreamer.permission.external_directory` | `"ask"` \\| `"allow"` \\| `"deny"` | — |  |
+| `dreamer.permission.edit` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
+| `dreamer.permission.bash` | `"ask"` \| `"allow"` \| `"deny"` \| map<string, `"ask"` \| `"allow"` \| `"deny"`> | — |  |
+| `dreamer.permission.webfetch` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
+| `dreamer.permission.doom_loop` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
+| `dreamer.permission.external_directory` | `"ask"` \| `"allow"` \| `"deny"` | — |  |
 | `dreamer.maxTokens` | number | — | Maximum output tokens |
 | `dreamer.opencode` | object | — | Strict OpenCode dreamer model-resolution block. It accepts no Pi vocabulary. |
-| `dreamer.opencode.model` | string \\| object | — | Primary OpenCode model entry. |
-| `dreamer.opencode.fallback_models` | string \\| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `dreamer.opencode.model` | string \| object | — | Primary OpenCode model entry. |
+| `dreamer.opencode.fallback_models` | string \| object[] | — | Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
 | `dreamer.opencode.variant` | string | — | OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry. |
 | `dreamer.opencode.tasks` | map<string, object> | — | OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes. |
 | `dreamer.pi` | object | — | Strict Pi dreamer model-resolution block. It accepts no OpenCode vocabulary. |
-| `dreamer.pi.model` | string \\| object | — | Primary Pi model entry. |
-| `dreamer.pi.fallback_models` | string \\| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
-| `dreamer.pi.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
+| `dreamer.pi.model` | string \| object | — | Primary Pi model entry. |
+| `dreamer.pi.fallback_models` | string \| object[] | — | Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array. |
+| `dreamer.pi.thinking_level` | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` | — | Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `dreamer.pi.tasks` | map<string, object> | — | Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes. |
 | `dreamer.omp` | object | — | Strict OMP dreamer model-resolution block. It accepts no OpenCode vocabulary. |
-| `dreamer.omp.model` | string \\| object | — | Primary OMP model entry. |
-| `dreamer.omp.fallback_models` | string \\| object[] | — | Ordered fallback OMP entries. |
-| `dreamer.omp.thinking_level` | `"off"` \\| `"minimal"` \\| `"low"` \\| `"medium"` \\| `"high"` \\| `"xhigh"` \\| `"max"` \\| `"inherit"` \\| `"auto"` | — | OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
+| `dreamer.omp.model` | string \| object | — | Primary OMP model entry. |
+| `dreamer.omp.fallback_models` | string \| object[] | — | Ordered fallback OMP entries. |
+| `dreamer.omp.thinking_level` | `"off"` \| `"minimal"` \| `"low"` \| `"medium"` \| `"high"` \| `"xhigh"` \| `"max"` \| `"inherit"` \| `"auto"` | — | OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry. |
 | `dreamer.omp.tasks` | map<string, object> | — | OMP task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes. |
 | `dreamer.tasks` | object | — | Harness-independent task metadata. schedule, promotion_threshold, and other task metadata remain here; execution settings live under dreamer.opencode.tasks, dreamer.pi.tasks, or dreamer.omp.tasks. |
-| `dreamer.tasks.map-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.verify.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.verify-broad.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.curate.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.compress-cues.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.classify-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.retrospective.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.maintain-docs.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.evaluate-smart-notes.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
-| `dreamer.tasks.review-user-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
+| `dreamer.tasks.map-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.verify.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.verify-broad.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.curate.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.compress-cues.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.classify-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.retrospective.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.maintain-docs.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.evaluate-smart-notes.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
+| `dreamer.tasks.review-user-memories.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.tasks.review-user-memories.promotion_threshold` | number (2–20) | — | review-user-memories: min candidate observations before promotion is considered (default: 3) |
-| `dreamer.tasks.promote-primers.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
+| `dreamer.tasks.promote-primers.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.tasks.promote-primers.promotion_threshold` | number (2–20) | — | promote-primers: min recurring source days before promotion is considered (default: 2) |
-| `dreamer.tasks.refresh-primers.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 * * *"), or "" to disable this task. |
+| `dreamer.tasks.refresh-primers.schedule` | string | `""` | 5-field cron schedule (e.g. "0 3 \* \* \*"), or "" to disable this task. |
 | `dreamer.inject_docs` | boolean | `true` | Inject ARCHITECTURE.md and STRUCTURE.md into the m[0] `<project-docs>` block (default true) |
 
 ## Advanced

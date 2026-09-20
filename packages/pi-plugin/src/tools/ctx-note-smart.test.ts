@@ -60,15 +60,14 @@ async function callNote(args: {
 }
 
 describe("Pi ctx_note smart notes", () => {
-	it("pins the multi-dismiss schema fields", () => {
+	it("declares one id field and pins its schema", () => {
 		const tool = createCtxNoteTool({ db: createTestDb() });
 		const properties = (
 			tool.parameters as { properties: Record<string, unknown> }
 		).properties;
-		expect(properties.note_id).toEqual({
-			type: "number",
-			description: "Note ID (required for 'dismiss' and 'update' actions).",
-		});
+		// A second scalar id field is what made required-all tool surfaces fail
+		// every call with filler in both (issue 460).
+		expect(properties.note_id).toBeUndefined();
 		expect(properties.note_ids).toEqual({
 			type: "array",
 			items: {
@@ -79,7 +78,7 @@ describe("Pi ctx_note smart notes", () => {
 			minItems: 1,
 			maxItems: 50,
 			description:
-				"One to fifty note ids for 'dismiss' only; do not combine with note_id.",
+				"Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'.",
 		});
 	});
 
@@ -344,7 +343,7 @@ describe("Pi ctx_note smart notes", () => {
 		await callNote({
 			db,
 			sessionId: "ses-a",
-			params: { action: "dismiss", note_id: 3 },
+			params: { action: "dismiss", note_ids: [3] },
 		});
 
 		const result = await callNote({
@@ -373,27 +372,49 @@ describe("Pi ctx_note smart notes", () => {
 		]);
 	});
 
-	it("rejects note_ids outside dismiss and rejects note_id conflicts", async () => {
+	it("ignores note_ids filler on write and read, and takes exactly one id for update", async () => {
+		// Required-all tool surfaces make the model fill every declared
+		// property (issue 460); ids on an action that does not use them must
+		// not fail the call.
 		const db = createTestDb();
-		const outsideDismiss = await callNote({
+		const writeWithFiller = await callNote({
 			db,
-			params: { action: "update", note_ids: [1], content: "not allowed" },
+			params: {
+				action: "write",
+				content: "Filler-tolerant note",
+				note_ids: [1],
+			},
 		});
-		const conflict = await callNote({
+		const readWithFiller = await callNote({
 			db,
-			params: { action: "dismiss", note_id: 1, note_ids: [1] },
+			params: { action: "read", note_ids: [1] },
 		});
-		const nonDismissConflict = await callNote({
+		const updateTwo = await callNote({
 			db,
-			params: { action: "update", note_id: 1, note_ids: [1] },
+			params: { action: "update", note_ids: [1, 2], content: "two ids" },
 		});
+		const updateNone = await callNote({
+			db,
+			params: { action: "update", content: "no ids" },
+		});
+		const dismissNone = await callNote({ db, params: { action: "dismiss" } });
 
-		expect(outsideDismiss.isError).toBe(true);
-		expect(outsideDismiss.text).toContain("'note_ids' is only valid");
-		expect(conflict.isError).toBe(true);
-		expect(conflict.text).toContain("'note_id' and 'note_ids'");
-		expect(nonDismissConflict.isError).toBe(true);
-		expect(nonDismissConflict.text).toContain("'note_id' and 'note_ids'");
+		expect(writeWithFiller.isError).toBe(false);
+		expect(writeWithFiller.text).toContain("Saved session note #1");
+		expect(readWithFiller.isError).toBe(false);
+		expect(readWithFiller.text).toContain("Filler-tolerant note");
+		expect(updateTwo.isError).toBe(true);
+		expect(updateTwo.text).toContain(
+			"exactly one positive integer id when action is 'update'",
+		);
+		expect(updateNone.isError).toBe(true);
+		expect(updateNone.text).toContain(
+			"exactly one positive integer id when action is 'update'",
+		);
+		expect(dismissNone.isError).toBe(true);
+		expect(dismissNone.text).toContain(
+			"1 to 50 positive integer ids when action is 'dismiss'",
+		);
 	});
 
 	it("read with filter='active' is STRICTER than default — does not include pending smart notes", async () => {
@@ -502,7 +523,7 @@ describe("Pi ctx_note smart notes", () => {
 			dreamerEnabled: true,
 			params: {
 				action: "update",
-				note_id: created.id,
+				note_ids: [created.id],
 				surface_condition: "New condition",
 			},
 		});
@@ -533,7 +554,7 @@ describe("Pi ctx_note smart notes", () => {
 			dreamerEnabled: true,
 			params: {
 				action: "update",
-				note_id: created.id,
+				note_ids: [created.id],
 				content: "New content",
 			},
 		});
@@ -557,7 +578,7 @@ describe("Pi ctx_note smart notes", () => {
 		const { isError, text } = await callNote({
 			db,
 			sessionId: "ses-note-1",
-			params: { action: "dismiss", note_id: created.id },
+			params: { action: "dismiss", note_ids: [created.id] },
 		});
 
 		expect(isError).toBe(true);
@@ -581,7 +602,7 @@ describe("Pi ctx_note smart notes", () => {
 			dreamerEnabled: true,
 			params: {
 				action: "update",
-				note_id: created.id,
+				note_ids: [created.id],
 				content: "Hijacked smart note",
 			},
 		});

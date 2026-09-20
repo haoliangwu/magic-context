@@ -3,6 +3,7 @@ import {
     type EmbeddingFeatures,
     registerProjectEmbedding,
     registerProjectShadowEmbedding,
+    unregisterProjectShadowEmbedding,
 } from "../features/magic-context/memory/embedding";
 import { invalidateProject } from "../features/magic-context/memory/embedding-cache";
 import { resolveProjectIdentityForSession } from "../features/magic-context/memory/project-identity";
@@ -43,5 +44,7 @@ export async function ensureProjectRegisteredFromOpenCodeDirectory(
     registerProjectEmbedding(db, projectIdentity, routing.primary, features, directory);
     if (routing.shadow) {
         registerProjectShadowEmbedding(db, projectIdentity, routing.shadow, directory);
+    } else {
+        unregisterProjectShadowEmbedding(projectIdentity);
     }
 }

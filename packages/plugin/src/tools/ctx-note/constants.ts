@@ -5,7 +5,7 @@ Use a note when something matters LATER but not in the next few steps: "revisit 
 Actions:
 - write: save a note (content). Add surface_condition to make it a smart note (below).
 - read: list notes, newest first. Default: latest active session notes + ready smart notes; page older ones with limit/offset, or inspect other states with filter.
-- update: change a note by note_id. dismiss: retire one by note_id or 1–50 by note_ids; provide exactly one.
+- update: change one note (note_ids=[N]). dismiss: retire 1–50 notes (note_ids=[...]).
 
 Smart notes: pass surface_condition and the note stays hidden until a background checker confirms the condition — using ONLY externally verifiable signals (GitHub state via gh, files on disk, git history, web pages). It cannot see this conversation, so the condition must be checkable from outside:
 ✓ "When PR #42 in cortexkit/magic-context is merged"

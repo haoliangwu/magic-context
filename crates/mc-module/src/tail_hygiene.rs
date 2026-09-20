@@ -785,9 +785,9 @@ pub(crate) fn refresh_tail_hygiene_baseline(
     let mut turn_delta_u = boundary_advance_u.saturating_add(queued_drop_delta_u);
     for part in &measured.parts[previous.baseline_parts.len()..] {
         turn_delta_t = turn_delta_t.saturating_add(part.tokens);
-        // A just-completed output is always in the newest recency reserve. Keeping it T-only
-        // prevents a defer pass from inflating U before the next full bust walk.
-        if part.kind != TailHygienePartKind::ToolOutput {
+        // Tool-output tokens are not reclaimable while their parts are protected. As new
+        // outputs extend the measured tail, include outputs that have aged out of protection.
+        if part.kind != TailHygienePartKind::ToolOutput || !part.protected {
             turn_delta_u = turn_delta_u.saturating_add(part.u_tokens);
         }
     }
@@ -1025,6 +1025,108 @@ mod tests {
             "old protected mass should advance into U"
         );
         assert_eq!(defer.baseline_generation, baseline.baseline_generation);
+    }
+
+    #[test]
+    fn appended_tool_output_enters_defer_delta_after_protection_ages_out() {
+        let base = vec![text("base", 1, "base text")];
+        let base_tags = vec![tag(1, "base#0")];
+        let protection = |numbers: &[i64]| TagNumberProjection {
+            coordinate_space: CoordinateSpace::TagNumber,
+            tag_numbers: numbers.iter().copied().map(TagNumber).collect(),
+        };
+        let empty = HashSet::new();
+        let baseline_measurement = measure_tail_hygiene_with_pending_drops(
+            &project_messages(&base).unwrap(),
+            &CoreState::default(),
+            None,
+            &base_tags,
+            &protection(&[1]),
+            &empty,
+            &empty,
+        );
+        let baseline = refresh_tail_hygiene_baseline(baseline_measurement, true, None, 10);
+
+        let reminder =
+            "\n\n<system-reminder>\nHousekeeping backlog: spent tool outputs are reclaimable.\n</system-reminder>";
+        let mut messages = base.clone();
+        messages.push(message(
+            "tool-delta",
+            2,
+            "assistant",
+            vec![CkKind::ToolCall {
+                id: "call-delta".to_string(),
+                name: "read".to_string(),
+                input: json!({"path": "new"}),
+                provider_executed: false,
+            }],
+        ));
+        messages.push(message(
+            "tool-delta-result",
+            3,
+            "user",
+            vec![CkKind::ToolResult {
+                id: "call-delta".to_string(),
+                tool_name: "read".to_string(),
+                output: CkToolOutput::bare(CkOutputKind::Text {
+                    text: format!("{}{}", "reclaimable tool output ".repeat(1_000), reminder),
+                }),
+                provider_executed: false,
+            }],
+        ));
+        let tags = vec![
+            base_tags[0].clone(),
+            McTagRow {
+                kind: "tool_result".to_string(),
+                ..tag(2, "tool-delta-result#0")
+            },
+        ];
+        let prefix_sha = hex_digest(serde_json::to_vec(&base).unwrap());
+        let served_array_sha = hex_digest(serde_json::to_vec(&messages).unwrap());
+        let projection = project_messages(&messages).unwrap();
+        let protected_measurement = measure_tail_hygiene_with_pending_drops(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            &protection(&[1, 2]),
+            &empty,
+            &empty,
+        );
+        let protected_defer =
+            refresh_tail_hygiene_baseline(protected_measurement, false, Some(&baseline), 20);
+        let aged_measurement = measure_tail_hygiene_with_pending_drops(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            &protection(&[1]),
+            &empty,
+            &empty,
+        );
+        let aged_defer = refresh_tail_hygiene_baseline(
+            aged_measurement.clone(),
+            false,
+            Some(&protected_defer),
+            30,
+        );
+
+        assert_eq!(effective_tail_hygiene(&protected_defer).0, 0);
+        assert_eq!(
+            effective_tail_hygiene(&aged_defer),
+            (aged_measurement.u, aged_measurement.t)
+        );
+        assert_eq!(hex_digest(serde_json::to_vec(&base).unwrap()), prefix_sha);
+        assert_eq!(
+            hex_digest(serde_json::to_vec(&messages).unwrap()),
+            served_array_sha
+        );
+        assert!(!serde_json::to_string(&messages[0])
+            .unwrap()
+            .contains("Housekeeping backlog"));
+        assert!(serde_json::to_string(messages.last().unwrap())
+            .unwrap()
+            .contains("Housekeeping backlog"));
     }
 
     #[test]

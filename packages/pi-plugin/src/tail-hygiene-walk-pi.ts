@@ -745,7 +745,10 @@ export function refreshPiTailHygieneBaseline(
 	) {
 		const part = measured.parts[index];
 		turnDeltaT += part.tokens;
-		if (part.kind !== "toolOutput") turnDeltaU += part.uTokens;
+		// Tool-output tokens are not reclaimable while their parts are protected. As new
+		// outputs extend the measured tail, include outputs that have aged out of protection.
+		if (part.kind !== "toolOutput" || !part.protected)
+			turnDeltaU += part.uTokens;
 	}
 	return {
 		...input.previous,

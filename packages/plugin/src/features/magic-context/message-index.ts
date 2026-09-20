@@ -740,13 +740,22 @@ export function ensureMessagesIndexed(
     indexMessagesAfterOrdinal(db, sessionId, messages, lastIndexedOrdinal, messages.length);
 }
 
-function getMessageHistoryOrphanSweepState(db: Database): MessageHistoryOrphanSweepRow {
+function openCodeSweepHarness(): "opencode" | "opencode2" {
+    const harness = getHarness();
+    if (harness === "opencode" || harness === "opencode2") return harness;
+    throw new Error(`OpenCode orphan sweep cannot read a ${harness} host store`);
+}
+
+function getMessageHistoryOrphanSweepState(
+    db: Database,
+    harness: "opencode" | "opencode2",
+): MessageHistoryOrphanSweepRow {
     return (
         (db
             .prepare(
-                "SELECT cursor_session_id, last_swept_at FROM message_history_orphan_sweep WHERE harness = 'opencode'",
+                "SELECT cursor_session_id, last_swept_at FROM message_history_orphan_sweep WHERE harness = ?",
             )
-            .get() as MessageHistoryOrphanSweepRow | null) ?? {}
+            .get(harness) as MessageHistoryOrphanSweepRow | null) ?? {}
     );
 }
 
@@ -754,24 +763,25 @@ function persistMessageHistoryOrphanSweepState(
     db: Database,
     cursor: string,
     lastSweptAt: number | null,
+    harness: "opencode" | "opencode2",
 ): void {
     db.prepare(
         `INSERT INTO message_history_orphan_sweep (harness, cursor_session_id, last_swept_at)
-         VALUES ('opencode', ?, ?)
+          VALUES (?, ?, ?)
          ON CONFLICT(harness) DO UPDATE SET
              cursor_session_id = excluded.cursor_session_id,
              last_swept_at = excluded.last_swept_at`,
-    ).run(cursor, lastSweptAt);
+    ).run(harness, cursor, lastSweptAt);
 }
 
-function getOpenCodeSessionScopedCandidateSourceSql(): string {
+function getOpenCodeSessionScopedCandidateSourceSql(harness: "opencode" | "opencode2"): string {
     // A table without harness provenance cannot safely nominate a session for an
     // OpenCode sweep: the same shared row could belong to Pi. Once an
     // OpenCode-scoped table is listed for deletion, it automatically becomes a
     // discovery source too; storage-db.test.ts fences that list to the schema.
     return SESSION_SCOPED_TABLES.filter((definition) => definition.harnessScoped === true)
         .map((definition) => {
-            const predicates = ["session_id IS NOT NULL", "harness = 'opencode'"];
+            const predicates = ["session_id IS NOT NULL", `harness = '${harness}'`];
             if (definition.extraPredicate) predicates.push(definition.extraPredicate);
             return `SELECT session_id FROM ${definition.table} WHERE ${predicates.join(" AND ")}`;
         })
@@ -800,7 +810,8 @@ export function sweepOrphanedOpenCodeMessageIndexes(
         cooldownMs,
         options.unavailableReprobeMs ?? MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS,
     );
-    const state = getMessageHistoryOrphanSweepState(db);
+    const harness = openCodeSweepHarness();
+    const state = getMessageHistoryOrphanSweepState(db, harness);
     const cursor = typeof state.cursor_session_id === "string" ? state.cursor_session_id : "";
     if (typeof state.last_swept_at === "number" && state.last_swept_at + cooldownMs > now) {
         return { status: "cooldown", scanned: 0, deleted: 0, cursor };
@@ -815,13 +826,18 @@ export function sweepOrphanedOpenCodeMessageIndexes(
     if (!openCodeDb) {
         // Mirror the git sweep's non-indexable parking: future-date the last
         // sweep so the normal cooldown arithmetic re-probes after one day.
-        persistMessageHistoryOrphanSweepState(db, cursor, now + unavailableReprobeMs - cooldownMs);
+        persistMessageHistoryOrphanSweepState(
+            db,
+            cursor,
+            now + unavailableReprobeMs - cooldownMs,
+            harness,
+        );
         return { status: "source_unavailable", scanned: 0, deleted: 0, cursor };
     }
 
     try {
         const cutoff = now - safetyAgeMs;
-        const candidateSourceSql = getOpenCodeSessionScopedCandidateSourceSql();
+        const candidateSourceSql = getOpenCodeSessionScopedCandidateSourceSql(harness);
         const candidates = db
             .prepare(
                 `SELECT session_id
@@ -831,7 +847,7 @@ export function sweepOrphanedOpenCodeMessageIndexes(
                        SELECT 1
                        FROM message_history_index
                        WHERE message_history_index.session_id = session_candidates.session_id
-                         AND message_history_index.harness = 'opencode'
+                          AND message_history_index.harness = '${harness}'
                          AND message_history_index.updated_at > ?
                    )
                  ORDER BY session_id ASC
@@ -861,7 +877,7 @@ export function sweepOrphanedOpenCodeMessageIndexes(
                        SELECT 1
                        FROM message_history_index
                        WHERE message_history_index.session_id = session_candidates.session_id
-                         AND message_history_index.harness = 'opencode'
+                          AND message_history_index.harness = '${harness}'
                          AND message_history_index.updated_at > ?
                    )
                  LIMIT 1`,
@@ -869,8 +885,8 @@ export function sweepOrphanedOpenCodeMessageIndexes(
             const eligibleSessionIds = missingSessionIds.filter((sessionId) =>
                 stillEligible.get(sessionId, cutoff),
             );
-            deleted = deleteSessionScopedRows(db, eligibleSessionIds, "opencode");
-            persistMessageHistoryOrphanSweepState(db, nextCursor, completedAt);
+            deleted = deleteSessionScopedRows(db, eligibleSessionIds, harness);
+            persistMessageHistoryOrphanSweepState(db, nextCursor, completedAt, harness);
             db.exec("COMMIT");
             committed = true;
             logSlowWriteTransaction("message_index_orphan_sweep", transactionStartedAt);

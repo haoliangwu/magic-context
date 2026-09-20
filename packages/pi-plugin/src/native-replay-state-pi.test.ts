@@ -14,6 +14,7 @@ import {
 import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
+	signalPiPendingMaterialization,
 } from "./context-handler";
 import {
 	applyNativeReasoningReplayPi,
@@ -370,6 +371,8 @@ describe("native upgrade application", () => {
 				expect(nativeBytes(await f.pass(0))).toBe(failed);
 				f.restart();
 				expect(nativeBytes(await f.pass(0))).toBe(failed);
+				// A consumed force episode cannot retry new mutations; an explicit flush can.
+				signalPiPendingMaterialization(sessionId);
 				const retried = nativeBytes(await f.pass(90));
 				expect(retried).not.toContain(retained);
 				expect(nativeBytes(await f.pass(0))).toBe(retried);

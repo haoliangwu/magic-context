@@ -35,7 +35,8 @@ RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 
 # OpenCode standalone install (matches the official curl|bash path).
-RUN curl -fsSL https://opencode.ai/install | bash
+COPY tests/docker/install-opencode.sh /usr/local/bin/install-opencode.sh
+RUN install-opencode.sh
 ENV PATH="/root/.opencode/bin:$PATH"
 
 # aimock provides the OpenAI-compatible mock LLM. AFT uses the same

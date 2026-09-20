@@ -2,6 +2,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync 
 import { dirname, join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 
+import {
+    AUTO_UPDATE_CHECK_STATE_FILENAME,
+    type AutoUpdateCheckState,
+    isUpdaterPinnedSpec,
+    readAutoUpdateCheckState,
+} from "../../shared/auto-update-provenance";
 import { getOpenCodeStorageDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";
 import { resolveInstallContext } from "./cache";
@@ -32,7 +38,6 @@ type ResolvedAutoUpdateCheckerOptions = Required<
 
 const DEFAULT_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const DEFAULT_INIT_DELAY_MS = 5_000;
-const TIMESTAMP_FILENAME = "last-update-check.json";
 const PENDING_UPDATE_FILENAME = "pending-plugin-update.json";
 const PENDING_UPDATE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -161,31 +166,43 @@ async function maybeRunCheck(
  * launch. The atomic temp+rename write ensures the file is always
  * fully-formed JSON for the next read, even mid-race.
  */
+function checkStatePath(storageDir: string | null): string {
+    return join(storageDir ?? getOpenCodeStorageDir(), AUTO_UPDATE_CHECK_STATE_FILENAME);
+}
+
+function writeCheckState(path: string, state: AutoUpdateCheckState): void {
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.tmp.${process.pid}`;
+    writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+    renameSync(tmp, path);
+}
+
 function claimCheckSlot(storageDir: string | null, intervalMs: number): boolean {
     if (!storageDir) return true; // No storage available — fail open.
     try {
-        const file = join(storageDir, TIMESTAMP_FILENAME);
-        if (existsSync(file)) {
-            try {
-                const raw = JSON.parse(readFileSync(file, "utf-8")) as {
-                    lastCheckedMs?: unknown;
-                };
-                const last = typeof raw.lastCheckedMs === "number" ? raw.lastCheckedMs : 0;
-                if (Number.isFinite(last) && Date.now() - last < intervalMs) {
-                    return false;
-                }
-            } catch {
-                // Corrupt timestamp file — overwrite it below.
-            }
-        }
-        mkdirSync(dirname(file), { recursive: true });
-        const tmp = `${file}.tmp.${process.pid}`;
-        writeFileSync(tmp, JSON.stringify({ lastCheckedMs: Date.now() }), "utf-8");
-        renameSync(tmp, file);
+        const file = checkStatePath(storageDir);
+        const previous = readAutoUpdateCheckState(file) ?? {};
+        const last = previous.lastCheckedMs ?? 0;
+        if (Date.now() - last < intervalMs) return false;
+        writeCheckState(file, { ...previous, lastCheckedMs: Date.now() });
         return true;
     } catch (err) {
         warn(`[auto-update-checker] Could not coordinate via timestamp file: ${String(err)}`);
         return true;
+    }
+}
+
+function recordUpdaterPinnedSpec(storageDir: string | null, spec: string): void {
+    try {
+        const path = checkStatePath(storageDir);
+        const previous = readAutoUpdateCheckState(path) ?? {};
+        writeCheckState(path, {
+            ...previous,
+            updaterPinnedSpec: spec,
+            updaterPinnedAt: Date.now(),
+        });
+    } catch (err) {
+        warn(`[auto-update-checker] Could not record updater pin provenance: ${String(err)}`);
     }
 }
 
@@ -205,6 +222,7 @@ function writePendingUpdateMarker(
     update: PreparedConfigUpdate,
     version: string,
 ): void {
+    recordUpdaterPinnedSpec(storageDir, update.spec);
     try {
         const dir = storageDir ?? dirname(pendingMarkerPath(storageDir));
         mkdirSync(dir, { recursive: true });
@@ -344,16 +362,25 @@ async function runBackgroundUpdateCheck(
         `[auto-update-checker] Update available (${channel}): ${currentVersion} → ${latestVersion}`,
     );
 
-    if (pluginInfo.isPinned) {
+    const updaterOwnedPin =
+        pluginInfo.isPinned &&
+        isUpdaterPinnedSpec(
+            readAutoUpdateCheckState(checkStatePath(options.storageDir)),
+            pluginInfo.entry,
+        );
+    if (pluginInfo.isPinned && !updaterOwnedPin) {
         showToast(
             ctx,
             `Magic Context ${latestVersion}`,
-            `v${latestVersion} available. Version is pinned; update your OpenCode plugin config to upgrade.`,
+            `v${latestVersion} available. This version was pinned by you; update your OpenCode plugin config to upgrade.`,
             "info",
             8000,
         );
-        log("[auto-update-checker] Version is pinned; skipping auto-update");
+        log("[auto-update-checker] Version was pinned by you; skipping auto-update");
         return;
+    }
+    if (updaterOwnedPin) {
+        log("[auto-update-checker] Version was pinned by the updater; continuing auto-update");
     }
 
     if (!options.autoUpdate) {

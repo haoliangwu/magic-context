@@ -312,12 +312,46 @@ export interface ModuleTransformWirePage {
 export function buildPagedModuleTransformPayloads(
     body: Record<string, unknown>,
     pageMaxBytes = MODULE_PAGE_MAX_BYTES,
+    forcePageEnvelope = false,
 ): ModuleTransformWirePage[] {
     // The unpaged path must stringify once to know it fits. Return that length so
     // the transport telemetry does not serialize the same body a second time.
     const serializedBody = JSON.stringify(body);
     const unpagedBytes = Buffer.byteLength(serializedBody);
-    if (unpagedBytes <= pageMaxBytes) return [{ page: body, bytes: unpagedBytes }];
+    if (unpagedBytes <= pageMaxBytes) {
+        if (!forcePageEnvelope) return [{ page: body, bytes: unpagedBytes }];
+        const pageContent = Object.fromEntries(
+            [
+                "input",
+                "messages",
+                "native_messages",
+                "ts_output",
+                "ts_ck_messages",
+                "normalizations",
+                "tool_input_key_orders",
+            ]
+                .filter((field) => {
+                    const value = body[field];
+                    return (
+                        Array.isArray(value) ||
+                        (value !== null &&
+                            typeof value === "object" &&
+                            field === "tool_input_key_orders")
+                    );
+                })
+                .map((field) => [field, body[field]]),
+        );
+        const page: Record<string, unknown> = {
+            transform_page_id: crypto.createHash("sha256").update(serializedBody).digest("hex"),
+            transform_generation: body.shadow_generation ?? 0,
+            transform_page_index: 0,
+            transform_page_total: 1,
+            transform_page_complete: true,
+            transform_page_digest: transformPageDigest(pageContent),
+            ...body,
+        };
+        return [{ page, bytes: Buffer.byteLength(JSON.stringify(page)) }];
+    }
 
     const arrayFields = [
         "input",

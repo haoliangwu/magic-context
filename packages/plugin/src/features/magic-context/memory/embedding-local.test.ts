@@ -51,6 +51,43 @@ function fakeTransformersModule(options?: {
 }
 
 describe("WASM ONNX runtime module identity", () => {
+    test("configures the injected WASM runtime single-threaded before pipeline construction", async () => {
+        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-single-thread-"));
+        const ortWeb = { env: { wasm: {} as { numThreads?: number } } };
+        let threadsAtTransformersImport: number | undefined;
+        let threadsAtPipelineConstruction: number | undefined;
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false, hasNodeFilesystem: false }),
+                importWasmOrt: async () => ortWeb,
+                importTransformersWasmFallback: async () => {
+                    threadsAtTransformersImport = ortWeb.env.wasm.numThreads;
+                    return fakeTransformersModule({
+                        env: { backends: { onnx: { wasm: ortWeb.env.wasm } } },
+                        onPipeline: () => {
+                            threadsAtPipelineConstruction = ortWeb.env.wasm.numThreads;
+                        },
+                    });
+                },
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(
+                await new LocalEmbeddingProvider(
+                    "Xenova/all-MiniLM-L6-v2",
+                    512,
+                    "fp32",
+                    "wasm",
+                ).initialize(),
+            ).toBe(true);
+            expect(threadsAtTransformersImport).toBe(1);
+            expect(threadsAtPipelineConstruction).toBe(1);
+            expect(ortWeb.env.wasm.numThreads).toBe(1);
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
     test("imports the canonical resolved URL instead of a host-rewritten bare specifier", async () => {
         const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-canonical-"));
         const requestedSpecifiers: string[] = [];
@@ -390,14 +427,19 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
         }
     });
 
-    test("native selection omits a device option", async () => {
+    test("native selection omits a device option and leaves WASM thread settings untouched", async () => {
         const cacheDir = mkdtempSync(join(tmpdir(), "mc-native-device-default-"));
         const pipelineOptions: Array<{ dtype: string; device?: string }> = [];
+        const wasm = { numThreads: 4 };
         try {
             __setLocalEmbeddingTestHooks({
                 host: () => ({ isElectron: false, isBun: false }),
+                importWasmOrt: async () => {
+                    throw new Error("native selection must not import onnxruntime-web");
+                },
                 importTransformers: async () =>
                     fakeTransformersModule({
+                        env: { backends: { onnx: { wasm } } },
                         onPipeline: (options) => pipelineOptions.push(options),
                     }),
                 modelCacheDir: () => cacheDir,
@@ -405,6 +447,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
 
             expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
             expect(pipelineOptions).toEqual([{ dtype: "fp32" }]);
+            expect(wasm.numThreads).toBe(4);
         } finally {
             rmSync(cacheDir, { recursive: true, force: true });
         }

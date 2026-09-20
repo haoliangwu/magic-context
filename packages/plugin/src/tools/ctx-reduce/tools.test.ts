@@ -118,6 +118,15 @@ describe("createCtxReduceTools", () => {
             expect(result).toContain("'drop' must be provided");
         });
 
+        it("refuses empty drop filler without queuing a phantom command", async () => {
+            seedTags(db, [{ id: 1, sessionId: "ses-1" }]);
+            const omitted = await tools.ctx_reduce.execute({}, toolContext());
+            const empty = await tools.ctx_reduce.execute({ drop: "" }, toolContext());
+            expect(empty).toBe(omitted);
+            expect(empty).toContain("'drop' must be provided");
+            expect(getPendingOps(db, "ses-1")).toHaveLength(0);
+        });
+
         it("accepts reduced compatibility fields alongside a real drop", async () => {
             seedTags(db, [
                 { id: 1, sessionId: "ses-1" },

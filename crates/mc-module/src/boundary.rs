@@ -689,7 +689,23 @@ fn chunked_message_estimate_with_estimator(
 ) -> ChunkEstimate {
     let mut ordered = messages.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|message| message.message_ordinal);
-    let mut builder = ChunkBuilder::new(budget_stop, token_estimator);
+    let mut completed_components: Vec<CompletedComponent> = Vec::new();
+    for arc in build_tool_arcs(messages) {
+        let Some(end) = arc.res_ordinal else {
+            continue;
+        };
+        if let Some(component) = completed_components.last_mut() {
+            if arc.inv_ordinal <= component.end {
+                component.end = component.end.max(end);
+                continue;
+            }
+        }
+        completed_components.push(CompletedComponent {
+            start: arc.inv_ordinal,
+            end,
+        });
+    }
+    let mut builder = ChunkBuilder::new(budget_stop, token_estimator, completed_components);
 
     for message in &ordered {
         if eligible_end_ordinal.is_some_and(|end| message.message_ordinal >= end) {
@@ -698,9 +714,14 @@ fn chunked_message_estimate_with_estimator(
         if message.message_ordinal < start_ordinal {
             continue;
         }
+        if !builder.accepts_ordinal(message.message_ordinal) {
+            builder.stopped_early = true;
+            break;
+        }
         if !builder.push_message(message) {
             break;
         }
+        builder.pin_component_when_formatted_budget_crosses(message.message_ordinal);
     }
     builder.finish()
 }
@@ -1563,6 +1584,12 @@ struct ChunkBlock {
     is_tool_only: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CompletedComponent {
+    start: u64,
+    end: u64,
+}
+
 struct ChunkBuilder<'a> {
     budget_stop: f64,
     token_estimator: &'a mut dyn FnMut(&str) -> usize,
@@ -1575,10 +1602,19 @@ struct ChunkBuilder<'a> {
     commit_cluster_count: usize,
     last_flushed_role: String,
     stopped_early: bool,
+    completed_components: Vec<CompletedComponent>,
+    admitted_oversize_component_end: Option<u64>,
+    current_block_approx_tokens: f64,
+    last_appended_part_tokens: f64,
+    formatted_budget_crossed: bool,
 }
 
 impl<'a> ChunkBuilder<'a> {
-    fn new(budget_stop: f64, token_estimator: &'a mut dyn FnMut(&str) -> usize) -> Self {
+    fn new(
+        budget_stop: f64,
+        token_estimator: &'a mut dyn FnMut(&str) -> usize,
+        completed_components: Vec<CompletedComponent>,
+    ) -> Self {
         Self {
             budget_stop,
             token_estimator,
@@ -1591,10 +1627,45 @@ impl<'a> ChunkBuilder<'a> {
             commit_cluster_count: 0,
             last_flushed_role: String::new(),
             stopped_early: false,
+            completed_components,
+            admitted_oversize_component_end: None,
+            current_block_approx_tokens: 0.0,
+            last_appended_part_tokens: 0.0,
+            formatted_budget_crossed: false,
         }
     }
 
+    fn accepts_ordinal(&self, ordinal: u64) -> bool {
+        self.admitted_oversize_component_end
+            .is_none_or(|end| ordinal <= end)
+    }
+
+    fn pin_component_when_formatted_budget_crosses(&mut self, ordinal: u64) {
+        if self.admitted_oversize_component_end.is_some() || self.formatted_budget_crossed {
+            return;
+        }
+        let Some(block) = self.current_block.as_ref() else {
+            return;
+        };
+        self.current_block_approx_tokens += self.last_appended_part_tokens;
+        if self.total_tokens + self.current_block_approx_tokens + 64.0 <= self.budget_stop {
+            return;
+        }
+        let preview_tokens =
+            self.total_tokens + (self.token_estimator)(&format_block(block)) as f64;
+        if preview_tokens <= self.budget_stop {
+            return;
+        }
+        self.formatted_budget_crossed = true;
+        self.admitted_oversize_component_end = self
+            .completed_components
+            .iter()
+            .find(|component| component.start <= ordinal && component.end >= ordinal)
+            .map(|component| component.end);
+    }
+
     fn push_message(&mut self, message: &BoundaryMsg) -> bool {
+        self.last_appended_part_tokens = 0.0;
         let meta = (message.message_ordinal, message.message_id.clone());
         if message.role == Role::User && !has_meaningful_user_text(&message.blocks) {
             let tc_summaries = extract_tool_call_summaries(&message.blocks);
@@ -1603,12 +1674,15 @@ impl<'a> ChunkBuilder<'a> {
                 return true;
             }
             let tc_text = tc_summaries.join(" / ");
+            let tc_tokens = (self.token_estimator)(&tc_text) as f64;
             if let Some(current) = self
                 .current_block
                 .as_mut()
                 .filter(|block| block.role == "A")
             {
                 current.end_ordinal = message.message_ordinal;
+                self.last_appended_part_tokens =
+                    tc_tokens + if current.parts.is_empty() { 0.0 } else { 1.0 };
                 current.parts.push(tc_text);
                 current.meta.append(&mut self.pending_noise_meta);
                 current.meta.push(meta);
@@ -1624,6 +1698,7 @@ impl<'a> ChunkBuilder<'a> {
                 .unwrap_or(message.message_ordinal);
             let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
             meta_list.push(meta);
+            self.last_appended_part_tokens = tc_tokens;
             self.current_block = Some(ChunkBlock {
                 role: "A".to_string(),
                 start_ordinal: start,
@@ -1652,12 +1727,15 @@ impl<'a> ChunkBuilder<'a> {
             return true;
         }
         let msg_has_narrative = !text_parts.is_empty();
+        let text_tokens = (self.token_estimator)(&text) as f64;
         if let Some(current) = self
             .current_block
             .as_mut()
             .filter(|block| block.role == role)
         {
             current.end_ordinal = message.message_ordinal;
+            self.last_appended_part_tokens =
+                text_tokens + if current.parts.is_empty() { 0.0 } else { 1.0 };
             current.parts.push(text);
             current.meta.append(&mut self.pending_noise_meta);
             current.meta.push(meta);
@@ -1679,6 +1757,7 @@ impl<'a> ChunkBuilder<'a> {
             .unwrap_or(message.message_ordinal);
         let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
         meta_list.push(meta);
+        self.last_appended_part_tokens = text_tokens;
         self.current_block = Some(ChunkBlock {
             role,
             start_ordinal: start,
@@ -1713,6 +1792,7 @@ impl<'a> ChunkBuilder<'a> {
         self.formatted_blocks.push(block_text);
         self.block_tokens.push(block_tokens);
         self.total_tokens += block_tokens;
+        self.current_block_approx_tokens = 0.0;
         true
     }
 
@@ -3645,6 +3725,21 @@ mod tests {
         if let Some(consume) = decision.consume_through_ordinal {
             assert!(consume < boundary.protected_start_ordinal);
         }
+    }
+
+    #[test]
+    fn consecutive_completed_arcs_stop_after_the_component_crossing_the_budget() {
+        let mut messages = Vec::new();
+        for index in 0..8u64 {
+            let arc_id = format!("chain-{index}");
+            messages.push(tool_call_msg(index * 2 + 1, &arc_id));
+            messages.push(tool_result_msg(index * 2 + 2, &arc_id, "result"));
+        }
+        let prefix = chunked_message_estimate(&messages, 1, Some(7), f64::MAX);
+        let estimate = chunked_message_estimate(&messages, 1, None, (prefix.tokens - 1.0).max(1.0));
+        assert_eq!(estimate.formatted_blocks, prefix.formatted_blocks);
+        assert!(estimate.has_more);
+        assert!(estimate.message_count < messages.len());
     }
 
     #[test]

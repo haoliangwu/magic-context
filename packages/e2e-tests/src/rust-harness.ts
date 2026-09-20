@@ -668,21 +668,39 @@ export class RustTestHarness {
         });
     }
 
+    /** Fetch the session row via the SDK (revert marker, timestamps). */
+    async getSession(
+        sessionId: string,
+    ): Promise<{ revert?: { messageID?: string }; time?: { updated?: number } } | undefined> {
+        const response = await this.clientInstance.session.get({ path: { id: sessionId } });
+        return (response as { data?: { revert?: { messageID?: string } } }).data ?? undefined;
+    }
+
     /** Fetch the session's messages via the SDK (for choosing a mid-session id to remove). */
     async listMessages(
         sessionId: string,
     ): Promise<
         Array<{
-            info?: { id?: string; role?: string };
-            parts?: Array<{ type?: string; text?: string }>;
+            info?: { id?: string; role?: string; parentID?: string };
+            parts?: Array<{
+                type?: string;
+                text?: string;
+                synthetic?: boolean;
+                ignored?: boolean;
+            }>;
         }>
     > {
         const res = await this.clientInstance.session.messages({ path: { id: sessionId } });
         const data = (res as { data?: unknown }).data;
         return Array.isArray(data)
             ? (data as Array<{
-                  info?: { id?: string; role?: string };
-                  parts?: Array<{ type?: string; text?: string }>;
+                  info?: { id?: string; role?: string; parentID?: string };
+                  parts?: Array<{
+                type?: string;
+                text?: string;
+                synthetic?: boolean;
+                ignored?: boolean;
+            }>;
               }>)
             : [];
     }
@@ -781,14 +799,14 @@ export class RustTestHarness {
 
     /** Poll until `predicate` returns truthy or `timeoutMs` elapses. */
     async waitFor<T>(
-        predicate: () => T | null | undefined | false,
+        predicate: () => T | null | undefined | false | Promise<T | null | undefined | false>,
         opts: { timeoutMs?: number; intervalMs?: number; label?: string } = {},
     ): Promise<T> {
         const timeoutMs = opts.timeoutMs ?? 60_000;
         const intervalMs = opts.intervalMs ?? 100;
         const deadline = Date.now() + timeoutMs;
         while (Date.now() < deadline) {
-            const value = predicate();
+            const value = await predicate();
             if (value) return value as T;
             await Bun.sleep(intervalMs);
         }

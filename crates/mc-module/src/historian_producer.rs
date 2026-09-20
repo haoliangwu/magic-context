@@ -852,11 +852,11 @@ impl HistorianProducer {
             target: RouteTarget::ManagementSurface {
                 module_id: self.config.module_id.clone(),
             },
-            identity: BindIdentity {
-                project_root: self.config.project_root.clone(),
-                harness: self.config.harness.clone(),
+            identity: BindIdentity::new(
+                self.config.project_root.clone(),
+                self.config.harness.clone(),
                 session,
-            },
+            ),
             consumer_identity: consumer_identity_from_env(),
             consumer_capabilities: None,
             admission_facts: None,

@@ -45,6 +45,7 @@ import {
     getEmbeddingCoverageStatus,
     getProjectEmbeddingSnapshot,
     getShadowBackfillStopReason,
+    getShadowEmbeddingMeasurementCohort,
     markProjectLoadUntrusted,
     registerProjectEmbedding,
     registerProjectInObservationMode,
@@ -52,6 +53,7 @@ import {
     sweepAllRegisteredProjects,
     sweepStaleEmbeddingIdentitiesForProject,
     TestProviderFactoryRequiredError,
+    unregisterProjectShadowEmbedding,
 } from "./project-embedding-registry";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 import { closeDatabase, openDatabase } from "./storage";
@@ -1987,5 +1989,39 @@ describe("project embedding registry", () => {
         await flushShadowEmbeddingBacklog(projectIdentity);
         expect(getShadowBackfillStopReason(projectIdentity, "memory")).toBe("drained");
         expect(loadAllEmbeddings(db, projectIdentity, repeated!.modelId).size).toBe(3);
+    });
+
+    it("does not dispose a shadow provider that is the same instance as the primary", async () => {
+        const shared = new FakeEmbeddingProvider("shared");
+        _setTestProviderFactoryForProject(() => shared);
+        const db = useTempDb();
+        const projectIdentity = "git:shared-shadow-provider";
+        const shadowConfig = {
+            provider: "synapse",
+            model: "synapse-model",
+            synapse_fingerprint: "fp-shared",
+        } as unknown as EmbeddingConfig;
+        registerProjectEmbedding(
+            db,
+            projectIdentity,
+            shadowConfig,
+            { memoryEnabled: true, gitCommitEnabled: false },
+            "/tmp/shared-shadow-provider",
+        );
+        // Primary constructs lazily; embed once so both lanes hold `shared`.
+        await embedTextForProject(projectIdentity, "prime the shared instance");
+        registerProjectShadowEmbedding(
+            db,
+            projectIdentity,
+            shadowConfig,
+            "/tmp/shared-shadow-provider",
+        );
+        expect(getShadowEmbeddingMeasurementCohort(projectIdentity)?.fingerprint).toBe("fp-shared");
+
+        unregisterProjectShadowEmbedding(projectIdentity);
+
+        expect(shared.disposed).toBe(false);
+        expect(getShadowEmbeddingMeasurementCohort(projectIdentity)).toBeNull();
+        expect(getProjectEmbeddingSnapshot(projectIdentity)?.provider).toBe("synapse");
     });
 });

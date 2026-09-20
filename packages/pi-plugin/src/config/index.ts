@@ -23,6 +23,7 @@ import { stripRemovedAgentConfig } from "@magic-context/core/config/removed-agen
 import {
 	type MagicContextConfig,
 	MagicContextConfigSchema,
+	PROTECTED_TOKENS_MIN,
 } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
 import {
@@ -407,6 +408,22 @@ function parsePiConfig(
 
 		delete patched[key];
 		const defaultValue = (defaults as unknown as Record<string, unknown>)[key];
+		// A numeric protected_tokens below the schema minimum is almost always a
+		// leftover protected_tags tag count (10–30) renamed by hand. Replace the
+		// generic invalid-leaf message with one that names the unit mismatch.
+		// Scoped precisely to `number < min` so wrong-type and above-max values
+		// still get the generic message (parity with the OpenCode loader).
+		const invalidRawValue = rawConfig[key];
+		if (
+			key === "protected_tokens" &&
+			typeof invalidRawValue === "number" &&
+			invalidRawValue < PROTECTED_TOKENS_MIN
+		) {
+			warnings.push(
+				`protected_tokens is a token floor (minimum ${PROTECTED_TOKENS_MIN}, default derived from the context window); ${invalidRawValue} looks like the old protected_tags count. Remove the key to use the default, or set a token count such as 16000.`,
+			);
+			continue;
+		}
 		warnings.push(
 			`"${key}": invalid value (${redactConfigValue(rawConfig[key])}), using default ${JSON.stringify(defaultValue)}.`,
 		);

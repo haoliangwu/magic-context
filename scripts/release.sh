@@ -18,6 +18,15 @@ set -euo pipefail
 #   8. CI takes over: test → build → publish npm + GitHub release
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+# The host and hermetic e2e lanes spawn `opencode serve` from PATH. The official
+# installer puts the binary under ~/.opencode/bin, which login shells add to PATH but
+# tool/daemon shells often do not (v0.42.6 r9: the same box that passed r8 lost the
+# entry when the tool daemon restarted). Prefer the ambient PATH; fall back to the
+# installer location before declaring it missing.
+if ! command -v opencode >/dev/null 2>&1 && [ -x "$HOME/.opencode/bin/opencode" ]; then
+  export PATH="$HOME/.opencode/bin:$PATH"
+fi
 VERSION=""
 DRY=""
 FORCE_E2E_HOST=0
@@ -408,13 +417,26 @@ echo "→ Committing version bump..."
 git add -- packages/plugin/package.json packages/pi-plugin/package.json packages/cli/package.json \
   assets/magic-context.schema.json \
   packages/plugin/src/hooks/magic-context/reference-seeds.generated.ts
-if [ -n "$(git status --porcelain --untracked-files=no | grep -v '^[MARC] ')" ]; then
+# Cargo.lock is the common dirty file here: the rust e2e lane builds against the
+# sibling subc checkout, so a sibling crate release that lands while the gates run
+# resolves into the lock. The gates just ran on that resolved graph, so the tested
+# artifact IS the drifted lock; committing it on its own (never folded into the
+# release commit) is what the deploy doctrine requires, and re-running two hours of
+# gates for a sibling patch bump the gates already exercised is pure waste. Only a
+# lock that still builds --locked qualifies; anything else dirty is foreign and aborts.
+unrelated="$(git status --porcelain --untracked-files=no | grep -v '^[MARC] ' || true)"
+if [ "$unrelated" = " M Cargo.lock" ]; then
+  echo "  Cargo.lock drifted during the gates (sibling crate release); verifying it builds --locked..."
+  if cargo build --locked --release -p mc-module >/dev/null 2>&1; then
+    versions="$(git diff Cargo.lock | grep -E '^[-+]version' | sed -E 's/^([-+])version = "([^"]+)"/\1\2/' | paste -sd' ' -)"
+    git commit -q -o Cargo.lock -m "cargo: reconcile lock to the sibling graph the release gates ran on (lock-only: ${versions})"
+    echo "  committed lock reconciliation: $(git log --oneline -1)"
+    unrelated=""
+  fi
+fi
+if [ -n "$unrelated" ]; then
   echo "Error: unrelated modified files present at bump time; refusing to fold them into the release commit:"
-  git status --porcelain --untracked-files=no | grep -v '^[MARC] '
-  # Cargo.lock is the common one: the rust e2e lane resolves the sibling subc
-  # checkout, so a sibling release since the last reconciliation shows up here as
-  # real drift. Commit it on its own (the artifact's dependency set must be the
-  # committed lock), then re-run this script.
+  echo "$unrelated"
   git reset -q
   exit 1
 fi

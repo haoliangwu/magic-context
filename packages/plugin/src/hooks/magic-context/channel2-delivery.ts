@@ -129,6 +129,47 @@ function releaseClaimWithoutDelivery(db: Database, sessionId: string, claimToken
     }
 }
 
+export interface SyntheticUserDeliveryDeps {
+    client: unknown;
+    text: string;
+    /** Re-check lease ownership immediately before the host call. */
+    beforeSend?: () => boolean;
+}
+
+/** Deliver an agent-directed synthetic user message through OpenCode's live run loop. */
+export async function deliverSyntheticUserMessage(
+    sessionId: string,
+    deps: SyntheticUserDeliveryDeps,
+): Promise<boolean> {
+    const promptContext = await resolvePromptContext(deps.client, sessionId);
+    const body: Record<string, unknown> = {
+        noReply: false,
+        // A synthetic part reaches the model without rendering as an operator message.
+        // `ignored` must remain absent because OpenCode removes ignored text from the model call.
+        parts: [{ type: "text", text: deps.text, synthetic: true }],
+    };
+    if (promptContext?.agent) body.agent = promptContext.agent;
+    if (promptContext?.model) {
+        body.model = {
+            providerID: promptContext.model.providerID,
+            modelID: promptContext.model.modelID,
+        };
+    }
+    if (promptContext?.variant) body.variant = promptContext.variant;
+    if (deps.beforeSend && !deps.beforeSend()) return false;
+
+    const session = (
+        deps.client as {
+            session?: { promptAsync?: (input: unknown) => Promise<unknown> };
+        }
+    ).session;
+    if (typeof session?.promptAsync !== "function") {
+        throw new Error("client has no session.promptAsync");
+    }
+    await session.promptAsync({ path: { id: sessionId }, body });
+    return true;
+}
+
 /**
  * Attempt to deliver a pending Channel 2 ceiling nudge for `sessionId`. Safe to
  * call on every step-boundary `message.updated`: it no-ops unless a `pending`
@@ -203,7 +244,6 @@ export async function maybeDeliverChannel2(
     }
 
     try {
-        const promptContext = await resolvePromptContext(client, sessionId);
         // Module directives carry their own validated wording; host-triggered
         // reminders use the measured reclaimable tail after the predicate above.
         const reminder =
@@ -213,50 +253,28 @@ export async function maybeDeliverChannel2(
                 reclaimableToolOutputCount(deps.baseline?.baselineParts ?? []),
                 deps.oldestReclaimableToolTags,
             );
-
-        const body: Record<string, unknown> = {
-            noReply: false,
-            // synthetic: true — this is an agent-directed nudge, not a real user
-            // turn. It still drives the run loop and reaches the model (OpenCode
-            // serializes on !ignored && text!=="", and MessageV2.latest/the run
-            // loop ignore `synthetic`), but it (a) skips OpenCode's queued-message
-            // `<system-reminder>…Please address…` wrapper — which would otherwise
-            // double-wrap our reminder AND flip wrapped↔unwrapped as lastFinished
-            // advances, busting the prefix cache (issue #129 class) — and (b)
-            // drops out of the TUI user-message render. MUST NOT be paired with
-            // `ignored: true` (that would strip it from the model call).
-            parts: [{ type: "text", text: reminder, synthetic: true }],
-        };
-        if (promptContext?.agent) body.agent = promptContext.agent;
-        if (promptContext?.model) {
-            body.model = {
-                providerID: promptContext.model.providerID,
-                modelID: promptContext.model.modelID,
-            };
-        }
-        if (promptContext?.variant) body.variant = promptContext.variant;
-
-        const session = (client as { session?: { promptAsync?: (i: unknown) => Promise<unknown> } })
-            .session;
-        if (typeof session?.promptAsync !== "function") {
-            throw new Error("client has no session.promptAsync");
-        }
-        const claim = getChannel2NudgeClaim(deps.db, sessionId);
-        if (claim.state !== "claimed" || claim.claimToken !== claimToken) {
-            sessionLog(
-                sessionId,
-                `channel2 ceiling nudge delivery skipped: claim no longer owned before send (state=${claim.state || "empty"})`,
-            );
-            return false;
-        }
-        // resolvePromptContext yielded to the host. Re-check immediately before
-        // promptAsync: a child that completed while the claim was queued must
-        // leave its report as the last message, not start a follow-up turn.
-        if (!subagentRunIsActive(deps, sessionId)) {
-            releaseClaimWithoutDelivery(deps.db, sessionId, claimToken);
-            return false;
-        }
-        await session.promptAsync({ path: { id: sessionId }, body });
+        const sent = await deliverSyntheticUserMessage(sessionId, {
+            client,
+            text: reminder,
+            beforeSend: () => {
+                const claim = getChannel2NudgeClaim(deps.db, sessionId);
+                if (claim.state !== "claimed" || claim.claimToken !== claimToken) {
+                    sessionLog(
+                        sessionId,
+                        `channel2 ceiling nudge delivery skipped: claim no longer owned before send (state=${claim.state || "empty"})`,
+                    );
+                    return false;
+                }
+                // Context lookup yielded to the host. A child that completed while
+                // the claim was queued must leave its report as the final message.
+                if (!subagentRunIsActive(deps, sessionId)) {
+                    releaseClaimWithoutDelivery(deps.db, sessionId, claimToken);
+                    return false;
+                }
+                return true;
+            },
+        });
+        if (!sent) return false;
     } catch (error) {
         // Revert only when the send itself failed. Once promptAsync returns, the
         // synthetic user message may already exist; re-arming can duplicate it.

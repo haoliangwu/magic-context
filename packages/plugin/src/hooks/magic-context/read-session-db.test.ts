@@ -15,6 +15,7 @@ import {
     closeReadOnlySessionDb,
     findLastAssistantModelFromOpenCodeDb,
     hasNewerRealUserMessage,
+    latestPersistedMessageForRecovery,
     observeOpenCodeTurnEvent,
     shouldHoldIgnoredNotification,
     shouldHoldIgnoredNotificationFromMessages,
@@ -558,6 +559,7 @@ interface MessageRow {
     modelID?: string;
     agent?: string;
     timeCreated: number;
+    data?: Record<string, unknown>;
 }
 
 function createOpenCodeDb(rows: MessageRow[]): void {
@@ -579,7 +581,7 @@ function createOpenCodeDb(rows: MessageRow[]): void {
              VALUES (?, ?, ?, ?, ?)`,
         );
         for (const row of rows) {
-            const data: Record<string, unknown> = { role: row.role };
+            const data: Record<string, unknown> = { ...row.data, role: row.role };
             if (row.providerID !== undefined) data.providerID = row.providerID;
             if (row.modelID !== undefined) data.modelID = row.modelID;
             if (row.agent !== undefined) data.agent = row.agent;
@@ -595,6 +597,33 @@ function createOpenCodeDb(rows: MessageRow[]): void {
         closeQuietly(db);
     }
 }
+
+describe("latestPersistedMessageForRecovery", () => {
+    it("reports when the latest assistant child has completed", () => {
+        useTempDataHome("read-session-db-recovery-completed-");
+        createOpenCodeDb([
+            {
+                id: "msg_assistant",
+                sessionId: "ses_recovery",
+                role: "assistant",
+                timeCreated: 1000,
+                data: {
+                    parentID: "msg_user",
+                    time: { created: 1000, completed: 1200 },
+                    error: { name: "ExampleError" },
+                },
+            },
+        ]);
+
+        expect(latestPersistedMessageForRecovery("ses_recovery")).toEqual({
+            id: "msg_assistant",
+            role: "assistant",
+            parentID: "msg_user",
+            completedAt: 1200,
+            error: { name: "ExampleError" },
+        });
+    });
+});
 
 describe("findLastAssistantModelFromOpenCodeDb", () => {
     it("returns null for a session with no assistant messages", () => {

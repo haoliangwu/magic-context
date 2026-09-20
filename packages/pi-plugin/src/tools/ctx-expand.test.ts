@@ -42,3 +42,38 @@ describe("Pi ctx_expand ordinal validation", () => {
 		);
 	});
 });
+
+describe("Pi ctx_expand required-all filler", () => {
+	it("matches the clean call for every mode when unused fields are filled", async () => {
+		const rangeClean = await execute({ start: 1, end: 3 });
+		const rangeFiller = await execute({
+			start: 1,
+			end: 3,
+			message: 0,
+			verbose: false,
+		});
+		const verboseClean = await execute({ start: 1, end: 3, verbose: true });
+		const verboseFiller = await execute({
+			start: 1,
+			end: 3,
+			verbose: true,
+			message: 0,
+		});
+		const messageClean = await execute({ message: 2 });
+		const messageFiller = await execute({
+			message: 2,
+			start: 0,
+			end: 0,
+			verbose: false,
+		});
+
+		expect(textOf(rangeFiller)).toBe(textOf(rangeClean));
+		expect(textOf(verboseFiller)).toBe(textOf(verboseClean));
+		expect(textOf(messageFiller)).toBe(textOf(messageClean));
+		expect(rangeFiller.isError).toBe(rangeClean.isError);
+		expect(verboseFiller.isError).toBe(verboseClean.isError);
+		expect(messageFiller.isError).toBe(messageClean.isError);
+		expect(textOf(rangeClean)).toContain("No messages found in range 1-3");
+		expect(textOf(messageClean)).toContain("No message at ordinal 2");
+	});
+});

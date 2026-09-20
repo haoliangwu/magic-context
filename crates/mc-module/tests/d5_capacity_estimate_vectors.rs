@@ -354,13 +354,19 @@ enum LineageRequest {
     },
     #[serde(rename = "capacity.finish")]
     CapacityFinish { upload_id: String, digest: String },
-    #[serde(rename = "lineage.put")]
+    // R48: the nine original lineage operations are tagged on the wire by their
+    // short names, so the source-segment upload family travels as `put` and
+    // `finish`; `lineage.put` and `lineage.finish` are their clause-3 labels,
+    // which the vectors keep in their own `op` field. The capacity family above
+    // was pinned with dotted discriminators and keeps them, so the two upload
+    // families stay distinct on the wire.
+    #[serde(rename = "put")]
     LineagePut {
         upload_id: String,
         seq: u64,
         bytes: String,
     },
-    #[serde(rename = "lineage.finish")]
+    #[serde(rename = "finish")]
     LineageFinish { upload_id: String, digest: String },
     #[serde(rename = "capacity.check")]
     CapacityCheck {
@@ -2248,6 +2254,42 @@ fn d5_capacity_upload_authorization_keeps_ticket_domains_separate() {
                 "{} crosses capacity and lineage upload authority",
                 vector.id
             ),
+        }
+    }
+}
+
+/// The source-segment upload family travels under the short wire
+/// discriminators of the clause 2 grammar, so its dotted clause-3 labels are
+/// refused on the wire with no alias and no dual acceptance, while the capacity
+/// family keeps the dotted discriminators it was pinned with (R48).
+#[test]
+fn d5_upload_vectors_carry_wire_discriminators_not_operation_labels() {
+    let (fixture, _) = load_fixture();
+    for vector in &fixture.upload_authorization_vectors {
+        let bytes = wire_bytes(&vector.request_bytes_base64);
+        let text = std::str::from_utf8(&bytes).expect("utf8 request");
+        let (label, discriminator) = match vector.op {
+            UploadOperation::CapacityPut => ("capacity.put", "capacity.put"),
+            UploadOperation::CapacityFinish => ("capacity.finish", "capacity.finish"),
+            UploadOperation::LineagePut => ("lineage.put", "put"),
+            UploadOperation::LineageFinish => ("lineage.finish", "finish"),
+        };
+        assert!(
+            text.starts_with(&format!("{{\"op\":\"{discriminator}\",")),
+            "{} must carry the wire discriminator {discriminator}: {text}",
+            vector.id
+        );
+        if label != discriminator {
+            let relabelled = text.replacen(
+                &format!("\"op\":\"{discriminator}\""),
+                &format!("\"op\":\"{label}\""),
+                1,
+            );
+            assert!(
+                serde_json::from_str::<LineageRequest>(&relabelled).is_err(),
+                "{} accepts the operation label {label} on the wire",
+                vector.id
+            );
         }
     }
 }

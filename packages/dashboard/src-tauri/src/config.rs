@@ -357,10 +357,7 @@ pub fn discover_project_configs_with_db(
     // ── 2. Enrich from the resolved OpenCode DB (names + extra projects) ──
     let opencode_db = crate::db::resolve_opencode_db_path();
     if let Some(ref opencode_path) = opencode_db {
-        if let Ok(conn) = rusqlite::Connection::open_with_flags(
-            opencode_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) {
+        if let Ok((conn, _generation)) = crate::db::open_opencode_readonly(opencode_path) {
             collect_opencode_db_projects(&conn, &mut worktree_map);
         }
     }

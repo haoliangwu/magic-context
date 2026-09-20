@@ -104,6 +104,15 @@ export interface AuthorityModuleClient {
         live_only?: boolean;
         projectRoot?: string;
     }): Promise<{ page: ChangefeedPage }>;
+    mirrorMemory?(args: {
+        module_row_id: number;
+        projectRoot?: string;
+    }): Promise<{ row: ChangefeedRow | null }>;
+    memoryIdentityAck?(args: {
+        project: string;
+        rows: Array<{ module_row_id: number; context_row_id: number }>;
+        projectRoot?: string;
+    }): Promise<{ acknowledged: number }>;
 }
 
 export interface ModuleNoteEvaluationBridge {
@@ -1552,6 +1561,43 @@ function mirrorIdentity(
     );
 }
 
+export interface MemoryMirrorIdentity {
+    moduleProject: string;
+    moduleRowId: number;
+    contextRowId: number;
+}
+
+export function moduleMemoryIdentityForHostId(
+    db: Database,
+    contextRowId: number,
+): MemoryMirrorIdentity | null {
+    const row = db
+        .prepare(
+            `SELECT module_project, module_row_id, context_row_id
+               FROM mirror_identity
+              WHERE domain = 'memories' AND context_row_id = ?`,
+        )
+        .get(contextRowId) as
+        | { module_project: string; module_row_id: number; context_row_id: number }
+        | undefined;
+    return row
+        ? {
+              moduleProject: row.module_project,
+              moduleRowId: row.module_row_id,
+              contextRowId: row.context_row_id,
+          }
+        : null;
+}
+
+export function hostMemoryIdentityForModuleId(
+    db: Database,
+    moduleProject: string,
+    moduleRowId: number,
+): MemoryMirrorIdentity | null {
+    const row = mirrorIdentity(db, "memories", moduleProject, moduleRowId);
+    return row ? { moduleProject, moduleRowId, contextRowId: row.context_row_id } : null;
+}
+
 export interface MirroredNoteCompileFields {
     compiledProvider: string | null;
     compiledConfig: string | null;
@@ -2109,6 +2155,29 @@ function applyNoteRow(db: Database, feed: ChangefeedRow, statements: MirrorPageS
     );
 }
 
+export function applyTargetedMemoryMirrorRow(args: {
+    db: Database;
+    row: ChangefeedRow;
+}): MemoryMirrorIdentity | null {
+    const { db, row } = args;
+    if (row.domain !== "memories" || row.op === "tombstone") {
+        throw new Error("targeted memory mirror requires a live memory row");
+    }
+    const project = rowString(row.full_row_snapshot, "project_path");
+    if (!project) throw new Error("memory feed snapshot has no project_path");
+    withPrivilegedWriter(db, () => {
+        db.transaction(() => {
+            ensureMemoryRepairState(db);
+            const statements = prepareMirrorPageStatements(db);
+            applyMemoryRow(db, row, statements);
+            translateMemoryReferences(statements);
+            repairNullClobberedMemoryRows(statements);
+            bumpDomainMutationEpoch(db, project, "memories");
+        }).immediate();
+    });
+    return hostMemoryIdentityForModuleId(db, project, row.module_row_id);
+}
+
 export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): number {
     const { db, page } = args;
     if (!AUTHORITY_DOMAINS.includes(page.domain)) throw new Error("unknown mirror domain");
@@ -2250,7 +2319,7 @@ export function applyMirrorPage(args: { db: Database; page: ChangefeedPage }): n
     return nextCursor;
 }
 
-type MirrorPullModuleClient = Pick<AuthorityModuleClient, "mirrorPull">;
+type MirrorPullModuleClient = Pick<AuthorityModuleClient, "mirrorPull" | "memoryIdentityAck">;
 
 export async function ensureLiveMemoryResnapshot(args: {
     db: Database;
@@ -2407,6 +2476,28 @@ async function pullAndApplyMirrorPageWithStatus(args: {
         limit,
     });
     const nextCursor = applyMirrorPage({ db: args.db, page: response.page });
+    if (args.domain === "memories" && args.module.memoryIdentityAck) {
+        const rowsByProject = new Map<
+            string,
+            Array<{ module_row_id: number; context_row_id: number }>
+        >();
+        for (const feed of response.page.rows) {
+            if (feed.domain !== "memories" || feed.op === "tombstone") continue;
+            const project = rowString(feed.full_row_snapshot, "project_path");
+            if (!project) continue;
+            const identity = mirrorIdentity(args.db, "memories", project, feed.module_row_id);
+            if (!identity) continue;
+            const rows = rowsByProject.get(project) ?? [];
+            rows.push({
+                module_row_id: feed.module_row_id,
+                context_row_id: identity.context_row_id,
+            });
+            rowsByProject.set(project, rows);
+        }
+        for (const [project, rows] of rowsByProject) {
+            await args.module.memoryIdentityAck({ project, rows });
+        }
+    }
     return {
         cursor: nextCursor,
         hasMore: response.page.has_more,

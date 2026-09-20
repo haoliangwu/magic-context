@@ -124,7 +124,21 @@ describe.skipIf(!rustPrereqs.ok)("rust memory mirror resumption", () => {
             }
 
             await h.restart({ rust: true });
+            let firstRustRenderIdentities: { total: number; missing: number } | undefined;
+            h.mock.addMatcher(() => {
+                if (firstRustRenderIdentities) return null;
+                const moduleDb = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "store.db"), { readonly: true });
+                try {
+                    firstRustRenderIdentities = moduleDb.prepare(
+                        "SELECT COUNT(*) AS total, SUM(CASE WHEN host_row_id IS NULL THEN 1 ELSE 0 END) AS missing FROM mc_memories WHERE project_path = ?",
+                    ).get(projectIdentity) as { total: number; missing: number };
+                } finally {
+                    moduleDb.close();
+                }
+                return null;
+            });
             await h.sendPrompt(sessionId, "activate Rust authority for the seeded corpus");
+            expect(firstRustRenderIdentities).toEqual({ total: 2_505, missing: 0 });
             await h.waitForRustPasses(1);
 
             const moduleDbPath = join(

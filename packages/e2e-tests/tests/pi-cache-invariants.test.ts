@@ -46,6 +46,14 @@ const HIGH_USAGE: MockUsage = {
     cache_read_input_tokens: 0,
 };
 
+// Scheduler execute alone cannot originate a bust. This crosses the 85% force band.
+const FORCE_USAGE: MockUsage = {
+    input_tokens: 86_000,
+    output_tokens: 20,
+    cache_creation_input_tokens: 86_000,
+    cache_read_input_tokens: 0,
+};
+
 // High enough to trip the historian trigger while still below the model limit.
 const HISTORIAN_TRIGGER_USAGE: MockUsage = {
     input_tokens: 90_000,
@@ -350,10 +358,11 @@ describe("pi cache invariants — replay class", () => {
                     text: `pi A3 newer context block ${index + 1}: ${h.ballast(800)}`,
                 })),
             );
-            // The queued target must age beyond both the token-mass floor and
-            // the structural recency floor before an execute pass can consume it.
-            await sendTurn(h, "pi A3 turn 3: pressure so pending drop applies next.", "pi A3 pressure", HIGH_USAGE);
-            await sendTurn(h, "pi A3 turn 4: execute pass materializes the dropped placeholder.", "pi A3 materialize");
+            // The queued target must age beyond both protection floors. A bare
+            // scheduler execute cannot originate the rewrite, so the response
+            // crosses the force band before the materializing pass.
+            await sendTurn(h, "pi A3 turn 3: force-band pressure permits the next bust.", "pi A3 pressure", FORCE_USAGE);
+            await sendTurn(h, "pi A3 turn 4: force pass materializes the dropped placeholder.", "pi A3 materialize");
 
             await h.waitFor(
                 () => {

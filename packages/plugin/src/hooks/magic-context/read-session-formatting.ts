@@ -17,6 +17,7 @@ export interface ChunkBlock {
     startOrdinal: number;
     endOrdinal: number;
     parts: string[];
+    partMeta: Array<{ ordinal: number; toolResultBodyTokens: number }>;
     meta: SessionChunkLine[];
     commitHashes: string[];
     /**
@@ -59,6 +60,23 @@ export function extractTexts(parts: unknown[]): string[] {
         }
     }
     return texts;
+}
+
+/** Count omitted tool-result bodies so pathological splits prefer the largest result boundary. */
+export function extractToolResultBodyTokens(parts: unknown[]): number {
+    let tokens = 0;
+    for (const part of parts) {
+        if (part === null || typeof part !== "object") continue;
+        const p = part as Record<string, unknown>;
+        if (p.type !== "tool") continue;
+        const state = p.state as Record<string, unknown> | null;
+        if (!state || typeof state !== "object") continue;
+        const body = state.output ?? state.error;
+        if (body === undefined) continue;
+        const text = typeof body === "string" ? body : JSON.stringify(body);
+        tokens += Math.ceil(text.length / 4);
+    }
+    return tokens;
 }
 
 /** Extract compact tool-call summaries from message parts.

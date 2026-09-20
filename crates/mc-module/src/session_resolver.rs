@@ -87,11 +87,7 @@ impl RealSessionResolver {
         instance_token: &str,
     ) -> Result<Option<ResolvedSession>, SessionResolveError> {
         let target = self.route_target();
-        let identity = BindIdentity {
-            project_root: project_root.to_path_buf(),
-            harness: harness.to_string(),
-            session: instance_token.to_string(),
-        };
+        let identity = BindIdentity::new(project_root.to_path_buf(), harness, instance_token);
         let consumer = SubcConsumer::connect(&self.connection_file, consumer_options())
             .await
             .map_err(|error| SessionResolveError::Transport(error.to_string()))?;

@@ -28,6 +28,7 @@ import {
 	CTX_EXPAND_DESCRIPTION,
 	CTX_EXPAND_TOKEN_BUDGET,
 } from "@magic-context/core/tools/ctx-expand/constants";
+import { resolveCtxExpandMode } from "@magic-context/core/tools/ctx-expand/mode";
 import {
 	renderMessageByOrdinal,
 	renderVerboseRange,
@@ -119,30 +120,14 @@ export function createCtxExpandTool(
 			});
 
 			try {
-				// By-ordinal mode: full recovery of a single message from JSONL.
-				if (params.message !== undefined) {
-					if (
-						typeof params.message !== "number" ||
-						!Number.isInteger(params.message) ||
-						params.message < 1
-					) {
-						return err("Error: message must be a positive integer.");
-					}
-					return ok(renderMessageByOrdinal(sessionId, params.message));
+				const mode = resolveCtxExpandMode(params, "positive");
+				if (mode.kind === "error") {
+					return err(mode.message);
 				}
-
-				if (
-					typeof params.start !== "number" ||
-					typeof params.end !== "number" ||
-					!Number.isInteger(params.start) ||
-					!Number.isInteger(params.end) ||
-					params.start < 1 ||
-					params.end < params.start
-				) {
-					return err(
-						"Error: provide either message=<ordinal>, or start and end (positive integers, start <= end).",
-					);
+				if (mode.kind === "message") {
+					return ok(renderMessageByOrdinal(sessionId, mode.message));
 				}
+				const { start, end, verbose } = mode;
 
 				// Clamp to the last compartment boundary (parity with OpenCode +
 				// ctx_search): messages after it are the live tail already visible
@@ -152,31 +137,29 @@ export function createCtxExpandTool(
 					deps.db,
 					sessionId,
 				);
-				if (lastCompartmentEnd >= 0 && params.start > lastCompartmentEnd) {
+				if (lastCompartmentEnd >= 0 && start > lastCompartmentEnd) {
 					return ok(
-						`Range ${params.start}-${params.end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`,
+						`Range ${start}-${end} is entirely within the live tail (after the last compacted message ${lastCompartmentEnd}); those messages are already visible in context.`,
 					);
 				}
 				const effectiveEnd =
-					lastCompartmentEnd >= 0
-						? Math.min(params.end, lastCompartmentEnd)
-						: params.end;
+					lastCompartmentEnd >= 0 ? Math.min(end, lastCompartmentEnd) : end;
 
 				// Verbose mode: each message separate, with ids + per-part previews.
-				if (params.verbose === true) {
+				if (verbose) {
 					const v = renderVerboseRange(
 						sessionId,
-						params.start,
+						start,
 						effectiveEnd,
 						CTX_EXPAND_TOKEN_BUDGET,
 					);
 					if (!v.text) {
 						return ok(
-							`No messages found in range ${params.start}-${effectiveEnd}. The range may be outside this session's history.`,
+							`No messages found in range ${start}-${effectiveEnd}. The range may be outside this session's history.`,
 						);
 					}
 					const out = [
-						`Messages ${params.start}-${v.lastOrdinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):`,
+						`Messages ${start}-${v.lastOrdinal} (verbose). Recover any one in full with ctx_expand(message=<ordinal>):`,
 						"",
 						v.text,
 					];
@@ -192,13 +175,13 @@ export function createCtxExpandTool(
 				const chunk = readSessionChunk(
 					sessionId,
 					CTX_EXPAND_TOKEN_BUDGET,
-					params.start,
+					start,
 					effectiveEnd + 1, // readSessionChunk uses exclusive end
 				);
 
 				if (!chunk.text || chunk.messageCount === 0) {
 					return ok(
-						`No messages found in range ${params.start}-${params.end}. The range may be outside this session's history.`,
+						`No messages found in range ${start}-${end}. The range may be outside this session's history.`,
 					);
 				}
 

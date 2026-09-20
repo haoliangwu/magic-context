@@ -4,8 +4,8 @@
  * Action surface mirrors OpenCode's `packages/plugin/src/tools/ctx-note/tools.ts`:
  *   - write: append a session note OR a smart note (when surface_condition is set)
  *   - read: show active session notes + ready smart notes by default; supports `filter`
- *   - dismiss: dismiss one note by note_id or 1–50 notes by note_ids
- *   - update: update a note's content and/or surface_condition by note_id
+ *   - dismiss: dismiss 1–50 notes by note_ids
+ *   - update: update one note's content and/or surface_condition (note_ids=[N])
  *
  * Smart notes (with `surface_condition`) are project-scoped and evaluated
  * by the dreamer during nightly runs. When dreamer is disabled in config,
@@ -81,11 +81,6 @@ const ParamsSchema = Type.Object(
 					"Externally verifiable condition for smart notes. A background checker verifies it using ONLY outside signals (GitHub state via gh, files on disk, git history, web) — it cannot see this conversation. Use for PR/issue state, release tags, file contents, workflow runs. NOT for 'when the user mentions X' / 'when we revisit Y' — write a regular note instead.",
 			}),
 		),
-		note_id: Type.Optional(
-			Type.Number({
-				description: "Note ID (required for 'dismiss' and 'update' actions).",
-			}),
-		),
 		note_ids: Type.Optional(
 			Type.Array(
 				Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
@@ -93,7 +88,7 @@ const ParamsSchema = Type.Object(
 					minItems: 1,
 					maxItems: 50,
 					description:
-						"One to fifty note ids for 'dismiss' only; do not combine with note_id.",
+						"Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'.",
 				},
 			),
 		),
@@ -174,7 +169,7 @@ function formatNoteLine(note: Note): string {
 }
 
 const DISMISS_FOOTER =
-	'\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_id=N) or note_ids=[N,...]';
+	'\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_ids=[N])';
 
 function formatDismissResults(
 	results: Array<{ noteId: number; outcome: string }>,
@@ -187,16 +182,26 @@ function formatDismissResults(
 		.join("\n")}`;
 }
 
-function parseDismissNoteIds(value: unknown): number[] | string {
+/**
+ * Read `note_ids` for the actions that use it. `write` and `read` never look
+ * at it: tool surfaces that require every declared property make the model
+ * send filler there (issue 460), and filler on an action that does not use
+ * the field must not fail the call. `update` addresses exactly one note;
+ * `dismiss` takes one to fifty.
+ */
+function parseNoteIds(action: string, value: unknown): number[] | string {
+	const max = action === "update" ? 1 : 50;
 	if (
 		!Array.isArray(value) ||
 		value.length < 1 ||
-		value.length > 50 ||
+		value.length > max ||
 		value.some(
 			(id) => typeof id !== "number" || !Number.isInteger(id) || id <= 0,
 		)
 	) {
-		return "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.";
+		return action === "update"
+			? "Error: 'note_ids' must contain exactly one positive integer id when action is 'update'."
+			: "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.";
 	}
 	return value;
 }
@@ -255,7 +260,6 @@ export function createCtxNoteTool(
 				},
 				content: "string",
 				surface_condition: "string",
-				note_id: "number",
 				note_ids: { type: "array", items: "number", maxItems: 50 },
 				filter: { type: "enum", values: FILTER_VALUES },
 				limit: "number",
@@ -269,21 +273,11 @@ export function createCtxNoteTool(
 			// check would mis-infer `write` and then reject the empty content.
 			const action =
 				params.action ?? (params.content?.trim() ? "write" : "read");
-			const hasNoteId = params.note_id !== undefined;
-			const hasNoteIds = params.note_ids !== undefined;
-			if (hasNoteId && hasNoteIds) {
-				return err(
-					"Error: 'note_id' and 'note_ids' cannot be used together; provide one or the other.",
-				);
-			}
-			if (hasNoteIds && action !== "dismiss") {
-				return err("Error: 'note_ids' is only valid when action is 'dismiss'.");
-			}
-			const dismissNoteIds =
-				action === "dismiss" && hasNoteIds
-					? parseDismissNoteIds(params.note_ids)
+			const noteIds =
+				action === "dismiss" || action === "update"
+					? parseNoteIds(action, params.note_ids)
 					: undefined;
-			if (typeof dismissNoteIds === "string") return err(dismissNoteIds);
+			if (typeof noteIds === "string") return err(noteIds);
 
 			if (action === "write") {
 				const content = params.content?.trim();
@@ -349,34 +343,30 @@ export function createCtxNoteTool(
 						"Error: Could not resolve project identity for note dismiss.",
 					);
 				}
-				if (dismissNoteIds) {
+				const ids = noteIds as number[];
+				if (ids.length > 1) {
 					return ok(
 						formatDismissResults(
-							dismissNotes(deps.db, dismissNoteIds, {
+							dismissNotes(deps.db, ids, {
 								projectPath: projectIdentity,
 								sessionId,
 							}),
 						),
 					);
 				}
-				if (typeof params.note_id !== "number") {
-					return err("Error: 'note_id' is required when action is 'dismiss'.");
-				}
-				const dismissed = dismissNote(deps.db, params.note_id, {
+				const dismissed = dismissNote(deps.db, ids[0], {
 					projectPath: projectIdentity,
 					sessionId,
 				});
 				return dismissed
-					? ok(`Note #${params.note_id} dismissed.`)
+					? ok(`Note #${ids[0]} dismissed.`)
 					: err(
-							`Error: Note #${params.note_id} not found in your session/project or already dismissed.`,
+							`Error: Note #${ids[0]} not found in your session/project or already dismissed.`,
 						);
 			}
 
 			if (action === "update") {
-				if (typeof params.note_id !== "number") {
-					return err("Error: 'note_id' is required when action is 'update'.");
-				}
+				const noteId = (noteIds as number[])[0];
 				const updates: UpdateNoteOptions = {};
 				if (params.content?.trim()) updates.content = params.content.trim();
 				let compilation:
@@ -401,13 +391,13 @@ export function createCtxNoteTool(
 						"Error: Could not resolve project identity for note update.",
 					);
 				}
-				const updated = updateNote(deps.db, params.note_id, updates, {
+				const updated = updateNote(deps.db, noteId, updates, {
 					projectPath: projectIdentity,
 					sessionId,
 				});
 				if (!updated) {
 					return err(
-						`Error: Note #${params.note_id} not found in your session/project.`,
+						`Error: Note #${noteId} not found in your session/project.`,
 					);
 				}
 				const parts: string[] = [];
@@ -415,7 +405,7 @@ export function createCtxNoteTool(
 				if (updates.surfaceCondition)
 					parts.push(`condition: ${updates.surfaceCondition}`);
 				return ok(
-					`Updated note #${params.note_id}\n- ${parts.join("\n- ")}${compilation ? conditionCompileReplySuffix(compilation) : ""}`,
+					`Updated note #${noteId}\n- ${parts.join("\n- ")}${compilation ? conditionCompileReplySuffix(compilation) : ""}`,
 				);
 			}
 

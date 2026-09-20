@@ -233,6 +233,70 @@ describe("runSessionProjectBackfill", () => {
         expect(_getSessionProjectBackfillState(db)?.status).toBe("completed");
     });
 
+    it("makes the lease immediately retryable when page discovery fails", async () => {
+        const db = createDb();
+        const now = 5_500;
+
+        await expect(
+            runSessionProjectBackfill(
+                db,
+                async () => {
+                    throw new Error("session discovery failed");
+                },
+                { holderId: "failed-holder", now: () => now },
+            ),
+        ).rejects.toThrow("session discovery failed");
+
+        expect(_getSessionProjectBackfillState(db)).toMatchObject({
+            status: "running",
+            holder_id: "failed-holder",
+            lease_expires_at: now,
+        });
+
+        const retry = await runSessionProjectBackfill(db, [], {
+            holderId: "retry-holder",
+            now: () => now,
+        });
+        expect(retry.status).toBe("completed");
+        expect(_getSessionProjectBackfillState(db)).toMatchObject({
+            status: "completed",
+            holder_id: "retry-holder",
+            lease_expires_at: null,
+        });
+    });
+
+    it("never expires a replacement holder's lease when the failing runner cleans up", async () => {
+        // A runner that loses its lease mid-page must not touch the row of whoever
+        // took over: the failure path is fenced on holder_id, and this test is what
+        // reddens if that fence is dropped (the retryable-lease test above stays green
+        // without it, because there the failing runner is still the holder).
+        const db = createDb();
+        const now = 5_500;
+        const replacementExpiry = 999_999;
+        const originalError = new Error("session discovery failed");
+
+        await expect(
+            runSessionProjectBackfill(
+                db,
+                async () => {
+                    db.prepare(
+                        `UPDATE session_project_backfill_state
+                         SET holder_id = 'replacement-holder', lease_expires_at = ?
+                         WHERE harness = 'opencode'`,
+                    ).run(replacementExpiry);
+                    throw originalError;
+                },
+                { holderId: "failed-holder", now: () => now },
+            ),
+        ).rejects.toBe(originalError);
+
+        expect(_getSessionProjectBackfillState(db)).toMatchObject({
+            status: "running",
+            holder_id: "replacement-holder",
+            lease_expires_at: replacementExpiry,
+        });
+    });
+
     it("skips empty directories", async () => {
         const db = createDb();
 

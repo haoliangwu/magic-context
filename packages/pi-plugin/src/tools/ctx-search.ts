@@ -74,9 +74,16 @@ const ParamsSchema = Type.Object(
 type CtxSearchParams = Static<typeof ParamsSchema>;
 
 function normalizeLimit(limit?: number): number {
-	if (typeof limit !== "number" || !Number.isFinite(limit))
+	if (typeof limit !== "number" || !Number.isFinite(limit) || limit === 0)
 		return DEFAULT_LIMIT;
 	return Math.max(1, Math.floor(limit));
+}
+
+function normalizeSources(
+	sources?: CtxSearchParams["sources"],
+): CtxSearchParams["sources"] | undefined {
+	if (sources === undefined || sources.length === 0) return undefined;
+	return sources;
 }
 
 export interface CtxSearchToolDeps {
@@ -228,7 +235,7 @@ export function createCtxSearchTool(
 					isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
 					maxMessageOrdinal: messageOrdinalCutoff,
 					gitCommitsEnabled,
-					sources: params.sources,
+					sources: normalizeSources(params.sources),
 					visibleMemoryIds,
 					diagnostics,
 					gitRepositoryAvailable: directoryHasGitMetadata(ctx.cwd),

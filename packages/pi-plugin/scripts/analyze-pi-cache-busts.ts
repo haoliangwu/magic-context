@@ -18,6 +18,7 @@ import {
 	type PiBodySnapshot,
 	resolvePiBodiesDirectory,
 } from "../../plugin/scripts/cache-bust-body-sources";
+import { loadSessionDecisions } from "../../plugin/scripts/cache-bust-sentinel";
 import { getMagicContextStorageDir } from "../../plugin/src/shared/data-path";
 import {
 	getPiServedArrayLedgerPath,
@@ -32,6 +33,7 @@ interface Args {
 	piDir?: string;
 	ompDir?: string;
 	ledgerDir: string;
+	db?: string;
 	since?: string;
 	until?: string;
 	limit?: number;
@@ -95,6 +97,7 @@ export interface PiCacheBustAnalysisOptions {
 	piDir?: string;
 	ompDir?: string;
 	ledgerDir?: string;
+	db?: string;
 	bodiesDir?: string;
 	decisions?: readonly CacheBustDecisionAttribution[];
 }
@@ -177,6 +180,7 @@ function parseArgs(argv: string[]): Args {
 		"--pi-dir",
 		"--omp-dir",
 		"--ledger-dir",
+		"--db",
 		"--since",
 		"--until",
 		"--limit",
@@ -200,6 +204,7 @@ function parseArgs(argv: string[]): Args {
 		piDir: getOpt("--pi-dir"),
 		ompDir: getOpt("--omp-dir"),
 		ledgerDir: getOpt("--ledger-dir") ?? getMagicContextStorageDir(),
+		db: getOpt("--db"),
 		since: getOpt("--since"),
 		until: getOpt("--until"),
 		limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
@@ -415,6 +420,63 @@ function digestAttribution(previous: JoinedPass, current: JoinedPass): string {
 	return `message[${divergence}]${seam}: ${previousVector} -> ${currentVector}`;
 }
 
+export function loadPiCacheBustDecisions(
+	sessionId: string,
+	storageDir: string,
+	dbPathOverride?: string,
+): CacheBustDecisionAttribution[] {
+	const dbPath = dbPathOverride ?? join(storageDir, "context.db");
+	if (!existsSync(dbPath)) return [];
+	return loadSessionDecisions(
+		{ sessionId, harness: "pi", projectPath: "" },
+		{
+			databasePath: dbPath,
+			rustStorePath: join(storageDir, "store.db"),
+			lookbackMs: 86_400_000,
+		},
+	);
+}
+
+export function nearestPiPassDecision(
+	decisions: readonly CacheBustDecisionAttribution[],
+	requestTimestampMs: number,
+	options: {
+		previousTimestampMs?: number;
+		messageId?: string;
+	} = {},
+): CacheBustDecisionAttribution | undefined {
+	if (decisions.length === 0) return undefined;
+
+	const minTs = Math.max(
+		options.previousTimestampMs !== undefined
+			? options.previousTimestampMs - 1_000
+			: 0,
+		requestTimestampMs - 30_000,
+	);
+	const maxTs = requestTimestampMs + 5_000;
+
+	const inWindow = decisions.filter(
+		(d) => d.timestampMs >= minTs && d.timestampMs <= maxTs,
+	);
+	if (inWindow.length === 0) return undefined;
+
+	if (options.messageId) {
+		const exact = inWindow.find((d) => d.messageId === options.messageId);
+		if (exact) return exact;
+	}
+
+	const preceding = inWindow
+		.filter((d) => d.timestampMs <= requestTimestampMs + 1_000)
+		.sort((a, b) => b.timestampMs - a.timestampMs);
+	if (preceding.length > 0) return preceding[0];
+
+	return inWindow.sort(
+		(a, b) =>
+			Math.abs(a.timestampMs - requestTimestampMs) -
+			Math.abs(b.timestampMs - requestTimestampMs),
+	)[0];
+}
+
 export function analyzeJoinedPasses(
 	joined: readonly JoinedPass[],
 	options: {
@@ -457,19 +519,27 @@ export function analyzeJoinedPasses(
 		const attribution = bodyDivergence
 			? `${bodyDivergence.description}${seam}`
 			: digestAttribution(previous, current);
-		const decision = nearestCacheBustDecision(
+		const decision = nearestPiPassDecision(
 			options.decisions ?? [],
 			current.usage.timestamp,
-			current.usage.messageId,
+			{
+				previousTimestampMs: previous?.usage.timestamp,
+				messageId: current.usage.messageId,
+			},
 		);
-		const previousDecision = nearestCacheBustDecision(
-			options.decisions ?? [],
-			previous.usage.timestamp,
-			previous.usage.messageId,
-		);
-		const attributionDecision = previousDecision?.materialized
-			? previousDecision
-			: decision;
+		const previousDecision = previous
+			? nearestPiPassDecision(
+					options.decisions ?? [],
+					previous.usage.timestamp,
+					{
+						messageId: previous.usage.messageId,
+					},
+				)
+			: undefined;
+		const attributionDecision =
+			rebust && bodyDivergence === undefined && previousDecision?.materialized
+				? previousDecision
+				: decision;
 		const rewrittenTokens = rebust
 			? current.usage.input
 			: bust
@@ -592,6 +662,9 @@ export async function analyzePiCacheBustSession(
 		options.bodiesDir,
 	);
 	const bodies = loadPiBodySnapshots(bodiesDirectory);
+	const decisions =
+		options.decisions ??
+		loadPiCacheBustDecisions(selected.sessionId, ledgerDir, options.db);
 	const inWindow = (timestampMs: number): boolean =>
 		(options.sinceExclusiveMs === undefined ||
 			timestampMs > options.sinceExclusiveMs) &&
@@ -615,7 +688,7 @@ export async function analyzePiCacheBustSession(
 				);
 	const rows = analyzeJoinedPasses(analysisJoined, {
 		bodies,
-		decisions: options.decisions,
+		decisions,
 	});
 	const requests: AnalyzedCacheRequest[] = rows.flatMap((row) => {
 		const timestampMs = row.current.usage.timestamp;
@@ -741,7 +814,15 @@ async function main(): Promise<void> {
 		options.bodiesDir,
 	);
 	const bodies = loadPiBodySnapshots(bodiesDirectory);
-	const rows = analyzeJoinedPasses(joinPasses(ledgers, session), { bodies });
+	const decisions = loadPiCacheBustDecisions(
+		session.sessionId,
+		options.ledgerDir,
+		options.db,
+	);
+	const rows = analyzeJoinedPasses(joinPasses(ledgers, session), {
+		bodies,
+		decisions,
+	});
 	console.log(`Session: ${session.sessionId}`);
 	console.log(`JSONL:   ${session.path}`);
 	console.log(
@@ -807,6 +888,8 @@ export const __test = {
 	discoverPiSessionFiles,
 	joinPasses,
 	loadLedger,
+	loadPiCacheBustDecisions,
+	nearestPiPassDecision,
 	parseArgs,
 	parsePiSessionFile,
 	resolveTimeBound,

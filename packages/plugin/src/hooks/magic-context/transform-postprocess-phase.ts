@@ -1264,7 +1264,8 @@ export async function runPostTransformPhase(
     const firstRenderBust = m0M1EnabledForFold && !completeCachedPrefixAvailable;
     let foldExecutedThisPass = false;
     let publishedM1RefreshedThisPass = false;
-    const softRefreshOpportunity = args.schedulerDecision === "execute";
+    let prefixPreflightFailed = false;
+    const softRefreshOpportunity = args.schedulerDecision === "execute" || deferredMaterialize;
     let m0RematerializedThisPass = false;
     const m0CoverageBeforeFold =
         args.sessionMeta.cachedM0Bytes === null ? -1 : args.sessionMeta.cachedM0MaxCompartmentSeq;
@@ -1297,6 +1298,7 @@ export async function runPostTransformPhase(
                 compactionOff,
             });
             preparedPrefix = foldResult;
+            prefixPreflightFailed = foldResult.materializationContentionRetryExhausted === true;
             foldExecutedThisPass = foldExecutesThisPass(
                 foldDueDecision.value || softRefreshOpportunity,
                 foldResult.m0RematerializedThisPass,
@@ -1323,6 +1325,7 @@ export async function runPostTransformPhase(
             }
         } catch (error) {
             preparedPrefix = cachedPrefixBeforePreflight;
+            prefixPreflightFailed = true;
             args.passOutcome?.record("m0-m1-fold-preexecution-degradation");
             sessionLog(
                 args.sessionId,
@@ -1335,22 +1338,11 @@ export async function runPostTransformPhase(
             `m[0] HARD fold decision: reason=${foldDueDecision.reason ?? "unknown"} executed=${foldExecutedThisPass}`,
         );
     }
-    // A historian reads raw harness data, while reductions and rendered summaries
-    // write context.db and the outgoing request. Published rows can therefore
-    // drain on the same bust without changing the in-flight chunk's input.
-    // All published work shares one permission. Historian chunk publication keeps
-    // its own lease; rendering and drop writes cannot alter its raw input.
-    const publishedWorkDrainAllowed =
-        args.schedulerDecision === "execute" ||
-        materializationRequested ||
-        forceMaterialization ||
-        emergencyDropEligible ||
-        foldExecutedThisPass ||
-        firstRenderBust;
 
     const shouldReadPendingOps =
         !compactionOff &&
         (materializationRequested ||
+            publishedM1RefreshedThisPass ||
             args.schedulerDecision === "execute" ||
             forceMaterialization ||
             foldExecutedThisPass ||
@@ -1362,26 +1354,14 @@ export async function runPostTransformPhase(
         const depth = getPendingOpsCount(args.db, args.sessionId);
         return depth === null ? "not loaded (deferred pass)" : String(depth);
     };
-    // Keep pending-op materialization coupled to the force signal itself. This
-    // prevents an escalation-band change from letting emergency cleanup mutate
-    // the wire while queued operations remain deferred.
-    const shouldApplyPendingOps =
-        !compactionOff &&
-        (args.schedulerDecision === "execute" ||
-            materializationRequested ||
-            forceMaterialization ||
-            foldExecutedThisPass ||
-            firstRenderBust) &&
-        publishedWorkDrainAllowed;
-    // Automatic cleanup waits for a separately priced prefix refresh or drop.
-    // Subagents retain the force-band escape even without a historian.
-    // A prepared legacy block is delivery evidence only when no m0/m1 renderer
-    // owns the prefix. With m0/m1 enabled, require its persisted preflight result;
-    // first render and force are separate known-bust exceptions to cached replay.
+    // All first applications share an independently priced cache-bust permission.
     const rideSignals = {
         hardFold: foldExecutedThisPass || firstRenderBust,
-        force: forceMaterialization || emergencyDropEligible,
-        explicitFlush: isExplicitFlush,
+        force:
+            emergencyDropEligible &&
+            (args.contextUsage.percentage >= 95 ||
+                getEmergencyInputSample(args.db, args.sessionId) === 0),
+        explicitFlush: isExplicitFlush || (deferredMaterialize && !prefixPreflightFailed),
         publishedHistory:
             publishedM1RefreshedThisPass ||
             (!m0M1EnabledForFold &&
@@ -1389,9 +1369,10 @@ export async function runPostTransformPhase(
                 (args.historyRebuiltThisPass ||
                     args.rebuiltHistoryFromInitialPrepare ||
                     (args.canConsumeDeferredLate && args.deferredHistoryWasPendingAtPassStart))),
-        agentDrop: false,
     };
-    let shouldRunHeuristics =
+    const publishedWorkDrainAllowed = !compactionOff && hasReclaimRide(rideSignals);
+    const shouldApplyPendingOps = publishedWorkDrainAllowed;
+    const shouldRunHeuristics =
         !compactionOff &&
         hasReclaimRide(rideSignals) &&
         (rideSignals.publishedHistory ||
@@ -1411,7 +1392,7 @@ export async function runPostTransformPhase(
                 (!alreadyRanThisTurn || !args.fullFeatureMode)));
     // Every first-application lane and m[1] refresh uses this same permission.
     // It authorizes mutation; individual lanes may still find no eligible work.
-    let isCacheBustingPass = !compactionOff && hasReclaimRide(rideSignals);
+    const isCacheBustingPass = publishedWorkDrainAllowed;
     // ctx_reduce stays frozen for prompt-hash stability, but observe the live
     // permission signal on the same busts so an operator knows guidance may be
     // stale until the session restarts. This log never changes the wire.
@@ -1488,21 +1469,11 @@ export async function runPostTransformPhase(
             `pending ops WILL NOT APPLY — reason=${args.schedulerDeferReason} pendingOps=${formatPendingOpsDepth()} context=${args.contextUsage.percentage.toFixed(1)}%`,
         );
     }
-    if (compartmentRunning && hasPendingUserOps) {
-        if (publishedWorkDrainAllowed) {
-            const bypassReason = forceMaterialization
-                ? `emergency >=${args.forceMaterializationPercentage}%`
-                : "m0 hard fold";
-            sessionLog(
-                args.sessionId,
-                `transform: compartment-gate bypass (${bypassReason}) — applying ${pendingOps.length} pending ops while compartment agent runs (${args.contextUsage.percentage.toFixed(1)}%)`,
-            );
-        } else {
-            sessionLog(
-                args.sessionId,
-                "transform: deferring pending ops — compartment agent in progress",
-            );
-        }
+    if (hasPendingUserOps && !shouldApplyPendingOps) {
+        sessionLog(
+            args.sessionId,
+            `pending ops held — reason=no originating cache-bust opportunity; scheduler=${args.schedulerDecision}, historianRunning=${compartmentRunning}`,
+        );
     }
     let explicitMaterializedSuccessfully = false;
     let deferredMaterializedSuccessfully = false;
@@ -1564,9 +1535,6 @@ export async function runPostTransformPhase(
                 (reduction) => droppedTokenReductions.push(reduction),
             );
             if (pendingOpsDidMutate) {
-                rideSignals.agentDrop = true;
-                isCacheBustingPass = hasReclaimRide(rideSignals);
-                shouldRunHeuristics = isCacheBustingPass;
                 droppedCount += pendingOps.length;
                 for (const pendingOp of pendingOps) {
                     const message = args.targets.get(pendingOp.tagId)?.message;

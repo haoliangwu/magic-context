@@ -18,6 +18,7 @@ import {
     estimateTokens,
     extractTexts,
     extractToolCallSummaries,
+    extractToolResultBodyTokens,
     formatBlock,
     hasMeaningfulUserText,
     mergeCommitHashes,
@@ -221,6 +222,12 @@ export interface SessionChunk {
     toolOnlyRanges: Array<{ start: number; end: number }>;
     /** Completed call/result ranges visible in the raw snapshot, including results past this chunk. */
     completedToolArcs: Array<{ start: number; end: number }>;
+    /** Character boundaries for omitted tool-result bodies, used only by pathological window fitting. */
+    toolResultBoundaries?: Array<{
+        ordinal: number;
+        sourceOffset: number;
+        bodyTokens: number;
+    }>;
 }
 
 export function withRawSessionMessageCache<T>(fn: () => T): T {
@@ -687,6 +694,13 @@ export function readSessionChunk(
     const completedToolArcs = buildToolArcs(messages).flatMap((arc) =>
         arc.resOrdinal === null ? [] : [{ start: arc.invOrdinal, end: arc.resOrdinal }],
     );
+    const completedToolComponents: Array<{ start: number; end: number }> = [];
+    for (const arc of completedToolArcs) {
+        const component = completedToolComponents[completedToolComponents.length - 1];
+        if (component && arc.start <= component.end)
+            component.end = Math.max(component.end, arc.end);
+        else completedToolComponents.push({ ...arc });
+    }
     const lines: string[] = [];
     const lineMeta: SessionChunkLine[] = [];
     /**
@@ -704,6 +718,28 @@ export function readSessionChunk(
     let pendingNoiseMeta: SessionChunkLine[] = [];
     let commitClusters = 0;
     let lastFlushedRole = "";
+    let admittedOversizeComponentEnd: number | null = null;
+    let currentBlockApproxTokens = 0;
+    let formattedBudgetCrossed = false;
+    let sourceCharacters = 0;
+    const toolResultBoundaries: NonNullable<SessionChunk["toolResultBoundaries"]> = [];
+
+    function pinComponentWhenFormattedBudgetCrosses(ordinal: number, appendedText: string): void {
+        if (admittedOversizeComponentEnd !== null || formattedBudgetCrossed || !currentBlock)
+            return;
+        currentBlockApproxTokens +=
+            estimateTokens(appendedText) + (currentBlock.parts.length > 1 ? 1 : 0);
+        // Exact tokenization of a growing merged block is quadratic. Stay additive
+        // until the block is close enough for its short ordinal/role prefix to matter.
+        if (totalTokens + currentBlockApproxTokens + 64 <= tokenBudget) return;
+        const previewTokens = totalTokens + estimateTokens(formatBlock(currentBlock));
+        if (previewTokens <= tokenBudget) return;
+        formattedBudgetCrossed = true;
+        const component = completedToolComponents.find(
+            (candidate) => candidate.start <= ordinal && candidate.end >= ordinal,
+        );
+        if (component) admittedOversizeComponentEnd = component.end;
+    }
 
     function recordFilteredNoise(meta: SessionChunkLine): void {
         pendingNoiseMeta.push(meta);
@@ -742,7 +778,23 @@ export function readSessionChunk(
         highestScannedOrdinal = Math.max(highestScannedOrdinal, lastOrdinal);
         lastMessageId = currentBlock.meta[currentBlock.meta.length - 1]?.messageId ?? "";
         messagesProcessed += currentBlock.meta.length;
+        const lineStart = sourceCharacters + (lines.length > 0 ? 1 : 0);
+        const renderedParts = currentBlock.parts.join(" / ");
+        let partOffset = lineStart + (blockText.length - renderedParts.length);
+        for (let index = 0; index < currentBlock.parts.length; index++) {
+            const part = currentBlock.parts[index] ?? "";
+            const partMeta = currentBlock.partMeta[index];
+            if (partMeta && partMeta.toolResultBodyTokens > 0) {
+                toolResultBoundaries.push({
+                    ordinal: partMeta.ordinal,
+                    sourceOffset: partOffset,
+                    bodyTokens: partMeta.toolResultBodyTokens,
+                });
+            }
+            partOffset += part.length + (index + 1 < currentBlock.parts.length ? 3 : 0);
+        }
         lines.push(blockText);
+        sourceCharacters = lineStart + blockText.length;
         lineMeta.push(...currentBlock.meta);
         totalTokens += blockTokens;
 
@@ -757,11 +809,15 @@ export function readSessionChunk(
         }
 
         currentBlock = null;
+        currentBlockApproxTokens = 0;
         return true;
     }
 
     for (const msg of messages) {
         if (eligibleEndOrdinal !== undefined && msg.ordinal >= eligibleEndOrdinal) break;
+        if (admittedOversizeComponentEnd !== null && msg.ordinal > admittedOversizeComponentEnd) {
+            break;
+        }
         if (msg.ordinal < startOrdinal) continue;
 
         const meta = { ordinal: msg.ordinal, messageId: msg.id };
@@ -783,6 +839,10 @@ export function readSessionChunk(
             if (currentBlock && currentBlock.role === "A") {
                 currentBlock.endOrdinal = msg.ordinal;
                 currentBlock.parts.push(tcText);
+                currentBlock.partMeta.push({
+                    ordinal: msg.ordinal,
+                    toolResultBodyTokens: extractToolResultBodyTokens(msg.parts),
+                });
                 currentBlock.meta.push(...pendingNoiseMeta, meta);
                 // Do NOT flip isToolOnly here — TC-only content merging into an
                 // existing A block keeps that block's narrative/tool-only status.
@@ -794,6 +854,12 @@ export function readSessionChunk(
                     startOrdinal: pendingNoiseMeta[0]?.ordinal ?? msg.ordinal,
                     endOrdinal: msg.ordinal,
                     parts: [tcText],
+                    partMeta: [
+                        {
+                            ordinal: msg.ordinal,
+                            toolResultBodyTokens: extractToolResultBodyTokens(msg.parts),
+                        },
+                    ],
                     meta: [...pendingNoiseMeta, meta],
                     commitHashes: [],
                     // Pure TC-only block — no narrative from text parts.
@@ -801,6 +867,7 @@ export function readSessionChunk(
                 };
                 pendingNoiseMeta = [];
             }
+            pinComponentWhenFormattedBudgetCrosses(msg.ordinal, tcText);
             continue;
         }
 
@@ -831,6 +898,10 @@ export function readSessionChunk(
         if (currentBlock && currentBlock.role === role) {
             currentBlock.endOrdinal = msg.ordinal;
             currentBlock.parts.push(text);
+            currentBlock.partMeta.push({
+                ordinal: msg.ordinal,
+                toolResultBodyTokens: extractToolResultBodyTokens(msg.parts),
+            });
             currentBlock.meta.push(...pendingNoiseMeta, meta);
             currentBlock.commitHashes = mergeCommitHashes(
                 currentBlock.commitHashes,
@@ -840,6 +911,7 @@ export function readSessionChunk(
             // no longer tool-only.
             if (msgHasNarrative) currentBlock.isToolOnly = false;
             pendingNoiseMeta = [];
+            pinComponentWhenFormattedBudgetCrosses(msg.ordinal, text);
             continue;
         }
 
@@ -850,11 +922,18 @@ export function readSessionChunk(
             startOrdinal: pendingNoiseMeta[0]?.ordinal ?? msg.ordinal,
             endOrdinal: msg.ordinal,
             parts: [text],
+            partMeta: [
+                {
+                    ordinal: msg.ordinal,
+                    toolResultBodyTokens: extractToolResultBodyTokens(msg.parts),
+                },
+            ],
             meta: [...pendingNoiseMeta, meta],
             commitHashes: [...compacted.commitHashes],
             isToolOnly: !msgHasNarrative,
         };
         pendingNoiseMeta = [];
+        pinComponentWhenFormattedBudgetCrosses(msg.ordinal, text);
     }
 
     if (flushCurrentBlock() && pendingNoiseMeta.length > 0) {
@@ -904,6 +983,7 @@ export function readSessionChunk(
         commitClusterCount: commitClusters,
         toolOnlyRanges,
         completedToolArcs,
+        toolResultBoundaries,
     };
 }
 

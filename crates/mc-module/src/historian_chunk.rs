@@ -50,6 +50,7 @@ impl ChunkSnapshotOwnedItem {
 pub struct HistorianBuiltChunk {
     pub text: String,
     pub chunk: HistorianChunk,
+    pub tool_result_boundaries: Vec<HistorianResultBoundary>,
     pub snapshot: Vec<ChunkSnapshotOwnedItem>,
     pub end_message_id: String,
     pub token_estimate: usize,
@@ -77,9 +78,23 @@ struct ChunkBlock {
     start_ordinal: u64,
     end_ordinal: u64,
     parts: Vec<String>,
+    part_meta: Vec<ChunkPartMeta>,
     meta: Vec<MessageMeta>,
     commit_hashes: Vec<String>,
     is_tool_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkPartMeta {
+    ordinal: u64,
+    tool_result_body_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorianResultBoundary {
+    pub ordinal: u64,
+    pub source_offset: usize,
+    pub body_tokens: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +118,13 @@ struct Builder {
     last_flushed_role: String,
     tool_call_summaries: HashMap<String, String>,
     completed_tool_arcs: Vec<MessageRange>,
+    completed_tool_components: Vec<MessageRange>,
+    admitted_oversize_component_end: Option<u64>,
+    source_characters: usize,
+    tool_result_boundaries: Vec<HistorianResultBoundary>,
+    current_block_approx_tokens: usize,
+    last_appended_part_tokens: usize,
+    formatted_budget_crossed: bool,
 }
 
 impl Builder {
@@ -112,6 +134,16 @@ impl Builder {
         tool_call_summaries: HashMap<String, String>,
         completed_tool_arcs: Vec<MessageRange>,
     ) -> Self {
+        let mut completed_tool_components: Vec<MessageRange> = Vec::new();
+        for arc in &completed_tool_arcs {
+            if let Some(component) = completed_tool_components.last_mut() {
+                if arc.start <= component.end {
+                    component.end = component.end.max(arc.end);
+                    continue;
+                }
+            }
+            completed_tool_components.push(arc.clone());
+        }
         Self {
             budget,
             total_tokens: 0,
@@ -126,10 +158,57 @@ impl Builder {
             last_flushed_role: String::new(),
             tool_call_summaries,
             completed_tool_arcs,
+            completed_tool_components,
+            admitted_oversize_component_end: None,
+            source_characters: 0,
+            tool_result_boundaries: Vec::new(),
+            current_block_approx_tokens: 0,
+            last_appended_part_tokens: 0,
+            formatted_budget_crossed: false,
         }
     }
 
+    fn accepts_ordinal(&self, ordinal: u64) -> bool {
+        self.admitted_oversize_component_end
+            .is_none_or(|end| ordinal <= end)
+    }
+
+    fn pin_component_when_formatted_budget_crosses(&mut self, ordinal: u64) {
+        if self.admitted_oversize_component_end.is_some() || self.formatted_budget_crossed {
+            return;
+        }
+        let Some(block) = self.current_block.as_ref() else {
+            return;
+        };
+        self.current_block_approx_tokens = self
+            .current_block_approx_tokens
+            .saturating_add(self.last_appended_part_tokens);
+        if self
+            .total_tokens
+            .saturating_add(self.current_block_approx_tokens)
+            .saturating_add(64)
+            <= self.budget
+        {
+            return;
+        }
+        let separator_tokens = usize::from(!self.lines.is_empty()) * estimate_tokens("\n");
+        let preview_tokens = self
+            .total_tokens
+            .saturating_add(estimate_tokens(&format_block(block)))
+            .saturating_add(separator_tokens);
+        if preview_tokens <= self.budget {
+            return;
+        }
+        self.formatted_budget_crossed = true;
+        self.admitted_oversize_component_end = self
+            .completed_tool_components
+            .iter()
+            .find(|component| component.start <= ordinal && component.end >= ordinal)
+            .map(|component| component.end);
+    }
+
     fn push_message(&mut self, message: &FlatMessage<'_>) -> bool {
+        self.last_appended_part_tokens = 0;
         let last_block_id = last_block_id(message);
         let meta = MessageMeta {
             ordinal: message.ordinal,
@@ -148,7 +227,12 @@ impl Builder {
                 self.pending_noise_meta.push(meta);
                 return true;
             }
-            return self.absorb_tool_only(meta, message.ordinal, summaries);
+            return self.absorb_tool_only(
+                meta,
+                message.ordinal,
+                summaries,
+                tool_result_body_tokens(message),
+            );
         }
 
         if message.role == "user" && !has_meaningful_user_text(message) {
@@ -157,7 +241,12 @@ impl Builder {
                 self.pending_noise_meta.push(meta);
                 return true;
             }
-            return self.absorb_tool_only(meta, message.ordinal, tc_summaries);
+            return self.absorb_tool_only(
+                meta,
+                message.ordinal,
+                tc_summaries,
+                tool_result_body_tokens(message),
+            );
         }
 
         let role = compact_role(message.role);
@@ -182,7 +271,13 @@ impl Builder {
             .filter(|block| block.role == role)
         {
             current.end_ordinal = message.ordinal;
+            self.last_appended_part_tokens =
+                estimate_tokens(&compacted.text) + usize::from(!current.parts.is_empty());
             current.parts.push(compacted.text);
+            current.part_meta.push(ChunkPartMeta {
+                ordinal: message.ordinal,
+                tool_result_body_tokens: tool_result_body_tokens(message),
+            });
             current.meta.append(&mut self.pending_noise_meta);
             current.meta.push(meta);
             current.commit_hashes =
@@ -203,11 +298,16 @@ impl Builder {
             .unwrap_or(message.ordinal);
         let mut meta_list = std::mem::take(&mut self.pending_noise_meta);
         meta_list.push(meta);
+        self.last_appended_part_tokens = estimate_tokens(&compacted.text);
         self.current_block = Some(ChunkBlock {
             role,
             start_ordinal: start,
             end_ordinal: message.ordinal,
             parts: vec![compacted.text],
+            part_meta: vec![ChunkPartMeta {
+                ordinal: message.ordinal,
+                tool_result_body_tokens: tool_result_body_tokens(message),
+            }],
             meta: meta_list,
             commit_hashes: compacted.commit_hashes,
             is_tool_only: !msg_has_narrative,
@@ -220,6 +320,7 @@ impl Builder {
         meta: MessageMeta,
         ordinal: u64,
         summaries: Vec<String>,
+        tool_result_body_tokens: usize,
     ) -> bool {
         let tc_text = if summaries.is_empty() {
             String::new()
@@ -233,7 +334,13 @@ impl Builder {
         {
             current.end_ordinal = ordinal;
             if !tc_text.is_empty() {
+                self.last_appended_part_tokens =
+                    estimate_tokens(&tc_text) + usize::from(!current.parts.is_empty());
                 current.parts.push(tc_text);
+                current.part_meta.push(ChunkPartMeta {
+                    ordinal,
+                    tool_result_body_tokens,
+                });
             }
             current.meta.append(&mut self.pending_noise_meta);
             current.meta.push(meta);
@@ -253,12 +360,17 @@ impl Builder {
             self.pending_noise_meta = meta_list;
             return true;
         }
+        self.last_appended_part_tokens = estimate_tokens(&tc_text);
         let parts = vec![tc_text];
         self.current_block = Some(ChunkBlock {
             role: "A".to_string(),
             start_ordinal: start,
             end_ordinal: ordinal,
             parts,
+            part_meta: vec![ChunkPartMeta {
+                ordinal,
+                tool_result_body_tokens,
+            }],
             meta: meta_list,
             commit_hashes: Vec::new(),
             is_tool_only: true,
@@ -304,14 +416,31 @@ impl Builder {
             .last()
             .map(|meta| meta.message_id.clone())
             .unwrap_or_default();
+        let line_start = self.source_characters + usize::from(!self.lines.is_empty());
+        let rendered_parts = block.parts.join(" / ");
+        let mut part_offset = line_start + block_text.len().saturating_sub(rendered_parts.len());
+        for (index, part) in block.parts.iter().enumerate() {
+            if let Some(part_meta) = block.part_meta.get(index) {
+                if part_meta.tool_result_body_tokens > 0 {
+                    self.tool_result_boundaries.push(HistorianResultBoundary {
+                        ordinal: part_meta.ordinal,
+                        source_offset: part_offset,
+                        body_tokens: part_meta.tool_result_body_tokens,
+                    });
+                }
+            }
+            part_offset += part.len() + usize::from(index + 1 < block.parts.len()) * 3;
+        }
         self.line_meta
             .extend(block.meta.iter().map(|meta| ChunkLine {
                 ordinal: meta.ordinal,
                 message_id: meta.message_id.clone(),
                 anchorable: meta.anchorable,
             }));
+        self.source_characters = line_start + block_text.len();
         self.lines.push(block_text);
         self.total_tokens += block_tokens;
+        self.current_block_approx_tokens = 0;
         if block.is_tool_only {
             self.tool_only_ranges.push(MessageRange {
                 start: block.start_ordinal,
@@ -416,9 +545,13 @@ pub fn build_historian_chunk(
                 .cloned()
                 .unwrap_or_default(),
         };
+        if !builder.accepts_ordinal(message.ordinal) {
+            break;
+        }
         if !builder.push_message(&flat_message) {
             break;
         }
+        builder.pin_component_when_formatted_budget_crosses(message.ordinal);
         if builder.current_block.is_none() {
             highest_scanned_ordinal = highest_scanned_ordinal.max(
                 builder
@@ -460,6 +593,7 @@ pub fn build_historian_chunk(
             tool_only_ranges,
             completed_tool_arcs: builder.completed_tool_arcs,
         },
+        tool_result_boundaries: builder.tool_result_boundaries,
         snapshot,
         end_message_id: builder.last_message_id,
         token_estimate: builder.total_tokens,
@@ -787,12 +921,42 @@ pub fn assemble_historian_firing(
             && chunk.chunk.completed_tool_arcs.iter().any(|arc| {
                 arc.start <= chunk.chunk.end_index && arc.end >= chunk.chunk.start_index
             });
+    let fitted_atomic_source = oversize_atomic_unit.then(|| {
+        fit_atomic_historian_source_to_producer_window(
+            &chunk.text,
+            &chunk.tool_result_boundaries,
+            config.historian_context_limit_tokens,
+            config.max_output_tokens,
+        )
+    });
     let input_source = if oversize_atomic_unit {
-        chunk.text.clone()
+        fitted_atomic_source
+            .as_ref()
+            .map(|fitted| fitted.text.clone())
+            .unwrap_or_else(|| chunk.text.clone())
     } else {
         truncate_historian_input_if_needed(&chunk.text, config.token_budget)
     };
     let producer_source_tokens = estimate_tokens(&input_source);
+    if let Some(fitted) = fitted_atomic_source
+        .as_ref()
+        .filter(|fitted| fitted.removed_tokens > 0)
+    {
+        eprintln!(
+            "[mc-module][{}] historian pathological component split: range={}-{} resultBoundary={} removedTokens={} producerSourceTokens={} producerInputLimitTokens={}",
+            config.session_id,
+            chunk.chunk.start_index,
+            chunk.chunk.end_index,
+            fitted
+                .split_boundary_ordinal
+                .map_or_else(|| "midpoint".to_string(), |ordinal| ordinal.to_string()),
+            fitted.removed_tokens,
+            producer_source_tokens,
+            fitted
+                .producer_input_limit_tokens
+                .map_or_else(|| "unknown".to_string(), |limit| limit.to_string()),
+        );
+    }
     if config.boundary.oversize_atomic_unit || oversize_atomic_unit {
         let raw_chunk_tokens: usize = live
             .iter()
@@ -866,6 +1030,99 @@ pub fn assemble_historian_firing(
 
 const HISTORIAN_TRUNCATION_MARKER: &str =
     "\n[… tokens truncated by Magic Context to fit the historian window …]";
+const HISTORIAN_SPLIT_MARKERS: &str = "\n[… tokens truncated by Magic Context to fit the historian window …]\n[… tokens truncated by Magic Context to fit the historian window …]\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FittedHistorianSource {
+    text: String,
+    producer_input_limit_tokens: Option<usize>,
+    split_boundary_ordinal: Option<u64>,
+    removed_tokens: usize,
+}
+
+fn floor_char_boundary(input: &str, requested: usize) -> usize {
+    let mut offset = requested.min(input.len());
+    while offset > 0 && !input.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn ceil_char_boundary(input: &str, requested: usize) -> usize {
+    let mut offset = requested.min(input.len());
+    while offset < input.len() && !input.is_char_boundary(offset) {
+        offset += 1;
+    }
+    offset
+}
+
+fn fit_atomic_historian_source_to_producer_window(
+    input: &str,
+    result_boundaries: &[HistorianResultBoundary],
+    context_limit_tokens: Option<usize>,
+    max_output_tokens: u32,
+) -> FittedHistorianSource {
+    let producer_input_limit_tokens =
+        crate::historian::producer_input_token_limit(context_limit_tokens, max_output_tokens);
+    let original_tokens = estimate_tokens(input);
+    let Some(limit) = producer_input_limit_tokens else {
+        return FittedHistorianSource {
+            text: input.to_string(),
+            producer_input_limit_tokens,
+            split_boundary_ordinal: None,
+            removed_tokens: 0,
+        };
+    };
+    if original_tokens < limit || limit == 0 {
+        return FittedHistorianSource {
+            text: input.to_string(),
+            producer_input_limit_tokens,
+            split_boundary_ordinal: None,
+            removed_tokens: 0,
+        };
+    }
+
+    let boundary = result_boundaries
+        .iter()
+        .filter(|boundary| boundary.source_offset > 0 && boundary.source_offset < input.len())
+        .max_by_key(|boundary| (boundary.body_tokens, std::cmp::Reverse(boundary.ordinal)));
+    let requested_split = boundary
+        .map(|boundary| boundary.source_offset)
+        .unwrap_or(input.len() / 2);
+    let split = floor_char_boundary(input, requested_split);
+    let (left, right) = input.split_at(split);
+    let target = limit;
+    let mut lo = 0usize;
+    let mut hi = 1_000_000usize;
+    let mut best = HISTORIAN_SPLIT_MARKERS.to_string();
+    while lo <= hi {
+        let scale = lo + (hi - lo) / 2;
+        let left_len = floor_char_boundary(left, left.len().saturating_mul(scale) / 1_000_000);
+        let right_len = floor_char_boundary(right, right.len().saturating_mul(scale) / 1_000_000);
+        let right_start = ceil_char_boundary(right, right.len().saturating_sub(right_len));
+        let candidate = format!(
+            "{}{}{}",
+            &left[..left_len],
+            HISTORIAN_SPLIT_MARKERS,
+            &right[right_start..]
+        );
+        if estimate_tokens(&candidate) <= target {
+            best = candidate;
+            lo = scale.saturating_add(1);
+        } else if scale == 0 {
+            break;
+        } else {
+            hi = scale - 1;
+        }
+    }
+    let fitted_tokens = estimate_tokens(&best);
+    FittedHistorianSource {
+        text: best,
+        producer_input_limit_tokens,
+        split_boundary_ordinal: boundary.map(|boundary| boundary.ordinal),
+        removed_tokens: original_tokens.saturating_sub(fitted_tokens),
+    }
+}
 
 pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> String {
     if estimate_tokens(input) <= token_budget {
@@ -1008,6 +1265,15 @@ fn extract_tool_call_summaries(message: &FlatMessage<'_>) -> Vec<String> {
         summaries.push(format_tool_summary(name, input));
     }
     summaries
+}
+
+fn tool_result_body_tokens(message: &FlatMessage<'_>) -> usize {
+    message
+        .blocks
+        .iter()
+        .filter(|block| matches!(&block.wire.kind, CkKind::ToolResult { .. }))
+        .map(|block| block.bytes.len().div_ceil(4))
+        .sum()
 }
 
 fn extract_tool_result_summaries(
@@ -1252,6 +1518,7 @@ mod tests {
     use mc_store::{CkKind, MediaBlock, MediaKind, ProviderExtras, StoredCompartment};
     use serde::Deserialize;
     use serde_json::json;
+    use sha2::Digest;
 
     #[derive(Deserialize)]
     struct GoldenRoot {
@@ -1656,6 +1923,11 @@ mod tests {
             firing.prompt.contains(&built.text),
             "producer must receive the whole formatted component"
         );
+        let prompt_hash = format!("{:x}", sha2::Sha256::digest(firing.prompt.as_bytes()));
+        assert_eq!(
+            prompt_hash,
+            "90e949d5ecab64b27a84497213d8aa03b450b025d2bf301e0d61593d98f2de27"
+        );
         let validated = crate::historian_validate::validate_historian_output(
             &historian_output(1, 3, 4),
             &firing.chunk.chunk,
@@ -1664,6 +1936,97 @@ mod tests {
         )
         .expect("whole component validates");
         assert_eq!(validated.compartments[0].end_message, 3);
+    }
+
+    #[test]
+    fn consecutive_completed_arcs_stop_after_the_component_crossing_the_budget() {
+        let mut messages = vec![msg("m1", 1, "user", vec![text("Inspect each target.")])];
+        for index in 0..8u64 {
+            let call_id = format!("chain-{index}");
+            messages.push(msg(
+                &format!("call-{index}"),
+                index * 2 + 2,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: call_id.clone(),
+                    name: "read".to_string(),
+                    input: json!({
+                        "description": format!("Inspect target {index}: {}", "detail ".repeat(20))
+                    }),
+                    provider_executed: false,
+                }],
+            ));
+            messages.push(msg(
+                &format!("result-{index}"),
+                index * 2 + 3,
+                "tool",
+                vec![CkKind::ToolResult {
+                    id: call_id,
+                    tool_name: "read".to_string(),
+                    output: mc_store::CkToolOutput::bare(mc_store::CkOutputKind::Text {
+                        text: format!("result {index}"),
+                    }),
+                    provider_executed: false,
+                }],
+            ));
+        }
+        let projection = project_messages(&messages).unwrap();
+        let third_result = 7;
+        let prefix = build_historian_chunk(
+            &messages,
+            &projection.blocks,
+            2,
+            1_000_000,
+            third_result + 1,
+        );
+        let budget = estimate_tokens(&prefix.text).saturating_sub(1);
+        let built = build_historian_chunk(
+            &messages,
+            &projection.blocks,
+            2,
+            budget,
+            messages.len() as u64 + 1,
+        );
+        assert_eq!(built.chunk.end_index, third_result);
+        assert!(built.has_more);
+        assert!(estimate_tokens(&built.text) > budget);
+    }
+
+    #[test]
+    fn atomic_source_over_nominal_window_is_split_below_estimator_margin() {
+        let input = format!(
+            "[2] A: TC: read\n[3] U: {}\n[4] A: TC: read",
+            "oversize steering value\n".repeat(20_000)
+        );
+        let source_tokens = estimate_tokens(&input);
+        let usable_input_tokens = source_tokens * 100 / 102;
+        let max_output_tokens = 32_000;
+        let context_limit_tokens = usable_input_tokens + max_output_tokens as usize;
+        let fitted = fit_atomic_historian_source_to_producer_window(
+            &input,
+            &[HistorianResultBoundary {
+                ordinal: 4,
+                source_offset: input.rfind("[4]").unwrap(),
+                body_tokens: 10_000,
+            }],
+            Some(context_limit_tokens),
+            max_output_tokens,
+        );
+        let limit = crate::historian::producer_input_token_limit(
+            Some(context_limit_tokens),
+            max_output_tokens,
+        )
+        .unwrap();
+        assert!(source_tokens >= usable_input_tokens * 101 / 100);
+        assert!(estimate_tokens(&fitted.text) <= limit);
+        assert_eq!(fitted.split_boundary_ordinal, Some(4));
+        assert_eq!(
+            fitted
+                .text
+                .matches(HISTORIAN_TRUNCATION_MARKER.trim())
+                .count(),
+            2
+        );
     }
 
     #[test]

@@ -2799,4 +2799,307 @@ describe("createCtxMemoryTools", () => {
             expect(result).toContain(`id ${missing}: not found or not visible from this project`);
         });
     });
+
+    describe("required-all filler", () => {
+        const isolatedWrite = async (args: Record<string, unknown>) => {
+            const isolated = createTestDb();
+            try {
+                const isolatedTools = createCtxMemoryTools({
+                    db: isolated,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                });
+                return await isolatedTools.ctx_memory.execute(args, toolContext());
+            } finally {
+                closeQuietly(isolated);
+            }
+        };
+
+        it("write ignores ids/limit/reason filler, including ids:[0]", async () => {
+            const clean = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+            });
+            const filler = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+                ids: [1],
+                limit: 0,
+                reason: "",
+            });
+            const zeroIds = await isolatedWrite({
+                action: "write",
+                category: "PROJECT_RULES",
+                content: "Same standalone fact.",
+                ids: [0],
+                limit: 0,
+                reason: "",
+            });
+            expect(filler).toBe(clean);
+            expect(zeroIds).toBe(clean);
+            expect(clean).toContain("Saved memory [ID: 1] in PROJECT_RULES.");
+        });
+
+        it("archive with empty reason and unused-field filler matches a clean archive", async () => {
+            const run = async (archiveArgs: Record<string, unknown>) => {
+                const isolated = createTestDb();
+                try {
+                    const isolatedTools = createCtxMemoryTools({
+                        db: isolated,
+                        resolveProjectPath: () => "/repo/project",
+                        memoryEnabled: true,
+                        embeddingEnabled: false,
+                    });
+                    const created = await isolatedTools.ctx_memory.execute(
+                        {
+                            action: "write",
+                            category: "PROJECT_RULES",
+                            content: "Archive this fact.",
+                        },
+                        toolContext(),
+                    );
+                    expect(created).toContain("Saved memory [ID: 1]");
+                    return await isolatedTools.ctx_memory.execute(archiveArgs, toolContext());
+                } finally {
+                    closeQuietly(isolated);
+                }
+            };
+            const clean = await run({ action: "archive", ids: [1] });
+            const filler = await run({
+                action: "archive",
+                ids: [1],
+                content: "",
+                category: "PROJECT_RULES",
+                limit: 0,
+                reason: "",
+            });
+            expect(filler).toBe(clean);
+            expect(clean).toContain("Archived memory [ID: 1]");
+        });
+
+        it("update/get/merge ignore unused-field filler and match the clean call", async () => {
+            const seed = async () => {
+                const isolated = createTestDb();
+                const isolatedTools = createCtxMemoryTools({
+                    db: isolated,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                });
+                await isolatedTools.ctx_memory.execute(
+                    {
+                        action: "write",
+                        category: "PROJECT_RULES",
+                        content: "Original fact.",
+                    },
+                    toolContext(),
+                );
+                await isolatedTools.ctx_memory.execute(
+                    {
+                        action: "write",
+                        category: "PROJECT_RULES",
+                        content: "Duplicate fact to merge.",
+                    },
+                    toolContext(),
+                );
+                return { isolated, isolatedTools };
+            };
+
+            const updateCleanDb = await seed();
+            const updateFillerDb = await seed();
+            const getCleanDb = await seed();
+            const getFillerDb = await seed();
+            const mergeCleanDb = await seed();
+            const mergeFillerDb = await seed();
+            try {
+                const updateClean = await updateCleanDb.isolatedTools.ctx_memory.execute(
+                    { action: "update", ids: [1], content: "Updated fact." },
+                    toolContext(),
+                );
+                const updateFiller = await updateFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "update",
+                        ids: [1],
+                        content: "Updated fact.",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const getClean = await getCleanDb.isolatedTools.ctx_memory.execute(
+                    { action: "get", ids: [1] },
+                    toolContext(),
+                );
+                const getFiller = await getFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "get",
+                        ids: [1],
+                        content: "",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const mergeClean = await mergeCleanDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "merge",
+                        ids: [1, 2],
+                        content: "Merged standalone fact.",
+                    },
+                    toolContext(),
+                );
+                const mergeFiller = await mergeFillerDb.isolatedTools.ctx_memory.execute(
+                    {
+                        action: "merge",
+                        ids: [1, 2],
+                        content: "Merged standalone fact.",
+                        category: "PROJECT_RULES",
+                        limit: 0,
+                        reason: "",
+                    },
+                    toolContext(),
+                );
+                const stamp = /\d{4}-\d{2}-\d{2}T[\d:.]+Z/g;
+                expect(updateFiller).toBe(updateClean);
+                expect(getFiller.replace(stamp, "<ts>")).toBe(getClean.replace(stamp, "<ts>"));
+                expect(mergeFiller).toBe(mergeClean);
+            } finally {
+                closeQuietly(updateCleanDb.isolated);
+                closeQuietly(updateFillerDb.isolated);
+                closeQuietly(getCleanDb.isolated);
+                closeQuietly(getFillerDb.isolated);
+                closeQuietly(mergeCleanDb.isolated);
+                closeQuietly(mergeFillerDb.isolated);
+            }
+        });
+
+        it("keeps unused ids and category filler inert under an active dreamer category scope", async () => {
+            const run = async (action: "write" | "get" | "list", filler: boolean) => {
+                const isolated = createTestDb();
+                try {
+                    const projectRule = insertMemory(isolated, {
+                        projectPath: "/repo/project",
+                        category: "PROJECT_RULES",
+                        content: "Different scoped fact.",
+                    });
+                    const architecture = insertMemory(isolated, {
+                        projectPath: "/repo/project",
+                        category: "ARCHITECTURE",
+                        content: "Scoped architecture fact.",
+                    });
+                    writeTaskStateJson(
+                        isolated,
+                        "/repo/project",
+                        "curate",
+                        JSON.stringify({ curate: { cursor: 0, activeCategory: "ARCHITECTURE" } }),
+                    );
+                    const isolatedTools = createCtxMemoryTools({
+                        db: isolated,
+                        resolveProjectPath: () => "/repo/project",
+                        memoryEnabled: true,
+                        embeddingEnabled: false,
+                    });
+                    const args =
+                        action === "write"
+                            ? {
+                                  action,
+                                  category: "ARCHITECTURE",
+                                  content: "New scoped architecture fact.",
+                                  ...(filler
+                                      ? { ids: [projectRule.id], limit: 0, reason: "" }
+                                      : {}),
+                              }
+                            : action === "get"
+                              ? {
+                                    action,
+                                    ids: [architecture.id],
+                                    ...(filler
+                                        ? {
+                                              content: "",
+                                              category: "PROJECT_RULES",
+                                              limit: 0,
+                                              reason: "",
+                                          }
+                                        : {}),
+                                }
+                              : {
+                                    action,
+                                    category: "ARCHITECTURE",
+                                    ...(filler
+                                        ? {
+                                              ids: [projectRule.id],
+                                              content: "",
+                                              limit: 0,
+                                              reason: "",
+                                          }
+                                        : {}),
+                                };
+                    return await isolatedTools.ctx_memory.execute(
+                        args,
+                        toolContext("ses-dreamer", DREAMER_AGENT),
+                    );
+                } finally {
+                    closeQuietly(isolated);
+                }
+            };
+            const stamp = /\d{4}-\d{2}-\d{2}T[\d:.]+Z/g;
+            const clean = {
+                write: await run("write", false),
+                get: (await run("get", false)).replace(stamp, "<ts>"),
+                list: (await run("list", false)).replace(stamp, "<ts>"),
+            };
+            const filler = {
+                write: await run("write", true),
+                get: (await run("get", true)).replace(stamp, "<ts>"),
+                list: (await run("list", true)).replace(stamp, "<ts>"),
+            };
+
+            expect(filler).toEqual(clean);
+            expect(clean.write).toContain("Saved memory");
+            expect(clean.get).toContain("Scoped architecture fact");
+            expect(clean.list).toContain("Scoped architecture fact");
+        });
+
+        it("list treats limit 0 as the default and filler ids do not bypass the dreamer-only gate", async () => {
+            for (const label of ["one", "two", "three"]) {
+                insertMemory(db, {
+                    projectPath: "/repo/project",
+                    category: "PROJECT_RULES",
+                    content: `List filler ${label}.`,
+                });
+            }
+            const dreamer = toolContext("ses-dreamer", DREAMER_AGENT);
+            const clean = await tools.ctx_memory.execute({ action: "list" }, dreamer);
+            const filler = await tools.ctx_memory.execute(
+                {
+                    action: "list",
+                    ids: [1],
+                    content: "",
+                    category: "PROJECT_RULES",
+                    limit: 0,
+                    reason: "",
+                },
+                dreamer,
+            );
+            const primaryFiller = await tools.ctx_memory.execute(
+                {
+                    action: "list",
+                    ids: [1],
+                    content: "",
+                    category: "PROJECT_RULES",
+                    limit: 0,
+                    reason: "",
+                },
+                toolContext(),
+            );
+            expect(filler).toBe(clean);
+            expect(clean).toContain("Found 3 active memories");
+            expect(primaryFiller).toBe("Error: Action 'list' is not allowed in this context.");
+        });
+    });
 });

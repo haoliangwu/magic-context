@@ -808,10 +808,18 @@ async function driveTrailingBlankLane(
         )?.info?.id;
         if (!addedUser) throw new Error(`replay stage ${stage} did not persist its user turn`);
         await harness.revertMessage(sessionId, addedUser);
-        await harness.waitFor(async () => {
-            const messages = await harness.listMessages(sessionId);
-            return messages.some((message) => message.info?.id === addedUser) ? null : true;
-        });
+        // OpenCode's revert sets `session.revert` and leaves the rows in place; the rows
+        // are deleted lazily by the next prompt, before it creates its own user message.
+        // So the durable proof that the revert landed is the marker, not the row's
+        // absence. (The absence wait passed for months only because the harness never
+        // awaited async predicates; once it did, this could never hold.)
+        await harness.waitFor(
+            async () => {
+                const session = await harness.getSession(sessionId);
+                return session?.revert?.messageID === addedUser ? true : null;
+            },
+            { timeoutMs: 30_000, label: `replay stage ${stage} revert marker recorded` },
+        );
     }
     return captures;
 }

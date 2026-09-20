@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveKnownHistorianContextLimit } from "../hooks/magic-context/derive-budgets";
 import {
     clearModelsDevCache,
     getModelsDevCacheState,
@@ -228,6 +229,30 @@ describe("models-dev-cache (SDK-only)", () => {
         expect(getSdkContextLimit("openai", "gpt-5.4")).toBe(922000);
         expect(getSdkContextLimit("openai", "gpt-5.4-fast")).toBe(922000);
         expect(getSdkContextLimit("openai", "gpt-5.4-mini")).toBe(922000);
+    });
+
+    test("explicit SDK-resolved config limit wins over a larger catalog or detected value", async () => {
+        // OpenCode's config.providers() has already applied opencode.json over its
+        // catalog. The cache must preserve that 120K effective value, and a later
+        // API-detected 262K value may narrow but never enlarge it.
+        await refreshModelLimitsFromApi(
+            makeClient([
+                {
+                    id: "regolo",
+                    models: {
+                        "qwen3.5-122b": { limit: { context: 120_000, output: 32_000 } },
+                    },
+                },
+            ]),
+        );
+
+        expect(
+            getSdkContextLimit("regolo", "qwen3.5-122b", 262_144, {
+                reservation: "none",
+                detectedLimitProvenance: "combined",
+            }),
+        ).toBe(120_000);
+        expect(resolveKnownHistorianContextLimit("regolo/qwen3.5-122b")).toBe(120_000);
     });
 
     test("narrows raw context with detected wire truth before reserving output", async () => {

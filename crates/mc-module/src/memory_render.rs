@@ -88,7 +88,11 @@ pub fn render_memory_line(memory: &StoredMemory, source_name: Option<&str>) -> S
         end -= 1;
     }
     let content = escape_xml_content(&memory.content[..end]).replace('\n', "\n  ");
-    format!("#{}{source}: {content}", memory.id)
+    if memory.id > 0 {
+        format!("#{}{source}: {content}", memory.id)
+    } else {
+        format!("-{source}: {content}")
+    }
 }
 
 /// Render the `<project-memory>` (or workspace-`wrapper`) block from an already-selected
@@ -122,8 +126,14 @@ pub fn render_memory_block(
     let mut ordered: Vec<&StoredMemory> = memories.iter().collect();
     ordered.sort_by(|left, right| memory_render_order(left, right));
 
-    let mut lines = Vec::with_capacity(memories.len() * 2 + 2);
+    let mut lines = Vec::with_capacity(memories.len() * 2 + 3);
     lines.push(format!("<{wrapper}>"));
+    if memories.iter().any(|memory| memory.id <= 0) {
+        lines.push(
+            "<!-- One or more memory ids are waiting for the host mirror; retry after the next pass. -->"
+                .to_string(),
+        );
+    }
     let mut open_category: Option<&str> = None;
     for memory in ordered {
         if open_category != Some(memory.category.as_str()) {

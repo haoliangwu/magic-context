@@ -191,26 +191,42 @@ describe("createCtxSearchTools", () => {
         );
     });
 
-    it("preserves an explicit empty sources list as no sources", async () => {
-        insertMemory(db, {
-            projectPath: "/repo/project",
-            category: "ARCHITECTURE_DECISIONS",
-            content: "This should not appear when sources is empty.",
-        });
-        const tools = createCtxSearchTools({
-            db,
-            resolveProjectPath: () => "/repo/project",
-            memoryEnabled: true,
-            embeddingEnabled: false,
-            readMessages: () => [],
-        });
+    it("treats empty sources and limit 0 as the omitted defaults so required-all filler matches a clean search", async () => {
+        const run = async (args: { query: string; sources?: never[]; limit?: number }) => {
+            const isolated = createTestDb();
+            try {
+                for (const [content, label] of [
+                    ["Needle alpha", "first"],
+                    ["Needle alpha alpha", "second"],
+                    ["Needle alpha alpha alpha", "third"],
+                ]) {
+                    insertMemory(isolated, {
+                        projectPath: "/repo/project",
+                        category: "ARCHITECTURE",
+                        content: `${content} ${label} result.`,
+                    });
+                }
+                const isolatedTools = createCtxSearchTools({
+                    db: isolated,
+                    resolveProjectPath: () => "/repo/project",
+                    memoryEnabled: true,
+                    embeddingEnabled: false,
+                    readMessages: () => [],
+                });
+                return await isolatedTools.ctx_search.execute(args, toolContext());
+            } finally {
+                closeQuietly(isolated);
+            }
+        };
 
-        const result = await tools.ctx_search.execute(
-            { query: "appear", sources: [] },
-            toolContext(),
-        );
+        const clean = await run({ query: "Needle alpha" });
+        const filler = await run({ query: "Needle alpha", sources: [], limit: 0 });
 
-        expect(result).toContain("No results found");
+        expect(filler).toBe(clean);
+        expect(clean).toContain("Found 3 results");
+        expect(clean).toContain("first result");
+        expect(clean).toContain("second result");
+        expect(clean).toContain("third result");
     });
 
     it("formats message results with inline ranges and one trailing expand hint", async () => {

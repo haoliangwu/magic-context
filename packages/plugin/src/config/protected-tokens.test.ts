@@ -188,6 +188,46 @@ describe("protected_tokens config and derivation", () => {
         });
     });
 
+    describe("protected_tokens below-minimum warning", () => {
+        it("emits the specific token-floor warning for a numeric value below the schema minimum", () => {
+            const recovered = parsePluginConfig({ protected_tokens: 20 });
+            const warnings = recovered.configWarnings ?? [];
+            expect(warnings.some((w) => w.includes("protected_tokens is a token floor"))).toBe(
+                true,
+            );
+            expect(warnings.some((w) => w.includes('"protected_tokens": invalid value'))).toBe(
+                false,
+            );
+        });
+
+        it("keeps the generic type message for a string value", () => {
+            const recovered = parsePluginConfig({ protected_tokens: "20" });
+            const warnings = recovered.configWarnings ?? [];
+            expect(warnings.some((w) => w.includes('"protected_tokens": invalid value'))).toBe(
+                true,
+            );
+            expect(warnings.some((w) => w.includes("protected_tokens is a token floor"))).toBe(
+                false,
+            );
+        });
+
+        it("keeps the generic above-max message for a value above the maximum", () => {
+            const recovered = parsePluginConfig({ protected_tokens: 2_000_000 });
+            const warnings = recovered.configWarnings ?? [];
+            expect(warnings.some((w) => w.includes('"protected_tokens": invalid value'))).toBe(
+                true,
+            );
+            expect(warnings.some((w) => w.includes("protected_tokens is a token floor"))).toBe(
+                false,
+            );
+        });
+
+        it("emits no warning when the key is absent", () => {
+            const recovered = parsePluginConfig({});
+            expect(recovered.configWarnings ?? []).toEqual([]);
+        });
+    });
+
     describe("protected_tags deprecation", () => {
         it("is parsed at any value (including 0 and 101) with parse succeeding and no numeric conversion", () => {
             resetProtectedTagsDeprecationWarningForTest();

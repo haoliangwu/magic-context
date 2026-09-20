@@ -118,11 +118,11 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: cold-start drop seed", () => {
         });
         await h.sendPrompt(sessionId, `turn 4: reduce tag ${dropTag}`);
 
-        // High real-content pressure so the pending drop APPLIES on an execute pass.
+        // Cross the force band so the pending drop has a legitimate originating bust.
         for (let i = 5; i <= 7; i += 1) {
             h.mock.setDefault({
                 text: `pressure ${i}`,
-                usage: { input_tokens: 20_000, output_tokens: 20, cache_creation_input_tokens: 2_000 },
+                usage: { input_tokens: 27_000, output_tokens: 20, cache_creation_input_tokens: 2_000 },
             });
             await h.sendPrompt(sessionId, `turn ${i}: ${h.ballast(1_500)}`);
         }

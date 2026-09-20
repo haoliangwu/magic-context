@@ -75,7 +75,10 @@ import {
 import { clearInjectionCache, renderMemoryBlock } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
 import { persistFilteredNoise } from "./persist-filtered-noise";
-import { producerWindowFailureReason } from "./producer-window-guard";
+import {
+    fitAtomicHistorianSourceToProducerWindow,
+    producerWindowFailureReason,
+} from "./producer-window-guard";
 import {
     createDefaultBoundarySnapshotForTests,
     describeBoundaryDiagnostics,
@@ -88,6 +91,7 @@ import {
 import {
     getRawSessionTagKeysThrough,
     hasRawMessageProvider,
+    readRawSessionMessageOrdinalById,
     readSessionChunk,
 } from "./read-session-chunk";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
@@ -106,6 +110,45 @@ function shouldSuppressHistorianAlert(sessionId: string): boolean {
     }
     lastHistorianAlertBySession.set(sessionId, Date.now());
     return false;
+}
+
+export interface DanglingPublicationBoundary {
+    sequence: number;
+    side: "start" | "end";
+    messageId: string;
+}
+
+/** Re-resolve the message IDs recorded in the historian snapshot immediately before
+ * publishing so concurrent history changes cannot persist stale boundaries. */
+export function findDanglingPublicationBoundary(
+    sessionId: string,
+    compartments: ReadonlyArray<{
+        sequence: number;
+        startMessageId: string;
+        endMessageId: string;
+    }>,
+    resolveOrdinal: (
+        sessionId: string,
+        messageId: string,
+    ) => number | null = readRawSessionMessageOrdinalById,
+): DanglingPublicationBoundary | null {
+    for (const compartment of compartments) {
+        if (resolveOrdinal(sessionId, compartment.startMessageId) === null) {
+            return {
+                sequence: compartment.sequence,
+                side: "start",
+                messageId: compartment.startMessageId,
+            };
+        }
+        if (resolveOrdinal(sessionId, compartment.endMessageId) === null) {
+            return {
+                sequence: compartment.sequence,
+                side: "end",
+                messageId: compartment.endMessageId,
+            };
+        }
+    }
+    return null;
 }
 
 /** Clean up module-level session state on session deletion. */
@@ -408,14 +451,28 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             rollbackDrainReservation();
             return;
         }
+        const fittedAtomicSource = chunk.oversizeAtomicUnit
+            ? fitAtomicHistorianSourceToProducerWindow({
+                  text: chunk.text,
+                  resultBoundaries: chunk.toolResultBoundaries,
+                  contextLimitTokens: deps.historianContextLimit,
+                  maxOutputTokens: deps.historianMaxOutputTokens ?? 32_000,
+              })
+            : null;
         const chunkText = chunk.oversizeAtomicUnit
-            ? chunk.text
+            ? (fittedAtomicSource?.text ?? chunk.text)
             : truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
         const producerSourceTokens = estimateTokens(chunkText);
         if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
             sessionLog(
                 sessionId,
                 `historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
+            );
+        }
+        if (fittedAtomicSource && fittedAtomicSource.removedTokens > 0) {
+            sessionLog(
+                sessionId,
+                `historian pathological component split: range=${chunk.startIndex}-${chunk.endIndex} resultBoundary=${fittedAtomicSource.splitBoundaryOrdinal ?? "midpoint"} removedTokens=${fittedAtomicSource.removedTokens} producerSourceTokens=${producerSourceTokens} producerInputLimitTokens=${fittedAtomicSource.producerInputLimitTokens ?? "unknown"}`,
             );
         }
         const producerWindowFailure = producerWindowFailureReason({
@@ -705,6 +762,19 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             lastCompartmentEnd,
             { db },
         );
+        const danglingBoundary = findDanglingPublicationBoundary(sessionId, newCompartments);
+        if (danglingBoundary) {
+            const reason = `compartment boundary disappeared before publication (sequence=${danglingBoundary.sequence} side=${danglingBoundary.side} missing_id=${danglingBoundary.messageId})`;
+            telemetry.failureReason = `publish-boundary: ${reason}`;
+            sessionLog(
+                sessionId,
+                `historian publish refused: sequence=${danglingBoundary.sequence} side=${danglingBoundary.side} missing_id=${danglingBoundary.messageId}; raw snapshot changed during the historian run`,
+            );
+            const failCount = incrementHistorianFailure(db, sessionId, reason);
+            await notifyHistorianIssue(buildHistorianFailureNotice(failCount, reason));
+            rollbackDrainReservation();
+            return;
+        }
         let published = false;
         const transactionStartedAt = performance.now();
         db.exec("BEGIN IMMEDIATE");

@@ -1,8 +1,8 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { OpenCode } from "../../../plugin/node_modules/@opencode/client/dist/promise/client.js";
-import { spawnOpencode2 } from "../../src/opencode2-runner/spawn";
+import { OpenCode } from "@opencode/client";
+import { spawnOpencode2, waitForPluginActive } from '../../src/opencode2-runner/spawn';
 
 test("R12 v2 setup selects opencode2 before session storage opens", async () => {
 	const host = await spawnOpencode2();
@@ -15,7 +15,7 @@ test("R12 v2 setup selects opencode2 before session storage opens", async () => 
 			location: { directory: host.cwd },
 			model: { providerID: "openai", id: "mock-model" },
 		});
-		await client.plugin.awaitActivation({ location: { directory: host.cwd } });
+		await waitForPluginActive(client, host.cwd);
 		host.mock.addMatcher(() => ({
 			text: "Done.",
 			usage: { input_tokens: 100, output_tokens: 10 },

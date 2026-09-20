@@ -104,7 +104,7 @@ describe.skipIf(!rustPrereqs.ok)("rust invariant: ctx_reduce round-trip", () => 
             )) as ModuleStatus;
             expect(queued.pending_drop_count ?? 0).toBeGreaterThan(0);
 
-            // Grow past the execute threshold so a bust drains the pending drop.
+            // Grow into the force band so a legitimate bust drains the pending drop.
             for (let i = 5; i <= 10; i += 1) {
                 h.mock.setDefault({
                     text: `pressure ${i}`,

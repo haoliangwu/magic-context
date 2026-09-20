@@ -305,6 +305,44 @@ pub fn resolve_opencode_db_path() -> Option<PathBuf> {
         .then_some(resolution.path)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeStoreGeneration {
+    V1,
+    V2,
+}
+
+fn opencode_store_generation(
+    conn: &Connection,
+) -> Result<OpenCodeStoreGeneration, rusqlite::Error> {
+    let table_exists = |name: &str| -> Result<bool, rusqlite::Error> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+    };
+    if table_exists("session_message")? {
+        return Ok(OpenCodeStoreGeneration::V2);
+    }
+    if table_exists("message")? || table_exists("session")? || table_exists("project")? {
+        return Ok(OpenCodeStoreGeneration::V1);
+    }
+    Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "OpenCode store generation is unknown; refusing generation-specific database access",
+        ),
+    )))
+}
+
+pub fn open_opencode_readonly(
+    path: &PathBuf,
+) -> Result<(Connection, OpenCodeStoreGeneration), rusqlite::Error> {
+    let conn = open_readonly(path)?;
+    let generation = opencode_store_generation(&conn)?;
+    Ok((conn, generation))
+}
+
 fn opencode_db_probe_descriptions(resolution: &OpenCodeDbResolution) -> Vec<String> {
     let channel_db_disabled = matches!(
         std::env::var("OPENCODE_DISABLE_CHANNEL_DB").as_deref(),
@@ -638,6 +676,7 @@ pub struct SessionSummary {
 #[serde(rename_all = "snake_case")]
 pub enum Harness {
     Opencode,
+    Opencode2,
     Pi,
     Omp,
     ClaudeCode,
@@ -648,6 +687,7 @@ impl Harness {
     fn as_str(self) -> &'static str {
         match self {
             Self::Opencode => "opencode",
+            Self::Opencode2 => "opencode2",
             Self::Pi => "pi",
             Self::Omp => "omp",
             Self::ClaudeCode => "claude_code",
@@ -656,7 +696,10 @@ impl Harness {
     }
 
     fn has_magic_context_plugin_state(self) -> bool {
-        matches!(self, Self::Opencode | Self::Pi | Self::Omp)
+        matches!(
+            self,
+            Self::Opencode | Self::Opencode2 | Self::Pi | Self::Omp
+        )
     }
 
     fn uses_codex_no_write_cache_model(self) -> bool {
@@ -670,6 +713,7 @@ impl std::str::FromStr for Harness {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "opencode" => Ok(Self::Opencode),
+            "opencode2" => Ok(Self::Opencode2),
             "pi" => Ok(Self::Pi),
             "omp" => Ok(Self::Omp),
             "claude_code" | "claude-code" | "claudecode" | "cc" => Ok(Self::ClaudeCode),
@@ -1349,7 +1393,7 @@ pub fn load_raw_db_cache_events(
         return Ok(Vec::new());
     };
 
-    let conn = open_readonly(&opencode_db_path)?;
+    let (conn, generation) = open_opencode_readonly(&opencode_db_path)?;
 
     // Per-session windowing: each session gets up to `limit` recent events
     // (so a session-filtered timeline always has full bar coverage), capped
@@ -1359,7 +1403,7 @@ pub fn load_raw_db_cache_events(
     let per_session_limit = limit as i64;
     let global_cap = per_session_limit.saturating_mul(10);
 
-    let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(since) =
+    let (mut sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(since) =
         since_timestamp
     {
         (
@@ -1423,11 +1467,28 @@ pub fn load_raw_db_cache_events(
         )
     };
 
+    let harness = match generation {
+        OpenCodeStoreGeneration::V1 => Harness::Opencode,
+        OpenCodeStoreGeneration::V2 => {
+            const V1_TOTAL: &str =
+                "COALESCE(CAST(json_extract(m.data, '$.tokens.total') AS INTEGER), 0)";
+            const V2_TOTAL: &str = "(COALESCE(CAST(json_extract(m.data, '$.tokens.input') AS INTEGER), 0) + COALESCE(CAST(json_extract(m.data, '$.tokens.output') AS INTEGER), 0) + COALESCE(CAST(json_extract(m.data, '$.tokens.reasoning') AS INTEGER), 0) + COALESCE(CAST(json_extract(m.data, '$.tokens.cache.read') AS INTEGER), 0) + COALESCE(CAST(json_extract(m.data, '$.tokens.cache.write') AS INTEGER), 0))";
+            sql = sql
+                .replace("FROM message m", "FROM session_message m")
+                .replace(
+                    "WHERE json_extract(m.data, '$.role') = 'assistant'",
+                    "WHERE m.type = 'assistant'",
+                )
+                .replace("CAST(json_extract(m.data, '$.parentID') AS TEXT)", "NULL")
+                .replace(V1_TOTAL, V2_TOTAL);
+            Harness::Opencode2
+        }
+    };
     let mut stmt = conn.prepare(&sql)?;
     let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let rows = stmt.query_map(params_refs.as_slice(), |row| {
         Ok(RawDbCacheEvent {
-            harness: Harness::Opencode,
+            harness,
             message_id: row.get(0)?,
             session_id: row.get(1)?,
             timestamp: row.get(2)?,
@@ -1833,26 +1894,33 @@ fn build_db_cache_events_with_attribution(
     let mut true_first_sessions: HashSet<(Harness, String)> = HashSet::new();
     let oc_session_ids: Vec<String> = earliest_ts_in_window
         .iter()
-        .filter(|((h, _), _)| matches!(h, Harness::Opencode))
+        .filter(|((h, _), _)| matches!(h, Harness::Opencode | Harness::Opencode2))
         .map(|((_, sid), _)| sid.clone())
         .collect();
     if !oc_session_ids.is_empty() {
         if let Some(opencode_db_path) = resolve_opencode_db_path() {
-            if let Ok(conn) = open_readonly(&opencode_db_path) {
-                if let Ok(mut stmt) = conn.prepare(FIRST_OPENCODE_CACHE_EVENT_SQL) {
+            if let Ok((conn, generation)) = open_opencode_readonly(&opencode_db_path) {
+                let first_event_sql = match generation {
+                    OpenCodeStoreGeneration::V1 => FIRST_OPENCODE_CACHE_EVENT_SQL,
+                    OpenCodeStoreGeneration::V2 => FIRST_OPENCODE2_CACHE_EVENT_SQL,
+                };
+                let harness = match generation {
+                    OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                    OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+                };
+                if let Ok(mut stmt) = conn.prepare(first_event_sql) {
                     for sid in oc_session_ids {
                         let db_earliest = stmt
                             .query_row(params![&sid], |row| row.get::<_, i64>(0))
                             .optional()
                             .ok()
                             .flatten();
-                        let window_earliest =
-                            earliest_ts_in_window.get(&(Harness::Opencode, sid.clone()));
+                        let window_earliest = earliest_ts_in_window.get(&(harness, sid.clone()));
                         if db_earliest
                             .zip(window_earliest)
                             .is_some_and(|(db, window)| *window <= db)
                         {
-                            true_first_sessions.insert((Harness::Opencode, sid));
+                            true_first_sessions.insert((harness, sid));
                         }
                     }
                 }
@@ -2333,6 +2401,19 @@ const FIRST_OPENCODE_CACHE_EVENT_SQL: &str = "SELECT time_created
      ORDER BY time_created ASC
      LIMIT 1";
 
+const RECENT_OPENCODE2_SESSION_MESSAGES_SQL: &str = "SELECT data
+     FROM session_message
+     WHERE session_id = ?1
+     ORDER BY seq DESC
+     LIMIT ?2";
+
+const FIRST_OPENCODE2_CACHE_EVENT_SQL: &str = "SELECT time_created
+     FROM session_message
+     WHERE session_id = ?1 AND type = 'assistant'
+       AND json_extract(data, '$.tokens') IS NOT NULL
+     ORDER BY seq ASC
+     LIMIT 1";
+
 type OpenCodeCachePresenceCache = HashMap<String, (i64, bool)>;
 static OPENCODE_CACHE_PRESENCE: OnceLock<RwLock<OpenCodeCachePresenceCache>> = OnceLock::new();
 
@@ -2347,28 +2428,31 @@ fn load_recent_opencode_cache_sessions(
     let Some(path) = resolve_opencode_db_path() else {
         return Vec::new();
     };
-    let Ok(conn) = open_readonly(&path) else {
+    let Ok((conn, generation)) = open_opencode_readonly(&path) else {
         return Vec::new();
     };
     if let Ok(mut cache) = opencode_cache_presence().write() {
         load_recent_opencode_cache_sessions_with_cache(
             &conn,
+            generation,
             limit,
             hidden_subagent_ids,
             &mut cache,
         )
     } else {
-        load_recent_opencode_cache_sessions_from_conn(&conn, limit, hidden_subagent_ids)
+        load_recent_opencode_cache_sessions_from_conn(&conn, generation, limit, hidden_subagent_ids)
     }
 }
 
 fn load_recent_opencode_cache_sessions_from_conn(
     conn: &Connection,
+    generation: OpenCodeStoreGeneration,
     limit: usize,
     hidden_subagent_ids: &HashSet<String>,
 ) -> Vec<CacheSessionListEntry> {
     load_recent_opencode_cache_sessions_with_cache(
         conn,
+        generation,
         limit,
         hidden_subagent_ids,
         &mut HashMap::new(),
@@ -2377,6 +2461,7 @@ fn load_recent_opencode_cache_sessions_from_conn(
 
 fn load_recent_opencode_cache_sessions_with_cache(
     conn: &Connection,
+    generation: OpenCodeStoreGeneration,
     limit: usize,
     hidden_subagent_ids: &HashSet<String>,
     presence_cache: &mut OpenCodeCachePresenceCache,
@@ -2396,10 +2481,24 @@ fn load_recent_opencode_cache_sessions_with_cache(
     let Ok(mut candidates_stmt) = conn.prepare(RECENT_OPENCODE_CACHE_SESSIONS_SQL) else {
         return Vec::new();
     };
-    let Ok(mut recent_messages_stmt) = conn.prepare(RECENT_OPENCODE_SESSION_MESSAGES_SQL) else {
+    let harness = match generation {
+        OpenCodeStoreGeneration::V1 => Harness::Opencode,
+        OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+    };
+    let (recent_messages_sql, first_event_sql) = match generation {
+        OpenCodeStoreGeneration::V1 => (
+            RECENT_OPENCODE_SESSION_MESSAGES_SQL,
+            FIRST_OPENCODE_CACHE_EVENT_SQL,
+        ),
+        OpenCodeStoreGeneration::V2 => (
+            RECENT_OPENCODE2_SESSION_MESSAGES_SQL,
+            FIRST_OPENCODE2_CACHE_EVENT_SQL,
+        ),
+    };
+    let Ok(mut recent_messages_stmt) = conn.prepare(recent_messages_sql) else {
         return Vec::new();
     };
-    let Ok(mut event_stmt) = conn.prepare(FIRST_OPENCODE_CACHE_EVENT_SQL) else {
+    let Ok(mut event_stmt) = conn.prepare(first_event_sql) else {
         return Vec::new();
     };
     let mut sessions = Vec::with_capacity(limit);
@@ -2416,7 +2515,7 @@ fn load_recent_opencode_cache_sessions_with_cache(
         let page = {
             let Ok(rows) = candidates_stmt.query_map(params![page_limit, offset], |row| {
                 Ok(CacheSessionListEntry {
-                    harness: Harness::Opencode,
+                    harness,
                     session_id: row.get(0)?,
                     last_activity_ms: row.get(1)?,
                     title: row.get(2)?,
@@ -2583,12 +2682,16 @@ pub fn load_cache_session_titles(
     let mut titles = HashMap::new();
     let opencode_ids: Vec<String> = keys
         .iter()
-        .filter(|(harness, _)| *harness == Harness::Opencode)
+        .filter(|(harness, _)| matches!(harness, Harness::Opencode | Harness::Opencode2))
         .map(|(_, sid)| sid.clone())
         .collect();
     if !opencode_ids.is_empty() {
         if let Some(path) = resolve_opencode_db_path() {
-            if let Ok(conn) = open_readonly(&path) {
+            if let Ok((conn, generation)) = open_opencode_readonly(&path) {
+                let harness = match generation {
+                    OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                    OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+                };
                 let placeholders = vec!["?"; opencode_ids.len()].join(",");
                 let sql = format!(
                     "SELECT id, COALESCE(title, '') FROM session WHERE id IN ({placeholders})"
@@ -2599,7 +2702,7 @@ pub fn load_cache_session_titles(
                     }) {
                         for (sid, title) in rows.flatten() {
                             if !title.is_empty() {
-                                titles.insert((Harness::Opencode, sid), title);
+                                titles.insert((harness, sid), title);
                             }
                         }
                     }
@@ -2639,7 +2742,12 @@ pub fn load_cache_subagent_flags(
     keys: &HashSet<(Harness, String)>,
 ) -> HashMap<(Harness, String), bool> {
     let mut out = HashMap::new();
-    for harness in [Harness::Opencode, Harness::Pi, Harness::Omp] {
+    for harness in [
+        Harness::Opencode,
+        Harness::Opencode2,
+        Harness::Pi,
+        Harness::Omp,
+    ] {
         if keys.iter().any(|(h, _)| *h == harness) {
             for (session_id, is_subagent) in load_subagent_map_for_harness(harness) {
                 let key = (harness, session_id);
@@ -2663,7 +2771,12 @@ pub fn get_session_cache_stats_from_db(
     // cards and chart, so the 1s reconcile never recomputes global aggregates.
     let mut pre_cap_subagent_flags = HashMap::new();
     if hide_subagents {
-        for harness in [Harness::Opencode, Harness::Pi, Harness::Omp] {
+        for harness in [
+            Harness::Opencode,
+            Harness::Opencode2,
+            Harness::Pi,
+            Harness::Omp,
+        ] {
             if harness_filter.map_or(true, |filter| filter == harness) {
                 pre_cap_subagent_flags.extend(
                     load_subagent_map_for_harness(harness)
@@ -2672,10 +2785,13 @@ pub fn get_session_cache_stats_from_db(
                 );
             }
         }
+        mark_opencode_store_children_as_subagents(&mut pre_cap_subagent_flags);
     }
     let hidden_opencode_ids: HashSet<String> = pre_cap_subagent_flags
         .iter()
-        .filter(|((harness, _), is_subagent)| *harness == Harness::Opencode && **is_subagent)
+        .filter(|((harness, _), is_subagent)| {
+            matches!(harness, Harness::Opencode | Harness::Opencode2) && **is_subagent
+        })
         .map(|((_, session_id), _)| session_id.clone())
         .collect();
     let includes_harness = |harness| harness_filter.map_or(true, |filter| filter == harness);
@@ -2786,7 +2902,9 @@ pub fn get_session_cache_stats_from_db(
     let subagent_flags = if hide_subagents {
         pre_cap_subagent_flags
     } else {
-        load_cache_subagent_flags(&stat_keys)
+        let mut flags = load_cache_subagent_flags(&stat_keys);
+        mark_opencode_store_children_as_subagents(&mut flags);
+        flags
     };
 
     sessions
@@ -2833,7 +2951,9 @@ pub fn get_session_cache_events(
     since_timestamp: Option<i64>,
 ) -> Vec<DbCacheEvent> {
     match harness {
-        Harness::Opencode => get_opencode_session_cache_events(session_id, limit, since_timestamp),
+        Harness::Opencode | Harness::Opencode2 => {
+            get_opencode_session_cache_events(session_id, limit, since_timestamp)
+        }
         Harness::Pi | Harness::Omp => {
             get_pi_session_cache_events(harness, session_id, limit, since_timestamp)
         }
@@ -2878,7 +2998,9 @@ pub fn get_session_cache_events_by_turn_count(
 ) -> Vec<DbCacheEvent> {
     let max_events = (target_turns * 50).max(200); // floor to existing limit
     let raw = match harness {
-        Harness::Opencode => get_opencode_session_cache_events(session_id, Some(max_events), None),
+        Harness::Opencode | Harness::Opencode2 => {
+            get_opencode_session_cache_events(session_id, Some(max_events), None)
+        }
         Harness::Pi | Harness::Omp => {
             get_pi_session_cache_events(harness, session_id, Some(max_events), None)
         }
@@ -2898,19 +3020,26 @@ fn get_opencode_session_cache_events(
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Vec::new();
     };
-    let Ok(conn) = open_readonly(&opencode_db_path) else {
+    let Ok((conn, generation)) = open_opencode_readonly(&opencode_db_path) else {
         return Vec::new();
     };
-    get_opencode_session_cache_events_from_conn(&conn, session_id, limit, since_timestamp)
+    get_opencode_session_cache_events_from_conn(
+        &conn,
+        generation,
+        session_id,
+        limit,
+        since_timestamp,
+    )
 }
 
 fn get_opencode_session_cache_events_from_conn(
     conn: &Connection,
+    generation: OpenCodeStoreGeneration,
     session_id: &str,
     limit: Option<usize>,
     since_timestamp: Option<i64>,
 ) -> Vec<DbCacheEvent> {
-    const COLS: &str = "SELECT CAST(id AS TEXT), session_id, time_created,
+    const V1_COLS: &str = "SELECT CAST(id AS TEXT), session_id, time_created,
                 COALESCE(CAST(json_extract(data, '$.tokens.input') AS INTEGER), 0),
                 COALESCE(CAST(json_extract(data, '$.tokens.cache.read') AS INTEGER), 0),
                 COALESCE(CAST(json_extract(data, '$.tokens.cache.write') AS INTEGER), 0),
@@ -2922,6 +3051,28 @@ fn get_opencode_session_cache_events_from_conn(
          WHERE session_id = ?1
            AND json_extract(data, '$.role') = 'assistant'
            AND COALESCE(CAST(json_extract(data, '$.tokens.total') AS INTEGER), 0) > 0";
+    const V2_COLS: &str = "SELECT CAST(id AS TEXT), session_id, time_created,
+                COALESCE(CAST(json_extract(data, '$.tokens.input') AS INTEGER), 0),
+                COALESCE(CAST(json_extract(data, '$.tokens.cache.read') AS INTEGER), 0),
+                COALESCE(CAST(json_extract(data, '$.tokens.cache.write') AS INTEGER), 0),
+                COALESCE(CAST(json_extract(data, '$.tokens.input') AS INTEGER), 0)
+                  + COALESCE(CAST(json_extract(data, '$.tokens.output') AS INTEGER), 0)
+                  + COALESCE(CAST(json_extract(data, '$.tokens.reasoning') AS INTEGER), 0)
+                  + COALESCE(CAST(json_extract(data, '$.tokens.cache.read') AS INTEGER), 0)
+                  + COALESCE(CAST(json_extract(data, '$.tokens.cache.write') AS INTEGER), 0),
+                CAST(json_extract(data, '$.agent') AS TEXT), NULL, NULL
+         FROM session_message
+         WHERE session_id = ?1
+           AND type = 'assistant'
+           AND json_extract(data, '$.tokens') IS NOT NULL";
+    let cols = match generation {
+        OpenCodeStoreGeneration::V1 => V1_COLS,
+        OpenCodeStoreGeneration::V2 => V2_COLS,
+    };
+    let harness = match generation {
+        OpenCodeStoreGeneration::V1 => Harness::Opencode,
+        OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+    };
 
     // Incremental (since): everything at/after the anchor, chronological. No
     // LIMIT — a 1s poll's delta is tiny, and the >= overlap is a single row.
@@ -2929,7 +3080,7 @@ fn get_opencode_session_cache_events_from_conn(
     // re-sorts ASC to chronological.
     let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match since_timestamp {
         Some(since) => (
-            format!("{COLS} AND time_created >= ?2 ORDER BY time_created ASC"),
+            format!("{cols} AND time_created >= ?2 ORDER BY time_created ASC"),
             vec![
                 Box::new(session_id.to_string()) as Box<dyn rusqlite::types::ToSql>,
                 Box::new(since),
@@ -2941,7 +3092,7 @@ fn get_opencode_session_cache_events_from_conn(
                 _ => -1, // SQLite: negative LIMIT == no limit.
             };
             (
-                format!("{COLS} ORDER BY time_created DESC LIMIT ?2"),
+                format!("{cols} ORDER BY time_created DESC LIMIT ?2"),
                 vec![
                     Box::new(session_id.to_string()) as Box<dyn rusqlite::types::ToSql>,
                     Box::new(lim),
@@ -2956,7 +3107,7 @@ fn get_opencode_session_cache_events_from_conn(
     let params_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let Ok(rows) = stmt.query_map(params_refs.as_slice(), |row| {
         Ok(RawDbCacheEvent {
-            harness: Harness::Opencode,
+            harness,
             message_id: row.get(0)?,
             session_id: row.get(1)?,
             timestamp: row.get(2)?,
@@ -3258,7 +3409,11 @@ fn mapped_session_directories(identities: &SessionIdentityMap) -> Vec<(String, S
     let mut dirs = Vec::new();
 
     if let Some(oc) = resolve_opencode_db_path() {
-        if let Ok(conn) = open_readonly(&oc) {
+        if let Ok((conn, generation)) = open_opencode_readonly(&oc) {
+            let harness = match generation {
+                OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+            };
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT id, COALESCE(directory, '')
                  FROM session
@@ -3269,8 +3424,7 @@ fn mapped_session_directories(identities: &SessionIdentityMap) -> Vec<(String, S
                 }) {
                     for row in rows.flatten() {
                         let (session_id, dir) = row;
-                        let identity =
-                            lookup_session_identity(identities, Harness::Opencode, &session_id);
+                        let identity = lookup_session_identity(identities, harness, &session_id);
                         if !identity.is_empty() {
                             dirs.push((identity, dir));
                         }
@@ -3364,7 +3518,11 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
     let identity_by_dir = session_identity_by_directory(&session_identities);
 
     if let Some(opencode_db_path) = resolve_opencode_db_path() {
-        if let Ok(conn) = open_readonly(&opencode_db_path) {
+        if let Ok((conn, generation)) = open_opencode_readonly(&opencode_db_path) {
+            let harness = match generation {
+                OpenCodeStoreGeneration::V1 => Harness::Opencode,
+                OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+            };
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT p.name, p.worktree, COUNT(s.id)
                  FROM project p LEFT JOIN session s ON s.project_id = p.id
@@ -3391,7 +3549,7 @@ fn enumerate_projects_filtered(project_paths_filter: Option<&HashSet<String>>) -
                             entry.opencode_name = Some(name);
                         }
                         entry.opencode_path = Some(worktree);
-                        entry.harnesses.insert(Harness::Opencode);
+                        entry.harnesses.insert(harness);
                         entry.session_count =
                             entry.session_count.saturating_add(count.max(0) as u32);
                     }
@@ -5053,15 +5211,19 @@ pub fn get_sessions(conn: &Connection) -> Result<Vec<SessionSummary>, rusqlite::
 }
 
 pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
-    if filter.harness.is_some_and(|h| h != Harness::Opencode) {
-        return Vec::new();
-    }
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Vec::new();
     };
-    let Ok(conn) = open_readonly(&opencode_db_path) else {
+    let Ok((conn, generation)) = open_opencode_readonly(&opencode_db_path) else {
         return Vec::new();
     };
+    let harness = match generation {
+        OpenCodeStoreGeneration::V1 => Harness::Opencode,
+        OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+    };
+    if filter.harness.is_some_and(|wanted| wanted != harness) {
+        return Vec::new();
+    }
     // No message-table join: the session list does not show a message count, and
     // joining/grouping the 300k+ row `message` table per call was the dominant
     // cost (a multi-hundred-ms scan that froze the UI on every History entry).
@@ -5091,7 +5253,7 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
     // plugin (very rare in practice for OpenCode sessions, since the plugin
     // tags every session on first prompt) default to `false`, matching the
     // "primary session" assumption.
-    let subagent_map = load_subagent_map_for_harness(Harness::Opencode);
+    let subagent_map = load_subagent_map_for_harness(harness);
     let session_identities = load_session_identity_map();
 
     let rows = stmt.query_map([], |row| {
@@ -5108,7 +5270,7 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
         } else {
             &directory
         };
-        let identity = lookup_session_identity(&session_identities, Harness::Opencode, &session_id);
+        let identity = lookup_session_identity(&session_identities, harness, &session_id);
         let is_subagent = subagent_map.get(&session_id).copied().unwrap_or(false);
         // Friendly label: the named project wins; otherwise the directory's
         // basename. Never show a bare "/" (the global-project worktree) when the
@@ -5119,7 +5281,7 @@ pub fn list_opencode_sessions(filter: &SessionFilter) -> Vec<SessionRow> {
             basename(effective_dir)
         };
         Ok(SessionRow {
-            harness: Harness::Opencode,
+            harness,
             session_id,
             title,
             project_identity: identity,
@@ -5185,9 +5347,9 @@ pub fn list_all_sessions(filter: SessionFilter) -> Vec<SessionRow> {
 }
 
 pub fn list_sessions_paged(filter: SessionFilter) -> PagedSessions {
-    let include_opencode = filter
-        .harness
-        .map_or(true, |harness| harness == Harness::Opencode);
+    let include_opencode = filter.harness.map_or(true, |harness| {
+        matches!(harness, Harness::Opencode | Harness::Opencode2)
+    });
     let rows = list_all_sessions(filter.clone());
     let mut page = page_session_rows(rows, filter.offset, filter.limit);
     if include_opencode {
@@ -5255,6 +5417,10 @@ fn session_matches_filter(row: &SessionRow, filter: &SessionFilter) -> bool {
 /// missing cortexkit DB never crashes the dashboard — sessions then default
 /// to `is_subagent=false` and the user simply sees no filtering until the
 /// plugin's first run populates the table.
+///
+/// OpenCode 1.x seats that locked the harness to "opencode2" wrote the flag
+/// under that label while the host store still lists the session as OpenCode.
+/// Match either label so the dashboard filter still sees those rows.
 fn load_subagent_map_for_harness(harness: Harness) -> std::collections::HashMap<String, bool> {
     use std::collections::HashMap;
     let mut map: HashMap<String, bool> = HashMap::new();
@@ -5264,7 +5430,25 @@ fn load_subagent_map_for_harness(harness: Harness) -> std::collections::HashMap<
     let Ok(conn) = open_readonly(&db_path) else {
         return map;
     };
-    let harness_str = harness.as_str();
+    if matches!(harness, Harness::Opencode | Harness::Opencode2) {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT session_id, is_subagent
+             FROM session_meta
+             WHERE harness IN ('opencode', 'opencode2') AND is_subagent != 0",
+        ) else {
+            return map;
+        };
+        if let Ok(rows) = stmt.query_map([], |row| {
+            let sid: String = row.get(0)?;
+            let flag: i64 = row.get(1)?;
+            Ok((sid, flag != 0))
+        }) {
+            for row in rows.flatten() {
+                map.insert(row.0, row.1);
+            }
+        }
+        return map;
+    }
     let Ok(mut stmt) = conn.prepare(
         "SELECT session_id, is_subagent
          FROM session_meta
@@ -5272,17 +5456,50 @@ fn load_subagent_map_for_harness(harness: Harness) -> std::collections::HashMap<
     ) else {
         return map;
     };
-    let rows = stmt.query_map([harness_str], |row| {
+    if let Ok(rows) = stmt.query_map([harness.as_str()], |row| {
         let sid: String = row.get(0)?;
         let flag: i64 = row.get(1)?;
         Ok((sid, flag != 0))
-    });
-    if let Ok(rows) = rows {
+    }) {
         for row in rows.flatten() {
             map.insert(row.0, row.1);
         }
     }
     map
+}
+
+/// OpenCode writes `session.parent_id` synchronously when it spawns a task
+/// child. That column is the host's structural subagent signal and is present
+/// even when Magic Context has no `session_meta` row yet (or the row was
+/// mislabelled). Empty-string parent_id is treated as primary, matching the
+/// plugin fallback.
+fn load_opencode_store_child_session_ids() -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(path) = resolve_opencode_db_path() else {
+        return out;
+    };
+    let Ok((conn, _)) = open_opencode_readonly(&path) else {
+        return out;
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id FROM session
+         WHERE parent_id IS NOT NULL AND TRIM(parent_id) != ''",
+    ) else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+        for id in rows.flatten() {
+            out.insert(id);
+        }
+    }
+    out
+}
+
+fn mark_opencode_store_children_as_subagents(flags: &mut HashMap<(Harness, String), bool>) {
+    for session_id in load_opencode_store_child_session_ids() {
+        flags.insert((Harness::Opencode, session_id.clone()), true);
+        flags.insert((Harness::Opencode2, session_id), true);
+    }
 }
 
 pub fn get_session_detail(
@@ -5291,7 +5508,7 @@ pub fn get_session_detail(
     session_id: &str,
 ) -> Result<Option<SessionDetail>, rusqlite::Error> {
     match harness {
-        Harness::Opencode => get_opencode_session_detail(conn, session_id),
+        Harness::Opencode | Harness::Opencode2 => get_opencode_session_detail(conn, session_id),
         Harness::Pi | Harness::Omp => Ok(get_pi_session_detail(conn, harness, session_id)),
         Harness::ClaudeCode | Harness::Codex => Ok(None),
     }
@@ -5307,12 +5524,12 @@ pub fn get_session_messages(
     session_id: &str,
 ) -> Result<Vec<SessionMessageRow>, rusqlite::Error> {
     match harness {
-        Harness::Opencode => {
+        Harness::Opencode | Harness::Opencode2 => {
             let Some(opencode_db_path) = resolve_opencode_db_path() else {
                 return Ok(Vec::new());
             };
-            let conn = open_readonly(&opencode_db_path)?;
-            load_opencode_messages(&conn, session_id)
+            let (conn, generation) = open_opencode_readonly(&opencode_db_path)?;
+            load_opencode_messages(&conn, generation, session_id)
         }
         Harness::Pi | Harness::Omp => {
             let Some(path) = find_pi_session_path_for_harness(harness, session_id) else {
@@ -5344,7 +5561,7 @@ pub fn get_opencode_session_detail(
     let Some(opencode_db_path) = resolve_opencode_db_path() else {
         return Ok(None);
     };
-    let oc_conn = open_readonly(&opencode_db_path)?;
+    let (oc_conn, generation) = open_opencode_readonly(&opencode_db_path)?;
     let row = oc_conn.query_row(
         "SELECT s.id, COALESCE(s.title, ''), COALESCE(p.name, ''), COALESCE(p.worktree, ''),
                 COALESCE(s.directory, ''),
@@ -5378,22 +5595,26 @@ pub fn get_opencode_session_detail(
     // Cheap row counts for badge rendering. Both are O(rows-in-session) at
     // worst but use only INTEGER aggregates (no JSON extraction or part-table
     // join), so they're <20ms even for 37k-message sessions.
+    let (harness, message_table, cache_predicate) = match generation {
+        OpenCodeStoreGeneration::V1 => (
+            Harness::Opencode,
+            "message",
+            "json_extract(data, '$.role') = 'assistant' AND COALESCE(CAST(json_extract(data, '$.tokens.total') AS INTEGER), 0) > 0",
+        ),
+        OpenCodeStoreGeneration::V2 => (
+            Harness::Opencode2,
+            "session_message",
+            "type = 'assistant' AND json_extract(data, '$.tokens') IS NOT NULL",
+        ),
+    };
+    let messages_count_sql = format!("SELECT COUNT(*) FROM {message_table} WHERE session_id = ?1");
     let messages_count: i64 = oc_conn
-        .query_row(
-            "SELECT COUNT(*) FROM message WHERE session_id = ?1",
-            [&session_id],
-            |row| row.get(0),
-        )
+        .query_row(&messages_count_sql, [&session_id], |row| row.get(0))
         .unwrap_or(0);
+    let cache_events_count_sql =
+        format!("SELECT COUNT(*) FROM {message_table} WHERE session_id = ?1 AND {cache_predicate}");
     let cache_events_count: i64 = oc_conn
-        .query_row(
-            "SELECT COUNT(*) FROM message
-             WHERE session_id = ?1
-               AND json_extract(data, '$.role') = 'assistant'
-               AND COALESCE(CAST(json_extract(data, '$.tokens.total') AS INTEGER), 0) > 0",
-            [&session_id],
-            |row| row.get(0),
-        )
+        .query_row(&cache_events_count_sql, [&session_id], |row| row.get(0))
         .unwrap_or(0);
 
     let compartments = conn
@@ -5418,11 +5639,10 @@ pub fn get_opencode_session_detail(
         .flatten();
 
     let session_identities = load_session_identity_map();
-    let project_identity =
-        lookup_session_identity(&session_identities, Harness::Opencode, &session_id);
+    let project_identity = lookup_session_identity(&session_identities, harness, &session_id);
 
     Ok(Some(SessionDetail {
-        harness: Harness::Opencode,
+        harness,
         session_id,
         title,
         project_identity,
@@ -5447,6 +5667,7 @@ pub fn get_opencode_session_detail(
 
 fn load_opencode_messages(
     conn: &Connection,
+    generation: OpenCodeStoreGeneration,
     session_id: &str,
 ) -> Result<Vec<SessionMessageRow>, rusqlite::Error> {
     // OpenCode stores message metadata (role, time, agent, model) on the `message` table
@@ -5459,24 +5680,39 @@ fn load_opencode_messages(
     //
     // The `||` operator concatenates SQL strings; `||` with NULL produces NULL, so we wrap
     // json_extract in COALESCE to handle non-text parts (which return NULL for `$.text`).
-    let mut stmt = conn.prepare(
-        "SELECT
-            CAST(m.id AS TEXT),
-            m.time_created,
-            COALESCE(CAST(json_extract(m.data, '$.role') AS TEXT), ''),
-            m.data,
-            COALESCE(
-                (SELECT GROUP_CONCAT(json_extract(p.data, '$.text'), ' ')
-                 FROM part p
-                 WHERE p.message_id = m.id
-                   AND json_extract(p.data, '$.type') = 'text'
-                   AND json_extract(p.data, '$.text') IS NOT NULL),
-                ''
-            ) AS aggregated_text
-         FROM message m
-         WHERE m.session_id = ?1
-         ORDER BY m.time_created ASC",
-    )?;
+    let sql = match generation {
+        OpenCodeStoreGeneration::V1 => {
+            "SELECT
+                CAST(m.id AS TEXT),
+                m.time_created,
+                COALESCE(CAST(json_extract(m.data, '$.role') AS TEXT), ''),
+                m.data,
+                COALESCE(
+                    (SELECT GROUP_CONCAT(json_extract(p.data, '$.text'), ' ')
+                     FROM part p
+                     WHERE p.message_id = m.id
+                       AND json_extract(p.data, '$.type') = 'text'
+                       AND json_extract(p.data, '$.text') IS NOT NULL),
+                    ''
+                ) AS aggregated_text
+             FROM message m
+             WHERE m.session_id = ?1
+             ORDER BY m.time_created ASC"
+        }
+        OpenCodeStoreGeneration::V2 => {
+            "SELECT
+                CAST(m.id AS TEXT),
+                m.time_created,
+                CASE WHEN m.type = 'assistant' THEN 'assistant' ELSE 'user' END,
+                m.data,
+                '' AS aggregated_text
+             FROM session_message m
+             WHERE m.session_id = ?1
+               AND m.type NOT IN ('idle', 'agent-switched', 'model-switched', 'location-switched')
+             ORDER BY m.seq ASC"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([session_id], |row| {
         let raw_string: String = row.get(3)?;
         let raw_json: serde_json::Value = serde_json::from_str(&raw_string).unwrap_or_default();
@@ -5667,8 +5903,8 @@ fn resolve_session_info(
         return result;
     };
 
-    let conn = match open_readonly(&opencode_db) {
-        Ok(c) => c,
+    let (conn, generation) = match open_opencode_readonly(&opencode_db) {
+        Ok(value) => value,
         Err(_) => return result,
     };
 
@@ -5677,14 +5913,17 @@ fn resolve_session_info(
         Err(_) => return result,
     };
     let session_identities = load_session_identity_map();
+    let harness = match generation {
+        OpenCodeStoreGeneration::V1 => Harness::Opencode,
+        OpenCodeStoreGeneration::V2 => Harness::Opencode2,
+    };
 
     if let Ok(rows) = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     }) {
         for row in rows.flatten() {
             let (session_id, title) = row;
-            let identity =
-                lookup_session_identity(&session_identities, Harness::Opencode, &session_id);
+            let identity = lookup_session_identity(&session_identities, harness, &session_id);
             result.insert(session_id, (title, identity));
         }
     }
@@ -5736,23 +5975,28 @@ pub fn get_compartments(
 
     // Resolve message timestamps from OpenCode DB
     if let Some(opencode_db_path) = resolve_opencode_db_path() {
-        if let Ok(oc_conn) = open_readonly(&opencode_db_path) {
+        if let Ok((oc_conn, generation)) = open_opencode_readonly(&opencode_db_path) {
+            let message_table = match generation {
+                OpenCodeStoreGeneration::V1 => "message",
+                OpenCodeStoreGeneration::V2 => "session_message",
+            };
+            let timestamp_sql = format!("SELECT time_created FROM {message_table} WHERE id = ?1");
             for comp in compartments.iter_mut() {
                 if let Some(ref start_id) = comp.start_message_id {
-                    if let Ok(ts) = oc_conn.query_row(
-                        "SELECT time_created FROM message WHERE id = ?1",
-                        rusqlite::params![start_id],
-                        |row| row.get::<_, Option<i64>>(0),
-                    ) {
+                    if let Ok(ts) =
+                        oc_conn.query_row(&timestamp_sql, rusqlite::params![start_id], |row| {
+                            row.get::<_, Option<i64>>(0)
+                        })
+                    {
                         comp.start_time = ts;
                     }
                 }
                 if let Some(ref end_id) = comp.end_message_id {
-                    if let Ok(ts) = oc_conn.query_row(
-                        "SELECT time_created FROM message WHERE id = ?1",
-                        rusqlite::params![end_id],
-                        |row| row.get::<_, Option<i64>>(0),
-                    ) {
+                    if let Ok(ts) =
+                        oc_conn.query_row(&timestamp_sql, rusqlite::params![end_id], |row| {
+                            row.get::<_, Option<i64>>(0)
+                        })
+                    {
                         comp.end_time = ts;
                     }
                 }
@@ -6956,7 +7200,12 @@ mod cache_session_list_query_tests {
             insert_message(&conn, &format!("raw-{time}"), "heavy", time, 0);
         }
 
-        let sessions = load_recent_opencode_cache_sessions_from_conn(&conn, 1, &HashSet::new());
+        let sessions = load_recent_opencode_cache_sessions_from_conn(
+            &conn,
+            OpenCodeStoreGeneration::V1,
+            1,
+            &HashSet::new(),
+        );
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "heavy");
@@ -6973,7 +7222,12 @@ mod cache_session_list_query_tests {
         insert_session(&conn, "older-event", 1);
         insert_message(&conn, "older-event-message", "older-event", 1, 10);
 
-        let sessions = load_recent_opencode_cache_sessions_from_conn(&conn, 1, &HashSet::new());
+        let sessions = load_recent_opencode_cache_sessions_from_conn(
+            &conn,
+            OpenCodeStoreGeneration::V1,
+            1,
+            &HashSet::new(),
+        );
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "older-event");
@@ -6992,10 +7246,112 @@ mod cache_session_list_query_tests {
         insert_session(&conn, "primary", 1);
         insert_message(&conn, "primary-event", "primary", 1, 10);
 
-        let sessions = load_recent_opencode_cache_sessions_from_conn(&conn, 1, &hidden);
+        let sessions = load_recent_opencode_cache_sessions_from_conn(
+            &conn,
+            OpenCodeStoreGeneration::V1,
+            1,
+            &hidden,
+        );
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "primary");
+    }
+}
+
+#[cfg(test)]
+mod opencode_parent_id_subagent_hide_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+    use std::fs;
+
+    fn insert_cache_message(conn: &Connection, id: &str, session_id: &str, time: i64) {
+        let data = serde_json::json!({
+            "role": "assistant",
+            "tokens": { "input": 10, "cache": { "read": 80, "write": 10 }, "total": 100 }
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+            params![id, session_id, time, data],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hide_subagents_uses_opencode_parent_id_when_session_meta_is_missing() {
+        let _guard = super::RESOLVE_DB_PATH_ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let storage = root.path().join("mc");
+        fs::create_dir_all(&storage).unwrap();
+        let context_db = storage.join("context.db");
+        Connection::open(&context_db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session_meta (
+                    session_id TEXT PRIMARY KEY,
+                    harness TEXT NOT NULL DEFAULT 'opencode',
+                    is_subagent INTEGER DEFAULT 0
+                );",
+            )
+            .unwrap();
+
+        let opencode_db = root.path().join("opencode.db");
+        let oc = Connection::open(&opencode_db).unwrap();
+        oc.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                title TEXT,
+                time_updated INTEGER NOT NULL,
+                time_archived INTEGER,
+                parent_id TEXT
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        oc.execute(
+            "INSERT INTO session (id, title, time_updated, time_archived, parent_id)
+             VALUES ('ses-primary', 'primary', 200, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        oc.execute(
+            "INSERT INTO session (id, title, time_updated, time_archived, parent_id)
+             VALUES ('ses-child', 'child', 300, NULL, 'ses-primary')",
+            [],
+        )
+        .unwrap();
+        insert_cache_message(&oc, "m-primary", "ses-primary", 200);
+        insert_cache_message(&oc, "m-child", "ses-child", 300);
+
+        let old_storage = std::env::var_os("MAGIC_CONTEXT_STORAGE_DIR");
+        let old_opencode = std::env::var_os("OPENCODE_DB");
+        std::env::set_var("MAGIC_CONTEXT_STORAGE_DIR", &storage);
+        std::env::set_var("OPENCODE_DB", &opencode_db);
+
+        let stats = get_session_cache_stats_from_db(10, true, true, Some(Harness::Opencode));
+        let ids: Vec<&str> = stats.iter().map(|row| row.session_id.as_str()).collect();
+        assert!(
+            ids.contains(&"ses-primary"),
+            "primary session should remain visible: {ids:?}",
+        );
+        assert!(
+            !ids.contains(&"ses-child"),
+            "child with parent_id and no session_meta row must still be hidden: {ids:?}",
+        );
+
+        match old_storage {
+            Some(value) => std::env::set_var("MAGIC_CONTEXT_STORAGE_DIR", value),
+            None => std::env::remove_var("MAGIC_CONTEXT_STORAGE_DIR"),
+        }
+        match old_opencode {
+            Some(value) => std::env::set_var("OPENCODE_DB", value),
+            None => std::env::remove_var("OPENCODE_DB"),
+        }
     }
 }
 
@@ -7592,7 +7948,8 @@ mod load_messages_tests {
             r#"{"type":"text","text":"hello world"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages =
+            load_opencode_messages(&conn, OpenCodeStoreGeneration::V1, "ses_test").expect("load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].text_preview, "hello world");
@@ -7617,7 +7974,8 @@ mod load_messages_tests {
             r#"{"type":"text","text":"second chunk"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages =
+            load_opencode_messages(&conn, OpenCodeStoreGeneration::V1, "ses_test").expect("load");
         assert_eq!(messages.len(), 1);
         // GROUP_CONCAT does not guarantee order across SQLite versions; both
         // halves must be present and joined by the configured separator.
@@ -7666,7 +8024,8 @@ mod load_messages_tests {
             r#"{"type":"text","text":"public answer"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages =
+            load_opencode_messages(&conn, OpenCodeStoreGeneration::V1, "ses_test").expect("load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text_preview, "public answer");
         assert!(!messages[0].text_preview.contains("internal thinking"));
@@ -7685,7 +8044,8 @@ mod load_messages_tests {
             r#"{"type":"tool","callID":"x","tool":"read"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages =
+            load_opencode_messages(&conn, OpenCodeStoreGeneration::V1, "ses_test").expect("load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text_preview, "");
     }
@@ -7710,7 +8070,8 @@ mod load_messages_tests {
             r#"{"type":"text","text":"early"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages =
+            load_opencode_messages(&conn, OpenCodeStoreGeneration::V1, "ses_test").expect("load");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text_preview, "early");
         assert_eq!(messages[1].text_preview, "late");
@@ -7729,7 +8090,8 @@ mod load_messages_tests {
             &format!(r#"{{"type":"text","text":"{}"}}"#, long_text),
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages =
+            load_opencode_messages(&conn, OpenCodeStoreGeneration::V1, "ses_test").expect("load");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text_preview.chars().count(), 500);
     }
@@ -7754,7 +8116,8 @@ mod load_messages_tests {
             r#"{"type":"text","text":"text for b"}"#,
         );
 
-        let messages = load_opencode_messages(&conn, "ses_test").expect("load");
+        let messages =
+            load_opencode_messages(&conn, OpenCodeStoreGeneration::V1, "ses_test").expect("load");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text_preview, "text for a");
         assert_eq!(messages[1].text_preview, "text for b");
@@ -7874,7 +8237,13 @@ mod cache_turn_tests {
             .unwrap();
         }
 
-        let events = get_opencode_session_cache_events_from_conn(&conn, "s1", Some(10), None);
+        let events = get_opencode_session_cache_events_from_conn(
+            &conn,
+            OpenCodeStoreGeneration::V1,
+            "s1",
+            Some(10),
+            None,
+        );
         assert_eq!(events.len(), 2);
         assert!(events[0].is_turn_start);
         assert!(!events[1].is_turn_start);

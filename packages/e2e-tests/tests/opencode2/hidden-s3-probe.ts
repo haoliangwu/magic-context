@@ -15,6 +15,10 @@ import { setRawMessageProvider } from "../../../plugin/src/hooks/magic-context/r
 import { getDataDir } from "../../../plugin/src/shared/data-path";
 import { createV2HiddenCompletionExecutor } from "../../../plugin/src/v2/hidden-completion";
 import { v2CompactionMarkerStrategy } from "../../../plugin/src/v2/fold/markers";
+import {
+    HiddenChildHook,
+    registerHiddenChildAgents,
+} from "../../../plugin/src/v2/hooks/hidden-child";
 import { rawMessages } from "../../../plugin/src/v2/hooks/store";
 import { gaDatabasePath, V2StoreReader } from "../../../plugin/src/v2/store-reader";
 
@@ -28,9 +32,21 @@ export default {
         await context.session.hook("generate", async (draft: any) => {
             if (text(draft) === "S3_WARMING") warmingBefore = JSON.stringify(draft);
         });
-        const executor = await createV2HiddenCompletionExecutor(context.session, async (sessionID) => {
-            const session = await context.session.get({ sessionID });
-            return session.model ? { providerID: session.model.providerID, modelID: session.model.id } : null;
+        const hiddenDb = openDatabase();
+        if (!hiddenDb) throw new Error("Hidden proof database did not open");
+        const hiddenHook = new HiddenChildHook();
+        await registerHiddenChildAgents(context.agent);
+        await context.session.hook("context", async (draft: any) => {
+            hiddenHook.apply(draft);
+        });
+        let agentsReady: Promise<void> | undefined;
+        const executor = await createV2HiddenCompletionExecutor(context.session, {
+            db: hiddenDb,
+            projectIdentity: context.location.directory,
+            hook: hiddenHook,
+            ensureAgent: () => (agentsReady ??= context.agent.reload()),
+            openReader: () => new V2StoreReader(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest")),
+            generation: "s3-proof-generation",
         });
         await context.session.hook("generate", async (draft: any) => {
             const command = text(draft);

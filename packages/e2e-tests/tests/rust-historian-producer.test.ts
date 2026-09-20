@@ -9,7 +9,8 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { RustTestHarness } from "../src/rust-harness";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
@@ -129,6 +130,124 @@ describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () =
             const final = await status(sessionId);
             expect(final.last_failure ?? null).toBeNull();
             expect(final.consecutive_publish_failures ?? 0).toBe(0);
+        },
+        300_000,
+    );
+
+    it(
+        "fits an oversize completed tool arc, publishes it once, and advances past it",
+        async () => {
+            const oversize = await RustTestHarness.create({
+                modelContextLimit: 30_000,
+                magicContextConfig: {
+                    execute_threshold_percentage: 25,
+                    protected_tags: 1,
+                    compressor: { enabled: false },
+                    historian: { context_limit_tokens: 120_000 },
+                },
+            });
+            try {
+                const moduleConfigDir = join(oversize.env.dataDir, "module-config", "cortexkit");
+                mkdirSync(moduleConfigDir, { recursive: true });
+                writeFileSync(
+                    join(moduleConfigDir, "magic-context.jsonc"),
+                    JSON.stringify({ historian: { context_limit_tokens: 120_000 } }),
+                );
+                const sessionId = await oversize.createSession();
+                const description = `oversize historian arc ${oversize.ballast(180_000)}`;
+                let toolEmitted = false;
+                oversize.mock.addMatcher((body) => {
+                    if (toolEmitted || !Array.isArray(body.tools)) return null;
+                    const tool = body.tools.find((candidate) =>
+                        /bash/i.test(String((candidate as { name?: unknown })?.name ?? "")),
+                    ) as { name?: string } | undefined;
+                    if (!tool?.name) return null;
+                    toolEmitted = true;
+                    return {
+                        content: [
+                            {
+                                type: "tool_use",
+                                id: "toolu_issue_467_oversize",
+                                name: tool.name,
+                                input: { command: "printf issue-467-ok", description },
+                            },
+                        ],
+                        stop_reason: "tool_use",
+                        usage: {
+                            input_tokens: 500,
+                            output_tokens: 20,
+                            cache_creation_input_tokens: 100,
+                        },
+                    };
+                });
+                oversize.mock.setDefault({
+                    text: "oversize tool arc completed",
+                    usage: {
+                        input_tokens: 500,
+                        output_tokens: 20,
+                        cache_creation_input_tokens: 100,
+                    },
+                });
+                await oversize.sendPrompt(sessionId, "Create the completed oversize tool arc.");
+                expect(toolEmitted).toBe(true);
+
+                for (let index = 1; index <= 6; index += 1) {
+                    oversize.mock.setDefault({
+                        text: `oversize follow-up ${index}`,
+                        usage: {
+                            input_tokens: index === 6 ? 27_000 : 1_000,
+                            output_tokens: 20,
+                            cache_creation_input_tokens: index === 6 ? 2_000 : 100,
+                        },
+                    });
+                    await oversize.sendPrompt(
+                        sessionId,
+                        `oversize follow-up ${index}: ${oversize.ballast(500)}`,
+                    );
+                }
+                oversize.mock.setDefault({
+                    text: "start oversize historian",
+                    usage: {
+                        input_tokens: 500,
+                        output_tokens: 20,
+                        cache_creation_input_tokens: 0,
+                    },
+                });
+                await oversize.sendPrompt(sessionId, "Start the oversize historian pass.");
+
+                await oversize.waitFor(() => oversize.subc.producerRequestCount() >= 1, {
+                    timeoutMs: 120_000,
+                    label: "oversize historian producer request",
+                });
+                const publishDeadline = Date.now() + 120_000;
+                let published: ModuleStatus = {};
+                while (Date.now() < publishDeadline) {
+                    published = (await oversize.subc.moduleStatus(
+                        sessionId,
+                        oversize.env.workdir,
+                        "session.status",
+                    )) as ModuleStatus;
+                    if ((published.compartment_count ?? 0) >= 1) break;
+                    await Bun.sleep(100);
+                }
+                expect(published.compartment_count ?? 0).toBeGreaterThanOrEqual(1);
+                expect(oversize.subc.producerLog()).toContain("truncation_markers=2");
+
+                const producerRuns = oversize.subc.producerRequestCount();
+                oversize.mock.setDefault({
+                    text: "post-publication low pressure",
+                    usage: {
+                        input_tokens: 500,
+                        output_tokens: 20,
+                        cache_creation_input_tokens: 0,
+                    },
+                });
+                await oversize.sendPrompt(sessionId, "Verify the published arc is not re-read.");
+                await Bun.sleep(500);
+                expect(oversize.subc.producerRequestCount()).toBe(producerRuns);
+            } finally {
+                await oversize.dispose();
+            }
         },
         300_000,
     );

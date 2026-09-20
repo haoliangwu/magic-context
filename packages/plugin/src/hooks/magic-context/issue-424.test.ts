@@ -10,7 +10,16 @@ import { registerIssue424CapacityTests } from "./issue-424-capacity-test-support
 registerIssue424CapacityTests(
     "opencode",
     (fixture) => fixture.raw,
-    async ({ db, sessionId, boundary, xml, holderId, historianChunkTokens }) => {
+    async ({
+        db,
+        sessionId,
+        boundary,
+        xml,
+        holderId,
+        historianChunkTokens,
+        historianContextLimit,
+        maxOutputTokens,
+    }) => {
         const prompts: string[] = [];
         const client = {
             session: {
@@ -37,6 +46,8 @@ registerIssue424CapacityTests(
             sessionId,
             directory: process.cwd(),
             historianChunkTokens,
+            historianContextLimit,
+            historianMaxOutputTokens: maxOutputTokens,
             boundarySnapshot: boundary,
             compartmentLeaseHolderId: holderId,
             memoryEnabled: false,

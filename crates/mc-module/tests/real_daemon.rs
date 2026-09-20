@@ -572,10 +572,12 @@ fn identity_for(session: &str) -> BindIdentity {
     let reg = REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let mut map = reg.lock().unwrap();
     map.entry(session.to_string())
-        .or_insert_with(|| BindIdentity {
-            project_root: PathBuf::from(project_root_for(session)),
-            harness: "mc-module-test".to_string(),
-            session: session.to_string(),
+        .or_insert_with(|| {
+            BindIdentity::new(
+                PathBuf::from(project_root_for(session)),
+                "mc-module-test",
+                session,
+            )
         })
         .clone()
 }

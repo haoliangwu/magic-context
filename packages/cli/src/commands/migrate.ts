@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import { assertOpenCodeStoreGeneration } from "@magic-context/core/shared/opencode-db-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
@@ -1374,6 +1375,7 @@ export function migrateOpenCodeSessionToPi(
     if (db === null) {
         throw new Error(`OpenCode database not found at ${opencodeDbPath}; nothing to migrate.`);
     }
+    assertOpenCodeStoreGeneration(db, "v1", opencodeDbPath);
 
     // Cortexkit DB: when not provided explicitly, open the canonical
     // shared DB read-write (we'll INSERT into compartments + session_facts).

@@ -553,7 +553,7 @@ describe("long-running OpenCode Magic Context session", () => {
         expect(readMeta<{ note_nudge_anchors: string }>(sessionId, "note_nudge_anchors")?.note_nudge_anchors ?? "").toContain("deferred note");
         // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
-        // Phase 4: ctx_reduce queues a real drop; the next execute materializes a dropped shell and suppresses cleanup nudges.
+        // Phase 4: ctx_reduce queues a real drop; the next force pass materializes a dropped shell and suppresses cleanup nudges.
         // Select the tag number and its expected text from the same provider
         // request. Pairing a database tag with hard-coded wire text can target a
         // different block after an earlier pass retags the assistant message.
@@ -570,7 +570,7 @@ describe("long-running OpenCode Magic Context session", () => {
         emitToolOnce(/^ctx_reduce$/, { drop: String(reduceTarget) });
         await send(sessionId, `turn 13: drop old assistant tag ${reduceTarget} with ctx_reduce`, "phase 4 after ctx_reduce");
         await send(sessionId, "turn 14: pressure after ctx_reduce so pending op applies next", "phase 4 pressure", FORCE_CLEANUP_USAGE);
-        const materializeMarker = await send(sessionId, "turn 15: materialize ctx_reduce pending op", "phase 4 materialize");
+        const materializeMarker = await send(sessionId, "turn 15: force-bust and materialize ctx_reduce pending op", "phase 4 materialize");
         if (!RUST_MODE) {
             await h.waitFor(
                 () => {

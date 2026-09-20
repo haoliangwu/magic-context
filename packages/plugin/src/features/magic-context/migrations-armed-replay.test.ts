@@ -20,6 +20,8 @@ import { addNote, getSmartNotes } from "./storage-notes";
 
 const PROJECT_PATH = "/armed-migration-replay";
 const V84_SESSION_ID = "armed-replay-session-meta-v84";
+const V85_SESSION_ID = "armed-replay-v85-o2";
+const V85_TWIN_SESSION_ID = "armed-replay-v85-twin";
 const STATE_TABLE_PREDICATE =
     "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
 const MEMORY_REFUSAL = "context.db memory writes are managed by the Rust module";
@@ -238,6 +240,33 @@ function assertV84SessionMetaArm(db: DatabaseType): void {
     expect(getPersistedEpochFloor(db, V84_SESSION_ID)).toBeNull();
 }
 
+function populateV85MislabelsAtV84(db: DatabaseType): void {
+    db.exec(`
+        INSERT INTO session_meta (session_id, harness, counter)
+        VALUES ('${V85_SESSION_ID}', 'opencode2', 2);
+        INSERT INTO session_projects (session_id, harness, project_path, updated_at)
+        VALUES
+            ('${V85_TWIN_SESSION_ID}', 'opencode', '/old', 1),
+            ('${V85_TWIN_SESSION_ID}', 'opencode2', '/new', 2);
+    `);
+}
+
+function assertV85RelabelArm(db: DatabaseType): void {
+    expect(
+        db
+            .prepare("SELECT harness, counter FROM session_meta WHERE session_id = ?")
+            .get(V85_SESSION_ID),
+    ).toEqual({ harness: "opencode", counter: 2 });
+    expect(
+        db
+            .prepare("SELECT harness, project_path FROM session_projects WHERE session_id = ?")
+            .all(V85_TWIN_SESSION_ID),
+    ).toEqual([{ harness: "opencode", project_path: "/new" }]);
+    expect(
+        db.prepare("SELECT COUNT(*) AS count FROM session_meta WHERE harness = 'opencode2'").get(),
+    ).toEqual({ count: 0 });
+}
+
 function populateModuleOwnedRows(db: DatabaseType, version: number, state: ReplayState): void {
     if (!state.contextStoreUuid) throw new Error("armed replay has no context store identity");
 
@@ -417,6 +446,12 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
         case 84:
             if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
             assertV84SessionMetaArm(db);
+            populateV85MislabelsAtV84(db);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 85:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            assertV85RelabelArm(db);
             populateModuleOwnedRows(db, version, state);
             return;
         default:

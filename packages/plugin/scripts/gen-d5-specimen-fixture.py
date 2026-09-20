@@ -49,6 +49,9 @@ SCOPE_OPEN_VECTORS_PATH = "crates/mc-module/tests/fixtures/d5-specimen/scope-ope
 CAPACITY_ESTIMATE_VECTORS_PATH = "crates/mc-module/tests/fixtures/d5-specimen/capacity-estimate-vectors-v1.json"
 OUTPUT_IDENTITY_VECTORS_PATH = "crates/mc-module/tests/fixtures/d5-specimen/output-identity-vectors-v1.json"
 COVERAGE_VECTORS_PATH = "crates/mc-module/tests/fixtures/d5-specimen/coverage-proof-vectors-v1.json"
+INHERITED_TRANSFER_VECTORS_PATH = (
+    "crates/mc-module/tests/fixtures/d5-specimen/d5-inherited-transfer-vectors-v1.json"
+)
 AGGREGATE_PREIMAGES_PATH = "crates/mc-module/tests/fixtures/d5-specimen/aggregate-preimages-v1.json"
 AGGREGATE_PREIMAGES_SHA256 = "952938e6ea60b5d5a6c639b73931c901f8767e8d224961310991de5031e9f957"
 DIGEST_PLACEHOLDER = "<computed-by-slice-0>"
@@ -1230,20 +1233,35 @@ def d5_text(value: str) -> bytes:
     return d5_blob(value.encode())
 
 
-def d5_digest(tag: str, payload: bytes) -> str:
+def d5_digest_preimage(tag: str, payload: bytes) -> bytes:
     encoded_tag = tag.encode("ascii")
-    preimage = (
+    return (
         len(encoded_tag).to_bytes(4, "big")
         + encoded_tag
         + (1).to_bytes(4, "big")
         + payload
     )
-    return sha256(preimage)
+
+
+def d5_digest(tag: str, payload: bytes) -> str:
+    return sha256(d5_digest_preimage(tag, payload))
+
+
+def d5_source_preimage(source: bytes) -> bytes:
+    return d5_digest_preimage("mc.d5.block.source.v1", d5_blob(source))
+
+
+def d5_served_preimage(source: bytes) -> bytes:
+    return d5_digest_preimage("mc.d5.block.served.v1", d5_blob(source))
+
+
+def d5_unit_preimage(unit: str, row_version: int, source: bytes) -> bytes:
+    payload = d5_text(unit) + row_version.to_bytes(8, "big") + d5_blob(source)
+    return d5_digest_preimage("mc.d5.unit-projection.v1", payload)
 
 
 def d5_unit_digest(unit: str, row_version: int, source: bytes) -> str:
-    payload = d5_text(unit) + row_version.to_bytes(8, "big") + d5_blob(source)
-    return d5_digest("mc.d5.unit-projection.v1", payload)
+    return sha256(d5_unit_preimage(unit, row_version, source))
 
 
 def d5_projection_digest(row_version: int, units: list[dict[str, Any]]) -> str:
@@ -1277,6 +1295,214 @@ def refresh_coverage_projection_digests(path: Path) -> int:
             moved += 1
     path.write_bytes(json_bytes(document))
     return moved
+
+
+def validate_inherited_transfer_contract(inherited_vectors: bytes) -> None:
+    document = load_json(inherited_vectors)
+    if document.get("schema") != "mc.d5.inherited-transfer-vectors.v1":
+        raise SystemExit("inherited-transfer schema drift")
+    if document.get("contract_version") != "1.3.38":
+        raise SystemExit("inherited-transfer contract-version drift")
+    if document.get("ruling_tip") != "R46g":
+        raise SystemExit("inherited-transfer ruling-tip drift")
+
+    specimen = document.get("specimen_class", {})
+    if specimen.get("classification") != "ALGEBRA":
+        raise SystemExit("inherited-transfer specimen classification drift")
+    if specimen.get("algebra_payload_example") != "late reduction\n":
+        raise SystemExit("inherited-transfer algebra payload drift")
+    if specimen.get("canonical_text_block_example") != '{"text":"late reduction\\n"}':
+        raise SystemExit("inherited-transfer canonical payload drift")
+    presence_note = specimen.get("presence_note", "")
+    if "CONSTRUCTED" not in presence_note or "do not claim observed presence" not in presence_note:
+        raise SystemExit("inherited-transfer constructed-presence boundary drift")
+    establishes = specimen.get("establishes", [])
+    if not any(
+        "origin_identity" in claim
+        and "native_mid" in claim
+        and "block index" in claim
+        and "source ordinal" in claim
+        for claim in establishes
+    ):
+        raise SystemExit("inherited-transfer manifest-address claim drift")
+    if not any("predecessor_identity independently" in claim for claim in establishes):
+        raise SystemExit("inherited-transfer source-identity claim drift")
+    if not any(
+        "mc.d5.block.source.v1" in claim and "mc.d5.block.served.v1" in claim
+        for claim in establishes
+    ):
+        raise SystemExit("inherited-transfer material digest-domain claim drift")
+    if not any(
+        "mc.d5.unit-projection.v1" in claim and "never compared" in claim
+        for claim in establishes
+    ):
+        raise SystemExit("inherited-transfer projection digest-domain claim drift")
+    if specimen.get("does_not_establish") != [
+        "normalized provider-block integration",
+        "locator resolution against a real returned view",
+    ]:
+        raise SystemExit("inherited-transfer non-readiness claim drift")
+    follow_up = specimen.get("follow_up", "")
+    if "real normalizer" not in follow_up or "returned-view path" not in follow_up:
+        raise SystemExit("inherited-transfer follow-up purpose drift")
+
+    vectors = document.get("vectors", [])
+    expected_ids = {
+        "V01_frozen_twice_inherited",
+        "V02_none_to_some",
+        "V03_some_to_some",
+        "V04_some_to_none",
+        "V05_missing_current_unit",
+        "V06_source_substitution",
+        "V07_frozen_changed_served",
+        "V08_origin_uses_predecessor_identity",
+        "V09_predecessor_uses_serving_identity",
+        "V10_per_hop_mid_reallocation",
+    }
+    if {vector.get("id") for vector in vectors} != expected_ids:
+        raise SystemExit("inherited-transfer vector inventory drift")
+
+    for vector in vectors:
+        if vector.get("member_presence") != {
+            "input_class": "CONSTRUCTED",
+            "state": "present",
+        }:
+            raise SystemExit(
+                f"inherited-transfer member-presence drift: {vector['id']}"
+            )
+        for side in ("held_m1", "successor_m2"):
+            member = vector[side]
+            source_derivation = vector["source_derivation"][side]
+            source = base64.b64decode(source_derivation["bytes_base64"], validate=True)
+            source_preimage = d5_source_preimage(source)
+            if source_derivation["preimage_hex"] != source_preimage.hex():
+                raise SystemExit(f"inherited-transfer source preimage drift: {vector['id']}")
+            if source_derivation["sha256"] != sha256(source_preimage):
+                raise SystemExit(f"inherited-transfer source digest drift: {vector['id']}")
+            if member["block"]["source"] != {
+                "len": len(source),
+                "sha256": source_derivation["sha256"],
+            }:
+                raise SystemExit(f"inherited-transfer source member drift: {vector['id']}")
+
+            served_derivation = vector["served_derivation"][side]
+            served = base64.b64decode(served_derivation["bytes_base64"], validate=True)
+            served_preimage = d5_served_preimage(served)
+            if served_derivation["preimage_hex"] != served_preimage.hex():
+                raise SystemExit(f"inherited-transfer served preimage drift: {vector['id']}")
+            if served_derivation["sha256"] != sha256(served_preimage):
+                raise SystemExit(f"inherited-transfer member served digest drift: {vector['id']}")
+            if member["block"]["served"] != {
+                "len": len(served),
+                "sha256": served_derivation["sha256"],
+            }:
+                raise SystemExit(f"inherited-transfer served member drift: {vector['id']}")
+
+        for evidence in vector["unit_evidence"]:
+            record = evidence["record"]
+            projection = evidence["projection"]
+            if record["locator"] != projection["locator"]:
+                raise SystemExit(
+                    f"inherited-transfer locator drift: {vector['id']} {record['unit']}"
+                )
+            member = vector[evidence["member_side"]]
+            expected_locator = {
+                "mid": member["message"]["native_mid"],
+                "index": member["block"]["index"],
+            }
+            if record["kind"] != {"kind": "reduction"} or record["locator"] != expected_locator:
+                raise SystemExit(
+                    f"inherited-transfer present reduction location drift: {vector['id']} {record['unit']}"
+                )
+            # source_relation is DECLARED on every carrier (a fresh serving mid does not imply
+            # a different source, R24a), so a present reduction's carrier is its own message.
+            if evidence.get("carrier") != {
+                "input_class": "CONSTRUCTED",
+                "mid": expected_locator["mid"],
+                "role": member["message"]["role"],
+                "ordinal": member["message"]["ordinal"],
+                "synthetic": False,
+                "source_relation": "same_message",
+            }:
+                raise SystemExit(
+                    f"inherited-transfer reduction carrier drift: {vector['id']} {record['unit']}"
+                )
+            source = base64.b64decode(projection["bytes_base64"], validate=True)
+            derivation = evidence["digest_derivation"]
+            served_preimage = d5_served_preimage(source)
+            unit_preimage = d5_unit_preimage(
+                record["unit"], evidence["row_version"], source
+            )
+            if derivation["bytes_base64"] != projection["bytes_base64"]:
+                raise SystemExit(f"inherited-transfer byte binding drift: {vector['id']}")
+            if derivation["served"]["preimage_hex"] != served_preimage.hex():
+                raise SystemExit(f"inherited-transfer served preimage drift: {vector['id']}")
+            if derivation["served"]["sha256"] != sha256(served_preimage):
+                raise SystemExit(f"inherited-transfer served digest drift: {vector['id']}")
+            if derivation["unit_projection"]["preimage_hex"] != unit_preimage.hex():
+                raise SystemExit(f"inherited-transfer unit preimage drift: {vector['id']}")
+            if derivation["unit_projection"]["sha256"] != sha256(unit_preimage):
+                raise SystemExit(f"inherited-transfer unit digest drift: {vector['id']}")
+            if record["sha256"] != derivation["unit_projection"]["sha256"]:
+                raise SystemExit(f"inherited-transfer UnitRecordV1 digest drift: {vector['id']}")
+            if derivation["served"]["sha256"] == derivation["unit_projection"]["sha256"]:
+                raise SystemExit(f"inherited-transfer digest domains met: {vector['id']}")
+
+    expected_controls = {
+        "L01_present_reduction_own_location",
+        "L02_present_reduction_distinct_location",
+        "L03_absent_reduction_independent_location",
+        "L04_compartment_synthetic_head",
+        "L05_compartment_manifest_location",
+        "L06_absent_reduction_same_source_reallocated",
+    }
+    controls = document.get("unit_locator_controls", [])
+    if {control.get("id") for control in controls} != expected_controls:
+        raise SystemExit("inherited-transfer unit-locator control inventory drift")
+    for control in controls:
+        record = control["record"]
+        locator = record["locator"]
+        projection = control["projection"]
+        carrier = control["carrier"]
+        presence = control["member_presence"]
+        member = control["member"]
+        source = base64.b64decode(projection["bytes_base64"], validate=True)
+        preimage = d5_unit_preimage(record["unit"], control["row_version"], source)
+        if locator != projection["locator"] or carrier.get("mid") != locator["mid"]:
+            raise SystemExit(f"inherited-transfer control locator drift: {control['id']}")
+        if carrier.get("input_class") != "CONSTRUCTED" or presence.get("input_class") != "CONSTRUCTED":
+            raise SystemExit(f"inherited-transfer control classification drift: {control['id']}")
+        if control["digest_derivation"] != {
+            "preimage_hex": preimage.hex(),
+            "sha256": sha256(preimage),
+        } or record["sha256"] != sha256(preimage):
+            raise SystemExit(f"inherited-transfer control digest drift: {control['id']}")
+
+        member_location = member["identity"]
+        if record["kind"]["kind"] == "reduction":
+            accepted = (
+                carrier.get("synthetic") is False
+                and carrier.get("ordinal") is not None
+                and (
+                    presence["state"] == "absent"
+                    or (
+                        locator == member_location
+                        and carrier.get("role") == member["role"]
+                        and carrier.get("ordinal") == member["ordinal"]
+                    )
+                )
+            )
+        else:
+            accepted = (
+                presence["state"] == "absent"
+                and locator != member_location
+                and carrier.get("role") == "user"
+                and carrier.get("ordinal") is None
+                and carrier.get("synthetic") is True
+            )
+        expected_outcome = "ACCEPT" if accepted else "REFUSE"
+        if control["expected"]["outcome"] != expected_outcome:
+            raise SystemExit(f"inherited-transfer control expectation drift: {control['id']}")
 
 
 def validate_aggregate_preimages(aggregate_preimages: bytes) -> None:
@@ -1414,6 +1640,22 @@ OpenCode and Pi consume different API structures and are not inputs to the Claud
 
 No D5 lineage serializer exists at this baseline. The closest tagged module fixture union is internally tagged (`crates/mc-module/src/tail_hygiene.rs:1212-1238`), while the current facade state-sync request is a struct rather than an operation union (`crates/mc-module/src/lib.rs:793-863`). Clause 2 therefore controls deliberately: `LineageRequest` is one internally tagged object whose `op` discriminator and redeem fields are siblings with no `args` wrapper; `LineageResponse` uses the externally keyed clause spelling `{{"redeem":{{"result":...}}}}`; and nested payload unions are internally tagged by `kind`. This is the pinned wire rule slice 2 must implement. The owner-authored expectations in `redeem-vectors-v1.json` are independent fixture data, never generated from the precedence evaluator.
 
+Candidate-scope occupancy is derived only from live source-segment uploads, prepared-or-later attempts, and lineage edges; gateway-local ticket samples are not occupancy. The two upload families have different keys: `lineage.begin`/put/finish is attempt-keyed and carries an `AdmissionTicket`, while `capacity.begin`/put/finish/check is scope-keyed by `(P, agent, incarnation)` and carries no ticket. Placeholder adoption advances `resolve_generation`, so source-upload operations, prepare, and resolve apply the existing generation fence to stale tickets. A live or consumed capacity upload is not occupancy and remains usable after adoption as legitimate work under the adopted lineage.
+
+## R47 sequences are executed, not read back
+
+`r47_sequences` used to assert literals inside its own `expected_bytes_base64`, a check that shares its source with the thing it checks and can only catch a typo. Every step now runs against the reference model in `crates/mc-module/tests/support/d5_scope_model.rs`: the oracle feeds the step's request bytes to the model, compares the bytes the model produces with the owner-authored `result_bytes_base64`, and compares the store afterwards with `scopes_after`. `r47_model_seed` is the world every sequence starts from, and `r47_specimen_preimages` records the preimage of each authored digest so a reader can recompute it instead of trusting a literal. The expectations are authored independently and are never generated from the model. A redeem step names the vector whose request it runs, so the sequence half and the classification half cannot drift apart.
+
+Each step pins two encodings of one result: `result_bytes_base64` is the bare typed result (`ScopeResult`, `TicketResult`, `PrepareResult`, `ResolveResult`, `BeginResult`, `PutResult`, `FinishResult`, `RedeemResult`), and `response_bytes_base64` is the clause-3a keyed response that wraps it. A step's own `op` field spells the operation as clause 3 names it (`scope.open`, `attempt.ticket`, `prepare`, `attempt.resolve`, `lineage.begin`, `capacity.begin`/`put`/`finish`/`check`); that is a label. Both the `op` discriminator inside `request_bytes_base64` and the outer key of `response_bytes_base64` follow the clause 2 wire grammar (`LineageRequest` line 103, `LineageResponse` line 104), where those dotted clause 3 names are operation labels rather than wire values: the nine original operations are tagged `ticket`, `prepare`, `resolve`, `redeem`, `release`, `cancel`, `begin`, `put`, and `finish`, while `capacity.begin`/`put`/`finish`/`check` and `scope.open` keep the dotted discriminators they were pinned with (R48). That split is what keeps the scope-keyed `capacity.put` and the attempt-keyed source-segment `put` distinct under R43c, and the reference model accepts each operation under one spelling only. An absent Option inside a typed DTO stays explicit `null` per R19, while `lineage_adopted_from` is the operation-style option R47a pins as omitted when absent.
+
+Where the generation proof rides is a per-result fact, not one shared blob:
+
+- `PrepareResult` is a struct. The refusal and its `generation_fence` proof sit inside `attempt_outcome`; there is no top-level `kind` and no top-level `negative`.
+- A terminal `attempt.resolve` of a fenced attempt is the RESOLVED arm carrying that same outcome, because clause 8 has one transaction return the outcome, the P fence and the generations; `ResolveResult`'s REFUSED arm is for a refusal of the operation itself, which clause 3 reserves for partial arguments. R1 keeps the replay identical, so `fenced_by` stays the ticket's generation plus one and `resolve_generation` is not bumped again.
+- `BeginResult` has no placement for a negative proof, so a generation-fenced `lineage.begin` returns a plain `REFUSED{{refusal}}` using the existing `ticket_invalid` reason and the existing `field` details arm. The authoritative proof for that ticket comes from prepare or attempt.resolve, and the oracle asserts both halves of that separation on what the model produced.
+
+The model stops at two bounds, and every step that reaches one declares it in `bounded_outcome` instead of inventing a wire body: an admitted prepare would seal, and a SEALED `AttemptOutcome` carries a whole `ReceiptV1` that no R47 vector authors; a CHECKED `capacity.check` carries `CapacityEstimateV1`, whose token algebra belongs to `capacity-estimate-vectors-v1.json`. Each such step asserts the state change instead: the admitted attempt becomes occupancy, and the consumed staging disappears.
+
 ## Coverage-proof preimage bytes
 
 `coverage-proof-vectors-v1.json` follows R16's internal `kind` tags and executes R17.3 step 0 from each vector's `served_array`; expectations remain owner-authored fixture data. Every digest has its exact `source_text` beside it. A located block's `bytes` must equal those decoded UTF-8 bytes, while `locator:null` requires empty `source_text`. With `T(s) = U64BE(len(UTF-8(s))) || UTF-8(s)` and `B(x) = U64BE(len(x)) || x`, the exact unit preimage is `U32BE(24) || ASCII("mc.d5.unit-projection.v1") || U32BE(1) || T(unit) || U64BE(row_version) || B(bytes)`. The exact aggregate preimage is `U32BE(19) || ASCII("mc.d5.projection.v1") || U32BE(1) || U64BE(row_version) || U64BE(unit_count)`, followed in listed order for each validated unit by `T(unit) || T(kind) || [U64BE(compartment_sequence) only for compartment] || U64BE(start) || U64BE(end) || B(bytes)`. SHA-256 of those complete preimages is compared with the unit and aggregate `sha256` fields. The 192-cell independent product covers proof variant, unit kind, locator presence, current-pass membership, and row-version relation exactly once. VALIDATED records become RECORDED only after the complete pass is accepted; a proof-rejected pass leaves complete RECORDED state and custody unchanged.
@@ -1445,9 +1687,13 @@ def write_fixture(
     capacity_estimate_vectors = (repository_root / CAPACITY_ESTIMATE_VECTORS_PATH).read_bytes()
     output_identity_vectors = (repository_root / OUTPUT_IDENTITY_VECTORS_PATH).read_bytes()
     coverage_vectors = (repository_root / COVERAGE_VECTORS_PATH).read_bytes()
+    inherited_transfer_vectors = (
+        repository_root / INHERITED_TRANSFER_VECTORS_PATH
+    ).read_bytes()
     aggregate_preimages = (repository_root / AGGREGATE_PREIMAGES_PATH).read_bytes()
     validate_representation_contract(canonical_vectors)
     validate_coverage_contract(coverage_vectors)
+    validate_inherited_transfer_contract(inherited_transfer_vectors)
     validate_aggregate_preimages(aggregate_preimages)
     payloads = {
         "source-segment-v1.json": json_bytes(source_segment),
@@ -1459,6 +1705,7 @@ def write_fixture(
         "capacity-estimate-vectors-v1.json": capacity_estimate_vectors,
         "output-identity-vectors-v1.json": output_identity_vectors,
         "coverage-proof-vectors-v1.json": coverage_vectors,
+        "d5-inherited-transfer-vectors-v1.json": inherited_transfer_vectors,
         "aggregate-preimages-v1.json": aggregate_preimages,
         "README.md": readme_text().encode(),
     }
@@ -1478,6 +1725,7 @@ def write_fixture(
             "capacity-estimate-vectors-v1.json",
             "output-identity-vectors-v1.json",
             "coverage-proof-vectors-v1.json",
+            "d5-inherited-transfer-vectors-v1.json",
             "aggregate-preimages-v1.json",
         }:
             source = {
@@ -1487,6 +1735,7 @@ def write_fixture(
                 "capacity-estimate-vectors-v1.json": "owner-authored D5 capacity contract vectors",
                 "output-identity-vectors-v1.json": "owner-authored D5 returned-message output identity vectors",
                 "coverage-proof-vectors-v1.json": "owner-authored D5 coverage-proof contract vectors",
+                "d5-inherited-transfer-vectors-v1.json": "owner-authored D5 inherited-member transfer vectors",
                 "aggregate-preimages-v1.json": "independently derived R17.4 CE1 aggregate preimages",
             }[name]
             entries.append(
@@ -1542,6 +1791,9 @@ def refresh_fixture_index(output: Path) -> None:
     index_path = output / "fixture-index-v1.json"
     moved = refresh_coverage_projection_digests(output / "coverage-proof-vectors-v1.json")
     validate_coverage_contract((output / "coverage-proof-vectors-v1.json").read_bytes())
+    validate_inherited_transfer_contract(
+        (output / "d5-inherited-transfer-vectors-v1.json").read_bytes()
+    )
     validate_aggregate_preimages((output / "aggregate-preimages-v1.json").read_bytes())
     index = load_json(index_path.read_bytes())
     entries = {entry["path"]: entry for entry in index["files"]}
@@ -1551,6 +1803,7 @@ def refresh_fixture_index(output: Path) -> None:
         "capacity-estimate-vectors-v1.json": "owner-authored D5 capacity contract vectors",
         "output-identity-vectors-v1.json": "owner-authored D5 returned-message output identity vectors",
         "coverage-proof-vectors-v1.json": "owner-authored D5 coverage-proof contract vectors",
+        "d5-inherited-transfer-vectors-v1.json": "owner-authored D5 inherited-member transfer vectors",
         "aggregate-preimages-v1.json": "independently derived R17.4 CE1 aggregate preimages",
     }
     for name, source in owner_vectors.items():
@@ -1573,6 +1826,7 @@ def refresh_fixture_index(output: Path) -> None:
         "capacity-estimate-vectors-v1.json",
         "output-identity-vectors-v1.json",
         "coverage-proof-vectors-v1.json",
+        "d5-inherited-transfer-vectors-v1.json",
         "aggregate-preimages-v1.json",
         "README.md",
     ]

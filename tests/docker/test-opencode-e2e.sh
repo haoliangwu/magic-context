@@ -218,6 +218,40 @@ if [[ -f "$DB_PATH" ]]; then
     TAG_COUNT=$(sqlite3 "$DB_PATH" \
         "SELECT COUNT(*) FROM tags WHERE harness='opencode'" 2>/dev/null || echo "0")
     echo "  tags(harness='opencode') row count: $TAG_COUNT (informational)"
+
+    # OpenCode 1.18.30 calls both server() and setup() on the published
+    # { id, server, setup } export. If setup() locks harness=opencode2, every
+    # session-scoped row is mislabelled. These DISTINCT checks are the
+    # regression that would have stopped that lock from shipping.
+    SESSION_META_ANY=$(sqlite3 "$DB_PATH" \
+        "SELECT COUNT(*) FROM session_meta" 2>/dev/null || echo "0")
+    SESSION_META_HARNESSES=$(sqlite3 "$DB_PATH" \
+        "SELECT IFNULL(group_concat(harness, ','), '') FROM (SELECT DISTINCT harness FROM session_meta ORDER BY 1)" \
+        2>/dev/null || echo "")
+    echo "  session_meta DISTINCT harness: $SESSION_META_HARNESSES (rows=$SESSION_META_ANY)"
+    # Empty tables mean the turn died before persist (qemu timeout). When any
+    # row exists, the set of labels must be exactly opencode — opencode2 here
+    # is the v1 setup() lock that shipped in 0.42.4/5.
+    # Native CI runners finish the turn; only the qemu-emulated local run may
+    # legitimately stop before persist, so in CI an empty table is a failure.
+    if [[ -n "${CI:-}" ]]; then
+        check "session_meta persisted at least one row" "test \"$SESSION_META_ANY\" -gt 0"
+    fi
+    if [[ "$SESSION_META_ANY" -gt 0 ]]; then
+        check "session_meta DISTINCT harness is exactly opencode" \
+            "test \"$SESSION_META_HARNESSES\" = \"opencode\""
+    fi
+
+    TAG_ANY=$(sqlite3 "$DB_PATH" \
+        "SELECT COUNT(*) FROM tags" 2>/dev/null || echo "0")
+    TAG_HARNESSES=$(sqlite3 "$DB_PATH" \
+        "SELECT IFNULL(group_concat(harness, ','), '') FROM (SELECT DISTINCT harness FROM tags ORDER BY 1)" \
+        2>/dev/null || echo "")
+    echo "  tags DISTINCT harness: $TAG_HARNESSES (rows=$TAG_ANY)"
+    if [[ "$TAG_ANY" -gt 0 ]]; then
+        check "tags DISTINCT harness is exactly opencode" \
+            "test \"$TAG_HARNESSES\" = \"opencode\""
+    fi
 fi
 
 # ----------------------------------------------------------------------

@@ -18,6 +18,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { HostCapabilities, HostHarness } from "./host-harness";
 import { assertHistorianMockRouting } from "./mock-routing";
 import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./opencode-runner/spawn";
@@ -67,7 +68,15 @@ const DEFAULT_MOCK_RESPONSE: MockResponse = {
     },
 };
 
-export class TestHarness {
+export class TestHarness implements HostHarness {
+    readonly host = "opencode" as const;
+    readonly harnessId = "opencode" as const;
+    readonly capabilities: HostCapabilities = {
+        childSessions: true,
+        nativeCompact: true,
+        sessionRemove: true,
+        steerDelivery: false,
+    };
     readonly mock: MockProvider;
 
     private opencodeInstance: SpawnedOpencode;

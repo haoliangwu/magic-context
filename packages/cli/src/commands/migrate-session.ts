@@ -37,6 +37,7 @@ import {
     SubcModuleTransport,
 } from "@magic-context/core/hooks/magic-context/module-transport";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
+import { assertOpenCodeStoreGeneration } from "@magic-context/core/shared/opencode-db-path";
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
 import {
@@ -631,6 +632,7 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
                 `OpenCode database not found at ${opencodeDbPath}; nothing to migrate.`,
             );
         }
+        assertOpenCodeStoreGeneration(opencodeDb, "v1", opencodeDbPath);
         contextDb = dryRun
             ? openExistingContextDatabase(contextDbPath, { readonly: true })
             : openExistingContextDatabaseForMutation(contextDbPath);

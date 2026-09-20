@@ -89,13 +89,19 @@
         "metadata": [
           "consistent",
           "inconsistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
       "applies_regardless_of": [
         "observation_class",
         "candidate",
         "delivery_evidence",
-        "metadata"
+        "metadata",
+        "candidate_scope"
       ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "resolved_absent"
@@ -118,9 +124,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "REDEEMED",
       "expected_reason_or_cause": null
     },
@@ -151,10 +164,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
       "applies_regardless_of": [
-        "candidate"
+        "candidate",
+        "candidate_scope"
       ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "already_redeemed"
@@ -180,9 +199,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "already_redeemed"
     },
@@ -215,12 +241,18 @@
         "metadata": [
           "consistent",
           "inconsistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
       "applies_regardless_of": [
         "observation_class",
         "candidate",
-        "metadata"
+        "metadata",
+        "candidate_scope"
       ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "already_redeemed"
@@ -253,11 +285,17 @@
         ],
         "metadata": [
           "inconsistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
       "applies_regardless_of": [
         "observation_class",
-        "candidate"
+        "candidate",
+        "candidate_scope"
       ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "already_redeemed"
@@ -284,10 +322,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
       "applies_regardless_of": [
-        "candidate"
+        "candidate",
+        "candidate_scope"
       ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "seal_material_mismatch"
@@ -317,9 +361,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "invalid_arguments"
     },
@@ -341,9 +392,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "invalid_arguments"
     },
@@ -365,9 +423,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "invalid_arguments"
     },
@@ -389,9 +454,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "UNRECOGNIZED",
       "expected_reason_or_cause": "no_candidate_block"
     },
@@ -413,9 +485,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "UNRECOGNIZED",
       "expected_reason_or_cause": "no_marker"
     },
@@ -437,9 +516,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "UNRECOGNIZED",
       "expected_reason_or_cause": "malformed_marker"
     },
@@ -461,9 +547,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "UNRECOGNIZED",
       "expected_reason_or_cause": "duplicate_marker"
     },
@@ -485,9 +578,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "UNRECOGNIZED",
       "expected_reason_or_cause": "foreign_marker"
     },
@@ -509,6 +609,10 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder"
         ]
       },
       "applies_regardless_of": [],
@@ -533,9 +637,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "invalid_arguments"
     },
@@ -557,9 +668,16 @@
         ],
         "metadata": [
           "consistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
-      "applies_regardless_of": [],
+      "applies_regardless_of": [
+        "candidate_scope"
+      ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "invalid_arguments"
     },
@@ -592,12 +710,18 @@
         "metadata": [
           "consistent",
           "inconsistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
       "applies_regardless_of": [
         "observation_class",
         "candidate",
-        "metadata"
+        "metadata",
+        "candidate_scope"
       ],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "invalid_arguments"
@@ -630,12 +754,45 @@
         ],
         "metadata": [
           "inconsistent"
+        ],
+        "candidate_scope": [
+          "absent",
+          "placeholder",
+          "occupied"
         ]
       },
       "applies_regardless_of": [
         "observation_class",
-        "candidate"
+        "candidate",
+        "candidate_scope"
       ],
+      "expected_variant": "REFUSED",
+      "expected_reason_or_cause": "invalid_arguments"
+    },
+    {
+      "row_id": "P20_sealed_candidate_scope_occupied",
+      "priority": 21,
+      "preconditions": {
+        "scope_state": [
+          "SEALED"
+        ],
+        "observation_class": [
+          "single_valid_stored_marker"
+        ],
+        "candidate": [
+          "observation_consistent"
+        ],
+        "delivery_evidence": [
+          "ok"
+        ],
+        "metadata": [
+          "consistent"
+        ],
+        "candidate_scope": [
+          "occupied"
+        ]
+      },
+      "applies_regardless_of": [],
       "expected_variant": "REFUSED",
       "expected_reason_or_cause": "invalid_arguments"
     }
@@ -2679,6 +2836,914 @@
         }
       },
       "precedence_row": "P17_sealed_marker_other_candidate"
+    },
+    {
+      "id": "V35",
+      "name": "placeholder candidate scope is adopted and reported",
+      "scope_state": "SEALED",
+      "scanned_material": {
+        "source_text": "positive successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REDEEMED",
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "edge": {
+              "edge_id": "11111111-2222-4333-8444-555555555555",
+              "predecessor_key": "session-predecessor-0001",
+              "successor_key": "session-successor-0001",
+              "agent": "agent-main",
+              "F": {
+                "digest": "8273dd5001275e071997f82a4d46744d643b5ae58748b5852d3d05e204189103",
+                "normalization_version": 1,
+                "excluded_additions": []
+              },
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "continuation_identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              },
+              "native_continuation_identity": {
+                "mid": "mid-successor-user-0001",
+                "index": 0,
+                "ordinal": 1940
+              }
+            },
+            "existing": false,
+            "fence_generation": 12,
+            "lineage_adopted_from": "33333333-4444-4555-8666-777777777777"
+          }
+        }
+      },
+      "precedence_row": "P15_sealed_positive",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "other",
+        "attempts_prepared_or_later": 0,
+        "in_edges": 0,
+        "out_edges": 0,
+        "source_uploads_live": 0
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJjMmNjOGZlZWIxMWMxODkyZmE3ZTg3ZDc4ODM1NWI2MjQ0Y2VkNDQ3NTJjY2FkOTE3ZjQ2NzNhMmYwODBkMDcyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjoiMzMzMzMzMzMtNDQ0NC00NTU1LTg2NjYtNzc3Nzc3Nzc3Nzc3In19fQ==",
+      "transition": {
+        "lineage_id_before": "33333333-4444-4555-8666-777777777777",
+        "lineage_id_after": "22222222-3333-4444-8555-666666666666",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 6,
+        "resolve_generation_after": 7,
+        "placeholder_retired": "33333333-4444-4555-8666-777777777777",
+        "predecessor_counter_before": 0,
+        "predecessor_counter_after": 0,
+        "positive_custody_before": 0,
+        "positive_custody_after": 0,
+        "capacity_uploads_before": 0,
+        "capacity_uploads_after": 0
+      }
+    },
+    {
+      "id": "V36",
+      "name": "same-lineage zero-occupancy candidate proceeds without adoption",
+      "scope_state": "SEALED",
+      "scanned_material": {
+        "source_text": "positive successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REDEEMED",
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "edge": {
+              "edge_id": "11111111-2222-4333-8444-555555555555",
+              "predecessor_key": "session-predecessor-0001",
+              "successor_key": "session-successor-0001",
+              "agent": "agent-main",
+              "F": {
+                "digest": "8273dd5001275e071997f82a4d46744d643b5ae58748b5852d3d05e204189103",
+                "normalization_version": 1,
+                "excluded_additions": []
+              },
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "continuation_identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              },
+              "native_continuation_identity": {
+                "mid": "mid-successor-user-0001",
+                "index": 0,
+                "ordinal": 1940
+              }
+            },
+            "existing": false,
+            "fence_generation": 12
+          }
+        }
+      },
+      "precedence_row": "P15_sealed_positive",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "L_P",
+        "attempts_prepared_or_later": 0,
+        "in_edges": 0,
+        "out_edges": 0,
+        "source_uploads_live": 0
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJjMmNjOGZlZWIxMWMxODkyZmE3ZTg3ZDc4ODM1NWI2MjQ0Y2VkNDQ3NTJjY2FkOTE3ZjQ2NzNhMmYwODBkMDcyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTJ9fX0=",
+      "transition": {
+        "lineage_id_before": "22222222-3333-4444-8555-666666666666",
+        "lineage_id_after": "22222222-3333-4444-8555-666666666666",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 6,
+        "resolve_generation_after": 6,
+        "placeholder_retired": null,
+        "predecessor_counter_before": 0,
+        "predecessor_counter_after": 0,
+        "positive_custody_before": 0,
+        "positive_custody_after": 0,
+        "capacity_uploads_before": 0,
+        "capacity_uploads_after": 0
+      }
+    },
+    {
+      "id": "V37",
+      "name": "candidate scope with a sealed attempt toward T refuses",
+      "scope_state": "SEALED",
+      "scanned_material": {
+        "source_text": "positive successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REFUSED",
+            "refusal": {
+              "reason": "invalid_arguments",
+              "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+              "details": {
+                "kind": "field",
+                "field": "candidate",
+                "reason": "candidate scope has its own attempts or descent"
+              }
+            }
+          }
+        }
+      },
+      "precedence_row": "P20_sealed_candidate_scope_occupied",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "other",
+        "attempts_prepared_or_later": 1,
+        "in_edges": 0,
+        "out_edges": 0,
+        "source_uploads_live": 0
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJjMmNjOGZlZWIxMWMxODkyZmE3ZTg3ZDc4ODM1NWI2MjQ0Y2VkNDQ3NTJjY2FkOTE3ZjQ2NzNhMmYwODBkMDcyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJpbnZhbGlkX2FyZ3VtZW50cyIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoiY2FuZGlkYXRlIiwicmVhc29uIjoiY2FuZGlkYXRlIHNjb3BlIGhhcyBpdHMgb3duIGF0dGVtcHRzIG9yIGRlc2NlbnQifX19fX0=",
+      "transition": {
+        "lineage_id_before": "33333333-4444-4555-8666-777777777777",
+        "lineage_id_after": "33333333-4444-4555-8666-777777777777",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 6,
+        "resolve_generation_after": 6,
+        "placeholder_retired": null,
+        "predecessor_counter_before": 0,
+        "predecessor_counter_after": 0,
+        "positive_custody_before": 1,
+        "positive_custody_after": 1,
+        "capacity_uploads_before": 0,
+        "capacity_uploads_after": 0
+      }
+    },
+    {
+      "id": "V38",
+      "name": "candidate lineage with descent and no candidate-scope attempt refuses",
+      "scope_state": "SEALED",
+      "scanned_material": {
+        "source_text": "positive successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REFUSED",
+            "refusal": {
+              "reason": "invalid_arguments",
+              "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+              "details": {
+                "kind": "field",
+                "field": "candidate",
+                "reason": "candidate scope has its own attempts or descent"
+              }
+            }
+          }
+        }
+      },
+      "precedence_row": "P20_sealed_candidate_scope_occupied",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "other",
+        "attempts_prepared_or_later": 0,
+        "in_edges": 0,
+        "out_edges": 1,
+        "source_uploads_live": 0
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJjMmNjOGZlZWIxMWMxODkyZmE3ZTg3ZDc4ODM1NWI2MjQ0Y2VkNDQ3NTJjY2FkOTE3ZjQ2NzNhMmYwODBkMDcyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJpbnZhbGlkX2FyZ3VtZW50cyIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoiY2FuZGlkYXRlIiwicmVhc29uIjoiY2FuZGlkYXRlIHNjb3BlIGhhcyBpdHMgb3duIGF0dGVtcHRzIG9yIGRlc2NlbnQifX19fX0=",
+      "transition": {
+        "lineage_id_before": "33333333-4444-4555-8666-777777777777",
+        "lineage_id_after": "33333333-4444-4555-8666-777777777777",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 6,
+        "resolve_generation_after": 6,
+        "placeholder_retired": null,
+        "predecessor_counter_before": 0,
+        "predecessor_counter_after": 0,
+        "positive_custody_before": 0,
+        "positive_custody_after": 0,
+        "capacity_uploads_before": 0,
+        "capacity_uploads_after": 0
+      }
+    },
+    {
+      "id": "V39",
+      "name": "exact E1 replay wins before occupied candidate scope",
+      "scope_state": "REDEEMED",
+      "scanned_material": {
+        "source_text": "replay successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "b6cfa0defcc071962ec8ccfe0acb4ee6541af671ef0dc8c399130f6b899a5762"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "b6cfa0defcc071962ec8ccfe0acb4ee6541af671ef0dc8c399130f6b899a5762",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REDEEMED",
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "edge": {
+              "edge_id": "11111111-2222-4333-8444-555555555555",
+              "predecessor_key": "session-predecessor-0001",
+              "successor_key": "session-successor-0001",
+              "agent": "agent-main",
+              "F": {
+                "digest": "8273dd5001275e071997f82a4d46744d643b5ae58748b5852d3d05e204189103",
+                "normalization_version": 1,
+                "excluded_additions": []
+              },
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "continuation_identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              },
+              "native_continuation_identity": {
+                "mid": "mid-successor-user-0001",
+                "index": 0,
+                "ordinal": 1940
+              }
+            },
+            "existing": true,
+            "fence_generation": 12
+          }
+        }
+      },
+      "precedence_row": "P02_redeemed_matching_candidate_and_marker",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "L_P",
+        "attempts_prepared_or_later": 1,
+        "in_edges": 1,
+        "out_edges": 0,
+        "source_uploads_live": 0
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJiNmNmYTBkZWZjYzA3MTk2MmVjOGNjZmUwYWNiNGVlNjU0MWFmNjcxZWYwZGM4YzM5OTEzMGY2Yjg5OWE1NzYyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjp0cnVlLCJmZW5jZV9nZW5lcmF0aW9uIjoxMn19fQ==",
+      "transition": {
+        "lineage_id_before": "22222222-3333-4444-8555-666666666666",
+        "lineage_id_after": "22222222-3333-4444-8555-666666666666",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 7,
+        "resolve_generation_after": 7,
+        "placeholder_retired": null,
+        "predecessor_counter_before": 4,
+        "predecessor_counter_after": 4,
+        "positive_custody_before": 1,
+        "positive_custody_after": 1,
+        "capacity_uploads_before": 0,
+        "capacity_uploads_after": 0
+      }
+    },
+    {
+      "id": "V40",
+      "name": "same-lineage candidate with another incoming edge refuses",
+      "scope_state": "SEALED",
+      "scanned_material": {
+        "source_text": "positive successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REFUSED",
+            "refusal": {
+              "reason": "invalid_arguments",
+              "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+              "details": {
+                "kind": "field",
+                "field": "candidate",
+                "reason": "candidate scope has its own attempts or descent"
+              }
+            }
+          }
+        }
+      },
+      "precedence_row": "P20_sealed_candidate_scope_occupied",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "L_P",
+        "attempts_prepared_or_later": 0,
+        "in_edges": 1,
+        "out_edges": 0,
+        "source_uploads_live": 0
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJjMmNjOGZlZWIxMWMxODkyZmE3ZTg3ZDc4ODM1NWI2MjQ0Y2VkNDQ3NTJjY2FkOTE3ZjQ2NzNhMmYwODBkMDcyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJpbnZhbGlkX2FyZ3VtZW50cyIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoiY2FuZGlkYXRlIiwicmVhc29uIjoiY2FuZGlkYXRlIHNjb3BlIGhhcyBpdHMgb3duIGF0dGVtcHRzIG9yIGRlc2NlbnQifX19fX0=",
+      "transition": {
+        "lineage_id_before": "22222222-3333-4444-8555-666666666666",
+        "lineage_id_after": "22222222-3333-4444-8555-666666666666",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 6,
+        "resolve_generation_after": 6,
+        "placeholder_retired": null,
+        "predecessor_counter_before": 0,
+        "predecessor_counter_after": 0,
+        "positive_custody_before": 0,
+        "positive_custody_after": 0,
+        "capacity_uploads_before": 0,
+        "capacity_uploads_after": 0
+      }
+    },
+    {
+      "id": "V41",
+      "name": "candidate scope with a live source-segment upload refuses",
+      "scope_state": "SEALED",
+      "scanned_material": {
+        "source_text": "positive successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REFUSED",
+            "refusal": {
+              "reason": "invalid_arguments",
+              "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+              "details": {
+                "kind": "field",
+                "field": "candidate",
+                "reason": "candidate scope has its own attempts or descent"
+              }
+            }
+          }
+        }
+      },
+      "precedence_row": "P20_sealed_candidate_scope_occupied",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "other",
+        "attempts_prepared_or_later": 0,
+        "in_edges": 0,
+        "out_edges": 0,
+        "source_uploads_live": 1
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJjMmNjOGZlZWIxMWMxODkyZmE3ZTg3ZDc4ODM1NWI2MjQ0Y2VkNDQ3NTJjY2FkOTE3ZjQ2NzNhMmYwODBkMDcyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJpbnZhbGlkX2FyZ3VtZW50cyIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoiY2FuZGlkYXRlIiwicmVhc29uIjoiY2FuZGlkYXRlIHNjb3BlIGhhcyBpdHMgb3duIGF0dGVtcHRzIG9yIGRlc2NlbnQifX19fX0=",
+      "transition": {
+        "lineage_id_before": "33333333-4444-4555-8666-777777777777",
+        "lineage_id_after": "33333333-4444-4555-8666-777777777777",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 6,
+        "resolve_generation_after": 6,
+        "placeholder_retired": null,
+        "predecessor_counter_before": 0,
+        "predecessor_counter_after": 0,
+        "positive_custody_before": 0,
+        "positive_custody_after": 0,
+        "capacity_uploads_before": 0,
+        "capacity_uploads_after": 0
+      }
+    },
+    {
+      "id": "V42",
+      "name": "live capacity upload is non-occupancy and survives placeholder adoption",
+      "scope_state": "SEALED",
+      "scanned_material": {
+        "source_text": "positive successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REDEEMED",
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "edge": {
+              "edge_id": "11111111-2222-4333-8444-555555555555",
+              "predecessor_key": "session-predecessor-0001",
+              "successor_key": "session-successor-0001",
+              "agent": "agent-main",
+              "F": {
+                "digest": "8273dd5001275e071997f82a4d46744d643b5ae58748b5852d3d05e204189103",
+                "normalization_version": 1,
+                "excluded_additions": []
+              },
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "continuation_identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              },
+              "native_continuation_identity": {
+                "mid": "mid-successor-user-0001",
+                "index": 0,
+                "ordinal": 1940
+              }
+            },
+            "existing": false,
+            "fence_generation": 12,
+            "lineage_adopted_from": "33333333-4444-4555-8666-777777777777"
+          }
+        }
+      },
+      "precedence_row": "P15_sealed_positive",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "other",
+        "attempts_prepared_or_later": 0,
+        "in_edges": 0,
+        "out_edges": 0,
+        "source_uploads_live": 0
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJjMmNjOGZlZWIxMWMxODkyZmE3ZTg3ZDc4ODM1NWI2MjQ0Y2VkNDQ3NTJjY2FkOTE3ZjQ2NzNhMmYwODBkMDcyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjoiMzMzMzMzMzMtNDQ0NC00NTU1LTg2NjYtNzc3Nzc3Nzc3Nzc3In19fQ==",
+      "transition": {
+        "lineage_id_before": "33333333-4444-4555-8666-777777777777",
+        "lineage_id_after": "22222222-3333-4444-8555-666666666666",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 6,
+        "resolve_generation_after": 7,
+        "placeholder_retired": "33333333-4444-4555-8666-777777777777",
+        "predecessor_counter_before": 0,
+        "predecessor_counter_after": 0,
+        "positive_custody_before": 0,
+        "positive_custody_after": 0,
+        "capacity_uploads_before": 1,
+        "capacity_uploads_after": 1
+      }
+    },
+    {
+      "id": "V43",
+      "name": "candidate lineage with an incoming edge and no candidate-scope attempt refuses",
+      "scope_state": "SEALED",
+      "scanned_material": {
+        "source_text": "positive successor mc-d5:0f5c2d7e-1234-4abc-8def-0123456789ab:aaisem2ekvthpcezvk5q",
+        "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072"
+      },
+      "request": {
+        "op": "redeem",
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "observation": {
+          "scanned_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "scanned_bytes_sha256": "c2cc8feeb11c1892fa7e87d788355b6244ced44752ccad917f4673a2f080d072",
+          "scanned_role": "user",
+          "scanned_kind": "text",
+          "native_user_index": 0,
+          "scan_source": {
+            "kind": "direct_scalar"
+          },
+          "observed_markers": [
+            {
+              "kind": "valid",
+              "identity": {
+                "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+                "recognition_token": "aaisem2ekvthpcezvk5q"
+              }
+            }
+          ],
+          "may_have_replied": true,
+          "ack": null
+        },
+        "candidate": {
+          "successor_key": "session-successor-0001",
+          "native_continuation_identity": {
+            "mid": "mid-successor-user-0001",
+            "index": 0,
+            "ordinal": 1940
+          },
+          "continuation_identity": {
+            "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+            "recognition_token": "aaisem2ekvthpcezvk5q"
+          }
+        }
+      },
+      "expected": {
+        "redeem": {
+          "result": {
+            "kind": "REFUSED",
+            "refusal": {
+              "reason": "invalid_arguments",
+              "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+              "details": {
+                "kind": "field",
+                "field": "candidate",
+                "reason": "candidate scope has its own attempts or descent"
+              }
+            }
+          }
+        }
+      },
+      "precedence_row": "P20_sealed_candidate_scope_occupied",
+      "candidate_scope": {
+        "row": "present",
+        "lineage_relation": "other",
+        "attempts_prepared_or_later": 0,
+        "in_edges": 1,
+        "out_edges": 0,
+        "source_uploads_live": 0
+      },
+      "request_bytes_base64": "eyJvcCI6InJlZGVlbSIsIlAiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6Nywib2JzZXJ2YXRpb24iOnsic2Nhbm5lZF9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfSwic2Nhbm5lZF9ieXRlc19zaGEyNTYiOiJjMmNjOGZlZWIxMWMxODkyZmE3ZTg3ZDc4ODM1NWI2MjQ0Y2VkNDQ3NTJjY2FkOTE3ZjQ2NzNhMmYwODBkMDcyIiwic2Nhbm5lZF9yb2xlIjoidXNlciIsInNjYW5uZWRfa2luZCI6InRleHQiLCJuYXRpdmVfdXNlcl9pbmRleCI6MCwic2Nhbl9zb3VyY2UiOnsia2luZCI6ImRpcmVjdF9zY2FsYXIifSwib2JzZXJ2ZWRfbWFya2VycyI6W3sia2luZCI6InZhbGlkIiwiaWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX1dLCJtYXlfaGF2ZV9yZXBsaWVkIjp0cnVlLCJhY2siOm51bGx9LCJjYW5kaWRhdGUiOnsic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJuYXRpdmVfY29udGludWF0aW9uX2lkZW50aXR5Ijp7Im1pZCI6Im1pZC1zdWNjZXNzb3ItdXNlci0wMDAxIiwiaW5kZXgiOjAsIm9yZGluYWwiOjE5NDB9LCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifX19",
+      "expected_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJpbnZhbGlkX2FyZ3VtZW50cyIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoiY2FuZGlkYXRlIiwicmVhc29uIjoiY2FuZGlkYXRlIHNjb3BlIGhhcyBpdHMgb3duIGF0dGVtcHRzIG9yIGRlc2NlbnQifX19fX0=",
+      "transition": {
+        "lineage_id_before": "33333333-4444-4555-8666-777777777777",
+        "lineage_id_after": "33333333-4444-4555-8666-777777777777",
+        "incarnation_before": 3,
+        "incarnation_after": 3,
+        "resolve_generation_before": 6,
+        "resolve_generation_after": 6,
+        "placeholder_retired": null,
+        "predecessor_counter_before": 0,
+        "predecessor_counter_after": 0,
+        "positive_custody_before": 0,
+        "positive_custody_after": 0,
+        "capacity_uploads_before": 0,
+        "capacity_uploads_after": 0
+      }
     }
   ],
   "precondition_space": {
@@ -2687,7 +3752,8 @@
       "delivery_evidence",
       "metadata",
       "observation_class",
-      "candidate"
+      "candidate",
+      "candidate_scope"
     ],
     "dimensions": {
       "scope_state": [
@@ -2731,9 +3797,769 @@
       "metadata": [
         "consistent",
         "inconsistent"
+      ],
+      "candidate_scope": [
+        "absent",
+        "placeholder",
+        "occupied"
       ]
     },
     "delivery_evidence_rule": "missing exactly when may_have_replied is false and ack is null; every other schema-valid pair is ok",
-    "metadata_rule": "consistent no_candidate_block uses null identity, digest, and kind; empty markers; and either user/rank-0 or all-null role/rank. Consistent direct_scalar or text_block uses a non-null identity and digest, user role, text kind, and rank 0. All other schema-valid metadata is inconsistent."
-  }
+    "metadata_rule": "consistent no_candidate_block uses null identity, digest, and kind; empty markers; and either user/rank-0 or all-null role/rank. Consistent direct_scalar or text_block uses a non-null identity and digest, user role, text kind, and rank 0. All other schema-valid metadata is inconsistent.",
+    "candidate_scope_rule": "derive absent from row=absent; derive placeholder from row=present and all occupancy counts zero regardless of lineage_relation; derive occupied when any of source_uploads_live, attempts_prepared_or_later, in_edges, or out_edges is nonzero"
+  },
+  "legacy_expected_bytes": [
+    {
+      "vector_id": "V01",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJub19jYW5kaWRhdGVfYmxvY2sifX19"
+    },
+    {
+      "vector_id": "V02",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJub19jYW5kaWRhdGVfYmxvY2sifX19"
+    },
+    {
+      "vector_id": "V03",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJub19tYXJrZXIifX19"
+    },
+    {
+      "vector_id": "V04",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJtYWxmb3JtZWRfbWFya2VyIn19fQ=="
+    },
+    {
+      "vector_id": "V05",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJtYWxmb3JtZWRfbWFya2VyIn19fQ=="
+    },
+    {
+      "vector_id": "V06",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJtYWxmb3JtZWRfbWFya2VyIn19fQ=="
+    },
+    {
+      "vector_id": "V07",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJtYWxmb3JtZWRfbWFya2VyIn19fQ=="
+    },
+    {
+      "vector_id": "V08",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJtYWxmb3JtZWRfbWFya2VyIn19fQ=="
+    },
+    {
+      "vector_id": "V09",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJkdXBsaWNhdGVfbWFya2VyIn19fQ=="
+    },
+    {
+      "vector_id": "V10",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJVTlJFQ09HTklaRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiY2F1c2UiOiJmb3JlaWduX21hcmtlciJ9fX0="
+    },
+    {
+      "vector_id": "V11",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJzZWFsX21hdGVyaWFsX21pc21hdGNoIiwicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsImRldGFpbHMiOnsia2luZCI6ImZpZWxkIiwiZmllbGQiOiJyZWNvZ25pdGlvbl90b2tlbiIsInJlYXNvbiI6Im1hcmtlciB0b2tlbiBkb2VzIG5vdCBtYXRjaCBzZWFsZWQgcmVjZWlwdCJ9fX19fQ=="
+    },
+    {
+      "vector_id": "V12",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJpbnZhbGlkX2FyZ3VtZW50cyIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoiY2FuZGlkYXRlIiwicmVhc29uIjoiY2FuZGlkYXRlIHJlcXVpcmVzIG9uZSB2YWxpZCBzY29wZWQgbWFya2VyIn19fX19"
+    },
+    {
+      "vector_id": "V13",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJpbnZhbGlkX2FyZ3VtZW50cyIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoiY2FuZGlkYXRlLmNvbnRpbnVhdGlvbl9pZGVudGl0eSIsInJlYXNvbiI6ImNhbmRpZGF0ZSBtYXJrZXIgaWRlbnRpdHkgZGlmZmVycyBmcm9tIG9ic2VydmF0aW9uIn19fX19"
+    },
+    {
+      "vector_id": "V14",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJpbnZhbGlkX2FyZ3VtZW50cyIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoiY2FuZGlkYXRlLm5hdGl2ZV9jb250aW51YXRpb25faWRlbnRpdHkiLCJyZWFzb24iOiJjYW5kaWRhdGUgbmF0aXZlIGlkZW50aXR5IGRpZmZlcnMgZnJvbSBzY2FubmVkIGlkZW50aXR5In19fX19"
+    },
+    {
+      "vector_id": "V15",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTJ9fX0="
+    },
+    {
+      "vector_id": "V16",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjp0cnVlLCJmZW5jZV9nZW5lcmF0aW9uIjoxMn19fQ=="
+    },
+    {
+      "vector_id": "V17",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJhbHJlYWR5X3JlZGVlbWVkIiwicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsImRldGFpbHMiOnsia2luZCI6Indpbm5lciIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIifX19fX0="
+    },
+    {
+      "vector_id": "V18",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJhbHJlYWR5X3JlZGVlbWVkIiwicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsImRldGFpbHMiOnsia2luZCI6Indpbm5lciIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIifX19fX0="
+    },
+    {
+      "vector_id": "V19",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJhbHJlYWR5X3JlZGVlbWVkIiwicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsImRldGFpbHMiOnsia2luZCI6Indpbm5lciIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIifX19fX0="
+    },
+    {
+      "vector_id": "V20",
+      "bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRUZVU0VEIiwicmVmdXNhbCI6eyJyZWFzb24iOiJyZXNvbHZlZF9hYnNlbnQiLCJyZWNlaXB0X2lkIjpudWxsLCJkZXRhaWxzIjp7ImtpbmQiOiJyZXNvbHZlZF9hYnNlbnQiLCJhdHRlbXB0X2lkIjoicmVkZWVtLXNjb3BlLWxvb2t1cCIsImluY2FybmF0aW9uIjo3fX19fX0="
+    }
+  ],
+  "r47_model_seed": {
+    "note": "The world every R47 sequence starts from: P holds one SEALED receipt and S holds a placeholder row with zero occupancy. Identities, fingerprints and surface digests are authored specimens; r47_specimen_preimages records the preimage of each authored digest.",
+    "scopes": [
+      {
+        "P": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "lineage_id": "22222222-3333-4444-8555-666666666666",
+        "resolve_generation": 0,
+        "fence_generation": 12,
+        "source_uploads_live": 0,
+        "attempts_prepared_or_later": 1,
+        "in_edges": 0,
+        "out_edges": 0
+      },
+      {
+        "P": "session-successor-0001",
+        "agent": "agent-main",
+        "incarnation": 3,
+        "lineage_id": "33333333-4444-4555-8666-777777777777",
+        "resolve_generation": 6,
+        "fence_generation": 0,
+        "source_uploads_live": 0,
+        "attempts_prepared_or_later": 0,
+        "in_edges": 0,
+        "out_edges": 0
+      }
+    ],
+    "receipts": [
+      {
+        "receipt_id": "0f5c2d7e-1234-4abc-8def-0123456789ab",
+        "predecessor_key": "session-predecessor-0001",
+        "agent": "agent-main",
+        "incarnation": 7,
+        "lineage_id": "22222222-3333-4444-8555-666666666666",
+        "state": "SEALED",
+        "recognition_token": "aaisem2ekvthpcezvk5q",
+        "F": {
+          "digest": "8273dd5001275e071997f82a4d46744d643b5ae58748b5852d3d05e204189103",
+          "normalization_version": 1,
+          "excluded_additions": []
+        },
+        "fence_generation": 12
+      }
+    ],
+    "next_edge_id": "11111111-2222-4333-8444-555555555555",
+    "next_source_upload_id": "upload-source-s-0002",
+    "next_capacity_upload_id": "upload-capacity-s-0001"
+  },
+  "r47_specimen_preimages": [
+    {
+      "value": "6b25e8a6310ebcd4f992ace9c5cd57cf9cbd7a562989bbd8327de247f13e3afe",
+      "preimage_utf8": "mc-d5-model:F:attempt-s-stale-0001",
+      "use": "the stale attempt's material fingerprint"
+    },
+    {
+      "value": "ea643cf6412e2ab0e1d2ff77337d594f9bcce2d6b499c67ec936f7e5edcedaf7",
+      "preimage_utf8": "mc-d5-model:F:attempt-s-fresh-0002",
+      "use": "the post-adoption attempt's material fingerprint"
+    },
+    {
+      "value": "27ce271ae2834d698dfe572d2c42a7445bb8f15b7073b31a3d7e43ff7caa89b1",
+      "preimage_utf8": "mc-d5-model:surface:tool",
+      "use": "prepare budget tool surface"
+    },
+    {
+      "value": "612d05c7a6a63549d9c6ff4efe0d6fb996ecab3c9e452e801f52f30505865cb5",
+      "preimage_utf8": "mc-d5-model:surface:guidance",
+      "use": "prepare budget guidance surface"
+    },
+    {
+      "value": "8413ca728a41d245b5165b82aefee1b33a91e455036defbbd998774e875ab6a1",
+      "preimage_utf8": "mc-d5-model:surface:system",
+      "use": "prepare budget system surface"
+    },
+    {
+      "value": "468081473a179b44e7a2c76d499f5db8747e6ab78ff040f67eddb3d924fd8d6a",
+      "preimage_utf8": "mc-d5-model:source-segment:attempt-s-stale-0001",
+      "use": "declared source-segment upload digest; these sequences transfer no chunk, because the fence decides at begin"
+    },
+    {
+      "value": "15d3ad197f7ac0b66eaba0d8ac9bd9674b922631ab5bfb48f85a596e8d4cfe3c",
+      "preimage_utf8": "mc-d5-model:source-segment:attempt-s-fresh-0002",
+      "use": "declared source-segment upload digest for the post-adoption attempt"
+    }
+  ],
+  "r47_sequences": [
+    {
+      "id": "S01_adoption_replay",
+      "name": "adoption followed by exact E1 replay returns the stored edge without a second adoption or counter effect",
+      "note": "Both steps are executed against one store: the second redeem sees the scope the first one wrote.",
+      "steps": [
+        {
+          "op": "redeem",
+          "vector_id": "V35",
+          "result_bytes_base64": "eyJraW5kIjoiUkVERUVNRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiZWRnZSI6eyJlZGdlX2lkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwicHJlZGVjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1wcmVkZWNlc3Nvci0wMDAxIiwic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJGIjp7ImRpZ2VzdCI6IjgyNzNkZDUwMDEyNzVlMDcxOTk3ZjgyYTRkNDY3NDRkNjQzYjVhZTU4NzQ4YjU4NTJkM2QwNWUyMDQxODkxMDMiLCJub3JtYWxpemF0aW9uX3ZlcnNpb24iOjEsImV4Y2x1ZGVkX2FkZGl0aW9ucyI6W119LCJsaW5lYWdlX2lkIjoiMjIyMjIyMjItMzMzMy00NDQ0LTg1NTUtNjY2NjY2NjY2NjY2IiwiY29udGludWF0aW9uX2lkZW50aXR5Ijp7InJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJyZWNvZ25pdGlvbl90b2tlbiI6ImFhaXNlbTJla3Z0aHBjZXp2azVxIn0sIm5hdGl2ZV9jb250aW51YXRpb25faWRlbnRpdHkiOnsibWlkIjoibWlkLXN1Y2Nlc3Nvci11c2VyLTAwMDEiLCJpbmRleCI6MCwib3JkaW5hbCI6MTk0MH19LCJleGlzdGluZyI6ZmFsc2UsImZlbmNlX2dlbmVyYXRpb24iOjEyLCJsaW5lYWdlX2Fkb3B0ZWRfZnJvbSI6IjMzMzMzMzMzLTQ0NDQtNDU1NS04NjY2LTc3Nzc3Nzc3Nzc3NyJ9",
+          "response_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjoiMzMzMzMzMzMtNDQ0NC00NTU1LTg2NjYtNzc3Nzc3Nzc3Nzc3In19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            },
+            {
+              "P": "session-predecessor-0001",
+              "agent": "agent-main",
+              "incarnation": 7,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 0,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 1,
+              "in_edges": 0,
+              "out_edges": 1,
+              "capacity_uploads_staged": 0,
+              "receipt_state": "REDEEMED"
+            }
+          ]
+        },
+        {
+          "op": "redeem",
+          "note": "the replay mints no second edge and advances no generation",
+          "vector_id": "V39",
+          "result_bytes_base64": "eyJraW5kIjoiUkVERUVNRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiZWRnZSI6eyJlZGdlX2lkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwicHJlZGVjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1wcmVkZWNlc3Nvci0wMDAxIiwic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJGIjp7ImRpZ2VzdCI6IjgyNzNkZDUwMDEyNzVlMDcxOTk3ZjgyYTRkNDY3NDRkNjQzYjVhZTU4NzQ4YjU4NTJkM2QwNWUyMDQxODkxMDMiLCJub3JtYWxpemF0aW9uX3ZlcnNpb24iOjEsImV4Y2x1ZGVkX2FkZGl0aW9ucyI6W119LCJsaW5lYWdlX2lkIjoiMjIyMjIyMjItMzMzMy00NDQ0LTg1NTUtNjY2NjY2NjY2NjY2IiwiY29udGludWF0aW9uX2lkZW50aXR5Ijp7InJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJyZWNvZ25pdGlvbl90b2tlbiI6ImFhaXNlbTJla3Z0aHBjZXp2azVxIn0sIm5hdGl2ZV9jb250aW51YXRpb25faWRlbnRpdHkiOnsibWlkIjoibWlkLXN1Y2Nlc3Nvci11c2VyLTAwMDEiLCJpbmRleCI6MCwib3JkaW5hbCI6MTk0MH19LCJleGlzdGluZyI6dHJ1ZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTJ9",
+          "response_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjp0cnVlLCJmZW5jZV9nZW5lcmF0aW9uIjoxMn19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            },
+            {
+              "P": "session-predecessor-0001",
+              "agent": "agent-main",
+              "incarnation": 7,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 0,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 1,
+              "in_edges": 0,
+              "out_edges": 1,
+              "capacity_uploads_staged": 0,
+              "receipt_state": "REDEEMED"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S02_adoption_then_scope_open",
+      "name": "scope.open after adoption returns the existing DTO with the predecessor lineage and created false",
+      "note": "ScopeResult gains no field for the adoption: the rebound row is simply what the existing OPENED arm reports.",
+      "steps": [
+        {
+          "op": "redeem",
+          "vector_id": "V35",
+          "result_bytes_base64": "eyJraW5kIjoiUkVERUVNRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiZWRnZSI6eyJlZGdlX2lkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwicHJlZGVjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1wcmVkZWNlc3Nvci0wMDAxIiwic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJGIjp7ImRpZ2VzdCI6IjgyNzNkZDUwMDEyNzVlMDcxOTk3ZjgyYTRkNDY3NDRkNjQzYjVhZTU4NzQ4YjU4NTJkM2QwNWUyMDQxODkxMDMiLCJub3JtYWxpemF0aW9uX3ZlcnNpb24iOjEsImV4Y2x1ZGVkX2FkZGl0aW9ucyI6W119LCJsaW5lYWdlX2lkIjoiMjIyMjIyMjItMzMzMy00NDQ0LTg1NTUtNjY2NjY2NjY2NjY2IiwiY29udGludWF0aW9uX2lkZW50aXR5Ijp7InJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJyZWNvZ25pdGlvbl90b2tlbiI6ImFhaXNlbTJla3Z0aHBjZXp2azVxIn0sIm5hdGl2ZV9jb250aW51YXRpb25faWRlbnRpdHkiOnsibWlkIjoibWlkLXN1Y2Nlc3Nvci11c2VyLTAwMDEiLCJpbmRleCI6MCwib3JkaW5hbCI6MTk0MH19LCJleGlzdGluZyI6ZmFsc2UsImZlbmNlX2dlbmVyYXRpb24iOjEyLCJsaW5lYWdlX2Fkb3B0ZWRfZnJvbSI6IjMzMzMzMzMzLTQ0NDQtNDU1NS04NjY2LTc3Nzc3Nzc3Nzc3NyJ9",
+          "response_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjoiMzMzMzMzMzMtNDQ0NC00NTU1LTg2NjYtNzc3Nzc3Nzc3Nzc3In19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "scope.open",
+          "request_bytes_base64": "eyJvcCI6InNjb3BlLm9wZW4iLCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiJ9",
+          "result_bytes_base64": "eyJraW5kIjoiT1BFTkVEIiwiaW5jYXJuYXRpb24iOjMsImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJyZXNvbHZlX2dlbmVyYXRpb24iOjcsImNyZWF0ZWQiOmZhbHNlfQ==",
+          "response_bytes_base64": "eyJzY29wZS5vcGVuIjp7InJlc3VsdCI6eyJraW5kIjoiT1BFTkVEIiwiaW5jYXJuYXRpb24iOjMsImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJyZXNvbHZlX2dlbmVyYXRpb24iOjcsImNyZWF0ZWQiOmZhbHNlfX19",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S03_generation_fence",
+      "name": "pre-adoption ticket is a gateway-local fact and remote prepare, source upload and resolve apply the generation fence",
+      "note": "Each step is an independent probe of the arrival check against the shared store, not one gateway transcript: the stale ticket is offered to both ticket-bearing families (prepare and lineage.begin) and then closed by attempt.resolve, and a ticket sampled after the adoption is offered to the same two.",
+      "steps": [
+        {
+          "op": "scope.open",
+          "note": "the placeholder row before the adoption",
+          "request_bytes_base64": "eyJvcCI6InNjb3BlLm9wZW4iLCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiJ9",
+          "result_bytes_base64": "eyJraW5kIjoiT1BFTkVEIiwiaW5jYXJuYXRpb24iOjMsImxpbmVhZ2VfaWQiOiIzMzMzMzMzMy00NDQ0LTQ1NTUtODY2Ni03Nzc3Nzc3Nzc3NzciLCJyZXNvbHZlX2dlbmVyYXRpb24iOjYsImNyZWF0ZWQiOmZhbHNlfQ==",
+          "response_bytes_base64": "eyJzY29wZS5vcGVuIjp7InJlc3VsdCI6eyJraW5kIjoiT1BFTkVEIiwiaW5jYXJuYXRpb24iOjMsImxpbmVhZ2VfaWQiOiIzMzMzMzMzMy00NDQ0LTQ1NTUtODY2Ni03Nzc3Nzc3Nzc3NzciLCJyZXNvbHZlX2dlbmVyYXRpb24iOjYsImNyZWF0ZWQiOmZhbHNlfX19",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "33333333-4444-4555-8666-777777777777",
+              "resolve_generation": 6,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 0,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "attempt.ticket",
+          "note": "the sample writes no row and moves no generation; the bind that follows it is gateway-local (R47b)",
+          "request_bytes_base64": "eyJvcCI6InRpY2tldCIsIlAiOiJzZXNzaW9uLXN1Y2Nlc3Nvci0wMDAxIiwiYWdlbnQiOiJhZ2VudC1tYWluIiwiaW5jYXJuYXRpb24iOjN9",
+          "result_bytes_base64": "eyJraW5kIjoiSVNTVUVEIiwidGlja2V0Ijp7InJlc29sdmVfZ2VuZXJhdGlvbiI6NiwiUCI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6M319",
+          "response_bytes_base64": "eyJ0aWNrZXQiOnsicmVzdWx0Ijp7ImtpbmQiOiJJU1NVRUQiLCJ0aWNrZXQiOnsicmVzb2x2ZV9nZW5lcmF0aW9uIjo2LCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsImluY2FybmF0aW9uIjozfX19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "33333333-4444-4555-8666-777777777777",
+              "resolve_generation": 6,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 0,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "redeem",
+          "note": "the adoption rebinds the lineage and advances the generation 6 -> 7",
+          "vector_id": "V35",
+          "result_bytes_base64": "eyJraW5kIjoiUkVERUVNRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiZWRnZSI6eyJlZGdlX2lkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwicHJlZGVjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1wcmVkZWNlc3Nvci0wMDAxIiwic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJGIjp7ImRpZ2VzdCI6IjgyNzNkZDUwMDEyNzVlMDcxOTk3ZjgyYTRkNDY3NDRkNjQzYjVhZTU4NzQ4YjU4NTJkM2QwNWUyMDQxODkxMDMiLCJub3JtYWxpemF0aW9uX3ZlcnNpb24iOjEsImV4Y2x1ZGVkX2FkZGl0aW9ucyI6W119LCJsaW5lYWdlX2lkIjoiMjIyMjIyMjItMzMzMy00NDQ0LTg1NTUtNjY2NjY2NjY2NjY2IiwiY29udGludWF0aW9uX2lkZW50aXR5Ijp7InJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJyZWNvZ25pdGlvbl90b2tlbiI6ImFhaXNlbTJla3Z0aHBjZXp2azVxIn0sIm5hdGl2ZV9jb250aW51YXRpb25faWRlbnRpdHkiOnsibWlkIjoibWlkLXN1Y2Nlc3Nvci11c2VyLTAwMDEiLCJpbmRleCI6MCwib3JkaW5hbCI6MTk0MH19LCJleGlzdGluZyI6ZmFsc2UsImZlbmNlX2dlbmVyYXRpb24iOjEyLCJsaW5lYWdlX2Fkb3B0ZWRfZnJvbSI6IjMzMzMzMzMzLTQ0NDQtNDU1NS04NjY2LTc3Nzc3Nzc3Nzc3NyJ9",
+          "response_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjoiMzMzMzMzMzMtNDQ0NC00NTU1LTg2NjYtNzc3Nzc3Nzc3Nzc3In19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            },
+            {
+              "P": "session-predecessor-0001",
+              "agent": "agent-main",
+              "incarnation": 7,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 0,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 1,
+              "in_edges": 0,
+              "out_edges": 1,
+              "capacity_uploads_staged": 0,
+              "receipt_state": "REDEEMED"
+            }
+          ]
+        },
+        {
+          "op": "prepare",
+          "note": "PrepareResult carries the proof inside attempt_outcome; it has no top-level kind or negative",
+          "request_bytes_base64": "eyJvcCI6InByZXBhcmUiLCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiNmIyNWU4YTYzMTBlYmNkNGY5OTJhY2U5YzVjZDU3Y2Y5Y2JkN2E1NjI5ODliYmQ4MzI3ZGUyNDdmMTNlM2FmZSIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sInNvdXJjZV9zZWdtZW50Ijp7ImtpbmQiOiJpbmxpbmUiLCJzZWdtZW50Ijp7Im5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwibWVzc2FnZXMiOlt7InBvc2l0aW9uIjowLCJvcmRpbmFsIjoxOTQxLCJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMiIsInJvbGUiOiJ1c2VyIiwiYmxvY2tzIjpbeyJpbmRleCI6MCwia2luZCI6InRleHQiLCJieXRlcyI6ImV5SjBaWGgwSWpvaWMzVmpZMlZ6YzI5eUlIUjFjbTRnYjI1bEluMD0iLCJwcm92ZW5hbmNlIjp7ImtpbmQiOiJuYXRpdmUifSwidG9vbF9saW5rcyI6W119XX1dLCJleGNsdWRlZF9hZGRpdGlvbnMiOltdfX0sImF0dGVtcHRfaWQiOiJhdHRlbXB0LXMtc3RhbGUtMDAwMSIsImluY2FybmF0aW9uIjozLCJhZG1pc3Npb25fdGlja2V0Ijp7InJlc29sdmVfZ2VuZXJhdGlvbiI6NiwiUCI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6M30sImluZ3Jlc3MiOnsiYm9vdF9pZCI6ImJvb3Qtc3VjY2Vzc29yLTAwMDEiLCJ3YXRlcm1hcmsiOjQxLCJzZXF1ZW5jZV9zZWVuIjo0MSwib3duZXJzaGlwX2lkIjoiaW5ncmVzcy1zdWNjZXNzb3ItMDAwMSJ9LCJidWRnZXQiOnsic2NoZW1hX3ZlcnNpb24iOjEsImdlb21ldHJ5Ijp7InVzYWJsZV9zb2Z0IjoxNzAwMDAsInVzYWJsZV9oYXJkIjoxODAwMDAsImFic29sdXRlX3dhbGwiOm51bGwsImRlcml2YXRpb24iOiJhdXRob3JlZCBzcGVjaW1lbiBnZW9tZXRyeSBmb3IgdGhlIGZlbmNlIHNlcXVlbmNlcyIsInJlc2VydmVfYWNjb3VudGluZyI6Im9uY2VfY2FydmVkIn0sImVudmVsb3BlIjp7ImtpbmQiOiJhYnNlbnQiLCJyZWFzb24iOiJ0aGUgZ2F0ZXdheSByZXN0YXJ0ZWQgYmVmb3JlIGl0IGNhcHR1cmVkIHRoaXMgcmVxdWVzdCdzIGVudmVsb3BlIn0sImludGVuZGVkX25vcm1hbF9wcm9qZWN0aW9uIjp7Im1vZGVsIjoiY2xhdWRlLXNvbm5ldC00LTUiLCJwcm9maWxlIjoiY2xhdWRlLWNvZGUtYW50aHJvcGljIiwidG9vbF9zdXJmYWNlIjoiMjdjZTI3MWFlMjgzNGQ2OThkZmU1NzJkMmM0MmE3NDQ1YmI4ZjE1YjcwNzNiMzFhM2Q3ZTQzZmY3Y2FhODliMSIsImd1aWRhbmNlX3N1cmZhY2UiOiI2MTJkMDVjN2E2YTYzNTQ5ZDljNmZmNGVmZTBkNmZiOTk2ZWNhYjNjOWU0NTJlODAxZjUyZjMwNTA1ODY1Y2I1Iiwic3lzdGVtX3N1cmZhY2UiOiI4NDEzY2E3MjhhNDFkMjQ1YjUxNjViODJhZWZlZTFiMzNhOTFlNDU1MDM2ZGVmYmJkOTk4Nzc0ZTg3NWFiNmExIn19fQ==",
+          "result_bytes_base64": "eyJhdHRlbXB0X291dGNvbWUiOnsia2luZCI6IlJFRlVTRUQiLCJyZWZ1c2FsIjp7InJlYXNvbiI6InJlc29sdmVkX2Fic2VudCIsInJlY2VpcHRfaWQiOm51bGwsImRldGFpbHMiOnsia2luZCI6InJlc29sdmVkX2Fic2VudCIsImF0dGVtcHRfaWQiOiJhdHRlbXB0LXMtc3RhbGUtMDAwMSIsImluY2FybmF0aW9uIjozfX0sIm5lZ2F0aXZlIjp7ImtpbmQiOiJnZW5lcmF0aW9uX2ZlbmNlIiwiaW5jYXJuYXRpb24iOjMsImludmFsaWRhdGVkX3RpY2tldF9nZW5lcmF0aW9uIjo2LCJmZW5jZWRfYnkiOjd9fSwicF9mZW5jZSI6eyJraW5kIjoibm9uZSJ9LCJmZW5jZV9nZW5lcmF0aW9uIjowfQ==",
+          "response_bytes_base64": "eyJwcmVwYXJlIjp7InJlc3VsdCI6eyJhdHRlbXB0X291dGNvbWUiOnsia2luZCI6IlJFRlVTRUQiLCJyZWZ1c2FsIjp7InJlYXNvbiI6InJlc29sdmVkX2Fic2VudCIsInJlY2VpcHRfaWQiOm51bGwsImRldGFpbHMiOnsia2luZCI6InJlc29sdmVkX2Fic2VudCIsImF0dGVtcHRfaWQiOiJhdHRlbXB0LXMtc3RhbGUtMDAwMSIsImluY2FybmF0aW9uIjozfX0sIm5lZ2F0aXZlIjp7ImtpbmQiOiJnZW5lcmF0aW9uX2ZlbmNlIiwiaW5jYXJuYXRpb24iOjMsImludmFsaWRhdGVkX3RpY2tldF9nZW5lcmF0aW9uIjo2LCJmZW5jZWRfYnkiOjd9fSwicF9mZW5jZSI6eyJraW5kIjoibm9uZSJ9LCJmZW5jZV9nZW5lcmF0aW9uIjowfX19",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "lineage.begin",
+          "note": "the source-segment upload carries the same stale ticket and is refused, but BeginResult has no placement for a negative proof, so it refuses plainly and the proof stays with prepare/resolve",
+          "request_bytes_base64": "eyJvcCI6ImJlZ2luIiwiYXR0ZW1wdCI6eyJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXN1Y2Nlc3Nvci0wMDAxIiwiYWdlbnQiOiJhZ2VudC1tYWluIiwiRiI6eyJkaWdlc3QiOiI2YjI1ZThhNjMxMGViY2Q0Zjk5MmFjZTljNWNkNTdjZjljYmQ3YTU2Mjk4OWJiZDgzMjdkZTI0N2YxM2UzYWZlIiwibm9ybWFsaXphdGlvbl92ZXJzaW9uIjoxLCJleGNsdWRlZF9hZGRpdGlvbnMiOltdfSwiYXR0ZW1wdF9pZCI6ImF0dGVtcHQtcy1zdGFsZS0wMDAxIiwiaW5jYXJuYXRpb24iOjN9LCJ0aWNrZXQiOnsicmVzb2x2ZV9nZW5lcmF0aW9uIjo2LCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsImluY2FybmF0aW9uIjozfSwia2luZCI6InNvdXJjZV9zZWdtZW50IiwidG90YWxfYnl0ZXMiOjEzMTA3MjAsInRvdGFsX2NodW5rcyI6MiwiZGlnZXN0IjoiNDY4MDgxNDczYTE3OWI0NGU3YTJjNzZkNDk5ZjVkYjg3NDdlNmFiNzhmZjA0MGY2N2VkZGIzZDkyNGZkOGQ2YSJ9",
+          "result_bytes_base64": "eyJraW5kIjoiUkVGVVNFRCIsInJlZnVzYWwiOnsicmVhc29uIjoidGlja2V0X2ludmFsaWQiLCJyZWNlaXB0X2lkIjpudWxsLCJkZXRhaWxzIjp7ImtpbmQiOiJmaWVsZCIsImZpZWxkIjoidGlja2V0IiwicmVhc29uIjoiYWRtaXNzaW9uIHRpY2tldCBnZW5lcmF0aW9uIGlzIG5vIGxvbmdlciBjdXJyZW50In19fQ==",
+          "response_bytes_base64": "eyJiZWdpbiI6eyJyZXN1bHQiOnsia2luZCI6IlJFRlVTRUQiLCJyZWZ1c2FsIjp7InJlYXNvbiI6InRpY2tldF9pbnZhbGlkIiwicmVjZWlwdF9pZCI6bnVsbCwiZGV0YWlscyI6eyJraW5kIjoiZmllbGQiLCJmaWVsZCI6InRpY2tldCIsInJlYXNvbiI6ImFkbWlzc2lvbiB0aWNrZXQgZ2VuZXJhdGlvbiBpcyBubyBsb25nZXIgY3VycmVudCJ9fX19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "attempt.resolve",
+          "note": "clause 8 returns the outcome, the P fence and the generations, so the terminal refusal rides in RESOLVED.attempt_outcome and never as UNKNOWN; R1 keeps the generation unbumped at 7",
+          "request_bytes_base64": "eyJvcCI6InJlc29sdmUiLCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsImluY2FybmF0aW9uIjozLCJhdHRlbXB0X2lkIjoiYXR0ZW1wdC1zLXN0YWxlLTAwMDEiLCJGIjp7ImRpZ2VzdCI6IjZiMjVlOGE2MzEwZWJjZDRmOTkyYWNlOWM1Y2Q1N2NmOWNiZDdhNTYyOTg5YmJkODMyN2RlMjQ3ZjEzZTNhZmUiLCJub3JtYWxpemF0aW9uX3ZlcnNpb24iOjEsImV4Y2x1ZGVkX2FkZGl0aW9ucyI6W119LCJhZG1pc3Npb25fdGlja2V0Ijp7InJlc29sdmVfZ2VuZXJhdGlvbiI6NiwiUCI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6M319",
+          "result_bytes_base64": "eyJraW5kIjoiUkVTT0xWRUQiLCJhdHRlbXB0X291dGNvbWUiOnsia2luZCI6IlJFRlVTRUQiLCJyZWZ1c2FsIjp7InJlYXNvbiI6InJlc29sdmVkX2Fic2VudCIsInJlY2VpcHRfaWQiOm51bGwsImRldGFpbHMiOnsia2luZCI6InJlc29sdmVkX2Fic2VudCIsImF0dGVtcHRfaWQiOiJhdHRlbXB0LXMtc3RhbGUtMDAwMSIsImluY2FybmF0aW9uIjozfX0sIm5lZ2F0aXZlIjp7ImtpbmQiOiJnZW5lcmF0aW9uX2ZlbmNlIiwiaW5jYXJuYXRpb24iOjMsImludmFsaWRhdGVkX3RpY2tldF9nZW5lcmF0aW9uIjo2LCJmZW5jZWRfYnkiOjd9fSwicF9mZW5jZSI6eyJraW5kIjoibm9uZSJ9LCJmZW5jZV9nZW5lcmF0aW9uIjowLCJyZXNvbHZlX2dlbmVyYXRpb24iOjd9",
+          "response_bytes_base64": "eyJyZXNvbHZlIjp7InJlc3VsdCI6eyJraW5kIjoiUkVTT0xWRUQiLCJhdHRlbXB0X291dGNvbWUiOnsia2luZCI6IlJFRlVTRUQiLCJyZWZ1c2FsIjp7InJlYXNvbiI6InJlc29sdmVkX2Fic2VudCIsInJlY2VpcHRfaWQiOm51bGwsImRldGFpbHMiOnsia2luZCI6InJlc29sdmVkX2Fic2VudCIsImF0dGVtcHRfaWQiOiJhdHRlbXB0LXMtc3RhbGUtMDAwMSIsImluY2FybmF0aW9uIjozfX0sIm5lZ2F0aXZlIjp7ImtpbmQiOiJnZW5lcmF0aW9uX2ZlbmNlIiwiaW5jYXJuYXRpb24iOjMsImludmFsaWRhdGVkX3RpY2tldF9nZW5lcmF0aW9uIjo2LCJmZW5jZWRfYnkiOjd9fSwicF9mZW5jZSI6eyJraW5kIjoibm9uZSJ9LCJmZW5jZV9nZW5lcmF0aW9uIjowLCJyZXNvbHZlX2dlbmVyYXRpb24iOjd9fX0=",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "attempt.ticket",
+          "note": "a ticket sampled after the adoption carries the advanced generation",
+          "request_bytes_base64": "eyJvcCI6InRpY2tldCIsIlAiOiJzZXNzaW9uLXN1Y2Nlc3Nvci0wMDAxIiwiYWdlbnQiOiJhZ2VudC1tYWluIiwiaW5jYXJuYXRpb24iOjN9",
+          "result_bytes_base64": "eyJraW5kIjoiSVNTVUVEIiwidGlja2V0Ijp7InJlc29sdmVfZ2VuZXJhdGlvbiI6NywiUCI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6M319",
+          "response_bytes_base64": "eyJ0aWNrZXQiOnsicmVzdWx0Ijp7ImtpbmQiOiJJU1NVRUQiLCJ0aWNrZXQiOnsicmVzb2x2ZV9nZW5lcmF0aW9uIjo3LCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsImluY2FybmF0aW9uIjozfX19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "lineage.begin",
+          "note": "the fresh ticket passes the arrival check; a live source upload is occupancy under S",
+          "request_bytes_base64": "eyJvcCI6ImJlZ2luIiwiYXR0ZW1wdCI6eyJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXN1Y2Nlc3Nvci0wMDAxIiwiYWdlbnQiOiJhZ2VudC1tYWluIiwiRiI6eyJkaWdlc3QiOiJlYTY0M2NmNjQxMmUyYWIwZTFkMmZmNzczMzdkNTk0ZjliY2NlMmQ2YjQ5OWM2N2VjOTM2ZjdlNWVkY2VkYWY3Iiwibm9ybWFsaXphdGlvbl92ZXJzaW9uIjoxLCJleGNsdWRlZF9hZGRpdGlvbnMiOltdfSwiYXR0ZW1wdF9pZCI6ImF0dGVtcHQtcy1mcmVzaC0wMDAyIiwiaW5jYXJuYXRpb24iOjN9LCJ0aWNrZXQiOnsicmVzb2x2ZV9nZW5lcmF0aW9uIjo3LCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsImluY2FybmF0aW9uIjozfSwia2luZCI6InNvdXJjZV9zZWdtZW50IiwidG90YWxfYnl0ZXMiOjEzMTA3MjAsInRvdGFsX2NodW5rcyI6MiwiZGlnZXN0IjoiMTVkM2FkMTk3ZjdhYzBiNjZlYWJhMGQ4YWM5YmQ5Njc0YjkyMjYzMWFiNWJmYjQ4Zjg1YTU5NmU4ZDRjZmUzYyJ9",
+          "result_bytes_base64": "eyJraW5kIjoiQkVHVU4iLCJ1cGxvYWRfaWQiOiJ1cGxvYWQtc291cmNlLXMtMDAwMiJ9",
+          "response_bytes_base64": "eyJiZWdpbiI6eyJyZXN1bHQiOnsia2luZCI6IkJFR1VOIiwidXBsb2FkX2lkIjoidXBsb2FkLXNvdXJjZS1zLTAwMDIifX19",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 1,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "prepare",
+          "note": "the new attempt is never re-ticketed from the stale one; it prepares normally",
+          "request_bytes_base64": "eyJvcCI6InByZXBhcmUiLCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiZWE2NDNjZjY0MTJlMmFiMGUxZDJmZjc3MzM3ZDU5NGY5YmNjZTJkNmI0OTljNjdlYzkzNmY3ZTVlZGNlZGFmNyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sInNvdXJjZV9zZWdtZW50Ijp7ImtpbmQiOiJpbmxpbmUiLCJzZWdtZW50Ijp7Im5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwibWVzc2FnZXMiOlt7InBvc2l0aW9uIjowLCJvcmRpbmFsIjoxOTQyLCJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMyIsInJvbGUiOiJ1c2VyIiwiYmxvY2tzIjpbeyJpbmRleCI6MCwia2luZCI6InRleHQiLCJieXRlcyI6ImV5SjBaWGgwSWpvaWMzVmpZMlZ6YzI5eUlIUjFjbTRnYjI1bEluMD0iLCJwcm92ZW5hbmNlIjp7ImtpbmQiOiJuYXRpdmUifSwidG9vbF9saW5rcyI6W119XX1dLCJleGNsdWRlZF9hZGRpdGlvbnMiOltdfX0sImF0dGVtcHRfaWQiOiJhdHRlbXB0LXMtZnJlc2gtMDAwMiIsImluY2FybmF0aW9uIjozLCJhZG1pc3Npb25fdGlja2V0Ijp7InJlc29sdmVfZ2VuZXJhdGlvbiI6NywiUCI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6M30sImluZ3Jlc3MiOnsiYm9vdF9pZCI6ImJvb3Qtc3VjY2Vzc29yLTAwMDEiLCJ3YXRlcm1hcmsiOjQxLCJzZXF1ZW5jZV9zZWVuIjo0MSwib3duZXJzaGlwX2lkIjoiaW5ncmVzcy1zdWNjZXNzb3ItMDAwMSJ9LCJidWRnZXQiOnsic2NoZW1hX3ZlcnNpb24iOjEsImdlb21ldHJ5Ijp7InVzYWJsZV9zb2Z0IjoxNzAwMDAsInVzYWJsZV9oYXJkIjoxODAwMDAsImFic29sdXRlX3dhbGwiOm51bGwsImRlcml2YXRpb24iOiJhdXRob3JlZCBzcGVjaW1lbiBnZW9tZXRyeSBmb3IgdGhlIGZlbmNlIHNlcXVlbmNlcyIsInJlc2VydmVfYWNjb3VudGluZyI6Im9uY2VfY2FydmVkIn0sImVudmVsb3BlIjp7ImtpbmQiOiJhYnNlbnQiLCJyZWFzb24iOiJ0aGUgZ2F0ZXdheSByZXN0YXJ0ZWQgYmVmb3JlIGl0IGNhcHR1cmVkIHRoaXMgcmVxdWVzdCdzIGVudmVsb3BlIn0sImludGVuZGVkX25vcm1hbF9wcm9qZWN0aW9uIjp7Im1vZGVsIjoiY2xhdWRlLXNvbm5ldC00LTUiLCJwcm9maWxlIjoiY2xhdWRlLWNvZGUtYW50aHJvcGljIiwidG9vbF9zdXJmYWNlIjoiMjdjZTI3MWFlMjgzNGQ2OThkZmU1NzJkMmM0MmE3NDQ1YmI4ZjE1YjcwNzNiMzFhM2Q3ZTQzZmY3Y2FhODliMSIsImd1aWRhbmNlX3N1cmZhY2UiOiI2MTJkMDVjN2E2YTYzNTQ5ZDljNmZmNGVmZTBkNmZiOTk2ZWNhYjNjOWU0NTJlODAxZjUyZjMwNTA1ODY1Y2I1Iiwic3lzdGVtX3N1cmZhY2UiOiI4NDEzY2E3MjhhNDFkMjQ1YjUxNjViODJhZWZlZTFiMzNhOTFlNDU1MDM2ZGVmYmJkOTk4Nzc0ZTg3NWFiNmExIn19fQ==",
+          "bounded_outcome": {
+            "kind": "prepare_admitted",
+            "attempt_id": "attempt-s-fresh-0002",
+            "unmodelled_wire_result": "an admitted prepare seals, and a SEALED AttemptOutcome carries a whole ReceiptV1 that no R47 vector authors; the model records the admission as occupancy and stops there"
+          },
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 1,
+              "attempts_prepared_or_later": 1,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S04_concurrent_open_pre_adoption",
+      "name": "concurrent scope.open linearizes before adoption and returns the complete old row",
+      "note": "The same two operations in the two possible orders; S04 opens first, S05 adopts first.",
+      "steps": [
+        {
+          "op": "scope.open",
+          "request_bytes_base64": "eyJvcCI6InNjb3BlLm9wZW4iLCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiJ9",
+          "result_bytes_base64": "eyJraW5kIjoiT1BFTkVEIiwiaW5jYXJuYXRpb24iOjMsImxpbmVhZ2VfaWQiOiIzMzMzMzMzMy00NDQ0LTQ1NTUtODY2Ni03Nzc3Nzc3Nzc3NzciLCJyZXNvbHZlX2dlbmVyYXRpb24iOjYsImNyZWF0ZWQiOmZhbHNlfQ==",
+          "response_bytes_base64": "eyJzY29wZS5vcGVuIjp7InJlc3VsdCI6eyJraW5kIjoiT1BFTkVEIiwiaW5jYXJuYXRpb24iOjMsImxpbmVhZ2VfaWQiOiIzMzMzMzMzMy00NDQ0LTQ1NTUtODY2Ni03Nzc3Nzc3Nzc3NzciLCJyZXNvbHZlX2dlbmVyYXRpb24iOjYsImNyZWF0ZWQiOmZhbHNlfX19",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "33333333-4444-4555-8666-777777777777",
+              "resolve_generation": 6,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 0,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "redeem",
+          "vector_id": "V35",
+          "result_bytes_base64": "eyJraW5kIjoiUkVERUVNRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiZWRnZSI6eyJlZGdlX2lkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwicHJlZGVjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1wcmVkZWNlc3Nvci0wMDAxIiwic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJGIjp7ImRpZ2VzdCI6IjgyNzNkZDUwMDEyNzVlMDcxOTk3ZjgyYTRkNDY3NDRkNjQzYjVhZTU4NzQ4YjU4NTJkM2QwNWUyMDQxODkxMDMiLCJub3JtYWxpemF0aW9uX3ZlcnNpb24iOjEsImV4Y2x1ZGVkX2FkZGl0aW9ucyI6W119LCJsaW5lYWdlX2lkIjoiMjIyMjIyMjItMzMzMy00NDQ0LTg1NTUtNjY2NjY2NjY2NjY2IiwiY29udGludWF0aW9uX2lkZW50aXR5Ijp7InJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJyZWNvZ25pdGlvbl90b2tlbiI6ImFhaXNlbTJla3Z0aHBjZXp2azVxIn0sIm5hdGl2ZV9jb250aW51YXRpb25faWRlbnRpdHkiOnsibWlkIjoibWlkLXN1Y2Nlc3Nvci11c2VyLTAwMDEiLCJpbmRleCI6MCwib3JkaW5hbCI6MTk0MH19LCJleGlzdGluZyI6ZmFsc2UsImZlbmNlX2dlbmVyYXRpb24iOjEyLCJsaW5lYWdlX2Fkb3B0ZWRfZnJvbSI6IjMzMzMzMzMzLTQ0NDQtNDU1NS04NjY2LTc3Nzc3Nzc3Nzc3NyJ9",
+          "response_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjoiMzMzMzMzMzMtNDQ0NC00NTU1LTg2NjYtNzc3Nzc3Nzc3Nzc3In19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S05_concurrent_open_post_adoption",
+      "name": "concurrent scope.open linearizes after adoption and returns the complete rebound row",
+      "note": "Neither order can observe a half-applied row: the lineage and the generation move together.",
+      "steps": [
+        {
+          "op": "redeem",
+          "vector_id": "V35",
+          "result_bytes_base64": "eyJraW5kIjoiUkVERUVNRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiZWRnZSI6eyJlZGdlX2lkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwicHJlZGVjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1wcmVkZWNlc3Nvci0wMDAxIiwic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJGIjp7ImRpZ2VzdCI6IjgyNzNkZDUwMDEyNzVlMDcxOTk3ZjgyYTRkNDY3NDRkNjQzYjVhZTU4NzQ4YjU4NTJkM2QwNWUyMDQxODkxMDMiLCJub3JtYWxpemF0aW9uX3ZlcnNpb24iOjEsImV4Y2x1ZGVkX2FkZGl0aW9ucyI6W119LCJsaW5lYWdlX2lkIjoiMjIyMjIyMjItMzMzMy00NDQ0LTg1NTUtNjY2NjY2NjY2NjY2IiwiY29udGludWF0aW9uX2lkZW50aXR5Ijp7InJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJyZWNvZ25pdGlvbl90b2tlbiI6ImFhaXNlbTJla3Z0aHBjZXp2azVxIn0sIm5hdGl2ZV9jb250aW51YXRpb25faWRlbnRpdHkiOnsibWlkIjoibWlkLXN1Y2Nlc3Nvci11c2VyLTAwMDEiLCJpbmRleCI6MCwib3JkaW5hbCI6MTk0MH19LCJleGlzdGluZyI6ZmFsc2UsImZlbmNlX2dlbmVyYXRpb24iOjEyLCJsaW5lYWdlX2Fkb3B0ZWRfZnJvbSI6IjMzMzMzMzMzLTQ0NDQtNDU1NS04NjY2LTc3Nzc3Nzc3Nzc3NyJ9",
+          "response_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjoiMzMzMzMzMzMtNDQ0NC00NTU1LTg2NjYtNzc3Nzc3Nzc3Nzc3In19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "scope.open",
+          "request_bytes_base64": "eyJvcCI6InNjb3BlLm9wZW4iLCJQIjoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiJ9",
+          "result_bytes_base64": "eyJraW5kIjoiT1BFTkVEIiwiaW5jYXJuYXRpb24iOjMsImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJyZXNvbHZlX2dlbmVyYXRpb24iOjcsImNyZWF0ZWQiOmZhbHNlfQ==",
+          "response_bytes_base64": "eyJzY29wZS5vcGVuIjp7InJlc3VsdCI6eyJraW5kIjoiT1BFTkVEIiwiaW5jYXJuYXRpb24iOjMsImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJyZXNvbHZlX2dlbmVyYXRpb24iOjcsImNyZWF0ZWQiOmZhbHNlfX19",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S06_capacity_upload_survives_adoption",
+      "name": "scope-keyed capacity upload neither occupies the placeholder nor loses usability after adoption",
+      "note": "The staging is begun and fed before the adoption and finished and consumed after it, so both halves of R47c are executed: it is not occupancy, and the generation advance does not strand it.",
+      "steps": [
+        {
+          "op": "capacity.begin",
+          "note": "no ticket and no attempt: the staging is keyed on (P, agent, incarnation) alone",
+          "request_bytes_base64": "eyJvcCI6ImNhcGFjaXR5LmJlZ2luIiwiUCI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6MywidG90YWxfYnl0ZXMiOjQyLCJ0b3RhbF9jaHVua3MiOjEsImRpZ2VzdCI6IjBjNjM0ODdhMzk3MDQyODI4YzY0NDM5ZmQwYjU2MzYzM2U0YjlmMDRlYzdkM2JiOTNiMzNkY2VjOGQ4MzFhNzcifQ==",
+          "result_bytes_base64": "eyJraW5kIjoiQkVHVU4iLCJ1cGxvYWRfaWQiOiJ1cGxvYWQtY2FwYWNpdHktcy0wMDAxIn0=",
+          "response_bytes_base64": "eyJjYXBhY2l0eS5iZWdpbiI6eyJyZXN1bHQiOnsia2luZCI6IkJFR1VOIiwidXBsb2FkX2lkIjoidXBsb2FkLWNhcGFjaXR5LXMtMDAwMSJ9fX0=",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "33333333-4444-4555-8666-777777777777",
+              "resolve_generation": 6,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 0,
+              "out_edges": 0,
+              "capacity_uploads_staged": 1,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "capacity.put",
+          "request_bytes_base64": "eyJvcCI6ImNhcGFjaXR5LnB1dCIsInVwbG9hZF9pZCI6InVwbG9hZC1jYXBhY2l0eS1zLTAwMDEiLCJzZXEiOjAsImJ5dGVzIjoiZXlKaWIyUjVJam9pYldNdFpEVWdZMkZ3WVdOcGRIa2djM1JoWjJsdVp5QnpjR1ZqYVcxbGJpSjkifQ==",
+          "result_bytes_base64": "eyJraW5kIjoiU1RPUkVEIiwic2VxIjowLCJjaHVua19kaWdlc3QiOiIwYzYzNDg3YTM5NzA0MjgyOGM2NDQzOWZkMGI1NjM2MzNlNGI5ZjA0ZWM3ZDNiYjkzYjMzZGNlYzhkODMxYTc3In0=",
+          "response_bytes_base64": "eyJjYXBhY2l0eS5wdXQiOnsicmVzdWx0Ijp7ImtpbmQiOiJTVE9SRUQiLCJzZXEiOjAsImNodW5rX2RpZ2VzdCI6IjBjNjM0ODdhMzk3MDQyODI4YzY0NDM5ZmQwYjU2MzYzM2U0YjlmMDRlYzdkM2JiOTNiMzNkY2VjOGQ4MzFhNzcifX19",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "33333333-4444-4555-8666-777777777777",
+              "resolve_generation": 6,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 0,
+              "out_edges": 0,
+              "capacity_uploads_staged": 1,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "redeem",
+          "note": "every occupancy count is still zero, so the placeholder is adopted with the staging in place",
+          "vector_id": "V42",
+          "result_bytes_base64": "eyJraW5kIjoiUkVERUVNRUQiLCJyZWNlaXB0X2lkIjoiMGY1YzJkN2UtMTIzNC00YWJjLThkZWYtMDEyMzQ1Njc4OWFiIiwiZWRnZSI6eyJlZGdlX2lkIjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwicHJlZGVjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1wcmVkZWNlc3Nvci0wMDAxIiwic3VjY2Vzc29yX2tleSI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJGIjp7ImRpZ2VzdCI6IjgyNzNkZDUwMDEyNzVlMDcxOTk3ZjgyYTRkNDY3NDRkNjQzYjVhZTU4NzQ4YjU4NTJkM2QwNWUyMDQxODkxMDMiLCJub3JtYWxpemF0aW9uX3ZlcnNpb24iOjEsImV4Y2x1ZGVkX2FkZGl0aW9ucyI6W119LCJsaW5lYWdlX2lkIjoiMjIyMjIyMjItMzMzMy00NDQ0LTg1NTUtNjY2NjY2NjY2NjY2IiwiY29udGludWF0aW9uX2lkZW50aXR5Ijp7InJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJyZWNvZ25pdGlvbl90b2tlbiI6ImFhaXNlbTJla3Z0aHBjZXp2azVxIn0sIm5hdGl2ZV9jb250aW51YXRpb25faWRlbnRpdHkiOnsibWlkIjoibWlkLXN1Y2Nlc3Nvci11c2VyLTAwMDEiLCJpbmRleCI6MCwib3JkaW5hbCI6MTk0MH19LCJleGlzdGluZyI6ZmFsc2UsImZlbmNlX2dlbmVyYXRpb24iOjEyLCJsaW5lYWdlX2Fkb3B0ZWRfZnJvbSI6IjMzMzMzMzMzLTQ0NDQtNDU1NS04NjY2LTc3Nzc3Nzc3Nzc3NyJ9",
+          "response_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjoiMzMzMzMzMzMtNDQ0NC00NTU1LTg2NjYtNzc3Nzc3Nzc3Nzc3In19fQ==",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 1,
+              "receipt_state": null
+            },
+            {
+              "P": "session-predecessor-0001",
+              "agent": "agent-main",
+              "incarnation": 7,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 0,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 1,
+              "in_edges": 0,
+              "out_edges": 1,
+              "capacity_uploads_staged": 0,
+              "receipt_state": "REDEEMED"
+            }
+          ]
+        },
+        {
+          "op": "capacity.finish",
+          "note": "the advanced generation does not reach the scope-keyed staging",
+          "request_bytes_base64": "eyJvcCI6ImNhcGFjaXR5LmZpbmlzaCIsInVwbG9hZF9pZCI6InVwbG9hZC1jYXBhY2l0eS1zLTAwMDEiLCJkaWdlc3QiOiIwYzYzNDg3YTM5NzA0MjgyOGM2NDQzOWZkMGI1NjM2MzNlNGI5ZjA0ZWM3ZDNiYjkzYjMzZGNlYzhkODMxYTc3In0=",
+          "result_bytes_base64": "eyJraW5kIjoiRklOSVNIRUQiLCJ1cGxvYWQiOnsidXBsb2FkX2lkIjoidXBsb2FkLWNhcGFjaXR5LXMtMDAwMSIsImRpZ2VzdCI6IjBjNjM0ODdhMzk3MDQyODI4YzY0NDM5ZmQwYjU2MzYzM2U0YjlmMDRlYzdkM2JiOTNiMzNkY2VjOGQ4MzFhNzciLCJ0b3RhbF9ieXRlcyI6NDJ9fQ==",
+          "response_bytes_base64": "eyJjYXBhY2l0eS5maW5pc2giOnsicmVzdWx0Ijp7ImtpbmQiOiJGSU5JU0hFRCIsInVwbG9hZCI6eyJ1cGxvYWRfaWQiOiJ1cGxvYWQtY2FwYWNpdHktcy0wMDAxIiwiZGlnZXN0IjoiMGM2MzQ4N2EzOTcwNDI4MjhjNjQ0MzlmZDBiNTYzNjMzZTRiOWYwNGVjN2QzYmI5M2IzM2RjZWM4ZDgzMWE3NyIsInRvdGFsX2J5dGVzIjo0Mn19fX0=",
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 1,
+              "receipt_state": null
+            }
+          ]
+        },
+        {
+          "op": "capacity.check",
+          "note": "the first check consumes the staged bytes",
+          "request_bytes_base64": "eyJvcCI6ImNhcGFjaXR5LmNoZWNrIiwiUCI6InNlc3Npb24tc3VjY2Vzc29yLTAwMDEiLCJhZ2VudCI6ImFnZW50LW1haW4iLCJpbmNhcm5hdGlvbiI6MywiYm9keSI6eyJraW5kIjoidXBsb2FkIiwicmVmIjp7InVwbG9hZF9pZCI6InVwbG9hZC1jYXBhY2l0eS1zLTAwMDEiLCJkaWdlc3QiOiIwYzYzNDg3YTM5NzA0MjgyOGM2NDQzOWZkMGI1NjM2MzNlNGI5ZjA0ZWM3ZDNiYjkzYjMzZGNlYzhkODMxYTc3IiwidG90YWxfYnl0ZXMiOjQyfX0sIm1vZGVsIjoiY2xhdWRlLXNvbm5ldC00LTUiLCJnZW9tZXRyeSI6eyJ1c2FibGVfc29mdCI6MTcwMDAwLCJ1c2FibGVfaGFyZCI6MTgwMDAwLCJhYnNvbHV0ZV93YWxsIjpudWxsLCJkZXJpdmF0aW9uIjoiYXV0aG9yZWQgc3BlY2ltZW4gZ2VvbWV0cnkgZm9yIHRoZSBmZW5jZSBzZXF1ZW5jZXMiLCJyZXNlcnZlX2FjY291bnRpbmciOiJvbmNlX2NhcnZlZCJ9fQ==",
+          "bounded_outcome": {
+            "kind": "capacity_check_authorized",
+            "upload_id": "upload-capacity-s-0001",
+            "unmodelled_wire_result": "a CHECKED result carries CapacityEstimateV1, whose token algebra is pinned by capacity-estimate-vectors-v1.json; this model decides authorization and consumption only"
+          },
+          "scopes_after": [
+            {
+              "P": "session-successor-0001",
+              "agent": "agent-main",
+              "incarnation": 3,
+              "lineage_id": "22222222-3333-4444-8555-666666666666",
+              "resolve_generation": 7,
+              "source_uploads_live": 0,
+              "attempts_prepared_or_later": 0,
+              "in_edges": 1,
+              "out_edges": 0,
+              "capacity_uploads_staged": 0,
+              "receipt_state": null
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "negative_vectors": [
+    {
+      "id": "N01_lineage_adopted_from_null",
+      "name": "present null lineage_adopted_from is malformed",
+      "response_bytes_base64": "eyJyZWRlZW0iOnsicmVzdWx0Ijp7ImtpbmQiOiJSRURFRU1FRCIsInJlY2VpcHRfaWQiOiIwZjVjMmQ3ZS0xMjM0LTRhYmMtOGRlZi0wMTIzNDU2Nzg5YWIiLCJlZGdlIjp7ImVkZ2VfaWQiOiIxMTExMTExMS0yMjIyLTQzMzMtODQ0NC01NTU1NTU1NTU1NTUiLCJwcmVkZWNlc3Nvcl9rZXkiOiJzZXNzaW9uLXByZWRlY2Vzc29yLTAwMDEiLCJzdWNjZXNzb3Jfa2V5Ijoic2Vzc2lvbi1zdWNjZXNzb3ItMDAwMSIsImFnZW50IjoiYWdlbnQtbWFpbiIsIkYiOnsiZGlnZXN0IjoiODI3M2RkNTAwMTI3NWUwNzE5OTdmODJhNGQ0Njc0NGQ2NDNiNWFlNTg3NDhiNTg1MmQzZDA1ZTIwNDE4OTEwMyIsIm5vcm1hbGl6YXRpb25fdmVyc2lvbiI6MSwiZXhjbHVkZWRfYWRkaXRpb25zIjpbXX0sImxpbmVhZ2VfaWQiOiIyMjIyMjIyMi0zMzMzLTQ0NDQtODU1NS02NjY2NjY2NjY2NjYiLCJjb250aW51YXRpb25faWRlbnRpdHkiOnsicmVjZWlwdF9pZCI6IjBmNWMyZDdlLTEyMzQtNGFiYy04ZGVmLTAxMjM0NTY3ODlhYiIsInJlY29nbml0aW9uX3Rva2VuIjoiYWFpc2VtMmVrdnRocGNlenZrNXEifSwibmF0aXZlX2NvbnRpbnVhdGlvbl9pZGVudGl0eSI6eyJtaWQiOiJtaWQtc3VjY2Vzc29yLXVzZXItMDAwMSIsImluZGV4IjowLCJvcmRpbmFsIjoxOTQwfX0sImV4aXN0aW5nIjpmYWxzZSwiZmVuY2VfZ2VuZXJhdGlvbiI6MTIsImxpbmVhZ2VfYWRvcHRlZF9mcm9tIjpudWxsfX19",
+      "rejected_field": "lineage_adopted_from"
+    }
+  ]
 }

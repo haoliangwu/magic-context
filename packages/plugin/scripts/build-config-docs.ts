@@ -36,18 +36,23 @@ interface LeafRow {
     description: string;
 }
 
+// Type labels use a bare " | " between union members; the table renderer
+// escapes cells exactly once (escapeCell). Escaping here as well produced
+// "\\|" in the markdown, which renders as a literal backslash followed by a
+// cell separator and silently pushed every union-typed row's description out
+// of the table on the published site.
 function typeLabel(s: JsonSchema): string {
-    if (s.enum) return s.enum.map((v) => `\`${JSON.stringify(v)}\``).join(" \\| ");
+    if (s.enum) return s.enum.map((v) => `\`${JSON.stringify(v)}\``).join(" | ");
     const variants = s.anyOf ?? s.oneOf;
     if (variants) {
         const labels = variants.map(typeLabel);
-        return [...new Set(labels)].join(" \\| ");
+        return [...new Set(labels)].join(" | ");
     }
     if (s.type === "array") return `${s.items ? typeLabel(s.items) : "unknown"}[]`;
     if (s.type === "object" && s.additionalProperties && s.additionalProperties !== true) {
         return `map<string, ${typeLabel(s.additionalProperties as JsonSchema)}>`;
     }
-    if (Array.isArray(s.type)) return s.type.join(" \\| ");
+    if (Array.isArray(s.type)) return s.type.join(" | ");
     let label = s.type ?? "unknown";
     if (s.minimum !== undefined || s.maximum !== undefined) {
         const lo = s.minimum !== undefined ? `${s.minimum}` : "";
@@ -62,8 +67,11 @@ function defaultLabel(s: JsonSchema): string {
     return `\`${JSON.stringify(s.default)}\``;
 }
 
+// Descriptions are prose, not code spans, so a pair of asterisks (two
+// `provider/*` mentions in one sentence) renders as emphasis and the
+// asterisks vanish from the published table.
 function escapeCell(text: string): string {
-    return text.replaceAll("|", "\\|").replaceAll("\n", " ").trim();
+    return text.replaceAll("|", "\\|").replaceAll("*", "\\*").replaceAll("\n", " ").trim();
 }
 
 /** Flattens nested object properties into dotted-path leaf rows. */

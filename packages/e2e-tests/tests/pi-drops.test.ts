@@ -8,8 +8,8 @@ import { openTestDb } from "../src/test-db";
 let h: PiTestHarness;
 
 beforeAll(async () => {
-    // Pending operations apply only on execute/force passes. Use a supported
-    // model window and a legitimate uncached-input sample, then put enough real
+    // Pending operations apply only on a cache-busting pass. Use a supported
+    // model window and a force-band uncached-input sample, then put enough real
     // message blocks after the target for it to leave the protected tail before
     // the next pass materializes the queued drop.
     h = await PiTestHarness.create({
@@ -30,7 +30,7 @@ describe("pi drops", () => {
                 type: "text",
                 text: `pi drop aging block ${index + 1}: ${h.ballast(200)}`,
             })),
-            usage: { input_tokens: 14_000, output_tokens: 10, cache_creation_input_tokens: 0 },
+            usage: { input_tokens: 18_000, output_tokens: 10, cache_creation_input_tokens: 0 },
         });
 
         const first = await h.sendPrompt("first pi drop target", { timeoutMs: 60_000 });
@@ -53,7 +53,7 @@ describe("pi drops", () => {
             text: "second response",
             usage: { input_tokens: 100, output_tokens: 10, cache_creation_input_tokens: 0 },
         });
-        const second = await h.sendPrompt("second pi turn drains pending ops", {
+        const second = await h.sendPrompt("second Pi turn force-busts and drains pending ops", {
             timeoutMs: 60_000,
             continueSession: true,
         });

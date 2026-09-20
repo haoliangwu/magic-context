@@ -60,8 +60,8 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 
 **`src/v2/`:**
 - Purpose: Adapt the shared transform core to the OpenCode 2 host (`setup` entry, `session.hook("context")` / `compaction`, `tool.hook`) without the v1 child-session historian/dream executors.
-- Contains: v2 server entry, payload projection, GA store reader, refusal guard, Channel 2 delivery, update checks, hidden-completion executor seam over host `generate`, host-owned fold/checkpoint tracking with inert v1 markers, dream-trigger wakeups off execution events, and the absence-pinning server test.
-- Key files: `src/v2/server.ts` (built to `dist/v2/server.js` via `build:v2`), `src/v2/hooks/context.ts`, `src/v2/hooks/payload.ts`, `src/v2/store-reader.ts`, `src/v2/hooks/store.ts`, `src/v2/hooks/types.ts`, `src/v2/hooks/refusal.ts`, `src/v2/hooks/channel2.ts`, `src/v2/hooks/update-check.ts`, `src/v2/hooks/dream-trigger.ts`, `src/v2/hidden-completion.ts`, `src/v2/fold/owner.ts`, `src/v2/fold/restore.ts`, `src/v2/fold/markers.ts`, `src/v2/executor-seam-proof.md`, `src/v2/server.test.ts`
+- Contains: v2 server entry, payload projection, GA store reader, refusal guard, Channel 2 delivery, update checks, hidden-completion executor seam over host `generate` with a reusable hidden-child carrier, host-owned fold/checkpoint tracking with inert v1 markers, dream-trigger wakeups off execution events, the OpenCode 2 TUI seam (`src/v2/tui/`: sidebar slot + `/ctx-status` / `/ctx-recomp` commands over the shared RPC-backed TUI data layer, served to both package loaders via the dual `src/tui/entry.mjs` default export), and the absence-pinning server test.
+- Key files: `src/v2/server.ts` (built to `dist/v2/server.js` via `build:v2`), `src/v2/hooks/context.ts`, `src/v2/hooks/payload.ts`, `src/v2/store-reader.ts`, `src/v2/hooks/store.ts`, `src/v2/hooks/types.ts`, `src/v2/hooks/refusal.ts`, `src/v2/hooks/channel2.ts`, `src/v2/hooks/hidden-child.ts`, `src/v2/hooks/update-check.ts`, `src/v2/hooks/dream-trigger.ts`, `src/v2/hidden-completion.ts`, `src/v2/fold/owner.ts`, `src/v2/fold/restore.ts`, `src/v2/fold/markers.ts`, `src/v2/tui/index.ts`, `src/v2/tui/types.ts`, `src/v2/tui/host-contract.test.ts`, `src/v2/executor-seam-proof.md`, `src/v2/server.test.ts`
 
 **`src/hooks/`:**
 - Purpose: Hold hook implementations and hook-specific helpers.
@@ -71,7 +71,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 **`src/tui/`:**
 - Purpose: Render Magic Context sidebar and `/ctx-status` / `/ctx-recomp` dialogs inside OpenCode's TUI.
 - Contains: TUI entrypoint, sidebar slot composition, RPC-backed data layer, type declarations.
-- Key files: `src/tui/index.tsx` (registered via `./tui` export in `package.json`), `src/tui/slots/`, `src/tui/data/`, `src/tui/types/`
+- Key files: `src/tui/index.tsx` (registered via `./tui` export in `package.json`), `src/tui/entry.mjs` (dual-loader default export carrying v1 `tui` plus the v2 `setup` from `src/v2/tui/index.ts`, so one object serves OpenCode 1.18.x and 2.0.x loaders), `src/tui/slots/`, `src/tui/data/`, `src/tui/types/`
 - Notes: Ships as raw TypeScript source, not bundled into `dist/index.js`. Loaded by OpenCode TUI via `tui.json` configuration.
 
 **`src/features/`:**
@@ -83,7 +83,7 @@ All paths below are relative to `packages/plugin/` — the published OpenCode np
 **`src/tools/`:**
 - Purpose: Define the agent-facing tool surface.
 - Contains: One directory per tool with constants, types, implementation, and tests. Five tools: `ctx-reduce`, `ctx-expand`, `ctx-note`, `ctx-memory`, `ctx-search`. Includes light tool description presets in `src/tools/light-descriptions.ts`.
-- Key files: `src/tools/ctx-reduce/tools.ts`, `src/tools/ctx-expand/tools.ts`, `src/tools/ctx-note/tools.ts`, `src/tools/ctx-memory/tools.ts`, `src/tools/ctx-search/tools.ts`, `src/tools/light-descriptions.ts`
+- Key files: `src/tools/ctx-reduce/tools.ts`, `src/tools/ctx-expand/tools.ts`, `src/tools/ctx-expand/mode.ts`, `src/tools/ctx-note/tools.ts`, `src/tools/ctx-memory/tools.ts`, `src/tools/ctx-search/tools.ts`, `src/tools/light-descriptions.ts`
 
 **`src/shared/`:**
 - Purpose: Keep cross-feature utilities small and dependency-light.
@@ -173,6 +173,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/module-state-sync.ts`: Synchronize database state (memories, commits, tags, markers) between host (TS SQLite) and subc (Rust).
 - `src/hooks/magic-context/module-wire.ts`: Translate wire messages, ordinals, and normalizations between host and Rust formats, using lifecycle-invalidated ordinal mapping instead of polling persisted state each pass.
 - `src/hooks/magic-context/lkg-slot.ts` and `src/hooks/magic-context/lkg-replay.ts`: Capture and replay the Last Known Good (LKG) transformed state on failure/parking.
+- `src/hooks/magic-context/rust-refusal-recovery.ts`: Arm per-session engine-reconnect recovery in Rust mode, polling `session.status` health probes and resuming the refused turn with a synthetic continue message.
 - `src/hooks/magic-context/pass-outcome.ts`: Track the outcome of transform passes.
 - `src/hooks/magic-context/emergency-fail-closed.ts`: Handle fail-closed cases under emergency context limit situations.
 - `src/plugin/boot-quiet.ts`: Quiet background maintenance logging on startup.
@@ -208,7 +209,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `src/hooks/magic-context/compaction-off-transition.ts`: Reconcile per-session compaction mode records and process off/on mode transitions.
 - `src/hooks/magic-context/child-session-spawn.ts`: Enforce child session spawn choke point with schema fence validation.
 - `src/shared/escalation-bands.ts`: Derive context limit escalation bands and threshold bounds.
-- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v84 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
+- `src/features/magic-context/migrations.ts`: Versioned schema migrations v1–v85 (`LATEST_SUPPORTED_VERSION` in `storage-db.ts` must track the highest; `schema-version-fence.test.ts` asserts they stay in lockstep).
 - `src/features/magic-context/message-index.ts`: FTS-backed raw-message index for `ctx_search` and orphan session sweep candidate discovery across session-scoped tables.
 - `src/features/magic-context/search.ts`: Unified retrieval over memories, raw messages, git commits, and session/smart notes, surfacing structured suppression diagnostics for visible memories, live-tail matches, and git repository availability.
 - `src/features/magic-context/session-project-storage.ts`: Persist session-to-project bindings and repair mis-scoped compartment chunk embeddings.
@@ -239,7 +240,7 @@ Unless specified otherwise, TypeScript paths are relative to `packages/plugin/` 
 - `packages/pi-plugin/src/clone-inheritance.ts`: Intercept Pi `session_start` fork events and inherit filtered session compartments, tags, and markers.
 - `packages/pi-plugin/src/subagent-runner.ts`: Win32/POSIX-safe subagent executor with command-line length cap mitigations, bundled CLI path resolution, and provider error capture.
 - `packages/pi-plugin/src/commands/ctx-wrapup.ts`: Implement the `/ctx-wrapup` command and orchestrator for Pi sessions.
-- `packages/pi-plugin/src/dreamer/pi-session-api.ts`: Resolve `pi-coding-agent` module and session APIs from running Pi first, using a memoized resolution ladder with traversal guards and dist-metadata detection to support symlinked or nonstandard Pi installs.
+- `packages/pi-plugin/src/dreamer/pi-session-api.ts`: Resolve `pi-coding-agent` module and session APIs from the running Pi or OMP host first (probing both `@earendil-works/pi-coding-agent` and `@oh-my-pi/pi-coding-agent`), using a memoized resolution ladder with traversal guards and dist-metadata detection to support symlinked or nonstandard Pi installs.
 - `packages/pi-plugin/scripts/experiments/perf/`: Run performance benchmarks and regression checks against production-registered context transform hooks.
 - `crates/mc-module/src/transform.rs`: Evaluates transform passes, applies modifications like metadata tag injection and history compaction in Rust, renders temporal overlays (tag numbers and time gap markers), self-heals boundary divergence, sanitizes query whitespace to match TypeScript canonical bytes, strips leading model-authored tag imitation prefixes from assistant messages, holds demoted signed assistant native reasoning vectors until priced passes, and excludes cache-preserving model variants from render identity keys.
 - `crates/mc-module/src/historian.rs`: Evaluates pressure, defines the `HistorianNoFireCause` taxonomy (raw and TS-canonical no-fire causes), and schedules/runs incremental historian summarizations in Rust.

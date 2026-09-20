@@ -80,7 +80,7 @@ function formatNoteLine(note: Note): string {
     return `- **#${note.id}**${statusSuffix}: ${note.content}${anchorSuffix(note)}\n  ${conditionLabel}: ${conditionText}`;
 }
 
-const DISMISS_FOOTER = '\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_id=N)';
+const DISMISS_FOOTER = '\n\nTo dismiss a stale note: ctx_note(action="dismiss", note_ids=[N])';
 
 /** Default page size for read. Long-running sessions accumulate hundreds of
  *  notes; dumping all of them burns output tokens and buries the recent ones,
@@ -255,16 +255,14 @@ const ctxNoteArgsShape = {
         .number()
         .optional()
         .describe("Skip this many newest notes for read — page older ones (default: 0)"),
-    note_id: tool.schema
-        .number()
-        .optional()
-        .describe("Note ID (required for 'dismiss' and 'update' actions)."),
     note_ids: tool.schema
         .array(tool.schema.number().int().min(1))
         .min(1)
         .max(50)
         .optional()
-        .describe("One to fifty note ids for 'dismiss' only; do not combine with note_id."),
+        .describe(
+            "Note ids: exactly one for 'update', one to fifty for 'dismiss'. Ignored by 'write' and 'read'.",
+        ),
 };
 // The tool definition exposes only the documented argument shape to the model
 // provider, but older callers may still send extra arguments. Parse with
@@ -278,14 +276,24 @@ function formatDismissResults(results: Array<{ noteId: number; outcome: string }
         .join("\n")}`;
 }
 
-function parseDismissNoteIds(value: unknown): number[] | string {
+/**
+ * Read `note_ids` for the actions that use it. `write` and `read` never look
+ * at it: tool surfaces that require every declared property make the model
+ * send filler there (issue 460), and filler on an action that does not use
+ * the field must not fail the call. `update` addresses exactly one note;
+ * `dismiss` takes one to fifty.
+ */
+function parseNoteIds(action: string, value: unknown): number[] | string {
+    const max = action === "update" ? 1 : 50;
     if (
         !Array.isArray(value) ||
         value.length < 1 ||
-        value.length > 50 ||
+        value.length > max ||
         value.some((id) => typeof id !== "number" || !Number.isInteger(id) || id <= 0)
     ) {
-        return "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.";
+        return action === "update"
+            ? "Error: 'note_ids' must contain exactly one positive integer id when action is 'update'."
+            : "Error: 'note_ids' must contain 1 to 50 positive integer ids when action is 'dismiss'.";
     }
     return value;
 }
@@ -307,7 +315,6 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                 },
                 limit: "number",
                 offset: "number",
-                note_id: "number",
                 note_ids: { type: "array", items: "number", maxItems: 50 },
             });
             const sessionId = toolContext.sessionID;
@@ -315,17 +322,11 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             // optional param (content:"" for a read), so a bare `typeof === "string"`
             // check would mis-infer `write` and then reject the empty content.
             const action = args.action ?? (args.content?.trim() ? "write" : "read");
-            const hasNoteId = args.note_id !== undefined;
-            const hasNoteIds = args.note_ids !== undefined;
-            if (hasNoteId && hasNoteIds) {
-                return "Error: 'note_id' and 'note_ids' cannot be used together; provide one or the other.";
-            }
-            if (hasNoteIds && action !== "dismiss") {
-                return "Error: 'note_ids' is only valid when action is 'dismiss'.";
-            }
-            const dismissNoteIds =
-                action === "dismiss" && hasNoteIds ? parseDismissNoteIds(args.note_ids) : undefined;
-            if (typeof dismissNoteIds === "string") return dismissNoteIds;
+            const noteIds =
+                action === "dismiss" || action === "update"
+                    ? parseNoteIds(action, args.note_ids)
+                    : undefined;
+            if (typeof noteIds === "string") return noteIds;
             const wakePlaneActive =
                 action === "write" &&
                 Boolean(args.surface_condition?.trim()) &&
@@ -387,8 +388,7 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
                     filter: args.filter,
                     limit: args.limit,
                     offset: args.offset,
-                    noteId: args.note_id,
-                    noteIds: dismissNoteIds,
+                    noteIds: Array.isArray(noteIds) ? noteIds : undefined,
                 };
                 try {
                     const text = moduleNoteText(await rustNote(request), args, action);
@@ -463,38 +463,29 @@ function createCtxNoteTool(deps: CtxNoteToolDeps): ToolDefinition {
             }
 
             if (action === "dismiss") {
-                if (dismissNoteIds) {
-                    if (!projectIdentity) {
-                        return "Error: Could not resolve project identity for note dismiss.";
-                    }
-                    return formatDismissResults(
-                        dismissNotes(deps.db, dismissNoteIds, {
-                            projectPath: projectIdentity,
-                            sessionId,
-                        }),
-                    );
-                }
-                const noteId = args.note_id;
-                if (typeof noteId !== "number") {
-                    return "Error: 'note_id' is required when action is 'dismiss'.";
-                }
                 if (!projectIdentity) {
                     return "Error: Could not resolve project identity for note dismiss.";
                 }
-                const dismissed = dismissNote(deps.db, noteId, {
-                    projectPath: projectIdentity,
-                    sessionId,
-                });
-                return dismissed
-                    ? `Note #${noteId} dismissed.`
-                    : `Error: Note #${noteId} not found in your session/project or already dismissed.`;
+                const ids = noteIds as number[];
+                if (ids.length === 1) {
+                    const dismissed = dismissNote(deps.db, ids[0], {
+                        projectPath: projectIdentity,
+                        sessionId,
+                    });
+                    return dismissed
+                        ? `Note #${ids[0]} dismissed.`
+                        : `Error: Note #${ids[0]} not found in your session/project or already dismissed.`;
+                }
+                return formatDismissResults(
+                    dismissNotes(deps.db, ids, {
+                        projectPath: projectIdentity,
+                        sessionId,
+                    }),
+                );
             }
 
             if (action === "update") {
-                const noteId = args.note_id;
-                if (typeof noteId !== "number") {
-                    return "Error: 'note_id' is required when action is 'update'.";
-                }
+                const noteId = (noteIds as number[])[0];
                 const updates: UpdateNoteOptions = {};
                 if (args.content?.trim()) updates.content = args.content.trim();
                 let compilation: Awaited<ReturnType<typeof compileSurfaceCondition>> | undefined;
