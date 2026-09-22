@@ -6,10 +6,12 @@
  * factory: (require) => ... })` classic-script shape (banner/intro/footer, see
  * the reference tsdown pipeline in the harness). It registers three slots:
  *
- *   1. `settings.section` (root scope, id "magic-context") — a READ-ONLY card
- *      that mirrors the Magic Context status and points at the JSONC config
- *      file; no write controls (the JSONC file stays the single source of
- *      truth, so there is no dual-source drift).
+ *   1. `settings.section` (root scope, id "magic-context") — the editable user
+ *      config pane: a Form / Raw JSONC editor over
+ *      ~/.config/cortexkit/magic-context.jsonc (see src/client/config-form.tsx).
+ *      Writes go through the host `magicContext/config-save` Remote, which
+ *      re-validates and writes atomically, so the JSONC file stays the single
+ *      source of truth.
  *   2. `conversation.session.header.actions` (session scope, id
  *      "magic-context-status") — a per-session button opening a status
  *      summary popover.
@@ -46,6 +48,13 @@ import type {} from "@deepseek-ai/dsh-token-meter"; // load SessionProjectionMap
 import type { SnapshotSelectorHook } from "@deepseek-ai/dsh-client-ui-slots";
 import { IconChevronDownOutline14 } from "@deepseek-ai/dsh-client-ui-primitives";
 import type { Context } from "@deepseek-ai/cordis";
+
+import {
+  ConfigForm,
+  type ConfigSnapshotState,
+  type UserConfigSaveOutcome,
+  type UserConfigRead,
+} from "./config-form";
 
 /* -------------------------------------------- ui-conversation / ui-settings slot augmentations */
 import type {} from "@deepseek-ai/dsh-client-ui-conversation/client";
@@ -88,6 +97,77 @@ const css = [
   ".ckmc-catLeft{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-tertiary);min-width:0}",
   ".ckmc-dot{width:8px;height:8px;border-radius:2px;flex:none}",
   ".ckmc-footnote{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);margin:4px 0 0}",
+  // Settings config form (config-form.tsx).
+  ".ckmc-rootColumn{display:flex;flex-direction:column;gap:10px;min-width:0}",
+  // Sticky section header (config-form.tsx): the pane's scroll container is the
+  // host settings dialog's options area, so the bar pins to its own top edge.
+  // The fill matches the panel surface (bg-layer-2) to mask the content
+  // scrolling underneath; the hairline + lv2 shadow only paint while stuck.
+  ".ckmc-stickyHead{position:sticky;top:0;z-index:3;box-sizing:border-box;display:flex;flex-direction:column;gap:8px;padding:2px 0 8px;background:var(--dsw-alias-bg-layer-2);border-bottom:.5px solid transparent}",
+  ".ckmc-stickyHeadStuck{border-bottom-color:var(--dsw-alias-border-l2);box-shadow:var(--dsw-shadow-lv2)}",
+  // Zero-impact sensor for the stuck flag: pinned to .ckmc-root's top-left
+  // (that root is position:relative), out of flow so it adds no gap or height,
+  // 1px instead of 0 so IntersectionObserver never sees a zero-area target.
+  ".ckmc-stickySentinel{position:absolute;top:0;left:0;width:1px;height:1px;pointer-events:none}",
+  ".ckmc-stickyHead>.ckmc-hint{margin:0}",
+  ".ckmc-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}",
+  ".ckmc-spacer{flex:1 1 auto}",
+  ".ckmc-tabs{display:inline-flex;align-items:center;background:var(--dsw-alias-bg-layer-3);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:2px;gap:2px;flex-wrap:wrap}",
+  ".ckmc-tab{border:0;background:0 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;padding:3px 10px;border-radius:6px;cursor:pointer;font-family:inherit}",
+  ".ckmc-tab:hover{color:var(--dsw-alias-label-primary)}",
+  ".ckmc-tabActive{background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);box-shadow:var(--dsw-shadow-lv1)}",
+  ".ckmc-harnessTabs{margin-bottom:6px}",
+  ".ckmc-btnPrimary{border-color:var(--dsw-alias-button-primary-fill);background:var(--dsw-alias-button-primary-fill);color:var(--dsw-alias-label-primary-foreground)}",
+  ".ckmc-btn:disabled{opacity:.45;cursor:default}",
+  ".ckmc-btnDanger{color:var(--dsw-alias-label-error);padding:2px 6px}",
+  ".ckmc-btnDanger:hover{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-label-error)}",
+  ".ckmc-form{display:flex;flex-direction:column;gap:12px;min-width:0}",
+  ".ckmc-section{box-sizing:border-box;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);border-radius:10px;padding:10px 12px;min-width:0}",
+  ".ckmc-sectionHead{margin:0 0 4px;font-size:10.5px;line-height:16px;letter-spacing:.08em;text-transform:uppercase;color:var(--dsw-alias-label-tertiary);font-weight:600}",
+  ".ckmc-subBlock{border-top:1px dashed var(--dsw-alias-border-l2);margin-top:8px;padding-top:8px;min-width:0}",
+  ".ckmc-subHead{display:block;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary);font-weight:600;letter-spacing:.04em;margin:0 0 4px}",
+  ".ckmc-field{display:flex;flex-direction:column;gap:4px;padding:8px 0;border-top:1px solid var(--dsw-alias-border-l2);min-width:0}",
+  ".ckmc-field:first-of-type,.ckmc-taskRow:first-of-type{border-top:0;padding-top:0}",
+  ".ckmc-fieldHead{display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0}",
+  ".ckmc-fieldLabel{font-size:12px;line-height:18px;color:var(--dsw-alias-label-primary);font-weight:500;min-width:0}",
+  ".ckmc-fieldKey{font-family:var(--dsw-font-mono);font-size:10.5px;line-height:16px;color:var(--dsw-alias-label-tertiary);flex:none;max-width:52%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}",
+  ".ckmc-fieldDesc{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary)}",
+  ".ckmc-input{box-sizing:border-box;width:100%;min-width:0;min-height:28px;border:1px solid var(--dsw-alias-border-l2);border-radius:7px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font-family:inherit;font-size:12px;line-height:18px;padding:4px 8px}",
+  ".ckmc-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary)}",
+  ".ckmc-input:disabled{opacity:.5}",
+  ".ckmc-inputShort{flex:0 0 auto;width:112px}",
+  ".ckmc-mono{font-family:var(--dsw-font-mono)}",
+  ".ckmc-textarea{min-height:240px;font-family:var(--dsw-font-mono);font-size:11.5px;line-height:17px;white-space:pre;resize:vertical}",
+  ".ckmc-textareaShort{min-height:74px;white-space:pre-wrap}",
+  ".ckmc-inlineRow{display:flex;align-items:center;gap:6px;min-width:0}",
+  ".ckmc-inlineRow>.ckmc-input{flex:1 1 auto;min-width:0}",
+  ".ckmc-addRow{margin-top:4px}",
+  ".ckmc-addBtn{align-self:flex-start;margin-top:4px}",
+  ".ckmc-toggle{display:inline-flex;align-items:center;gap:8px;background:0 0;border:0;padding:0;cursor:pointer;align-self:flex-start}",
+  ".ckmc-switch{position:relative;flex:none;box-sizing:border-box;width:36px;height:20px;border-radius:10px;background:var(--dsw-alias-border-l3);transition:background .15s ease}",
+  ".ckmc-switch::before{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:var(--dsw-alias-bg-base);box-shadow:0 1px 2px rgba(0,0,0,.28);transition:transform .15s ease}",
+  ".ckmc-toggleOn .ckmc-switch{background:var(--dsw-alias-button-primary-fill)}",
+  ".ckmc-toggleOn .ckmc-switch::before{transform:translateX(16px)}",
+  ".ckmc-toggleLabel{font-size:11.5px;line-height:18px;color:var(--dsw-alias-label-secondary)}",
+  ".ckmc-sliderRow{display:flex;align-items:center;gap:10px;flex:1 1 auto;min-width:0}",
+  ".ckmc-slider{flex:1 1 auto;min-width:0;height:4px;-webkit-appearance:none;appearance:none;background:var(--dsw-alias-border-l2);border-radius:2px;outline:none;cursor:pointer;margin:0}",
+  ".ckmc-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:14px;height:14px;border-radius:50%;background:var(--dsw-alias-button-primary-fill);border:2px solid var(--dsw-alias-bg-base);cursor:pointer;box-shadow:0 1px 2px rgba(0,0,0,.2)}",
+  ".ckmc-slider::-moz-range-track{height:4px;background:var(--dsw-alias-border-l2);border-radius:2px;border:0}",
+  ".ckmc-slider::-moz-range-progress{height:4px;background:var(--dsw-alias-button-primary-fill);border-radius:2px}",
+  ".ckmc-slider::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:var(--dsw-alias-button-primary-fill);border:2px solid var(--dsw-alias-bg-base);cursor:pointer}",
+  ".ckmc-sliderValue{flex:none;min-width:58px;text-align:right;font-family:var(--dsw-font-mono);font-size:11px;line-height:18px;color:var(--dsw-alias-label-primary)}",
+  ".ckmc-overrides{display:flex;flex-direction:column;gap:6px;border:1px solid var(--dsw-alias-border-l2);border-radius:8px;padding:8px;margin-top:6px;min-width:0}",
+  ".ckmc-overrideRow{display:flex;align-items:center;gap:6px;min-width:0}",
+  ".ckmc-overrideRow>.ckmc-input{flex:1 1 auto;min-width:0}",
+  ".ckmc-overrideKey{flex:none;max-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;line-height:18px;color:var(--dsw-alias-label-tertiary)}",
+  ".ckmc-statusOk{font-size:11.5px;color:var(--dsw-alias-state-success-primary)}",
+  ".ckmc-statusErr{font-size:11.5px;color:var(--dsw-alias-label-error)}",
+  ".ckmc-errorText{margin:0 0 4px;font-size:11.5px;line-height:17px;color:var(--dsw-alias-label-error);word-break:break-word}",
+  ".ckmc-hintInline{flex:none;font-size:10.5px;color:var(--dsw-alias-label-error)}",
+  ".ckmc-emptyLine{font-size:11px;color:var(--dsw-alias-label-tertiary);font-style:italic}",
+  ".ckmc-emptyCard{display:flex;flex-direction:column;gap:4px}",
+  ".ckmc-taskRow{display:flex;flex-direction:column;gap:4px;padding:6px 0;border-top:1px solid var(--dsw-alias-border-l2);min-width:0}",
+  ".ckmc-harnessBlock{display:flex;flex-direction:column;min-width:0}",
 ].join("");
 if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(CSS_TAG_ID) + "]") === null) {
   const tag = document.createElement("style");
@@ -202,6 +282,8 @@ const CHANNEL = "/api";
 const STATUS_ENDPOINT = "magicContext/status";
 const DIAGNOSTICS_ENDPOINT = "magicContext/diagnostics";
 const SIDEBAR_ENDPOINT = "magicContext/sidebar-snapshot";
+const CONFIG_ENDPOINT = "magicContext/config";
+const CONFIG_SAVE_ENDPOINT = "magicContext/config-save";
 
 function unavailable(message: string): MagicRpcResult<never> {
   return { ok: false, error: { code: "unavailable", message, details: {} } };
@@ -263,6 +345,22 @@ export function callSidebarSnapshot(
   args: { sessionId: string },
 ): Promise<MagicRpcResult<SidebarSnapshot>> {
   return callRpc<SidebarSnapshot>(connection, SIDEBAR_ENDPOINT, args);
+}
+
+/** Call the host `magicContext/config` Remote — raw user config text. */
+export function callConfig(
+  connection: RpcConnectionLike | undefined,
+  args: Record<string, never> = {},
+): Promise<MagicRpcResult<UserConfigRead>> {
+  return callRpc<UserConfigRead>(connection, CONFIG_ENDPOINT, args);
+}
+
+/** Call the host `magicContext/config-save` Remote — validated atomic write. */
+export function callConfigSave(
+  connection: RpcConnectionLike | undefined,
+  args: { content: string },
+): Promise<MagicRpcResult<UserConfigSaveOutcome>> {
+  return callRpc<UserConfigSaveOutcome>(connection, CONFIG_SAVE_ENDPOINT, args);
 }
 
 /* ------------------------------------------------ controllers */
@@ -363,6 +461,39 @@ class SidebarController {
   readonly refresh: (args: { sessionId: string }) => Promise<void>;
 }
 
+/**
+ * Controller for the settings config pane: one host read (`magicContext/config`)
+ * plus the validated write (`magicContext/config-save`). Refresh keeps the last
+ * loaded config in the snapshot so a re-read never blanks the form.
+ */
+export class ConfigController {
+  readonly store: SnapshotStore<ConfigSnapshotState>;
+
+  constructor(connection: RpcConnectionLike | undefined) {
+    this.store = createSnapshotStore<ConfigSnapshotState>({ state: "idle", config: null, error: null });
+    this.refresh = () => {
+      this.store.set({ state: "loading", config: this.store.getSnapshot().config, error: null });
+      return callConfig(connection).then((result) => {
+        this.store.set(
+          result.ok === true
+            ? { state: "ready", config: result.value, error: null }
+            : { state: "error", config: null, error: result.error },
+        );
+      });
+    };
+    this.save = (content: string) =>
+      callConfigSave(connection, { content }).then((result) =>
+        result.ok === true ? result.value : { ok: false, error: result.error.message },
+      );
+  }
+
+  /** Re-pull the raw user config. */
+  readonly refresh: () => Promise<void>;
+
+  /** Validate + atomically save one config document; never throws. */
+  readonly save: (content: string) => Promise<UserConfigSaveOutcome>;
+}
+
 /* ------------------------------------------------ rows */
 function storageText(status: MagicStatus): string {
   if (status.storage === undefined || status.storage === null) return "unknown";
@@ -448,7 +579,7 @@ export function StatusSummary({ useMagicStatus, onRefresh, onClose }: StatusSumm
           ))}
         </div>
       )}
-      <p className={C.hint}>配置源：~/.config/cortexkit/magic-context.jsonc —— 此界面只读，请用编辑器修改。</p>
+      <p className={C.hint}>配置源：~/.config/cortexkit/magic-context.jsonc —— 编辑请前往「设置 → Magic Context」。</p>
       <div className={C.actions}>
         <button type="button" className={C.btn} disabled={snapshot.state === "loading"} onClick={onRefresh}>
           刷新
@@ -464,16 +595,28 @@ export function StatusSummary({ useMagicStatus, onRefresh, onClose }: StatusSumm
 }
 
 /* ------------------------------- settings.section entry */
-/** Read-only settings section mirroring live status and the config location. */
+/**
+ * Settings section: the editable user-config pane. Mounting it pulls the raw
+ * config once; every write goes through the host endpoint (validate + atomic
+ * rename), so the JSONC file stays the single source of truth.
+ */
 export interface MagicSettingsSectionProps {
-  useMagicStatus: SnapshotSelectorHook<StatusSnapshotState>;
-  refresh: (args?: { sessionId?: string }) => void;
+  useMagicConfig: SnapshotSelectorHook<ConfigSnapshotState>;
+  refresh: () => void;
+  save: (content: string) => Promise<UserConfigSaveOutcome>;
 }
 
-export function MagicSettingsSection({ useMagicStatus, refresh }: MagicSettingsSectionProps) {
+export function MagicSettingsSection({ useMagicConfig, refresh, save }: MagicSettingsSectionProps) {
+  const snapshot = useMagicConfig((state) => state);
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (startedRef.current) return;
+    startedRef.current = true;
+    void refresh();
+  }, [refresh]);
   return (
     <div className={C.root}>
-      <StatusSummary useMagicStatus={useMagicStatus} onRefresh={() => refresh({})} />
+      <ConfigForm state={snapshot} onRefresh={refresh} onSave={save} />
     </div>
   );
 }
@@ -694,7 +837,7 @@ export function apply(ctx: Context): void {
   // session-scoped — sharing one store would let the last session leak across
   // surfaces. The view keeps the plugin-level controller (headerController
   // pattern), refreshing with whichever session is current on open.
-  const sectionController = new StatusController(connection);
+  const sectionController = new ConfigController(connection);
   const headerController = new StatusController(connection);
   const diagnosticsController = new DiagnosticsController(connection);
   const sidebarController = new SidebarController(connection);
@@ -706,8 +849,9 @@ export function apply(ctx: Context): void {
       order: 60,
       label: "Magic Context",
       inject: () => ({
-        hooks: { magicStatus: sectionController.store },
+        hooks: { magicConfig: sectionController.store },
         refresh: sectionController.refresh,
+        save: sectionController.save,
       }),
     }, MagicSettingsSection),
   );

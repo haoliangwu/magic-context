@@ -43,6 +43,12 @@ import {
   DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE,
   resolveExecuteThresholdPercentage,
 } from "../shared/execute-threshold";
+import {
+  readUserConfig,
+  saveUserConfig,
+  type UserConfigReadResult,
+  type UserConfigSaveResult,
+} from "./config-rpc";
 
 /** Wire endpoint name (client calls `magicContext/status`). */
 export const MAGIC_STATUS_METHOD = "status";
@@ -52,6 +58,12 @@ export const MAGIC_DIAGNOSTICS_METHOD = "diagnostics";
 
 /** Wire endpoint name for the per-session token breakdown (Phase 5). */
 export const MAGIC_SNAPSHOT_METHOD = "sidebar-snapshot";
+
+/** Wire endpoint name for the raw user config read (Phase 6). */
+export const MAGIC_CONFIG_METHOD = "config";
+
+/** Wire endpoint name for the validated atomic user config write (Phase 6). */
+export const MAGIC_CONFIG_SAVE_METHOD = "config-save";
 
 /** dsh-plugin package version, shipped with every snapshot payload. */
 const MAGIC_CONTEXT_VERSION = pkg.version;
@@ -399,6 +411,28 @@ export class MagicContextRemoteService extends Service {
   }
 
   /**
+   * `magicContext/config` — raw user config file text. The wire delivers
+   * `{ args: { args: request } }`, so the request rides under the wrapper's
+   * `args` key; accept either shape (direct calls from tests) via the shared
+   * unwrap. The path is always the resolved CortexKit user path — a client
+   * supplied path is never honored.
+   */
+  async config(args: { args?: Record<string, unknown> } = {}): Promise<UserConfigReadResult> {
+    void unwrapRemoteRequest(args);
+    return readUserConfig();
+  }
+
+  /** `magicContext/config-save` — validate + atomically save the user config. */
+  async ["config-save"](args: { args?: Record<string, unknown> } = {}): Promise<UserConfigSaveResult> {
+    const request = unwrapRemoteRequest(args);
+    const content = request?.content;
+    if (typeof content !== "string") {
+      return { ok: false, error: "content must be a string" };
+    }
+    return saveUserConfig(content);
+  }
+
+  /**
    * Configured execute-threshold percentage for display (user + project
    * magic-context.jsonc scoped to the host workspace directory — dsh has no
    * per-model config, so a model-keyed map contributes only its `default`).
@@ -415,6 +449,19 @@ export class MagicContextRemoteService extends Service {
       return DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE;
     }
   }
+}
+
+/**
+ * The gateway delivers one src-json parameter wire under exactly that wire
+ * name, and the client bundle sends `{ args: { args: request } }`, so the
+ * service method receives `{ args: request }` — the request rides under the
+ * wrapper's `args` key. Accept both that wire shape and a direct request
+ * object (unit tests / future leaner clients).
+ */
+function unwrapRemoteRequest(args: { args?: Record<string, unknown> } = {}): Record<string, unknown> | undefined {
+  return args !== null && typeof args === "object" && args.args !== undefined
+    ? args.args
+    : (args as Record<string, unknown> | undefined);
 }
 
 /** Strict descriptor for `magicContext/status` (src-json codecs, no schemas). */
@@ -492,6 +539,56 @@ export function magicSnapshotDescriptor(): InvocationDescriptor {
   };
 }
 
+/** Strict descriptor for `magicContext/config` (Phase 6 raw read). */
+export function magicConfigDescriptor(): InvocationDescriptor {
+  return {
+    id: "magicContext.config",
+    service: "magicContextRemote",
+    namespace: MAGIC_CONTEXT_REMOTE_NAMESPACE,
+    method: MAGIC_CONFIG_METHOD,
+    invocation: { kind: "direct" },
+    parameters: [
+      {
+        name: "args",
+        wire: "args",
+        source: "json",
+        codec: { mode: "src-json" },
+      },
+    ],
+    result: { mode: "src-json" },
+    sourceLocation: {
+      file: "packages/dsh-plugin/src/host/remote.ts",
+      line: 1,
+      column: 1,
+    },
+  };
+}
+
+/** Strict descriptor for `magicContext/config-save` (Phase 6 validated write). */
+export function magicConfigSaveDescriptor(): InvocationDescriptor {
+  return {
+    id: "magicContext.config-save",
+    service: "magicContextRemote",
+    namespace: MAGIC_CONTEXT_REMOTE_NAMESPACE,
+    method: MAGIC_CONFIG_SAVE_METHOD,
+    invocation: { kind: "direct" },
+    parameters: [
+      {
+        name: "args",
+        wire: "args",
+        source: "json",
+        codec: { mode: "src-json" },
+      },
+    ],
+    result: { mode: "src-json" },
+    sourceLocation: {
+      file: "packages/dsh-plugin/src/host/remote.ts",
+      line: 1,
+      column: 1,
+    },
+  };
+}
+
 /**
  * Provide the remote service and register the `magicContext/status`
  * contribution. Returns a disposer, or undefined when the Typert registry is
@@ -519,6 +616,8 @@ export function registerMagicContextRemote(
       magicStatusDescriptor(),
       magicDiagnosticsDescriptor(),
       magicSnapshotDescriptor(),
+      magicConfigDescriptor(),
+      magicConfigSaveDescriptor(),
     ],
   };
   const disposer = typert.register(contribution);

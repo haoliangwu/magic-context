@@ -73,7 +73,7 @@ dsh plugin --profile <name> install link:/absolute/path/to/magic-context/package
 - **知识：** m0/m1 基线注入（项目文档 + 记忆）、auto-search、`§N§` 标签与 Channel-1/2 提醒
 - **上下文：** DSH transcript + surface CAS（outbox saga）、historian 分区（分级衰减）、Magic 压缩策略
 - **自动化：** Dreamer 任务、`/ctx-recomp` / `/ctx-wrapup` / `/ctx-session-upgrade`、`/ctx-embed`、feedback 桥接
-- **Web：** 侧边状态卡 + Remote 诊断（`src/client/client.tsx` → `dist/client.js`，`__ModuleLoader__` id `@cortexkit/dsh-magic-context`）
+- **Web：** 设置页配置编辑器（用户配置的表单 + Raw JSONC）与状态卡、Remote 诊断（`src/client/client.tsx` → `dist/client.js`，`__ModuleLoader__` id `@cortexkit/dsh-magic-context`）
 
 完整对照与约束见仓库 `README.md` 与 `ARCHITECTURE.md`。
 

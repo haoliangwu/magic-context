@@ -87,7 +87,7 @@ shipped presets' compaction rows point at `file://…/magic-context/packages/dsh
 - **Knowledge.** m0/m1 baseline injection (project docs + memories), auto-search, `§N§` tag hygiene with Channel-1/2 nudges
 - **Context.** DSH transcript + surface CAS (outbox saga), historian compartments (tiered decay), Magic compaction policy
 - **Automation.** Dreamer tasks, `/ctx-recomp` / `/ctx-wrapup` / `/ctx-session-upgrade`, `/ctx-embed`, feedback bridge
-- **Web.** Sidebar card + Remote diagnostics via `src/client/client.tsx` → `dist/client.js` (`__ModuleLoader__` id `@cortexkit/dsh-magic-context`)
+- **Web.** Settings config editor (form + raw JSONC over the CortexKit user config) plus the status card and Remote diagnostics via `src/client/client.tsx` → `dist/client.js` (`__ModuleLoader__` id `@cortexkit/dsh-magic-context`)
 
 Full feature table and constraints: see repository `README.md` and `ARCHITECTURE.md`.
 
