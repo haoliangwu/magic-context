@@ -16,7 +16,12 @@ export const OPENCODE_OUTPUT_CAP = 32_000;
  * real window, so every denominator check shares this one floor.
  */
 export const MIN_PLAUSIBLE_CONTEXT_LIMIT = 1_024;
-const OUTPUT_RESERVE_CAP_RATIO = 0.25;
+export const OUTPUT_RESERVE_CAP_RATIO = 0.25;
+
+/** Catalog output ceilings are not requested output; reserve at most a quarter of a shared window. */
+export function catalogOutputReserve(window: number, output: number | undefined): number {
+    return Math.min(output ?? 0, Math.floor(window * OUTPUT_RESERVE_CAP_RATIO));
+}
 
 export type WindowGeometry = "shared_upfront" | "shared_truncating" | "separate";
 export type WindowReserveSource = "output_catalog" | "output_config" | "wall_margin" | "none";
@@ -640,9 +645,12 @@ export function hasTrustedAbsoluteWall(geometry: WindowGeometryResult): boolean 
 }
 
 /**
- * Successful requests can disprove static catalog metadata, but cannot
- * disprove a provider, overlay, or observed-overflow wall. A reading beyond
- * that wall is malformed usage accounting and must not enlarge the geometry.
+ * Successful requests can disprove static catalog metadata, but do not widen a
+ * provider, overlay, or observed-overflow wall here. A provider or overlay wall
+ * is the configured limit: a reading beyond it is real pressure against that
+ * limit (the usage handlers count it in full), not proof that the geometry
+ * should grow. An observed-overflow wall that a larger accepted request
+ * disproves is cleared by the usage handlers instead.
  */
 export function applyProvenInputFloor(
     geometry: WindowGeometryResult,
@@ -692,14 +700,19 @@ export function formatWindowDerivationLine(
     inputTokens: number,
     result: WindowGeometryResult,
 ): string {
-    const percentage = result.usableSoft > 0 ? (inputTokens / result.usableSoft) * 100 : 0;
     const reserveLabel =
         result.derivation.reserveSource === "wall_margin"
             ? "wall margin"
             : result.derivation.reserveSource === "none"
               ? "reserve"
               : "output reserve";
-    return `Context: ${formatCompactTokens(inputTokens)} / ${formatCompactTokens(result.usableSoft)} usable (${percentage.toFixed(1)}%) — window ${formatCompactTokens(result.derivation.window)} − ${formatCompactTokens(result.derivation.reserve)} ${reserveLabel} [${result.geometry}]`;
+    // One line at the dialog's narrowest width, and no geometry vocabulary: the
+    // bracketed derivation tag (`[shared_truncating]`) names an internal
+    // window-geometry mode, and the percentage is already on the headline row
+    // above this one. The `Context:` prefix is dropped for the same reason — it
+    // pushed the line past the narrowest dialog's content width, where it
+    // wrapped onto a second row.
+    return `${formatCompactTokens(inputTokens)} / ${formatCompactTokens(result.usableSoft)} usable · window ${formatCompactTokens(result.derivation.window)} · ${formatCompactTokens(result.derivation.reserve)} ${reserveLabel}`;
 }
 
 export function formatCompactTokens(value: number): string {

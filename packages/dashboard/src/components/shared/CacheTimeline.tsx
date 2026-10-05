@@ -3,10 +3,12 @@ import { formatDateTime } from "../../lib/api";
 import {
   cacheCauseLabel,
   cacheCauseTooltip,
+  cacheEventColorClass,
+  cacheEventLabel,
+  cacheWriteLabel,
   ctxBarGeom,
   formatTokensShort,
   normalizeEstimatedContextLimits,
-  severityColorClass,
 } from "../../lib/cache-format";
 import type { DbCacheEvent } from "../../lib/types";
 
@@ -90,9 +92,10 @@ export default function CacheTimeline(props: {
     const outerClass = isUnknown ? "unknown" : event.severity === "full_bust" ? "full_bust" : "";
     const pctOfWindow = g.limit > 0 ? (g.prompt / g.limit) * 100 : 0;
     const cachedOfPrompt = g.prompt > 0 ? (event.cache_read / g.prompt) * 100 : 0;
-    const cachedLine = isUnknown
-      ? "Cache: not reported by provider"
-      : `Cached: ${event.cache_read.toLocaleString()} (${cachedOfPrompt.toFixed(0)}% of prompt)`;
+    const cachedLine =
+      isUnknown || !event.cache_reported
+        ? "Cache: not reported by provider"
+        : `Cached: ${event.cache_read.toLocaleString()} (${cachedOfPrompt.toFixed(0)}% of prompt)`;
     const dropLine = event.is_drop
       ? `\n⬇ MC reclaimed context${event.cause ? ` — ${cacheCauseLabel(event.cause)}` : ""}`
       : "";
@@ -110,7 +113,7 @@ export default function CacheTimeline(props: {
     };
     const windowLabel = g.limit > 0 ? g.limit.toLocaleString() : "unknown";
     const causeTip = event.cause ? cacheCauseTooltip(event.cause) : undefined;
-    const title = `${formatDateTime(event.timestamp)}\n${event.severity.toUpperCase()}${g.overflow ? " · OVERFLOW" : ""}\nPrompt: ${g.prompt.toLocaleString()} / ${windowLabel} (${pctOfWindow.toFixed(1)}% of window)\n${cachedLine}\nUncached: ${(event.input_tokens + event.cache_write).toLocaleString()}${dropLine}${causeTip ? `\n${causeTip}` : ""}\n(click → jump to step in list)`;
+    const title = `${formatDateTime(event.timestamp)}\n${cacheEventLabel(event)}${g.overflow ? " · OVERFLOW" : ""}\nPrompt: ${g.prompt.toLocaleString()} / ${windowLabel} (${pctOfWindow.toFixed(1)}% of window)\n${cachedLine}\nUncached: ${(event.input_tokens + event.cache_write).toLocaleString()}\nCache writes: ${cacheWriteLabel([event])}${dropLine}${causeTip ? `\n${causeTip}` : ""}\n(click → jump to step in list)`;
     return (
       <div class="ctx-bar-slot">
         <Show when={event.is_drop}>
@@ -134,7 +137,7 @@ export default function CacheTimeline(props: {
         >
           <Show when={!isUnknown && g.innerPct > 0}>
             <div
-              class={`ctx-bar-cached ${severityColorClass(event.severity)}`}
+              class={`ctx-bar-cached ${cacheEventColorClass(event)}`}
               style={{ height: `${g.innerPct}%` }}
             />
           </Show>

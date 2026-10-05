@@ -452,7 +452,7 @@ export function buildChannel2Reminder(
     const hintText = formatOldestReclaimableHint(hint);
     return (
         `<system-reminder>\n` +
-        `Routine housekeeping: ${summary} are reclaimable — make a ctx_reduce pass at a natural stopping point.${hintText}\n` +
+        `Your next step: call ctx_reduce on the outputs you've already used (${summary}). Then continue your task.${hintText}\n` +
         `</system-reminder>`
     );
 }
@@ -480,19 +480,19 @@ export function buildChannel1Reminder(
     const summary = formatReclaimableOutputSummary(reclaimableToolOutputs, undroppedTokens);
     const hintText = formatOldestReclaimableHint(hint);
     if (sticky) {
-        return `\n\n<system-reminder>\nReminder: ${summary} are still reclaimable — ctx_reduce them at a natural stopping point.${hintText}\n</system-reminder>`;
+        return `\n\n<system-reminder>\nStill unstamped: ${summary}. Stamp the ones you've used with ctx_reduce now.${hintText}\n</system-reminder>`;
     }
 
     let body: string;
     switch (level) {
         case "gentle":
-            body = `Housekeeping: ${summary} are reclaimable — drop the ones you have already processed with ctx_reduce at a natural stopping point.`;
+            body = `Housekeeping: ${summary} are reclaimable. Stamp each output with ctx_reduce as soon as you've taken what you need from it; don't wait for the task to finish.`;
             break;
         case "firm":
-            body = `Housekeeping: ${summary} are reclaimable — make a ctx_reduce pass at a natural stopping point.`;
+            body = `${summary} are reclaimable. Make a ctx_reduce pass now over the outputs you've already used, then continue.`;
             break;
         case "urgent":
-            body = `Housekeeping backlog: ${summary} are reclaimable — a ctx_reduce pass is due.`;
+            body = `${summary} are still unstamped. Call ctx_reduce now, before your next tool call, on every output you've already used.`;
             break;
     }
     return `\n\n<system-reminder>\n${body}${hintText}\n</system-reminder>`;

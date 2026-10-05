@@ -1,5 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
-import { drainMirrorPages } from "../context-authority";
+
 import { archiveMemory } from "../memory";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
 import { type LeaseAcquisition, leaseOwnershipMatches, runLeaseGuardedWrite } from "./lease";
@@ -53,13 +53,6 @@ async function archiveExpiredThroughModule(args: {
     expiredContextIds: readonly number[];
     moduleRoute: DreamerModuleRoute;
 }): Promise<number> {
-    if (!args.moduleRoute.moduleClient.mirrorPull) {
-        throw new DreamerModuleFailureError(
-            "mirror.pull expired archive",
-            new Error("Rust dreamer client omitted the memory mirror route"),
-        );
-    }
-
     for (
         let offset = 0;
         offset < args.expiredContextIds.length;
@@ -83,7 +76,7 @@ async function archiveExpiredThroughModule(args: {
         if (identities.size !== contextBatch.length) {
             throw new DreamerModuleFailureError(
                 "ctx_memory expired archive",
-                new Error("expired memory is missing its module mirror identity"),
+                new Error("expired memory no longer belongs to the project"),
             );
         }
         const moduleBatch = contextBatch.map((id) => {
@@ -113,22 +106,6 @@ async function archiveExpiredThroughModule(args: {
         }
     }
 
-    const mirrorPull = args.moduleRoute.moduleClient.mirrorPull;
-    const drained = await drainMirrorPages({
-        db: args.db,
-        module: {
-            mirrorPull: (request) =>
-                mirrorPull({ ...request, projectRoot: args.moduleRoute.moduleProjectRoot }),
-        },
-        domain: "memories",
-        limit: 1_000,
-    });
-    if (!drained.complete) {
-        throw new DreamerModuleFailureError(
-            "mirror.pull expired archive",
-            new Error("memory mirror did not reach the module cursor"),
-        );
-    }
     if (
         !leaseOwnershipMatches(
             args.db,

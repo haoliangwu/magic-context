@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     type ConditionCompilerOptions,
     compileSurfaceCondition,
@@ -201,7 +202,7 @@ describe("surface-condition compiler", () => {
     });
 
     test("refuses a provider-fenced path while preserving the authoring operation", async () => {
-        const home = mkdtempSync(join(tmpdir(), "condition-compiler-home-"));
+        const home = createTestTempDirFromPath(join(tmpdir(), "condition-compiler-home-"));
         temporaryDirectories.push(home);
         const result = await compileSurfaceCondition(
             "when path ~/.local/share/cortexkit/plexus/store.db exists",

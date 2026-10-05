@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { isDevPathPluginEntry } from "../adapters/opencode";
 import { projectPathToPiDirSlug } from "../commands/migrate";
 import { resolveAdaptersForCommand } from "./harness-select";
@@ -19,7 +20,7 @@ afterEach(() => {
 });
 
 function tempRoot(): string {
-    const root = mkdtempSync(join(tmpdir(), "mc-cli-hardening-"));
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-cli-hardening-"));
     roots.push(root);
     return root;
 }
@@ -54,8 +55,29 @@ describe("CLI hardening helpers", () => {
         );
         writeFileSync(join(theme, "package.json"), JSON.stringify({ name: "magic-context-theme" }));
 
-        expect(isDevPathPluginEntry(pathToFileURL(plugin).href)).toBe(true);
-        expect(isDevPathPluginEntry(pathToFileURL(theme).href)).toBe(false);
+        expect(isDevPathPluginEntry(pathToFileURL(plugin).href, root)).toBe(true);
+        expect(isDevPathPluginEntry(pathToFileURL(theme).href, root)).toBe(false);
+    });
+
+    it("resolves a relative development path against the config file's directory", () => {
+        // OpenCode resolves `./…` plugin entries against the directory of the
+        // config file that declares them, not the shell's working directory.
+        const configDir = tempRoot();
+        const elsewhere = tempRoot();
+        mkdirSync(join(configDir, "mc", "plugin"), { recursive: true });
+        writeFileSync(
+            join(configDir, "mc", "plugin", "package.json"),
+            JSON.stringify({ name: "@cortexkit/opencode-magic-context" }),
+        );
+        const originalCwd = process.cwd();
+        process.chdir(elsewhere);
+        try {
+            expect(isDevPathPluginEntry("./mc/plugin", configDir)).toBe(true);
+            // The same relative path from the shell's directory is not the checkout.
+            expect(isDevPathPluginEntry("./mc/plugin", elsewhere)).toBe(false);
+        } finally {
+            process.chdir(originalCwd);
+        }
     });
 
     it("recognizes source-only Pi object entries without substring matches", () => {

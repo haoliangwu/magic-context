@@ -1,9 +1,15 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it, mock } from "bun:test";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+	copyFileSync,
+	mkdirSync,
+	realpathSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
 
 import {
@@ -137,26 +143,46 @@ describe("loadDefaultPiSessionApi", () => {
 			]);
 		});
 
-		it("loads the OMP package through the final bare-import fallback", () => {
-			const resolverUrl = new URL("./pi-session-api.ts", import.meta.url).href;
-			const script = `
-				import { mock } from "bun:test";
-				mock.module(${JSON.stringify(OMP_SPEC)}, () => ({
-					SessionManager: { listAll: async () => ["omp-bare-import"] },
-				}));
-				const resolver = await import(${JSON.stringify(resolverUrl)});
-				const ompLoader = resolver.defaultLoaders.find(
-					(loader) => loader.name === "Bare import (OMP)",
-				);
-				if (!ompLoader) throw new Error("OMP bare-import loader missing");
-				const api = await resolver.loadDefaultPiSessionApi([ompLoader]);
-				process.stdout.write(JSON.stringify(await api.listSessions()));
-			`;
-			const output = execFileSync(process.execPath, ["-e", script], {
-				encoding: "utf8",
-			});
-			expect(JSON.parse(output)).toEqual(["omp-bare-import"]);
-		});
+		it("loads the OMP package through the final bare-import fallback", async () => {
+			// OMP is not installed in this repo, so the bare import needs a
+			// package to find. A bare specifier resolves from the importing
+			// file's directory, so the resolver source is copied next to a
+			// fixture node_modules/@oh-my-pi/pi-coding-agent and the copy is
+			// imported in this process. That avoids two hazards: mock.module
+			// cannot be undone, so mocking the OMP package here would leak into
+			// every later test in the process; and spawning a `bun -e` child to
+			// contain that mock once hung until the 30 s test timeout on CI.
+			// The resolver imports only node: builtins. If it ever gains a
+			// relative import, the copy fails to load and this test goes red.
+			const dir = createTestTempDir("omp-bare-import-").dir;
+			writeFixturePackage(
+				join(dir, "node_modules", "@oh-my-pi", "pi-coding-agent"),
+				{
+					manifest: {
+						name: OMP_SPEC,
+						version: "18.2.1",
+						exports: { ".": { import: "./index.js" } },
+					},
+					files: { "index.js": fixtureModule("omp-bare-import") },
+				},
+			);
+			const resolverCopy = join(dir, "src", "pi-session-api.ts");
+			mkdirSync(dirname(resolverCopy), { recursive: true });
+			copyFileSync(
+				fileURLToPath(new URL("./pi-session-api.ts", import.meta.url)),
+				resolverCopy,
+			);
+
+			const resolver = (await import(
+				pathToFileURL(resolverCopy).href
+			)) as typeof import("./pi-session-api");
+			const ompLoader = resolver.defaultLoaders.find(
+				(loader) => loader.name === "Bare import (OMP)",
+			);
+			if (!ompLoader) throw new Error("OMP bare-import loader missing");
+			const api = await resolver.loadDefaultPiSessionApi([ompLoader]);
+			expect(await api.listSessions()).toEqual(["omp-bare-import"]);
+		}, 30000);
 
 		it("resolves through a bin-shim symlink when argv[1] is the shim path", async () => {
 			const dir = createTestTempDir("pi-symlink-test-").dir;

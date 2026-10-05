@@ -235,7 +235,6 @@ Przywoływanie działa **między sesjami** (nowa sesja dziedziczy wszystko) i **
 | `/ctx-status` | Widok debugowania: tags, pending drops, cache TTL, stan nudge, postęp historian, pokrycie kompartymentów, budżet historii |
 | `/ctx-flush` | Natychmiast wymuś wszystkie operacje w kolejce, z pominięciem cache TTL |
 | `/ctx-recomp` | Przebuduj kompartymenty z surowej historii (akceptuje zakres `start-end`). Użyj, gdy zapisany stan wygląda źle |
-| `/ctx-session-upgrade` | Uaktualnij tę sesję do najnowszego formatu historii: przebuduj kompartymenty i migruj pamięci projektu |
 | `/ctx-dream` | Uruchom konserwację dreamer na żądanie: pamięć, docs, smart notes i review user-profile |
 
 ---

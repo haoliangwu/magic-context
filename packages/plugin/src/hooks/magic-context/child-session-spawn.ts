@@ -14,6 +14,8 @@ export const STALE_PLUGIN_RESTART_NOTICE =
 export const SCHEMA_PROBE_FAILURE_NOTICE = `Magic Context: unable to verify the database schema before spawning a child — run ${FAIL_CLOSED_DOCTOR_COMMAND}`;
 
 interface ChildSessionClient {
+    /** True only for clients whose background work cannot appear in a user's session list. */
+    backgroundSessionsAreHidden?: boolean;
     session: { create(input: never): unknown | Promise<unknown> };
 }
 
@@ -88,6 +90,18 @@ export async function createChildSessionWithFence(
             if (args.onFenceLatched) await args.onFenceLatched(verdict.failure);
             else await surfaceSchemaFenceFailure(args, verdict.failure);
         }
+        return null;
+    }
+
+    // Agent.hidden only hides the agent picker. OpenCode's session picker and
+    // Desktop error notifications use parentID, so background work must wait
+    // for an ordinary session rather than creating a visible root at startup.
+    if (
+        args.title.startsWith("magic-context-dream") &&
+        !args.parentSessionId &&
+        !args.client.backgroundSessionsAreHidden
+    ) {
+        sessionLog("dreamer", "child session deferred: no parent session is available");
         return null;
     }
 

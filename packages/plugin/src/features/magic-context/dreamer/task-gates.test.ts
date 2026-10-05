@@ -1,8 +1,12 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     getMemoriesByProject,
     getUnclassifiedMemoryIds,
@@ -11,8 +15,9 @@ import {
     setMemoryClassification,
 } from "../memory";
 import { runMigrations } from "../migrations";
+import { advanceSessionActivity } from "../session-activity";
 import { initializeDatabase } from "../storage-db";
-import { evaluateTaskGate, getDreamTaskBacklog } from "./task-gates";
+import { evaluateTaskGate, getDreamTaskBacklog, getDreamTaskBacklogs } from "./task-gates";
 import { formatDreamTaskBacklogs, processedDreamTaskItems } from "./task-registry";
 
 let db: Database | null = null;
@@ -30,6 +35,77 @@ function freshDb(): Database {
 }
 
 describe("dream task backlog probes", () => {
+    test("an empty task registry returns without requiring memory tables", () => {
+        db = new Database(":memory:");
+        expect(getDreamTaskBacklogs(db, "empty", [])).toEqual({});
+    });
+
+    test("backlog memo distinguishes non-finite watermarks from null", () => {
+        db = freshDb();
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("watermark-session", "opencode", "watermark-project", 1);
+        for (const value of [Number.POSITIVE_INFINITY, Number.NaN, null]) {
+            const options = { retrospectiveWatermarkMs: value };
+            expect(
+                getDreamTaskBacklogs(db, "watermark-project", ["retrospective"], options)
+                    .retrospective,
+            ).toEqual(getDreamTaskBacklog(db, "watermark-project", "retrospective", options));
+        }
+    });
+    test("backlog memo observes own and external writes, isolates handles and does not retain caller mutations", () => {
+        const dir = createTestTempDirFromPath(join(tmpdir(), "backlog-cache-"));
+        const reader = new Database(join(dir, "copy.db"));
+        initializeDatabase(reader);
+        runMigrations(reader);
+        const writer = new Database(join(dir, "copy.db"));
+        const other = freshDb();
+        const project = "git:backlog-cache";
+        const read = (database: Database) =>
+            getDreamTaskBacklogs(database, project, ["map-memories"]);
+        const add = (database: Database, content: string) =>
+            insertMemory(database, { projectPath: project, category: "ARCHITECTURE", content });
+        try {
+            add(reader, "first");
+            const first = read(reader);
+            expect(first["map-memories"]).toEqual({ pending: 1, total: 1 });
+            if (first["map-memories"]) first["map-memories"].total = 999;
+            expect(read(reader)["map-memories"]).toEqual({ pending: 1, total: 1 });
+            add(reader, "second");
+            expect(read(reader)["map-memories"]).toEqual({ pending: 2, total: 2 });
+            add(writer, "third");
+            expect(read(reader)["map-memories"]).toEqual({ pending: 3, total: 3 });
+            expect(read(other)["map-memories"]).toEqual({ pending: 0, total: 0 });
+        } finally {
+            reader.close();
+            writer.close();
+            other.close();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("backlog memo bypasses expiring pools even when no database write occurs", () => {
+        db = freshDb();
+        const originalNow = Date.now;
+        try {
+            Date.now = () => 1000;
+            insertMemory(db, {
+                projectPath: "git:expiry-cache",
+                category: "ARCHITECTURE",
+                content: "expires",
+                expiresAt: 2000,
+            });
+            expect(
+                getDreamTaskBacklogs(db, "git:expiry-cache", ["map-memories"])["map-memories"],
+            ).toEqual({ pending: 1, total: 1 });
+            Date.now = () => 2000;
+            expect(
+                getDreamTaskBacklogs(db, "git:expiry-cache", ["map-memories"])["map-memories"],
+            ).toEqual({ pending: 0, total: 0 });
+        } finally {
+            Date.now = originalNow;
+        }
+    });
     test("map and classify probes match seeded candidate counts", () => {
         db = freshDb();
         const projectIdentity = "/repo/project";
@@ -177,6 +253,52 @@ describe("dream task backlog probes", () => {
         });
     });
 
+    test("uses persisted task watermarks unless an explicit value is supplied", () => {
+        db = freshDb();
+        const project = "/repo/watermarks";
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("old", "opencode", project, 100);
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("new", "opencode", project, 300);
+        db.prepare(
+            "INSERT INTO task_schedule_state (project_path, task, retrospective_watermark_ms, last_run_at) VALUES (?, ?, ?, ?)",
+        ).run(project, "retrospective", 200, null);
+        advanceSessionActivity(db, "old", 100);
+        advanceSessionActivity(db, "new", 300);
+        expect(getDreamTaskBacklog(db, project, "retrospective").pending).toBe(1);
+        expect(
+            getDreamTaskBacklog(db, project, "retrospective", { retrospectiveWatermarkMs: null })
+                .pending,
+        ).toBe(2);
+        expect(
+            getDreamTaskBacklog(db, project, "retrospective", { retrospectiveWatermarkMs: 200 })
+                .pending,
+        ).toBe(1);
+        db.prepare(
+            "UPDATE task_schedule_state SET retrospective_watermark_ms = ? WHERE project_path = ? AND task = ?",
+        ).run(300, project, "retrospective");
+        expect(getDreamTaskBacklog(db, project, "retrospective").pending).toBe(0);
+
+        db.prepare(
+            "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
+        ).run("docs-session", "opencode", project, 500);
+        db.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, title, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ).run("docs-session", 1, 0, 1, "old doc", "old", 100);
+        db.prepare(
+            "INSERT INTO compartments (session_id, sequence, start_message, end_message, title, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ).run("docs-session", 2, 2, 3, "new doc", "new", 300);
+        db.prepare(
+            "INSERT INTO task_schedule_state (project_path, task, last_run_at) VALUES (?, ?, ?)",
+        ).run(project, "maintain-docs", 200);
+        expect(getDreamTaskBacklog(db, project, "maintain-docs").pending).toBe(1);
+        expect(getDreamTaskBacklog(db, project, "maintain-docs", { lastRunAt: null }).pending).toBe(
+            2,
+        );
+    });
+
     test("processed count is the start-to-end backlog reduction", () => {
         expect(processedDreamTaskItems(17, 5)).toBe(12);
         expect(processedDreamTaskItems(5, 7)).toBe(0);
@@ -246,6 +368,7 @@ describe("evaluateTaskGate", () => {
         db.prepare(
             "INSERT INTO session_projects (session_id, harness, project_path, updated_at) VALUES (?, ?, ?, ?)",
         ).run("s1", "opencode", projectIdentity, 200);
+        advanceSessionActivity(db, "s1", 200);
 
         // Never scanned → runs.
         expect(
@@ -257,8 +380,7 @@ describe("evaluateTaskGate", () => {
                 promotionThreshold: 3,
             }),
         ).toBe(true);
-        // Session newer than watermark → runs (even if lastRunAt is newer — the
-        // session was updated mid-run, so its content hasn't been scanned).
+        // Message activity newer than watermark runs even if lastRunAt is newer.
         expect(
             evaluateTaskGate("retrospective", {
                 db,
@@ -268,7 +390,7 @@ describe("evaluateTaskGate", () => {
                 promotionThreshold: 3,
             }),
         ).toBe(true);
-        // Watermark at/after the session update → nothing new → skip.
+        // Watermark at/after the last message → nothing new → skip.
         expect(
             evaluateTaskGate("retrospective", {
                 db,

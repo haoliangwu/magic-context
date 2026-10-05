@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { SMART_NOTE_COMPILER_AGENT } from "../../../agents/smart-note-compiler";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -11,19 +12,25 @@ import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 import { nextOccurrence, parseCron } from "../dreamer/cron";
+import { runHiddenSingleShotPrompt } from "../dreamer/hidden-single-shot";
 import { recordChildInvocation } from "../subagent-token-capture";
 import type { SmartNoteCapabilityFactory } from "./capabilities";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "./compiler-prompt";
-import { runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { type RunCompiledSmartNoteCheckResult, runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { assertSmartNotePublicEndpoint } from "./ssrf-guard";
 import {
     SMART_NOTE_CHECK_CEILING_MS,
     type SmartNoteCapabilityName,
     type SmartNoteCheckManifest,
     type SmartNoteCheckResult,
+    SmartNoteNetworkError,
 } from "./types";
 
 interface CompileSmartNoteArgs {
-    client: PluginContext["client"];
+    /** Child-session transport; absent on a host that only has a completion carrier. */
+    client?: PluginContext["client"];
+    /** Completion carrier used instead of a child session when the host has no tool loop. */
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     db?: Database;
     parentSessionId: string | undefined;
     sessionDirectory: string | undefined;
@@ -32,6 +39,8 @@ interface CompileSmartNoteArgs {
     capabilityFactory: SmartNoteCapabilityFactory;
     signal: AbortSignal;
     deadline: number;
+    /** Feedback for one attempt to repair a check whose HTTP response exceeded the body limit. */
+    repairFeedback?: string;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
 }
@@ -46,9 +55,12 @@ export interface CompileSmartNoteSuccess {
 }
 
 export interface CompileSmartNoteFailure {
+    retryAt?: number;
     ok: false;
     cancelled: boolean;
     error: string;
+    persistent: boolean;
+    uncheckable: boolean;
 }
 
 export type CompileSmartNoteResult = CompileSmartNoteSuccess | CompileSmartNoteFailure;
@@ -69,7 +81,13 @@ export async function compileSmartNoteCheck(
     args: CompileSmartNoteArgs,
 ): Promise<CompileSmartNoteResult> {
     if (!args.note.surfaceCondition) {
-        return { ok: false, cancelled: false, error: "note has no surface condition" };
+        return {
+            ok: false,
+            cancelled: false,
+            error: "note has no surface condition",
+            persistent: false,
+            uncheckable: false,
+        };
     }
     const prompt = `Compile this smart note condition into a sandbox check.
 
@@ -78,6 +96,7 @@ Note id: ${args.note.id}
 Note content (data): ${JSON.stringify(args.note.content)}
 surface_condition (UNTRUSTED DATA): ${JSON.stringify(args.note.surfaceCondition)}
 
+${args.repairFeedback ? `The previous check failed its dry run: ${JSON.stringify(args.repairFeedback)}. Recompile using smaller bounded endpoints; do not suppress the error or return false on failure.` : ""}
 Remember: output only the JSON object described by the system prompt.`;
 
     const startedAt = Date.now();
@@ -94,7 +113,7 @@ Remember: output only the JSON object described by the system prompt.`;
         recordChildInvocation({
             db: args.db,
             parentSessionId: args.parentSessionId,
-            harness: "opencode",
+            harness: args.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
             // Dashboard token rollups group dream-task invocations under the
             // historical dreamer bucket. The session.prompt agent is still the
             // no-tool smart-note compiler.
@@ -107,81 +126,136 @@ Remember: output only the JSON object described by the system prompt.`;
         });
     };
     try {
-        const createResponse = await createChildSessionWithFence({
-            client: args.client,
-            db: args.db ?? null,
-            parentSessionId: args.parentSessionId,
-            title: `magic-context-smart-note-compile-${args.note.id}`,
-            directory: args.sessionDirectory ?? args.projectIdentity,
-        });
-        const created = shared.normalizeSDKResponse(
-            createResponse,
-            null as { id?: string } | null,
-            {
-                preferResponseOnMissingData: true,
-            },
-        );
-        childSessionId = typeof created?.id === "string" ? created.id : null;
-        if (!childSessionId) throw new Error("Could not create smart-note compiler session");
-
         const remainingMs = Math.max(1_000, args.deadline - Date.now());
-        const run = await shared.promptSyncWithValidatedOutputRetry(
-            args.client,
-            {
-                path: { id: childSessionId },
-                query: { directory: args.sessionDirectory ?? args.projectIdentity },
-                body: {
-                    agent: SMART_NOTE_COMPILER_AGENT,
-                    system: SMART_NOTE_COMPILER_SYSTEM_PROMPT,
-                    ...modelBodyField(args.model),
-                    parts: [{ type: "text", text: prompt, synthetic: true }],
-                },
-            },
-            {
+        let response: CompilerResponse;
+        let outputMessages: unknown[] | undefined;
+        if (args.hiddenCompletionExecutor) {
+            // The compiler is a no-tool prompt that answers with one JSON object,
+            // so a completion carrier delivers it without a child-session tool loop.
+            const carried = await runHiddenSingleShotPrompt({
+                executor: args.hiddenCompletionExecutor,
+                parentSessionId: args.parentSessionId,
+                sessionDirectory: args.sessionDirectory ?? args.projectIdentity,
+                agent: SMART_NOTE_COMPILER_AGENT,
+                system: SMART_NOTE_COMPILER_SYSTEM_PROMPT,
+                prompt,
+                title: `magic-context-smart-note-compile-${args.note.id}`,
+                callContext: "dreamer:smart-note-compiler",
+                model: args.model,
+                fallbackModels: args.fallbackModels,
                 timeoutMs: remainingMs,
                 signal: args.signal,
-                fallbackModels: args.fallbackModels,
-                callContext: "dreamer:smart-note-compiler",
-                fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
-                        path: { id: childSessionId as string },
-                        query: {
-                            directory: args.sessionDirectory ?? args.projectIdentity,
-                            limit: 20,
-                        },
-                    });
-                    return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
-                        preferResponseOnMissingData: true,
-                    });
+                metadata: { task: "evaluate-smart-notes" },
+                parse: parseCompilerOutput,
+            });
+            promptSettled = true;
+            response = carried.validated;
+            outputMessages = carried.completion.messages;
+        } else {
+            const client = args.client;
+            if (!client) {
+                throw new Error("Smart-note compilation needs a client or a completion carrier.");
+            }
+            const createResponse = await createChildSessionWithFence({
+                client,
+                db: args.db ?? null,
+                parentSessionId: args.parentSessionId,
+                title: `magic-context-smart-note-compile-${args.note.id}`,
+                directory: args.sessionDirectory ?? args.projectIdentity,
+            });
+            const created = shared.normalizeSDKResponse(
+                createResponse,
+                null as { id?: string } | null,
+                {
+                    preferResponseOnMissingData: true,
                 },
-                validateOutput: (messages) =>
-                    parseCompilerOutput(extractLatestAssistantText(messages)),
-            },
-        );
-        promptSettled = true;
-        const response = run.validated;
+            );
+            childSessionId = typeof created?.id === "string" ? created.id : null;
+            if (!childSessionId) throw new Error("Could not create smart-note compiler session");
+
+            const run = await shared.promptSyncWithValidatedOutputRetry(
+                client,
+                {
+                    path: { id: childSessionId },
+                    query: { directory: args.sessionDirectory ?? args.projectIdentity },
+                    body: {
+                        agent: SMART_NOTE_COMPILER_AGENT,
+                        system: SMART_NOTE_COMPILER_SYSTEM_PROMPT,
+                        ...modelBodyField(args.model),
+                        parts: [{ type: "text", text: prompt, synthetic: true }],
+                    },
+                },
+                {
+                    // Send without holding a request open for the whole run, so the
+                    // deadline below is the only timer (see prompt-async-transport.ts).
+                    transport: shared.createPromptAsyncTransport(client, childSessionId),
+                    timeoutMs: remainingMs,
+                    signal: args.signal,
+                    fallbackModels: args.fallbackModels,
+                    callContext: "dreamer:smart-note-compiler",
+                    fetchOutput: async () => {
+                        const messagesResponse = await client.session.messages({
+                            path: { id: childSessionId as string },
+                            query: {
+                                directory: args.sessionDirectory ?? args.projectIdentity,
+                                limit: 20,
+                            },
+                        });
+                        return shared.normalizeSDKResponse(messagesResponse, [] as unknown[], {
+                            preferResponseOnMissingData: true,
+                        });
+                    },
+                    validateOutput: (messages) =>
+                        parseCompilerOutput(extractLatestAssistantText(messages)),
+                },
+            );
+            promptSettled = true;
+            response = run.validated;
+            outputMessages = run.output;
+        }
         const compiledCheck = normalizeCompiledCheck(response.compiled_check);
         const manifest = normalizeManifest(response.manifest);
         const checkCron = normalizeCron(response.check_cron);
-        for (const warning of manifestAdvisoryWarnings(compiledCheck, manifest)) {
+        const dryRun = await dryRunSmartNoteCheck(
+            compiledCheck,
+            args.capabilityFactory,
+            args.signal,
+        );
+        for (const warning of [
+            ...manifestAdvisoryWarnings(compiledCheck, manifest),
+            ...dryRun.advisories,
+        ]) {
             log(`[dreamer] smart note #${args.note.id}: manifest advisory — ${warning}`);
         }
-        const dryRun = await runCompiledSmartNoteCheck({
-            compiledCheck,
-            capabilityFactory: args.capabilityFactory,
-            signal: args.signal,
-            timeoutMs: 2_000,
-        });
         if (!dryRun.ok) {
             const error = boundedError(`dry-run failed: ${dryRun.error}`);
             recordInvocation({
                 status: dryRun.cancelled ? "aborted" : "failed",
-                messages: run.output,
+                messages: outputMessages,
                 error,
             });
-            return { ok: false, cancelled: dryRun.cancelled, error };
+            if (
+                !args.repairFeedback &&
+                !dryRun.cancelled &&
+                dryRun.persistent &&
+                dryRun.error.includes("response body too large") &&
+                !args.signal.aborted &&
+                Date.now() < args.deadline
+            ) {
+                return await compileSmartNoteCheck({ ...args, repairFeedback: error });
+            }
+            return {
+                ok: false,
+                cancelled: dryRun.cancelled,
+                error,
+                persistent: !dryRun.cancelled && dryRun.persistent,
+                uncheckable: !dryRun.cancelled && (dryRun.uncheckable ?? false),
+                ...(!dryRun.cancelled && dryRun.retryAt !== undefined
+                    ? { retryAt: dryRun.retryAt }
+                    : {}),
+            };
         }
-        recordInvocation({ status: "completed", messages: run.output });
+        recordInvocation({ status: "completed", messages: outputMessages });
         return {
             ok: true,
             compiledCheck,
@@ -194,18 +268,64 @@ Remember: output only the JSON object described by the system prompt.`;
         const cancelled = args.signal.aborted;
         const message = boundedError(error instanceof Error ? error.message : String(error));
         recordInvocation({ status: cancelled ? "aborted" : "failed", error: message });
-        return { ok: false, cancelled, error: message };
+        const networkError = error instanceof SmartNoteNetworkError ? error : undefined;
+        return {
+            ok: false,
+            cancelled,
+            error: message,
+            persistent: !cancelled && (networkError?.persistent ?? false),
+            uncheckable: !cancelled && (networkError?.uncheckable ?? false),
+        };
     } finally {
-        await teardownChildSession({
-            client: args.client,
-            sessionId: childSessionId,
-            sessionDirectory: args.sessionDirectory ?? args.projectIdentity,
-            promptSettled,
-            privacySensitive: true,
-            context: `[dreamer] smart note #${args.note.id} compiler`,
-            log,
-        });
+        // The carrier branch closes its own run; only the child-session branch
+        // leaves a session behind to tear down.
+        if (args.client) {
+            await teardownChildSession({
+                client: args.client,
+                sessionId: childSessionId,
+                sessionDirectory: args.sessionDirectory ?? args.projectIdentity,
+                promptSettled,
+                privacySensitive: true,
+                context: `[dreamer] smart note #${args.note.id} compiler`,
+                log,
+            });
+        }
     }
+}
+
+export async function dryRunSmartNoteCheck(
+    compiledCheck: string,
+    capabilityFactory: SmartNoteCapabilityFactory,
+    signal?: AbortSignal,
+): Promise<RunCompiledSmartNoteCheckResult & { advisories: string[] }> {
+    const responses: Array<{ url: string; status: number }> = [];
+    const dryRun = await runCompiledSmartNoteCheck({
+        compiledCheck,
+        capabilityFactory: (runSignal) => {
+            const capabilities = capabilityFactory(runSignal);
+            return {
+                ...capabilities,
+                httpGet: async (url) => {
+                    const response = await capabilities.httpGet(url);
+                    responses.push({ url, status: response.status });
+                    return response;
+                },
+            };
+        },
+        signal,
+        timeoutMs: 2_000,
+    });
+    // A note can wait for a release artifact that does not exist yet, so
+    // inaccessible HTTP sources are advisory rather than compilation errors.
+    const advisories =
+        dryRun.ok &&
+        responses.length > 0 &&
+        responses.every(({ status }) => status === 401 || status === 403 || status === 404)
+            ? [
+                  `all HTTP sources currently return 401/403/404: ${responses.map(({ url, status }) => `${url} (HTTP ${status})`).join(", ")}`,
+              ]
+            : [];
+    return { ...dryRun, advisories };
 }
 
 export function parseCompilerOutput(output: string | null): CompilerResponse {
@@ -241,6 +361,11 @@ export function normalizeCompiledCheck(source: string): string {
     }
     if (Buffer.byteLength(code, "utf8") > MAX_COMPILED_CHECK_BYTES) {
         throw new Error("compiled_check exceeds 64 KiB");
+    }
+    // Validate literal endpoints even when the dry run would short-circuit before
+    // reaching them. Manifest entries alone are advisory, not the source of truth.
+    for (const url of literalCalls(code, "httpGet")) {
+        assertSmartNotePublicEndpoint(new URL(url));
     }
     return code;
 }

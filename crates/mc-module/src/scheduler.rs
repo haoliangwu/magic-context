@@ -56,6 +56,8 @@ const OVERFLOW_PATTERN_SOURCES: &[&str] = &[
     r"too large for model with \d+ maximum context length",
     r"model_context_window_exceeded",
     r"context size has been exceeded",
+    r"prepared prompt exceeds engine max_context",
+    r"prompt exceeds (?:the )?.{0,32}\bmax_context\b",
 ];
 
 const LIMIT_EXTRACTION_PATTERN_SOURCES: &[(&str, ContextLimitProvenance)] = &[
@@ -94,6 +96,19 @@ const LIMIT_EXTRACTION_PATTERN_SOURCES: &[(&str, ContextLimitProvenance)] = &[
     (
         r">\s*(\d+)\s*(?:tokens?\s*)?(?:maximum|max|limit)\b",
         ContextLimitProvenance::PromptOnly,
+    ),
+    // Gemini: "input token count (N) exceeds the maximum number of tokens allowed (M)".
+    (
+        r"maximum number of tokens allowed\s*\(?\s*(\d+)",
+        ContextLimitProvenance::PromptOnly,
+    ),
+    (
+        r"prepared prompt exceeds engine max_context\s+(\d+)",
+        ContextLimitProvenance::Unknown,
+    ),
+    (
+        r"prompt exceeds (?:the )?.{0,32}\bmax_context\s+(\d+)",
+        ContextLimitProvenance::Unknown,
     ),
     (
         r"max(?:imum)?.*context.*?(\d+)",

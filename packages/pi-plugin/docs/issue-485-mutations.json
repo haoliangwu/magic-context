@@ -1,0 +1,86 @@
+[
+  {
+    "control": "inject-compartments-pi.ts: if (isPiSystemEntry(piMessages[i])) preserved++;",
+    "expected_red": "trim preserves initial and delta declarations with aligned ids",
+    "captured_output": "error: expect(received).toEqual(expected)\n- Expected  - 697\n+ Received  + 0\n(fail) Pi system entry preservation > trim preserves initial and delta declarations with aligned ids [0.42ms]",
+    "applied_evidence": "packages/pi-plugin/src/inject-compartments-pi.ts: packages/pi-plugin/src/inject-compartments-pi.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "transcript-pi.ts: msg === undefined || isPiSystemEntry(msg)",
+    "expected_red": "system entries never enter tagging or ctx_reduce target selection",
+    "captured_output": "error: expect(received).toHaveLength(expected)\nExpected length: 0\nReceived length: 2\n(fail) Pi system entry preservation > system entries never enter tagging or ctx_reduce target selection [0.68ms]",
+    "applied_evidence": "packages/pi-plugin/src/transcript-pi.ts: packages/pi-plugin/src/transcript-pi.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "Hydrate protocol system content into historian prose instead of the empty content projection",
+    "expected_red": "historian never treats system entries as foldable ordinals",
+    "captured_output": "error: expect(received).not.toContain(expected)\nExpected to not contain: \"Base instructions\"\nReceived: \"[1] S: Base instructions\\n[2] U: question\\n[3] S: More instructions\"\n(fail) Pi system entry preservation > historian never treats system entries as foldable ordinals [85.84ms]",
+    "applied_evidence": "packages/pi-plugin/src/read-session-pi.ts: packages/pi-plugin/src/read-session-pi.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "system-entry-pi.ts: while (isPiSystemEntry(messages[index])) index++;",
+    "expected_red": "fold and four defer passes retain the initial request tools and prompt",
+    "captured_output": "error: expect(received).toBe(expected)\nExpected: \"system\"\nReceived: \"user\"\n(fail) Pi 0.86 provider contract > fold and four defer passes retain the initial request tools and prompt [115.01ms]",
+    "applied_evidence": "packages/pi-plugin/src/system-entry-pi.ts: packages/pi-plugin/src/system-entry-pi.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "system-entry-pi.ts: const snapshot = structuredClone(entry.systemMessage);",
+    "expected_red": "host marker consolidation preserves effective state and replay bytes through restart and LKG",
+    "captured_output": "error: expect(received).toEqual(expected)\n- Expected  - 9\n+ Received  + 10\n(fail) Pi 0.86 provider contract > host marker consolidation preserves effective state and replay bytes through restart and LKG [153.57ms]",
+    "applied_evidence": "packages/pi-plugin/src/system-entry-pi.ts: packages/pi-plugin/src/system-entry-pi.ts | 2 ++\n 1 file changed, 2 insertions(+); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "inject-compartments-pi.ts: if (preserved > 0)",
+    "expected_red": "trim diagnostics discriminate zero from two preserved system entries",
+    "captured_output": "error: expect(received).toEqual(expected)\n- Expected  - 3\n+ Received  + 1\n(fail) Pi protocol exclusions > trim diagnostics discriminate zero from two preserved system entries [0.37ms]",
+    "applied_evidence": "packages/pi-plugin/src/inject-compartments-pi.ts: packages/pi-plugin/src/inject-compartments-pi.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "pi-lkg.ts: isPiSystemEntry(message) ||",
+    "expected_red": "LKG prefix shaving retains system entries owned by the removed raw head",
+    "captured_output": "error: expect(received).toEqual(expected)\n- Expected  - 567\n+ Received  + 0\n(fail) LKG prefix shaving retains system entries owned by the removed raw head [38.43ms]",
+    "applied_evidence": "packages/pi-plugin/src/pi-lkg.ts: packages/pi-plugin/src/pi-lkg.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "pi-lkg.ts: for (const expected of snapshot.systemEntries ?? [])",
+    "expected_red": "LKG rejects a pre-upgrade snapshot that lost system declarations",
+    "captured_output": "error: expect(received).toEqual(expected)\n- Expected  - 2\n+ Received  + 8\n(fail) LKG rejects a pre-upgrade snapshot that lost system declarations [38.70ms]",
+    "applied_evidence": "packages/pi-plugin/src/pi-lkg.ts: packages/pi-plugin/src/pi-lkg.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "native-replay-pi.ts: !isRecord(message) || isPiSystemEntry(message)",
+    "expected_red": "native replay never edits system provider payloads",
+    "captured_output": "error: expect(received).toBe(expected)\nExpected: \"not-native\"\nReceived: \"cleared\"\n(fail) native replay never edits system provider payloads [0.29ms]",
+    "applied_evidence": "packages/pi-plugin/src/native-replay-pi.ts: packages/pi-plugin/src/native-replay-pi.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "Neutralize emergency planner branch",
+    "expected_red": "95 percent emergency reclaims tool outputs while retaining interleaved system state",
+    "captured_output": "error: expect(received).toBeGreaterThan(expected)\nExpected: > 0\nReceived: 0\n(fail) 95 percent emergency reclaims tool outputs while retaining interleaved system state [342.17ms]",
+    "applied_evidence": "packages/pi-plugin/src/heuristic-cleanup-pi.ts: packages/pi-plugin/src/heuristic-cleanup-pi.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "Reintroduce system ordinal removal",
+    "expected_red": "matches the real master converter golden with two interleaved system entries",
+    "captured_output": "(fail) Pi canonical system ordinals > matches the real master converter golden with two interleaved system entries\nerror: expect(received).toBe(expected)\nOnly the selected test failed; canonical JSON differed after system slots were removed.",
+    "applied_evidence": "packages/pi-plugin/src/read-session-pi.ts: packages/pi-plugin/src/read-session-pi.ts | 2 ++\n 1 file changed, 2 insertions(+); after restore: empty",
+    "outcome": "reddened"
+  },
+  {
+    "control": "Allow a system ordinal to become the first kept conversation entry",
+    "expected_red": "keeps native marker boundaries off system entries without renumbering the next user",
+    "captured_output": "error: expect(received).toBe(expected)\nExpected: \"u1\"\nReceived: \"s1\"\n(fail) Pi canonical system ordinals > keeps native marker boundaries off system entries without renumbering the next user [0.41ms]",
+    "applied_evidence": "packages/pi-plugin/src/pi-historian-runner.ts: packages/pi-plugin/src/pi-historian-runner.ts | 3 ++-\n 1 file changed, 2 insertions(+), 1 deletion(-); after restore: empty",
+    "outcome": "reddened"
+  }
+]

@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../config/schema/magic-context";
 import { setBootQuietPeriodForTests } from "../../plugin/boot-quiet";
+import { drainBackgroundBatches } from "../../shared/background-batch-drain";
+import { isEmbeddingHostBusy } from "../../shared/embedding-activity";
 import { log } from "../../shared/logger";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
@@ -12,12 +14,15 @@ import {
     type CompartmentChunkBackfillCandidate,
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
+    chunkWindowSourceKey,
     countSessionCompartmentEmbedCoverage,
-    countUnembeddedSessionCompartments,
+    countSessionCompartmentEmbedCoveragePolite,
+    countUnembeddedSessionCompartmentsPolite,
     loadUnembeddedCompartmentChunkCandidatesPolite,
-    loadUnembeddedSessionChunkCandidates,
+    loadUnembeddedSessionChunkCandidatesPolite,
     loadUnembeddedShadowChunkCandidates,
     normalizeCompartmentChunkMaxInputTokens,
+    recordChunkEmbedBackoff,
     replaceCompartmentChunkEmbeddings,
     type SaveCompartmentChunkEmbeddingInput,
 } from "./compartment-chunk-embedding";
@@ -50,6 +55,7 @@ import {
     saveEmbeddingIfHashMatches,
 } from "./memory/storage-memory-embeddings";
 import {
+    findMisScopedCompartmentChunkEmbeddingIdsForProject,
     recordSessionProjectIdentity,
     repairMisScopedCompartmentChunkEmbeddingsForProject,
 } from "./session-project-storage";
@@ -91,7 +97,7 @@ const COMMIT_DRAIN_MAX_PER_SWEEP = 500;
 const CHUNK_DRAIN_BATCH_SIZE = 8;
 const CHUNK_DRAIN_MAX_PER_SWEEP = CHUNK_DRAIN_BATCH_SIZE;
 const EMBEDDING_IDENTITY_GC_GRACE_MS = 14 * 24 * 60 * 60 * 1000;
-const STALE_EMBEDDING_GC_BATCH_SIZE = 250;
+const STALE_EMBEDDING_GC_BATCH_SIZE = 25;
 // Hard cap on embedding-window texts sent in ONE provider call. Deliberately
 // SMALL: a local embedding endpoint (LMStudio/Ollama) runs one forward pass per
 // input, so batching many max_input_tokens-sized windows into a single request
@@ -139,7 +145,12 @@ export interface ProjectEmbeddingRegistrationSnapshot {
     runtimeFingerprint: string;
     generation: number;
     features: EmbeddingFeatures;
+    /** Memory embeddings are on: a provider is configured and `memory.enabled`
+     *  is not false. Gates only memory rows, never session history. */
     enabled: boolean;
+    /** History (compartment chunk) embeddings are on. Needs only a provider
+     *  that is configured and not `off`; `memory.enabled` does not affect it. */
+    historyEnabled: boolean;
     gitCommitEnabled: boolean;
     modelId: string;
     chunkModelId: string;
@@ -796,8 +807,8 @@ function snapshotFor(
     registration: ProjectEmbeddingRegistration,
 ): ProjectEmbeddingRegistrationSnapshot {
     const providerIsOn = registration.providerIdentity !== OFF_PROVIDER_IDENTITY;
-    const enabled =
-        !registration.observationMode && providerIsOn && registration.features.memoryEnabled;
+    const historyEnabled = !registration.observationMode && providerIsOn;
+    const enabled = historyEnabled && registration.features.memoryEnabled;
     const gitCommitEnabled =
         !registration.observationMode && providerIsOn && registration.features.gitCommitEnabled;
     const configuredModel =
@@ -816,6 +827,7 @@ function snapshotFor(
         generation: registration.generation,
         features: { ...registration.features },
         enabled,
+        historyEnabled,
         gitCommitEnabled,
         modelId: registration.observationMode || !providerIsOn ? "off" : registration.modelId,
         chunkModelId:
@@ -888,10 +900,12 @@ function getBackfillActiveIdentityStatement(
                     WHERE e.project_path = ?`,
         };
         stmt = db.prepare(
-            `INSERT OR IGNORE INTO embedding_identity_active (project_path, scope, model_id, last_active_at)
-             SELECT ?, ?, model_id, ?
-             FROM (${selectByScope[scope]})
-             WHERE model_id IS NOT NULL`,
+            `SELECT model_id FROM (${selectByScope[scope]}) legacy
+             WHERE model_id IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM embedding_identity_active active
+                 WHERE active.project_path = ? AND active.scope = ?
+                   AND active.model_id = legacy.model_id
+             ) LIMIT 25`,
         );
         map.set(db, stmt);
     }
@@ -906,8 +920,9 @@ function recordScopeActiveIdentity(
     now: number,
 ): void {
     getUpsertActiveIdentityStatement(db).run(projectIdentity, scope, modelId, now);
-    getBackfillActiveIdentityStatement(db, scope).run(projectIdentity, scope, now, projectIdentity);
 }
+
+const legacyDiscoveryComplete = new WeakMap<Database, Set<string>>();
 
 function recordActiveEmbeddingIdentity(
     db: Database,
@@ -915,14 +930,55 @@ function recordActiveEmbeddingIdentity(
     currentProviderIdentity: string,
     currentChunkIdentity: string,
     features: EmbeddingFeatures,
-): void {
+): boolean {
     if (currentProviderIdentity === OFF_PROVIDER_IDENTITY) {
-        return;
+        return false;
+    }
+
+    const scopes: Array<[EmbeddingIdentityScope, string]> = [["chunk", currentChunkIdentity]];
+    if (features.memoryEnabled) scopes.push(["memory", currentProviderIdentity]);
+    if (features.gitCommitEnabled) scopes.push(["commit", currentProviderIdentity]);
+    const active = db.prepare(
+        "SELECT 1 FROM embedding_identity_active WHERE project_path = ? AND scope = ? AND model_id = ?",
+    );
+    let discovered = legacyDiscoveryComplete.get(db);
+    if (!discovered) {
+        discovered = new Set();
+        legacyDiscoveryComplete.set(db, discovered);
+    }
+    const discoveryKey = (scope: EmbeddingIdentityScope, model: string) =>
+        JSON.stringify([projectIdentity, scope, model]);
+    // Once discovery is exhausted, ordinary re-registration only checks keyed
+    // markers and project-indexed repairs. A full slice stays pending so later
+    // observations (including after restart) resume legacy marker discovery.
+    const legacy = scopes
+        .filter(
+            ([scope, model]) =>
+                !discovered.has(discoveryKey(scope, model)) ||
+                !active.get(projectIdentity, scope, model),
+        )
+        .map(([scope, model]) => ({
+            scope,
+            model,
+            rows: getBackfillActiveIdentityStatement(db, scope).all(
+                projectIdentity,
+                projectIdentity,
+                scope,
+            ) as Array<{ model_id: string }>,
+        }));
+    const repairIds = findMisScopedCompartmentChunkEmbeddingIdsForProject(db, projectIdentity);
+    if (
+        legacy.every(({ rows }) => rows.length === 0) &&
+        scopes.every(([scope, model]) => active.get(projectIdentity, scope, model)) &&
+        repairIds.length === 0
+    ) {
+        for (const { scope, model } of legacy) discovered.add(discoveryKey(scope, model));
+        return false;
     }
 
     const now = Date.now();
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
         if (features.memoryEnabled) {
             recordScopeActiveIdentity(db, projectIdentity, "memory", currentProviderIdentity, now);
@@ -932,12 +988,30 @@ function recordActiveEmbeddingIdentity(
             recordScopeActiveIdentity(db, projectIdentity, "commit", currentProviderIdentity, now);
         }
 
-        if (features.memoryEnabled) {
-            repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
-            recordScopeActiveIdentity(db, projectIdentity, "chunk", currentChunkIdentity, now);
+        for (const { scope, rows } of legacy) {
+            for (const { model_id } of rows) {
+                // Preserve an embedding identity's activity time if another registration
+                // refreshed it after the read-only model discovery.
+                db.prepare(`INSERT OR IGNORE INTO embedding_identity_active
+                    (project_path, scope, model_id, last_active_at) VALUES (?, ?, ?, ?)`).run(
+                    projectIdentity,
+                    scope,
+                    model_id,
+                    now,
+                );
+            }
         }
+
+        // History embeddings depend only on the provider, which the early
+        // return above already checked, so the chunk scope is always recorded.
+        repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity, repairIds);
+        recordScopeActiveIdentity(db, projectIdentity, "chunk", currentChunkIdentity, now);
         db.exec("COMMIT");
         logSlowWriteTransaction("embedding_identity_record", transactionStartedAt);
+        for (const { scope, model, rows } of legacy) {
+            if (rows.length < 25) discovered.add(discoveryKey(scope, model));
+        }
+        return true;
     } catch (error) {
         try {
             db.exec("ROLLBACK");
@@ -1017,8 +1091,8 @@ function deleteStaleEmbeddingBatch(
                  WHERE rowid IN (
                      SELECT me.rowid
                      FROM memory_embeddings me
-                     JOIN memories m ON m.id = me.memory_id
-                     WHERE m.project_path = ? AND me.model_id = ?
+                     WHERE me.memory_id IN (SELECT id FROM memories WHERE project_path = ?)
+                        AND me.model_id = ?
                      LIMIT ?
                  )`,
             )
@@ -1031,8 +1105,8 @@ function deleteStaleEmbeddingBatch(
                  WHERE rowid IN (
                      SELECT gce.rowid
                      FROM git_commit_embeddings gce
-                     JOIN git_commits gc ON gc.sha = gce.sha
-                     WHERE gc.project_path = ? AND gce.model_id = ?
+                     WHERE gce.sha IN (SELECT sha FROM git_commits WHERE project_path = ?)
+                        AND gce.model_id = ?
                      LIMIT ?
                  )`,
             )
@@ -1063,8 +1137,8 @@ function hasStaleEmbeddingRows(
                 .prepare(
                     `SELECT 1
                      FROM memory_embeddings me
-                     JOIN memories m ON m.id = me.memory_id
-                     WHERE m.project_path = ? AND me.model_id = ?
+                     WHERE me.memory_id IN (SELECT id FROM memories WHERE project_path = ?)
+                        AND me.model_id = ?
                      LIMIT 1`,
                 )
                 .get(projectIdentity, modelId),
@@ -1076,8 +1150,8 @@ function hasStaleEmbeddingRows(
                 .prepare(
                     `SELECT 1
                      FROM git_commit_embeddings gce
-                     JOIN git_commits gc ON gc.sha = gce.sha
-                     WHERE gc.project_path = ? AND gce.model_id = ?
+                     WHERE gce.sha IN (SELECT sha FROM git_commits WHERE project_path = ?)
+                        AND gce.model_id = ?
                      LIMIT 1`,
                 )
                 .get(projectIdentity, modelId),
@@ -1140,7 +1214,7 @@ export function sweepStaleEmbeddingIdentitiesForProject(
         },
         {
             scope: "chunk",
-            enabled: snapshot.enabled && snapshot.chunkModelId !== "off",
+            enabled: snapshot.historyEnabled && snapshot.chunkModelId !== "off",
             currentModelId: snapshot.chunkModelId,
         },
     ];
@@ -1149,42 +1223,58 @@ export function sweepStaleEmbeddingIdentitiesForProject(
     // identity marker until its final vector is gone makes later timer ticks
     // resume safely without holding a writer lock across the whole backlog.
     let remainingBudget = STALE_EMBEDDING_GC_BATCH_SIZE;
-    const transactionStartedAt = performance.now();
+    // Model discovery runs before admission. Limit empty identities too: a vector
+    // budget alone does not bound a sweep through thousands of expired markers.
+    const candidates = scopes
+        .flatMap(({ scope, enabled, currentModelId }) =>
+            enabled
+                ? staleModelsForScope(
+                      db,
+                      projectIdentity,
+                      scope,
+                      currentModelId,
+                      cutoff,
+                      protectedModels[scope],
+                  )
+                      .slice(0, STALE_EMBEDDING_GC_BATCH_SIZE)
+                      .map((modelId) => ({ scope, modelId }))
+                : [],
+        )
+        .slice(0, STALE_EMBEDDING_GC_BATCH_SIZE);
+    if (candidates.length === 0) return result;
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
-        for (const { scope, enabled, currentModelId } of scopes) {
-            if (!enabled || remainingBudget === 0) continue;
-            for (const modelId of staleModelsForScope(
+        for (const { scope, modelId } of candidates) {
+            if (remainingBudget === 0) break;
+            // A concurrent registration can refresh the marker between discovery
+            // and admission. Never collect vectors for that refreshed identity.
+            const marker = db
+                .prepare(`SELECT last_active_at FROM embedding_identity_active
+                    WHERE project_path = ? AND scope = ? AND model_id = ?`)
+                .get(projectIdentity, scope, modelId) as { last_active_at: number } | undefined;
+            if (!marker || marker.last_active_at >= cutoff) continue;
+            const deleted = deleteStaleEmbeddingBatch(
                 db,
-                projectIdentity,
                 scope,
-                currentModelId,
-                cutoff,
-                protectedModels[scope],
-            )) {
-                if (remainingBudget === 0) break;
-                const deleted = deleteStaleEmbeddingBatch(
-                    db,
-                    scope,
-                    projectIdentity,
-                    modelId,
-                    remainingBudget,
-                );
-                remainingBudget -= deleted;
-                if (scope === "memory") result.memoryRowsDeleted += deleted;
-                else if (scope === "commit") result.commitRowsDeleted += deleted;
-                else result.chunkRowsDeleted += deleted;
+                projectIdentity,
+                modelId,
+                remainingBudget,
+            );
+            remainingBudget -= deleted;
+            if (scope === "memory") result.memoryRowsDeleted += deleted;
+            else if (scope === "commit") result.commitRowsDeleted += deleted;
+            else result.chunkRowsDeleted += deleted;
 
-                if (!hasStaleEmbeddingRows(db, scope, projectIdentity, modelId)) {
-                    result.trackingRowsDeleted += deleteTracking.run(
-                        projectIdentity,
-                        scope,
-                        modelId,
-                    ).changes;
-                } else if (deleted === 0) {
-                    // Avoid spinning through an unexpectedly undeletable backlog.
-                    remainingBudget = 0;
-                }
+            if (!hasStaleEmbeddingRows(db, scope, projectIdentity, modelId)) {
+                result.trackingRowsDeleted += deleteTracking.run(
+                    projectIdentity,
+                    scope,
+                    modelId,
+                ).changes;
+            } else if (deleted === 0) {
+                // Avoid spinning through an unexpectedly undeletable backlog.
+                remainingBudget = 0;
             }
         }
         db.exec("COMMIT");
@@ -1200,6 +1290,57 @@ export function sweepStaleEmbeddingIdentitiesForProject(
 
     if (result.memoryRowsDeleted > 0) invalidateProject(projectIdentity);
     return result;
+}
+
+export async function drainProjectEmbeddingIdentityMaintenance(
+    db: Database,
+    projectIdentity: string,
+    budgetMs = 2000,
+): Promise<number> {
+    const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+    if (!snapshot || untrustedLoadProjects.has(projectIdentity)) return 0;
+    return drainBackgroundBatches(
+        () =>
+            recordActiveEmbeddingIdentity(
+                db,
+                projectIdentity,
+                snapshot.modelId,
+                snapshot.chunkModelId,
+                { memoryEnabled: snapshot.enabled, gitCommitEnabled: snapshot.gitCommitEnabled },
+            ),
+        { budgetMs },
+    );
+}
+
+export async function drainStaleEmbeddingIdentitiesForProject(
+    db: Database,
+    projectIdentity: string,
+    budgetMs = 2000,
+): Promise<StaleEmbeddingSweepResult> {
+    const total: StaleEmbeddingSweepResult = {
+        memoryRowsDeleted: 0,
+        commitRowsDeleted: 0,
+        chunkRowsDeleted: 0,
+        trackingRowsDeleted: 0,
+    };
+    await drainBackgroundBatches(
+        () => {
+            const result = sweepStaleEmbeddingIdentitiesForProject(db, projectIdentity);
+            total.memoryRowsDeleted += result.memoryRowsDeleted;
+            total.commitRowsDeleted += result.commitRowsDeleted;
+            total.chunkRowsDeleted += result.chunkRowsDeleted;
+            total.trackingRowsDeleted += result.trackingRowsDeleted;
+            return (
+                result.memoryRowsDeleted +
+                    result.commitRowsDeleted +
+                    result.chunkRowsDeleted +
+                    result.trackingRowsDeleted >
+                0
+            );
+        },
+        { budgetMs },
+    );
+    return total;
 }
 
 export function registerProjectEmbedding(
@@ -1249,7 +1390,16 @@ export function registerProjectEmbedding(
     };
 
     projectRegistrations.set(projectIdentity, registration);
-    persistPrimaryDescriptor(db, registration);
+    if (
+        generationChanged ||
+        !db
+            .prepare(
+                "SELECT 1 FROM embedding_registrations WHERE project_path = ? AND provider_identity = ? AND chunk_model_id = ? AND generation = ?",
+            )
+            .get(projectIdentity, providerIdentity, registration.chunkModelId, generation)
+    ) {
+        persistPrimaryDescriptor(db, registration);
+    }
 
     if (!canReuseProvider) {
         disposeProvider(prior?.provider ?? null);
@@ -1332,7 +1482,7 @@ export function registerProjectShadowEmbedding(
         recordScopeActiveIdentity(db, projectIdentity, "commit", registration.modelId, now);
         recordScopeActiveIdentity(db, projectIdentity, "chunk", registration.chunkModelId, now);
         persistShadowDescriptor(db, registration);
-    })();
+    }).immediate();
     // A new shadow identity just landed (rotation, or a first/again registration
     // over a corpus that already has primary rows). Re-embed the historical
     // corpus under it so the measurement cohort keeps its coverage; the old
@@ -1347,6 +1497,7 @@ export function registerProjectShadowEmbedding(
         generation,
         features: { memoryEnabled: true, gitCommitEnabled: true },
         enabled: true,
+        historyEnabled: true,
         gitCommitEnabled: true,
         modelId: registration.modelId,
         chunkModelId: registration.chunkModelId,
@@ -1715,6 +1866,9 @@ function maybeArmShadowBackfill(
         const shadowModelId = shadowModelIdForScope(shadow, scope);
         const stallKey = `${projectIdentity}:${scope}`;
         if (primaryModelId === "off" || shadowModelId === "off") continue;
+        // Memory rows are embedded only while the memory feature is on; the
+        // shadow model must not embed them either.
+        if (scope === "memory" && !primary.features.memoryEnabled) continue;
         const batch = shadowBackfillCandidateBatch(
             db,
             projectIdentity,
@@ -1981,6 +2135,14 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
             db,
             "memory",
         );
+        // The provider call above can take seconds (or minutes on a cold model
+        // load). unregisterProjectShadowEmbedding may have retired this shadow
+        // while we were waiting, so re-check the live registration before
+        // writing any vectors.
+        const live = shadowRegistrations.get(item.projectIdentity);
+        if (!live || live.generation !== registration.generation) {
+            return { writes: 0, refusalReason: "registration_retired_during_embed" };
+        }
         let writes = 0;
         let hashGuardRejected = false;
         db.transaction(() => {
@@ -2001,7 +2163,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
                     hashGuardRejected = true;
                 }
             }
-        })();
+        }).immediate();
         return {
             writes,
             ...(writes === 0
@@ -2035,6 +2197,11 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
             db,
             "commit",
         );
+        // Re-check after the provider round-trip; see the memory scope above.
+        const live = shadowRegistrations.get(item.projectIdentity);
+        if (!live || live.generation !== registration.generation) {
+            return { writes: 0, refusalReason: "registration_retired_during_embed" };
+        }
         let writes = 0;
         db.transaction(() => {
             for (const row of rows) {
@@ -2043,7 +2210,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
                 saveCommitEmbedding(db, row.sha, vector, registration.modelId);
                 writes += 1;
             }
-        })();
+        }).immediate();
         return {
             writes,
             ...(writes === 0
@@ -2072,6 +2239,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
     const prepared: Array<{
         candidate: (typeof candidates)[number];
         windows: ReturnType<typeof chunkCanonicalText>;
+        windowSourceKey: string;
     }> = [];
     let ftsMappingIncomplete = false;
     let emptyCanonicalText = false;
@@ -2086,13 +2254,20 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
             ftsMappingIncomplete = true;
         } else {
             const text = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
+            const shadowMaxInputTokens = shadowMaxInputTokensFor(registration);
             const windows = chunkCanonicalText(
                 text,
                 candidate.start_message,
                 candidate.end_message,
-                shadowMaxInputTokensFor(registration),
+                shadowMaxInputTokens,
             );
-            if (windows.length > 0) prepared.push({ candidate, windows });
+            const windowSourceKey = chunkWindowSourceKey(
+                text,
+                candidate.start_message,
+                candidate.end_message,
+                shadowMaxInputTokens,
+            );
+            if (windows.length > 0) prepared.push({ candidate, windows, windowSourceKey });
             else emptyCanonicalText = true;
         }
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -2113,6 +2288,11 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
         })),
     );
     const embedded = await embedShadowItems(registration, items, db, "chunk");
+    // Re-check after the provider round-trip; see the memory scope above.
+    const live = shadowRegistrations.get(item.projectIdentity);
+    if (!live || live.generation !== registration.generation) {
+        return { writes: 0, refusalReason: "registration_retired_during_embed" };
+    }
     let writes = 0;
     let partialVectorSet = false;
     for (const item of prepared) {
@@ -2132,7 +2312,7 @@ async function processShadowQueueItem(item: ShadowQueueItem): Promise<ShadowBack
                 : [];
         });
         if (rows.length === item.windows.length) {
-            replaceCompartmentChunkEmbeddings(db, rows);
+            replaceCompartmentChunkEmbeddings(db, rows, item.windowSourceKey);
             writes += 1;
         } else {
             partialVectorSet = true;
@@ -2182,14 +2362,31 @@ async function runShadowWorker(): Promise<void> {
             shadowQueue.unshift(item);
             break;
         }
+        // A worker item may outlive its registration: retirement or a re-arm can
+        // land while the provider call is in flight. Publishing the outcome then
+        // re-creates state that retirement just cleared, and the stall detector
+        // reads that map — so a retired item's refusal could be attributed to a
+        // freshly re-armed registration and stop its backfill. Only record the
+        // outcome when the registration this item started under is still live.
+        const generationAtStart = shadowRegistrations.get(item.projectIdentity)?.generation;
+        const isStillCurrent = (): boolean =>
+            generationAtStart !== undefined &&
+            shadowRegistrations.get(item.projectIdentity)?.generation === generationAtStart;
         try {
             const outcome = await processShadowQueueItem(item);
-            shadowBackfillLastWriteOutcomes.set(`${item.projectIdentity}:${item.scope}`, outcome);
+            if (isStillCurrent()) {
+                shadowBackfillLastWriteOutcomes.set(
+                    `${item.projectIdentity}:${item.scope}`,
+                    outcome,
+                );
+            }
         } catch (error) {
-            shadowBackfillLastWriteOutcomes.set(`${item.projectIdentity}:${item.scope}`, {
-                writes: 0,
-                refusalReason: "provider_returned_no_vectors",
-            });
+            if (isStillCurrent()) {
+                shadowBackfillLastWriteOutcomes.set(`${item.projectIdentity}:${item.scope}`, {
+                    writes: 0,
+                    refusalReason: "provider_returned_no_vectors",
+                });
+            }
             log("[magic-context] Synapse shadow write failed:", error);
         }
         processed += item.ids.length;
@@ -2520,19 +2717,49 @@ function getLoadUnembeddedMemoriesStatement(db: Database): PreparedStatement {
     return stmt;
 }
 
+/**
+ * Why one embedding batch for a project's memories ended the way it did.
+ *
+ * A count alone cannot carry this: "embedded nothing" means the work is finished in only
+ * one of these cases (`done`). A caller that records progress, such as the single-store
+ * watermark drain, must not treat an outage or a disabled provider as finished work.
+ */
+export type EmbedMemoriesOutcome =
+    /** Embedding is not enabled for this project, so nothing was attempted. */
+    | { kind: "disabled" }
+    /** No active memory in this project is missing a vector for the current model. */
+    | { kind: "done" }
+    /** A batch ran; `count` rows were saved. More rows may still be pending. */
+    | { kind: "embedded"; count: number }
+    /** The provider produced no result for the batch (for example, it is not loaded). */
+    | { kind: "unavailable" }
+    /** The provider call threw. The error has already been logged. */
+    | { kind: "failed"; error: unknown };
+
 export async function embedUnembeddedMemoriesForProject(
     db: Database,
     projectIdentity: string,
     batchSize = 10,
 ): Promise<number> {
+    const outcome = await embedUnembeddedMemoriesForProjectOutcome(db, projectIdentity, batchSize);
+    return outcome.kind === "embedded" ? outcome.count : 0;
+}
+
+/** Embed one batch of a project's unembedded memories and say why it ended. */
+export async function embedUnembeddedMemoriesForProjectOutcome(
+    db: Database,
+    projectIdentity: string,
+    batchSize = 10,
+): Promise<EmbedMemoriesOutcome> {
+    if (isEmbeddingHostBusy()) return { kind: "unavailable" };
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.enabled) return 0;
+    if (!snapshot?.enabled) return { kind: "disabled" };
 
     const normalizedBatchSize = Math.max(1, Math.floor(batchSize));
     const memories = getLoadUnembeddedMemoriesStatement(db)
         .all(snapshot.modelId, projectIdentity, normalizedBatchSize)
         .filter(isUnembeddedMemoryRow);
-    if (memories.length === 0) return 0;
+    if (memories.length === 0) return { kind: "done" };
 
     try {
         const result = await embedItemsForProject(
@@ -2546,7 +2773,7 @@ export async function embedUnembeddedMemoriesForProject(
             db,
             projectIdentity,
         );
-        if (!result) return 0;
+        if (!result) return { kind: "unavailable" };
 
         let embeddedCount = 0;
         db.transaction(() => {
@@ -2565,7 +2792,7 @@ export async function embedUnembeddedMemoriesForProject(
                     embeddedCount += 1;
                 }
             }
-        })();
+        }).immediate();
         enqueueShadowEmbeddingItems(
             projectIdentity,
             "memory",
@@ -2573,10 +2800,10 @@ export async function embedUnembeddedMemoriesForProject(
                 .filter((memory) => result.vectors.has(`memory:${memory.id}`))
                 .map((memory) => String(memory.id)),
         );
-        return embeddedCount;
+        return { kind: "embedded", count: embeddedCount };
     } catch (error) {
         log("[magic-context] failed to proactively embed missing memories:", error);
-        return 0;
+        return { kind: "failed", error };
     }
 }
 
@@ -2617,7 +2844,7 @@ async function embedCommitBatch(
             saveCommitEmbedding(db, commit.sha, embedding, result.modelId);
             embeddedCount += 1;
         }
-    })();
+    }).immediate();
     enqueueShadowEmbeddingItems(
         projectIdentity,
         "commit",
@@ -2668,7 +2895,12 @@ export async function drainCommitBacklogForProject(
     }, SESSION_EMBED_LEASE_RENEWAL_MS);
     (renewal as { unref?: () => void }).unref?.();
     try {
-        while (!leaseLost && Date.now() < deadline && total < COMMIT_DRAIN_MAX_PER_SWEEP) {
+        while (
+            !leaseLost &&
+            !isEmbeddingHostBusy() &&
+            Date.now() < deadline &&
+            total < COMMIT_DRAIN_MAX_PER_SWEEP
+        ) {
             const embedded = await embedCommitBatch(db, projectIdentity, COMMIT_DRAIN_BATCH_SIZE);
             if (!renewGitSweepLease(db, projectIdentity, holderId)) leaseLost = true;
             if (leaseLost || embedded === 0) break;
@@ -2688,7 +2920,7 @@ async function embedCompartmentChunkBatch(
     batchSize: number,
 ): Promise<number> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.enabled || snapshot.chunkModelId === "off") return 0;
+    if (!snapshot?.historyEnabled || snapshot.chunkModelId === "off") return 0;
 
     repairMisScopedCompartmentChunkEmbeddingsForProject(db, projectIdentity);
     const candidates = await loadUnembeddedCompartmentChunkCandidatesPolite(
@@ -2753,6 +2985,7 @@ async function embedCandidateChunkBatch(
     type Prepared = {
         candidate: CompartmentChunkBackfillCandidate;
         windows: ReturnType<typeof chunkCanonicalText>;
+        windowSourceKey: string;
     };
     const prepared: Prepared[] = [];
     for (const candidate of candidates) {
@@ -2770,6 +3003,7 @@ async function embedCandidateChunkBatch(
         if (mappedText === null) continue;
         const canonicalText = mappedText || buildCompartmentSummaryFallbackText(db, candidate.id);
         if (canonicalText.length === 0) {
+            recordChunkEmbedBackoff(db, candidate, projectIdentity, modelId);
             noWork.push(candidate.id);
             continue;
         }
@@ -2786,7 +3020,16 @@ async function embedCandidateChunkBatch(
             noWork.push(candidate.id);
             continue;
         }
-        prepared.push({ candidate, windows });
+        prepared.push({
+            candidate,
+            windows,
+            windowSourceKey: chunkWindowSourceKey(
+                canonicalText,
+                candidate.startMessage,
+                candidate.endMessage,
+                maxInputTokens,
+            ),
+        });
     }
 
     if (prepared.length === 0) return { embedded: 0, noWork, failed, failureReasons };
@@ -2841,6 +3084,7 @@ async function embedCandidateChunkBatch(
         const persistedIds = new Set<number>();
         for (let attempt = 0; attempt < EMBED_SLICE_RETRY_ATTEMPTS; attempt++) {
             if (signal?.aborted) break;
+            await new Promise<void>((resolve) => setTimeout(resolve, 15));
             let result: Awaited<ReturnType<typeof embedItemsForProject>> = null;
             const attemptStart = Date.now();
             try {
@@ -2862,6 +3106,7 @@ async function embedCandidateChunkBatch(
                 if (failure) failureReasons.push(failure);
             }
             if (result) {
+                let writeSliceStarted = performance.now();
                 for (const item of slice) {
                     if (persistedIds.has(item.candidate.id)) continue;
                     const vectors = item.windows.map((window) =>
@@ -2880,11 +3125,15 @@ async function embedCandidateChunkBatch(
                             vector: vectors[index] as Float32Array,
                         }),
                     );
-                    replaceCompartmentChunkEmbeddings(db, rows);
+                    replaceCompartmentChunkEmbeddings(db, rows, item.windowSourceKey);
                     persistedIds.add(item.candidate.id);
                     enqueueShadowEmbeddingItems(projectIdentity, "chunk", [
                         String(item.candidate.id),
                     ]);
+                    if (performance.now() - writeSliceStarted >= 35) {
+                        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                        writeSliceStarted = performance.now();
+                    }
                 }
             }
             if (persistedIds.size === slice.length) break; // whole slice done
@@ -2908,7 +3157,10 @@ async function embedCandidateChunkBatch(
         // Skip on abort — those simply didn't get their turn and re-queue naturally.
         if (!signal?.aborted) {
             for (const item of slice) {
-                if (!persistedIds.has(item.candidate.id)) failed.push(item.candidate.id);
+                if (!persistedIds.has(item.candidate.id)) {
+                    recordChunkEmbedBackoff(db, item.candidate, projectIdentity, modelId);
+                    failed.push(item.candidate.id);
+                }
             }
         }
     }
@@ -2921,7 +3173,7 @@ async function drainCompartmentChunkBacklogForProject(
     deadline: number,
 ): Promise<number> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.enabled) return 0;
+    if (!snapshot?.historyEnabled) return 0;
 
     const holderId = `chunk-embed-sweep-${randomUUID()}`;
     const lease = acquireGitSweepLease(db, projectIdentity, holderId, { ignoreCooldown: true });
@@ -2940,7 +3192,12 @@ async function drainCompartmentChunkBacklogForProject(
     }, SESSION_EMBED_LEASE_RENEWAL_MS);
     (renewal as { unref?: () => void }).unref?.();
     try {
-        while (!leaseLost && Date.now() < deadline && total < CHUNK_DRAIN_MAX_PER_SWEEP) {
+        while (
+            !leaseLost &&
+            !isEmbeddingHostBusy() &&
+            Date.now() < deadline &&
+            total < CHUNK_DRAIN_MAX_PER_SWEEP
+        ) {
             const embedded = await embedCompartmentChunkBatch(
                 db,
                 projectIdentity,
@@ -3016,7 +3273,7 @@ export async function embedSessionCompartmentChunks(
     },
 ): Promise<SessionChunkBackfillOutcome> {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.enabled || snapshot.chunkModelId === "off") {
+    if (!snapshot?.historyEnabled || snapshot.chunkModelId === "off") {
         return { status: "disabled", embedded: 0, total: 0 };
     }
     // The session command path resolves this identity from the host session;
@@ -3024,7 +3281,7 @@ export async function embedSessionCompartmentChunks(
     // this session look already embedded forever.
     recordSessionProjectIdentity(db, sessionId, projectIdentity);
     const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectIdentity);
-    const total = countUnembeddedSessionCompartments(
+    const total = await countUnembeddedSessionCompartmentsPolite(
         db,
         projectIdentity,
         sessionId,
@@ -3079,11 +3336,11 @@ export async function embedSessionCompartmentChunks(
         // denominator; `embedded` is clamped to it in the callback in case the
         // historian published mid-run.
         for (;;) {
-            if (leaseLost || drainAbort.signal.aborted) {
+            if (leaseLost || drainAbort.signal.aborted || isEmbeddingHostBusy()) {
                 aborted = true;
                 break;
             }
-            const candidates = loadUnembeddedSessionChunkCandidates(
+            const candidates = await loadUnembeddedSessionChunkCandidatesPolite(
                 db,
                 projectIdentity,
                 sessionId,
@@ -3139,7 +3396,7 @@ export async function embedSessionCompartmentChunks(
             options?.onProgress?.({ embedded: Math.min(embedded, total), total });
             // Yield to the event loop so the burst stays interruptible and the
             // host process can serve other work between batches.
-            await new Promise((resolve) => setTimeout(resolve, 0));
+            await new Promise((resolve) => setTimeout(resolve, 15));
         }
     } finally {
         clearInterval(renewal);
@@ -3160,14 +3417,14 @@ export async function embedSessionCompartmentChunks(
     // compartments, not a stall).
     if (providerDown || failedIds.length > 0) {
         const remaining = Math.max(
-            0,
-            countUnembeddedSessionCompartments(
+            failedIds.length,
+            (await countUnembeddedSessionCompartmentsPolite(
                 db,
                 projectIdentity,
                 sessionId,
                 snapshot.chunkModelId,
                 maxInputTokens,
-            ) - skipIds.length,
+            )) - skipIds.length,
         );
         if (remaining > 0) {
             return {
@@ -3194,8 +3451,9 @@ export interface EmbeddingCoverageStatus {
     synapseDescriptor?: SynapseLaneDescriptor;
     /** This session's compartment-chunk coverage. */
     session: { embedded: number; total: number };
-    /** Project-wide active-memory coverage. */
-    memories: { embedded: number; total: number };
+    /** Project-wide active-memory coverage. `memoryEnabled: false` means memory
+     *  is turned off, so no memory rows are embedded. */
+    memories: { embedded: number; total: number; memoryEnabled?: boolean };
     /** Project-wide git-commit coverage (only meaningful when gitEnabled). */
     commits: { embedded: number; total: number; gitEnabled: boolean };
     /** Durable write-side reasons for current shadow scopes that stopped without progress. */
@@ -3213,7 +3471,7 @@ export function getEmbeddingCoverageStatus(
     sessionId: string,
 ): EmbeddingCoverageStatus {
     const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
-    if (!snapshot?.enabled || snapshot.chunkModelId === "off") {
+    if (!snapshot?.historyEnabled || snapshot.chunkModelId === "off") {
         return {
             enabled: false,
             model: snapshot?.model ?? "off",
@@ -3234,7 +3492,11 @@ export function getEmbeddingCoverageStatus(
         snapshot.chunkModelId,
         getProjectEmbeddingMaxInputTokens(projectIdentity),
     );
-    const memories = getMemoryEmbedCoverage(db, projectIdentity, snapshot.modelId);
+    // With memory off, memory rows are never embedded, so their coverage is
+    // reported as off rather than as a backlog that will never drain.
+    const memories = snapshot.enabled
+        ? getMemoryEmbedCoverage(db, projectIdentity, snapshot.modelId)
+        : { embedded: 0, total: 0, memoryEnabled: false };
     const gitEnabled = snapshot.gitCommitEnabled;
     const commits = gitEnabled
         ? {
@@ -3255,6 +3517,29 @@ export function getEmbeddingCoverageStatus(
     };
 }
 
+// Automatic embedding only needs this session's history coverage, not status
+// for project memories, commits or secondary embedding providers. The caller
+// defers it until after the message transform; counting yields between groups
+// of compartments so a cold session does not block one long host turn.
+export async function getAutoEmbeddingSessionCoverage(
+    db: Database,
+    projectIdentity: string,
+    sessionId: string,
+): Promise<{ enabled: boolean; embedded: number; total: number }> {
+    const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+    if (!snapshot?.historyEnabled || snapshot.chunkModelId === "off") {
+        return { enabled: false, embedded: 0, total: 0 };
+    }
+    const coverage = await countSessionCompartmentEmbedCoveragePolite(
+        db,
+        projectIdentity,
+        sessionId,
+        snapshot.chunkModelId,
+        getProjectEmbeddingMaxInputTokens(projectIdentity),
+    );
+    return { enabled: true, ...coverage };
+}
+
 export async function sweepAllRegisteredProjects(
     db: Database,
     batchSize = 10,
@@ -3264,7 +3549,7 @@ export async function sweepAllRegisteredProjects(
     chunksEmbedded: number;
     perProject: Map<string, { memories: number; commits: number; chunks: number }>;
 }> {
-    if (projectSweepInProgress) {
+    if (projectSweepInProgress || isEmbeddingHostBusy()) {
         log("[magic-context] project embedding sweep already in progress, skipping this tick");
         return {
             memoriesEmbedded: 0,
@@ -3289,7 +3574,7 @@ export async function sweepAllRegisteredProjects(
             let chunks = 0;
             let consecutiveEmpty = 0;
 
-            while (Date.now() < deadline) {
+            while (Date.now() < deadline && !isEmbeddingHostBusy()) {
                 const count = await embedUnembeddedMemoriesForProject(
                     db,
                     projectIdentity,

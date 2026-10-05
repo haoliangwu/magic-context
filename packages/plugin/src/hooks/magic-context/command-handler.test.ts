@@ -1,6 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { CANONICAL_DREAM_TASKS } from "../../features/magic-context/dreamer/task-registry";
+import { runMigrations } from "../../features/magic-context/migrations";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
 import {
     __resetNotificationStateForTests,
     drainNotifications,
@@ -383,6 +386,9 @@ describe("createMagicContextCommandHandler", () => {
     });
 
     describe("knowledge-layer commands in compaction-off mode", () => {
+        // The mode used to be labelled by a diagnostics-only prefix naming the
+        // config path. `/ctx-status` now has one view and no argument to reach
+        // that prefix, so the summary's own compression line labels the mode.
         it("keeps /ctx-status functional and labels the mode", async () => {
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
@@ -396,7 +402,7 @@ describe("createMagicContextCommandHandler", () => {
                     {
                         command: "ctx-status",
                         sessionID: "ses-status-off",
-                        arguments: "diagnostics",
+                        arguments: "",
                     },
                     makeOutput(""),
                     {},
@@ -406,9 +412,7 @@ describe("createMagicContextCommandHandler", () => {
 
             expect(sendNotification).toHaveBeenCalledWith(
                 "ses-status-off",
-                expect.stringContaining(
-                    "**Compaction:** disabled (compaction.enabled: false) — native compaction owns the context window.",
-                ),
+                expect.stringContaining("- **Automatic compression:** Off"),
                 {},
             );
         });
@@ -587,7 +591,11 @@ describe("createMagicContextCommandHandler", () => {
             expect(text).not.toContain("Host backends → MODULE");
         });
 
-        it("lists queued drop operations", async () => {
+        // Was "lists queued drop operations": that per-tag list belongs to the
+        // legacy dump, which `/ctx-status diagnostics` used to reach. The
+        // argument is gone, so chat gets the summary; the legacy renderer still
+        // lists the queue and execute-status.test.ts covers that directly.
+        it("answers with the status summary, not the legacy per-tag dump", async () => {
             insertTag(db, "ses-status-ops", 10, 300);
             insertPendingOp(db, "ses-status-ops", 10);
             const sendNotification = mock(async () => {});
@@ -601,7 +609,7 @@ describe("createMagicContextCommandHandler", () => {
                     {
                         command: "ctx-status",
                         sessionID: "ses-status-ops",
-                        arguments: "diagnostics",
+                        arguments: "",
                     },
                     makeOutput(""),
                     {},
@@ -613,9 +621,9 @@ describe("createMagicContextCommandHandler", () => {
                 [string, string, unknown]
             >;
             const [, text] = calls[0]!;
-            expect(text).toContain("### Queued Operations");
-            expect(text).toContain("§10§ → drop");
-            expect(text).toContain("- Drops: 1");
+            expect(text).toContain("## Magic Context Status");
+            expect(text).not.toContain("### Queued Operations");
+            expect(text).not.toContain("§10§ → drop");
         });
 
         it("returns defaults for an empty session", async () => {
@@ -725,7 +733,7 @@ describe("createMagicContextCommandHandler", () => {
                     "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
                 );
 
-                expect(received).toEqual([{ action: "show-status-dialog", diagnostics: false }]);
+                expect(received).toEqual([{ action: "show-status-dialog" }]);
                 expect(getStatusDetail).not.toHaveBeenCalled();
                 expect(sendNotification).not.toHaveBeenCalled();
             } finally {
@@ -873,7 +881,7 @@ describe("createMagicContextCommandHandler", () => {
             );
         });
 
-        it("points /ctx-recomp --upgrade at the new /ctx-session-upgrade command", async () => {
+        it("points /ctx-recomp --upgrade at a plain rebuild", async () => {
             insertLegacyCompartment(db, "ses-upgrade-legacy");
             const sendNotification = mock(async () => {});
             const executeRecomp = mock(async () => "## Magic Recomp\n\nRebuilt state.");
@@ -896,11 +904,13 @@ describe("createMagicContextCommandHandler", () => {
                 "__CONTEXT_MANAGEMENT_CTX-RECOMP_HANDLED__",
             );
 
-            // Deprecated flag does not run recomp itself; it redirects to the command.
+            // Deprecated flag does not run recomp itself; it points at /ctx-recomp.
             expect(executeRecomp).not.toHaveBeenCalled();
             expect(sendNotification).toHaveBeenCalledWith(
                 "ses-upgrade-legacy",
-                expect.stringContaining("/ctx-session-upgrade"),
+                expect.stringContaining(
+                    "The `--upgrade` flag is deprecated. Run `/ctx-recomp` to rebuild them in the current format.",
+                ),
                 {},
             );
         });
@@ -1045,15 +1055,13 @@ describe("createMagicContextCommandHandler", () => {
             );
         });
 
-        it("refuses Rust partial recomp and session upgrade without touching either authority store", async () => {
+        it("refuses Rust partial recomp without touching either authority store", async () => {
             const sendNotification = mock(async () => {});
             const moduleCall = mock(async () => ({ disposition: "started" }));
-            const runUpgrade = mock(async () => "TS upgrade ran");
             const handler = createMagicContextCommandHandler({
                 db,
                 transformMode: "rust",
                 rustModeModuleClient: { call: moduleCall },
-                runUpgrade,
                 sendNotification,
             });
 
@@ -1069,26 +1077,12 @@ describe("createMagicContextCommandHandler", () => {
                 ),
                 "__CONTEXT_MANAGEMENT_CTX-RECOMP_HANDLED__",
             );
-            await expectSentinel(
-                handler["command.execute.before"](
-                    {
-                        command: "ctx-session-upgrade",
-                        sessionID: "ses-rust-maintenance",
-                        arguments: "",
-                    },
-                    makeOutput(""),
-                    {},
-                ),
-                "__CONTEXT_MANAGEMENT_CTX-SESSION-UPGRADE_HANDLED__",
-            );
 
             expect(moduleCall).not.toHaveBeenCalled();
-            expect(runUpgrade).not.toHaveBeenCalled();
             const text = (sendNotification.mock.calls as unknown as Array<[string, string]>)
                 .map(([, notification]) => notification)
                 .join("\n");
-            expect(text).toContain("(MC-C06)");
-            expect(text).toContain("Run /ctx-recomp instead. (MC-C07)");
+            expect(text).toContain("Run /ctx-recomp without a range. (MC-C06)");
             expect(text).not.toContain("standard mode");
             for (const forbidden of ["authority", "MODULE", "drain", "facade", "changefeed"]) {
                 expect(text).not.toContain(forbidden);
@@ -1203,6 +1197,68 @@ describe("createMagicContextCommandHandler", () => {
             expect(texts).not.toContain("— Failed");
         });
 
+        it("renders each retryable Rust wrapup reason with what unblocks it", async () => {
+            const sendMessageFirst =
+                "Send a message in this session first, then run /ctx-wrapup again. (MC-C12)";
+            const retry = "Retry in a moment. (MC-C09)";
+            const cases = [
+                {
+                    reason: "transform_not_observed",
+                    summary: "anything",
+                    expected: sendMessageFirst,
+                },
+                // A module that predates `transform_not_observed` reports the missing
+                // snapshot under the generic reason with this summary.
+                {
+                    reason: "snapshot_unavailable",
+                    summary: "wrapup unavailable until a full session transform has been observed",
+                    expected: sendMessageFirst,
+                },
+                {
+                    reason: "snapshot_unavailable",
+                    summary: "too many concurrent wrapups",
+                    expected: retry,
+                },
+                { reason: "budget_exhausted", summary: "budget expired", expected: retry },
+                { reason: "snapshot_stale", summary: "stale", expected: retry },
+                { reason: "backoff_active", summary: "backoff", expected: retry },
+                { reason: "some_future_reason", summary: "future", expected: retry },
+            ];
+            for (const [index, row] of cases.entries()) {
+                const sendNotification = mock(async () => {});
+                const moduleCall = mock(async () => ({
+                    ok: false,
+                    disposition: "retryable",
+                    reason: row.reason,
+                    summary: row.summary,
+                }));
+                const handler = createMagicContextCommandHandler({
+                    db,
+                    transformMode: "rust",
+                    rustModeModuleClient: { call: moduleCall },
+                    sendNotification,
+                });
+                const sessionId = `ses-rust-wrapup-reason-${index}`;
+                await expectSentinel(
+                    handler["command.execute.before"](
+                        { command: "ctx-wrapup", sessionID: sessionId, arguments: "" },
+                        makeOutput(""),
+                        {},
+                    ),
+                    "__CONTEXT_MANAGEMENT_CTX-WRAPUP_HANDLED__",
+                );
+                const text = (sendNotification.mock.calls as unknown as Array<[string, string]>)
+                    .filter(([notified]) => notified === sessionId)
+                    .map(([, notification]) => notification)
+                    .join("\n");
+                const label = `${row.reason}/${row.summary}`;
+                expect(text, label).toContain("## Magic Wrapup — Partial");
+                expect(text, label).toContain(row.expected);
+                const other = row.expected === retry ? sendMessageFirst : retry;
+                expect(text, label).not.toContain(other);
+            }
+        });
+
         it("keeps /ctx-embed on the TypeScript subsystem in Rust mode", async () => {
             const sendNotification = mock(async () => {});
             const moduleCall = mock(async () => {
@@ -1232,22 +1288,31 @@ describe("createMagicContextCommandHandler", () => {
             );
         });
 
-        it("merges structured module status into the desktop status output", async () => {
+        // Was "merges structured module status into the desktop status output":
+        // the module cache block and the host-backends line were text only the
+        // diagnostics view printed, and /ctx-status now has one view with no
+        // argument. Rust mode still asks the module for status; what chat shows
+        // is the summary built from what it answered.
+        it("asks the module for session status and answers with the summary", async () => {
+            const methods: string[] = [];
             const sendNotification = mock(async () => {});
             const handler = createMagicContextCommandHandler({
                 db,
                 transformMode: "rust",
                 rustModeModuleClient: {
-                    call: async () => ({
-                        ok: true,
-                        usage: {
-                            current_total_input_tokens: 42_000,
-                            context_limit_tokens: 100_000,
-                        },
-                        boundary_present: true,
-                        coverage_ordinal: 17,
-                        compartment_count: 4,
-                    }),
+                    call: async (request) => {
+                        methods.push(request.method);
+                        return {
+                            ok: true,
+                            usage: {
+                                current_total_input_tokens: 42_000,
+                                context_limit_tokens: 100_000,
+                            },
+                            boundary_present: true,
+                            coverage_ordinal: 17,
+                            compartment_count: 4,
+                        };
+                    },
                 },
                 sendNotification,
             });
@@ -1257,21 +1322,18 @@ describe("createMagicContextCommandHandler", () => {
                     {
                         command: "ctx-status",
                         sessionID: "ses-rust-status",
-                        arguments: "diagnostics",
+                        arguments: "",
                     },
                     makeOutput(""),
                     {},
                 ),
                 "__CONTEXT_MANAGEMENT_CTX-STATUS_HANDLED__",
             );
-            expect(sendNotification).toHaveBeenCalledWith(
-                "ses-rust-status",
-                expect.stringContaining("- Coverage ordinal: 17"),
-                {},
-            );
-            expect(String(sendNotification.mock.calls[0]?.[1])).toContain(
-                "Host backends → MODULE: ctx_memory, ctx_note; historian: module-side",
-            );
+            expect(methods).toEqual(["session.status"]);
+            const text = String(sendNotification.mock.calls[0]?.[1]);
+            expect(text).toContain("## Magic Context Status");
+            expect(text).not.toContain("Coverage ordinal");
+            expect(text).not.toContain("MODULE");
         });
 
         it("routes wrapup and recomp forwarding the requested keep and command ids", async () => {
@@ -1353,78 +1415,12 @@ describe("createMagicContextCommandHandler", () => {
             );
         });
     });
-
-    describe("ctx-session-upgrade", () => {
-        it("runs the managed upgrade (recomp + migration) and throws the sentinel", async () => {
-            insertLegacyCompartment(db, "ses-su-legacy");
-            const sendNotification = mock(async () => {});
-            // The command path now delegates to the unified `runUpgrade` (shared
-            // recomp-orchestrator: full recomp → once-per-project memory
-            // migration), so it gets the same fallback + progress as the RPC
-            // dialog path. The command handler just invokes it and reports.
-            const runUpgrade = mock(
-                async () => "## Session Upgrade — Complete\n\nRebuilt 1 compartment.",
-            );
-            const handler = createMagicContextCommandHandler({
-                db,
-                runUpgrade,
-                sendNotification,
-            });
-
-            await expectSentinel(
-                handler["command.execute.before"](
-                    {
-                        command: "ctx-session-upgrade",
-                        sessionID: "ses-su-legacy",
-                        arguments: "",
-                    },
-                    makeOutput(""),
-                    {},
-                ),
-                "__CONTEXT_MANAGEMENT_CTX-SESSION-UPGRADE_HANDLED__",
-            );
-
-            expect(runUpgrade).toHaveBeenCalledWith("ses-su-legacy");
-            expect(sendNotification).toHaveBeenCalledWith(
-                "ses-su-legacy",
-                expect.stringContaining("Session Upgrade"),
-                {},
-            );
-        });
-
-        it("reports a no-session message when the prompt has no session id", async () => {
-            const sendNotification = mock(async () => {});
-            const executeRecomp = mock(async () => "rebuilt");
-            const handler = createMagicContextCommandHandler({
-                db,
-                executeRecomp,
-                sendNotification,
-            });
-
-            await expectSentinel(
-                handler["command.execute.before"](
-                    {
-                        command: "ctx-session-upgrade",
-                        sessionID: "",
-                        arguments: "",
-                    },
-                    makeOutput(""),
-                    {},
-                ),
-                "__CONTEXT_MANAGEMENT_CTX-SESSION-UPGRADE_HANDLED__",
-            );
-
-            expect(executeRecomp).not.toHaveBeenCalled();
-            expect(sendNotification).toHaveBeenCalledWith(
-                "",
-                expect.stringContaining("not attached to a session"),
-                {},
-            );
-        });
-    });
-
     describe("ctx-dream", () => {
         it("runs all enabled tasks, sends summary, and throws the sentinel", async () => {
+            // A migrated store, so the backlog panels have real rows to count.
+            const dreamDb = new Database(":memory:");
+            initializeDatabase(dreamDb);
+            runMigrations(dreamDb);
             const sendNotification = mock(async () => {});
             const runManual = mock(async () => ({
                 ran: ["verify"],
@@ -1432,9 +1428,11 @@ describe("createMagicContextCommandHandler", () => {
                 skippedNoWork: [],
                 deferredBusy: [],
                 failed: [],
+                // The runner reports only the task it selected.
+                backlogAfter: { verify: { pending: 0, total: 0 } },
             }));
             const handler = createMagicContextCommandHandler({
-                db,
+                db: dreamDb,
                 sendNotification,
                 dreamer: {
                     // command handler only reads `config` for presence; runManual is the entry.
@@ -1466,6 +1464,69 @@ describe("createMagicContextCommandHandler", () => {
             expect(sendNotification.mock.calls[1]?.[1]).toContain(
                 "curate: 8 memory operations applied",
             );
+            const before = String(sendNotification.mock.calls[0]?.[1]);
+            const after = String(sendNotification.mock.calls[1]?.[1]);
+            // The end panel appears once and lists exactly the tasks the start panel listed,
+            // even though the runner only reported the task it ran.
+            expect(after.split("Backlog at run end:").length - 1).toBe(1);
+            expect(after).not.toContain("Backlog at run start:");
+            const taskNames = (panel: string) =>
+                panel
+                    .split("\n")
+                    .map((line) => /^\s*[-*]?\s*([a-z-]+):/.exec(line)?.[1])
+                    .filter((name): name is string =>
+                        CANONICAL_DREAM_TASKS.includes(name as never),
+                    );
+            const beforeTasks = taskNames(before.split("Backlog before starting:")[1] ?? "");
+            const afterTasks = taskNames(after.split("Backlog at run end:")[1] ?? "");
+            expect(beforeTasks.length).toBe(CANONICAL_DREAM_TASKS.length);
+            expect(afterTasks).toEqual(beforeTasks);
+        });
+
+        it("samples toast duration once when a dream run starts", async () => {
+            let duration = 3000;
+            const sampleToastDurationMs = mock(() => duration);
+            const sendNotification = mock(async () => {});
+            const handler = createMagicContextCommandHandler({
+                db,
+                sendNotification,
+                sampleToastDurationMs,
+                dreamer: {
+                    config: {} as never,
+                    projectPath: "/repo/project",
+                    runManual: async () => {
+                        duration = 9000;
+                        return {
+                            ran: ["verify"],
+                            details: [],
+                            skippedNoWork: [],
+                            deferredBusy: [],
+                            failed: [],
+                        };
+                    },
+                },
+            });
+            const run = () =>
+                expectSentinel(
+                    handler["command.execute.before"](
+                        { command: "ctx-dream", sessionID: "ses-dream", arguments: "" },
+                        makeOutput(""),
+                        {},
+                    ),
+                    "__CONTEXT_MANAGEMENT_CTX-DREAM_HANDLED__",
+                );
+            await run();
+            expect(sampleToastDurationMs).toHaveBeenCalledTimes(1);
+            expect(sendNotification.mock.calls.slice(0, 2).map((call) => call[2])).toEqual([
+                { toastDurationMs: 3000 },
+                { toastDurationMs: 3000 },
+            ]);
+            await run();
+            expect(sampleToastDurationMs).toHaveBeenCalledTimes(2);
+            expect(sendNotification.mock.calls.slice(2, 4).map((call) => call[2])).toEqual([
+                { toastDurationMs: 9000 },
+                { toastDurationMs: 9000 },
+            ]);
         });
 
         it("force-runs a single named task when given an argument", async () => {

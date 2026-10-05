@@ -5,7 +5,7 @@ description: What Magic Context tools your agent calls mean in transcripts and h
 
 Magic Context registers tools for your agent, not for you. You will see `ctx_reduce`, `ctx_search`, and others in transcripts when the model trims context or looks something up. This page explains each tool, when the agent tends to use it, and how to read typical results.
 
-For reduction behavior see [Context reduction](/concepts/context-reduction/). For durable facts vs session notes see [Memory](/concepts/memory/). Tool registration follows the active mode: `compaction.enabled: false` removes only `ctx_reduce`; `ctx_expand`, `ctx_note`, `ctx_search`, and `ctx_memory` keep their normal gates. With `memory.enabled: false`, `ctx_memory` is omitted while `ctx_search` still covers conversation and enabled git-commit sources. Pi's `todowrite` registration is controlled separately by `todowrite.enabled`.
+For reduction behavior see [Context reduction](/concepts/context-reduction/). For durable facts vs session notes see [Memory](/concepts/memory/). Tool registration follows the active mode: `compaction.enabled: false` removes only `ctx_reduce`; `ctx_expand`, `ctx_note`, `ctx_search`, and `ctx_memory` keep their normal gates. With `memory.enabled: false`, `ctx_memory` is omitted while `ctx_search` still covers conversation and enabled git-commit sources. Pi's `todowrite` tool, `/todos` command, and overlay are off by default; set `todowrite.enabled: true` to opt in. The overlay defaults to on when the tool is enabled.
 
 ## ctx_reduce
 
@@ -28,18 +28,19 @@ Tool: Dropped tags: 4, 5, 6. Changes take effect on next message.
 
 ## ctx_expand
 
-**What it does.** Recovers raw transcript for message ordinals when history is compacted into `<compartment>` blocks in `<session-history>`. Use compartment `start`/`end` or a window around a `ctx_search` hit.
+**What it does.** Recovers original content from stored history. `tag=N` recovers the one text part or tool call identified by a `§N§` tag or `[dropped §N§]` placeholder, including full tool input and output. `message=N` and `start`/`end` use whole-message ordinals from `<session-history>` headings or `ctx_search` hits instead. Tags count text and tool items separately: the same number is not interchangeable between these modes.
 
 **When the agent reaches for it.** When a summary lacks exact wording, errors, values, or reasoning.
 
 | Param | Meaning |
 | --- | --- |
-| `start` | First message ordinal (inclusive). |
-| `end` | Last message ordinal (inclusive). |
+| `tag` | One tag number, not a message ordinal. Use alone. Numbers and copied strings such as `"12"`, `"§12§"`, `"§12"`, `"tag 12"`, and `"[dropped §12§]"` are accepted, with surrounding whitespace. |
+| `start` | First message ordinal (inclusive), not a tag number. |
+| `end` | Last message ordinal (inclusive), not a tag number. |
 | `verbose` | With `start`/`end`: list each message separately with its ordinal `[N]` and a per-part preview (each tool call shown with its output size). |
 | `message` | Full untruncated recovery of one message by its ordinal — every text part and every tool call's complete input/output. |
 
-Output is capped near 15K tokens. Ordinals after the last compartment are the live tail (already visible, not expandable). `ctx_expand` remains available in compaction-off mode.
+Range output is capped near 15K tokens; single-item and single-message recovery are untruncated. Ordinals after the last compartment are the live tail (already visible, not expandable). `ctx_expand` remains available in compaction-off mode.
 
 ```text
 Agent: ctx_expand({ "start": 120, "end": 245 })
@@ -47,24 +48,25 @@ Tool: [120] U: Can we rename the handler?
 [121] A: Updating command-handler.ts...
 ```
 
-**Two recovery modes for finer detail.** The default range view returns a condensed digest. To drill in:
+**Recovery modes for finer detail.** The default range view returns a condensed digest. To drill in:
 
 - `ctx_expand({ "start": 120, "end": 245, "verbose": true })` — each message listed separately with its ordinal `[N]`, so you can find the exact message or tool call you want.
-- `ctx_expand({ "message": 138 })` — the full, untruncated content of the message at that ordinal. This is the cheap way to get back a tool output you dropped with `ctx_reduce`: the original is still in stored history even though the wire shows `[dropped §N§]`. If the message was deleted (session prune/revert), it says so.
+- `ctx_expand({ "message": 138 })` — the full, untruncated content of the message at that ordinal, including every tool call in a multi-tool message.
+- `ctx_expand({ "tag": 138 })` — just the item tagged `§138§`, including a dropped tool output. The original is still in stored history even though the wire shows `[dropped §138§]`. A missing tag reports that no such tag exists and suggests `message=138` if the number came from a history heading or search hit. If the original was deleted (session prune/revert), it says so.
 
 ## ctx_note
 
-**What it does.** Session working notes: reminders and follow-ups for later in this session. Not [project memory](/concepts/memory/).
+**What it does.** Session notes are pending intentions: work the agent intends to return to, with findings attached. Findings without an intention are not a note.
 
-**When the agent reaches for it.** “Revisit later” items that are not durable memories and not active todos.
+**When the agent reaches for it.** “Revisit later” work that is not [project memory](/concepts/memory/) or an active todo. A record of how things stand (world-state, a design at a point in time) with nothing you intend to do about it — that goes stale silently; a fact worth keeping is memory, the rest is nothing. Dismiss a note when its work lands or is abandoned; a queue you never dismiss from stops being read.
 
 | Param | Meaning |
 | --- | --- |
 | `action` | `write`, `read`, `update`, `dismiss`. |
 | `content` | Text for `write` / `update`. |
 | `surface_condition` | Creates a **smart note** (hidden until an external condition is true). |
-| `note_ids` | Targets: exactly one id for `update`, one to fifty for `dismiss`; ignored by `write` / `read`. |
-| `filter` | For `read`: `all`, `active`, `pending`, `ready`, `dismissed`. |
+| `note_ids` | Targets: exactly one id for `update`, one to fifty for `dismiss`, or one to fifty specific full bodies for `read`; ignored by `write`. |
+| `filter` | For `read`: `all`, `active`, `pending`, `ready`, `dismissed`. Omitted: active session notes plus every current smart note, including pending. `active`: only active-status notes. |
 | `limit` / `offset` | Page `read` results (newest first). |
 
 **Smart notes** need Dreamer to be runnable (not `dreamer.disable: true`) and are evaluated only when the `evaluate-smart-notes` task is scheduled. Conditions must be externally checkable (GitHub, files, git, web) — not “when the user says X”.
@@ -85,7 +87,7 @@ Tool: Smart note #7 saved (pending).
 
 | Param | Meaning |
 | --- | --- |
-| `action` | `write`, `update`, `archive`, `merge`, `get` (primary); `list` is dreamer-only. |
+| `action` | `write`, `update`, `archive`, `merge`, `get`. |
 | `content` | Text for `write`, `update`, `merge`. |
 | `category` | Category for `write`. |
 | `ids` | One id for `update`; one or more for `archive`; two or more for `merge`; 1–20 for `get`. |
@@ -98,7 +100,6 @@ Tool: Smart note #7 saved (pending).
 | `archive` | Yes | Yes |
 | `merge` | Yes | Yes |
 | `get` | Yes | Yes |
-| `list` | No | Yes |
 
 `get` reads memories by id (own project, any status, plus shared categories of workspace neighbors). Not-visible or missing ids are reported per-id without distinguishing "foreign hidden" from "doesn't exist".
 
@@ -110,6 +111,10 @@ Tool: Memory #42 written (CONSTRAINTS).
 
 Edit memories in the [dashboard](/reference/dashboard/) Mem tab; running sessions pick up changes automatically.
 
+### ctx_memory_list
+
+Dreamer Curate workers get a separate `ctx_memory_list` tool for bulk enumeration. It accepts the same optional `category` and `limit` filters as the former list action. Primary sessions never receive this tool in their provider-visible tool list.
+
 ## ctx_search
 
 **What it does.** Search project recall: memories, raw messages behind compacted history, indexed git commits, parked notes, and promoted primers. Skips content already visible in `<project-memory>` and the live tail.
@@ -120,7 +125,7 @@ Edit memories in the [dashboard](/reference/dashboard/) Mem tab; running session
 | --- | --- |
 | `query` | Search string — or a list of memory ids (`#12`, `12, 34`). |
 | `limit` | Max hits (default 10). |
-| `sources` | `memory`, `message`, `git_commit`, `note`, `primer` — omit for all. |
+| `sources` | `memory`, `message`, `git_commit`, `note`, `primer` — omit or pass `[]` for all. |
 
 | Question | Typical sources |
 | --- | --- |

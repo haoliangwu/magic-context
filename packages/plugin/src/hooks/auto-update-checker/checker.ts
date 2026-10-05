@@ -355,6 +355,7 @@ function runHostPluginInstall(
         signal?.addEventListener("abort", onAbort, { once: true });
         try {
             const proc = spawn("opencode", ["plugin", spec, "--global", "--force"], {
+                windowsHide: true,
                 stdio: "ignore",
             });
             processStarted = true;
@@ -502,7 +503,12 @@ function buildRegistryUrl(registryUrl: string): string {
 
 export async function getLatestVersion(
     channel = "latest",
-    options: { registryUrl?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+    options: {
+        registryUrl?: string;
+        timeoutMs?: number;
+        signal?: AbortSignal;
+        fetch?: typeof fetch;
+    } = {},
 ): Promise<string | null> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), options.timeoutMs ?? NPM_FETCH_TIMEOUT);
@@ -511,10 +517,13 @@ export async function getLatestVersion(
 
     try {
         if (options.signal?.aborted) return null;
-        const response = await fetch(buildRegistryUrl(options.registryUrl ?? NPM_REGISTRY_URL), {
-            signal: controller.signal,
-            headers: { Accept: "application/json" },
-        });
+        const response = await (options.fetch ?? fetch)(
+            buildRegistryUrl(options.registryUrl ?? NPM_REGISTRY_URL),
+            {
+                signal: controller.signal,
+                headers: { Accept: "application/json" },
+            },
+        );
         if (!response.ok) return null;
 
         const data = NpmPackageEnvelopeSchema.safeParse(await response.json());

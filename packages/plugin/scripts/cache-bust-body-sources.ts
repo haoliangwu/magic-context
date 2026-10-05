@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-export type BodyProvider = "anthropic" | "openai";
+export type BodyProvider = "anthropic" | "openai" | "gemini";
 
 type Json = Record<string, unknown>;
 
@@ -29,6 +29,7 @@ export interface NormalizedRequestBody {
 export interface PiBodySnapshot {
     sequence: number;
     path: string;
+    wireModel?: string;
     messages: NormalizedMessage[];
 }
 
@@ -49,11 +50,26 @@ function sha(value: string): string {
     return createHash("sha256").update(value).digest("hex").slice(0, 10);
 }
 
+/**
+ * Values the caller rotates on every request even when the prompt is byte-stable.
+ * The Anthropic auth plugin prepends a billing-header block to `system` whose
+ * `cch`, `cc_prev_req`, and `cc_prompt_id` change per request; the provider meter
+ * reports a full cache read straight across those rotations, so a comparison that
+ * counts them reports a divergence on every single request and buries the real
+ * ones. The whole header line is replaced rather than each field, so a field
+ * added to it later cannot quietly reintroduce the noise.
+ */
+export function stripRotatingRequestFields(text: string): string {
+    return text
+        .replace(/^[ \t]*x-anthropic-billing-header:.*$/gim, "x-anthropic-billing-header: <rotating>")
+        .replace(/cch=[^;]*;/g, "cch=<NONCE>;");
+}
+
 function stripCacheControl(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(stripCacheControl);
     const object = asJson(value);
     if (!object) {
-        return typeof value === "string" ? value.replace(/cch=[^;]*;/g, "cch=<NONCE>;") : value;
+        return typeof value === "string" ? stripRotatingRequestFields(value) : value;
     }
     const normalized: Json = {};
     for (const [key, child] of Object.entries(object)) {
@@ -88,7 +104,10 @@ function partType(value: unknown, fallback: string): string {
 }
 
 function normalizePart(value: unknown, fallbackType: string): NormalizedPart {
-    const text = textForPart(value);
+    // Normalize before measuring: the part length and text prefix both feed the
+    // message identity the analyzer diffs on, so an un-normalized length or
+    // prefix would diverge on a rotation the hash already forgives.
+    const text = stripRotatingRequestFields(textForPart(value));
     const oneLine = text.replace(/\s+/g, " ").trim();
     return {
         type: partType(value, fallbackType),
@@ -170,7 +189,62 @@ function normalizeOpenAiBody(body: Json): NormalizedMessage[] {
     return messages;
 }
 
-/** Convert Anthropic `messages[]` and Responses `input[]` into the same diagnostic shape. */
+/** Gemini parts carry no `type`; the payload key (text, functionCall, ...) names the part. */
+function geminiPartType(value: unknown): string {
+    const object = asJson(value);
+    if (!object) return "text";
+    for (const key of [
+        "functionCall",
+        "functionResponse",
+        "inlineData",
+        "fileData",
+        "executableCode",
+        "codeExecutionResult",
+    ] as const) {
+        if (object[key] !== undefined) return key;
+    }
+    if (object.text !== undefined) return object.thought === true ? "thought" : "text";
+    return "part";
+}
+
+function geminiMessage(role: string, parts: unknown, original: unknown): NormalizedMessage {
+    const message = normalizedMessage(role, parts, original, "text");
+    return {
+        ...message,
+        parts: Array.isArray(parts)
+            ? parts.map((part) => normalizePart(part, geminiPartType(part)))
+            : message.parts,
+    };
+}
+
+/**
+ * Gemini `generateContent` bodies: `systemInstruction` + `tools` + `contents[]`.
+ * Google Code Assist (Antigravity) wraps the same request in a
+ * `{model, project, request: {...}}` envelope, so the inner request is read when
+ * present. Tool declarations are kept as their own message because they sit in the
+ * provider's cached prefix: a changed tool list is a real prefix rewrite.
+ */
+function normalizeGeminiBody(body: Json): NormalizedMessage[] {
+    const request = asJson(body.request) ?? body;
+    const messages: NormalizedMessage[] = [];
+    if (request.systemInstruction !== undefined) {
+        const system = asJson(request.systemInstruction);
+        messages.push(geminiMessage("system", system?.parts ?? request.systemInstruction, system));
+    }
+    if (request.tools !== undefined) {
+        messages.push(normalizedMessage("tools", request.tools, request.tools, "tools"));
+    }
+    if (!Array.isArray(request.contents)) return messages;
+    for (const value of request.contents) {
+        const content = asJson(value);
+        if (!content) continue;
+        const role = typeof content.role === "string" ? content.role : "unknown";
+        messages.push(geminiMessage(role, content.parts, content));
+    }
+    return messages;
+}
+
+/** Convert Anthropic `messages[]`, Responses `input[]`, and Gemini `contents[]` into the same diagnostic shape. */
 export function normalizeRequestBody(body: Json, provider?: BodyProvider): NormalizedRequestBody {
     const resolvedProvider = provider ?? (Array.isArray(body.input) ? "openai" : "anthropic");
     return {
@@ -178,7 +252,9 @@ export function normalizeRequestBody(body: Json, provider?: BodyProvider): Norma
         messages:
             resolvedProvider === "openai"
                 ? normalizeOpenAiBody(body)
-                : normalizeAnthropicBody(body),
+                : resolvedProvider === "gemini"
+                  ? normalizeGeminiBody(body)
+                  : normalizeAnthropicBody(body),
     };
 }
 
@@ -301,6 +377,8 @@ export function loadPiBodySnapshots(directory: string | undefined): Map<number, 
             snapshots.set(Number.parseInt(match[1], 10), {
                 sequence: Number.parseInt(match[1], 10),
                 path,
+                wireModel:
+                    typeof body.model === "string" && body.model.length > 0 ? body.model : undefined,
                 messages: normalizeRequestBody(body, "openai").messages,
             });
         } catch {

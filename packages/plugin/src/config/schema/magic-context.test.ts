@@ -38,7 +38,7 @@ describe("MagicContextConfigSchema", () => {
                     retrieval_count_promotion_threshold: 3,
                 },
                 todowrite: {
-                    enabled: true,
+                    enabled: false,
                     overlay: true,
                 },
             });
@@ -48,6 +48,21 @@ describe("MagicContextConfigSchema", () => {
             expect(result.pi).toBeUndefined();
             expect(result.mural).toEqual({ enabled: false });
         });
+    });
+
+    it("defaults todowrite off but honors explicit enablement and disablement", () => {
+        expect(MagicContextConfigSchema.parse({}).todowrite).toEqual({
+            enabled: false,
+            overlay: true,
+        });
+        expect(MagicContextConfigSchema.parse({ todowrite: {} }).todowrite.enabled).toBe(false);
+        expect(MagicContextConfigSchema.parse({ todowrite: { enabled: true } }).todowrite).toEqual({
+            enabled: true,
+            overlay: true,
+        });
+        expect(
+            MagicContextConfigSchema.parse({ todowrite: { enabled: false } }).todowrite.enabled,
+        ).toBe(false);
     });
 
     describe("budget configuration", () => {
@@ -191,12 +206,20 @@ describe("MagicContextConfigSchema", () => {
             expect(result.dreamer?.tasks.retrospective.schedule).toBe("0 5 * * *");
         });
 
-        it("defaults classify-memories and retrospective on daily in dreamer task metadata", () => {
-            const result = MagicContextConfigSchema.parse({
+        it("defaults retrospective to a 30-day source window and accepts an override", () => {
+            const defaults = MagicContextConfigSchema.parse({
                 dreamer: { opencode: { model: "x/y" } },
             });
-            expect(result.dreamer?.tasks["classify-memories"].schedule).toBe("0 6 * * *");
-            expect(result.dreamer?.tasks.retrospective.schedule).toBe("0 5 * * *");
+            expect(defaults.dreamer?.tasks["classify-memories"].schedule).toBe("0 6 * * *");
+            expect(defaults.dreamer?.tasks.retrospective.schedule).toBe("0 5 * * *");
+            expect(defaults.dreamer?.tasks.retrospective.recency_days).toBe(30);
+
+            const overridden = MagicContextConfigSchema.parse({
+                dreamer: {
+                    tasks: { retrospective: { schedule: "0 5 * * *", recency_days: 14 } },
+                },
+            });
+            expect(overridden.dreamer?.tasks.retrospective.recency_days).toBe(14);
         });
 
         it("parses both transform modes", () => {
@@ -449,7 +472,7 @@ describe("MagicContextConfigSchema", () => {
                     migrated_execution: ["model", "fallback_models", "variant", "thinking_level"],
                 },
                 task: {
-                    retained: ["schedule", "promotion_threshold"],
+                    retained: ["schedule", "promotion_threshold", "recency_days"],
                     migrated_execution: [
                         "model",
                         "fallback_models",

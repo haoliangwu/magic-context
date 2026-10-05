@@ -235,7 +235,6 @@ Abruf funktioniert **über Sitzungen hinweg** (eine neue Sitzung erbt alles) und
 | `/ctx-status` | Debug-Ansicht: tags, pending drops, Cache-TTL, Hinweiszustand, historian-Fortschritt, Kompartimentabdeckung, Historienbudget |
 | `/ctx-flush` | Alle eingereihten Operationen sofort erzwingen und Cache-TTL umgehen |
 | `/ctx-recomp` | Kompartimente aus Rohhistorie neu aufbauen (akzeptiert einen `start-end`-Bereich). Verwenden, wenn gespeicherter Zustand falsch wirkt |
-| `/ctx-session-upgrade` | Diese Sitzung auf das neueste Historienformat aktualisieren: Kompartimente neu aufbauen und Projekterinnerungen migrieren |
 | `/ctx-dream` | Dreamer-Wartung bei Bedarf ausführen: Speicher, Dokumente, smart notes und user-profile-Review pflegen |
 
 ---

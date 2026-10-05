@@ -560,7 +560,7 @@ pub fn get_config(source: String, project_path: Option<String>) -> config::Confi
             config::read_config(&path, "project")
         }
         _ => {
-            let path = config::resolve_user_config_path();
+            let path = config::resolve_user_config_path(&config::config_home());
             config::read_config(&path, "user")
         }
     }
@@ -569,7 +569,7 @@ pub fn get_config(source: String, project_path: Option<String>) -> config::Confi
 #[tauri::command(async)]
 pub fn save_config(source: String, content: String) -> Result<(), String> {
     let path = match source.as_str() {
-        "user" => config::resolve_user_config_path(),
+        "user" => config::resolve_user_config_path(&config::config_home()),
         _ => return Err("Only user config editing is supported in V1".to_string()),
     };
     config::write_config(&path, &content)
@@ -577,8 +577,13 @@ pub fn save_config(source: String, content: String) -> Result<(), String> {
 
 #[tauri::command(async)]
 pub fn get_project_configs(state: State<'_, AppState>) -> Vec<config::ProjectConfigEntry> {
-    let db_path = state.db_path.lock().ok().and_then(|guard| guard.clone());
-    config::discover_project_configs_with_db(db_path.as_ref())
+    let db_path = state.get_db_path().ok();
+    config::discover_project_configs_with_db(
+        db_path.as_ref(),
+        &db::data_home(),
+        &config::config_home(),
+        &db::opencode_overrides(),
+    )
 }
 
 #[tauri::command(async)]
@@ -940,6 +945,8 @@ pub struct ModelCatalogs {
     pub opencode: Vec<String>,
     pub pi: Vec<String>,
     pub omp: Vec<String>,
+    #[serde(rename = "opencodeError", skip_serializing_if = "Option::is_none")]
+    pub opencode_error: Option<String>,
 }
 
 fn catalog_model_id(value: &str) -> Option<String> {
@@ -965,8 +972,46 @@ pub fn parse_opencode_models_output(text: &str) -> Vec<String> {
         .collect()
 }
 
-async fn discover_opencode_models() -> Vec<String> {
+// Loading providers and plugins on a cold OpenCode 2 startup can take much longer
+// than the short probe used for install-state detection.
+const MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+async fn probe_opencode_models(
+    bin: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<String>, String> {
+    let output = tokio::time::timeout(
+        timeout,
+        tokio::process::Command::new(bin)
+            .arg("models")
+            .no_window()
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    match output {
+        Err(_) => Err(format!(
+            "Couldn't load models from OpenCode (timed out after {}s)",
+            timeout.as_secs()
+        )),
+        Ok(Err(err)) => Err(format!("Couldn't run OpenCode models: {err}")),
+        Ok(Ok(output)) if !output.status.success() => {
+            Err(format!("OpenCode models exited with {}", output.status))
+        }
+        Ok(Ok(output)) => {
+            let models = parse_opencode_models_output(&String::from_utf8_lossy(&output.stdout));
+            if models.is_empty() {
+                Err("OpenCode returned no models; try again after it finishes starting".to_string())
+            } else {
+                Ok(models)
+            }
+        }
+    }
+}
+
+async fn discover_opencode_models() -> Result<Vec<String>, String> {
     let candidates = opencode_cli_candidates();
+    let mut failure = None;
 
     // Use the plain `opencode models` command, NOT `--pure`. `--pure` skips all
     // external plugins, including the auth/provider plugins that register the
@@ -976,21 +1021,17 @@ async fn discover_opencode_models() -> Vec<String> {
     // start background work only on a tool call (rather than at plugin load) are
     // not triggered by a model listing.
     for bin in &candidates {
-        if let Some(text) = run_bounded_binary(bin, &["models"]).await {
-            let models = parse_opencode_models_output(&text);
-            if !models.is_empty() {
-                return models;
-            }
+        match probe_opencode_models(bin, MODEL_PROBE_TIMEOUT).await {
+            Ok(models) => return Ok(models),
+            Err(err) if !err.contains("Couldn't run OpenCode models:") => failure = Some(err),
+            Err(_) => {}
         }
     }
 
     if cfg!(target_os = "windows") {
         if let Some(bin) = resolve_via_where("opencode").await {
-            if let Some(text) = run_bounded_binary(&bin, &["models"]).await {
-                let models = parse_opencode_models_output(&text);
-                if !models.is_empty() {
-                    return models;
-                }
+            if let Ok(models) = probe_opencode_models(&bin, MODEL_PROBE_TIMEOUT).await {
+                return Ok(models);
             }
         }
     }
@@ -998,10 +1039,15 @@ async fn discover_opencode_models() -> Vec<String> {
     // Login-shell fallback for version-manager (mise/nvm/fnm) installs the
     // hardcoded candidates can't enumerate — see run_via_login_shell.
     if let Some(text) = run_via_login_shell("opencode models".to_string()).await {
-        return parse_opencode_models_output(&text);
+        let models = parse_opencode_models_output(&text);
+        if !models.is_empty() {
+            return Ok(models);
+        }
     }
 
-    Vec::new()
+    Err(failure.unwrap_or_else(|| {
+        "Couldn't load models from OpenCode; check the CLI installation".to_string()
+    }))
 }
 
 #[tauri::command]
@@ -1011,7 +1057,12 @@ pub async fn get_model_catalogs() -> ModelCatalogs {
         discover_pi_models(),
         get_available_omp_models()
     );
-    ModelCatalogs { opencode, pi, omp }
+    ModelCatalogs {
+        opencode: opencode.as_ref().cloned().unwrap_or_default(),
+        pi,
+        omp,
+        opencode_error: opencode.err(),
+    }
 }
 
 fn strip_ansi_pi_output(text: &str) -> String {
@@ -1306,7 +1357,7 @@ pub(crate) fn prepare_embedding_probe_options(
 
     // Relative `{file:}` references resolve against the user config file's dir,
     // matching the plugin's load-time resolution.
-    let config_dir = config::resolve_user_config_path()
+    let config_dir = config::resolve_user_config_path(&config::config_home())
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -1436,8 +1487,8 @@ mod tests {
     use super::{
         opencode_desktop_detected_for_env, parse_omp_models_output, parse_opencode_models_output,
         parse_pi_models_output, pick_first_line, prepare_embedding_probe_options,
-        run_bounded_binary, windows_opencode_candidates, DesktopPlatform, ModelCatalogs,
-        OpencodeDesktopEnv, OPENCODE_DESKTOP_APP_IDS,
+        probe_opencode_models, run_bounded_binary, windows_opencode_candidates, DesktopPlatform,
+        ModelCatalogs, OpencodeDesktopEnv, OPENCODE_DESKTOP_APP_IDS,
     };
     use crate::embedding_probe::EmbeddingProbeOutcome;
     use std::path::{Path, PathBuf};
@@ -1583,6 +1634,82 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires an isolated HOME/XDG environment with OpenCode 2 installed at HOME/.opencode/bin/opencode"]
+    async fn isolated_real_opencode_catalog() {
+        assert_eq!(
+            std::env::var("MAGIC_CONTEXT_ISOLATED_OPENCODE_TEST").as_deref(),
+            Ok("1"),
+            "explicit isolated test opt-in required"
+        );
+        let temp = std::env::temp_dir().join("magic-context");
+        for key in [
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "MAGIC_CONTEXT_STORAGE_DIR",
+        ] {
+            let root = std::env::var(key).expect("private root required");
+            assert!(
+                std::path::Path::new(&root).starts_with(&temp),
+                "{key} must be under {}",
+                temp.display()
+            );
+        }
+        assert!(
+            std::env::var("OPENCODE_DB").is_ok(),
+            "private DB name required"
+        );
+        let bin = super::opencode_cli_candidates().remove(0);
+        assert!(std::path::Path::new(&bin).exists(), "isolated CLI missing");
+        let models = super::discover_opencode_models().await;
+        let catalogs = super::get_model_catalogs().await;
+        eprintln!("first discovery: {models:?}; catalogs: {catalogs:?}");
+        assert_eq!(
+            catalogs.opencode.is_empty(),
+            catalogs.opencode_error.is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_model_probe_reports_timeout_and_empty_then_accepts_warm_output() {
+        // Shared content-addressed stubs (see crate::test_bin), reused across
+        // runs. The "empty" CLI is a second stub with its own content and path
+        // rather than an in-place rewrite of the first.
+        let slow = crate::test_bin::write_test_executable(
+            "opencode",
+            "#!/bin/sh\nsleep 0.2\nprintf 'opencode/big-pickle\\n'\n",
+            "",
+        );
+        let empty = crate::test_bin::write_test_executable("opencode", "#!/bin/sh\nexit 0\n", "");
+        let bin = slow.to_str().expect("UTF-8 path");
+        let timeout = std::time::Duration::from_millis(30);
+        assert!(probe_opencode_models(bin, timeout)
+            .await
+            .unwrap_err()
+            .contains("timed out after 0s"));
+        assert_eq!(
+            probe_opencode_models(bin, std::time::Duration::from_secs(2))
+                .await
+                .unwrap(),
+            vec!["opencode/big-pickle"]
+        );
+        // The empty-output case is not about the deadline. A generous timeout
+        // keeps the first-ever launch of a new stub file (which macOS delays
+        // for a malware scan) from surfacing as a timeout instead.
+        let bin = empty.to_str().expect("UTF-8 path");
+        assert!(
+            probe_opencode_models(bin, std::time::Duration::from_secs(2))
+                .await
+                .unwrap_err()
+                .contains("returned no models")
+        );
+    }
+
     // #149 regression: the discovery path must be able to LAUNCH a `.cmd` shim
     // (pnpm/npm install opencode as opencode.cmd). Verified on windows-latest
     // that Rust's Command runs a `.cmd` directly, so the fix is purely adding the
@@ -1650,6 +1777,7 @@ mod tests {
                 "shared/model".to_string(),
             ],
             omp: vec!["opencode-zen/gpt-5".to_string(), "shared/model".to_string()],
+            opencode_error: None,
         })
         .expect("catalogs serialize");
 
@@ -1660,6 +1788,17 @@ mod tests {
                 "pi": ["anthropic/claude-sonnet", "shared/model"],
                 "omp": ["opencode-zen/gpt-5", "shared/model"],
             })
+        );
+        let unavailable = ModelCatalogs {
+            opencode: vec![],
+            pi: vec![],
+            omp: vec![],
+            opencode_error: Some("Couldn't load models from OpenCode (timed out after 45s)".into()),
+        };
+        let value = serde_json::to_value(&unavailable).expect("failure serializes");
+        assert_eq!(
+            value["opencodeError"].as_str(),
+            unavailable.opencode_error.as_deref()
         );
     }
 
@@ -1779,7 +1918,8 @@ mod tests {
 
     #[test]
     fn embedding_probe_expands_env_model_token_for_the_test() {
-        std::env::set_var("MC_DASHBOARD_TEST_MODEL", "resolved-model");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MC_DASHBOARD_TEST_MODEL", "resolved-model");
         let options = prepare_embedding_probe_options(
             "https://example.com/v1".to_string(),
             "{env:MC_DASHBOARD_TEST_MODEL}".to_string(),
@@ -1789,14 +1929,15 @@ mod tests {
             None,
         )
         .expect("resolvable env token should expand, not error");
-        std::env::remove_var("MC_DASHBOARD_TEST_MODEL");
+        env.remove("MC_DASHBOARD_TEST_MODEL");
 
         assert_eq!(options.model, "resolved-model");
     }
 
     #[test]
     fn embedding_probe_reports_unresolved_env_token() {
-        std::env::remove_var("MC_DASHBOARD_UNSET_TEST_VAR");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MC_DASHBOARD_UNSET_TEST_VAR");
         let outcome = prepare_embedding_probe_options(
             "https://example.com/v1".to_string(),
             "text-embedding-3-small".to_string(),
@@ -1818,10 +1959,11 @@ mod tests {
 
     #[test]
     fn embedding_probe_refuses_project_scope_without_expanding() {
+        let mut env = crate::test_env::EnvGuard::new();
         // Project config is untrusted. A project-scope probe must refuse BEFORE
         // expanding any {env:}/{file:} token, so a malicious repo can't
         // exfiltrate a secret to its endpoint via one Test Connection click.
-        std::env::set_var("MC_DASHBOARD_PROJECT_SECRET", "should-not-leak");
+        env.set("MC_DASHBOARD_PROJECT_SECRET", "should-not-leak");
         let outcome = prepare_embedding_probe_options(
             "https://attacker.example/v1".to_string(),
             "text-embedding-3-small".to_string(),
@@ -1831,7 +1973,7 @@ mod tests {
             Some("project".to_string()),
         )
         .expect_err("project scope must be refused");
-        std::env::remove_var("MC_DASHBOARD_PROJECT_SECRET");
+        env.remove("MC_DASHBOARD_PROJECT_SECRET");
 
         match outcome {
             EmbeddingProbeOutcome::ScopeNotAllowed { scope } => assert_eq!(scope, "project"),
@@ -1841,7 +1983,8 @@ mod tests {
 
     #[test]
     fn embedding_probe_allows_explicit_user_scope() {
-        std::env::set_var("MC_DASHBOARD_USER_SCOPE_MODEL", "ok-model");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MC_DASHBOARD_USER_SCOPE_MODEL", "ok-model");
         let options = prepare_embedding_probe_options(
             "https://example.com/v1".to_string(),
             "{env:MC_DASHBOARD_USER_SCOPE_MODEL}".to_string(),
@@ -1851,7 +1994,7 @@ mod tests {
             Some("user".to_string()),
         )
         .expect("explicit user scope should expand + probe");
-        std::env::remove_var("MC_DASHBOARD_USER_SCOPE_MODEL");
+        env.remove("MC_DASHBOARD_USER_SCOPE_MODEL");
         assert_eq!(options.model, "ok-model");
     }
 }

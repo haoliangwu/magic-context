@@ -16,7 +16,7 @@ Read this before writing or editing any page. It is the contract reviewers hold 
 - Internal jargon is allowed ONLY where the concept page defines it first (e.g. "compartment" is defined in concepts/historian). Never use undefined internal terms: m[0]/m[1], SOFT/HARD bust, watermark, tagger, sentinel — these may appear ONLY in concepts/cache-architecture, defined inline.
 - No internal process references: no audit/council/Oracle/plan-version mentions, no issue numbers as explanation, no commit hashes.
 - Config keys, defaults, and ranges must match `packages/plugin/src/config/schema/magic-context.ts` exactly. The configuration reference page is GENERATED — do not hand-write config tables on other pages; link to the reference instead.
-- Tool and command names exactly as registered: `ctx_reduce`, `ctx_expand`, `ctx_note`, `ctx_memory`, `ctx_search`; `/ctx-status`, `/ctx-flush`, `/ctx-recomp`, `/ctx-wrapup`, `/ctx-dream`, `/ctx-session-upgrade`.
+- Tool and command names exactly as registered: `ctx_reduce`, `ctx_expand`, `ctx_note`, `ctx_memory`, `ctx_search`; `/ctx-status`, `/ctx-flush`, `/ctx-recomp`, `/ctx-wrapup`, `/ctx-dream`, `/ctx-embed`.
 
 ## Structure
 

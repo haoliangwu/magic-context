@@ -1,4 +1,5 @@
 import { sessionLog } from "../../shared/logger";
+import { isPidAlive } from "../../shared/rpc-utils";
 import type { Database } from "../../shared/sqlite";
 
 export const COMPARTMENT_LEASE_TTL_MS = 5 * 60 * 1000;
@@ -9,6 +10,29 @@ export interface LeaseAcquired {
     holderId: string;
     acquiredAt: number;
     expiresAt: number;
+    ownerPid: number;
+}
+
+export interface CompartmentLeaseBlocker {
+    holderId: string;
+    ownerPid: number | null;
+    acquiredAt: number;
+    expiresAt: number;
+}
+
+export function getCompartmentLeaseBlocker(
+    db: Database,
+    sessionId: string,
+): CompartmentLeaseBlocker | null {
+    const row = db
+        .prepare(
+            `SELECT holder_id AS holderId, owner_pid AS ownerPid,
+                    acquired_at AS acquiredAt, expires_at AS expiresAt
+               FROM compartment_state_lease
+              WHERE session_id = ? AND expires_at > ?`,
+        )
+        .get(sessionId, Date.now()) as CompartmentLeaseBlocker | undefined;
+    return row ?? null;
 }
 
 export function acquireCompartmentLease(
@@ -18,24 +42,49 @@ export function acquireCompartmentLease(
 ): LeaseAcquired | null {
     const acquiredAt = Date.now();
     const expiresAt = acquiredAt + COMPARTMENT_LEASE_TTL_MS;
+    const ownerPid = process.pid;
+    const blocker = getCompartmentLeaseBlocker(db, sessionId);
+    if (blocker?.ownerPid && isPidAlive(blocker.ownerPid) === "dead") {
+        const reclaimed = db
+            .prepare(
+                `DELETE FROM compartment_state_lease
+                  WHERE session_id = ? AND holder_id = ? AND owner_pid = ?
+                    AND acquired_at = ? AND expires_at = ?`,
+            )
+            .run(
+                sessionId,
+                blocker.holderId,
+                blocker.ownerPid,
+                blocker.acquiredAt,
+                blocker.expiresAt,
+            );
+        if (reclaimed.changes === 1) {
+            sessionLog(
+                sessionId,
+                `reclaimed compartment lease from dead owner holder=${blocker.holderId} pid=${blocker.ownerPid}`,
+            );
+        }
+    }
     const result = db
         .prepare(
-            `INSERT INTO compartment_state_lease (session_id, holder_id, acquired_at, expires_at)
-             VALUES (?, ?, ?, ?)
+            `INSERT INTO compartment_state_lease
+                (session_id, holder_id, owner_pid, acquired_at, expires_at)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(session_id) DO UPDATE SET
                 holder_id = excluded.holder_id,
+                owner_pid = excluded.owner_pid,
                 acquired_at = excluded.acquired_at,
                 expires_at = excluded.expires_at
              WHERE compartment_state_lease.holder_id = excluded.holder_id
                 OR compartment_state_lease.expires_at <= ?`,
         )
-        .run(sessionId, holderId, acquiredAt, expiresAt, acquiredAt);
+        .run(sessionId, holderId, ownerPid, acquiredAt, expiresAt, acquiredAt);
 
     if (result.changes !== 1) {
         return null;
     }
 
-    return { sessionId, holderId, acquiredAt, expiresAt };
+    return { sessionId, holderId, acquiredAt, expiresAt, ownerPid };
 }
 
 export function renewCompartmentLease(db: Database, sessionId: string, holderId: string): boolean {

@@ -1,4 +1,7 @@
 import type { Database } from "../../shared/sqlite";
+import { deleteChunkEmbedBackoffForSession } from "./compartment-chunk-embedding";
+import { deleteUnmappedMessageFtsRows } from "./message-fts-rowid-map";
+import { deleteSessionActivity } from "./session-activity";
 
 export interface SessionScopedTableDefinition {
     readonly table: string;
@@ -16,9 +19,22 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "tool_owner_backfill_state" },
     { table: "tags", harnessScoped: true },
     { table: "session_meta", harnessScoped: true },
+    // Replay decisions belong to the session's metadata row; a harness sweep that
+    // keeps another harness's row keeps them too.
+    {
+        table: "session_replay_decisions",
+        extraPredicate:
+            "NOT EXISTS (SELECT 1 FROM session_meta AS remaining WHERE remaining.session_id = session_replay_decisions.session_id)",
+    },
     { table: "session_projects", harnessScoped: true },
     { table: "compartment_chunk_embeddings", harnessScoped: true },
     { table: "compartments", harnessScoped: true },
+    // A harness sweep can leave another harness's compartments for the same session.
+    {
+        table: "compartment_history_versions",
+        extraPredicate:
+            "NOT EXISTS (SELECT 1 FROM compartments AS remaining WHERE remaining.session_id = compartment_history_versions.session_id)",
+    },
     { table: "compression_depth", harnessScoped: true },
     { table: "session_facts", harnessScoped: true },
     { table: "compartment_state_lease" },
@@ -42,6 +58,7 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "message_history_source", harnessScoped: true },
     { table: "message_history_index", harnessScoped: true },
     { table: "lkg_slots" },
+    { table: "lkg_slot_chunks" },
 ];
 
 export interface DeleteSessionScopedRowsOptions {
@@ -85,6 +102,7 @@ export function deleteSessionScopedRows(
     if (deletableSessionIds.length === 0) return 0;
     const placeholders = deletableSessionIds.map(() => "?").join(", ");
 
+    for (const sessionId of deletableSessionIds) deleteChunkEmbedBackoffForSession(db, sessionId);
     for (const definition of SESSION_SCOPED_TABLES) {
         if (definition.table === "message_history_fts") {
             db.prepare(
@@ -95,6 +113,7 @@ export function deleteSessionScopedRows(
                      WHERE session_id IN (${placeholders})
                  )`,
             ).run(...deletableSessionIds);
+            deleteUnmappedMessageFtsRows(db, deletableSessionIds);
             continue;
         }
 
@@ -108,5 +127,8 @@ export function deleteSessionScopedRows(
         if (bindHarness) statement.run(...deletableSessionIds, harness);
         else statement.run(...deletableSessionIds);
     }
+    // Activity is session-owned but stored as keys in the existing KV table,
+    // so it cannot appear in the schema-derived SESSION_SCOPED_TABLES list.
+    deleteSessionActivity(db, deletableSessionIds);
     return deletableSessionIds.length;
 }

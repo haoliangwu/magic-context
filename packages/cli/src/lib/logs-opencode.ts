@@ -1,5 +1,5 @@
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { type DiagnosticReport, renderDiagnosticsMarkdown } from "./diagnostics-opencode";
 import { capBodyToGithubLimit, extractRecentErrors } from "./issue-body";
 import { parseLogLine, readLogLines } from "./log-lines";
@@ -119,6 +119,7 @@ export async function bundleIssueReport(
     description: string,
     title: string,
     sessionFilter: string | null = null,
+    options: { outputPath?: string } = {},
 ): Promise<BundledIssueReport> {
     const LOG_TAIL_LINES = 400;
     const allLogLines = readLogLines(report.logFiles ?? [report.logFile]);
@@ -152,7 +153,9 @@ export async function bundleIssueReport(
     const sanitizedTitle = sanitizeDiagnosticText(title).trim();
 
     const selectedSession = sessionFilter
-        ? report.recentSessions.find((session) => session.sessionId === sessionFilter)
+        ? (report.recentSessions.available ? report.recentSessions.rows : []).find(
+              (session) => session.sessionId === sessionFilter,
+          )
         : undefined;
     const sessionContext = selectedSession
         ? [
@@ -208,7 +211,8 @@ export async function bundleIssueReport(
     const bodyMarkdown = capBodyToGithubLimit(rawBodyMarkdown);
     const truncated = bodyMarkdown !== rawBodyMarkdown;
     const timestamp = formatTimestamp(new Date());
-    const path = join(process.cwd(), `magic-context-issue-${timestamp}.md`);
+    const path = options.outputPath ?? join(process.cwd(), `magic-context-issue-${timestamp}.md`);
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${bodyMarkdown}\n`);
 
     // Keep the complete sanitized report beside the capped issue body. This is
@@ -216,7 +220,9 @@ export async function bundleIssueReport(
     // control of where the diagnostic bundle is uploaded when GitHub rejects or
     // cannot create the issue.
     const fullPath = truncated
-        ? join(process.cwd(), `magic-context-issue-${timestamp}-full.md`)
+        ? options.outputPath
+            ? `${options.outputPath}.full.md`
+            : join(process.cwd(), `magic-context-issue-${timestamp}-full.md`)
         : undefined;
     if (fullPath) writeFileSync(fullPath, `${rawBodyMarkdown}\n`);
 

@@ -1,0 +1,1290 @@
+{
+  "runAt": "2026-10-01T08:50:15.121Z",
+  "callCap": 21,
+  "used": 19,
+  "results": [
+    {
+      "scenario": "openrouter-claude-haiku-4.5:age",
+      "route": "openrouter-claude-haiku-4.5",
+      "model": "anthropic/claude-haiku-4.5",
+      "hostVersion": "1.18.30",
+      "pluginCommit": "7e61ac82fd4af47c6faf9e90d78dd34763daedc7",
+      "startedAt": "2026-10-01T08:48:33.035Z",
+      "finishedAt": "2026-10-01T08:50:15.116Z",
+      "outcome": "completed",
+      "abortReason": null,
+      "calls": [
+        {
+          "index": 1,
+          "at": "2026-10-01T08:49:29.737Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 12188,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 0,
+            "cacheWrite": 12178,
+            "output": 165,
+            "reasoning": 91,
+            "cost": 0.0160575,
+            "raw": {
+              "prompt_tokens": 12188,
+              "completion_tokens": 165,
+              "total_tokens": 12353,
+              "cost": 0.0160575,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 0,
+                "cache_write_tokens": 12178,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0160575,
+                "upstream_inference_prompt_cost": 0.0152325,
+                "upstream_inference_completions_cost": 0.000825
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 91,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 46059,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 2581
+        },
+        {
+          "index": 2,
+          "at": "2026-10-01T08:49:33.869Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 12375,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11664,
+            "cacheWrite": 706,
+            "output": 72,
+            "reasoning": 0,
+            "cost": 0.0024139,
+            "raw": {
+              "prompt_tokens": 12375,
+              "completion_tokens": 72,
+              "total_tokens": 12447,
+              "cost": 0.0024139,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11664,
+                "cache_write_tokens": 706,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0024139,
+                "upstream_inference_prompt_cost": 0.0020539,
+                "upstream_inference_completions_cost": 0.00036
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 48114,
+            "reasoningMap": "R",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 1,
+            "toolResults": 1,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1292
+        },
+        {
+          "index": 3,
+          "at": "2026-10-01T08:49:35.834Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 12467,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 12370,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00171175,
+            "raw": {
+              "prompt_tokens": 12467,
+              "completion_tokens": 71,
+              "total_tokens": 12538,
+              "cost": 0.00171175,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 12370,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00171175,
+                "upstream_inference_prompt_cost": 0.00135675,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 48444,
+            "reasoningMap": "R-",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 2,
+            "toolResults": 2,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1773
+        },
+        {
+          "index": 4,
+          "at": "2026-10-01T08:49:37.983Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 12558,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 12461,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00172085,
+            "raw": {
+              "prompt_tokens": 12558,
+              "completion_tokens": 71,
+              "total_tokens": 12629,
+              "cost": 0.00172085,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 12461,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00172085,
+                "upstream_inference_prompt_cost": 0.00136585,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 48771,
+            "reasoningMap": "R--",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 3,
+            "toolResults": 3,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1291
+        },
+        {
+          "index": 5,
+          "at": "2026-10-01T08:49:39.535Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 12649,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 12552,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00172995,
+            "raw": {
+              "prompt_tokens": 12649,
+              "completion_tokens": 71,
+              "total_tokens": 12720,
+              "cost": 0.00172995,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 12552,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00172995,
+                "upstream_inference_prompt_cost": 0.00137495,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 49098,
+            "reasoningMap": "R---",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 4,
+            "toolResults": 4,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1565
+        },
+        {
+          "index": 6,
+          "at": "2026-10-01T08:49:41.358Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 12740,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 12643,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00173905,
+            "raw": {
+              "prompt_tokens": 12740,
+              "completion_tokens": 71,
+              "total_tokens": 12811,
+              "cost": 0.00173905,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 12643,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00173905,
+                "upstream_inference_prompt_cost": 0.00138405,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 49427,
+            "reasoningMap": "R----",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 5,
+            "toolResults": 5,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1230
+        },
+        {
+          "index": 7,
+          "at": "2026-10-01T08:49:42.914Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 12831,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 12734,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00174815,
+            "raw": {
+              "prompt_tokens": 12831,
+              "completion_tokens": 71,
+              "total_tokens": 12902,
+              "cost": 0.00174815,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 12734,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00174815,
+                "upstream_inference_prompt_cost": 0.00139315,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 49756,
+            "reasoningMap": "R-----",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 6,
+            "toolResults": 6,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1316
+        },
+        {
+          "index": 8,
+          "at": "2026-10-01T08:49:44.428Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 12922,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 12825,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00175725,
+            "raw": {
+              "prompt_tokens": 12922,
+              "completion_tokens": 71,
+              "total_tokens": 12993,
+              "cost": 0.00175725,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 12825,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00175725,
+                "upstream_inference_prompt_cost": 0.00140225,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 50085,
+            "reasoningMap": "R------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 7,
+            "toolResults": 7,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1307
+        },
+        {
+          "index": 9,
+          "at": "2026-10-01T08:49:46.021Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13013,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 12916,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00176635,
+            "raw": {
+              "prompt_tokens": 13013,
+              "completion_tokens": 71,
+              "total_tokens": 13084,
+              "cost": 0.00176635,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 12916,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00176635,
+                "upstream_inference_prompt_cost": 0.00141135,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 50414,
+            "reasoningMap": "R-------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 8,
+            "toolResults": 8,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1496
+        },
+        {
+          "index": 10,
+          "at": "2026-10-01T08:49:48.053Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13104,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13007,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00177545,
+            "raw": {
+              "prompt_tokens": 13104,
+              "completion_tokens": 71,
+              "total_tokens": 13175,
+              "cost": 0.00177545,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13007,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00177545,
+                "upstream_inference_prompt_cost": 0.00142045,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 50743,
+            "reasoningMap": "R--------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 9,
+            "toolResults": 9,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1593
+        },
+        {
+          "index": 11,
+          "at": "2026-10-01T08:49:49.977Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13195,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13098,
+            "cacheWrite": 91,
+            "output": 71,
+            "reasoning": 0,
+            "cost": 0.00178455,
+            "raw": {
+              "prompt_tokens": 13195,
+              "completion_tokens": 71,
+              "total_tokens": 13266,
+              "cost": 0.00178455,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13098,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00178455,
+                "upstream_inference_prompt_cost": 0.00142955,
+                "upstream_inference_completions_cost": 0.000355
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 51075,
+            "reasoningMap": "R---------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 10,
+            "toolResults": 10,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1532
+        },
+        {
+          "index": 12,
+          "at": "2026-10-01T08:49:52.003Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13286,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13189,
+            "cacheWrite": 91,
+            "output": 75,
+            "reasoning": 0,
+            "cost": 0.00181365,
+            "raw": {
+              "prompt_tokens": 13286,
+              "completion_tokens": 75,
+              "total_tokens": 13361,
+              "cost": 0.00181365,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13189,
+                "cache_write_tokens": 91,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00181365,
+                "upstream_inference_prompt_cost": 0.00143865,
+                "upstream_inference_completions_cost": 0.000375
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 51408,
+            "reasoningMap": "R----------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 11,
+            "toolResults": 11,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 2814
+        },
+        {
+          "index": 13,
+          "at": "2026-10-01T08:49:55.177Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13381,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13280,
+            "cacheWrite": 95,
+            "output": 5,
+            "reasoning": 0,
+            "cost": 0.00147775,
+            "raw": {
+              "prompt_tokens": 13381,
+              "completion_tokens": 5,
+              "total_tokens": 13386,
+              "cost": 0.00147775,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13280,
+                "cache_write_tokens": 95,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00147775,
+                "upstream_inference_prompt_cost": 0.00145275,
+                "upstream_inference_completions_cost": 0.000025
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 51757,
+            "reasoningMap": "R-----------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 12,
+            "toolResults": 12,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1636
+        },
+        {
+          "index": 14,
+          "at": "2026-10-01T08:49:57.924Z",
+          "phase": "turn-2",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13400,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11664,
+            "cacheWrite": 1726,
+            "output": 120,
+            "reasoning": 52,
+            "cost": 0.0039339,
+            "raw": {
+              "prompt_tokens": 13400,
+              "completion_tokens": 120,
+              "total_tokens": 13520,
+              "cost": 0.0039339,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11664,
+                "cache_write_tokens": 1726,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0039339,
+                "upstream_inference_prompt_cost": 0.0033339,
+                "upstream_inference_completions_cost": 0.0006
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 52,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 51851,
+            "reasoningMap": "R------------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 12,
+            "toolResults": 12,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1863
+        },
+        {
+          "index": 15,
+          "at": "2026-10-01T08:50:00.270Z",
+          "phase": "turn-2",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13540,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13390,
+            "cacheWrite": 144,
+            "output": 9,
+            "reasoning": 0,
+            "cost": 0.00157,
+            "raw": {
+              "prompt_tokens": 13540,
+              "completion_tokens": 9,
+              "total_tokens": 13549,
+              "cost": 0.00157,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13390,
+                "cache_write_tokens": 144,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00157,
+                "upstream_inference_prompt_cost": 0.001525,
+                "upstream_inference_completions_cost": 0.000045
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 53367,
+            "reasoningMap": "R------------R",
+            "reasoningItems": 2,
+            "emptyReasoning": 0,
+            "toolCalls": 13,
+            "toolResults": 13,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1488
+        },
+        {
+          "index": 16,
+          "at": "2026-10-01T08:50:02.162Z",
+          "phase": "turn-3",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13523,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13390,
+            "cacheWrite": 123,
+            "output": 102,
+            "reasoning": 34,
+            "cost": 0.00201275,
+            "raw": {
+              "prompt_tokens": 13523,
+              "completion_tokens": 102,
+              "total_tokens": 13625,
+              "cost": 0.00201275,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13390,
+                "cache_write_tokens": 123,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00201275,
+                "upstream_inference_prompt_cost": 0.00150275,
+                "upstream_inference_completions_cost": 0.00051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 34,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 53551,
+            "reasoningMap": "R------------R-",
+            "reasoningItems": 2,
+            "emptyReasoning": 0,
+            "toolCalls": 13,
+            "toolResults": 13,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1607
+        },
+        {
+          "index": 17,
+          "at": "2026-10-01T08:50:03.938Z",
+          "phase": "turn-3",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13645,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13513,
+            "cacheWrite": 126,
+            "output": 9,
+            "reasoning": 0,
+            "cost": 0.0015598,
+            "raw": {
+              "prompt_tokens": 13645,
+              "completion_tokens": 9,
+              "total_tokens": 13654,
+              "cost": 0.0015598,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13513,
+                "cache_write_tokens": 126,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0015598,
+                "upstream_inference_prompt_cost": 0.0015148,
+                "upstream_inference_completions_cost": 0.000045
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 54803,
+            "reasoningMap": "R------------R-R",
+            "reasoningItems": 3,
+            "emptyReasoning": 0,
+            "toolCalls": 14,
+            "toolResults": 14,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1204
+        },
+        {
+          "index": 18,
+          "at": "2026-10-01T08:50:05.743Z",
+          "phase": "turn-4",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13646,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13513,
+            "cacheWrite": 123,
+            "output": 136,
+            "reasoning": 68,
+            "cost": 0.00219505,
+            "raw": {
+              "prompt_tokens": 13646,
+              "completion_tokens": 136,
+              "total_tokens": 13782,
+              "cost": 0.00219505,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13513,
+                "cache_write_tokens": 123,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00219505,
+                "upstream_inference_prompt_cost": 0.00151505,
+                "upstream_inference_completions_cost": 0.00068
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 68,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 54987,
+            "reasoningMap": "R------------R-R-",
+            "reasoningItems": 3,
+            "emptyReasoning": 0,
+            "toolCalls": 14,
+            "toolResults": 14,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1935
+        },
+        {
+          "index": 19,
+          "at": "2026-10-01T08:50:08.074Z",
+          "phase": "turn-4",
+          "path": "/api/v1/chat/completions",
+          "model": "anthropic/claude-haiku-4.5",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 13802,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 13636,
+            "cacheWrite": 160,
+            "output": 9,
+            "reasoning": 0,
+            "cost": 0.0016146,
+            "raw": {
+              "prompt_tokens": 13802,
+              "completion_tokens": 9,
+              "total_tokens": 13811,
+              "cost": 0.0016146,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 13636,
+                "cache_write_tokens": 160,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0016146,
+                "upstream_inference_prompt_cost": 0.0015696,
+                "upstream_inference_completions_cost": 0.000045
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 56585,
+            "reasoningMap": "R------------R-R-R",
+            "reasoningItems": 4,
+            "emptyReasoning": 0,
+            "toolCalls": 15,
+            "toolResults": 15,
+            "flags": {
+              "reasoning": {
+                "max_tokens": 1024
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1074
+        }
+      ],
+      "removalLog": [
+        "[2026-10-01T08:49:22.083Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.7ms targets=1 fetched=0",
+        "[2026-10-01T08:49:22.220Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL APPLY — reason=m0_hard_fold (drain folded into executed m[0] bust, scheduler=defer), pendingOps=0, context=16.5%",
+        "[2026-10-01T08:49:22.221Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=applyPendingOperations elapsed=0.7ms",
+        "[2026-10-01T08:49:22.221Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=applyHeuristicCleanup elapsed=0.6ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0",
+        "[2026-10-01T08:49:33.100Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=3 fetched=0",
+        "[2026-10-01T08:49:33.102Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.4%",
+        "[2026-10-01T08:49:35.770Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=5 fetched=0",
+        "[2026-10-01T08:49:35.771Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.5%",
+        "[2026-10-01T08:49:37.699Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=7 fetched=0",
+        "[2026-10-01T08:49:37.700Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.5%",
+        "[2026-10-01T08:49:39.453Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=9 fetched=0",
+        "[2026-10-01T08:49:39.453Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.5%",
+        "[2026-10-01T08:49:41.231Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=11 fetched=0",
+        "[2026-10-01T08:49:41.232Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.6%",
+        "[2026-10-01T08:49:42.651Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=13 fetched=0",
+        "[2026-10-01T08:49:42.652Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.6%",
+        "[2026-10-01T08:49:44.283Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=15 fetched=0",
+        "[2026-10-01T08:49:44.284Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.7%",
+        "[2026-10-01T08:49:45.779Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=17 fetched=0",
+        "[2026-10-01T08:49:45.780Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.7%",
+        "[2026-10-01T08:49:47.607Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.8ms targets=19 fetched=0",
+        "[2026-10-01T08:49:47.611Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.8%",
+        "[2026-10-01T08:49:49.680Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=21 fetched=0",
+        "[2026-10-01T08:49:49.814Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.8%",
+        "[2026-10-01T08:49:51.617Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=23 fetched=0",
+        "[2026-10-01T08:49:51.618Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.9%",
+        "[2026-10-01T08:49:54.926Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=25 fetched=0",
+        "[2026-10-01T08:49:54.927Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.9%",
+        "[2026-10-01T08:49:57.305Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] command ctx-flush handled via command.execute.before",
+        "[2026-10-01T08:49:57.452Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=28 fetched=0",
+        "[2026-10-01T08:49:57.590Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL APPLY — reason=explicit_flush, pendingOps=0, context=7.0%",
+        "[2026-10-01T08:49:57.590Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=applyPendingOperations elapsed=0.3ms",
+        "[2026-10-01T08:49:57.590Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=applyHeuristicCleanup elapsed=0.3ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0",
+        "[2026-10-01T08:49:57.591Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] reasoning removal: froze 1 assistant(s), total=1",
+        "[2026-10-01T08:50:00.074Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=30 fetched=0",
+        "[2026-10-01T08:50:00.075Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=7.0%",
+        "[2026-10-01T08:50:01.825Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=32 fetched=0",
+        "[2026-10-01T08:50:01.827Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=7.1%",
+        "[2026-10-01T08:50:03.889Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=34 fetched=0",
+        "[2026-10-01T08:50:03.890Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=7.1%",
+        "[2026-10-01T08:50:05.313Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=36 fetched=0",
+        "[2026-10-01T08:50:05.314Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=7.1%",
+        "[2026-10-01T08:50:07.811Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=38 fetched=0",
+        "[2026-10-01T08:50:07.812Z] [magic-context][ses_f0958aa43ffeSRnNK2H8dQepqg] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=7.1%"
+      ],
+      "isolation": {
+        "dbFiles": [
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db",
+          "/private<root>/data/cortexkit/magic-context/context.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db"
+        ],
+        "rootRemoved": true
+      },
+      "summary": {
+        "loopCalls": 19,
+        "rejectedCalls": 0,
+        "firstRemovalCall": null,
+        "acceptedAfterRemoval": null,
+        "callsAfterRemoval": 0,
+        "before": null,
+        "after": null
+      }
+    }
+  ]
+}

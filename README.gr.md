@@ -235,7 +235,6 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 | `/ctx-status` | Προβολή debug: tags, pending drops, cache TTL, nudge state, πρόοδος historian, κάλυψη διαμερισμάτων, budget ιστορικού |
 | `/ctx-flush` | Αναγκαστική άμεση εκτέλεση όλων των queued operations, παρακάμπτοντας cache TTL |
 | `/ctx-recomp` | Αναδόμηση διαμερισμάτων από raw history (δέχεται εύρος `start-end`). Χρήση όταν η αποθηκευμένη κατάσταση φαίνεται λάθος |
-| `/ctx-session-upgrade` | Αναβάθμιση της συνεδρίας στο πιο πρόσφατο history format: rebuild compartments και migrate project memories |
 | `/ctx-dream` | Εκτέλεση dreamer maintenance κατά απαίτηση: memory, docs, smart notes και user-profile review |
 
 ---

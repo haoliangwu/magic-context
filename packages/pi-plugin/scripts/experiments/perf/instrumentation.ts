@@ -78,26 +78,42 @@ export function createDatabaseTimer<T extends object>(
 	database: T;
 	snapshot(): DatabaseTiming;
 	reset(): void;
+	queries(): { sql: string; elapsedMs: number; operations: number }[];
 } {
+	const queries = new Map<
+		string,
+		{ sql: string; elapsedMs: number; operations: number }
+	>();
 	let elapsedMs = 0;
 	let operations = 0;
 	let reads = 0;
 	let writes = 0;
 	const statementCache = new WeakMap<object, object>();
 
-	const time = <R>(kind: "read" | "write", operation: () => R): R => {
+	const time = <R>(
+		kind: "read" | "write",
+		operation: () => R,
+		sql?: string,
+	): R => {
 		const start = performance.now();
 		try {
 			return operation();
 		} finally {
-			elapsedMs += performance.now() - start;
+			const elapsed = performance.now() - start;
+			elapsedMs += elapsed;
+			if (sql) {
+				const sample = queries.get(sql) ?? { sql, elapsedMs: 0, operations: 0 };
+				sample.elapsedMs += elapsed;
+				sample.operations++;
+				queries.set(sql, sample);
+			}
 			operations += 1;
 			if (kind === "read") reads += 1;
 			else writes += 1;
 		}
 	};
 
-	const wrapStatement = (statement: object): object => {
+	const wrapStatement = (statement: object, sql: string): object => {
 		const cached = statementCache.get(statement);
 		if (cached) return cached;
 		const wrapped = new Proxy(statement, {
@@ -106,11 +122,11 @@ export function createDatabaseTimer<T extends object>(
 				if (typeof value !== "function") return value;
 				if (property === "get" || property === "all" || property === "values") {
 					return (...args: unknown[]) =>
-						time("read", () => Reflect.apply(value, target, args));
+						time("read", () => Reflect.apply(value, target, args), sql);
 				}
 				if (property === "run") {
 					return (...args: unknown[]) =>
-						time("write", () => Reflect.apply(value, target, args));
+						time("write", () => Reflect.apply(value, target, args), sql);
 				}
 				return value.bind(target);
 			},
@@ -125,7 +141,7 @@ export function createDatabaseTimer<T extends object>(
 			if (typeof value !== "function") return value;
 			if (property === "prepare" || property === "query") {
 				return (...args: unknown[]) =>
-					wrapStatement(Reflect.apply(value, target, args));
+					wrapStatement(Reflect.apply(value, target, args), String(args[0]));
 			}
 			if (property === "exec") {
 				return (...args: unknown[]) =>
@@ -138,7 +154,10 @@ export function createDatabaseTimer<T extends object>(
 	return {
 		database: proxy,
 		snapshot: () => ({ elapsedMs, operations, reads, writes }),
+		queries: () =>
+			[...queries.values()].sort((a, b) => b.elapsedMs - a.elapsedMs),
 		reset() {
+			queries.clear();
 			elapsedMs = 0;
 			operations = 0;
 			reads = 0;

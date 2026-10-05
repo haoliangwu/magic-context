@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { findOnPath, isExecutableFile } from "./find-on-path";
 
 /** Where a detectable OpenCode installation was found. */
-export type OpenCodeInstallSource = "PATH" | "home-bin" | "desktop" | "app";
+export type OpenCodeInstallSource = "PATH" | "home-bin" | "openchamber" | "desktop" | "app";
 
 /** A single OpenCode installation found by the filesystem detection ladder. */
 export interface OpenCodeInstallation {
@@ -114,6 +114,20 @@ function extraCliCandidates(d: DetectDeps): string[] {
     ];
 }
 
+/**
+ * The OpenCode CLI bundled inside the OpenChamber app (macOS). OpenChamber runs
+ * this binary as its OpenCode server, so it is a real, runnable install even
+ * when no `opencode` is on PATH.
+ */
+function openChamberCliCandidates(d: DetectDeps): string[] {
+    if (d.platform !== "darwin") return [];
+    const bundled = ["Contents", "Resources", "opencode-cli", "opencode"];
+    return [
+        join("/Applications", "OpenChamber.app", ...bundled),
+        join(d.home, "Applications", "OpenChamber.app", ...bundled),
+    ];
+}
+
 function canonicalPath(d: DetectDeps, path: string): string {
     try {
         return d.realpath ? d.realpath(path) : realpathSync(path);
@@ -192,8 +206,8 @@ export function openCodeDesktopSettingsMarkers(deps?: Partial<DetectDeps>): stri
  *
  * This intentionally keeps the existing probes and their priority: the
  * resolved PATH binary is the active install, followed by the stock home-bin
- * binary, other known CLI locations, Desktop userData markers, and GUI app
- * paths. Pure filesystem checks (no exec) keep this safe in restricted shells.
+ * binary, other known CLI locations, the CLI bundled in OpenChamber, Desktop
+ * userData markers, and GUI app paths. Pure filesystem checks (no exec) keep this safe in restricted shells.
  * Pass `deps` to test against a virtual filesystem.
  */
 export function detectOpenCodeInstallations(deps?: Partial<DetectDeps>): OpenCodeInstallation[] {
@@ -216,6 +230,12 @@ export function detectOpenCodeInstallations(deps?: Partial<DetectDeps>): OpenCod
     for (const candidate of extraCliCandidates(d)) {
         if (d.isExecutable(candidate)) {
             addCandidate(installations, seenRealpaths, d, candidate, "PATH", "cli");
+        }
+    }
+
+    for (const candidate of openChamberCliCandidates(d)) {
+        if (d.isExecutable(candidate)) {
+            addCandidate(installations, seenRealpaths, d, candidate, "openchamber", "cli");
         }
     }
 

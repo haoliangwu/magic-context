@@ -69,7 +69,11 @@ describe("Pi deferred compaction marker manager", () => {
 				"ses",
 				pending(),
 			);
-			expect(outcome.kind).toBe("applied");
+			expect(outcome).toEqual({
+				kind: "applied",
+				firstKeptEntryId: "entry-3",
+				compactionId: "compact-1",
+			});
 			expect(appendCompaction).toHaveBeenCalledWith(
 				"summary",
 				"entry-3",
@@ -102,7 +106,13 @@ describe("Pi deferred compaction marker manager", () => {
 					{
 						db,
 						readBranchEntries: () =>
-							branch([{ type: "compaction", firstKeptEntryId: "entry-3" }]),
+							branch([
+								{
+									type: "compaction",
+									id: "compact-0",
+									firstKeptEntryId: "entry-3",
+								},
+							]),
 						appendCompaction,
 					},
 					"ses",
@@ -282,7 +292,11 @@ describe("Pi deferred compaction marker manager", () => {
 					readBranchEntries: () =>
 						branch([
 							{ type: "message", id: "entry-4" },
-							{ type: "compaction", firstKeptEntryId: "entry-4" },
+							{
+								type: "compaction",
+								id: "compact-0",
+								firstKeptEntryId: "entry-4",
+							},
 						]),
 					appendCompaction,
 				},

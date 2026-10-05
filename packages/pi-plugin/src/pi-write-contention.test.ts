@@ -1,6 +1,6 @@
 import { expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -17,6 +17,7 @@ import { createTagger } from "@magic-context/core/features/magic-context/tagger"
 import { applyPendingOperations } from "@magic-context/core/hooks/magic-context/apply-operations";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { tagTranscript } from "@magic-context/core/shared/tag-transcript";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { authorizePiToolRemoval } from "./native-replay-state-pi";
 import {
 	assistantToolCall,
@@ -26,7 +27,7 @@ import {
 import { createPiTranscript } from "./transcript-pi";
 
 it("Pi write admission preserves the last served array under contention and retries reclaim", () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-write-admission-"));
+	const dir = createTestTempDirFromPath(join(tmpdir(), "pi-write-admission-"));
 	const path = join(dir, "context.db");
 	const db = createTestDb(path);
 	const blocker = new Database(path);
@@ -114,7 +115,9 @@ it("Pi write admission preserves the last served array under contention and retr
 });
 
 it("Pi content marker contention declines only the new decision and retries after unlock", () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-marker-contention-"));
+	const dir = createTestTempDirFromPath(
+		join(tmpdir(), "pi-marker-contention-"),
+	);
 	const path = join(dir, "context.db");
 	const db = createTestDb(path);
 	const blocker = new Database(path);
@@ -141,8 +144,8 @@ it("Pi content marker contention declines only the new decision and retries afte
 	}
 });
 
-it("Node Pi bootstrap retains its 5s timeout and waits out a short pending-op writer", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-node-admission-"));
+it("Node Pi bootstrap retains its timeout and async admission waits out a short pending-op writer", async () => {
+	const dir = createTestTempDirFromPath(join(tmpdir(), "pi-node-admission-"));
 	const path = join(dir, "context.db");
 	const db = createTestDb(path);
 	const blocker = new Database(path);
@@ -164,11 +167,13 @@ it("Node Pi bootstrap retains its 5s timeout and waits out a short pending-op wr
 			`
 import { openDatabase } from ${JSON.stringify(storage)};
 import { applyPendingOperations } from ${JSON.stringify(operations)};
+import { withAsyncPrivilegedWriter } from ${JSON.stringify(new URL("../../plugin/src/shared/sqlite.ts", import.meta.url).pathname)};
 const db = openDatabase(${JSON.stringify(path)});
 process.stdout.write('READY ' + db.prepare('PRAGMA busy_timeout').get().timeout + '\\n');
 await new Promise(resolve => process.stdin.once('data', resolve));
 process.stdout.write('ADMITTING\\n');
 const start = performance.now();
+await withAsyncPrivilegedWriter(db, () => undefined);
 const changed = applyPendingOperations('node-wait', db, new Map([[1, { setContent: () => true }]]), new Set());
 process.stdout.write(JSON.stringify({ changed, elapsed: performance.now() - start }) + '\\n');
 db.close();
@@ -179,6 +184,8 @@ process.stdin.destroy();
 			entrypoints: [entry],
 			outdir: dir,
 			target: "node",
+			format: "esm",
+			splitting: true,
 			external: ["node:sqlite", "bun:sqlite"],
 		});
 		expect(built.success).toBe(true);
@@ -186,11 +193,15 @@ process.stdin.destroy();
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
+			windowsHide: true,
 		});
 		const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
 		const decoder = new TextDecoder();
 		const ready = decoder.decode((await reader.read()).value);
-		expect(ready).toContain("READY 5000");
+		expect(
+			ready,
+			ready ? undefined : await new Response(child.stderr).text(),
+		).toContain("READY 5000");
 		blocker.exec("BEGIN IMMEDIATE");
 		(child.stdin as { write(data: string): unknown }).write("go\n");
 		expect(decoder.decode((await reader.read()).value)).toContain("ADMITTING");

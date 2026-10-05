@@ -111,4 +111,47 @@ describe("OpenCode tag id fallback adoption", () => {
         ]);
         expect(restarted.assignTag(sessionId, "m-three:p0", "message", 3, db)).toBe(3);
     });
+
+    it("never hands a tag allocated earlier in the same pass to a later part through the ordinal fallback", () => {
+        const db = openTestDb();
+        const sessionId = "ses-fallback";
+        const tagger = createTagger();
+
+        // Pass 1: two text parts at indexes 1 and 2 get tags 1 and 2.
+        tagger.initFromDb(sessionId, db);
+        const pass1 = [
+            message("m-shift", [
+                { type: "metadata" },
+                { type: "text", text: "alpha" },
+                { type: "text", text: "beta" },
+            ]),
+        ];
+        tagMessages(sessionId, pass1, tagger, db);
+        expect([textAt(pass1, 0, 1), textAt(pass1, 0, 2)]).toEqual(["§1§ alpha", "§2§ beta"]);
+
+        // Pass 2: the text parts move to indexes 2, 3 and 4. Index 3 has no tag,
+        // so the walk allocates a new one there; that allocation changes the
+        // assignment count and rebuilds the fallback view, which then lists the
+        // just-allocated tag at the ordinal index 4 looks up.
+        tagger.initFromDb(sessionId, db);
+        const pass2 = [
+            message("m-shift", [
+                { type: "metadata" },
+                { type: "metadata" },
+                { type: "text", text: "alpha" },
+                { type: "text", text: "beta" },
+                { type: "text", text: "gamma" },
+            ]),
+        ];
+        tagMessages(sessionId, pass2, tagger, db);
+
+        const served = [2, 3, 4].map((index) => /^§(\d+)§/.exec(textAt(pass2, 0, index))?.[1]);
+        expect(served.every((tag) => tag !== undefined)).toBe(true);
+        expect(new Set(served).size).toBe(served.length);
+        const owners = new Map<number, string>();
+        for (const [contentId, tagNumber] of tagger.getAssignments(sessionId)) {
+            expect(owners.get(tagNumber)).toBeUndefined();
+            owners.set(tagNumber, contentId);
+        }
+    });
 });

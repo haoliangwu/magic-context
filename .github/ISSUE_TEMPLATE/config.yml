@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Design proposal
+    url: https://github.com/cortexkit/magic-context/issues/new?template=feature_request.yml
+    about: Agree on a feature or design change before implementation; a maintainer's design-approved label unblocks the PR.
   - name: Documentation
     url: https://github.com/cortexkit/magic-context#readme
     about: Check the README for configuration, setup, and feature docs before filing an issue.

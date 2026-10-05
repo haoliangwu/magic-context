@@ -1,0 +1,319 @@
+import { Database } from "bun:sqlite";
+import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { OpenCode } from "@opencode/client";
+import {
+	closeDatabase,
+    LATEST_SUPPORTED_VERSION,
+	openDatabase,
+} from "../../../plugin/src/features/magic-context/storage-db";
+import {
+	CLI,
+	isolation,
+	spawnOpencode2,
+	waitForPluginActive,
+} from "../../src/opencode2-runner/spawn";
+
+async function checkStorageBoot(blocked: boolean) {
+	const probeDelayMs = blocked ? 10_000 : 2_000;
+	const parent = join(tmpdir(), "magic-context", "boot-readiness");
+	mkdirSync(parent, { recursive: true });
+	const previousTmp = process.env.TMPDIR;
+	process.env.TMPDIR = parent;
+	const fixture = isolation();
+	if (previousTmp === undefined) delete process.env.TMPDIR;
+	else process.env.TMPDIR = previousTmp;
+	const cliVersion = execFileSync(CLI, ["--version"], {
+		env: fixture.env,
+		encoding: "utf8",
+	}).trim();
+	console.log(`OpenCode CLI: ${CLI}; version: ${cliVersion}`);
+	const storage = fixture.env.MAGIC_CONTEXT_STORAGE_DIR!;
+	mkdirSync(join(storage, "rpc", "older-host"), { recursive: true });
+	const dbPath = join(storage, "context.db");
+	if (!openDatabase(dbPath))
+		throw new Error("could not seed isolated storage");
+	closeDatabase();
+	const db = new Database(dbPath);
+	db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(LATEST_SUPPORTED_VERSION);
+	if (blocked) db.exec("BEGIN IMMEDIATE");
+	const blockerPid = process.pid;
+	if (blocked)
+		writeFileSync(
+			join(storage, "rpc", "older-host", `port-${blockerPid}.json`),
+			JSON.stringify({
+				pid: blockerPid,
+				port: 43123,
+				started_at: Date.now(),
+				kind: "OpenCode server",
+			}),
+		);
+	const source =
+		process.env.MC_BOOT_SOURCE_ROOT ??
+		resolve(import.meta.dir, "../../../plugin/src");
+	const plugin = join(fixture.root, "probe-plugin");
+	mkdirSync(plugin);
+	symlinkSync(
+		resolve(import.meta.dir, "../../../plugin/node_modules"),
+		join(plugin, "node_modules"),
+	);
+	const trace = join(fixture.root, "probes.log");
+	writeFileSync(
+		join(plugin, "package.json"),
+		JSON.stringify({
+			name: "storage-readiness-probe",
+			type: "module",
+			main: "index.js",
+		}),
+	);
+	const entry = join(plugin, "entry.ts");
+	writeFileSync(
+		entry,
+		`
+import { appendFileSync } from "node:fs";
+import { setup } from ${JSON.stringify(join(source, "v2/server.ts"))};
+import * as probes from ${JSON.stringify(join(source, "shared/rpc-utils.ts"))};
+const facts = JSON.stringify([{ ProcessId: ${blockerPid}, ParentProcessId: 1, CommandLine: "opencode serve", CreationDate: "2026-01-01T00:00:00Z" }]);
+const mark = (text) => appendFileSync(${JSON.stringify(trace)}, text + "\\n");
+probes.__setRpcIdentityTestHooks({ platform: "win32", execFileSync: (file) => file === "powershell" ? facts : '"opencode.exe","${blockerPid}"', processListExecFileSync: () => { mark("sync-start"); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000); mark("sync-end"); return facts; } });
+const asyncHook = probes["__setAsyncProcessProbeForTests"];
+if (asyncHook) asyncHook(async () => { mark("async-start"); await new Promise(resolve => setTimeout(resolve, ${probeDelayMs})); mark("async-end"); return ${blocked ? "facts" : 'JSON.stringify([{ ProcessId: process.pid, ParentProcessId: 1, CommandLine: "opencode serve", CreationDate: "2026-01-01T00:00:00Z" }])'}; });
+export default { id: "opencode-magic-context", async setup(context) { mark("setup-start " + Date.now()); let lastBeat = Date.now(); let maxGap = 0; const beat = () => { const now = Date.now(); maxGap = Math.max(maxGap, now - lastBeat); lastBeat = now; }; const heartbeat = setInterval(beat, 10); try { const dispose = await setup(context); mark("setup-end " + Date.now()); return dispose; } finally { beat(); clearInterval(heartbeat); mark("heartbeat-max " + maxGap); } } };
+`,
+	);
+	const built = await Bun.build({
+		entrypoints: [entry],
+		outdir: plugin,
+		naming: "server.js",
+		target: "bun",
+		define: { "process.env.NODE_ENV": JSON.stringify("production") },
+		external: [
+			"@opencode/plugin",
+			"onnxruntime-node",
+			"onnxruntime-web",
+			"sharp",
+		],
+	});
+	if (!built.success) throw new Error(built.logs.join("\n"));
+	const host = await spawnOpencode2({
+		existingIsolation: fixture,
+		includeMagicContext: false,
+		probePlugin: plugin,
+		prepareContextDatabase: false,
+		magicContextConfig: {
+			dreamer: { disable: true },
+			historian: { disable: true },
+			memory: { enabled: false },
+		},
+	});
+	const headers = {
+		authorization: `Basic ${btoa(`opencode:${host.password}`)}`,
+	};
+	const client = OpenCode.make({ baseUrl: host.url, headers });
+	let releaseLock: ReturnType<typeof setTimeout> | undefined;
+	try {
+		// Activation is lazy on this host; drive it while sampling HTTP from outside
+		// the host process, so a blocked host event loop cannot delay our timeout.
+		const activationStarted = performance.now();
+		let activationMs = 0;
+		const activation = client.session
+			.create({
+				title: "blocked storage boot",
+				location: { directory: host.cwd },
+				model: { providerID: "openai", id: "mock-model" },
+			})
+			.then(async (session) => {
+				await waitForPluginActive(client, host.cwd);
+				return session;
+			})
+			.then((session) => {
+				activationMs = performance.now() - activationStarted;
+				return session;
+			});
+		const setupDeadline = Date.now() + 30_000;
+		while (
+			(!existsSync(trace) ||
+				!readFileSync(trace, "utf8").includes("setup-start")) &&
+			Date.now() < setupDeadline
+		)
+			await Bun.sleep(10);
+		// The fixture's RPC discovery record still names a live older host, so the
+		// migration guard must refuse even after the SQLite writer lock releases.
+		if (blocked)
+			releaseLock = setTimeout(() => db.exec("ROLLBACK"), 10_000);
+		const secondStarted = performance.now();
+		const secondSession = client.session
+			.create(
+				{
+					title: "second session during setup",
+					location: { directory: host.cwd },
+					model: { providerID: "openai", id: "mock-model" },
+				},
+				{ signal: AbortSignal.timeout(2000) },
+			)
+			.then((session) => ({
+				id: session.id,
+				latencyMs: performance.now() - secondStarted,
+				setupPending: !readFileSync(trace, "utf8").includes(
+					"setup-end",
+				),
+			}))
+			.catch((error: unknown) => ({
+				id: null,
+				latencyMs: performance.now() - secondStarted,
+				setupPending: false,
+				error: String(error),
+			}));
+		const latencies: number[] = [];
+		const failures: string[] = [];
+		let healthWhilePending = 0;
+		for (let index = 0; index < 30; index++) {
+			const started = performance.now();
+			try {
+				const response = await fetch(`${host.url}/health`, {
+					headers,
+					signal: AbortSignal.timeout(2000),
+				});
+				if (!response.ok) failures.push(`HTTP ${response.status}`);
+				else if (!readFileSync(trace, "utf8").includes("setup-end"))
+					healthWhilePending++;
+			} catch (error) {
+				failures.push(String(error));
+			}
+			latencies.push(performance.now() - started);
+			await Bun.sleep(200);
+		}
+		const session = await activation;
+		const second = await secondSession;
+		clearTimeout(releaseLock);
+		if (db.inTransaction) db.exec("ROLLBACK");
+		const openFiles = execFileSync(
+			"lsof",
+			["-p", String(host.pid), "-Fn"],
+			{
+				encoding: "utf8",
+			},
+		);
+		const databases = openFiles
+			.split("\n")
+			.filter(
+				(line) =>
+					line.startsWith("n") && /\.db(?:-wal|-shm)?$/.test(line),
+			);
+		expect(databases.length).toBeGreaterThan(0);
+		for (const path of databases)
+			expect(path.slice(1).startsWith(fixture.root)).toBe(true);
+		const probeLog = readFileSync(trace, "utf8");
+		const evidence = {
+			root: fixture.root,
+			cliVersion,
+			pid: host.pid,
+			source,
+			blocked,
+			probeDelayMs,
+			second,
+			healthWhilePending,
+			probeLog,
+			activationMs,
+			latencies,
+			failures,
+			databases,
+		};
+		writeFileSync(
+			join(fixture.root, "readiness-evidence.json"),
+			JSON.stringify(evidence, null, 2),
+		);
+		console.log(JSON.stringify(evidence));
+		expect(probeLog).toContain("setup-end");
+		if (!process.env.MC_BOOT_SOURCE_ROOT) {
+			expect(probeLog).toContain("async-start");
+			expect(probeLog.split("\n")).not.toContain("sync-start");
+		}
+		const setupMs =
+			Number(/setup-end (\d+)/.exec(probeLog)?.[1]) -
+			Number(/setup-start (\d+)/.exec(probeLog)?.[1]);
+		console.log(`Setup duration: ${setupMs} ms`);
+		expect(Number(/heartbeat-max (\d+)/.exec(probeLog)?.[1])).toBeLessThan(
+			1000,
+		);
+		expect(failures).toEqual([]);
+		if (blocked) {
+			expect(healthWhilePending).toBeGreaterThan(0);
+			expect(second.setupPending).toBe(true);
+		}
+		expect(Math.max(...latencies)).toBeLessThan(2000);
+		const checked = new Database(dbPath, { readonly: true });
+		expect(
+			checked
+				.query("SELECT MAX(version) AS version FROM schema_migrations")
+				.get(),
+		).toEqual({ version: blocked ? LATEST_SUPPORTED_VERSION - 1 : LATEST_SUPPORTED_VERSION });
+		checked.close();
+		if (!blocked) {
+			expect(
+				probeLog.split("\n").filter((line) => line === "async-start"),
+			).toHaveLength(1);
+			host.mock.setDefault({
+				text: "healthy storage reply",
+				usage: { input_tokens: 100, output_tokens: 10 },
+			});
+			await client.session.prompt({
+				sessionID: session.id,
+				text: "Check tools after slow healthy storage open",
+			});
+			await client.session.wait(
+				{ sessionID: session.id },
+				{ signal: AbortSignal.timeout(30_000) },
+			);
+			const requests = host.mock
+				.requests()
+				.filter((request) => request.body.model === "mock-model");
+			expect(requests.length).toBeGreaterThan(0);
+			const tools = (
+				requests[0].body.tools as Array<{ name?: string }>
+			).map((tool) => tool.name);
+			console.log(
+				JSON.stringify({
+					registeredTools: tools.filter((name) =>
+						name?.startsWith("ctx_"),
+					),
+				}),
+			);
+			for (const name of [
+				"ctx_reduce",
+				"ctx_expand",
+				"ctx_note",
+				"ctx_search",
+			])
+				expect(tools).toContain(name);
+		}
+	} catch (error) {
+		writeFileSync(join(fixture.root, "host-stderr.log"), host.stderr());
+		console.error(`Host diagnostics: ${fixture.root}`);
+		throw error;
+	} finally {
+		clearTimeout(releaseLock);
+		db.close();
+		await host.stop();
+	}
+}
+
+test(
+	"OpenCode 2 serves HTTP and a second session while storage setup waits ten seconds",
+	() => checkStorageBoot(true),
+	120_000,
+);
+test(
+	"OpenCode 2 registers context tools after a two-second healthy storage open",
+	() => checkStorageBoot(false),
+	120_000,
+);

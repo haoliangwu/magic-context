@@ -34,6 +34,10 @@ import {
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import { CTX_SEARCH_DESCRIPTION } from "@magic-context/core/tools/ctx-search/constants";
+import {
+	parseSearchDateRange,
+	SearchDateRangeError,
+} from "@magic-context/core/tools/ctx-search/date-range";
 import { unwrapImitatedReducedArgs } from "@magic-context/core/tools/unwrap-imitated-reduced-args";
 import { type Static, Type } from "typebox";
 
@@ -44,12 +48,22 @@ const ParamsSchema = Type.Object(
 		query: Type.Optional(
 			Type.String({
 				description:
-					"Search query. Matches against memory content, Primers, git commit messages, and raw user/assistant message text.",
+					"A natural-language question carrying the exact terms you expect in the answer.",
 			}),
 		),
 		limit: Type.Optional(
 			Type.Number({
-				description: "Maximum results to return (default: 10)",
+				description: "Maximum results (default 10).",
+			}),
+		),
+		from: Type.Optional(
+			Type.String({
+				description: "Earliest date, YYYY-MM-DD (inclusive).",
+			}),
+		),
+		to: Type.Optional(
+			Type.String({
+				description: "Latest date, YYYY-MM-DD (inclusive; default open).",
 			}),
 		),
 		sources: Type.Optional(
@@ -63,7 +77,7 @@ const ParamsSchema = Type.Object(
 				]),
 				{
 					description:
-						'Optional. Restrict to specific sources. Examples: ["primer"] for standing project explanations, ["git_commit"] for "when did we change X", ["memory"] for naming conventions, ["message"] for "did we discuss this earlier", ["note"] for parked decisions or follow-ups, ["git_commit","message"] for regression hunts. Omit for a broad search across all enabled sources.',
+						"Restrict to these sources; omitting it or passing [] searches every source.",
 				},
 			),
 		),
@@ -119,6 +133,8 @@ export function createCtxSearchTool(
 			params = unwrapImitatedReducedArgs(params, ["query"], {
 				query: "string",
 				limit: "number",
+				from: "string",
+				to: "string",
 				sources: {
 					type: "array",
 					items: "string",
@@ -130,6 +146,17 @@ export function createCtxSearchTool(
 			if (!query) {
 				return {
 					content: [{ type: "text", text: "Error: 'query' is required." }],
+					details: undefined,
+					isError: true,
+				};
+			}
+			let dateRange: ReturnType<typeof parseSearchDateRange>;
+			try {
+				dateRange = parseSearchDateRange(params.from, params.to);
+			} catch (error) {
+				if (!(error instanceof SearchDateRangeError)) throw error;
+				return {
+					content: [{ type: "text", text: `Error: ${error.message}` }],
 					details: undefined,
 					isError: true,
 				};
@@ -153,8 +180,10 @@ export function createCtxSearchTool(
 			const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
 			const memoryEnabled =
 				snapshot?.features.memoryEnabled ?? deps.memoryEnabled;
+			// Query embedding follows the provider alone; each lane applies its
+			// own feature gate, and history search ignores `memory.enabled`.
 			const embeddingEnabled = snapshot
-				? snapshot.enabled || snapshot.gitCommitEnabled
+				? snapshot.historyEnabled
 				: deps.embeddingEnabled;
 			const gitCommitsEnabled =
 				snapshot?.gitCommitEnabled ?? deps.gitCommitsEnabled ?? false;
@@ -192,6 +221,7 @@ export function createCtxSearchTool(
 					limit: Math.max(normalizeLimit(params.limit), idShape.length),
 					visibleMemoryIds,
 					diagnostics,
+					...dateRange,
 				});
 				if (
 					idResults !== null ||
@@ -243,6 +273,7 @@ export function createCtxSearchTool(
 					// (parity with OpenCode's ctx_search). Pi auto-search leaves
 					// this off to protect its latency budget.
 					explicitSearch: true,
+					...dateRange,
 				},
 			);
 

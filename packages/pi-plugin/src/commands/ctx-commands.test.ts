@@ -1,11 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { replaceAllCompartmentState } from "@magic-context/core/features/magic-context/compartment-storage";
-import { isMemoryMigrationDone } from "@magic-context/core/features/magic-context/memory/memory-migration";
-import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
-import {
-	getMemoriesByProject,
-	insertMemory,
-} from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import {
 	getPendingPiCompactionMarkerState,
@@ -13,6 +7,10 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import { queuePendingOp } from "@magic-context/core/features/magic-context/storage-ops";
+import {
+	clearProducerModelObservations,
+	observeProducerModelsForTest,
+} from "@magic-context/core/hooks/magic-context/producer-window-test-support";
 import { Database } from "@magic-context/core/shared/sqlite";
 
 import {
@@ -26,7 +24,6 @@ import {
 import { registerCtxDreamCommand } from "./ctx-dream";
 import { registerCtxFlushCommand } from "./ctx-flush";
 import { registerCtxRecompCommand } from "./ctx-recomp";
-import { registerCtxSessionUpgradeCommand } from "./ctx-session-upgrade";
 import { registerCtxStatusCommand } from "./ctx-status";
 import { registerCtxWrapupCommand } from "./ctx-wrapup";
 
@@ -228,6 +225,21 @@ describe("Pi Magic Context commands", () => {
 		expect(customCalls[0]?.options).toMatchObject({ overlay: true });
 	});
 
+	it("reports an empty Pi model chain loudly in /ctx-status", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		registerCtxStatusCommand(pi as never, {
+			db,
+			projectIdentity: "/tmp/project",
+			modelChainWarning:
+				"Pi model chain empty (no model found): classify-memories, historian",
+		});
+		await handlers.get("ctx-status")?.("", createCtx());
+		expect(sent[0]?.data.text).toContain(
+			"WARNING: Pi model chain empty (no model found): classify-memories, historian",
+		);
+	});
+
 	it("appends a model-invisible status entry without UI", async () => {
 		const db = createDb();
 		const { pi, handlers, sent } = createMockPi();
@@ -244,7 +256,11 @@ describe("Pi Magic Context commands", () => {
 		expect(sent[0]?.data.text).not.toContain("##");
 	});
 
-	it("surfaces the active profile in /ctx-status text and dialog data", async () => {
+	// Was "surfaces the active profile in /ctx-status text and dialog data": the
+	// profile line lived in the diagnostics text, which was deleted along with
+	// the argument that reached it. The structured dialog data still carries the
+	// profile.
+	it("surfaces the active profile in /ctx-status dialog data", async () => {
 		const db = createDb();
 		const { pi, handlers, sent } = createMockPi();
 		registerCtxStatusCommand(pi as never, {
@@ -253,10 +269,22 @@ describe("Pi Magic Context commands", () => {
 			activeProfile: "work",
 		});
 
+		await handlers.get("ctx-status")?.("", createCtx());
+
+		expect(sent[0]?.data.details).toMatchObject({ activeProfile: "work" });
+	});
+
+	it("refuses an argument now that /ctx-status has one view", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		registerCtxStatusCommand(pi as never, {
+			db,
+			projectIdentity: "/tmp/project",
+		});
+
 		await handlers.get("ctx-status")?.("diagnostics", createCtx());
 
-		expect(sent[0]?.data.text).toContain("Active profile: work");
-		expect(sent[0]?.data.details).toMatchObject({ activeProfile: "work" });
+		expect(sent[0]?.data.text).toBe("Usage: /ctx-status");
 	});
 
 	it("presents /ctx-status through the live RPC command context", async () => {
@@ -355,19 +383,12 @@ describe("Pi Magic Context commands", () => {
 		registerCtxFlushCommand(pi as never, { db, compactionOff: true });
 		registerCtxRecompCommand(pi as never, common);
 		registerCtxWrapupCommand(pi as never, common);
-		registerCtxSessionUpgradeCommand(pi as never, common);
 
-		for (const name of [
-			"ctx-flush",
-			"ctx-recomp",
-			"ctx-wrapup",
-			"ctx-session-upgrade",
-		]) {
+		for (const name of ["ctx-flush", "ctx-recomp", "ctx-wrapup"]) {
 			await handlers.get(name)?.("", createCtx(sessionId));
 		}
 
 		expect(sent.map((entry) => entry.data.text)).toEqual([
-			"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).",
 			"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).",
 			"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).",
 			"Unavailable: magic-context is in compaction-off mode (compaction.enabled=false).",
@@ -415,6 +436,46 @@ describe("Pi Magic Context commands", () => {
 		expect(registrationCwds).toEqual(["/tmp/project"]);
 		expect(sent[0]?.customType).toBe("ctx-status");
 		expect(sent[0]?.data.text).toContain("/ctx-dream");
+	});
+
+	it("/ctx-dream returns to an interactive Pi while the run continues", async () => {
+		const db = createDb();
+		const { pi, handlers, sent } = createMockPi();
+		let finishRegistration: () => void = () => {};
+		const registration = new Promise<void>((resolve) => {
+			finishRegistration = resolve;
+		});
+
+		registerCtxDreamCommand(pi as never, {
+			db,
+			projectDir: "/tmp/project",
+			projectIdentity: "/tmp/project",
+			registrationOwner: {},
+			// Stands in for a dream run that takes minutes.
+			ensureRegistered: () => registration,
+		});
+
+		// In interactive Pi the command handler is the user's turn: awaiting
+		// the run would freeze the REPL until every dream task finished.
+		const handled = await Promise.race([
+			Promise.resolve(
+				handlers.get("ctx-dream")?.("", { ...createCtx(), hasUI: true }),
+			).then(() => "returned"),
+			new Promise((resolve) => setTimeout(() => resolve("blocked"), 500)),
+		]);
+
+		expect(handled).toBe("returned");
+		expect(sent).toHaveLength(1);
+		expect(sent[0]?.data.text).toContain("Starting dream run");
+
+		// The detached run still reports its outcome when it ends (here the
+		// project is not registered with the dreamer, so it reports a failure).
+		finishRegistration();
+		for (let i = 0; i < 50 && sent.length < 2; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		expect(sent).toHaveLength(2);
+		expect(sent[1]?.data.title).toBe("/ctx-dream");
 	});
 
 	it("/ctx-dream accepts split memory tasks and rejects retired task names", async () => {
@@ -636,7 +697,7 @@ describe("Pi Magic Context commands", () => {
 
 		expect(sent[0]?.data.text).toContain("Magic Recomp Upgrade");
 		expect(sent[0]?.data.text).toContain(
-			"The `--upgrade` flag is deprecated. Run `/ctx-session-upgrade` to upgrade this session.",
+			"The `--upgrade` flag is deprecated. Run `/ctx-recomp` to rebuild them in the current format.",
 		);
 		expect(sent[0]?.data.text).not.toContain("Invalid Arguments");
 	});
@@ -787,158 +848,13 @@ describe("Pi Magic Context commands", () => {
 		expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
 		expect(consumeDeferredMaterialization(sessionId)).toBe(false);
 	});
-
-	it("fences /ctx-session-upgrade side effects when an aborted runner settles late", async () => {
-		const sessionId = "ses-upgrade-late";
-		const db = createDb();
-		replaceAllCompartmentState(
-			db,
-			sessionId,
-			[
-				{
-					sequence: 1,
-					startMessage: 1,
-					endMessage: 2,
-					startMessageId: "m1",
-					endMessageId: "m2",
-					title: "legacy",
-					content: "legacy content",
-				},
-			],
-			[],
-		);
-		const { pi, handlers, sent } = createMockPi();
-		const runStarted = deferred();
-		const releaseRun = deferred();
-		let observedSignal: AbortSignal | undefined;
-		let observedDirectory: string | undefined;
-		let runnerCalls = 0;
-
-		registerCtxSessionUpgradeCommand(pi as never, {
-			db,
-			runner: {
-				run: async (args) => {
-					runnerCalls += 1;
-					observedSignal = args.signal;
-					observedDirectory = args.cwd;
-					runStarted.resolve();
-					await releaseRun.promise;
-					return {
-						ok: true as const,
-						assistantText: validCompartmentForPrompt(args.userMessage),
-						cost: 0,
-						durationMs: 1,
-					};
-				},
-			},
-			historianModel: "anthropic/claude",
-			historianChunkTokens: 20,
-			memoryEnabled: true,
-			autoPromote: false,
-		});
-
-		const ctx = createCtx(sessionId);
-		const contextProbe = probeLiveCommandContext(ctx);
-		let branchReads = 0;
-		const getBranch = ctx.sessionManager.getBranch;
-		ctx.sessionManager.getBranch = () => {
-			branchReads += 1;
-			if (branchReads > 1) throw new Error("late session access");
-			return getBranch?.() ?? [];
-		};
-		await handlers.get("ctx-session-upgrade")?.("", ctx);
-		await runStarted.promise;
-		const sentBeforeAbort = sent.length;
-
-		abortInFlightRecomps(sessionId);
-		contextProbe.endLifecycle();
-		releaseRun.resolve();
-		await awaitInFlightRecomps(sessionId);
-
-		expect(observedSignal?.aborted).toBe(true);
-		expect(observedDirectory).toBe("/tmp/project");
-		expect(contextProbe.lateAccesses()).toBe(0);
-		expect(runnerCalls).toBe(1);
-		expect(branchReads).toBe(1);
-		expect(sent).toHaveLength(sentBeforeAbort);
-		expect(getPendingPiCompactionMarkerState(db, sessionId)).toBeNull();
-		expect(consumeDeferredHistoryRefresh(sessionId)).toBe(false);
-		expect(consumeDeferredMaterialization(sessionId)).toBe(false);
-	});
-
-	it("keeps migration-only upgrade state unchanged after a late cancelled result", async () => {
-		const sessionId = "ses-upgrade-migration-late";
-		const db = createDb();
-		const { pi, handlers, sent } = createMockPi();
-		const ctx = createCtx(sessionId);
-		const projectPath = resolveProjectIdentity(ctx.cwd);
-		insertMemory(db, {
-			projectPath,
-			category: "ARCHITECTURE_DECISIONS",
-			content: "Legacy migration fixture.",
-		});
-		const before = getMemoriesByProject(db, projectPath).map((memory) => ({
-			id: memory.id,
-			category: memory.category,
-			content: memory.content,
-		}));
-		const runStarted = deferred();
-		const releaseRun = deferred();
-		let observedSignal: AbortSignal | undefined;
-		registerCtxSessionUpgradeCommand(pi as never, {
-			db,
-			runner: {
-				run: async (args) => {
-					observedSignal = args.signal;
-					runStarted.resolve();
-					await releaseRun.promise;
-					return {
-						ok: true as const,
-						assistantText: [
-							"<migrated>",
-							"<ARCHITECTURE>",
-							"* Migrated replacement.",
-							"</ARCHITECTURE>",
-							"</migrated>",
-						].join("\n"),
-						cost: 0,
-						durationMs: 1,
-					};
-				},
-			},
-			historianModel: "anthropic/claude",
-			historianChunkTokens: 100_000,
-			memoryEnabled: true,
-			autoPromote: false,
-		});
-		const contextProbe = probeLiveCommandContext(ctx);
-		let branchReads = 0;
-		const getBranch = ctx.sessionManager.getBranch;
-		ctx.sessionManager.getBranch = () => {
-			branchReads += 1;
-			if (branchReads > 1) throw new Error("late session access");
-			return getBranch?.() ?? [];
-		};
-
-		await handlers.get("ctx-session-upgrade")?.("", ctx);
-		await runStarted.promise;
-		const sentBeforeAbort = sent.length;
-		abortInFlightRecomps(sessionId);
-		contextProbe.endLifecycle();
-		releaseRun.resolve();
-		await awaitInFlightRecomps(sessionId);
-
-		expect(observedSignal?.aborted).toBe(true);
-		expect(branchReads).toBe(1);
-		expect(contextProbe.lateAccesses()).toBe(0);
-		expect(sent).toHaveLength(sentBeforeAbort);
-		expect(
-			getMemoriesByProject(db, projectPath).map((memory) => ({
-				id: memory.id,
-				category: memory.category,
-				content: memory.content,
-			})),
-		).toEqual(before);
-		expect(isMemoryMigrationDone(db, projectPath)).toBe(false);
-	});
 });
+
+beforeEach(async () => {
+	await observeProducerModelsForTest([
+		"test/model",
+		"anthropic/claude",
+		"anthropic/claude-from-project-b",
+	]);
+});
+afterEach(clearProducerModelObservations);

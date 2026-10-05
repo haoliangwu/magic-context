@@ -139,3 +139,45 @@ describe("createChildSessionWithFence", () => {
         ).toEqual({ last_transform_error: STALE_PLUGIN_RESTART_NOTICE });
     });
 });
+
+it("defers parentless dreamer work without creating a visible root", async () => {
+    const create = mock(async () => ({ id: "child" }));
+    const result = await createChildSessionWithFence({
+        client: { session: { create } },
+        db: null,
+        title: "magic-context-dream-map-memories",
+        directory: "/project",
+    });
+    expect(result).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+});
+
+it("creates dreamer sessions with the ordinary parent relationship", async () => {
+    const create = mock(async () => ({ id: "child" }));
+    await createChildSessionWithFence({
+        client: { session: { create } },
+        db: null,
+        parentSessionId: "ses_parent",
+        title: "magic-context-dream-verify",
+        directory: "/project",
+    });
+    expect(create).toHaveBeenCalledWith({
+        body: { parentID: "ses_parent", title: "magic-context-dream-verify" },
+        query: { directory: "/project" },
+    });
+});
+
+it("creates parentless process-local dreamer sessions without exposing a host root", async () => {
+    const create = mock(async () => ({ id: "hidden-child" }));
+    const result = await createChildSessionWithFence({
+        client: { backgroundSessionsAreHidden: true, session: { create } },
+        db: null,
+        title: "magic-context-dream-curate",
+        directory: "/project",
+    });
+    expect(result).toEqual({ id: "hidden-child" });
+    expect(create).toHaveBeenCalledWith({
+        body: { title: "magic-context-dream-curate" },
+        query: { directory: "/project" },
+    });
+});

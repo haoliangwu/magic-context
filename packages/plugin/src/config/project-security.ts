@@ -23,7 +23,17 @@ const HARNESS_KEYS = PER_HARNESS_MODEL_KEYS;
 /** Every historian model-resolution field, including per-harness qualifiers.
  *  Variant and thinking_level merge onto the user's historian model at resolve
  *  time, so leaving them would let a cloned repo force extra spend. */
-const HISTORIAN_USER_ONLY_FIELDS = PER_HARNESS_MIGRATION_INVENTORY.historian.migrated_execution;
+const HISTORIAN_USER_ONLY_FIELDS = [
+    ...PER_HARNESS_MIGRATION_INVENTORY.historian.migrated_execution,
+    // `runner` chooses which process and which provider account runs the hidden
+    // historian completion. A cloned repo redirecting it would move that spend and
+    // that prompt text somewhere the user never agreed to.
+    "runner",
+    // `host_runner` turns this machine's pull loop on and off. A cloned repo
+    // turning it ON would start spending the user's provider account on folds for
+    // every project this process serves, not just its own.
+    "host_runner",
+] as const;
 const PROMPT_SURFACE_USER_ONLY_FIELDS = ["guidance_override_path", "tool_descriptions"] as const;
 
 /**
@@ -193,8 +203,11 @@ function stripNestedMuralModels(
     }
 }
 
+// Must match the schema's execute_threshold_percentage range (20-90). A narrower
+// range here let a valid project value of 81-90 skip the raise-only clamp and
+// reach the merged config as-is, lowering a higher user threshold.
 function isValidPercentageThreshold(value: unknown): value is number {
-    return typeof value === "number" && Number.isFinite(value) && value >= 20 && value <= 80;
+    return typeof value === "number" && Number.isFinite(value) && value >= 20 && value <= 90;
 }
 
 function isValidTokenThreshold(value: unknown): value is number {
@@ -348,10 +361,13 @@ function makeProjectThresholdWarning(field: string, reason: string): string {
  *    can opt its own runtime into the experimental Rust pipeline. The resolver
  *    requires trusted user-level `subc` configuration before Rust can activate.
  *  - historian model-resolution fields (model, fallback_models, variant,
- *    thinking_level), including both per-harness blocks — historian model
- *    spend is user-level only. Qualifiers merge onto the user's historian
+ *    thinking_level) and `runner`, including both per-harness blocks — historian
+ *    model spend is user-level only. Qualifiers merge onto the user's historian
  *    model at resolve time, so a cloned repo cannot force extra thinking or
- *    variant cost.
+ *    variant cost, and cannot move the completion to a different process or
+ *    provider account. `host_runner` is stripped for the same reason in the other
+ *    direction: a repo must not switch this machine's pull loop on and start
+ *    spending the user's provider account on folds.
  *  - `mural.model` at the top-level block, the legacy experimental spelling,
  *    and any nested `mural.model` under hidden agents — a cloned repo cannot
  *    choose where project memory is sent.
@@ -577,6 +593,17 @@ export function stripUnsafeProjectConfigFields(projectRaw: Record<string, unknow
                     "(security: historian model selection is user-level only; a repository cannot force extra compaction cost).",
             );
         }
+    }
+
+    // `dreamer.runner` chooses which process and which provider account runs the
+    // module-routed dreamer completions, for the same reason `historian.runner`
+    // is user-level only.
+    const dreamer = projectRaw.dreamer;
+    if (isPlainObject(dreamer) && "runner" in dreamer) {
+        delete dreamer.runner;
+        warnings.push(
+            "Ignoring dreamer.runner from project config (security: which process and provider account run dreamer completions is a user-level setting).",
+        );
     }
 
     const mural = projectRaw.mural;
@@ -871,4 +898,218 @@ export function dropInheritedEmbeddingKeyOnRedirect(
             "embedding.endpoint without supplying its own key (security: prevents key " +
             "exfiltration to a repository-chosen endpoint).",
     ];
+}
+
+/** Path of a schema issue in the merged raw config, e.g. ["compaction", "enabled"]. */
+export type ConfigIssuePath = readonly PropertyKey[];
+
+/**
+ * Shortest prefix of `issuePath` whose value the PROJECT tier supplied, or
+ * undefined when the invalid value did not come from the project. The raw merge
+ * recurses only into plain objects on both sides, so the project owns the value
+ * at the first prefix where its node is not a plain object (a scalar, array or
+ * null replaces the user's value whole), or at the full issue path.
+ */
+function projectContributionPath(
+    projectRaw: Record<string, unknown>,
+    issuePath: ConfigIssuePath,
+): ConfigIssuePath | undefined {
+    let node: unknown = projectRaw;
+    for (let index = 0; index < issuePath.length; index++) {
+        const segment = String(issuePath[index]);
+        if (!isPlainObject(node) || !Object.hasOwn(node, segment)) return undefined;
+        node = node[segment];
+        if (index === issuePath.length - 1 || !isPlainObject(node)) {
+            return issuePath.slice(0, index + 1);
+        }
+    }
+    return undefined;
+}
+
+/**
+ * The trusted value the project displaced along `contribution`, and where it
+ * sits. Walking down, the first trusted node that is not a plain object was
+ * replaced whole by the project's object (e.g. a user scalar threshold of 80
+ * under a project `{ default: 5 }`), so it is restored at that shorter path.
+ * Undefined when the trusted tier has no value there to protect.
+ */
+function displacedTrustedValue(
+    trustedRaw: Record<string, unknown>,
+    contribution: ConfigIssuePath,
+): { path: ConfigIssuePath; value: unknown } | undefined {
+    let node: unknown = trustedRaw;
+    for (let index = 0; index < contribution.length; index++) {
+        const segment = String(contribution[index]);
+        if (!isPlainObject(node) || !Object.hasOwn(node, segment)) return undefined;
+        node = node[segment];
+        if (index === contribution.length - 1 || !isPlainObject(node)) {
+            return { path: contribution.slice(0, index + 1), value: node };
+        }
+    }
+    return undefined;
+}
+
+function defineOwnValue(target: Record<string, unknown>, key: string, value: unknown): void {
+    Object.defineProperty(target, key, {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+    });
+}
+
+/** Put `value` at `path` in `root`, copying each object on the way so objects
+ *  shared with the trusted or project raw configs are never mutated. */
+function writeOwnPath(root: Record<string, unknown>, path: ConfigIssuePath, value: unknown): void {
+    let node = root;
+    for (let index = 0; index < path.length - 1; index++) {
+        const segment = String(path[index]);
+        const child = node[segment];
+        if (!isPlainObject(child)) return;
+        const copy = { ...child };
+        defineOwnValue(node, segment, copy);
+        node = copy;
+    }
+    defineOwnValue(node, String(path[path.length - 1]), value);
+}
+
+/** Most rounds a single load can take; each round restores at least one path. */
+const MAX_PROJECT_RESTORE_ROUNDS = 16;
+
+/**
+ * After the project config is merged over the trusted (user + profile) config,
+ * put back the trusted value wherever an INVALID project value displaced it.
+ *
+ * Without this, a repository could reset user settings by writing a wrong type:
+ * `compaction: false` replaces the user's `compaction` block in the raw merge,
+ * the schema rejects it, and schema recovery drops the key and uses the schema
+ * default, so compaction turns back on, the historian loses its model, or the
+ * embedding provider flips and forces a full re-embed. A repository may only
+ * tighten what the user configured, so an invalid project value is ignored and
+ * the user's value stays. When the user has no value at that path, the project
+ * value is left for normal schema recovery, which already lands on the default
+ * the user would get anyway.
+ *
+ * `collectIssuePaths` runs the caller's own pre-schema migrations and schema
+ * check and returns every issue path (empty when the config is valid), so this
+ * stays aligned with the loader's real parse on every harness. `mergedRaw` is
+ * mutated in place.
+ */
+export function restoreTrustedValuesOverInvalidProjectValues(args: {
+    mergedRaw: Record<string, unknown>;
+    trustedRaw: Record<string, unknown>;
+    projectRaw: Record<string, unknown>;
+    collectIssuePaths: (raw: Record<string, unknown>) => readonly ConfigIssuePath[];
+}): { warnings: string[]; restoredTopLevelKeys: string[] } {
+    const warnings: string[] = [];
+    const restoredTopLevelKeys = new Set<string>();
+    const restored = new Set<string>();
+
+    for (let round = 0; round < MAX_PROJECT_RESTORE_ROUNDS; round++) {
+        let changed = false;
+        for (const issuePath of args.collectIssuePaths(args.mergedRaw)) {
+            const contribution = projectContributionPath(args.projectRaw, issuePath);
+            if (contribution === undefined || contribution.length === 0) continue;
+            const trusted = displacedTrustedValue(args.trustedRaw, contribution);
+            if (trusted === undefined) continue;
+            const key = trusted.path.map(String).join(".");
+            // Already restored: any remaining issue there is in the user's own
+            // value, which normal schema recovery handles.
+            if (restored.has(key)) continue;
+            writeOwnPath(args.mergedRaw, trusted.path, trusted.value);
+            restored.add(key);
+            restoredTopLevelKeys.add(String(trusted.path[0]));
+            changed = true;
+            warnings.push(
+                `Ignoring invalid ${key} from project config and keeping the user-level value (security: a repository cannot reset user settings by supplying an invalid value).`,
+            );
+        }
+        if (!changed) break;
+    }
+
+    return { warnings, restoredTopLevelKeys: [...restoredTopLevelKeys] };
+}
+
+const PROJECT_COMMAND_STRING_FIELDS = ["description", "agent", "model"] as const;
+
+/** A well-formed command entry with only the fields the command config uses. */
+function wellFormedCommand(value: unknown): Record<string, unknown> | undefined {
+    if (!isPlainObject(value)) return undefined;
+    if (typeof value.template !== "string" || value.template.trim().length === 0) return undefined;
+    const command: Record<string, unknown> = { template: value.template };
+    for (const field of PROJECT_COMMAND_STRING_FIELDS) {
+        if (value[field] === undefined) continue;
+        if (typeof value[field] !== "string") return undefined;
+        command[field] = value[field];
+    }
+    if (value.subtask !== undefined) {
+        if (typeof value.subtask !== "boolean") return undefined;
+        command.subtask = value.subtask;
+    }
+    return command;
+}
+
+/**
+ * Rebuild the merged `command` block so a repository may only ADD commands.
+ *
+ * The command block is not part of the schema; it is copied into the host's
+ * command config after Magic Context's built-in commands. Merged as raw
+ * config, a project could replace a command the user defined, shadow a
+ * built-in /ctx-* command, wipe the user's commands with a non-object value,
+ * or pass malformed entries to the host. Now the user's commands are kept as
+ * they are, and a project entry is used only when it is well formed and its
+ * name is neither a user command nor one of `reservedNames`. `mergedRaw` is
+ * mutated in place.
+ */
+export function constrainProjectCommands(args: {
+    mergedRaw: Record<string, unknown>;
+    trustedRaw: Record<string, unknown>;
+    projectRaw: Record<string, unknown>;
+    reservedNames: readonly string[];
+}): string[] {
+    if (!("command" in args.projectRaw)) return [];
+    const warnings: string[] = [];
+    const trustedCommands = isPlainObject(args.trustedRaw.command)
+        ? args.trustedRaw.command
+        : undefined;
+    const merged: Record<string, unknown> = { ...(trustedCommands ?? {}) };
+    const projectCommands = args.projectRaw.command;
+
+    if (!isPlainObject(projectCommands)) {
+        warnings.push(
+            "Ignoring command from project config (it must be an object of named commands).",
+        );
+    } else {
+        for (const [name, value] of Object.entries(projectCommands)) {
+            if (trustedCommands && Object.hasOwn(trustedCommands, name)) {
+                warnings.push(
+                    `Ignoring command.${name} from project config (security: a repository cannot replace a command defined in user config).`,
+                );
+                continue;
+            }
+            if (args.reservedNames.includes(name)) {
+                warnings.push(
+                    `Ignoring command.${name} from project config (security: a repository cannot replace a built-in Magic Context command).`,
+                );
+                continue;
+            }
+            const command = wellFormedCommand(value);
+            if (!command) {
+                warnings.push(
+                    `Ignoring command.${name} from project config (it needs a non-empty string template; description, agent and model must be strings and subtask a boolean).`,
+                );
+                continue;
+            }
+            Object.defineProperty(merged, name, {
+                value: command,
+                enumerable: true,
+                configurable: true,
+                writable: true,
+            });
+        }
+    }
+
+    if (Object.keys(merged).length === 0) delete args.mergedRaw.command;
+    else args.mergedRaw.command = merged;
+    return warnings;
 }

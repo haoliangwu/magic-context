@@ -1,3 +1,4 @@
+import { nativeSessionRemove } from '../../../plugin/src/v2/hidden-child-native';
 import { calibrationChunk, calibrationPrompt } from "./calibration-s3-fixture";
 import { runValidatedHistorianPass } from "../../../plugin/src/hooks/magic-context/compartment-runner-historian";
 import { writeFileSync } from "node:fs";
@@ -40,9 +41,10 @@ export default {
             hiddenHook.apply(draft);
         });
         let agentsReady: Promise<void> | undefined;
-        const executor = await createV2HiddenCompletionExecutor(context.session, {
+        const executor = await createV2HiddenCompletionExecutor({ ...context.session, removeSession: nativeSessionRemove(context.session) }, {
             db: hiddenDb,
             projectIdentity: context.location.directory,
+            directory: context.location.directory,
             hook: hiddenHook,
             ensureAgent: () => (agentsReady ??= context.agent.reload()),
             openReader: () => new V2StoreReader(gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest")),

@@ -1,0 +1,34 @@
+{
+  "stagedCredentialDeleted": true,
+  "copies": [
+    {
+      "root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/self-tag-trial/run-alCgtr",
+      "deleted": true
+    },
+    {
+      "root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/self-tag-trial/run-ZP8Vuk",
+      "deleted": true
+    },
+    {
+      "root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/self-tag-trial/run-CYS41v",
+      "deleted": true
+    },
+    {
+      "root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/self-tag-trial/run-kW6fsG",
+      "deleted": true
+    },
+    {
+      "root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/self-tag-trial/run-TCzPr7",
+      "deleted": true
+    },
+    {
+      "root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/self-tag-trial/run-xivJ2X",
+      "deleted": true
+    }
+  ],
+  "credentialLeakScan": {
+    "files": 47,
+    "leaks": 0
+  },
+  "deletedAfterDCompleted": true
+}

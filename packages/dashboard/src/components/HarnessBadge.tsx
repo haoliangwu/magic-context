@@ -9,6 +9,7 @@ const HARNESS_LABELS: Record<Harness, { short: string; title: string; color: str
   opencode2: { short: "OC2", title: "OpenCode 2", color: "amber" },
   pi: { short: "Pi", title: "Pi", color: "purple" },
   omp: { short: "OMP", title: "Oh My Pi", color: "purple" },
+  broca: { short: "Broca", title: "Broca", color: "purple" },
   claude_code: { short: "CC", title: "Claude Code", color: "blue" },
   codex: { short: "Codex", title: "Codex", color: "green" },
 };

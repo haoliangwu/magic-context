@@ -1,6 +1,7 @@
 import { DREAMER_PRIMER_INVESTIGATOR_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import {
     type RawMessageProvider,
     setRawMessageProvider,
@@ -16,22 +17,20 @@ import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
-import {
-    getActivePrimers,
-    getPrimerCandidatesByIds,
-    type Primer,
-    updatePrimerAnswer,
-} from "../storage-primers";
-import { recordChildInvocation } from "../subagent-token-capture";
+import { getActivePrimers, type Primer, updatePrimerAnswer } from "../storage-primers";
+import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
+import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
+import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
-import { buildPrimerSeed } from "./primer-seed";
+import { buildPrimerSeed, selectPrimerOriginCandidate } from "./primer-seed";
 import { PRIMER_INVESTIGATOR_SYSTEM_PROMPT } from "./task-prompts";
 
 const REFRESH_PRIMERS_PER_RUN = 5;
 
 export interface RefreshPrimersArgs {
     db: Database;
-    client: PluginContext["client"];
+    client?: PluginContext["client"];
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     projectIdentity: string;
     parentSessionId: string | undefined;
     sessionDirectory: string;
@@ -41,6 +40,8 @@ export interface RefreshPrimersArgs {
     leaseAcquisition?: LeaseAcquisition;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    tokenBudget?: number;
+    onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     language?: string;
     onProgress?: (processed: number) => void;
     /**
@@ -48,8 +49,8 @@ export interface RefreshPrimersArgs {
      * (JSONL), so the orientation seed read works on Pi-only installs where there
      * is no opencode.db. OpenCode leaves this undefined — the seed read falls to
      * the read-only opencode.db path. Returning null → closed-book fallback.
-     * May be async (Pi JSONL discovery is async); the returned provider's
-     * `readMessages()` itself is synchronous (wraps already-loaded entries).
+     * May be async (Pi JSONL discovery is async); the returned provider serves
+     * synchronous summary pages without retaining the historical transcript.
      */
     rawProviderFactory?: (
         sessionId: string,
@@ -237,8 +238,46 @@ async function refreshOnePrimer(
     let promptSettled = false;
     const startedAt = Date.now();
     try {
+        const prompt = buildInvestigationPrompt(primer, seed.kind, seed.orientation, seed.prePost);
+        if (args.hiddenCompletionExecutor) {
+            const run = await runHiddenSingleShotPrompt({
+                executor: args.hiddenCompletionExecutor,
+                parentSessionId: args.parentSessionId,
+                sessionDirectory: args.sessionDirectory,
+                agent: DREAMER_PRIMER_INVESTIGATOR_AGENT,
+                system: PRIMER_INVESTIGATOR_SYSTEM_PROMPT,
+                prompt,
+                title: "magic-context-dream-refresh-primers",
+                callContext: "dreamer:refresh-primers",
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate: args.onBudgetUpdate },
+                model: args.model,
+                fallbackModels: args.fallbackModels,
+                language: args.language,
+                timeoutMs: sliceMs,
+                signal,
+                parse: (text) =>
+                    parseAnswer(
+                        [{ info: { role: "assistant" }, parts: [{ type: "text", text }] }],
+                        primer.answer,
+                    ),
+            });
+            recordInvocation(args, startedAt, {
+                status: "completed",
+                messages: run.completion.messages ?? [],
+            });
+            const answer = run.validated.trim();
+            if (!answer || investigationToolCallCount(run.completion.messages ?? []) === 0)
+                return false;
+            runLeaseGuardedWrite(args.db, args.holderId, args.leaseKey, () => {
+                updatePrimerAnswer(args.db, primer.id, answer);
+            });
+            return true;
+        }
+        const client = args.client;
+        if (!client)
+            throw new Error("refresh-primers requires a client or hidden completion executor");
         const createResponse = await createChildSessionWithFence({
-            client: args.client,
+            client,
             db: args.db,
             parentSessionId: args.parentSessionId,
             title: "magic-context-dream-refresh-primers",
@@ -254,9 +293,8 @@ async function refreshOnePrimer(
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create primer refresh session.");
 
-        const prompt = buildInvestigationPrompt(primer, seed.kind, seed.orientation, seed.prePost);
         const run = await shared.promptSyncWithValidatedOutputRetry(
-            args.client,
+            client,
             {
                 path: { id: agentSessionId },
                 query: { directory: args.sessionDirectory },
@@ -275,8 +313,12 @@ async function refreshOnePrimer(
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:refresh-primers",
+                transport: shared.createPromptAsyncTransport(client, agentSessionId, {
+                    tokenBudget: args.tokenBudget,
+                    onBudgetUpdate: args.onBudgetUpdate,
+                }),
                 fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
+                    const messagesResponse = await client.session.messages({
                         path: { id: agentSessionId as string },
                         query: { directory: args.sessionDirectory, limit: 100 },
                     });
@@ -313,34 +355,31 @@ async function refreshOnePrimer(
             `[dreamer] refresh-primers failed (primer #${primer.id}): ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: "failed", error });
+        recordInvocation(args, startedAt, { status: failedInvocationStatus(error), error });
         throw error;
     } finally {
-        await teardownChildSession({
-            client: args.client,
-            sessionId: agentSessionId,
-            sessionDirectory: args.sessionDirectory,
-            promptSettled,
-            privacySensitive: true,
-            context: "[dreamer] refresh-primers",
-            log,
-        });
+        if (agentSessionId && args.client)
+            await teardownChildSession({
+                client: args.client,
+                sessionId: agentSessionId,
+                sessionDirectory: args.sessionDirectory,
+                promptSettled,
+                privacySensitive: true,
+                context: "[dreamer] refresh-primers",
+                log,
+            });
     }
 }
 
 function originSessionIdForPrimer(args: RefreshPrimersArgs, primer: Primer): string | null {
-    // Cheap lookup: the most-recent candidate's session id, without rendering.
-    const candidates = getPrimerCandidatesByIds(args.db, primer.sourceCandidateIds);
-    const mostRecent = candidates
-        .slice()
-        .sort((a, b) => b.sourceMessageTime - a.sourceMessageTime || b.id - a.id)[0];
-    return mostRecent?.sessionId ?? null;
+    // Cheap lookup without rendering; the same same-project candidate the seed uses.
+    return selectPrimerOriginCandidate(args.db, primer)?.sessionId ?? null;
 }
 
 function recordInvocation(
     args: RefreshPrimersArgs,
     startedAt: number,
-    params: { status: "completed" | "failed"; messages?: unknown[]; error?: unknown },
+    params: { status: SubagentInvocationStatus; messages?: unknown[]; error?: unknown },
 ): void {
     if (!args.parentSessionId) return;
     recordChildInvocation({

@@ -14,6 +14,7 @@ import {
     captureSlot,
     getSlot,
     lkgContentDigest,
+    messageContentFields,
     noteEntry,
     resetLkgSlotsForTest,
 } from "./lkg-slot";
@@ -45,6 +46,31 @@ function assistant(id: string, created: number, parts: unknown[] = []): MessageL
 }
 
 describe("LKG transform replay", () => {
+    test("captures entry digests before live tagging mutates the host messages", () => {
+        resetLkgSlotsForTest();
+        const raw = [user("u0", 1), user("u1", 2)];
+        const pristine = structuredClone(raw);
+        const entry = projectLkgEntry(raw);
+        (raw[0].parts[0] as { text: string }).text = "§1§ managed summary";
+        expect(
+            captureLkgSlot({
+                sessionId: "eager-input",
+                input: entry,
+                output: raw,
+                modelKey: "test/model",
+                providerKey: "test",
+            }),
+        ).toBe(true);
+        const replay = replayLkg({
+            sessionId: "eager-input",
+            messages: pristine,
+            modelKey: "test/model",
+            providerKey: "test",
+        });
+        expect(replay.ok).toBe(true);
+        if (replay.ok) expect(JSON.stringify(replay.messages)).toBe(JSON.stringify(raw));
+    });
+
     test("projects only anchor fields without retaining message parts", () => {
         const input = [
             user("u0", 1),
@@ -135,6 +161,40 @@ describe("LKG transform replay", () => {
             expect(replay.messages[2]).toEqual(originalTail?.[0]);
             expect(new Set(replay.messages.map((message) => message.info.id)).size).toBe(4);
         }
+    });
+
+    test("accepts an empty host diff summary added after capture without masking real changes", () => {
+        resetLkgSlotsForTest();
+        const input = [user("u0", 1), user("u1", 2)];
+        expect(
+            captureLkgSlot({
+                sessionId: "late-empty-summary",
+                input,
+                output: structuredClone(input),
+                modelKey: "test/model",
+                providerKey: "test",
+            }),
+        ).toBe(true);
+        const current = [...structuredClone(input), user("u2", 3)] as MessageLike[];
+        (current[1]!.info as Record<string, unknown>).summary = { diffs: [] };
+        expect(messageContentFields(current[1]!)).toEqual(messageContentFields(input[1]!));
+        expect(
+            replayLkg({
+                sessionId: "late-empty-summary",
+                messages: current,
+                modelKey: "test/model",
+                providerKey: "test",
+            }).ok,
+        ).toBe(true);
+        (current[1]!.parts[0] as { text: string }).text = "edited despite stable id";
+        expect(
+            replayLkg({
+                sessionId: "late-empty-summary",
+                messages: current,
+                modelKey: "test/model",
+                providerKey: "test",
+            }),
+        ).toEqual({ ok: false, reason: "lkg_content_mismatch" });
     });
 
     test("declines replay when stable-id content changes through the anchor", () => {
@@ -342,6 +402,118 @@ describe("LKG transform replay", () => {
             providerKey: "anthropic",
         });
         expect(replay).toEqual({ ok: true, messages: [prefix, current[1]] });
+    });
+
+    test("accepts CEREB's contiguous signed thinking pair before a completed tool in one message", () => {
+        const message = assistant("a-cereb", 1, [
+            { type: "step-start" },
+            { type: "reasoning", text: "first trace", signature: "synthetic-sig-a" },
+            { type: "reasoning", text: "second trace", signature: "synthetic-sig-b" },
+            {
+                type: "tool",
+                callID: "call-1",
+                tool: "read",
+                providerExecuted: false,
+                state: { status: "completed", input: {}, output: "result" },
+            },
+            { type: "step-finish" },
+        ]);
+
+        expect(validateAnthropicReasoningRuns([message])).toBe(true);
+    });
+
+    test("declines a contiguous thinking pair split across merged assistant messages", () => {
+        const first = assistant("a-first", 1, [
+            { type: "thinking", thinking: "first trace", signature: "synthetic-sig-a" },
+        ]);
+        const second = assistant("a-second", 2, [
+            { type: "thinking", thinking: "second trace", signature: "synthetic-sig-b" },
+        ]);
+
+        expect(validateAnthropicReasoningRuns([first, second])).toBe(false);
+    });
+
+    test("accepts leading thinking after an assistant that holds only step markers", () => {
+        // Step markers never reach the provider, so the second message's thinking
+        // still leads the merged run on the wire.
+        expect(
+            validateAnthropicReasoningRuns([
+                assistant("a-empty", 1, [{ type: "step-start" }]),
+                assistant("a-thinking", 2, [
+                    { type: "thinking", thinking: "trace", signature: "synthetic-sig" },
+                ]),
+            ]),
+        ).toBe(true);
+    });
+
+    test("declines thinking from a second merged assistant after text in the first", () => {
+        expect(
+            validateAnthropicReasoningRuns([
+                assistant("a-text", 1, [{ type: "text", text: "preface" }]),
+                assistant("a-thinking", 2, [
+                    { type: "thinking", thinking: "trace", signature: "synthetic-sig" },
+                ]),
+            ]),
+        ).toBe(false);
+    });
+
+    test("declines thinking after text in the same assistant run", () => {
+        expect(
+            validateAnthropicReasoningRuns([
+                assistant("a-text-first", 1, [
+                    { type: "text", text: "preface" },
+                    { type: "thinking", thinking: "late trace", signature: "synthetic-sig" },
+                ]),
+            ]),
+        ).toBe(false);
+    });
+
+    test("declines thinking after a tool use in the same assistant run", () => {
+        expect(
+            validateAnthropicReasoningRuns([
+                assistant("a-tool-first", 1, [
+                    { type: "tool", providerExecuted: true, state: { status: "completed" } },
+                    { type: "thinking", thinking: "late trace", signature: "synthetic-sig" },
+                ]),
+            ]),
+        ).toBe(false);
+    });
+
+    test("applies durable thinking strips before validating a replay candidate", () => {
+        resetLkgSlotsForTest();
+        const input = [user("u0", 1, { providerID: "anthropic", modelID: "claude-test" })];
+        const prefix = assistant("a-prefix", 2, [
+            { type: "thinking", thinking: "signed prefix", signature: "sig-a" },
+            { type: "text", text: "answer" },
+        ]);
+        captureSlot("strip-before-validate", {
+            jsonPrefix: JSON.stringify([prefix]),
+            inputIdSeq: ["u0"],
+            inputContentDigests: [lkgContentDigest(input[0])!],
+            lastInputMessageId: "u0",
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            capturedAt: 1,
+        });
+        const tail = assistant("a-tail", 3, [
+            { type: "thinking", thinking: "previously stripped", signature: "sig-b" },
+            { type: "text", text: "continued answer" },
+        ]);
+        const replay = replayLkg({
+            sessionId: "strip-before-validate",
+            messages: [...input, tail],
+            modelKey: "anthropic/claude-test",
+            providerKey: "anthropic",
+            prepareReplay: (messages) => {
+                const restored = messages.find((message) => message.info.id === "a-tail")!;
+                restored.parts = restored.parts.filter(
+                    (part) => (part as { type: string }).type !== "thinking",
+                );
+            },
+        });
+        expect(replay.ok).toBe(true);
+        if (replay.ok) expect(JSON.stringify(replay.messages)).not.toContain("previously stripped");
+        expect(getSlot("strip-before-validate")).toBeDefined();
     });
 
     test("declines a new thinking run after a provider-executed tool", () => {

@@ -82,7 +82,8 @@ impl FixtureBuilder {
     /// Open an isolated module store and retain its directory for project-shaped fixtures.
     pub fn store() -> StoreFixture {
         let dir = tempfile::tempdir().expect("fixture store directory");
-        let store = mc_store::McStore::open(&descriptor(dir.path())).expect("fixture store");
+        let store =
+            mc_store::McStore::open_for_test(&descriptor(dir.path())).expect("fixture store");
         StoreFixture { dir, store }
     }
 

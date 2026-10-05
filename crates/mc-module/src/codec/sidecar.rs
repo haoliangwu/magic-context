@@ -1,10 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::ck_wire::{CkIngressMessage, CkWireBlock};
 
@@ -197,10 +195,26 @@ impl AlignmentScore {
 }
 
 pub(crate) fn decoded_block_fingerprint(block: &CkWireBlock) -> String {
-    let mut canonical = block.clone();
-    canonical.provider_extras.remove(BLOCK_IDENTITY_NAMESPACE);
-    canonical.mark_modified();
-    stable_hash(&serde_json::to_value(canonical).unwrap_or(Value::Null))
+    profile_start!(_perf_fingerprint, "rt07_decode_fingerprint");
+    #[derive(Serialize)]
+    struct TypedBlock<'a> {
+        kind: &'a crate::ck_wire::CkKind,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        provider_extras: BTreeMap<&'a String, &'a BTreeMap<String, Value>>,
+    }
+    // Fingerprints deliberately ignore retained outer ingress JSON and our own
+    // identity stamp. Borrow the typed fields instead of cloning and then
+    // discarding the retained ingress payload. Keep the sorted Value form: a
+    // typed serializer emits nested keys in a different order.
+    let typed = TypedBlock {
+        kind: &block.kind,
+        provider_extras: block
+            .provider_extras
+            .iter()
+            .filter(|(namespace, _)| namespace.as_str() != BLOCK_IDENTITY_NAMESPACE)
+            .collect(),
+    };
+    stable_hash(&serde_json::to_value(typed).unwrap_or(Value::Null))
 }
 
 pub(crate) fn stamp_block_identity(
@@ -364,14 +378,12 @@ pub(crate) fn match_block_metas<'a>(
 }
 
 pub fn stable_hash(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    let digest = Sha256::digest(bytes);
+    let digest = crate::digest::json_value(value);
     hex_prefix(&digest, digest.len())
 }
 
 pub fn stable_hash_prefix(value: &Value, chars: usize) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
-    let digest = Sha256::digest(bytes);
+    let digest = crate::digest::json_value(value);
     hex_prefix(&digest, chars.div_ceil(2))
         .chars()
         .take(chars)
@@ -379,11 +391,7 @@ pub fn stable_hash_prefix(value: &Value, chars: usize) -> String {
 }
 
 fn hex_prefix(bytes: &[u8], count: usize) -> String {
-    let mut out = String::with_capacity(count * 2);
-    for byte in bytes.iter().take(count) {
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
+    crate::digest::hex(&bytes[..count.min(bytes.len())])
 }
 
 pub fn meta_for_ck<'a>(
@@ -410,4 +418,71 @@ pub(crate) fn is_synthetic_part(part: &Value) -> bool {
             .get("syntheticTodoMarker")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+    use crate::ck_wire::{CkKind, CkOutputKind, CkToolOutput};
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn borrowed_decoded_fingerprint_matches_owned_sorted_reference() {
+        for kind in [
+            CkKind::Text {
+                text: "quoted\"\0é🙂".into(),
+            },
+            CkKind::Reasoning {
+                text: "thinking".into(),
+                signature: Some("signature".into()),
+            },
+            CkKind::ToolCall {
+                id: "call".into(),
+                name: "read".into(),
+                input: json!({"z":[1.0,false],"a":{"quoted":"\"\\"}}),
+                provider_executed: false,
+            },
+            CkKind::ToolResult {
+                id: "call".into(),
+                tool_name: "read".into(),
+                output: CkToolOutput::bare(CkOutputKind::Json {
+                    value: json!({"z":1,"a":[null,"é"]}),
+                }),
+                provider_executed: false,
+            },
+        ] {
+            let mut value = serde_json::to_value(CkWireBlock::bare(kind)).unwrap();
+            value["unknown_outer_ingress"] = json!({"ignored":"retained source"});
+            let mut block: CkWireBlock = serde_json::from_value(value).unwrap();
+            for extras in [false, true] {
+                if extras {
+                    block.provider_extras.insert(
+                        "vendor".into(),
+                        BTreeMap::from([
+                            ("z".into(), json!({"nested":[1.0, "é\0"]})),
+                            ("a".into(), json!(true)),
+                        ]),
+                    );
+                }
+                block.provider_extras.insert(
+                    BLOCK_IDENTITY_NAMESPACE.into(),
+                    BTreeMap::from([("stamp".into(), json!(42))]),
+                );
+                let mut owned = block.clone();
+                owned.provider_extras.remove(BLOCK_IDENTITY_NAMESPACE);
+                owned.mark_modified();
+                let canonical = serde_json::to_value(owned).unwrap();
+                let bytes = serde_json::to_vec(&canonical).unwrap();
+                let expected = format!("{:x}", Sha256::digest(bytes));
+                assert_eq!(decoded_block_fingerprint(&block), expected);
+                for length in [0, 1, 23, 24, 63, 64, 65] {
+                    assert_eq!(
+                        stable_hash_prefix(&canonical, length),
+                        expected.chars().take(length).collect::<String>()
+                    );
+                }
+            }
+        }
+    }
 }

@@ -188,12 +188,11 @@ export function getUnclassifiedMemoryIds(db: Database, memoryIds: readonly numbe
     if (!hasMemoryClassifiedAtColumn(db)) return [...memoryIds];
     const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
     if (ids.length === 0) return [];
-    const ph = ids.map(() => "?").join(", ");
     const rows = db
         .prepare<unknown[], { id: number }>(
-            `SELECT id FROM memories WHERE id IN (${ph}) AND classified_at IS NOT NULL`,
+            "SELECT id FROM memories WHERE id IN (SELECT value FROM json_each(?)) AND classified_at IS NOT NULL",
         )
-        .all(...ids);
+        .all(JSON.stringify(ids));
     const classified = new Set(rows.map((r) => r.id));
     return ids.filter((id) => !classified.has(id));
 }
@@ -712,17 +711,54 @@ export function getMemoriesByProject(
     return rows.map(toMemory);
 }
 
+const memoryListStatements = new WeakMap<Database, PreparedStatement>();
+
+/** Read a bounded tool list in the same order and with the same row validation
+ * as the full project reader. Invalid legacy rows must not consume the limit. */
+export function getMemoriesForList(
+    db: Database,
+    projectPath: string,
+    categories: readonly string[] | null,
+    limit: number,
+): Memory[] {
+    if (limit <= 0) return [];
+    let statement = memoryListStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(`SELECT ${getMemorySelectColumns(db)} FROM memories
+            WHERE project_path = ? AND status IN ('active', 'permanent')
+              AND (expires_at IS NULL OR expires_at > ?)
+              AND (? IS NULL OR category IN (SELECT value FROM json_each(?)))
+            ORDER BY category ASC, updated_at DESC, id ASC LIMIT ? OFFSET ?`);
+        memoryListStatements.set(db, statement);
+    }
+    const categoryJson = categories === null ? null : JSON.stringify(categories);
+    const cutoff = Date.now();
+    const pageSize = Math.min(256, limit);
+    const result: Memory[] = [];
+    for (let offset = 0; result.length < limit; offset += pageSize) {
+        const rows = statement.all(
+            projectPath,
+            cutoff,
+            categoryJson,
+            categoryJson,
+            pageSize,
+            offset,
+        );
+        result.push(...rows.filter(isMemoryRow).map(toMemory));
+        if (rows.length < pageSize) break;
+    }
+    return result.slice(0, limit);
+}
+
 /**
  * Load ALL `active` memories for a project, INCLUDING expired ones.
  *
  * `getMemoriesByProject` filters out rows whose `expires_at` has passed (correct
- * for the RENDER path — expired memories shouldn't be injected). But the memory
- * MIGRATION (`/ctx-session-upgrade`) does a destructive delete+reinsert of the
- * `active` pool, and it MUST operate on the full active set: if it only saw
- * unexpired rows, it would delete those and leave expired `active` rows orphaned
- * — a partial, inconsistent wipe (root cause, dogfood 2026-05-31: 831 unexpired
- * deleted, 27 expired KNOWN_ISSUES stranded). Migration is a re-categorization,
- * so it re-evaluates every active row regardless of TTL.
+ * for the RENDER path — expired memories shouldn't be injected). A caller that
+ * REWRITES the `active` pool in place must instead see the full active set: if
+ * it only saw unexpired rows, it would rewrite those and leave expired `active`
+ * rows orphaned — a partial, inconsistent wipe (root cause, dogfood 2026-05-31:
+ * 831 unexpired deleted, 27 expired KNOWN_ISSUES stranded).
  */
 
 function sqlPlaceholders(values: readonly unknown[]): string {
@@ -1080,7 +1116,7 @@ export function updateMemoryContent(
             deleteEmbeddingOnContentUpdateStatements.set(db, stmt);
         }
         stmt.run(id);
-    })();
+    }).immediate();
 
     if (memory) {
         invalidateMemory(memory.projectPath, id);
@@ -1207,7 +1243,7 @@ export function deleteMemory(db: Database, id: number): void {
     db.transaction(() => {
         getDeleteMemoryEmbeddingStatement(db).run(id);
         getDeleteMemoryStatement(db).run(id);
-    })();
+    }).immediate();
 
     if (memory) {
         invalidateMemory(memory.projectPath, id);

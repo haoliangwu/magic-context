@@ -512,12 +512,12 @@ function snapDimensionToVisionTile(contentPixels: number, maximum: number): numb
 }
 
 /**
- * Render the deterministic mural from a pre-ordered flat entry list. Zero LLM,
- * pure function of its input — callable any time. Category bands, bullet lines,
+ * Plan the deterministic mural layout from a pre-ordered flat entry list without
+ * rasterizing or encoding an image. Category bands, bullet lines,
  * shared-pair packing, fitted word-wrap, balanced columns, and prohibition ink
  * are all preserved from the author-era renderer; rooms and merges are gone.
  */
-export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderResult {
+export function planMuralRender(entries: readonly MuralRenderEntry[]) {
     const roomWidth = chooseRoomWidth(entries);
     const plan = planLines(entries, roomWidth);
     const candidates = Array.from({ length: MURAL_COLUMNS }, (_, index) => {
@@ -565,7 +565,11 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
         return candidate.requestedColumnCount < best.requestedColumnCount ? candidate : best;
     }, firstCandidate);
 
-    const { layout, width, height } = selected;
+    return { roomWidth, layout: selected.layout, width: selected.width, height: selected.height };
+}
+
+export function rasterMural(plan: ReturnType<typeof planMuralRender>): Uint8Array {
+    const { roomWidth, layout, width, height } = plan;
     const pixels = new Uint8Array(width * height * 3).fill(255);
     const contentWidth =
         layout.columnCount === 0
@@ -605,7 +609,16 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
             );
         }
     }
-    const png = encodeRgbPng(pixels, width, height);
+    return pixels;
+}
+
+export function encodeMuralPng(pixels: Uint8Array, width: number, height: number): Uint8Array {
+    return encodeRgbPng(pixels, width, height);
+}
+
+export function renderPlannedMural(plan: ReturnType<typeof planMuralRender>): MuralRenderResult {
+    const { layout, width, height } = plan;
+    const png = encodeMuralPng(rasterMural(plan), width, height);
     const dataUrl = `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
     return {
         png,
@@ -621,6 +634,10 @@ export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderRe
         width,
         height,
     };
+}
+
+export function renderMural(entries: readonly MuralRenderEntry[]): MuralRenderResult {
+    return renderPlannedMural(planMuralRender(entries));
 }
 
 /** Anthropic charges one visual token per 28x28 image patch. */

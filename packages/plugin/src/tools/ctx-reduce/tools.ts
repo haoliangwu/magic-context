@@ -8,7 +8,7 @@ import { parseRangeString } from "../../features/magic-context/range-parser";
 import {
     getOrCreateSessionMeta,
     getPendingOps,
-    getTagsBySession,
+    getTagsByNumbers,
     queuePendingOp,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
@@ -54,7 +54,7 @@ const ctxReduceArgsShape = {
     drop: tool.schema
         .string()
         .optional()
-        .describe("Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'"),
+        .describe('Tag IDs to drop: "3-5", "1,2,9", "1-5,8,12-15".'),
 };
 // The tool definition exposes only the documented argument shape to the model
 // provider, but older callers may still send extra arguments. Parse with
@@ -158,7 +158,7 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
 
             const allIds = [...new Set(dropIds)];
 
-            const allTags = getTagsBySession(deps.db, sessionId);
+            const allTags = getTagsByNumbers(deps.db, sessionId, allIds);
             const foundSet = new Set(allTags.map((tag) => tag.tagNumber));
             const unknownIds = allIds.filter((id) => !foundSet.has(id));
             if (unknownIds.length > 0) {
@@ -230,12 +230,14 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             }
 
             try {
-                deps.db.transaction(() => {
-                    const now = Date.now();
-                    for (const id of dropIds) {
-                        queuePendingOp(deps.db, sessionId, id, "drop", now);
-                    }
-                })();
+                deps.db
+                    .transaction(() => {
+                        const now = Date.now();
+                        for (const id of dropIds) {
+                            queuePendingOp(deps.db, sessionId, id, "drop", now);
+                        }
+                    })
+                    .immediate();
             } catch (error) {
                 const errorMessage = getErrorMessage(error);
                 return `Error: Failed to queue ctx_reduce operations. ${errorMessage}`;

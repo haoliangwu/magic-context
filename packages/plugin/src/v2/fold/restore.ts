@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { isStorageNoticeText } from "../hooks/storage-notice";
 import type { V2Message } from "../hooks/types";
 import type { StoreRow } from "../store-reader";
 
@@ -11,8 +12,27 @@ interface Attachment {
     source: { type: string; uri?: string };
     mention?: { text?: string };
 }
+/**
+ * How restored attachments are rendered. Hosts before OpenCode 2.0.15 take a plain
+ * `{ mediaType, data }` media part; later hosts need their own `Media.Asset` instance
+ * (see host-media.ts). When no instance can be produced the attachment is replaced by a
+ * short note, so the row's text still reaches the model and the host does not reject
+ * the whole request.
+ */
+export interface RestoreMedia {
+    /** The host's asset for a base64 payload, or why none could be built. */
+    asset(data: string, mediaType: string): object | string;
+    /** Called once per attachment replaced by the note. */
+    unavailable(detail: { rowID: string; name?: string; mediaType: string; reason: string }): void;
+}
+
+/** Depends only on the stored row, so a replay of the same row produces the same bytes. */
+export function unavailableAttachmentNote(name: string | undefined, mediaType: string): string {
+    return `[Attachment ${name ? `"${name}" ` : ""}(${mediaType}) is not available in this restored history]`;
+}
+
 const imageMimes = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-function attachmentParts(files: Attachment[]): Part[] {
+function attachmentParts(files: Attachment[], rowID: string, media?: RestoreMedia): Part[] {
     const seen = new Map<string, Set<string>>();
     return files.flatMap((file): Part[] => {
         if (imageMimes.has(file.mime) && file.source.type === "inline" && file.mention?.text) {
@@ -59,17 +79,30 @@ function attachmentParts(files: Attachment[]): Part[] {
             ];
         }
         if (!imageMimes.has(file.mime) && file.mime !== "application/pdf") return [];
-        return [
-            ...(location ? [{ type: "text", text: `Attached file: ${location}` }] : []),
-            {
-                type: "media",
-                mediaType: file.mime,
-                data: file.data,
-                filename: file.name,
-                metadata:
-                    file.description === undefined ? undefined : { description: file.description },
-            },
-        ];
+        const metadata =
+            file.description === undefined ? undefined : { description: file.description };
+        const located = location ? [{ type: "text", text: `Attached file: ${location}` }] : [];
+        if (!media)
+            return [
+                ...located,
+                {
+                    type: "media",
+                    mediaType: file.mime,
+                    data: file.data,
+                    filename: file.name,
+                    metadata,
+                },
+            ];
+        const asset = media.asset(file.data, file.mime);
+        if (typeof asset === "string") {
+            media.unavailable({ rowID, name: file.name, mediaType: file.mime, reason: asset });
+            return [
+                ...located,
+                { type: "text", text: unavailableAttachmentNote(file.name, file.mime) },
+            ];
+        }
+        // Same keys, in the same order, as the host's own rendering of a stored attachment.
+        return [...located, { type: "media", media: asset, filename: file.name, metadata }];
     });
 }
 
@@ -77,7 +110,11 @@ function attachmentParts(files: Attachment[]): Part[] {
  * historian projection. Tool results stay paired, and attachments retain their payloads.
  * The store remains read-only; the host's bounded recent-context is not a preservation source.
  */
-export function restoreRow(row: StoreRow, model: { providerID: string; id: string }): V2Message[] {
+export function restoreRow(
+    row: StoreRow,
+    model: { providerID: string; id: string },
+    media?: RestoreMedia,
+): V2Message[] {
     const data = row.data;
     const make = (role: string, content: Part[], metadata: unknown = data.metadata): V2Message => ({
         id: row.id,
@@ -92,7 +129,7 @@ export function restoreRow(row: StoreRow, model: { providerID: string; id: strin
                 skill.text === undefined ? [] : [{ type: "text", text: skill.text }],
             ),
             ...(data.text ? [{ type: "text", text: data.text }] : []),
-            ...attachmentParts((data.files ?? []) as Attachment[]),
+            ...attachmentParts((data.files ?? []) as Attachment[], row.id, media),
         ];
         return content.length
             ? [
@@ -103,12 +140,19 @@ export function restoreRow(row: StoreRow, model: { providerID: string; id: strin
               ]
             : [];
     }
-    if (["synthetic", "skill", "system"].includes(row.type))
-        return [
-            make(row.type === "system" ? "system" : "user", [
-                { type: "text", text: data.text ?? "" },
-            ]),
-        ];
+    // The host renders an instruction-update row as a bare system message with
+    // neither the row id nor its metadata. Restoring it the same way keeps a
+    // restored row byte-identical to the host-rendered one, so the request does
+    // not change when the row moves between the restored range and the host's
+    // own window, and an id-less row is never tagged or dropped as history.
+    if (row.type === "system")
+        return [{ role: "system", content: [{ type: "text", text: data.text ?? "" }] }];
+    // Magic Context's own storage notices are for the user and are dropped from
+    // every request the context hook serves, so a restored copy is dropped too, and
+    // boundary lookups see the row as one the request never carries.
+    if (row.type === "synthetic" && isStorageNoticeText(data.text)) return [];
+    if (["synthetic", "skill"].includes(row.type))
+        return [make("user", [{ type: "text", text: data.text ?? "" }])];
     if (row.type === "location-switched")
         return [
             make("user", [

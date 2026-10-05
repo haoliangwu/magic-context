@@ -1,6 +1,10 @@
 import type { DreamerConfig } from "../../../config/schema/magic-context";
 import { type ModelHarness, resolveDreamerTaskModel } from "../../../shared/model-resolution";
-import { CANONICAL_DREAM_TASKS, type DreamTaskName } from "./task-registry";
+import {
+    CANONICAL_DREAM_TASKS,
+    DREAM_TOOL_LOOP_TOKEN_BUDGETS,
+    type DreamTaskName,
+} from "./task-registry";
 import type { DreamTaskRuntimeConfig } from "./task-scheduler";
 
 /**
@@ -35,7 +39,24 @@ export function buildDreamTaskRuntimeConfigs(
                     : undefined,
             language,
             timeoutMinutes: resolved.timeoutMinutes ?? 20,
+            tokenBudget:
+                task in DREAM_TOOL_LOOP_TOKEN_BUDGETS
+                    ? ((dreamer as DreamerConfig | undefined)?.tasks?.[task]?.token_budget ??
+                      DREAM_TOOL_LOOP_TOKEN_BUDGETS[
+                          task as keyof typeof DREAM_TOOL_LOOP_TOKEN_BUDGETS
+                      ])
+                    : undefined,
             promotionThreshold: resolved.promotionThreshold,
+            docsMaxTokens:
+                task === "maintain-docs"
+                    ? ((dreamer as DreamerConfig | undefined)?.tasks?.["maintain-docs"]
+                          ?.max_tokens ?? 12000)
+                    : undefined,
+            retrospectiveRecencyDays:
+                task === "retrospective"
+                    ? ((dreamer as DreamerConfig | undefined)?.tasks?.retrospective?.recency_days ??
+                      30)
+                    : undefined,
         };
     });
 }

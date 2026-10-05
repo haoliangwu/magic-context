@@ -187,6 +187,7 @@ function computeTiers(
  */
 export function renderDecayedCompartments(args: {
     compartments: DecayRenderCompartment[];
+    /** The caller converts the provider-token history budget to local tokens before rendering. */
     historyBudgetTokens: number;
 }): string {
     const { historyBudgetTokens } = args;

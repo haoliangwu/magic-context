@@ -72,6 +72,7 @@ export class FoldOwner {
     }): Promise<FoldIdentity> {
         return this.serial(args.sessionID, async () => {
             let state = await this.read(args.sessionID);
+            let changed = !state;
             const renderedSha = foldDigest(JSON.stringify(args.rendered));
             // An already-persisted checkpoint can predate the plugin's storage commit.
             // Recover its two identities without draining any pending operation twice.
@@ -95,15 +96,19 @@ export class FoldOwner {
                 args.onHard(reason);
                 state.reason = reason;
                 state.rejectedSha = renderedSha;
+                changed = true;
             }
-            if (state.cutSeq === undefined && args.cutSeq >= state.watermark)
+            if (state.cutSeq === undefined && args.cutSeq >= state.watermark) {
                 state.cutSeq = args.cutSeq;
+                changed = true;
+            }
             if (!state.rendered && reason !== "host_cut_before_watermark") {
                 state.rendered = structuredClone(args.rendered);
                 state.renderedSha = renderedSha;
                 state.renderedSummary = args.summary;
+                changed = true;
             }
-            await this.storage.set(this.key(args.sessionID), state);
+            if (changed) await this.storage.set(this.key(args.sessionID), state);
             return state;
         });
     }

@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
 	mkdirSync,
-	mkdtempSync,
 	realpathSync,
 	rmSync,
 	symlinkSync,
@@ -10,6 +9,7 @@ import {
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import {
 	__setPiHarnessKindForTesting,
@@ -27,7 +27,7 @@ interface BunGlobalHost {
 }
 
 function temporaryRoot(): string {
-	const root = mkdtempSync(join(tmpdir(), "mc-pi-harness-kind-"));
+	const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-harness-kind-"));
 	temporaryRoots.push(root);
 	return root;
 }

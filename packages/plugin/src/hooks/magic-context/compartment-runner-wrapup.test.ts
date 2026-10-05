@@ -1,6 +1,9 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it, mock, spyOn } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
     acquireCompartmentLease,
     releaseCompartmentLease,
@@ -21,12 +24,29 @@ import type { PluginContext } from "../../plugin/types";
 import * as loggerModule from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { createV2RawMessageProvider, createV2RawMessageReader } from "../../v2/hooks/store";
+import {
+    getV2StoreReaderDebugCounters,
+    RAW_MESSAGE_TYPES,
+    resetV2StoreReaderDebugCounters,
+    V2_MESSAGE_PAGE_SQL,
+    V2StoreReader,
+} from "../../v2/store-reader";
 import { runCompartmentAgent } from "./compartment-runner";
+import {
+    clearProducerModelObservations,
+    prepareProducerFixture,
+} from "./producer-window-test-support";
 import {
     type ProtectedTailBoundarySnapshot,
     resolveWrapupProtectedTailBoundary,
 } from "./protected-tail-boundary";
-import { readSessionChunk, setRawMessageProvider } from "./read-session-chunk";
+import {
+    readSessionChunk,
+    setBoundedRawMessageProvider,
+    setRawMessageProvider,
+} from "./read-session-chunk";
 import type { RawMessage } from "./read-session-raw";
 
 function createDb(): Database {
@@ -217,30 +237,34 @@ async function runWithLease(args: {
     historianChunkTokens?: number;
     output?: string;
     beforeHistorianCollect?: () => void;
+    memoryEnabled?: boolean;
 }) {
     const holderId = `holder-${Math.random()}`;
     expect(acquireCompartmentLease(args.db, args.sessionId, holderId)).not.toBeNull();
     try {
-        await runCompartmentAgent({
-            client: client(args.output, args.beforeHistorianCollect),
-            db: args.db,
-            sessionId: args.sessionId,
-            historianChunkTokens: args.historianChunkTokens ?? 10_000,
-            historianTimeoutMs: 5_000,
-            boundarySnapshot: args.snapshot,
-            currentContextLimit: 20,
-            directory: "/tmp/wrapup-runner",
-            memoryEnabled: true,
-            autoPromote: true,
-            experimentalUserMemories: true,
-            fallbackModels: [],
-            compartmentLeaseHolderId: holderId,
-            forceKeepLastCompartment: args.forceKeepLastCompartment,
-            forceDrainQuota: args.forceDrainQuota,
-            preserveInjectionCacheUntilConsumed: true,
-            refreshBoundarySnapshot: args.refreshBoundarySnapshot,
-        });
+        await runCompartmentAgent(
+            await prepareProducerFixture({
+                client: client(args.output, args.beforeHistorianCollect),
+                db: args.db,
+                sessionId: args.sessionId,
+                historianChunkTokens: args.historianChunkTokens ?? 10_000,
+                historianTimeoutMs: 5_000,
+                boundarySnapshot: args.snapshot,
+                currentContextLimit: 20,
+                directory: "/tmp/wrapup-runner",
+                memoryEnabled: args.memoryEnabled ?? true,
+                autoPromote: true,
+                experimentalUserMemories: true,
+                fallbackModels: [],
+                compartmentLeaseHolderId: holderId,
+                forceKeepLastCompartment: args.forceKeepLastCompartment,
+                forceDrainQuota: args.forceDrainQuota,
+                preserveInjectionCacheUntilConsumed: true,
+                refreshBoundarySnapshot: args.refreshBoundarySnapshot,
+            }),
+        );
     } finally {
+        clearProducerModelObservations();
         releaseCompartmentLease(args.db, args.sessionId, holderId);
     }
 }
@@ -317,6 +341,16 @@ describe("runCompartmentAgent wrapup controls", () => {
                 sessionId,
                 expect.stringContaining(
                     "historian publish refused: sequence=0 side=start missing_id=m-1",
+                ),
+            );
+            expect(logSpy).toHaveBeenCalledWith(
+                sessionId,
+                "historian output discarded: reason=dangling_boundary",
+            );
+            expect(logSpy).toHaveBeenCalledWith(
+                sessionId,
+                expect.stringContaining(
+                    "historian publish stage: stage=dangling-boundary-check status=discarded elapsed=",
                 ),
             );
         } finally {
@@ -466,6 +500,179 @@ describe("runCompartmentAgent wrapup controls", () => {
             expect(getCompartments(db, sessionId)).toHaveLength(1);
         } finally {
             closeQuietly(db);
+        }
+    });
+
+    it("keeps a 10K-row v2 post-historian publish bounded and closes every reader", async () => {
+        const db = createDb();
+        const sessionId = "ses-v2-post-historian";
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-v2-post-historian-"));
+        const storePath = join(root, "opencode.db");
+        const store = new Database(storePath);
+        const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+        try {
+            store.exec(`
+                CREATE TABLE session_message(
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX session_message_session_seq_idx
+                    ON session_message(session_id, seq);
+                CREATE INDEX session_message_session_type_seq_idx
+                    ON session_message(session_id, type, seq);
+            `);
+            const insert = store.prepare(
+                "INSERT INTO session_message VALUES (?, ?, 'user', ?, ?, ?, ?)",
+            );
+            store.transaction(() => {
+                for (let ordinal = 1; ordinal <= 10_000; ordinal++) {
+                    const time = 1_800_000_000_000 + ordinal;
+                    insert.run(
+                        `message-${ordinal}`,
+                        sessionId,
+                        ordinal,
+                        time,
+                        time,
+                        JSON.stringify({
+                            text: `message ${ordinal} with enough content for the historian`,
+                            time: { created: time },
+                        }),
+                    );
+                }
+            })();
+
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 9_900,
+                    startMessageId: "message-1",
+                    endMessageId: "message-9900",
+                    title: "Prior history",
+                    content: "Previously published history.",
+                },
+            ]);
+            const snapshot: ProtectedTailBoundarySnapshot = {
+                sessionId,
+                mode: "incremental-runner",
+                offset: 9_901,
+                offsetMessageId: "message-9901",
+                protectedTailStart: 9_951,
+                protectedTailStartMessageId: "message-9951",
+                eligibleEndOrdinal: 9_951,
+                eligibleEndMessageId: "message-9950",
+                rawMessageCountAtTrigger: 10_000,
+                rawLastMessageIdAtTrigger: "message-10000",
+                N: 0,
+                usagePercentage: 90,
+                usageInputTokens: 90_000,
+                usageSource: "test",
+                contextLimit: 128_000,
+                executeThresholdPercentage: 65,
+                triggerBudget: 83_200,
+                priorBoundaryOrdinal: 9_951,
+                migrationFloorActive: false,
+                providerShapeVersion: "opencode-v2",
+                cacheNamespace: "test:v2-post-historian",
+                createdAt: Date.now(),
+                rawRangeFingerprint: "",
+                trueRawEligibleTokens: 10_000,
+                oversizeAtomicUnit: false,
+                boundaryReason: "test",
+            };
+            const output = `<output><compartments><compartment start="9901" end="9950" title="New history" episode_type="debug" importance="50"><p1>Newly published history.</p1><p2>New history.</p2><p3>New.</p3><p4>history</p4></compartment></compartments><meta><messages_processed>9901-9950</messages_processed><unprocessed_from>9951</unprocessed_from></meta></output>`;
+
+            resetV2StoreReaderDebugCounters({ captureQueries: true });
+            const boundedReader = createV2RawMessageReader(() => new V2StoreReader(storePath));
+            const unregister = setBoundedRawMessageProvider(
+                sessionId,
+                createV2RawMessageProvider(boundedReader, sessionId),
+            );
+            try {
+                await runWithLease({
+                    db,
+                    sessionId,
+                    snapshot,
+                    historianChunkTokens: 10_000,
+                    forceDrainQuota: true,
+                    memoryEnabled: false,
+                    output,
+                });
+            } finally {
+                unregister();
+            }
+            // History embedding runs even with memory off. It is
+            // fire-and-forget, so its "embeddings" stage log lands after the
+            // publish returns; one macrotask lets that background step finish
+            // (no provider is registered, so it does no embedding work).
+            await new Promise((resolve) => setTimeout(resolve, 0));
+
+            const counters = getV2StoreReaderDebugCounters();
+            expect(getCompartments(db, sessionId).at(-1)?.endMessage).toBe(9_950);
+            expect(counters.operations.history).toBeUndefined();
+            expect(counters.decodedRows).toBeLessThanOrEqual(110);
+            expect(counters.operations.messageExistsById?.calls).toBe(2);
+            expect(counters.operations.messageOrdinalById).toBeUndefined();
+            expect(counters.openReaders).toBe(0);
+            expect(counters.readersOpened).toBe(counters.readersClosed);
+            expect(counters.maxOpenReaders).toBe(1);
+
+            const stageLines = logSpy.mock.calls
+                .filter(([loggedSession]) => loggedSession === sessionId)
+                .map(([, message]) => String(message));
+            for (const stage of [
+                "parse",
+                "validate",
+                "dangling-boundary-check",
+                "post-publish-drops",
+                "publish-txn",
+                "embeddings",
+            ]) {
+                expect(
+                    stageLines.some(
+                        (line) =>
+                            line.includes(`stage=${stage}`) &&
+                            line.includes("status=completed") &&
+                            line.includes("elapsed="),
+                    ),
+                ).toBe(true);
+            }
+            expect(stageLines.some((line) => line.includes("range=9901-9950"))).toBe(true);
+
+            const rawTypes = [...RAW_MESSAGE_TYPES];
+            const plan = store
+                .prepare(`EXPLAIN QUERY PLAN ${V2_MESSAGE_PAGE_SQL}`)
+                .all(
+                    9_900,
+                    sessionId,
+                    ...rawTypes,
+                    9_899,
+                    sessionId,
+                    ...rawTypes,
+                    9_949,
+                    Number.MAX_SAFE_INTEGER,
+                    sessionId,
+                    ...rawTypes,
+                    32,
+                ) as Array<{ detail: string }>;
+            const sessionMessageSteps = plan
+                .map((row) => row.detail)
+                .filter((detail) => detail.includes("session_message"));
+            expect(sessionMessageSteps.length).toBeGreaterThan(0);
+            expect(sessionMessageSteps.every((detail) => detail.includes("SEARCH"))).toBe(true);
+            expect(
+                sessionMessageSteps.some((detail) => detail.includes("session_message_session")),
+            ).toBe(true);
+        } finally {
+            logSpy.mockRestore();
+            closeQuietly(store);
+            closeQuietly(db);
+            rmSync(root, { recursive: true, force: true });
         }
     });
 

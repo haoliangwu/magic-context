@@ -8,7 +8,7 @@
  *
  * Parsing contract:
  *   - We request `--format=%H%x1f%s%x1f%ae%x1f%ct%x1f%b%x1e`:
- *       %H = full 40-char SHA
+ *       %H = full object name (40 hex chars, or 64 in a SHA-256 repository)
  *       %s = subject (one line)
  *       %ae = author email
  *       %ct = committer time (seconds since epoch)
@@ -38,6 +38,8 @@ const GIT_TIMEOUT_MS = 10_000;
 const DEFAULT_MAX_COMMITS = 5000;
 const RECORD_SEPARATOR = "\x1e";
 const FIELD_SEPARATOR = "\x1f";
+/** A full SHA-1 (40 hex) or SHA-256 (64 hex) object name, as printed by `%H`. */
+const FULL_OBJECT_NAME = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
  * Why `git log` produced no commits, when it failed. `not_a_repo` and
@@ -62,7 +64,7 @@ export function classifyGitLogFailure(message: string): GitLogFailureKind {
 }
 
 export interface GitCommit {
-    /** Full 40-char SHA. */
+    /** Full object name: 40 hex chars, or 64 in a SHA-256 repository. */
     sha: string;
     /** First 7 chars of SHA for display. */
     shortSha: string;
@@ -81,6 +83,15 @@ export interface ReadGitCommitsOptions {
     branch?: string;
     /** Hard cap on returned commits. Default 5000. */
     maxCommits?: number;
+    /**
+     * Full name of a commit whose history is already indexed. Commits
+     * reachable from it are skipped, so an incremental read returns exactly
+     * the commits that became reachable since, including merged branch
+     * commits whose dates are older than anything indexed. Ignored when it
+     * is not a full object name; when the object no longer exists (rewritten
+     * and garbage-collected), the read falls back to no exclusion.
+     */
+    excludeReachableFrom?: string;
     /**
      * Project identity (`git:<sha>` / `dir:<hash>`) used ONLY for log
      * correlation. We never log the absolute `directory` — it carries the
@@ -119,9 +130,9 @@ export async function readGitCommitsResult(
     // would be parsed as a git OPTION (not a revision) since it sits ahead of
     // the format/since flags below. No shell is involved (execFile), so this
     // was never command injection — but the exported contract invites future
-    // untrusted `branch` callers. We can't use a `--` separator here because
-    // git treats everything after `--` as a PATHSPEC, not a revision, so we
-    // validate instead. (`HEAD`, `main`, `refs/heads/x`, `a1b2c3d` all pass.)
+    // untrusted `branch` callers. A `--` ahead of the revision would make git
+    // read it as a PATHSPEC, so we validate instead. (`HEAD`, `main`,
+    // `refs/heads/x`, `a1b2c3d` all pass.)
     const revision = options.branch ?? "HEAD";
     if (revision.startsWith("-")) {
         throw new Error(
@@ -132,9 +143,14 @@ export async function readGitCommitsResult(
     // absolute cwd (which carries the username + project name and lands in
     // doctor --issue reports).
     const projectLabel = options.projectIdentity ?? "<project>";
+    const exclusion =
+        options.excludeReachableFrom && FULL_OBJECT_NAME.test(options.excludeReachableFrom)
+            ? options.excludeReachableFrom
+            : null;
     const args = [
         "log",
         revision,
+        ...(exclusion ? [`^${exclusion}`] : []),
         "--no-merges",
         `--max-count=${options.maxCommits ?? DEFAULT_MAX_COMMITS}`,
         `--format=%H${FIELD_SEPARATOR}%s${FIELD_SEPARATOR}%ae${FIELD_SEPARATOR}%ct${FIELD_SEPARATOR}%b${RECORD_SEPARATOR}`,
@@ -144,10 +160,15 @@ export async function readGitCommitsResult(
         const iso = new Date(options.sinceMs).toISOString();
         args.push(`--since=${iso}`);
     }
+    // A trailing `--` with no paths after it tells git every argument above is
+    // a revision. Without it, a worktree file named like the revision (e.g.
+    // `HEAD`) fails with "ambiguous argument" on every sweep.
+    args.push("--");
 
     let stdout: string;
     try {
         const result = await execFileAsync("git", args, {
+            windowsHide: true,
             cwd: directory,
             timeout: GIT_TIMEOUT_MS,
             // Default buffer is 1MB; bump to 32MB for large repos. Commits are
@@ -164,6 +185,14 @@ export async function readGitCommitsResult(
         // We DO log the reason though — a silent empty-result masked a real
         // cwd / PATH / timeout bug during the v0.14 git-commits rollout.
         const message = error instanceof Error ? error.message : String(error);
+        if (exclusion && message.includes("bad object")) {
+            // The excluded commit is gone, so it no longer bounds anything:
+            // read the full window and let the upsert skip known commits.
+            log(
+                `[git-commits] indexed tip ${exclusion.slice(0, 7)} is missing for ${projectLabel}; reading the full window`,
+            );
+            return readGitCommitsResult(directory, { ...options, excludeReachableFrom: undefined });
+        }
         const failure = classifyGitLogFailure(message);
         if (failure === "transient") {
             log(
@@ -216,7 +245,7 @@ export function parseGitLogOutput(stdout: string): GitCommit[] {
         const timeSec = Number.parseInt(fields[3].trim(), 10);
         const body = fields[4].trim();
 
-        if (sha.length !== 40 || !Number.isFinite(timeSec) || timeSec <= 0) {
+        if (!FULL_OBJECT_NAME.test(sha) || !Number.isFinite(timeSec) || timeSec <= 0) {
             continue;
         }
 

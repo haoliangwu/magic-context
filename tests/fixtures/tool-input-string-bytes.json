@@ -1,0 +1,135 @@
+{
+  "description": "Shared cross-lane fixture: the size of a dropped tool call's input is the total UTF-8 byte length of every string value in it, recursively through objects and arrays. Keys, numbers, booleans and nulls do not count. An input of at most max_small_bytes keeps its real arguments when dropped inside the newest-call window; a larger one is removed.",
+  "max_small_bytes": 1024,
+  "cases": [
+    {
+      "name": "empty object",
+      "input": {},
+      "expected_bytes": 0,
+      "expected_small": true
+    },
+    {
+      "name": "flat ascii",
+      "input": {
+        "command": "ls -la"
+      },
+      "expected_bytes": 6,
+      "expected_small": true
+    },
+    {
+      "name": "keys, numbers, booleans and nulls do not count",
+      "input": {
+        "a": 1,
+        "b": true,
+        "c": null,
+        "d": 1.5,
+        "long_key_name_here": false
+      },
+      "expected_bytes": 0,
+      "expected_small": true
+    },
+    {
+      "name": "two-byte utf-8",
+      "input": {
+        "text": "héllo"
+      },
+      "expected_bytes": 6,
+      "expected_small": true
+    },
+    {
+      "name": "three-byte utf-8",
+      "input": {
+        "s": "日本"
+      },
+      "expected_bytes": 6,
+      "expected_small": true
+    },
+    {
+      "name": "four-byte utf-8 (emoji)",
+      "input": {
+        "s": "😀"
+      },
+      "expected_bytes": 4,
+      "expected_small": true
+    },
+    {
+      "name": "nested arrays and objects",
+      "input": {
+        "a": [
+          [
+            "x",
+            "yy"
+          ],
+          {
+            "b": [
+              "zzz",
+              7,
+              null
+            ]
+          }
+        ],
+        "n": [
+          1,
+          2
+        ]
+      },
+      "expected_bytes": 6,
+      "expected_small": true
+    },
+    {
+      "name": "top-level string",
+      "input": "abc",
+      "expected_bytes": 3,
+      "expected_small": true
+    },
+    {
+      "name": "top-level array",
+      "input": [
+        "a",
+        [
+          "bc",
+          {
+            "d": "é"
+          }
+        ]
+      ],
+      "expected_bytes": 5,
+      "expected_small": true
+    },
+    {
+      "name": "exactly 1024 ascii bytes",
+      "input": {
+        "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected_bytes": 1024,
+      "expected_small": true
+    },
+    {
+      "name": "1025 ascii bytes",
+      "input": {
+        "content": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expected_bytes": 1025,
+      "expected_small": false
+    },
+    {
+      "name": "exactly 1024 bytes of two-byte characters",
+      "input": {
+        "content": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+      },
+      "expected_bytes": 1024,
+      "expected_small": true
+    },
+    {
+      "name": "1025 bytes split across keys",
+      "input": {
+        "content": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+        "more": [
+          "x"
+        ]
+      },
+      "expected_bytes": 1025,
+      "expected_small": false
+    }
+  ]
+}

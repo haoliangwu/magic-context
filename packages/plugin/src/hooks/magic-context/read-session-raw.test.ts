@@ -88,7 +88,11 @@ describe("raw session point lookup", () => {
             const pointMs = performance.now() - pointStartedAt;
 
             expect(target?.parts).toHaveLength(2);
-            expect(pointMs).toBeLessThan(scanMs);
+            // The query plans above are the proof that the point lookup never scans.
+            // The wall-clock comparison is only meaningful on a quiet machine: under
+            // load a single 100k-part scan can finish in a few milliseconds while an
+            // unrelated scheduler stall lands on the point lookup, so it is opt-in.
+            if (process.env.MC_PERF_GATE) expect(pointMs).toBeLessThan(scanMs);
         } finally {
             closeQuietly(db);
         }

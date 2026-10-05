@@ -8,8 +8,11 @@ type OpencodeClient = PluginContext["client"];
 /**
  * Age-gated backstop for internal children that carry raw user or project text.
  *
- * A settled prompt deletes its child inline. A timeout, abort, or client error can
- * leave OpenCode's server loop writing, so unsettled rows remain for this sweep.
+ * Unless retention is enabled, a settled prompt deletes its child inline. A
+ * timeout, abort, or client error can leave OpenCode's server loop writing, so
+ * unsettled rows are archived and remain for this sweep. With retention enabled,
+ * only archived privacy-sensitive rows are eligible; settled children accumulate
+ * until the operator clears them manually.
  *
  * CONCURRENCY: `session.delete` has no cross-process "active session" lease (OC
  * peer confirmed), so the ONLY safe filter is AGE — a child older than any
@@ -182,7 +185,9 @@ export async function sweepOrphanedRetrospectiveChildren(args: {
                 predicateParams,
             );
             if (!privacyTitles) return 0;
-            agePredicates.push(`(${requestedTitles} AND ${privacyTitles} AND time_created < ?)`);
+            agePredicates.push(
+                `(${requestedTitles} AND ${privacyTitles} AND time_archived IS NOT NULL AND time_created < ?)`,
+            );
         } else {
             agePredicates.push(`(${requestedTitles} AND time_created < ?)`);
         }
@@ -193,7 +198,9 @@ export async function sweepOrphanedRetrospectiveChildren(args: {
             predicateParams,
         );
         if (privacyTitles) {
-            agePredicates.push(`(${privacyTitles} AND time_created < ?)`);
+            const archivedOnly =
+                args.keepSubagents === true ? " AND time_archived IS NOT NULL" : "";
+            agePredicates.push(`(${privacyTitles}${archivedOnly} AND time_created < ?)`);
             predicateParams.push(now - args.staleMs.privacy);
         }
         if (args.keepSubagents !== true) {

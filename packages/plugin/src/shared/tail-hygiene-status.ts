@@ -58,8 +58,16 @@ export function resolveTailHygieneStatus(
     };
 }
 
+/**
+ * The reclaimable share and the two masses it is computed from.
+ *
+ * The tokenizer calibration makes `u` and `t` fractional, but a token count is
+ * a whole number to the reader: `63,063.522 tok` reads as a measurement error,
+ * not as precision. Both masses are rounded here, at the one formatter every
+ * host prints, so the dialog, the sidebar and Pi cannot disagree.
+ */
 export function formatTailHygiene(status: TailHygieneStatus): string {
     const percentage = (status.severity * 100).toFixed(1);
     const state = status.evaluable ? "" : " · held until baseline refresh";
-    return `${percentage}% · ${status.u.toLocaleString()} / ${status.t.toLocaleString()} tok${state}`;
+    return `${percentage}% · ${Math.round(status.u).toLocaleString()} / ${Math.round(status.t).toLocaleString()} tok${state}`;
 }

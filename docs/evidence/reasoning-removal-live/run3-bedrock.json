@@ -1,0 +1,81 @@
+{
+  "runAt": "2026-10-01T08:48:08.740Z",
+  "callCap": 21,
+  "used": 1,
+  "results": [
+    {
+      "scenario": "bedrock-haiku-4-5:age",
+      "route": "bedrock-haiku-4-5",
+      "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "hostVersion": "1.18.30",
+      "pluginCommit": "7e61ac82fd4af47c6faf9e90d78dd34763daedc7",
+      "startedAt": "2026-10-01T08:47:18.911Z",
+      "finishedAt": "2026-10-01T08:48:08.727Z",
+      "outcome": "aborted",
+      "abortReason": "provider rejected call 1",
+      "calls": [
+        {
+          "index": 1,
+          "at": "2026-10-01T08:48:05.464Z",
+          "phase": "turn-1",
+          "path": "/model/us.anthropic.claude-haiku-4-5-20251001-v1%3A0/converse-stream",
+          "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"Message\":\"[REDACTED] has expired\"}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 45941,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "additionalModelRequestFields": {
+                "thinking": {
+                  "type": "enabled",
+                  "budget_tokens": 1024
+                }
+              }
+            }
+          },
+          "durationMs": 607
+        }
+      ],
+      "removalLog": [
+        "[2026-10-01T08:48:00.073Z] [magic-context][ses_f0959dffcffeJkNit2UvEnqGqi] transform stage: stage=getDroppedTagsByNumbers elapsed=0.3ms targets=1 fetched=0",
+        "[2026-10-01T08:48:00.223Z] [magic-context][ses_f0959dffcffeJkNit2UvEnqGqi] pending ops WILL APPLY — reason=m0_hard_fold (drain folded into executed m[0] bust, scheduler=defer), pendingOps=0, context=16.5%",
+        "[2026-10-01T08:48:00.227Z] [magic-context][ses_f0959dffcffeJkNit2UvEnqGqi] transform stage: stage=applyPendingOperations elapsed=3.4ms",
+        "[2026-10-01T08:48:00.230Z] [magic-context][ses_f0959dffcffeJkNit2UvEnqGqi] transform stage: stage=applyHeuristicCleanup elapsed=3.5ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0"
+      ],
+      "isolation": {
+        "dbFiles": [
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db",
+          "/private<root>/data/cortexkit/magic-context/context.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal"
+        ],
+        "rootRemoved": true
+      },
+      "summary": {
+        "loopCalls": 1,
+        "rejectedCalls": 1,
+        "firstRemovalCall": null,
+        "acceptedAfterRemoval": null,
+        "callsAfterRemoval": 0,
+        "before": null,
+        "after": null
+      }
+    }
+  ]
+}

@@ -9,18 +9,19 @@
  *
  * Tolerant of the `§N§` tag notation the agent sees in the transcript: a model
  * frequently copies the markers verbatim (e.g. `§302§-§380§`) instead of the bare
- * numbers. Since `§` (U+00A7) is never legitimate in a numeric range, we strip it
- * up front and accept the numbers rather than erroring — the markers are exactly
- * the identifiers we want to drop anyway.
+ * numbers. Copied tag handles, prose references (`tag 12`), and dropped
+ * placeholders are normalized before parsing the list and its range endpoints.
  *
  * @throws {Error} on empty string, non-numeric input, reversed ranges, or ranges exceeding 1000 elements
  */
 export function parseRangeString(input: string): number[] {
     const maxRangeElements = 1000;
-    // Strip the §N§ tag markers the agent sees in the transcript (it commonly
-    // pastes them back verbatim). § has no meaning in a range, so this is safe
-    // and unambiguous: "§302§-§380§" → "302-380", "§5§" → "5".
-    const trimmed = input.replace(/§/g, "").trim();
+    // Normalize copied handles before splitting numeric lists and ranges.
+    const trimmed = input
+        .replace(/\[dropped\s+§(\d+)§\]/g, "$1")
+        .replace(/tag\s+(\d+)/g, "$1")
+        .replace(/§(\d+)§?/g, "$1")
+        .trim();
 
     if (trimmed === "") {
         throw new Error("Range string must not be empty");

@@ -9,8 +9,11 @@ import {
     stripUnsafeProjectConfigFields,
 } from "@magic-context/core/config/project-security";
 import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
-import { MagicContextConfigSchema } from "@magic-context/core/config/schema/magic-context";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
+import {
+    formatDreamerTickFailure,
+    getDreamerTickFailure,
+} from "@magic-context/core/features/magic-context/dreamer/tick-failure";
 import {
     type EmbeddingProbeOutcome,
     probeEmbeddingEndpoint,
@@ -37,6 +40,12 @@ import {
     sanitizeParsedJson,
 } from "@magic-context/core/shared/jsonc-parser";
 import { loadPiConfig } from "@magic-context/pi-core/config";
+import {
+    findEmptyPiModelChains,
+    formatEmptyPiModelChain,
+    isPiModelRegistered,
+    runnablePiModelChains,
+} from "@magic-context/pi-core/model-chain-health";
 import { parse as parseCommentJson, stringify as stringifyJsonc } from "comment-json";
 
 import { writeFileAtomic } from "../lib/atomic-write";
@@ -73,6 +82,7 @@ import {
 } from "../lib/paths";
 import {
     detectPiBinary,
+    getAvailableModels,
     getPiVersion,
     PI_PACKAGE_SOURCE,
     type PiBinaryInfo,
@@ -128,6 +138,8 @@ interface DoctorDeps {
     collectDiagnostics: typeof collectDiagnostics;
     detectPiBinary: () => PiBinaryInfo | null;
     getPiVersion: (piPath: string) => string | null;
+    /** `provider/model` ids from `pi --list-models`; empty when the list is unavailable. */
+    listPiModels: (piPath: string) => string[];
     getLatestNpmVersion: () => string | null;
     selfVersion: () => string;
     probeEmbeddingEndpoint: typeof probeEmbeddingEndpoint;
@@ -152,6 +164,7 @@ const DEFAULT_DEPS: DoctorDeps = {
     collectDiagnostics,
     detectPiBinary,
     getPiVersion,
+    listPiModels: getAvailableModels,
     getLatestNpmVersion: () => getLatestNpmVersion(PACKAGE_NAME),
     selfVersion,
     probeEmbeddingEndpoint,
@@ -210,6 +223,7 @@ function selfVersion(): string {
 function getLatestNpmVersion(packageName: string): string | null {
     try {
         return execFileSync("npm", ["view", packageName, "version"], {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "ignore"],
             timeout: 10_000,
@@ -515,6 +529,58 @@ function findPiMagicContextCacheDirs(
     return [...found.values()];
 }
 
+/**
+ * Check the historian and scheduled dreamer model chains against the models
+ * Pi lists. Magic Context drops every configured model Pi does not register,
+ * and a chain left empty never runs (the historian then stops summarising
+ * sessions without any other sign), so each dropped model is named with the
+ * closest model Pi does list.
+ */
+function checkPiModelChains(
+    results: CheckResult[],
+    pi: PiBinaryInfo | null,
+    config: ReturnType<typeof loadPiConfig>["config"],
+    deps: DoctorDeps,
+): void {
+    const chains = runnablePiModelChains(config, "pi");
+    if (chains.length === 0) return;
+    const listed = pi ? deps.listPiModels(pi.path) : [];
+    if (listed.length === 0) {
+        add(
+            results,
+            "info",
+            "Historian/dreamer model chains not checked: `pi --list-models` returned no models",
+        );
+        return;
+    }
+    const models = listed.flatMap((entry) => {
+        const separator = entry.indexOf("/");
+        return separator > 0
+            ? [{ provider: entry.slice(0, separator), id: entry.slice(separator + 1) }]
+            : [];
+    });
+    const registry = {
+        find: (provider: string, id: string) =>
+            models.find((model) => model.provider === provider && model.id === id),
+        getAll: () => models,
+    };
+    const empty = findEmptyPiModelChains({ config, registry, harness: "pi" });
+    for (const chain of empty) {
+        add(
+            results,
+            chain.owner === "historian" ? "fail" : "warn",
+            `Pi ${chain.owner === "historian" ? "historian" : `dreamer task ${chain.owner}`} has no model Pi lists, so it will not run: ${formatEmptyPiModelChain(chain)}`,
+        );
+    }
+    const historian = chains.find((chain) => chain.owner === "historian");
+    if (historian && !empty.some((chain) => chain.owner === "historian")) {
+        const usable = historian.chain
+            .map((entry) => (typeof entry === "string" ? entry : entry.model))
+            .filter((model) => isPiModelRegistered(model, registry, "pi"));
+        add(results, "pass", `Pi historian model chain resolves: ${usable.join(", ")}`);
+    }
+}
+
 async function runHealthChecks(options: {
     cwd: string;
     prompts: PromptIO;
@@ -674,6 +740,8 @@ async function runHealthChecks(options: {
         );
     }
 
+    checkPiModelChains(results, pi, loadedConfig.config, options.deps);
+
     const storage = getMagicContextStorageResolution();
     const storageDir = storage.path;
     const dbPath = join(storageDir, "context.db");
@@ -724,6 +792,9 @@ async function runHealthChecks(options: {
                 for (const stall of listShadowBackfillStalls(db)) {
                     add(results, "warn", formatShadowBackfillStall(stall));
                 }
+                const tickFailure = getDreamerTickFailure(db);
+                if (tickFailure) add(results, "warn", formatDreamerTickFailure(tickFailure));
+                else add(results, "pass", "Background maintenance completed its last pass");
             }
         } catch (error) {
             if (error instanceof UnsupportedSchemaVersionError) {
@@ -877,7 +948,7 @@ async function runHealthChecks(options: {
                 { isBun: false, isElectron: false },
             );
             if (runtime.state === "wasm-selected") {
-                add(results, "info", formatLocalEmbeddingRuntimeWasmSelected(runtime));
+                add(results, "warn", formatLocalEmbeddingRuntimeWasmSelected(runtime));
                 runtimeReported = true;
                 break;
             }
@@ -1031,10 +1102,11 @@ async function runHealthChecks(options: {
 
 function writeDefaultMagicContextConfig(path: string): void {
     mkdirSync(dirname(path), { recursive: true });
+    // Only the editor schema reference: writing every schema default explicitly
+    // would pin those values, so later default changes would never take effect.
     const config = {
         $schema:
             "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
-        ...MagicContextConfigSchema.parse({}),
     };
     writeFileAtomic(path, `${stringifyJsonc(config, null, 2)}\n`);
 }
@@ -1091,6 +1163,7 @@ function repair(plan: RepairPlan, prompts: PromptIO): number {
 function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult {
     if (args[0] === "issue") {
         const result = deps.spawnSync("gh", args, {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "pipe"],
         });
@@ -1103,6 +1176,7 @@ function runGhCommandWithDeps(deps: DoctorDeps, args: string[]): GhCommandResult
 
     try {
         const output = deps.execFileSync("gh", args, {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "pipe"],
         });

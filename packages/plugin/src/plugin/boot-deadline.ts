@@ -1,3 +1,5 @@
+import { startBootDeadline } from "../shared/off-thread-migration-clock";
+
 export type BootPhaseResult<T> =
     | { status: "completed"; value: T; elapsedMs: number }
     | {
@@ -76,19 +78,20 @@ export async function runBootPhaseWithDeadline<T>(
     deadlineDescription = `its ${timeoutMs}ms deadline`,
 ): Promise<BootPhaseResult<T>> {
     const startedAt = performance.now();
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    // Schema migrations run on a worker thread; their time is not counted here,
+    // so a long first-start upgrade still finishes with Magic Context enabled.
+    const deadline = startBootDeadline(timeoutMs, () =>
+        report(
+            `[magic-context] boot phase '${phase}' reached ${deadlineDescription} while a schema migration runs off the main thread; waiting for the migration, which does not count against the deadline`,
+        ),
+    );
     const running = Promise.resolve().then(operation);
-    const timeout = new Promise<BootPhaseResult<T>>((resolve) => {
-        timer = setTimeout(
-            () => {
-                const elapsedMs = performance.now() - startedAt;
-                report(
-                    `[magic-context] boot phase '${phase}' exceeded ${deadlineDescription}; host startup will continue with Magic Context fail-closed`,
-                );
-                resolve({ status: "timed_out", elapsedMs, pending: running });
-            },
-            Math.max(0, timeoutMs),
+    const timeout = deadline.expired.then<BootPhaseResult<T>>(() => {
+        const elapsedMs = performance.now() - startedAt;
+        report(
+            `[magic-context] boot phase '${phase}' exceeded ${deadlineDescription}; host startup will continue with Magic Context fail-closed`,
         );
+        return { status: "timed_out", elapsedMs, pending: running };
     });
     const completed = running.then<BootPhaseResult<T>>((value) => ({
         status: "completed",
@@ -107,7 +110,7 @@ export async function runBootPhaseWithDeadline<T>(
         }
         return result;
     } finally {
-        if (timer) clearTimeout(timer);
+        deadline.cancel();
     }
 }
 

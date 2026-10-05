@@ -1,8 +1,16 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import { V2StoreReader, gaDatabasePath } from '../../plugin/src/v2/store-reader';
 import { TestHarness } from "../src/harness";
-import { buildMockHistorianPayload } from "../src/mock-historian";
+import { OpenCode2TestHarness } from '../src/opencode2-harness';
+import {
+    createScenarioHarness,
+    forEachHost,
+    isPiFamily,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
+import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
 
 /**
  * Plan v6: deferred compaction marker — publish-time persistence and
@@ -61,66 +69,46 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
     return false;
 }
 
-function findOrdinalRange(
-    body: Record<string, unknown>,
-): { start: number; end: number } | null {
-    const messages = body.messages as
-        | Array<{ role: string; content: unknown }>
-        | undefined;
-    if (!messages) return null;
-    for (const m of messages) {
-        const contentArr = Array.isArray(m.content) ? m.content : [];
-        for (const block of contentArr) {
-            const text = (block as { text?: string }).text;
-            if (!text || !text.includes("<new_messages>")) continue;
-            const matches = text.matchAll(/\[(\d+)\]/g);
-            const nums: number[] = [];
-            for (const mm of matches) nums.push(Number(mm[1]));
-            if (nums.length === 0) continue;
-            return { start: Math.min(...nums), end: Math.max(...nums) };
-        }
-    }
-    return null;
-}
-
 interface PendingRow {
     pending_compaction_marker_state: string | null;
     compaction_marker_state: string | null;
 }
 
-function readMarkerState(h: TestHarness, sessionId: string): PendingRow | null {
+function readMarkerState(h: ScenarioHarness, sessionId: string): PendingRow | null {
+    const pendingColumn = isPiFamily(h.host)
+        ? "pending_pi_compaction_marker_state"
+        : "pending_compaction_marker_state";
     const row = h
         .contextDb()
         .prepare(
-            "SELECT pending_compaction_marker_state, compaction_marker_state FROM session_meta WHERE session_id = ?",
+            `SELECT ${pendingColumn} AS pending_compaction_marker_state, compaction_marker_state FROM session_meta WHERE session_id = ?`,
         )
         .get(sessionId) as PendingRow | null;
     return row;
 }
 
-let h: TestHarness;
+forEachHost(import.meta.url, "deferred compaction marker (plan v6)", (host) => {
+    let h: ScenarioHarness;
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            execute_threshold_percentage: 40,
-        },
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: {
+                execute_threshold_percentage: 40,
+            },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("deferred compaction marker (plan v6)", () => {
-    it("writes pending blob in-tx on publish and holds it across defer passes", async () => {
+    afterAll(async () => {
+        await h.dispose();
+    });
+    it(host === "opencode2" ? "publishes a compartment and supplies a durable native checkpoint without a provider call" : "writes pending blob in-tx on publish and holds it across defer passes", async () => {
             h.mock.reset();
 
             // Mock historian: return a valid response that covers the actual
             // chunk range we receive.
             h.mock.addMatcher((body) => {
                 if (!isHistorianRequest(body)) return null;
-                const range = findOrdinalRange(body);
+                const range = findHistorianOrdinalRange(body);
                 if (!range) {
                     return {
                         text: "<output><compartments></compartments><facts></facts><unprocessed_from>1</unprocessed_from></output>",
@@ -199,10 +187,27 @@ describe("deferred compaction marker (plan v6)", () => {
             await h.sendPrompt(sessionId, "turn 12: post-trigger follow-up.");
 
             // ── ASSERTION 1: pending blob populated after publish ─────────
-        if (RUST_MODE) {
+        if (h instanceof OpenCode2TestHarness) {
+            await h.waitFor(() => h.countCompartments(sessionId) > 0, { timeoutMs: 30_000, label: "historian publication before native fold" });
+            expect(readMarkerState(h, sessionId)?.pending_compaction_marker_state).toBeNull();
+            const before = h.mock.requests().length;
+            await h.compactSession(sessionId);
+            expect(h.mock.requests().length).toBe(before);
+            const reader = new V2StoreReader(gaDatabasePath(h.dataDir, "latest", h.opencode.env));
+            try {
+                const checkpoint = reader.latestCompaction(sessionId);
+                expect(checkpoint?.data.status).toBe("completed");
+                expect(checkpoint?.data.summary).toContain("<session-history>");
+            } finally { reader.close(); }
+            await h.sendPrompt(sessionId, "small defer turn — native checkpoint remains visible");
+            expect(JSON.stringify(h.mock.lastRequest()?.body)).toContain("<conversation-checkpoint>");
+        } else if (RUST_MODE) {
             // a5b7d61d moved Rust publication and its pending delta into the
             // module transaction. `pending_m1_delta` is the authority-level
             // equivalent of the legacy context.db marker blob.
+            if (!(h instanceof TestHarness)) {
+                throw new Error("Rust marker check requires the OpenCode 1 hermetic module stack");
+            }
             const stack = h.rustStack;
             if (!stack)
                 throw new Error("Rust marker check requires the hermetic module stack");
@@ -211,7 +216,7 @@ describe("deferred compaction marker (plan v6)", () => {
             while (Date.now() < deadline) {
                 afterPublish = await stack.moduleStatus(
                     sessionId,
-                    h.opencode.env.workdir,
+                    h.workdir,
                     "session.status",
                 );
                 if (
@@ -228,7 +233,7 @@ describe("deferred compaction marker (plan v6)", () => {
             await h.sendPrompt(sessionId, "small defer turn — no mutation expected");
             const pendingAfter = await stack.moduleStatus(
                 sessionId,
-                h.opencode.env.workdir,
+                h.workdir,
                 "session.status",
             );
             const unchanged = pendingAfter.pending_m1_delta === true;

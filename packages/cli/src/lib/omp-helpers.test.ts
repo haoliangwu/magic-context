@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { writeTestExecutable } from "@magic-context/core/shared/test-fake-executable";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import {
     detectOmpBinary,
     getOmpCommandInvocation,
@@ -29,18 +31,17 @@ afterEach(() => {
 describe("OMP binary discovery", () => {
     /** A real OMP package root plus a fake `bun` on PATH; HOME has no OMP. */
     function makePackageRoot(): { root: string; binDir: string } {
-        const root = mkdtempSync(join(tmpdir(), "mc-omp-package-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-omp-package-"));
         roots.push(root);
-        const binDir = join(root, "bin");
         mkdirSync(join(root, "pkg", "dist"), { recursive: true });
-        mkdirSync(binDir, { recursive: true });
         writeFileSync(
             join(root, "pkg", "package.json"),
             JSON.stringify({ name: "@oh-my-pi/pi-coding-agent" }),
         );
         writeFileSync(join(root, "pkg", "dist", "cli.js"), "");
-        writeFileSync(join(binDir, "bun"), "#!/bin/sh\n");
-        chmodSync(join(binDir, "bun"), 0o755);
+        // The fake bun is a shared content-addressed stub alone in its directory
+        // (see writeTestExecutable), so it is not under `root` and not removed per test.
+        const binDir = dirname(writeTestExecutable("bun", "#!/bin/sh\n"));
         process.env.HOME = join(root, "home");
         process.env.PI_PACKAGE_DIR = join(root, "pkg");
         return { root, binDir };

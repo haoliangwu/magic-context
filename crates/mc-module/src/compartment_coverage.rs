@@ -51,11 +51,12 @@ pub struct M0ContentEpoch {
     /// the shared-category policy): a wholesale change to which foreign memories are
     /// visible.
     pub workspace_fingerprint: String,
-    /// The session-upgrade migration state. A session upgrade re-evaluates the whole
-    /// memory pool into the current taxonomy; the resulting wholesale rewrite changes it.
+    /// Whether this session's compartments are still in the pre-v2 layout or have been
+    /// rebuilt into the current one. Crossing that line rewrites the rendered history
+    /// wholesale, so m0 must refold rather than serve the old format.
     pub upgrade_state: String,
     /// The EXTERNAL project-memory epoch — bumped ONLY by an out-of-process editor
-    /// (the dashboard) or a session-upgrade migration. An external edit is the one
+    /// (the dashboard). An external edit is the one
     /// memory change the module can't see as a discrete mutation-log row (the editor
     /// didn't queue one), so it signals via this wholesale counter and forces a HARD.
     /// In-session memory mutations do NOT touch this — they ride the m1 correction delta

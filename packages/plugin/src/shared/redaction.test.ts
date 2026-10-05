@@ -2,7 +2,12 @@
 
 import { describe, expect, test } from "bun:test";
 
-import { hasShareabilitySensitiveText, redactSecretText } from "./redaction";
+import {
+    hasShareabilitySensitiveText,
+    isSecretKey,
+    redactSecretText,
+    sanitizeConfigValue,
+} from "./redaction";
 
 describe("redactSecretText — token counts and scalar diagnostics stay visible", () => {
     test("keeps numeric/boolean values whose key merely contains a secret word", () => {
@@ -80,5 +85,50 @@ describe("hasShareabilitySensitiveText", () => {
     test("a public IP / port alone is not flagged by the private-range rules", () => {
         // 8.8.8.8 is public; no private-range or localhost pattern should match.
         expect(hasShareabilitySensitiveText("DNS resolver at 8.8.8.8")).toBe(false);
+    });
+});
+
+describe("redaction gaps: unambiguous secret key names and header/URL credentials", () => {
+    test("object keys naming a password, secret, credential or ID token are redacted", () => {
+        for (const key of [
+            "db_password",
+            "id_token",
+            "secret_value",
+            "smtp_password",
+            "aws_credentials",
+        ]) {
+            expect(isSecretKey(key)).toBe(true);
+            expect(sanitizeConfigValue({ [key]: "hunter2-value" })).toEqual({
+                [key]: expect.stringContaining("<REDACTED:"),
+            });
+        }
+    });
+
+    test("ambiguous key/token compounds that are counts or labels stay visible", () => {
+        for (const key of [
+            "max_tokens",
+            "input_tokens",
+            "cache_key",
+            "sort_key",
+            "password_min_length",
+        ]) {
+            expect(isSecretKey(key)).toBe(false);
+        }
+    });
+
+    test("URL userinfo credentials are redacted", () => {
+        const redacted = redactSecretText(
+            "connecting to https://alice:s3cretPass@db.example.com/x",
+        );
+        expect(redacted).not.toContain("s3cretPass");
+        expect(redacted).toContain("db.example.com");
+    });
+
+    test("Basic authorization and API-key headers are redacted", () => {
+        const basic = redactSecretText("Authorization: Basic YWxpY2U6czNjcmV0UGFzcw==");
+        expect(basic).not.toContain("YWxpY2U6czNjcmV0UGFzcw==");
+        const apiKey = redactSecretText("x-api-key: live_9f8e7d6c5b4a3");
+        expect(apiKey).not.toContain("live_9f8e7d6c5b4a3");
+        expect(apiKey).toContain("x-api-key");
     });
 });

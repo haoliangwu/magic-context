@@ -49,8 +49,13 @@
  * next transform, and the historian actually clears the flag.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createFreshSession,
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
@@ -68,26 +73,23 @@ interface SessionMetaRow {
     detected_context_limit: number | null;
 }
 
-let h: TestHarness;
+forEachHost(import.meta.url, "context overflow recovery", (host) => {
+    let h: ScenarioHarness;
 
-beforeAll(async () => {
-    // modelContextLimit is what the plugin *believes* — the default. The
-    // mock provider then tells it the real limit is smaller via the overflow
-    // error (matching the issue #32 scenario where lemonade accepts the
-    // request at the plugin's default 128k but rejects somewhere under that).
-    h = await TestHarness.create({
-        modelContextLimit: 128_000,
-        magicContextConfig: {
-            execute_threshold_percentage: 40,
-        },
+    beforeAll(async () => {
+        // The host starts with 128K, then the mock reports the smaller real
+        // provider limit through the overflow response.
+        h = await createScenarioHarness(host, {
+            modelContextLimit: 128_000,
+            magicContextConfig: {
+                execute_threshold_percentage: 40,
+            },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("context overflow recovery", () => {
+    afterAll(async () => {
+        await h.dispose();
+    });
     it(
         "detects provider overflow, persists real limit, triggers emergency recovery, clears flag on historian success",
         async () => {
@@ -157,7 +159,7 @@ describe("context overflow recovery", () => {
                 };
             });
 
-            const sessionId = await h.createSession();
+            const sessionId = await createFreshSession(h);
 
             // Build a few turns of history so historian has something to
             // compartmentalize once triggered.
@@ -263,7 +265,13 @@ describe("context overflow recovery", () => {
                     // doomed shape: the fail-closed transform must interrupt the
                     // run before OpenCode emits another main-model request.
                     // Historian traffic is counted separately by the matcher above.
-                    expect(mainCalls).toBe(mainCallsBeforeFollowup);
+                    if (h.host === "pi" || h.host === "omp") {
+                        // Pi's extension surface has no turn-abort primitive, so
+                        // it must forward the best-effort reduced request.
+                        expect(mainCalls).toBe(mainCallsBeforeFollowup + 1);
+                    } else {
+                        expect(mainCalls).toBe(mainCallsBeforeFollowup);
+                    }
                 }
                 // Otherwise the recovery pass force-fired the historian, blocked
                 // until it published, and the fold materialized in that same pass
@@ -302,7 +310,7 @@ describe("context overflow recovery", () => {
                     },
                 );
             } catch (err) {
-                const stderrTail = h.opencode.stderr().slice(-2000);
+                const stderrTail = h.diagnostics().slice(-2000);
                 const currentState = readState();
                 throw new Error(
                     `overflow recovery did not complete: ${String(err)}\n` +
@@ -339,7 +347,7 @@ describe("context overflow recovery", () => {
                 };
             });
 
-            const sessionId = await h.createSession();
+            const sessionId = await createFreshSession(h);
 
             try {
                 await h.sendPrompt(sessionId, "this will rate-limit", { timeoutMs: 15_000 });

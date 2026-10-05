@@ -217,7 +217,7 @@ describe("maybeChannel1ReminderForToolResult", () => {
 		expect(block?.type).toBe("text");
 		expect(block?.text).toContain("<system-reminder>");
 		expect(block?.text).toContain(
-			"Housekeeping backlog: spent tool outputs (~90k tokens) are reclaimable",
+			"spent tool outputs (~90k tokens) are still unstamped. Call ctx_reduce now, before your next tool call",
 		);
 		clearPiChannel1State(SESSION);
 	});
@@ -360,8 +360,8 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			toolName: "bash",
 			content: [{ type: "text", text: "first output" }],
 		});
-		expect(first?.text).toContain("Housekeeping:");
-		expect(first?.text).not.toContain("Reminder:");
+		expect(first?.text).toContain("Make a ctx_reduce pass now");
+		expect(first?.text).not.toContain("Still unstamped:");
 
 		expect(
 			maybeChannel1ReminderForToolResult({
@@ -397,8 +397,8 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			toolName: "bash",
 			content: [{ type: "text", text: "regrown" }],
 		});
-		expect(regrown?.text).toContain("Reminder:");
-		expect(regrown?.text).not.toContain("a ctx_reduce pass is due");
+		expect(regrown?.text).toContain("Still unstamped:");
+		expect(regrown?.text).not.toContain("before your next tool call");
 		clearPiChannel1State(SESSION);
 	});
 
@@ -508,7 +508,7 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			content: [{ type: "text", text: "first output" }],
 		});
 		expect(first?.text).toContain(
-			"Housekeeping: spent tool outputs (~50k tokens)",
+			"spent tool outputs (~50k tokens) are reclaimable. Make a ctx_reduce pass now",
 		);
 		expect(
 			db
@@ -556,9 +556,9 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			content: [{ type: "text", text: "five turns later" }],
 		});
 		expect(sticky?.text).toContain(
-			"Reminder: spent tool outputs (~110k tokens) are still reclaimable",
+			"Still unstamped: spent tool outputs (~110k tokens). Stamp the ones you've used",
 		);
-		expect(sticky?.text).not.toContain("a ctx_reduce pass is due");
+		expect(sticky?.text).not.toContain("before your next tool call");
 
 		setPiChannel1Baseline(SESSION, baseline(120_000, 180_000, 6));
 		const escalation = maybeChannel1ReminderForToolResult({
@@ -568,9 +568,11 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			content: [{ type: "text", text: "fourth output" }],
 		});
 		expect(escalation?.text).toContain(
-			"Housekeeping backlog: spent tool outputs (~120k tokens)",
+			"spent tool outputs (~120k tokens) are still unstamped. Call ctx_reduce now, before your next tool call",
 		);
-		expect(escalation?.text).not.toContain("Reminder: spent tool outputs");
+		expect(escalation?.text).not.toContain(
+			"Still unstamped: spent tool outputs",
+		);
 		clearPiChannel1State(SESSION);
 	});
 
@@ -605,7 +607,7 @@ describe("maybeChannel1ReminderForToolResult", () => {
 			content: [{ type: "text", text: "legacy output" }],
 		});
 		expect(block?.text).toContain(
-			"Reminder: spent tool outputs (~80k tokens) are still reclaimable",
+			"Still unstamped: spent tool outputs (~80k tokens). Stamp the ones you've used",
 		);
 		expect(
 			db
@@ -786,7 +788,7 @@ describe("maybeDeliverChannel2Pi", () => {
 		expect(capturedCustomType).toBe("magic-context:ceiling-nudge");
 		expect(capturedContent).toContain("<system-reminder>");
 		expect(capturedContent).toContain(
-			"Routine housekeeping: spent tool outputs (~75k tokens) are reclaimable — make a ctx_reduce pass at a natural stopping point.",
+			"Your next step: call ctx_reduce on the outputs you've already used (spent tool outputs (~75k tokens)). Then continue your task.",
 		);
 		expect(capturedContent).toContain("oldest reclaimable");
 		expect(getChannel2NudgeState(db, SESSION)).toBe("delivered");

@@ -13,6 +13,7 @@ import {
 	rearmChannel2AfterMeasuredCollapse,
 } from "@magic-context/core/hooks/magic-context/channel2-cycle";
 import {
+	buildChannel1Reminder,
 	decideChannel1,
 	evaluateChannel2,
 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
@@ -20,6 +21,7 @@ import * as formattingModule from "@magic-context/core/hooks/magic-context/read-
 import { PI_CTX_REDUCE_KEEP } from "./heuristic-cleanup-pi";
 import {
 	assertPiTailHygieneContentUnchanged,
+	clearPiTailHygieneContentMemo,
 	effectivePiTailHygiene,
 	measurePiTailHygiene,
 	refreshPiTailHygieneBaseline,
@@ -117,6 +119,72 @@ function measuredBand(u: number, t: number): string {
 }
 
 describe("Pi rendered-tail hygiene walk", () => {
+	it("calibrates the Fable tool-only hygiene floors and reminder figures", () => {
+		const tokenizer = spyOn(
+			formattingModule,
+			"estimateTokens",
+		).mockImplementation((content) =>
+			content.startsWith("fable-output-") ? 10_000 : 0,
+		);
+		// The walk memoizes token counts process-wide. Another test file in the same
+		// process can cache the real count for the same content (`{}` tool input),
+		// which would bypass this stub.
+		clearPiTailHygieneContentMemo();
+		try {
+			const messages: object[] = [];
+			const ids: string[] = [];
+			const tags: TagEntry[] = [];
+			for (let number = 1; number <= 4; number += 1) {
+				const owner = `fable-owner-${number}`;
+				const callId = `fable-call-${number}`;
+				messages.push(
+					{
+						role: "assistant",
+						content: [
+							{ type: "toolCall", id: callId, name: "read", arguments: {} },
+						],
+					},
+					{
+						role: "toolResult",
+						toolCallId: callId,
+						toolName: "read",
+						content: [{ type: "text", text: `fable-output-${number}` }],
+					},
+				);
+				ids.push(owner, `${owner}-result`);
+				tags.push(tag(number, callId, "tool", { toolOwnerMessageId: owner }));
+			}
+			const baseline = refreshPiTailHygieneBaseline({
+				messages,
+				tags,
+				protectedTagNumbers: new Set([3, 4]),
+				stableId: withStableIds(messages, ids),
+				cacheBusting: true,
+				calibration: { toolsRatio: 1.551639, proseRatio: 1.571778 },
+				hygieneUnitsVersion: 2,
+			});
+			const effective = effectivePiTailHygiene(baseline);
+			const decision = decideChannel1({
+				...baseline,
+				lastNudgeUndropped: 0,
+				lastNudgeLevel: "",
+				hasRecentReduce: false,
+			});
+
+			expect(effective).toEqual({ u: 31_033, t: 62_066 });
+			expect(decision).toMatchObject({
+				fire: true,
+				band: "firm",
+				level: "firm",
+			});
+			expect(buildChannel1Reminder("firm", effective.u, 4)).toContain(
+				"4 spent tool outputs (~31k tokens)",
+			);
+		} finally {
+			tokenizer.mockRestore();
+		}
+	});
+
 	it("excludes thinking, redacted reasoning, and every signature field", () => {
 		const base = [textMessage("assistant", "visible work ".repeat(2_000))];
 		const withReasoning = [
@@ -569,38 +637,155 @@ describe("Pi baseline persistence and defer deltas", () => {
 		expect(defer.baselineGeneration).toBe(baseline.baselineGeneration);
 	});
 
-	it("marks prior-part mutation NOT EVALUABLE until a bust rewalk", () => {
-		const original = [textMessage("user", "original")];
-		const changed = [textMessage("user", "changed")];
+	it("re-measures a prior-part mutation on the defer pass that finds it", () => {
+		// The newest message is never frozen, so the mutated message needs one after
+		// it to land inside the frozen prefix that a defer pass compares.
+		const newest = textMessage("assistant", "newest turn");
+		const original = [textMessage("user", "original"), newest];
+		const changed = [textMessage("user", "changed and then some"), newest];
 		const tags = [tag(1, "m:p0", "message")];
+		const ids = ["m", "newest"];
 		const baseline = refreshPiTailHygieneBaseline({
 			messages: original,
 			tags,
 			protectedTagNumbers: new Set(),
-			stableId: withStableIds(original, ["m"]),
+			stableId: withStableIds(original, ids),
 			cacheBusting: true,
 		});
-		const invalidated = refreshPiTailHygieneBaseline({
+		const remeasured = refreshPiTailHygieneBaseline({
 			messages: changed,
 			tags,
 			protectedTagNumbers: new Set(),
-			stableId: withStableIds(changed, ["m"]),
+			stableId: withStableIds(changed, ids),
 			cacheBusting: false,
 			previous: baseline,
 		});
-		expect(invalidated.evaluable).toBe(false);
-		expect(invalidated.generationInvalidated).toBe(true);
-		expect(evaluateChannel2(invalidated).evaluable).toBe(false);
-		const refreshed = refreshPiTailHygieneBaseline({
+		const measured = measurePiTailHygiene({
 			messages: changed,
 			tags,
 			protectedTagNumbers: new Set(),
-			stableId: withStableIds(changed, ["m"]),
-			cacheBusting: true,
-			previous: invalidated,
+			stableId: withStableIds(changed, ids),
 		});
-		expect(refreshed.evaluable).toBe(true);
-		expect(refreshed.baselineGeneration).toBe(baseline.baselineGeneration + 1);
+		// Named, then measured on this same pass rather than held until a bust.
+		expect(remeasured.lastPrefixMismatch).toMatchObject({
+			partIndex: 0,
+			messageId: "m",
+			field: "contentHash",
+		});
+		expect(remeasured.evaluable).toBe(true);
+		expect(remeasured.generationInvalidated).toBe(false);
+		expect(remeasured.baselineGeneration).toBe(baseline.baselineGeneration + 1);
+		expect(evaluateChannel2(remeasured).evaluable).toBe(true);
+		expect(effectivePiTailHygiene(remeasured)).toEqual({
+			u: measured.u,
+			t: measured.t,
+		});
+		const steady = refreshPiTailHygieneBaseline({
+			messages: changed,
+			tags,
+			protectedTagNumbers: new Set(),
+			stableId: withStableIds(changed, ids),
+			cacheBusting: false,
+			previous: remeasured,
+		});
+		// One invalidation event, one diagnostic.
+		expect(steady.lastPrefixMismatch).toBeUndefined();
+		expect(steady.baselineGeneration).toBe(remeasured.baselineGeneration);
+	});
+
+	it("fires Channel 1 inside a long defer window after a mid-window mismatch", () => {
+		const narration = {
+			type: "text",
+			text: `${"narration text ".repeat(9_000)}\n\n`,
+		};
+		const messages: object[] = [
+			textMessage("user", "prompt text ".repeat(9_000)),
+			{ role: "assistant", content: [narration] },
+		];
+		const ids = ["prompt", "narration"];
+		const tags: TagEntry[] = [];
+		let arcs = 0;
+		const appendArc = (): void => {
+			arcs += 1;
+			const callId = `call-${arcs}`;
+			messages.push(
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: callId,
+							name: "read",
+							arguments: { path: `file-${arcs}` },
+						},
+					],
+				},
+				{
+					role: "toolResult",
+					toolCallId: callId,
+					toolName: "read",
+					content: [
+						{
+							type: "text",
+							text: `${"tool output row ".repeat(4_400)}${arcs}`,
+						},
+					],
+				},
+			);
+			ids.push(`arc-${arcs}`, `arc-${arcs}-result`);
+			tags.push(
+				tag(arcs, callId, "tool", {
+					toolName: "read",
+					toolOwnerMessageId: `arc-${arcs}`,
+				}),
+			);
+		};
+		appendArc();
+		appendArc();
+
+		let baseline: ReturnType<typeof refreshPiTailHygieneBaseline> | undefined;
+		let lastNudgeUndropped = 0;
+		let lastNudgeLevel: "" | "gentle" | "firm" | "urgent" = "";
+		const reasons: string[] = [];
+		const fires: number[] = [];
+		const diagnosed: number[] = [];
+		for (let pass = 1; pass <= 11; pass += 1) {
+			if (pass > 1) appendArc();
+			// A historical assistant part loses its trailing blank line after it was
+			// already measured into the frozen prefix.
+			if (pass === 3) narration.text = narration.text.replace(/\n\n$/, "");
+			baseline = refreshPiTailHygieneBaseline({
+				messages,
+				tags,
+				protectedTagNumbers:
+					pass < 3
+						? new Set(tags.map((entry) => entry.tagNumber))
+						: new Set([arcs]),
+				stableId: withStableIds(messages, ids),
+				cacheBusting: pass === 1,
+				previous: baseline,
+			});
+			const decision = decideChannel1({
+				...baseline,
+				lastNudgeUndropped,
+				lastNudgeLevel,
+				hasRecentReduce: false,
+			});
+			lastNudgeUndropped = decision.nextLastNudge;
+			lastNudgeLevel = decision.nextLastNudgeLevel;
+			reasons.push(decision.verdictReason);
+			if (decision.fire) fires.push(pass);
+			if (baseline.lastPrefixMismatch) diagnosed.push(pass);
+		}
+
+		expect(reasons.slice(0, 2)).toEqual([
+			"reclaimable-below-floor",
+			"reclaimable-below-floor",
+		]);
+		expect(reasons).not.toContain("baseline-unevaluable");
+		expect(fires[0]).toBeGreaterThanOrEqual(3);
+		expect(fires[0]).toBeLessThanOrEqual(5);
+		expect(diagnosed).toEqual([3]);
 	});
 
 	it("detects a byte mutation after the final walk", () => {

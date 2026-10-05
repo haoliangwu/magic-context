@@ -1,72 +1,153 @@
+import { join } from "node:path";
+import { PRIMER_SEED_CAP_TOKENS } from "@magic-context/core/features/magic-context/dreamer/primer-seed";
 import type { RawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
-import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
-import { convertEntriesToRawMessages } from "../read-session-pi";
-import { loadDefaultPiSessionApi } from "./pi-session-api";
+import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
+import { RAW_SUMMARY_TEXT_MAX_CHARS } from "@magic-context/core/hooks/magic-context/read-session-raw";
+import {
+	convertEntriesToRawMessagePage,
+	iterateEntriesToRawMessageRange,
+} from "../read-session-pi";
+import { findSession, lines } from "./bounded-session-reader";
+import { resolvePiCodingAgentModule } from "./pi-session-api";
 
-/**
- * Pi `primerRawProviderFactory`: resolve a historical session id to a
- * `RawMessageProvider` over its JSONL, so refresh-primers can render the
- * orientation seed on Pi-only installs (no opencode.db).
- *
- * Discovery is async (listSessions / loadEntriesFromFile), so this returns a
- * Promise; the produced provider's `readMessages()` is synchronous (it wraps the
- * already-loaded RawMessage[]). Returns null when the session can't be resolved
- * or has no entries → refresh-primers falls back to closed-book for that primer.
- */
 export interface PiPrimerRawProviderDeps {
-	listSessions?: (sessionDir?: string) => unknown[] | Promise<unknown[]>;
-	loadEntriesFromFile?: (filePath: string) => unknown[] | Promise<unknown[]>;
+	/** An explicit session directory, as accepted by SessionManager.listAll. */
 	sessionDir?: string;
 }
 
-interface PiSessionInfoLike {
-	id?: unknown;
-	path?: unknown;
+const MAX_PARTS = 256;
+const TOOL_KEYS = [
+	"description",
+	"filePath",
+	"path",
+	"pattern",
+	"query",
+	"symbol",
+	"module",
+	"action",
+];
+
+function record(value: unknown): Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: {};
+}
+function short(value: unknown, max = 512): string | undefined {
+	if (typeof value !== "string") return undefined;
+	// Keep a long string unchanged when its estimated tokens fit the primer's
+	// token budget; otherwise truncate it to the field's character limit.
+	return value.length <= max || estimateTokens(value) <= PRIMER_SEED_CAP_TOKENS
+		? value
+		: value.slice(0, max);
+}
+
+/** Keep only text and the tool-input fields used by the OpenCode summary reader. */
+function projectEntry(value: unknown): unknown {
+	const entry = record(value);
+	if (entry.type !== "message") return { type: entry.type };
+	const message = record(entry.message);
+	let content: unknown = [];
+	if (message.role === "user" && typeof message.content === "string") {
+		content = short(message.content, RAW_SUMMARY_TEXT_MAX_CHARS);
+	} else if (message.role !== "toolResult" && Array.isArray(message.content)) {
+		if (message.content.length > MAX_PARTS)
+			throw new Error("Pi primer entry has too many parts");
+		content = message.content.flatMap<unknown>((part) => {
+			const p = record(part);
+			if (p.type === "text")
+				return [
+					{ type: "text", text: short(p.text, RAW_SUMMARY_TEXT_MAX_CHARS) },
+				];
+			if (p.type !== "toolCall") return [];
+			const args = record(p.arguments);
+			return [
+				{
+					type: "toolCall",
+					id: short(p.id),
+					name: short(p.name),
+					arguments: Object.fromEntries(
+						TOOL_KEYS.map((key) => [key, short(args[key])]),
+					),
+				},
+			];
+		});
+	}
+	return {
+		type: entry.type,
+		id: entry.id,
+		timestamp: entry.timestamp,
+		message: {
+			role: message.role,
+			content,
+			toolCallId: short(message.toolCallId),
+			toolName: short(message.toolName),
+		},
+	};
+}
+
+function* summaryEntries(path: string): Generator<unknown> {
+	let pendingResults = 0;
+	for (const line of lines(path)) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const entry = projectEntry(parsed);
+		const e = record(entry);
+		if (e.type === "message") {
+			const m = record(e.message);
+			if (m.role === "toolResult" && m.toolCallId) {
+				// The canonical converter folds consecutive results into one user
+				// row. Bound that row too, not only the number of rows in a page.
+				if (++pendingResults > MAX_PARTS)
+					throw new Error("Pi primer has too many consecutive tool results");
+			} else if (m.role === "user" || m.role === "assistant")
+				pendingResults = 0;
+		}
+		yield entry;
+	}
 }
 
 export function createPiPrimerRawProviderFactory(
 	deps: PiPrimerRawProviderDeps = {},
 ): (sessionId: string) => Promise<RawMessageProvider | null> {
-	let resolved: Promise<
-		Required<
-			Pick<PiPrimerRawProviderDeps, "listSessions" | "loadEntriesFromFile">
-		>
-	> | null = null;
-
-	const resolveDeps = async () => {
-		if (deps.listSessions && deps.loadEntriesFromFile) {
-			return {
-				listSessions: deps.listSessions,
-				loadEntriesFromFile: deps.loadEntriesFromFile,
-			};
-		}
-		resolved ??= loadDefaultPiSessionApi();
-		return resolved;
-	};
-
-	return async (sessionId: string): Promise<RawMessageProvider | null> => {
+	return async (sessionId) => {
 		try {
-			const { listSessions, loadEntriesFromFile } = await resolveDeps();
-			const sessions = (await listSessions(
-				deps.sessionDir,
-			)) as PiSessionInfoLike[];
-			const match = sessions.find(
-				(s) =>
-					s &&
-					typeof s === "object" &&
-					s.id === sessionId &&
-					typeof s.path === "string",
-			);
-			if (!match || typeof match.path !== "string") return null;
-			const entries = await loadEntriesFromFile(match.path);
-			const messages = convertEntriesToRawMessages(entries);
-			if (messages.length === 0) return null;
+			let directory = deps.sessionDir;
+			if (!directory) {
+				const mod = (await resolvePiCodingAgentModule()) as {
+					getAgentDir?: () => string;
+				};
+				if (!mod.getAgentDir) return null;
+				directory = join(mod.getAgentDir(), "sessions");
+			}
+			const path = findSession(directory, !deps.sessionDir, sessionId);
+			if (!path) return null;
 			return {
-				readMessages(): RawMessage[] {
-					return messages;
+				readMessages() {
+					throw new Error("Pi primer history requires bounded pages");
 				},
-				getMessageCount() {
-					return messages.length;
+				iterateMessageRange(from, to) {
+					// One iterator owns the JSONL traversal. Closing it after an early
+					// visitor exit also closes the bounded line reader's descriptor.
+					return iterateEntriesToRawMessageRange(
+						summaryEntries(path),
+						from - 1,
+						Number.MAX_SAFE_INTEGER,
+						to,
+					);
+				},
+				readMessagePage(after, limit, watermark) {
+					// Re-open per page: no file descriptor survives early visitor
+					// termination, and no earlier page or tool output is retained.
+					return convertEntriesToRawMessagePage(
+						summaryEntries(path),
+						after,
+						Math.min(50, limit),
+						watermark,
+					);
 				},
 			};
 		} catch {

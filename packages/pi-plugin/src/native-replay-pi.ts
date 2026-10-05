@@ -1,5 +1,7 @@
 import { isRecord } from "@magic-context/core/shared/record-type-guard";
 
+import { isPiSystemEntry } from "./system-entry-pi";
+
 type NativeEnvelope = {
 	message: Record<string, unknown>;
 	payload: Record<string, unknown>;
@@ -18,7 +20,7 @@ type ToolCallMatch = {
 };
 
 function getNativeEnvelope(message: unknown): NativeEnvelope | undefined {
-	if (!isRecord(message)) return undefined;
+	if (!isRecord(message) || isPiSystemEntry(message)) return undefined;
 	const payload = message.providerPayload;
 	if (
 		!isRecord(payload) ||

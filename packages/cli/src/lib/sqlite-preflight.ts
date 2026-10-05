@@ -19,7 +19,7 @@ export function formatSqlitePreflightFailure(error: unknown): string {
     return [
         "Magic Context doctor cannot use SQLite in this runtime.",
         `SQLite probe: ${detail}`,
-        "Remediation: install Node.js >= 24 or use a Bun build with node:sqlite.",
+        "Remediation: install Node.js 22.16+ (22.x) or >= 24, or use a Bun build with node:sqlite.",
         "For Docker, use node:24-slim or a two-runtime image.",
     ].join("\n");
 }

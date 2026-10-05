@@ -23,7 +23,7 @@ import {
     _resetProjectEmbeddingRegistryForTests,
     registerProjectEmbedding,
 } from "./project-embedding-registry";
-import { parseIdShapedQuery, unifiedSearch } from "./search";
+import { parseIdShapedQuery, type UnifiedSearchOptions, unifiedSearch } from "./search";
 import { initializeDatabase } from "./storage-db";
 import { addNote, dismissNote, updateNote } from "./storage-notes";
 import { createPrimer } from "./storage-primers";
@@ -141,6 +141,77 @@ describe("unifiedSearch", () => {
         }
     });
 
+    it("recovers identifier-bearing questions without embeddings while preserving exact-hit output", async () => {
+        const memory = insertMemory(db, {
+            projectPath: "git:recall",
+            category: "CONSTRAINTS",
+            content: "Set cache_timeout in src/config.json for worker retries",
+        });
+        rawMessagesBySession.set("ses-recall", [
+            {
+                ordinal: 1,
+                id: "m-recall",
+                role: "assistant",
+                parts: [
+                    {
+                        type: "text",
+                        text: "cache_timeout in src/config.json controls worker retries",
+                    },
+                ],
+            },
+            {
+                ordinal: 2,
+                id: "m-other",
+                role: "assistant",
+                parts: [{ type: "text", text: "unrelated orange banana" }],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-recall", readMessages);
+        const options: UnifiedSearchOptions = {
+            sources: ["memory", "message"],
+            limit: 50,
+            embeddingEnabled: false,
+            explicitSearch: true,
+            isEmbeddingRuntimeEnabled: () => false,
+            countRetrievals: false,
+            measurementDisabled: true,
+        };
+        const exact = await unifiedSearch(
+            db,
+            "ses-recall",
+            "git:recall",
+            "cache_timeout config.json",
+            options,
+        );
+        expect(exact.map((hit) => ({ source: hit.source, content: hit.content }))).toEqual([
+            {
+                source: "message",
+                content: "cache_timeout in src/config.json controls worker retries",
+            },
+            {
+                source: "memory",
+                content: "Set cache_timeout in src/config.json for worker retries",
+            },
+        ]);
+        const question = await unifiedSearch(
+            db,
+            "ses-recall",
+            "git:recall",
+            "Where does cache_timeout get configured in src/config.json when embeddings are offline?",
+            options,
+        );
+        expect(question.map((hit) => hit.source)).toEqual(["message", "memory"]);
+        expect(question.some((hit) => hit.source === "memory" && hit.memoryId === memory.id)).toBe(
+            true,
+        );
+        expect(
+            question.some((hit) => hit.source === "message" && hit.messageId === "m-recall"),
+        ).toBe(true);
+        expect(
+            question.some((hit) => hit.source === "message" && hit.messageId === "m-other"),
+        ).toBe(false);
+    });
+
     it("returns ranked results across memories and messages (no facts)", async () => {
         const memory = insertMemory(db, {
             projectPath: "/repo/project",
@@ -165,7 +236,12 @@ describe("unifiedSearch", () => {
                 ordinal: 1,
                 id: "m1",
                 role: "user",
-                parts: [{ type: "text", text: "Can you add ranked search across the history?" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "Can you add ranked search across the history?",
+                    },
+                ],
             },
             {
                 ordinal: 2,
@@ -380,7 +456,12 @@ describe("unifiedSearch", () => {
                 ordinal: 1,
                 id: "m1",
                 role: "user",
-                parts: [{ type: "text", text: "delete all entries in the ranked_search table" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "delete all entries in the ranked_search table",
+                    },
+                ],
             },
             {
                 ordinal: 2,
@@ -405,6 +486,375 @@ describe("unifiedSearch", () => {
         expect(results.filter((r) => r.source === "message")).toHaveLength(0);
         // Memory results are unaffected by the message-ordinal cutoff.
         expect(results.some((r) => r.source === "memory")).toBe(true);
+    });
+
+    it("filters indexed messages by inclusive time before LIMIT and excludes NULL times", async () => {
+        rawMessagesBySession.set("ses-dated", [
+            {
+                ordinal: 1,
+                id: "outside-before",
+                role: "user",
+                parts: [{ type: "text", text: "temporal needle" }],
+                createdAt: 1_000,
+            },
+            {
+                ordinal: 2,
+                id: "inside-start",
+                role: "assistant",
+                parts: [{ type: "text", text: "temporal needle" }],
+                createdAt: 2_000,
+            },
+            {
+                ordinal: 3,
+                id: "legacy-null",
+                role: "user",
+                parts: [{ type: "text", text: "temporal needle" }],
+                createdAt: null,
+            },
+            {
+                ordinal: 4,
+                id: "inside-end",
+                role: "assistant",
+                parts: [{ type: "text", text: "temporal needle" }],
+                createdAt: 3_000,
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-dated", readMessages);
+
+        const results = await unifiedSearch(db, "ses-dated", "git:test", "temporal needle", {
+            sources: ["message"],
+            embeddingEnabled: false,
+            from: 2_000,
+            to: 3_000,
+            limit: 10,
+        });
+
+        expect(
+            results
+                .filter((result) => result.source === "message")
+                .map((result) => result.messageId),
+        ).toEqual(["inside-start", "inside-end"]);
+        expect(
+            db
+                .prepare(
+                    "SELECT message_time_ms FROM message_fts_rowid_map WHERE session_id = ? AND message_ordinal = 3",
+                )
+                .get("ses-dated"),
+        ).toEqual({ message_time_ms: null });
+    });
+
+    it("matches message text only, never the indexed role column", async () => {
+        rawMessagesBySession.set("ses-role", [
+            {
+                ordinal: 1,
+                id: "role-only",
+                role: "user",
+                parts: [{ type: "text", text: "login keeps failing on staging" }],
+                createdAt: 2_000,
+            },
+            {
+                ordinal: 2,
+                id: "content-match",
+                role: "assistant",
+                parts: [{ type: "text", text: "the users login flow now retries" }],
+                createdAt: 2_000,
+            },
+            {
+                ordinal: 3,
+                id: "live-tail",
+                role: "user",
+                parts: [{ type: "text", text: "login again please" }],
+                createdAt: 2_000,
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-role", readMessages);
+        const search = async (query: string, extra: Partial<UnifiedSearchOptions> = {}) => {
+            const results = await unifiedSearch(db, "ses-role", "git:test", query, {
+                sources: ["message"],
+                embeddingEnabled: false,
+                limit: 10,
+                measurementDisabled: true,
+                countRetrievals: false,
+                ...extra,
+            });
+            return results.flatMap((result) =>
+                result.source === "message" ? [result.messageId] : [],
+            );
+        };
+        const diagnostics = {
+            suppressedVisibleMemoryIds: [],
+            suppressedLiveMessageMatches: 0,
+            gitCommitUnavailable: null,
+        };
+
+        // Each variant reaches a different prepared statement: plain, ordinal
+        // cutoff, cutoff with the live-tail diagnostic count, and date range.
+        expect(await search("users login")).toEqual(["content-match"]);
+        expect(await search("users login", { maxMessageOrdinal: 2 })).toEqual(["content-match"]);
+        expect(await search("users login", { maxMessageOrdinal: 2, diagnostics })).toEqual([
+            "content-match",
+        ]);
+        expect(diagnostics.suppressedLiveMessageMatches).toBe(0);
+        expect(await search("users login", { from: 1_000, to: 3_000 })).toEqual(["content-match"]);
+        expect(await search("assistant")).toEqual([]);
+    });
+
+    it("treats a NUL byte in the query as a word break instead of throwing", async () => {
+        createPrimer(db, {
+            projectPath: "git:test",
+            question: "How does the nulprobe cache work?",
+            answer: "It stays stable.",
+            totalSupport: 2,
+            lastObservedAt: 1_000,
+            sourceCandidateIds: [],
+        });
+        rawMessagesBySession.set("ses-nul", [
+            {
+                ordinal: 1,
+                id: "nul-hit",
+                role: "assistant",
+                parts: [{ type: "text", text: "nulprobe cache warmed" }],
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-nul", readMessages);
+
+        const results = await unifiedSearch(db, "ses-nul", "git:test", "nulprobe\0cache", {
+            sources: ["message", "primer"],
+            embeddingEnabled: false,
+            explicitSearch: true,
+            limit: 10,
+            measurementDisabled: true,
+            countRetrievals: false,
+        });
+
+        expect(results.map((result) => result.source).sort()).toEqual(["message", "primer"]);
+    });
+
+    it("keeps undated search output byte-identical when both bounds are absent", async () => {
+        rawMessagesBySession.set("ses-undated", [
+            {
+                ordinal: 1,
+                id: "undated-1",
+                role: "user",
+                parts: [{ type: "text", text: "stable output needle" }],
+                createdAt: 1_000,
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-undated", readMessages);
+        const baseOptions: UnifiedSearchOptions = {
+            sources: ["message"],
+            embeddingEnabled: false,
+            limit: 10,
+        };
+
+        const current = await unifiedSearch(
+            db,
+            "ses-undated",
+            "git:test",
+            "stable output needle",
+            baseOptions,
+        );
+        const absent = await unifiedSearch(db, "ses-undated", "git:test", "stable output needle", {
+            ...baseOptions,
+            from: undefined,
+            to: undefined,
+        });
+
+        expect(JSON.stringify(absent)).toBe(JSON.stringify(current));
+    });
+
+    it("filters memories, notes, primers, and git commits by their stored times", async () => {
+        const outsideMemory = insertMemory(db, {
+            projectPath: "git:dated-sources",
+            category: "CONSTRAINTS",
+            content: "range corpus needle outside memory",
+        });
+        const insideMemory = insertMemory(db, {
+            projectPath: "git:dated-sources",
+            category: "CONSTRAINTS",
+            content: "range corpus needle inside memory",
+        });
+        db.prepare("UPDATE memories SET created_at = ? WHERE id = ?").run(1_000, outsideMemory.id);
+        db.prepare("UPDATE memories SET created_at = ? WHERE id = ?").run(3_000, insideMemory.id);
+
+        const outsideNote = addNote(db, "session", {
+            content: "range corpus needle outside note",
+            projectPath: "git:dated-sources",
+            sessionId: "ses-dated-sources",
+        });
+        const insideNote = addNote(db, "session", {
+            content: "range corpus needle inside note",
+            projectPath: "git:dated-sources",
+            sessionId: "ses-dated-sources",
+        });
+        db.prepare("UPDATE notes SET created_at = ? WHERE id = ?").run(1_000, outsideNote.id);
+        db.prepare("UPDATE notes SET created_at = ? WHERE id = ?").run(3_000, insideNote.id);
+
+        const outsidePrimer = createPrimer(db, {
+            projectPath: "git:dated-sources",
+            question: "range corpus needle outside primer",
+            answer: "outside",
+            totalSupport: 2,
+            lastObservedAt: 1_000,
+            sourceCandidateIds: [],
+        });
+        const insidePrimer = createPrimer(db, {
+            projectPath: "git:dated-sources",
+            question: "range corpus needle inside primer",
+            answer: "inside",
+            totalSupport: 2,
+            lastObservedAt: 3_000,
+            sourceCandidateIds: [],
+        });
+        db.prepare("UPDATE primers SET created_at = ? WHERE id = ?").run(1_000, outsidePrimer);
+        db.prepare("UPDATE primers SET created_at = ? WHERE id = ?").run(3_000, insidePrimer);
+
+        db.prepare(
+            `INSERT INTO git_commits
+                (sha, project_path, short_sha, message, author, committed_at, indexed_at)
+             VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+        ).run(
+            "outside-sha",
+            "git:dated-sources",
+            "outside",
+            "range corpus needle outside commit",
+            1_000,
+            1_000,
+        );
+        db.prepare(
+            `INSERT INTO git_commits
+                (sha, project_path, short_sha, message, author, committed_at, indexed_at)
+             VALUES (?, ?, ?, ?, NULL, ?, ?)`,
+        ).run(
+            "inside-sha",
+            "git:dated-sources",
+            "inside",
+            "range corpus needle inside commit",
+            3_000,
+            3_000,
+        );
+
+        const searchSource = (source: "memory" | "note" | "primer" | "git_commit") =>
+            unifiedSearch(db, "ses-dated-sources", "git:dated-sources", "range corpus needle", {
+                sources: [source],
+                limit: 20,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                gitCommitsEnabled: true,
+                from: 2_000,
+                to: 4_000,
+            });
+        const [memoryResults, noteResults, primerResults, commitResults] = await Promise.all([
+            searchSource("memory"),
+            searchSource("note"),
+            searchSource("primer"),
+            searchSource("git_commit"),
+        ]);
+
+        expect(
+            memoryResults.some(
+                (result) => result.source === "memory" && result.memoryId === insideMemory.id,
+            ),
+        ).toBe(true);
+        expect(
+            memoryResults.some(
+                (result) => result.source === "memory" && result.memoryId === outsideMemory.id,
+            ),
+        ).toBe(false);
+        expect(
+            noteResults.some(
+                (result) => result.source === "note" && result.noteId === insideNote.id,
+            ),
+        ).toBe(true);
+        expect(
+            noteResults.some(
+                (result) => result.source === "note" && result.noteId === outsideNote.id,
+            ),
+        ).toBe(false);
+        expect(
+            primerResults.some(
+                (result) => result.source === "primer" && result.primerId === insidePrimer,
+            ),
+        ).toBe(true);
+        expect(
+            primerResults.some(
+                (result) => result.source === "primer" && result.primerId === outsidePrimer,
+            ),
+        ).toBe(false);
+        expect(
+            commitResults.some(
+                (result) => result.source === "git_commit" && result.sha === "inside-sha",
+            ),
+        ).toBe(true);
+        expect(
+            commitResults.some(
+                (result) => result.source === "git_commit" && result.sha === "outside-sha",
+            ),
+        ).toBe(false);
+    });
+
+    it("filters compartment chunks by indexed boundary-time overlap", async () => {
+        rawMessagesBySession.set("ses-dated-compartment", [
+            {
+                ordinal: 1,
+                id: "u1",
+                role: "user",
+                parts: [{ type: "text", text: "boundary alpha" }],
+                createdAt: 2_000,
+            },
+            {
+                ordinal: 2,
+                id: "a2",
+                role: "assistant",
+                parts: [{ type: "text", text: "boundary omega" }],
+                createdAt: 4_000,
+            },
+        ]);
+        ensureMessagesIndexed(db, "ses-dated-compartment", readMessages);
+        seedCompartmentChunkEmbedding(
+            db,
+            "ses-dated-compartment",
+            "git:dated-compartment",
+            new Float32Array([1, 0]),
+        );
+        queryEmbedding = new Float32Array([1, 0]);
+
+        const overlapping = await unifiedSearch(
+            db,
+            "ses-dated-compartment",
+            "git:dated-compartment",
+            "semantic only title",
+            {
+                sources: ["message"],
+                limit: 10,
+                memoryEnabled: true,
+                embeddingEnabled: true,
+                embedQuery,
+                isEmbeddingRuntimeEnabled,
+                chunkModelIdOverride: "mock:model",
+                from: 3_000,
+                to: 3_000,
+            },
+        );
+        const outside = await unifiedSearch(
+            db,
+            "ses-dated-compartment",
+            "git:dated-compartment",
+            "semantic only title",
+            {
+                sources: ["message"],
+                limit: 10,
+                memoryEnabled: true,
+                embeddingEnabled: true,
+                embedQuery,
+                isEmbeddingRuntimeEnabled,
+                chunkModelIdOverride: "mock:model",
+                from: 5_000,
+            },
+        );
+
+        expect(overlapping.some((result) => result.source === "compartment")).toBe(true);
+        expect(outside.some((result) => result.source === "compartment")).toBe(false);
     });
 
     it("returns note hits with id, status, anchor, and ready_reason text", async () => {
@@ -836,7 +1286,12 @@ describe("unifiedSearch", () => {
                 ordinal: 2,
                 id: "m2",
                 role: "user",
-                parts: [{ type: "text", text: "unrelated chatter about something else entirely" }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "unrelated chatter about something else entirely",
+                    },
+                ],
             },
         ]);
         ensureMessagesIndexed(db, "ses-probe", readMessages);
@@ -967,7 +1422,12 @@ describe("unifiedSearch", () => {
             ordinal: i + 1,
             id: `f${i}`,
             role: "assistant",
-            parts: [{ type: "text", text: `CommonTerm appears here in filler message ${i}` }],
+            parts: [
+                {
+                    type: "text",
+                    text: `CommonTerm appears here in filler message ${i}`,
+                },
+            ],
         }));
         const rare = {
             ordinal: 31,
@@ -1059,7 +1519,12 @@ describe("unifiedSearch", () => {
                 ordinal: 4,
                 id: "a2",
                 role: "assistant",
-                parts: [{ type: "text", text: "The indexed ticket search now supports history." }],
+                parts: [
+                    {
+                        type: "text",
+                        text: "The indexed ticket search now supports history.",
+                    },
+                ],
             },
         ]);
         ensureMessagesIndexed(db, "ses-2", readMessages);
@@ -1135,6 +1600,41 @@ describe("unifiedSearch", () => {
         expect(memoryResults).toHaveLength(1);
         expect(memoryResults[0]?.memoryId).toBe(memory.id);
         expect(memoryResults[0]?.matchType).toBe("semantic");
+    });
+
+    it("keeps semantic-only memories alongside FTS hits when the embedding cache is cold", async () => {
+        const snapshot = registerEmbeddingProject(db, "/repo/project");
+        const ftsHit = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "coldneedle lexical match",
+        });
+        const semanticTarget = insertMemory(db, {
+            projectPath: "/repo/project",
+            category: "ARCHITECTURE_DECISIONS",
+            content: "durable vector neighbour",
+        });
+        saveEmbedding(db, ftsHit.id, new Float32Array([0, 1]), snapshot.modelId);
+        saveEmbedding(db, semanticTarget.id, new Float32Array([1, 0]), snapshot.modelId);
+        queryEmbedding = new Float32Array([1, 0]);
+        // Nothing has loaded the project's vectors yet, as after the cache TTL.
+        resetEmbeddingCacheForTests();
+
+        const results = await unifiedSearch(db, "ses-cold", "/repo/project", "coldneedle", {
+            limit: 5,
+            memoryEnabled: true,
+            embeddingEnabled: true,
+            readMessages,
+            embedQuery,
+            isEmbeddingRuntimeEnabled,
+            sources: ["memory"],
+        });
+
+        const memoryHits = results.flatMap((result) =>
+            result.source === "memory" ? [[result.memoryId, result.matchType]] : [],
+        );
+        expect(memoryHits).toContainEqual([semanticTarget.id, "semantic"]);
+        expect(memoryHits).toContainEqual([ftsHit.id, "hybrid"]);
     });
 
     /**
@@ -1260,16 +1760,31 @@ describe("unifiedSearch", () => {
 
         expect(results.some((result) => result.source === "message")).toBe(false);
         const compartment = results.find((result) => result.source === "compartment");
-        expect(compartment).toMatchObject({ source: "compartment", matchType: "hybrid" });
+        expect(compartment).toMatchObject({
+            source: "compartment",
+            matchType: "hybrid",
+        });
         expect(compartment && "snippet" in compartment ? compartment.snippet : "").toContain(
             "bounded drains",
         );
     });
 
-    it("respects message watermark cutoff and memory.enabled for compartment chunks", async () => {
+    // Issue 543: semantic history search is not a memory feature, so memory off
+    // keeps the compartment lane; only turning embedding off removes it.
+    it("respects message watermark cutoff for compartment chunks and ignores memory.enabled", async () => {
         rawMessagesBySession.set("ses-cutoff", [
-            { ordinal: 1, id: "u1", role: "user", parts: [{ type: "text", text: "first" }] },
-            { ordinal: 2, id: "a2", role: "assistant", parts: [{ type: "text", text: "second" }] },
+            {
+                ordinal: 1,
+                id: "u1",
+                role: "user",
+                parts: [{ type: "text", text: "first" }],
+            },
+            {
+                ordinal: 2,
+                id: "a2",
+                role: "assistant",
+                parts: [{ type: "text", text: "second" }],
+            },
         ]);
         ensureMessagesIndexed(db, "ses-cutoff", readMessages);
         seedCompartmentChunkEmbedding(db, "ses-cutoff", "/repo/cutoff", new Float32Array([0, 1]));
@@ -1295,10 +1810,32 @@ describe("unifiedSearch", () => {
             readMessages,
             embedQuery,
             isEmbeddingRuntimeEnabled,
+            chunkModelIdOverride: "mock:model",
             sources: ["message"],
             maxMessageOrdinal: 2,
         });
-        expect(memoryOffResults.some((result) => result.source === "compartment")).toBe(false);
+        expect(memoryOffResults.some((result) => result.source === "compartment")).toBe(true);
+        expect(embeddingQueries).toHaveLength(1);
+
+        embeddingQueries.length = 0;
+        const embeddingOffResults = await unifiedSearch(
+            db,
+            "ses-cutoff",
+            "/repo/cutoff",
+            "concept",
+            {
+                limit: 5,
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages,
+                embedQuery,
+                isEmbeddingRuntimeEnabled,
+                chunkModelIdOverride: "mock:model",
+                sources: ["message"],
+                maxMessageOrdinal: 2,
+            },
+        );
+        expect(embeddingOffResults.some((result) => result.source === "compartment")).toBe(false);
         expect(embeddingQueries).toEqual([]);
     });
 });

@@ -18,7 +18,11 @@
  * unlike the old poll it does no network work at idle.
  */
 
-import { getRpcClient, getRpcGeneration } from "./context-db";
+import {
+    getRpcGeneration,
+    notificationDirectoryFor,
+    resolveNotificationTarget,
+} from "./context-db";
 
 export interface SocketNotification {
     id: number;
@@ -30,6 +34,12 @@ export interface SocketNotification {
 interface NotificationSocketOptions {
     /** Current active session id (re-read cheaply to follow session switches). */
     getSessionId: () => string | null;
+    /**
+     * Directory of the active session, when the host reports it. The socket
+     * subscribes to that directory's server, because that is the server whose
+     * commands push this session's notifications; null means the startup one.
+     */
+    getSessionDirectory?: () => string | null;
     /** Handle one delivered notification. Returns true only after it is fully
      *  consumed and can be acknowledged. Async because dialog handlers await. */
     onNotification: (notification: SocketNotification) => boolean | Promise<boolean>;
@@ -47,6 +57,13 @@ let sessionWatchTimer: ReturnType<typeof setInterval> | undefined;
 let reconnectAttempt = 0;
 let closed = false;
 let helloedSession: string | null = null;
+/** Directory whose server the open socket is subscribed to. */
+let connectedDirectory: string | null = null;
+/** Last time the socket was moved to follow a session's directory. */
+let lastRetargetAt = 0;
+/** Minimum spacing between moves, so a session whose server is not up yet does
+ *  not reconnect the socket every watcher tick. */
+const RETARGET_MIN_INTERVAL_MS = 10_000;
 let opts: NotificationSocketOptions | null = null;
 let activeToken: string | null = null;
 /** Generation of the rpc client used by the active socket. */
@@ -110,6 +127,8 @@ export function stopNotificationSocket(): void {
     opts = null;
     activeToken = null;
     helloedSession = null;
+    connectedDirectory = null;
+    lastRetargetAt = 0;
     reconnectAttempt = 0;
     activeInstanceId = null;
     notificationProtocolMode = null;
@@ -136,24 +155,22 @@ function scheduleReconnect(): void {
 async function connect(): Promise<void> {
     if (closed || socket || inFlightAttemptId !== null) return;
 
-    const client = getRpcClient();
-    if (!client) {
-        scheduleReconnect();
-        return;
-    }
-
     const attemptId = ++nextAttemptId;
     const rpcGeneration = getRpcGeneration();
     inFlightAttemptId = attemptId;
-    const endpoint = await client.resolveEndpoint();
+    const target = await resolveNotificationTarget(
+        opts?.getSessionDirectory?.() ?? null,
+        opts?.getSessionId() ?? null,
+    );
     if (closed || inFlightAttemptId !== attemptId || getRpcGeneration() !== rpcGeneration) {
         return;
     }
     inFlightAttemptId = null;
-    if (!endpoint) {
+    if (!target) {
         scheduleReconnect();
         return;
     }
+    const { client, endpoint } = target;
 
     let ws: WebSocket;
     try {
@@ -171,6 +188,7 @@ async function connect(): Promise<void> {
         return;
     }
     connectGeneration = rpcGeneration;
+    connectedDirectory = target.directory;
     activeToken = endpoint.token;
     notificationProtocolMode = null;
     bufferedNotifications.length = 0;
@@ -457,6 +475,26 @@ export function _resetNotificationSocketStateForTesting(): void {
  *  actually changes. Reads a property; no network at idle. */
 function watchSession(): void {
     if (closed || !socket || socket.readyState !== WebSocket.OPEN) return;
+    // The shown session belongs to another directory's server: move the socket
+    // there, or that server's pushes for this session never reach this TUI.
+    const wanted = notificationDirectoryFor(opts?.getSessionDirectory?.() ?? null);
+    if (wanted !== connectedDirectory && Date.now() - lastRetargetAt >= RETARGET_MIN_INTERVAL_MS) {
+        lastRetargetAt = Date.now();
+        const previous = socket;
+        socket = null;
+        activeToken = null;
+        helloedSession = null;
+        connectedDirectory = null;
+        notificationProtocolMode = null;
+        bufferedNotifications.length = 0;
+        try {
+            previous.close();
+        } catch {
+            // best-effort
+        }
+        void connect();
+        return;
+    }
     const current = opts?.getSessionId() ?? null;
     if (current === helloedSession) return;
     // Re-hello with the token authenticated by this socket; no rediscovery or

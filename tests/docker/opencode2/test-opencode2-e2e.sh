@@ -12,12 +12,12 @@ export OPENCODE_DISABLE_DEFAULT_PLUGINS=true
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
 
 command -v opencode2 >/dev/null || { echo "FAIL opencode2 binary missing"; exit 1; }
-[[ "$(opencode2 --version)" == "opencode v2.0.5" ]] || {
+[[ "$(opencode2 --version)" == "opencode v2.0.22" ]] || {
     echo "FAIL unexpected OpenCode version: $(opencode2 --version)"
     exit 1
 }
-[[ "$(node -p "require('/test/host/node_modules/@opencode/cli/package.json').version")" == "2.0.5" ]]
-[[ "$(node -p "require('/test/host/node_modules/@opencode/cli-linux-x64/package.json').version")" == "2.0.5" ]]
+[[ "$(node -p "require('/test/host/node_modules/@opencode/cli/package.json').version")" == "2.0.22" ]]
+[[ "$(node -p "require('/test/host/node_modules/@opencode/cli-linux-x64/package.json').version")" == "2.0.22" ]]
 
 PLUGIN_PACKAGE=/test/mc-install/node_modules/@cortexkit/opencode-magic-context
 PLUGIN_VERSION=$(node -p "require('$PLUGIN_PACKAGE/package.json').version")
@@ -61,8 +61,14 @@ script -qefc "stty rows 40 cols 160; opencode2 --standalone --print-logs --sessi
 TUI_PID=$!
 TUI_MARKER_SEEN=0
 for ((elapsed = 0; elapsed < TUI_MARKER_CEILING_SECONDS; elapsed++)); do
-    if grep -aFq "Magic Context" /tmp/opencode2-tui.log 2>/dev/null \
-        || grep -aFq "MagicContext" /tmp/opencode2-tui.log 2>/dev/null; then
+    # "Compartments" is a row only the real sidebar component draws. The plugin
+    # also has a four-line plain-text projection for hosts that register no
+    # OpenTUI runtime modules, and that projection folds the compartment count
+    # into a "C:n" fragment. Matching the component row is what makes this lane
+    # fail if the Linux GA host silently lands on the fallback.
+    if grep -aFq "Compartments" /tmp/opencode2-tui.log 2>/dev/null \
+        && { grep -aFq "Magic Context" /tmp/opencode2-tui.log 2>/dev/null \
+            || grep -aFq "MagicContext" /tmp/opencode2-tui.log 2>/dev/null; }; then
         TUI_MARKER_SEEN=1
         echo "TUI sidebar marker painted after ${elapsed}s"
         break
@@ -82,11 +88,11 @@ if [[ $TUI_MARKER_SEEN -eq 0 && $TUI_EXIT -ne 0 && $TUI_EXIT -ne 124 && $TUI_EXI
     exit 1
 fi
 if [[ $TUI_MARKER_SEEN -eq 0 ]]; then
-    echo "FAIL GA TUI did not execute setup and paint the Magic Context sidebar"
+    echo "FAIL GA TUI did not execute setup and paint the Magic Context sidebar component"
     tail -80 /tmp/opencode2-tui.stdout
     exit 1
 fi
 
-echo "PASS @opencode/cli@2.0.5 and @opencode/cli-linux-x64@2.0.5 exact pins"
-echo "PASS GA TUI executed setup and painted the RPC-backed sidebar"
-echo "All OpenCode 2.0.5 Docker E2E checks passed."
+echo "PASS @opencode/cli@2.0.22 and @opencode/cli-linux-x64@2.0.22 exact pins"
+echo "PASS GA TUI executed setup and painted the RPC-backed sidebar component"
+echo "All OpenCode 2.0.22 Docker E2E checks passed."

@@ -13,9 +13,10 @@
  * NAMES are intentionally unsupported (smaller surface; add later if asked).
  * Empty string `""` means "never" and is handled by the caller, not here.
  *
- * Day matching uses Vixie OR-semantics: when BOTH dom and dow are restricted
- * (not `*`), a day matches if EITHER matches; when only one is restricted, only
- * that one is consulted; when neither is restricted, every day matches.
+ * Day matching follows Vixie cron: a dom or dow field that starts with `*`
+ * (`*` itself or a star-step such as `*\/2`) counts as unrestricted. When BOTH
+ * fields are restricted a day matches if EITHER matches; otherwise a day must
+ * match both sets, which for a plain `*` field means only the other one counts.
  *
  * Timezone: all matching is in the machine's LOCAL time — the dreamer's whole
  * purpose is "run while the user is asleep", which is a wall-clock concept.
@@ -30,7 +31,7 @@ export interface ParsedCron {
     dom: Set<number>;
     month: Set<number>;
     dow: Set<number>;
-    /** Original field token was not `*` — drives Vixie dom/dow OR-semantics. */
+    /** Field token does not start with `*` — drives Vixie dom/dow OR-semantics. */
     domRestricted: boolean;
     dowRestricted: boolean;
 }
@@ -145,8 +146,10 @@ export function parseCron(expression: string): ParseCronResult {
             dom: sets[2],
             month: sets[3],
             dow: sets[4],
-            domRestricted: tokens[2] !== "*",
-            dowRestricted: tokens[4] !== "*",
+            // Vixie cron treats any star-prefixed field (`*`, `*/2`) as
+            // unrestricted when choosing between OR and AND day matching.
+            domRestricted: !tokens[2].startsWith("*"),
+            dowRestricted: !tokens[4].startsWith("*"),
         },
     };
 }
@@ -160,9 +163,26 @@ function matchesDay(cron: ParsedCron, date: Date): boolean {
     const dom = cron.dom.has(date.getDate());
     const dow = cron.dow.has(date.getDay());
     if (cron.domRestricted && cron.dowRestricted) return dom || dow;
-    if (cron.domRestricted) return dom;
-    if (cron.dowRestricted) return dow;
-    return true;
+    return dom && dow;
+}
+
+/** Longest each month can be, counting Feb 29. */
+const MAX_DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/**
+ * False when the day-of-month set fits in none of the cron's months (e.g.
+ * `0 0 31 2 *`, Feb 31), so the schedule can never fire. Lets nextOccurrence
+ * answer "never" at once instead of scanning ~2 million minutes on every
+ * evaluation. A restricted weekday under OR-matching always fires eventually.
+ */
+function dayOfMonthCanOccur(cron: ParsedCron): boolean {
+    if (cron.domRestricted && cron.dowRestricted) return true;
+    for (const month of cron.month) {
+        for (const day of cron.dom) {
+            if (day <= MAX_DAYS_IN_MONTH[month - 1]) return true;
+        }
+    }
+    return false;
 }
 
 /** True if `date`'s local civil fields match the cron. */
@@ -199,6 +219,7 @@ export function nextOccurrence(
     excludeCivilMinute?: string,
     maxSearchMs = MAX_SEARCH_MS,
 ): Date | null {
+    if (!dayOfMonthCanOccur(cron)) return null;
     const afterMs = after.getTime();
     // Align to the next whole minute strictly after `after` (never returns `after`).
     let cursorMs = Math.floor(afterMs / MINUTE_MS) * MINUTE_MS + MINUTE_MS;

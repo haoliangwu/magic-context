@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
-
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { withoutSqliteTransformPass, withSqliteBackgroundWriter } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 
-export const MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE = 500;
+export const MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE = 100;
 
 const BACKFILL_STATE_ID = 1;
 const EMPTY_INDEX_CONTENT_HASH = createHash("sha256").update("").digest("hex");
@@ -27,16 +27,22 @@ export interface MessageFtsRowidMapBackfillProgress {
 
 const upsertMapStatements = new WeakMap<Database, PreparedStatement>();
 const rangeReadyStatements = new WeakMap<Database, PreparedStatement>();
+const updateTimeStatements = new WeakMap<Database, PreparedStatement>();
 const activeBackfills = new WeakMap<Database, Promise<void>>();
 
 function getUpsertMapStatement(db: Database): PreparedStatement {
     let statement = upsertMapStatements.get(db);
     if (!statement) {
         statement = db.prepare(
-            `INSERT INTO message_fts_rowid_map (session_id, message_ordinal, fts_rowid)
-             VALUES (?, ?, ?)
+            `INSERT INTO message_fts_rowid_map
+                 (session_id, message_ordinal, fts_rowid, message_time_ms)
+             VALUES (?, ?, ?, ?)
              ON CONFLICT(session_id, message_ordinal) DO UPDATE SET
-                 fts_rowid = excluded.fts_rowid`,
+                 fts_rowid = excluded.fts_rowid,
+                 message_time_ms = COALESCE(
+                     excluded.message_time_ms,
+                     message_fts_rowid_map.message_time_ms
+                 )`,
         );
         upsertMapStatements.set(db, statement);
     }
@@ -67,12 +73,46 @@ export function recordMessageFtsRowid(
     sessionId: string,
     messageOrdinal: number,
     ftsRowid: number | bigint,
+    messageTimeMs: number | null = null,
 ): void {
     const numericRowid = Number(ftsRowid);
     if (!Number.isSafeInteger(numericRowid) || numericRowid <= 0) {
         throw new Error(`invalid message FTS rowid: ${String(ftsRowid)}`);
     }
-    getUpsertMapStatement(db).run(sessionId, messageOrdinal, numericRowid);
+    const normalizedTime =
+        typeof messageTimeMs === "number" &&
+        Number.isSafeInteger(messageTimeMs) &&
+        messageTimeMs >= 0
+            ? messageTimeMs
+            : null;
+    getUpsertMapStatement(db).run(sessionId, messageOrdinal, numericRowid, normalizedTime);
+}
+
+/** Fill a missing indexed timestamp without changing the FTS row identity. */
+export function recordIndexedMessageTime(
+    db: Database,
+    sessionId: string,
+    messageOrdinal: number,
+    messageTimeMs: number | null | undefined,
+): void {
+    if (
+        typeof messageTimeMs !== "number" ||
+        !Number.isSafeInteger(messageTimeMs) ||
+        messageTimeMs < 0
+    ) {
+        return;
+    }
+    let statement = updateTimeStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `UPDATE message_fts_rowid_map
+                SET message_time_ms = ?
+              WHERE session_id = ? AND message_ordinal = ?
+                AND message_time_ms IS NULL`,
+        );
+        updateTimeStatements.set(db, statement);
+    }
+    statement.run(messageTimeMs, sessionId, messageOrdinal);
 }
 
 /**
@@ -84,33 +124,32 @@ export function backfillMessageFtsRowidMapBatch(
     db: Database,
     batchSize = MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE,
 ): MessageFtsRowidMapBackfillProgress {
-    const boundedBatchSize = Math.max(1, Math.floor(batchSize));
+    const boundedBatchSize = Number.isFinite(batchSize)
+        ? Math.min(MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE, Math.max(1, Math.floor(batchSize)))
+        : MESSAGE_FTS_ROWID_MAP_BACKFILL_BATCH_SIZE;
     let progress: MessageFtsRowidMapBackfillProgress = {
         processed: 0,
         watermarkRowid: 0,
         completed: false,
     };
 
-    const transactionStartedAt = performance.now();
+    let transactionStartedAt = 0;
     db.transaction(() => {
+        transactionStartedAt = performance.now();
+        db.prepare(`INSERT OR IGNORE INTO message_fts_rowid_map_backfill_state
+            (id, watermark_rowid, completed) VALUES (?, 0, 0)`).run(BACKFILL_STATE_ID);
         const state = getBackfillState(db);
         if (state.completed) {
             progress = state;
             return;
         }
-
+        // Keep the bounded read and mapping atomic: a concurrent FTS delete/insert
+        // could recycle a rowid between discovery and recording its owner.
         const rows = db
-            .prepare(
-                `SELECT rowid AS ftsRowid,
-                        session_id AS sessionId,
-                        message_ordinal AS messageOrdinal
-                 FROM message_history_fts
-                 WHERE rowid > ?
-                 ORDER BY rowid ASC
-                 LIMIT ?`,
-            )
+            .prepare(`SELECT rowid AS ftsRowid,
+            session_id AS sessionId, message_ordinal AS messageOrdinal
+            FROM message_history_fts WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`)
             .all(state.watermarkRowid, boundedBatchSize) as BackfillFtsRow[];
-
         let watermarkRowid = state.watermarkRowid;
         for (const row of rows) {
             const ftsRowid = Number(row.ftsRowid);
@@ -140,7 +179,7 @@ export function backfillMessageFtsRowidMapBatch(
             watermarkRowid,
             completed,
         };
-    })();
+    }).immediate();
     logSlowWriteTransaction("message_fts_rowid_backfill", transactionStartedAt);
 
     return progress;
@@ -148,6 +187,7 @@ export function backfillMessageFtsRowidMapBatch(
 
 /** Drain legacy FTS rows in bounded turns so SQLite never owns the host loop. */
 export async function runMessageFtsRowidMapBackfill(db: Database): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     for (;;) {
         const progress = backfillMessageFtsRowidMapBatch(db);
         if (progress.completed) return;
@@ -159,7 +199,9 @@ export async function runMessageFtsRowidMapBackfill(db: Database): Promise<void>
 export function startMessageFtsRowidMapBackfill(db: Database): Promise<void> {
     const active = activeBackfills.get(db);
     if (active) return active;
-    const run = runMessageFtsRowidMapBackfill(db).finally(() => {
+    const run = withoutSqliteTransformPass(() =>
+        withSqliteBackgroundWriter(() => runMessageFtsRowidMapBackfill(db)),
+    ).finally(() => {
         activeBackfills.delete(db);
     });
     activeBackfills.set(db, run);
@@ -222,4 +264,27 @@ export function getMessageFtsRowidMapBackfillProgress(
     db: Database,
 ): MessageFtsRowidMapBackfillProgress {
     return getBackfillState(db);
+}
+
+/**
+ * Delete the FTS rows of whole sessions that the rowid map cannot reach yet.
+ *
+ * Whole-session clears delete FTS rows through `message_fts_rowid_map`. Rows
+ * written before the map existed get their map entry only when the bounded
+ * backfill reaches them, and the backfill walks rowids in ascending order, so
+ * every such unmapped row sits above its watermark. Until the backfill
+ * completes, a clear also sweeps that rowid range for the sessions; otherwise
+ * the rows outlive the clear, get mapped later, and surface in search as stale
+ * duplicates forever, even after the session is deleted. The rowid bound keeps
+ * the sweep to the part of the table the backfill has not reached.
+ */
+export function deleteUnmappedMessageFtsRows(db: Database, sessionIds: readonly string[]): void {
+    if (sessionIds.length === 0) return;
+    const state = getBackfillState(db);
+    if (state.completed) return;
+    const placeholders = sessionIds.map(() => "?").join(", ");
+    db.prepare(
+        `DELETE FROM message_history_fts
+         WHERE rowid > ? AND session_id IN (${placeholders})`,
+    ).run(state.watermarkRowid, ...sessionIds);
 }

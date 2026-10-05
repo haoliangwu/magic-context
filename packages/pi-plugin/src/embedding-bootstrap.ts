@@ -7,9 +7,11 @@ import {
 	type EmbeddingFeatures,
 	registerProjectEmbedding,
 	registerProjectShadowEmbedding,
+	unregisterProjectEmbedding,
 	unregisterProjectShadowEmbedding,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { drainProjectEmbeddingIdentityMaintenance } from "@magic-context/core/features/magic-context/project-embedding-registry";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
 	handleUntrustedLoad,
@@ -28,6 +30,7 @@ const registrationFingerprintsByDatabase = new WeakMap<
 	object,
 	Map<string, RegistrationFingerprint>
 >();
+const registeredIdentitiesByDatabase = new WeakMap<object, Set<string>>();
 
 function configCandidatePaths(
 	directory: string,
@@ -57,6 +60,13 @@ function configFingerprint(paths: readonly string[]): string {
 		.join("|");
 }
 
+export function unregisterPiProjectEmbeddings(db: ContextDatabase): void {
+	for (const identity of registeredIdentitiesByDatabase.get(db) ?? [])
+		unregisterProjectEmbedding(identity);
+	registeredIdentitiesByDatabase.delete(db);
+	registrationFingerprintsByDatabase.get(db)?.clear();
+}
+
 export async function ensureProjectRegisteredFromPiDirectory(
 	directory: string,
 	db: ContextDatabase,
@@ -73,7 +83,11 @@ export async function ensureProjectRegisteredFromPiDirectory(
 		registrationFingerprintsByDatabase.set(db, registrationFingerprints);
 	}
 	const cached = registrationFingerprints.get(projectIdentity);
-	if (cached && configFingerprint(cached.paths) === cached.fingerprint) return;
+	if (cached && configFingerprint(cached.paths) === cached.fingerprint) {
+		// Config caching must not cache away resumable database maintenance.
+		await drainProjectEmbeddingIdentityMaintenance(db, projectIdentity);
+		return;
+	}
 
 	if (isConfigLoadUntrusted(detailed)) {
 		handleUntrustedLoad(db, projectIdentity, directory, detailed);
@@ -93,6 +107,12 @@ export async function ensureProjectRegisteredFromPiDirectory(
 		memoryEnabled: detailed.config.memory.enabled,
 		gitCommitEnabled: detailed.config.memory.git_commit_indexing.enabled,
 	};
+	let registered = registeredIdentitiesByDatabase.get(db);
+	if (!registered) {
+		registered = new Set();
+		registeredIdentitiesByDatabase.set(db, registered);
+	}
+	registered.add(projectIdentity);
 	registerProjectEmbedding(
 		db,
 		projectIdentity,

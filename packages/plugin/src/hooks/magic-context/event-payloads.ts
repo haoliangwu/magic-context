@@ -17,11 +17,12 @@ export type MagicContextEvent = {
 export interface SessionCreatedInfo {
     id: string;
     parentID: string;
+    directory?: string;
     providerID?: string;
     modelID?: string;
     /**
      * Session title set at create time. Magic Context's own hidden children
-     * (historian/dreamer/memory-migration) all use `magic-context-*`
+     * (historian/dreamer) all use `magic-context-*`
      * titles, so this is the signal used to fully exempt them from the
      * transform + system-prompt injection pipeline.
      */
@@ -35,6 +36,7 @@ export interface MessageUpdatedAssistantInfo {
     /** OpenCode assistant message id. Undefined only when the event payload
      *  doesn't include one (older SDK versions or malformed events). */
     messageID?: string;
+    parentID?: string;
     completedAt?: number;
     providerID?: string;
     modelID?: string;
@@ -98,6 +100,7 @@ export function getSessionCreatedInfo(properties: unknown): SessionCreatedInfo |
     return {
         id: info.id,
         parentID: info.parentID,
+        directory: typeof info.directory === "string" ? info.directory : undefined,
         providerID: typeof info.providerID === "string" ? info.providerID : undefined,
         modelID: typeof info.modelID === "string" ? info.modelID : undefined,
         title: typeof info.title === "string" ? info.title : undefined,
@@ -126,6 +129,7 @@ export function getMessageUpdatedAssistantInfo(
         finish: typeof info.finish === "string" ? info.finish : undefined,
         sessionID: info.sessionID,
         messageID: typeof info.id === "string" ? info.id : undefined,
+        ...(typeof info.parentID === "string" ? { parentID: info.parentID } : {}),
         completedAt: typeof time?.completed === "number" ? time.completed : undefined,
         providerID: typeof info.providerID === "string" ? info.providerID : undefined,
         modelID: typeof info.modelID === "string" ? info.modelID : undefined,

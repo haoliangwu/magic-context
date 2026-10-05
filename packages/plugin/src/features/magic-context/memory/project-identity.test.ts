@@ -1,19 +1,21 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     __resetProjectIdentityForTests,
     __setProjectIdentityTestHooks,
+    describeUnresolvedProjectIdentity,
     isLinkedGitWorktree,
     resolveProjectIdentity,
     resolveProjectIdentityForSession,
 } from "./project-identity";
 
 function tempDir(): string {
-    return mkdtempSync(join(tmpdir(), "mc-identity-"));
+    return createTestTempDirFromPath(join(tmpdir(), "mc-identity-"));
 }
 
 function returningRootCommit(rootCommit: string): typeof execFileSync {
@@ -57,6 +59,15 @@ describe("resolveProjectIdentity directory fallback", () => {
         expect(resolveProjectIdentityForSession(join(homedir(), "a-project"))).not.toBeUndefined();
     });
 
+    // Agents read this text; it must name the home-directory rule and the opt-in,
+    // not leave them to guess "no git repo" (which resolves fine).
+    test("explains the home-directory refusal with the opt-in", () => {
+        const reason = describeUnresolvedProjectIdentity(homedir());
+        expect(reason).toContain("home directory");
+        expect(reason).toContain("allow_home_project");
+        expect(reason).not.toContain("git");
+    });
+
     test("uses the canonical home directory's stable dir identity when opted in", () => {
         const canonicalHome = realpathSync.native(homedir());
         const expected = `dir:${createHash("md5").update(canonicalHome, "utf8").digest("hex").slice(0, 12)}`;
@@ -98,7 +109,7 @@ describe("resolveProjectIdentity directory fallback", () => {
     });
 
     test("keeps a contained repository distinct from the home identity", () => {
-        const contained = mkdtempSync(join(homedir(), "mc-home-identity-"));
+        const contained = createTestTempDirFromPath(join(homedir(), "mc-home-identity-"));
         try {
             mkdirSync(join(contained, ".git"));
             __setProjectIdentityTestHooks({ execFileSync: returningRootCommit("abc1234") });
@@ -123,10 +134,8 @@ describe("resolveProjectIdentity directory fallback", () => {
                 execFileSync: returningRootCommit("def5678"),
                 homeDirectory: () => fakeHome,
             });
-            const expectedHomeIdentity = `dir:${createHash("md5")
-                .update(realpathSync.native(fakeHome), "utf8")
-                .digest("hex")
-                .slice(0, 12)}`;
+            // Opt-in permits memory, not a second identity for the home repository.
+            const expectedHomeIdentity = "git:def5678";
 
             expect(resolveProjectIdentityForSession(fakeHome)).toBeUndefined();
             expect(resolveProjectIdentityForSession(child)).toBeUndefined();
@@ -152,6 +161,31 @@ describe("resolveProjectIdentity directory fallback", () => {
             expect(resolveProjectIdentity(dir)).toBe(second);
         } finally {
             rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    test("keeps the remembered git identity for a leftover worktree folder with no git metadata", () => {
+        const dir = tempDir();
+        const neverResolved = tempDir();
+        try {
+            mkdirSync(join(dir, ".git"));
+            __setProjectIdentityTestHooks({ execFileSync: returningRootCommit("fedcba9") });
+            expect(resolveProjectIdentity(dir)).toBe("git:fedcba9");
+
+            // A new process sees only the durable sidecar. Removing the worktree's git
+            // metadata leaves an empty folder that git no longer recognizes.
+            __resetProjectIdentityForTests();
+            rmSync(join(dir, ".git"), { recursive: true, force: true });
+            expect(resolveProjectIdentity(dir)).toBe("git:fedcba9");
+            expect(resolveProjectIdentityForSession(dir)).toBe("git:fedcba9");
+
+            // A plain folder the plugin never resolved to git keeps its directory identity.
+            expect(resolveProjectIdentity(neverResolved)).toBe(
+                `dir:${createHash("md5").update(neverResolved, "utf8").digest("hex").slice(0, 12)}`,
+            );
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+            rmSync(neverResolved, { recursive: true, force: true });
         }
     });
 

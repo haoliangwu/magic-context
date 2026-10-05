@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,6 +8,7 @@ import {
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { parseCompartmentOutput } from "./compartment-parser";
 
 /**
@@ -24,7 +25,7 @@ let tempHome: string;
 
 beforeEach(() => {
     prevDataHome = process.env.XDG_DATA_HOME;
-    tempHome = mkdtempSync(join(tmpdir(), "mc-v2-roundtrip-"));
+    tempHome = createTestTempDirFromPath(join(tmpdir(), "mc-v2-roundtrip-"));
     process.env.XDG_DATA_HOME = tempHome;
     closeDatabase();
 });

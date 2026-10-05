@@ -1,7 +1,11 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 /**
@@ -50,21 +54,20 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
     return asString.includes(HISTORIAN_SYSTEM_MARKER);
 }
 
-let h: TestHarness;
+forEachHost(import.meta.url, "slow historian vs fast main", (host) => {
+    let h: ScenarioHarness;
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            execute_threshold_percentage: 40,
-        },
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: {
+                execute_threshold_percentage: 40,
+            },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("slow historian vs fast main", () => {
+    afterAll(async () => {
+        await h.dispose();
+    });
     it(
         "main turns stay responsive while historian hangs in background",
         async () => {

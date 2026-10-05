@@ -1,17 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import {
-    existsSync,
-    mkdirSync,
-    mkdtempSync,
-    readFileSync,
-    rmSync,
-    statSync,
-    writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import type { Database } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { closeDatabase, openDatabase, updateSessionMeta } from "./storage";
 import {
     __resetWindowReportLedgerDiagnosticsForTests,
@@ -37,7 +29,7 @@ afterEach(() => {
 });
 
 function useTemporaryDataHome(): void {
-    const directory = mkdtempSync(join(tmpdir(), "mc-window-report-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-window-report-"));
     temporaryPaths.push(directory);
     process.env.XDG_DATA_HOME = directory;
 }
@@ -174,7 +166,7 @@ describe("window report ledger", () => {
     });
 
     it("swallows ledger write failures and records diagnostics", () => {
-        const filePath = mkdtempSync(join(tmpdir(), "mc-window-report-file-"));
+        const filePath = createTestTempDirFromPath(join(tmpdir(), "mc-window-report-file-"));
         temporaryPaths.push(filePath);
         process.env.XDG_DATA_HOME = join(filePath, "not-a-directory");
         writeFileSync(process.env.XDG_DATA_HOME, "file");

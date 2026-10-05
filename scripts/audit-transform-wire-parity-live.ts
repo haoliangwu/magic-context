@@ -680,7 +680,12 @@ function rustCavemanCandidate(
 	rows: Row[];
 	samples: CavemanInput[];
 } | null {
-	if (!tableExists(store, "mc_cache_state") || !tableExists(store, "mc_tags"))
+	// Since store migration 63 the frozen units live in positional chunk rows, read in
+	// chunk order; the cache-state row no longer carries them.
+	if (
+		!tableExists(store, "mc_cache_frozen_chunks") ||
+		!tableExists(store, "mc_tags")
+	)
 		return null;
 	const projectBySession = new Map(
 		bindings.map((row) => [row.sessionId, row.projectPath]),
@@ -688,13 +693,20 @@ function rustCavemanCandidate(
 	for (const sessionId of RUST_SESSIONS) {
 		if (bindingLane(context, projectBySession.get(sessionId) ?? "") !== "rust")
 			continue;
-		const state = store
-			.query("SELECT core_state FROM mc_cache_state WHERE session_id = ?")
-			.get(sessionId) as Row | null;
-		const core = safeJson(state?.core_state);
-		const units = Array.isArray(core.frozen_units)
-			? (core.frozen_units as Row[])
-			: [];
+		const units = (
+			store
+				.query(
+					"SELECT body FROM mc_cache_frozen_chunks WHERE session_id = ? ORDER BY chunk",
+				)
+				.all(sessionId) as Row[]
+		).flatMap((chunk) => {
+			try {
+				const body = JSON.parse(String(chunk.body ?? "[]"));
+				return Array.isArray(body) ? (body as Row[]) : [];
+			} catch {
+				return [];
+			}
+		});
 		const depthByBlock = new Map<string, number>();
 		for (const unit of units) {
 			const key = String(unit.key ?? "");
@@ -1747,9 +1759,32 @@ function decisionEvidence(
 	const schedulerPassBands: Record<string, number> = {};
 	const schedulerDeferReasons: Record<string, number> = {};
 	let schedulerRows = 0;
-	if (tableExists(store, "mc_pass_trace")) {
+	// Store migration 63 moved the histories into ring rows and dropped the array columns;
+	// its read-only view rebuilds each session's arrays in sequence order. Older stores still
+	// carry the columns.
+	const historyView = Boolean(
+		store
+			.query(
+				"SELECT 1 FROM sqlite_master WHERE type = 'view' AND name = 'mc_pass_trace_history_arrays'",
+			)
+			.get(),
+	);
+	const historySource = historyView
+		? "mc_pass_trace_history_arrays"
+		: tableExists(store, "mc_pass_trace") &&
+				columns(store, "mc_pass_trace").has("scheduler_history")
+			? "mc_pass_trace"
+			: null;
+	if (tableExists(store, "mc_pass_trace") && historySource === null) {
+		// Trace rows with no readable history would otherwise report zero scheduler
+		// decisions as if none had happened.
+		fixedClasses.scheduler_history_unreadable = Number(
+			(store.query("SELECT COUNT(*) AS n FROM mc_pass_trace").get() as Row).n ?? 0,
+		);
+	}
+	if (historySource !== null) {
 		for (const row of store
-			.query("SELECT scheduler_history FROM mc_pass_trace")
+			.query(`SELECT scheduler_history FROM ${historySource}`)
 			.all() as Row[]) {
 			let history: unknown[] = [];
 			try {

@@ -1,24 +1,14 @@
 {
   "artifactId": "prompt-surface-light-weak-model-validation",
-  "revision": "s3-r1",
-  "timestamp": "2026-08-08T19:13:53.471Z",
+  "revision": "desk-r1",
+  "timestamp": "2026-09-22T16:08:08.050Z",
   "endpoint": "https://ollama.com/api/chat",
-  "models": [
-    {
-      "label": "DeepSeek V4 Flash",
-      "route": "ollama-cloud/deepseek-v4-flash",
-      "model": "deepseek-v4-flash"
-    },
-    {
-      "label": "Gemma 4 31B",
-      "route": "ollama-cloud/gemma4:31b",
-      "model": "gemma4:31b"
-    }
-  ],
-  "presets": [
-    "full",
-    "light"
-  ],
+  "model": {
+    "label": "Gemma 4 31B",
+    "route": "ollama-cloud/gemma4:31b",
+    "model": "gemma4:31b"
+  },
+  "preset": "light",
   "settings": {
     "temperature": 0,
     "seed": 268,
@@ -28,139 +18,117 @@
     "maxAttempts": 2,
     "repetitions": 1
   },
-  "probe": "§101§ User instruction: preserve the requested migration order.\n§102§ Assistant: I extracted the relevant code paths.\n§103§ Tool output: a large file read already analyzed and acted on.\n§104§ Tool output: an unresolved compiler error that still needs diagnosis.\n§105§ Tool output: repeated passing status already recorded elsewhere.\n\nYou have finished with §103§ and §105§, but §104§ is unresolved. Silently call ctx_reduce once with both eligible IDs in the documented drop grammar. Emit no prose or placeholder markers.",
-  "expectedDropIds": [
-    103,
-    105
+  "probes": [
+    {
+      "id": "stamp",
+      "prompt": "§101§ User instruction: preserve the requested migration order.\n§102§ Assistant: I extracted the relevant code paths.\n§103§ Tool output: a large file read already analyzed and acted on.\n§104§ Tool output: an unresolved compiler error that still needs diagnosis.\n§105§ Tool output: repeated passing status already recorded elsewhere.\n\nThe next step uses only the unresolved compiler error. Continue with normal desk housekeeping before that step."
+    },
+    {
+      "id": "search",
+      "prompt": "You need the recorded reason this project chose SQLite instead of Postgres. It is not on the desk, but it may already be in the archive. Resolve it using the available project tool before deciding whether the user must be asked."
+    },
+    {
+      "id": "note",
+      "prompt": "The user says: \"Take a note: after v1.0, revisit the cache invalidation benchmark. Evidence: the current run is noisy on CI, and compare it with the local baseline.\" Use the available session-note tool."
+    }
   ],
   "rubric": [
-    "one real ctx_reduce tool call",
-    "drop parses to exactly IDs 103 and 105",
-    "no §N§ imitation in assistant output or tool arguments",
-    "no fabricated [dropped §N§] marker"
+    "stamps early: one ctx_reduce call includes spent outputs 103 and 105 while keeping user 101 and unresolved error 104",
+    "does not narrate: the stamp call emits no prose or marker imitation",
+    "searches before asking: one ctx_search query names SQLite and Postgres",
+    "notes with title: one ctx_note write has a title under 80 chars and detail"
   ],
   "unavailableModelPolicy": "fail the harness; do not substitute a model silently",
   "records": [
     {
-      "model": "ollama-cloud/deepseek-v4-flash",
-      "requestedModel": "deepseek-v4-flash",
-      "preset": "full",
-      "content": "",
-      "toolCalls": [
-        {
-          "id": "call_bv1qt0t3",
-          "function": {
-            "index": 0,
-            "name": "ctx_reduce",
-            "arguments": {
-              "drop": "103,105"
-            }
-          }
-        }
-      ],
-      "drop": "103,105",
-      "checks": {
-        "oneRealCtxReduceCall": true,
-        "correctDropShape": true,
-        "noTagImitation": true,
-        "noFabricatedDroppedMarker": true
-      },
-      "passed": true,
-      "usage": {
-        "promptTokens": 2275,
-        "completionTokens": 47
-      }
-    },
-    {
-      "model": "ollama-cloud/deepseek-v4-flash",
-      "requestedModel": "deepseek-v4-flash",
-      "preset": "light",
-      "content": "",
-      "toolCalls": [
-        {
-          "id": "call_o9yyogjb",
-          "function": {
-            "index": 0,
-            "name": "ctx_reduce",
-            "arguments": {
-              "drop": "103,105"
-            }
-          }
-        }
-      ],
-      "drop": "103,105",
-      "checks": {
-        "oneRealCtxReduceCall": true,
-        "correctDropShape": true,
-        "noTagImitation": true,
-        "noFabricatedDroppedMarker": true
-      },
-      "passed": true,
-      "usage": {
-        "promptTokens": 1709,
-        "completionTokens": 47
-      }
-    },
-    {
       "model": "ollama-cloud/gemma4:31b",
       "requestedModel": "gemma4:31b",
-      "preset": "full",
+      "preset": "light",
+      "probe": "stamp",
       "content": "",
       "toolCalls": [
         {
-          "id": "call_dek5c5sp",
+          "id": "call_o9gcpzts",
           "function": {
             "index": 0,
             "name": "ctx_reduce",
             "arguments": {
-              "drop": "103,105"
+              "drop": "102,103,105"
             }
           }
         }
       ],
-      "drop": "103,105",
       "checks": {
-        "oneRealCtxReduceCall": true,
-        "correctDropShape": true,
-        "noTagImitation": true,
-        "noFabricatedDroppedMarker": true
+        "stampsEarly": true,
+        "doesNotNarrate": true
       },
       "passed": true,
       "usage": {
-        "promptTokens": 2149,
-        "completionTokens": 21
+        "promptTokens": 1240,
+        "completionTokens": 25
       }
     },
     {
       "model": "ollama-cloud/gemma4:31b",
       "requestedModel": "gemma4:31b",
       "preset": "light",
+      "probe": "search",
       "content": "",
       "toolCalls": [
         {
-          "id": "call_2yonjblq",
+          "id": "call_r4p339by",
           "function": {
             "index": 0,
-            "name": "ctx_reduce",
+            "name": "ctx_search",
             "arguments": {
-              "drop": "103,105"
+              "query": "why did we choose SQLite over postgres?"
             }
           }
         }
       ],
-      "drop": "103,105",
       "checks": {
-        "oneRealCtxReduceCall": true,
-        "correctDropShape": true,
-        "noTagImitation": true,
-        "noFabricatedDroppedMarker": true
+        "searchesBeforeAsking": true
       },
       "passed": true,
       "usage": {
-        "promptTokens": 1548,
-        "completionTokens": 21
+        "promptTokens": 1127,
+        "completionTokens": 22
+      }
+    },
+    {
+      "model": "ollama-cloud/gemma4:31b",
+      "requestedModel": "gemma4:31b",
+      "preset": "light",
+      "probe": "note",
+      "content": "",
+      "toolCalls": [
+        {
+          "id": "call_twzil2sg",
+          "function": {
+            "index": 0,
+            "name": "ctx_note",
+            "arguments": {
+              "action": "write",
+              "content": "Revisit cache invalidation benchmark after v1.0\nThe current run is noisy on CI; need to compare it with the local baseline."
+            }
+          }
+        }
+      ],
+      "checks": {
+        "notesWithTitle": true
+      },
+      "passed": true,
+      "usage": {
+        "promptTokens": 1189,
+        "completionTokens": 49
       }
     }
   ],
+  "behaviors": {
+    "stampsEarly": true,
+    "doesNotNarrate": true,
+    "searchesBeforeAsking": true,
+    "notesWithTitle": true
+  },
   "passed": true
 }

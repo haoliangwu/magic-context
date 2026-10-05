@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+	MEMORY_MURAL_BLOCK,
+	MEMORY_MURAL_GUIDANCE,
+} from "@magic-context/core/agents/magic-context-prompt";
 import { resolveMuralWire } from "@magic-context/core/features/magic-context/mural/render-trigger";
 import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -9,11 +13,17 @@ import {
 	refreshModelLimitsFromApi,
 } from "@magic-context/core/shared/models-dev-cache";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
+import { clearContextHandlerSession } from "./context-handler";
 import {
 	__test,
 	injectM0M1Pi,
 	type PiM0M1State,
 } from "./inject-compartments-pi";
+import {
+	__test as hygieneTest,
+	measurePiTailHygiene,
+} from "./tail-hygiene-walk-pi";
 import { createTestDb, textOf, userMessage } from "./test-utils.test";
 
 const SESSION_ID = "ses_pi_mural_inject";
@@ -25,12 +35,15 @@ const FAKE_MURAL_BASE64 = FAKE_MURAL_DATA_URL.slice(
 	"data:image/png;base64,".length,
 );
 
-function muralOption() {
+function muralOption(
+	dataUrl = FAKE_MURAL_DATA_URL,
+	contentHash = "mural-hash-1",
+) {
 	return {
 		enabled: true,
 		supportsVision: true,
-		dataUrl: FAKE_MURAL_DATA_URL,
-		contentHash: "mural-hash-1",
+		dataUrl,
+		contentHash,
 	};
 }
 
@@ -79,6 +92,88 @@ function findM0Image(messages: Array<{ content?: unknown }>): {
 }
 
 describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
+	it("session teardown frees mural and hygiene bodies without changing persisted replay bytes", () => {
+		const db = createTestDb();
+		try {
+			getOrCreateSessionMeta(db, SESSION_ID);
+			const first = [userMessage("hello")];
+			injectM0M1Pi(
+				baseState({ mural: muralOption() }),
+				db,
+				first as never,
+				undefined,
+				true,
+			);
+			measurePiTailHygiene({
+				messages: first,
+				tags: [],
+				protectedTagNumbers: new Set(),
+			});
+			expect(__test.hasMuralProcessCache(SESSION_ID)).toBe(true);
+			expect(hygieneTest.contentMemoStats().bytes).toBeGreaterThan(0);
+			clearContextHandlerSession(SESSION_ID);
+			expect(__test.hasMuralProcessCache(SESSION_ID)).toBe(false);
+			expect(hygieneTest.contentMemoStats()).toEqual({ entries: 0, bytes: 0 });
+			const replay = [userMessage("hello")];
+			injectM0M1Pi(baseState(), db, replay as never, undefined, false);
+			expect(JSON.stringify(replay)).toBe(JSON.stringify(first));
+		} finally {
+			__test.clearPiMuralProcessCache(SESSION_ID);
+			closeQuietly(db);
+		}
+	});
+	it("replays a pre-legend baseline unchanged until the next HARD fold", () => {
+		const db = createTestDb();
+		try {
+			getOrCreateSessionMeta(db, SESSION_ID);
+			const firstMessages = [userMessage("first")];
+			injectM0M1Pi(
+				baseState({ mural: muralOption() }),
+				db,
+				firstMessages as never,
+				undefined,
+				true,
+			);
+			const meta = getOrCreateSessionMeta(db, SESSION_ID);
+			const legacy = Buffer.from(
+				meta.cachedM0Bytes
+					?.toString("utf8")
+					.replace(`${MEMORY_MURAL_GUIDANCE}\n`, ""),
+			);
+			db.prepare(
+				"UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?",
+			).run(legacy, SESSION_ID);
+			__test.clearPiMuralProcessCache(SESSION_ID);
+			const deferredMessages = [userMessage("defer")];
+			const deferred = injectM0M1Pi(
+				baseState(),
+				db,
+				deferredMessages as never,
+				undefined,
+				false,
+			);
+			expect(deferred.m0Materialized).toBe(false);
+			expect(textOf(deferredMessages[0])).toBe(
+				textOf(firstMessages[0]).replace(`${MEMORY_MURAL_GUIDANCE}\n`, ""),
+			);
+			const foldedMessages = [userMessage("hard")];
+			injectM0M1Pi(
+				baseState({
+					mural: muralOption(),
+					hardSignals: { ...baseState().hardSignals!, systemHash: "next" },
+				}),
+				db,
+				foldedMessages as never,
+				undefined,
+				true,
+			);
+			expect(textOf(foldedMessages[0])).toContain(MEMORY_MURAL_BLOCK);
+		} finally {
+			__test.clearPiMuralProcessCache(SESSION_ID);
+			closeQuietly(db);
+		}
+	});
+
 	it("folds the <memory-mural> block and Pi image part on HARD, replays byte-identical on defer", () => {
 		const db = createTestDb();
 		try {
@@ -95,7 +190,7 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			);
 			expect(first.injected).toBe(true);
 			expect(first.m0Materialized).toBe(true);
-			expect(textOf(hardMessages[0])).toContain("<memory-mural>");
+			expect(textOf(hardMessages[0])).toContain(MEMORY_MURAL_BLOCK);
 			const hardImage = findM0Image(hardMessages);
 			expect(hardImage).toBeDefined();
 			expect(hardImage?.mimeType).toBe("image/png");
@@ -121,6 +216,29 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 			expect(deferImage?.data).toBe(FAKE_MURAL_BASE64);
 			expect(deferImage?.data).not.toBe(currentManifestBase64);
 			expect(textOf(deferMessages[0])).toBe(textOf(hardMessages[0]));
+
+			const refreshedMessages = [userMessage("natural hard")];
+			const refreshed = injectM0M1Pi(
+				baseState({
+					mural: muralOption(
+						`data:image/png;base64,${currentManifestBase64}`,
+						"current-pi-manifest",
+					),
+					hardSignals: {
+						systemHash: "sys-next",
+						modelKey: "anthropic/claude-sonnet-4",
+						cacheExpired: false,
+						lastResponseTime: 0,
+					},
+				}),
+				db,
+				refreshedMessages as never,
+				undefined,
+				false,
+			);
+			expect(refreshed.m0Reason).toBe("system_hash");
+			expect(refreshed.m0Materialized).toBe(true);
+			expect(findM0Image(refreshedMessages)?.data).toBe(currentManifestBase64);
 		} finally {
 			closeQuietly(db);
 		}
@@ -157,10 +275,11 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 				undefined,
 				false,
 			);
-			expect(disabled.m0Reason).toBe("render_config");
+			expect(disabled.m0Reason).toBe("render_config:mural(true→false)");
 			expect(disabled.m0Materialized).toBe(true);
 			expect(findM0Image(disabledMessages)).toBeNull();
 			expect(textOf(disabledMessages[0])).not.toContain("<memory-mural>");
+			expect(textOf(disabledMessages[0])).not.toContain(MEMORY_MURAL_GUIDANCE);
 
 			const deferMessages = [userMessage("defer")];
 			const defer = injectM0M1Pi(
@@ -209,7 +328,9 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 				undefined,
 				false,
 			);
-			expect(changed.m0Reason).toBe("render_config");
+			expect(changed.m0Reason).toBe(
+				"render_config:budget(m1000-h2000→m1001-h2000)",
+			);
 			expect(changed.m0Materialized).toBe(true);
 
 			const unchanged = injectM0M1Pi(
@@ -312,7 +433,9 @@ describe("Pi m[0] mural image fold (on-demand render → wire)", () => {
 	});
 
 	it("stays text-only when the model has no vision metadata (fail closed)", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "mc-pi-mural-novision-"));
+		const tempDir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-mural-novision-"),
+		);
 		const originalXdgData = process.env.XDG_DATA_HOME;
 		process.env.XDG_DATA_HOME = tempDir;
 		clearModelsDevCache();
@@ -378,7 +501,7 @@ describe("resolveMuralWire Pi provider-prefix translation", () => {
 	beforeEach(() => {
 		// Isolate the persisted models-dev cache so vision seeds never touch the
 		// real ~/.local/share tree or leak across cases via cold-start reload.
-		tempDir = mkdtempSync(join(tmpdir(), "mc-pi-mural-models-"));
+		tempDir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-mural-models-"));
 		originalXdgData = process.env.XDG_DATA_HOME;
 		process.env.XDG_DATA_HOME = tempDir;
 		clearModelsDevCache();

@@ -36,7 +36,7 @@ registerIssue424CapacityTests(
 			},
 			historianModel: "test/model",
 			historianChunkTokens,
-			historianContextLimit,
+			historianContextLimit: historianContextLimit ?? 1_000_000,
 			maxOutputTokens,
 			boundarySnapshot: boundary,
 			compartmentLeaseHolderId: holderId,

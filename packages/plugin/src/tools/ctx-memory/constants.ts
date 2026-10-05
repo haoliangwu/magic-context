@@ -1,14 +1,15 @@
 export const CTX_MEMORY_TOOL_NAME = "ctx_memory";
-export const CTX_MEMORY_DESCRIPTION = `Durable project knowledge shared across every session on this project.
+export const CTX_MEMORY_LIST_TOOL_NAME = "ctx_memory_list";
+export const CTX_MEMORY_LIST_DESCRIPTION = "Browse active memories, optionally filter by category.";
+export const CTX_MEMORY_DESCRIPTION = `Durable facts about this project, shared with every agent working on it and kept for the months this work lasts.
 
-Your active memories are already visible in <project-memory> (each with its id), and every future session starts with them — write one when you learn something future sessions must know: a project rule, an architectural fact, a hard-won constraint, a config value, or a naming convention. Keep each memory one standalone fact, phrased to make sense without this session's context.
+Your active memories are already in <project-memory> as \`#id: fact\` lines. Write one when you learn something that must not have to be found again — a project rule, an architectural fact, a hard-won constraint, a config value, a naming convention — and especially when it cost you turns to find. One standalone fact per memory, phrased to make sense on its own. A pending intention with its evidence ("do X later, here is what we know") is ctx_note, not memory.
 
 Actions:
-- write: save a new memory (content + category).
-- update: rewrite one memory whose fact changed (ids: [one], content).
+- write: new memory (content + category).
+- update: rewrite one memory whose fact changed (ids: [one], content; category optional to recategorize).
 - archive: retire wrong or obsolete memories (ids: [one or more], optional reason).
-- merge: collapse duplicates into one memory (ids: [two or more], content).
-- get: fetch memories by id (ids: [1-20]); readable in every status. \`list\` remains dreamer-only.
-
-Example: ctx_memory(action="write", category="CONSTRAINTS", content="Pi stores sessions as JSONL under ~/.pi/agent/sessions/, not SQLite")`;
+- merge: collapse duplicates into one (ids: [two or more], content).
+- get: fetch by id (ids: 1–20), readable in every status.
+Examples: category="CONFIG_VALUES", content="OpenCode source is at ~/Work/OSS/opencode" · category="CONSTRAINTS", content="Dashboard Tauri build needs RGBA PNGs, not grayscale"`;
 export const DEFAULT_SEARCH_LIMIT = 10;

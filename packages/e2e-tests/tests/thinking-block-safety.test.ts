@@ -3,6 +3,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { TestHarness } from "../src/harness";
+import { forEachHost } from "../src/scenario-hosts";
 import { openTestDb } from "../src/test-db";
 
 /**
@@ -53,27 +54,7 @@ const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 
 let h: TestHarness;
 
-beforeAll(async () => {
-	h = await TestHarness.create({
-		magicContextConfig: {
-			// Keep the nudge band active but not aggressive — tests will
-			// inject specific usage percentages via mock responses.
-			execute_threshold_percentage: 80,
-			// Off because Bug B asserts the dropped paste body is absent from ALL
-			// user text. Dropped content intentionally stays searchable, so when
-			// the async FTS index catches up in time the auto-search hint quotes
-			// an 80-char fragment of the paste back into the next user message —
-			// a timing coin-flip that failed 3 of 20 serial runs. This suite
-			// tests thinking-block safety, not search recall.
-			memory: { auto_search: { enabled: false } },
-		},
-		modelContextLimit: 50_000,
-	});
-});
 
-afterAll(async () => {
-	await h.dispose();
-});
 
 interface AnthropicContentBlock {
 	type: string;
@@ -322,7 +303,23 @@ function findThinkingBlocks(req: RequestWithMessages): AnthropicContentBlock[] {
 	return findThinkingBlockLocations(req).map(({ block }) => block);
 }
 
-describe("thinking-block safety (Anthropic 400 regression)", () => {
+forEachHost(import.meta.url, "thinking-block safety (Anthropic 400 regression)", () => {
+	beforeAll(async () => {
+		h = await TestHarness.create({
+			magicContextConfig: {
+            // Keep the execute threshold high enough to exercise intermediate
+            // nudges without triggering aggressive compaction; tests inject
+            // specific usage percentages through mock responses.
+				execute_threshold_percentage: 80,
+				memory: { auto_search: { enabled: false } },
+			},
+			modelContextLimit: 50_000,
+		});
+	});
+
+	afterAll(async () => {
+		await h.dispose();
+	});
 	it("rejects a delayed request that lacks the intended prompt marker", () => {
 		const intendedMarker = "[[thinking-block-intended]]";
 		const intended = {

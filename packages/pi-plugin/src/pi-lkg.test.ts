@@ -1,7 +1,10 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
-import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
+import {
+	getSlot,
+	resetLkgSlotsForTest,
+} from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 
@@ -49,6 +52,71 @@ afterEach(() => {
 });
 
 describe("Pi incremental LKG capture", () => {
+	it("detaches exact nested output fields and rejects same-length in-place rewrites", () => {
+		const harness = createHarness();
+		databases.push(harness.db);
+		const output = [
+			{
+				role: "assistant",
+				content: [
+					{
+						type: "toolCall",
+						name: "read",
+						arguments: { path: "alpha", values: [null, true, 1, undefined] },
+					},
+				],
+				timestamp: 1,
+			},
+		];
+		const snapshot = harness.coordinator.beginPass({
+			sessionId: "nested-output",
+			messages: output,
+			entryIds: ["entry"],
+			modelKey: "test/model",
+			providerKey: "test",
+		});
+		const capture = () =>
+			harness.coordinator.captureAppliedPass({
+				snapshot,
+				outputMessages: output,
+				outputEntryIds: ["entry"],
+				cacheBusting: false,
+			});
+		const originalJson = JSON.stringify(output);
+		expect(capture()?.json).toBe(originalJson);
+		harness.flushCapture();
+		output[0].content[0].arguments.path = "bravo";
+		const changedJson = JSON.stringify(output);
+		expect(changedJson).not.toBe(originalJson);
+		expect(capture()?.json).toBe(changedJson);
+		harness.flushCapture();
+		expect(getSlot("nested-output")?.jsonPrefix).toBe(changedJson);
+	});
+
+	it("keeps sparse and custom-JSON output on the one-shot serialization path", () => {
+		const harness = createHarness();
+		databases.push(harness.db);
+		const snapshot = harness.coordinator.beginPass({
+			sessionId: "custom-output",
+			messages: [message("input")],
+			entryIds: ["entry"],
+			modelKey: "test/model",
+			providerKey: "test",
+		});
+		for (const content of [new Array(2), { toJSON: () => "custom" }]) {
+			const output = [{ role: "user", content, timestamp: 1 }];
+			expect(
+				harness.coordinator.captureAppliedPass({
+					snapshot,
+					outputMessages: output,
+					outputEntryIds: ["entry"],
+					cacheBusting: false,
+				}),
+			).toBeUndefined();
+			harness.flushCapture();
+			expect(getSlot("custom-output")?.jsonPrefix).toBe(JSON.stringify(output));
+		}
+	});
 	it("refuses replay when the same entry id returns to old same-length content", () => {
 		const harness = createHarness();
 		databases.push(harness.db);
@@ -262,7 +330,10 @@ describe("Pi contracted LKG", () => {
 		harness.flushCapture();
 		expect(
 			harness.coordinator.replay(harness.coordinator.beginPass(args)),
-		).toEqual({ ok: true, messages: args.messages });
+		).toEqual({
+			ok: true,
+			messages: args.messages,
+		});
 		expect(
 			harness.coordinator.beginPass({
 				...args,
@@ -319,6 +390,11 @@ it("Pi high-fill recovery replays a mapped contraction with 16 stable host entri
 			204000,
 			() => {},
 			new Error("database is locked"),
+			{
+				modelKey: "openai-codex/gpt-5.6-sol",
+				systemTokens: 100,
+				toolDefinitionTokens: 0,
+			},
 		),
 	).toThrow();
 	const replay = harness.coordinator.replay(next);
@@ -335,6 +411,11 @@ it("Pi high-fill recovery replays a mapped contraction with 16 stable host entri
 			204000,
 			() => {},
 			new Error("database is locked"),
+			{
+				modelKey: "openai-codex/gpt-5.6-sol",
+				systemTokens: 100,
+				toolDefinitionTokens: 0,
+			},
 		),
 	).not.toThrow();
 });
@@ -405,4 +486,150 @@ it("maps synthetic todo results to their assistant owner without guessing ambigu
 					: undefined,
 		),
 	).toEqual(["first", "second", undefined]);
+});
+
+it("reuses cloned output serialization and skips unchanged LKG persistence", () => {
+	const harness = createHarness();
+	databases.push(harness.db);
+	const inputs = [message("large image data".repeat(10000))];
+	const args = {
+		sessionId: "pi-lkg-unchanged-output-cost",
+		messages: inputs,
+		entryIds: ["one"],
+		modelKey: "model",
+		providerKey: "provider",
+	};
+	const capture = (messages: typeof inputs) => {
+		harness.coordinator.captureAppliedPass({
+			snapshot: harness.coordinator.beginPass({ ...args, messages }),
+			outputMessages: messages,
+			outputEntryIds: ["one"],
+			cacheBusting: false,
+		});
+		harness.flushCapture();
+	};
+	capture(inputs);
+	const changes = () =>
+		(harness.db.prepare("SELECT total_changes() AS n").get() as { n: number })
+			.n;
+	const before = changes();
+	const clone = structuredClone(inputs);
+	const stringify = spyOn(JSON, "stringify");
+	try {
+		capture(clone);
+		expect(
+			stringify.mock.calls.filter(
+				([value]) => value === clone || value === clone[0],
+			),
+		).toHaveLength(0);
+		expect(changes()).toBe(before);
+	} finally {
+		stringify.mockRestore();
+	}
+	const clonedMessage = clone[0];
+	if (!clonedMessage) throw new Error("expected cloned message");
+	clonedMessage.content = "rewritten";
+	capture(clone);
+	expect(changes()).toBeGreaterThan(before);
+	expect(
+		harness.coordinator.replay(
+			harness.coordinator.beginPass({ ...args, messages: clone }),
+		),
+	).toEqual({ ok: true, messages: clone });
+});
+
+it("reuses input fingerprints across a cache-busting capture while invalidating replay", () => {
+	const timings: PiLkgCaptureTiming[] = [];
+	const harness = createHarness((sample) => timings.push(sample));
+	databases.push(harness.db);
+	const args = {
+		sessionId: "pi-lkg-busted-prefix-reuse",
+		messages: [message("one"), message("two")],
+		entryIds: ["one", "two"],
+		modelKey: "model",
+		providerKey: "provider",
+	};
+	harness.coordinator.captureAppliedPass({
+		snapshot: harness.coordinator.beginPass(args),
+		outputMessages: args.messages,
+		outputEntryIds: args.entryIds,
+		cacheBusting: false,
+	});
+	harness.flushCapture();
+	const appended = {
+		...args,
+		messages: [...args.messages, message("three")],
+		entryIds: [...args.entryIds, "three"],
+	};
+	harness.coordinator.captureAppliedPass({
+		snapshot: harness.coordinator.beginPass(appended),
+		outputMessages: appended.messages,
+		outputEntryIds: appended.entryIds,
+		cacheBusting: true,
+	});
+	expect(
+		harness.coordinator.replay(harness.coordinator.beginPass(appended)).ok,
+	).toBe(false);
+	harness.flushCapture();
+	expect(timings.at(-1)?.reusedPrefix).toBe(2);
+	expect(
+		harness.coordinator.replay(harness.coordinator.beginPass(appended)),
+	).toEqual({ ok: true, messages: appended.messages });
+});
+
+it("preserves JSON serialization for non-plain output values", () => {
+	const harness = createHarness();
+	databases.push(harness.db);
+	const args = {
+		sessionId: "pi-lkg-date-output",
+		messages: [message("input")],
+		entryIds: ["one"],
+		modelKey: null,
+		providerKey: null,
+	};
+	for (const date of ["2026-01-01", "2026-02-01"]) {
+		const output = [{ ...message("output"), details: new Date(date) }];
+		harness.coordinator.captureAppliedPass({
+			snapshot: harness.coordinator.beginPass(args),
+			outputMessages: output,
+			outputEntryIds: ["one"],
+			cacheBusting: false,
+		});
+		harness.flushCapture();
+		expect(
+			harness.coordinator.replay(harness.coordinator.beginPass(args)),
+		).toEqual({ ok: true, messages: JSON.parse(JSON.stringify(output)) });
+	}
+});
+
+it("serializes custom output accessors exactly once", () => {
+	const harness = createHarness();
+	databases.push(harness.db);
+	const args = {
+		sessionId: "pi-lkg-accessor-output",
+		messages: [message("input")],
+		entryIds: ["one"],
+		modelKey: null,
+		providerKey: null,
+	};
+	let reads = 0;
+	const output = [
+		{
+			role: "user",
+			get content() {
+				return `read-${++reads}`;
+			},
+		},
+	];
+	harness.coordinator.captureAppliedPass({
+		snapshot: harness.coordinator.beginPass(args),
+		outputMessages: output,
+		outputEntryIds: ["one"],
+		cacheBusting: false,
+	});
+	harness.flushCapture();
+	expect(reads).toBe(1);
+	expect(
+		harness.coordinator.replay(harness.coordinator.beginPass(args)),
+	).toEqual({ ok: true, messages: [{ role: "user", content: "read-1" }] });
 });

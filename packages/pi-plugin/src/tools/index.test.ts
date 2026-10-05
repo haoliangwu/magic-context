@@ -10,6 +10,10 @@ import {
 	LIGHT_TOOL_DESCRIPTIONS,
 } from "@magic-context/core/shared/prompt-surface-runtime";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import {
+	FULL_PARAMETER_DESCRIPTIONS,
+	LIGHT_PARAMETER_DESCRIPTIONS,
+} from "@magic-context/core/tools/parameter-descriptions";
 import { createTestDb } from "../test-utils.test";
 import { registerMagicContextTools, syncCtxMemoryToolEnabled } from "./index";
 
@@ -51,6 +55,7 @@ describe("registerMagicContextTools", () => {
 
 			registerMagicContextTools(pi, {
 				db,
+				todowriteEnabled: true,
 				memoryToolEnabled: false,
 				sessionScopedToolsDisabled: true,
 				todowriteCommandEnabled: false,
@@ -75,7 +80,11 @@ describe("registerMagicContextTools", () => {
 				registerTool: (tool: { name: string }) => registered.push(tool.name),
 				registerCommand: () => undefined,
 			} as never;
-			registerMagicContextTools(pi, { db, compactionOff: true });
+			registerMagicContextTools(pi, {
+				db,
+				compactionOff: true,
+				todowriteEnabled: true,
+			});
 
 			expect(registered).not.toContain("ctx_reduce");
 			expect(registered).toEqual(
@@ -117,10 +126,13 @@ describe("registerMagicContextTools", () => {
 			} as never;
 
 			registerMagicContextTools(pi, { db });
+			expect(registered.has("ctx_memory_list")).toBe(false);
 
 			const expectedFields: Record<string, string[]> = {
-				ctx_search: ["query", "limit", "sources"],
-				ctx_memory: ["action", "content", "category", "ids", "limit", "reason"],
+				ctx_search: ["query", "limit", "from", "to", "sources"],
+				// No `limit`: it only sized the dreamer-only list action, which now
+				// lives on ctx_memory_list (issue 575).
+				ctx_memory: ["action", "content", "category", "ids", "reason"],
 				ctx_note: [
 					"action",
 					"content",
@@ -130,7 +142,7 @@ describe("registerMagicContextTools", () => {
 					"limit",
 					"offset",
 				],
-				ctx_expand: ["start", "end", "verbose", "message"],
+				ctx_expand: ["start", "end", "verbose", "message", "tag"],
 				ctx_reduce: ["drop"],
 			};
 			for (const [name, fields] of Object.entries(expectedFields)) {
@@ -143,6 +155,32 @@ describe("registerMagicContextTools", () => {
 				expect(definition?.parameters.properties).not.toHaveProperty("summary");
 				expect(definition?.parameters.additionalProperties).toBe(true);
 			}
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("registers ctx_memory_list only for dreamer child surfaces", () => {
+		const db = createTestDb();
+		try {
+			const registered = new Map<
+				string,
+				{ parameters: { properties?: Record<string, unknown> } }
+			>();
+			const pi = {
+				registerTool: (tool: {
+					name: string;
+					parameters: { properties?: Record<string, unknown> };
+				}) => registered.set(tool.name, tool),
+				registerCommand: () => undefined,
+			} as never;
+			registerMagicContextTools(pi, { db, allowDreamerActions: true });
+			expect(registered.has("ctx_memory_list")).toBe(true);
+			expect(
+				Object.keys(
+					registered.get("ctx_memory_list")?.parameters.properties ?? {},
+				).sort(),
+			).toEqual(["category", "limit"]);
 		} finally {
 			closeQuietly(db);
 		}
@@ -196,7 +234,7 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
-	it("registers todowrite and /todos by default", () => {
+	it("registers todowrite and /todos when explicitly enabled", () => {
 		const db = createTestDb();
 		try {
 			const registered: string[] = [];
@@ -206,7 +244,7 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db });
+			registerMagicContextTools(pi, { db, todowriteEnabled: true });
 
 			expect(registered).toContain("todowrite");
 			expect(commands).toContain("todos");
@@ -215,7 +253,10 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 
-	it("omits todowrite and /todos when todowrite is disabled", () => {
+	it.each([
+		undefined,
+		false,
+	])("omits todowrite and /todos when enabled is %s", (todowriteEnabled) => {
 		const db = createTestDb();
 		try {
 			const registered: string[] = [];
@@ -225,7 +266,7 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db, todowriteEnabled: false });
+			registerMagicContextTools(pi, { db, todowriteEnabled });
 
 			expect(registered).toContain("ctx_search");
 			expect(registered).not.toContain("todowrite");
@@ -245,7 +286,11 @@ describe("registerMagicContextTools", () => {
 				registerCommand: (name: string) => commands.push(name),
 			} as never;
 
-			registerMagicContextTools(pi, { db, todowriteCommandEnabled: false });
+			registerMagicContextTools(pi, {
+				db,
+				todowriteEnabled: true,
+				todowriteCommandEnabled: false,
+			});
 
 			expect(registered).toContain("todowrite");
 			expect(commands).not.toContain("todos");
@@ -254,6 +299,16 @@ describe("registerMagicContextTools", () => {
 		}
 	});
 });
+
+function withoutDescriptions(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(withoutDescriptions);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(
+		Object.entries(value)
+			.filter(([key]) => key !== "description")
+			.map(([key, child]) => [key, withoutDescriptions(child)]),
+	);
+}
 
 type RegisteredPromptTool = {
 	name: string;
@@ -349,7 +404,7 @@ describe("registerMagicContextTools — prompt-surface registration", () => {
 		}
 	});
 
-	it("registers built-in light descriptions without changing parameter schemas", () => {
+	it("registers built-in light prose without changing non-description schema fields", () => {
 		const fullDb = createTestDb();
 		const lightDb = createTestDb();
 		try {
@@ -364,9 +419,35 @@ describe("registerMagicContextTools — prompt-surface registration", () => {
 						toolId as keyof typeof LIGHT_TOOL_DESCRIPTIONS
 					],
 				);
-				expect(light.get(toolId)?.parameters).toEqual(
+				expect(light.get(toolId)?.parameters).not.toEqual(
 					full.get(toolId)?.parameters,
 				);
+				const lightParameters = light.get(toolId)?.parameters;
+				const fullParameters = full.get(toolId)?.parameters;
+				expect(withoutDescriptions(lightParameters)).toEqual(
+					withoutDescriptions(fullParameters),
+				);
+				for (const [name, description] of Object.entries(
+					LIGHT_PARAMETER_DESCRIPTIONS[
+						toolId as keyof typeof LIGHT_PARAMETER_DESCRIPTIONS
+					],
+				)) {
+					expect(
+						(lightParameters?.properties?.[name] as { description?: string })
+							?.description,
+					).toBe(description);
+					expect(
+						(fullParameters?.properties?.[name] as { description?: string })
+							?.description,
+					).toBe(
+						(
+							FULL_PARAMETER_DESCRIPTIONS as Record<
+								string,
+								Record<string, string>
+							>
+						)[toolId]?.[name],
+					);
+				}
 			}
 		} finally {
 			closeQuietly(fullDb);

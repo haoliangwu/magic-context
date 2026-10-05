@@ -15,7 +15,7 @@ use subc_client_rs::{
 };
 use subc_protocol::{BindIdentity, RouteTarget};
 
-const DEFAULT_THALAMUS_MODULE_ID: &str = "thalamus";
+use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 const SESSION_RESOLVE_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,14 +59,21 @@ pub trait SessionResolver: Send + Sync {
 
 pub struct RealSessionResolver {
     connection_file: PathBuf,
-    module_id: String,
+    route_targets: RouteTargetConfig,
 }
 
 impl RealSessionResolver {
     pub fn new(connection_file: PathBuf) -> Self {
+        Self::new_with_route_targets(connection_file, RouteTargetConfig::default())
+    }
+
+    pub fn new_with_route_targets(
+        connection_file: PathBuf,
+        route_targets: RouteTargetConfig,
+    ) -> Self {
         Self {
             connection_file,
-            module_id: DEFAULT_THALAMUS_MODULE_ID.to_string(),
+            route_targets,
         }
     }
 
@@ -75,9 +82,9 @@ impl RealSessionResolver {
     /// "thalamus", and a stale id here kills every stateful facade tool call
     /// at route-open.
     fn route_target(&self) -> RouteTarget {
-        RouteTarget::ManagementSurface {
-            module_id: self.module_id.clone(),
-        }
+        self.route_targets
+            .target(RegisteredRoute::SessionResolve)
+            .expect("session.resolve always has a registered module target")
     }
 
     async fn resolve_once(
@@ -253,10 +260,8 @@ mod tests {
         // Pin the exact runtime module id: the gateway registers as "thalamus";
         // any other id (e.g. the retired "ai-proxy") fails every facade call.
         assert_eq!(
-            resolver.route_target(),
-            RouteTarget::ManagementSurface {
-                module_id: "thalamus".to_string(),
-            }
+            format!("{:?}", resolver.route_target()),
+            "ManagementSurface { module_id: \"thalamus\" }"
         );
     }
 }

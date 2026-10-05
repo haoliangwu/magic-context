@@ -1,6 +1,7 @@
 export * from "./compaction";
 export * from "./compartment-storage";
 export * from "./dreamer";
+export * from "./install-instance-id";
 export * from "./memory";
 export * from "./range-parser";
 export * from "./scheduler";

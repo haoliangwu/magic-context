@@ -36,7 +36,12 @@ RUN cd /test && \
     npm install --silent --no-audit --no-fund @copilotkit/aimock
 
 COPY packages/pi-plugin/dist/ /test/mc-pi/dist/
-COPY tests/docker/.generated/subagent-runner-e2e.mjs /test/e2e/subagent-runner-e2e.mjs
+# Keep the Node renderer's split chunks together, as with the published plugin.
+# A monolithic Bun bundle of this async SQLite graph emits a Bun-only helper.
+COPY tests/docker/.generated/ /test/e2e/
+# npm init creates /test/package.json as CommonJS; the renderer's .js chunks
+# need the same explicit ESM package boundary as the published Pi plugin.
+COPY packages/pi-plugin/package.json /test/e2e/package.json
 COPY packages/pi-plugin/package.json /test/mc-pi/package.json
 COPY packages/pi-plugin/README.md /test/mc-pi/README.md
 RUN cd /test/mc-pi && \

@@ -35,7 +35,7 @@ const ParamsSchema = Type.Object(
 	{
 		drop: Type.Optional(
 			Type.String({
-				description: "Tag IDs to drop entirely. Ranges: '3-5', '1,2,9'",
+				description: 'Tag IDs to drop: "3-5", "1,2,9", "1-5,8,12-15".',
 			}),
 		),
 	},
@@ -215,12 +215,14 @@ export function createCtxReduceTool(
 			}
 
 			try {
-				deps.db.transaction(() => {
-					const now = Date.now();
-					for (const id of dropIds) {
-						queuePendingOp(deps.db, sessionId, id, "drop", now);
-					}
-				})();
+				deps.db
+					.transaction(() => {
+						const now = Date.now();
+						for (const id of dropIds) {
+							queuePendingOp(deps.db, sessionId, id, "drop", now);
+						}
+					})
+					.immediate();
 			} catch (error) {
 				return err(
 					`Error: Failed to queue ctx_reduce operations. ${getErrorMessage(error)}`,

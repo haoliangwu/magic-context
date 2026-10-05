@@ -2,13 +2,18 @@ import { chmodSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { open, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { workerData } from "node:worker_threads";
 import { DEFAULT_LOCAL_EMBEDDING_MODEL } from "../../../config/schema/magic-context";
 import { getMagicContextStorageDir } from "../../../shared/data-path";
+import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
+import { importPluginModule } from "../../../shared/stale-plugin-build";
 import { shouldEnforcePrivateStoragePermissions } from "../../../shared/storage-permissions";
 import { classifyLocalEmbeddingFailure, type EmbeddingFailure } from "./embedding-failure";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
+import { EmbeddingWorkerClient, type EmbeddingWorkerReply } from "./embedding-worker-client";
+import { configureTransformersRemoteHost } from "./transformers-remote-host";
 
 /** The dtype enum values accepted by @huggingface/transformers' feature-extraction
  *  pipeline (keyof typeof DATA_TYPES in transformers/types/utils/dtypes.d.ts).
@@ -84,6 +89,16 @@ export function resolveLocalEmbeddingRuntime(
     if (host.isElectron) return "electron";
     if (host.isBun && !bunHasNapiTeardownFix(host.bunVersion)) return "wasm";
     return "native";
+}
+
+/** Bun before 1.4 can panic the process when native ONNX is released during worker termination. */
+export function resolveLocalEmbeddingWorkerRuntime(
+    preference: LocalEmbeddingRuntime = "auto",
+    host: LocalEmbeddingHost = currentLocalEmbeddingHost(),
+): ResolvedLocalEmbeddingRuntime {
+    if (host.isBun && !bunHasNapiTeardownFix(host.bunVersion) && preference === "native")
+        return "wasm";
+    return resolveLocalEmbeddingRuntime(preference, host);
 }
 
 /**
@@ -209,6 +224,7 @@ type ImportWasmOrtModule = (specifier: string) => Promise<WasmOrtModule>;
 type LocalEmbeddingRuntimeMode = "native" | "wasm" | "disabled";
 
 type LocalEmbeddingTestHooks = {
+    workerFactory?: (data: Record<string, unknown>) => EmbeddingWorkerClient;
     host?: () => LocalEmbeddingHost;
     injectWasmOrt?: () => Promise<boolean>;
     resolveWasmOrt?: () => string | undefined;
@@ -222,6 +238,8 @@ type LocalEmbeddingTestHooks = {
 
 const ONNX_RUNTIME_WEB_SPECIFIER = "onnxruntime-web";
 
+let useInThreadTestRuntime = false;
+let workerFactoryForTests: LocalEmbeddingTestHooks["workerFactory"];
 let localEmbeddingRuntimeMode: LocalEmbeddingRuntimeMode = "native";
 let localEmbeddingProcessFailure: EmbeddingFailure | null = null;
 let wasmRuntimeInjected = false;
@@ -258,21 +276,36 @@ let importWasmOrtForRuntime = async (): Promise<{
 let importTransformersForRuntime = async (): Promise<TransformersModule> => {
     // Keep transformers in a lazy split chunk: the host can load the plugin and
     // use remote embeddings without evaluating the optional native accelerator.
-    return (await import("@huggingface/transformers")) as TransformersModule;
+    return (await importPluginModule(
+        () => import("@huggingface/transformers"),
+    )) as TransformersModule;
 };
 let importTransformersWasmFallbackForRuntime = async (): Promise<TransformersModule> => {
     // The browser-condition sibling remains the compatibility path for Electron
     // and hosts without Node filesystem access.
-    const webEntry = new URL("./transformers-web.js", import.meta.url).href;
-    return (await import(webEntry)) as TransformersModule;
+    const webEntry = new URL(
+        new URL(import.meta.url).pathname.endsWith(".ts")
+            ? "../../../../dist/transformers-web.js"
+            : "./transformers-web.js",
+        import.meta.url,
+    ).href;
+    return (await importPluginModule(() => import(webEntry))) as TransformersModule;
 };
 let importTransformersNodeWasmFallbackForRuntime = async (): Promise<TransformersModule> => {
     // This sibling resolves Transformers.js's Node source (real node:fs) while
     // aliasing optional native addons away from their platform loaders.
-    const nodeWasmEntry = new URL("./transformers-node-wasm.js", import.meta.url).href;
-    return (await import(nodeWasmEntry)) as TransformersModule;
+    const nodeWasmEntry = new URL(
+        new URL(import.meta.url).pathname.endsWith(".ts")
+            ? "../../../../dist/transformers-node-wasm.js"
+            : "./transformers-node-wasm.js",
+        import.meta.url,
+    ).href;
+    return (await importPluginModule(() => import(nodeWasmEntry))) as TransformersModule;
 };
-let modelCacheDirForRuntime = () => join(getMagicContextStorageDir(), "models");
+let modelCacheDirForRuntime = () =>
+    workerData?.magicContextEmbeddingWorker && typeof workerData.modelCacheDir === "string"
+        ? workerData.modelCacheDir
+        : join(getMagicContextStorageDir(), "models");
 let logForRuntime: (message: string, data?: unknown) => void = log;
 let injectWasmOrtForRuntime: () => Promise<boolean> = injectWasmOrt;
 
@@ -337,6 +370,8 @@ export function getLocalEmbeddingNativeMemoryStats(): LocalEmbeddingNativeMemory
 
 /** Test-only seams keep native-loader failures reproducible without loading a real addon. */
 export function __setLocalEmbeddingTestHooks(hooks: LocalEmbeddingTestHooks): void {
+    useInThreadTestRuntime = !hooks.workerFactory;
+    workerFactoryForTests = hooks.workerFactory;
     localEmbeddingHostForRuntime = hooks.host ?? (() => ({ isElectron: false, isBun: false }));
     injectWasmOrtForRuntime = hooks.injectWasmOrt ?? injectWasmOrt;
     resolveWasmOrtForRuntime = hooks.resolveWasmOrt ?? resolveWasmOrtForRuntimeDefault;
@@ -354,6 +389,8 @@ export function __setLocalEmbeddingTestHooks(hooks: LocalEmbeddingTestHooks): vo
 
 /** Reset process-global runtime decisions between isolated provider tests. */
 export function __resetLocalEmbeddingForTests(): void {
+    useInThreadTestRuntime = false;
+    workerFactoryForTests = undefined;
     localEmbeddingRuntimeMode = "native";
     localEmbeddingProcessFailure = null;
     wasmRuntimeInjected = false;
@@ -399,7 +436,7 @@ async function injectWasmOrt(): Promise<boolean> {
 
         if (ortWeb.env?.wasm) {
             // ORT's WASM worker threads can spin between runs and cannot currently
-            // be terminated. A single thread keeps the host event loop idle.
+            // be terminated. A single inference thread avoids an idle spinning pool.
             ortWeb.env.wasm.numThreads = 1;
 
             // Prefer package-local assets so first use works offline instead of
@@ -741,6 +778,8 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     private readonly dtype: LocalEmbeddingDtype;
     private readonly runtimePreference: LocalEmbeddingRuntime;
     private pipeline: EmbeddingPipeline | null = null;
+    private readonly workerClient: EmbeddingWorkerClient | null;
+    private workerLoaded = false;
     private initPromise: Promise<void> | null = null;
     private lastFailureReason: EmbeddingFailure | null = null;
     private usesWasm = false;
@@ -759,18 +798,42 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         this.maxInputTokens = maxInputTokens;
         this.dtype = dtype || DEFAULT_LOCAL_DTYPE;
         this.runtimePreference = runtimePreference;
+        this.workerClient =
+            !workerData?.magicContextEmbeddingWorker && !useInThreadTestRuntime
+                ? (workerFactoryForTests ?? ((data) => new EmbeddingWorkerClient(data)))({
+                      magicContextEmbeddingWorker: true,
+                      modelCacheDir: modelCacheDirForRuntime(),
+                      enforcePrivateStoragePermissions: shouldEnforcePrivateStoragePermissions(),
+                      harness: getHarness(),
+                      model,
+                      maxInputTokens,
+                      dtype: this.dtype,
+                      runtimePreference,
+                  })
+                : null;
         this.modelId = getEmbeddingProviderIdentity({
             provider: "local",
             model,
             local_runtime: runtimePreference,
-            // Only fold non-default dtype into identity so the default config
-            // produces the byte-identical identity string as before this field
-            // existed (no forced re-embed on upgrade). See issue #259.
+            // Only fold non-default dtype into identity. The runtime fingerprint
+            // separately changes the identity when vector-producing dependencies
+            // change, while fp32 remains the stable default within one runtime.
             ...(dtype && dtype !== DEFAULT_LOCAL_DTYPE ? { local_dtype: dtype } : {}),
         });
     }
 
     async initialize(): Promise<boolean> {
+        if (this.workerClient && !this.disposing) {
+            if (this.workerLoaded && this.workerClient.isRunning()) return true;
+            try {
+                const reply = await this.workerClient.request();
+                this.recordWorkerReply(reply);
+                return reply.loaded;
+            } catch (error) {
+                this.recordWorkerFailure(error);
+                return false;
+            }
+        }
         if (this.disposing) {
             return false;
         }
@@ -806,9 +869,11 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 const env = transformersModule.env as {
                     logLevel?: unknown;
                     cacheDir?: string;
+                    remoteHost?: string;
                     useFS?: boolean;
                     useFSCache?: boolean;
                 };
+                configureTransformersRemoteHost(env);
                 const LogLevel = transformersModule.LogLevel as Record<string, unknown> | undefined;
                 if (LogLevel && "ERROR" in LogLevel) {
                     env.logLevel = LogLevel.ERROR;
@@ -994,6 +1059,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         signal?: AbortSignal,
         _purpose?: EmbeddingPurpose,
     ): Promise<Float32Array | null> {
+        if (this.workerClient) return (await this.embedBatch([text], signal, _purpose))[0] ?? null;
         // MiniLM and gte-modernbert are plain encoders, so query/document text
         // stays byte-identical unless a future local model owns its own recipe.
         // Local inference is fast (typically <100ms) and can't be cancelled
@@ -1050,6 +1116,18 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         signal?: AbortSignal,
         _purpose?: EmbeddingPurpose,
     ): Promise<(Float32Array | null)[]> {
+        if (this.workerClient) {
+            if (!texts.length) return [];
+            if (signal?.aborted || this.disposing) return texts.map(() => null);
+            try {
+                const reply = await this.workerClient.request(texts, signal);
+                this.recordWorkerReply(reply);
+                return reply.vectors ?? texts.map(() => null);
+            } catch (error) {
+                this.recordWorkerFailure(error);
+                return texts.map(() => null);
+            }
+        }
         // Plain local encoders intentionally receive the original text for both purposes.
         if (texts.length === 0) {
             return [];
@@ -1105,7 +1183,35 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
         }
     }
 
+    private recordWorkerReply(reply: EmbeddingWorkerReply): void {
+        this.workerLoaded = reply.loaded;
+        this.lastFailureReason = reply.failure ?? null;
+        if (reply.loaded && reply.stats) {
+            loadedLocalEmbeddingRuntimes.set(this.memoryStatsId, {
+                model: this.model,
+                runtime: reply.stats.runtimes[0] ?? "wasm",
+                rssDeltaAtLoad: reply.stats.rssDeltaAtLoad,
+                externalDeltaAtLoad: reply.stats.externalDeltaAtLoad,
+                arrayBuffersDeltaAtLoad: reply.stats.arrayBuffersDeltaAtLoad,
+            });
+        } else loadedLocalEmbeddingRuntimes.delete(this.memoryStatsId);
+    }
+
+    private recordWorkerFailure(error: unknown): void {
+        loadedLocalEmbeddingRuntimes.delete(this.memoryStatsId);
+        this.workerLoaded = false;
+        this.lastFailureReason = classifyLocalEmbeddingFailure(error);
+        logForRuntime("[magic-context] embedding worker failed:", error);
+    }
+
     async dispose(): Promise<void> {
+        if (this.workerClient) {
+            this.disposing = true;
+            this.workerLoaded = false;
+            loadedLocalEmbeddingRuntimes.delete(this.memoryStatsId);
+            await this.workerClient.dispose();
+            return;
+        }
         if (this.disposePromise) {
             return this.disposePromise;
         }
@@ -1137,7 +1243,9 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
     }
 
     isLoaded(): boolean {
-        return this.pipeline !== null;
+        return this.workerClient
+            ? this.workerLoaded && this.workerClient.isRunning()
+            : this.pipeline !== null;
     }
 
     getLastFailureReason(): EmbeddingFailure | null {

@@ -108,6 +108,7 @@ export function runOmpCommand(
     try {
         const invocation = deps.getInvocation(ompPath, args);
         const result = deps.spawnSync(invocation.command, invocation.args, {
+            windowsHide: true,
             encoding: "utf-8",
             timeout,
             maxBuffer: 10 * 1024 * 1024,

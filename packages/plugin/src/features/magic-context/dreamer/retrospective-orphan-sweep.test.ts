@@ -36,16 +36,26 @@ function makeOpencodeDb(): Database {
             id TEXT PRIMARY KEY,
             title TEXT,
             directory TEXT,
-            time_created INTEGER
+            time_created INTEGER,
+            time_archived INTEGER
         );
     `);
     return database;
 }
 
-function insert(database: Database, id: string, title: string, dir: string, created: number) {
+function insert(
+    database: Database,
+    id: string,
+    title: string,
+    dir: string,
+    created: number,
+    archived: number | null = null,
+) {
     database
-        .prepare("INSERT INTO session (id, title, directory, time_created) VALUES (?, ?, ?, ?)")
-        .run(id, title, dir, created);
+        .prepare(
+            "INSERT INTO session (id, title, directory, time_created, time_archived) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(id, title, dir, created, archived);
 }
 
 describe("retrospectiveOrphanStaleMs", () => {
@@ -209,13 +219,12 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
         expect(deleted).toEqual(["historian-budget-expired"]);
     });
 
-    test("keep_subagents preserves ordinary children but still sweeps the privacy class", async () => {
+    test("keep_subagents sweeps an unsettled privacy child but preserves settled children", async () => {
         db = makeOpencodeDb();
-        insert(db, "kept-historian", HISTORIAN_CHILD_TITLE, DIR, now - staleMs - 1);
-        insert(db, "kept-migration", MEMORY_MIGRATION_CHILD_TITLE, DIR, now - staleMs - 2);
-        insert(db, "private-retrospective", RETROSPECTIVE_CHILD_TITLE, DIR, now - staleMs - 4);
-        insert(db, "private-curate", CURATE_CHILD_TITLE, DIR, now - staleMs - 5);
-        insert(db, "private-docs", MAINTAIN_DOCS_CHILD_TITLE, DIR, now - staleMs - 6);
+        insert(db, "settled-historian", HISTORIAN_CHILD_TITLE, DIR, now - staleMs - 1);
+        insert(db, "settled-migration", MEMORY_MIGRATION_CHILD_TITLE, DIR, now - staleMs - 2);
+        insert(db, "settled-private", RETROSPECTIVE_CHILD_TITLE, DIR, now - staleMs - 3);
+        insert(db, "unsettled-private", CURATE_CHILD_TITLE, DIR, now - staleMs - 4, now - staleMs);
         const { client, deleted } = deleteClient();
 
         const count = await sweepOrphanedRetrospectiveChildren({
@@ -227,8 +236,8 @@ describe("sweepOrphanedRetrospectiveChildren", () => {
             keepSubagents: true,
         });
 
-        expect(count).toBe(3);
-        expect(deleted).toEqual(["private-docs", "private-curate", "private-retrospective"]);
+        expect(count).toBe(1);
+        expect(deleted).toEqual(["unsettled-private"]);
     });
 
     test("treats a delete error (404 / already removed) as success", async () => {

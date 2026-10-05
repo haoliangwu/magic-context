@@ -144,6 +144,8 @@ pub struct MemorySearchOptions<'a> {
     pub include_messages: bool,
     pub include_notes: bool,
     pub excluded_memory_ids: &'a BTreeSet<i64>,
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -383,6 +385,8 @@ pub fn search_memories_and_compartments_for_session(
             include_messages: true,
             include_notes: true,
             excluded_memory_ids: &excluded_memory_ids,
+            from_ms: None,
+            to_ms: None,
         },
     )
 }
@@ -419,10 +423,22 @@ pub fn search_available_corpora_for_session_with_diagnostics(
         });
     }
 
+    let in_range = |timestamp: i64| {
+        options.from_ms.is_none_or(|from| timestamp >= from)
+            && options.to_ms.is_none_or(|to| timestamp <= to)
+    };
     let mut ranked = Vec::new();
     let mut suppressed_visible_memory_ids = Vec::new();
     if options.include_memories {
-        for memory in store.search_visible_memory_contents(project_path, query)? {
+        for memory in store.search_visible_memory_contents_in_range(
+            project_path,
+            query,
+            options.from_ms,
+            options.to_ms,
+        )? {
+            if !in_range(memory.created_at) {
+                continue;
+            }
             if first_match(&memory.content, query).is_none() {
                 continue;
             }
@@ -434,14 +450,31 @@ pub fn search_available_corpora_for_session_with_diagnostics(
         }
     }
     if options.include_messages {
-        for compartment in store.search_compartments_like(session_id, query)? {
+        for compartment in store.search_compartments_like_in_range(
+            session_id,
+            query,
+            options.from_ms,
+            options.to_ms,
+        )? {
+            if !in_range(compartment.created_at) {
+                continue;
+            }
             if let Some(hit) = compartment_search_hit(compartment, query) {
                 ranked.push(hit);
             }
         }
     }
     if options.include_notes {
-        for note in store.search_notes_like(project_path, session_id, query)? {
+        for note in store.search_notes_like_in_range(
+            project_path,
+            session_id,
+            query,
+            options.from_ms,
+            options.to_ms,
+        )? {
+            if !in_range(note.created_at_ms) {
+                continue;
+            }
             if let Some(hit) = note_search_hit(note, query) {
                 ranked.push(hit);
             }
@@ -483,6 +516,8 @@ pub fn resolve_memory_ids_for_search(
         ids,
         limit,
         excluded_memory_ids,
+        None,
+        None,
     )?
     .results)
 }
@@ -493,6 +528,8 @@ pub fn resolve_memory_ids_for_search_with_diagnostics(
     ids: &[i64],
     limit: usize,
     excluded_memory_ids: &BTreeSet<i64>,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
 ) -> Result<MemoryIdSearchOutcome, MemoryToolError> {
     if ids.is_empty() || limit == 0 {
         return Ok(MemoryIdSearchOutcome {
@@ -511,6 +548,11 @@ pub fn resolve_memory_ids_for_search_with_diagnostics(
         let Some(memory) = visible.get(id) else {
             continue;
         };
+        if from_ms.is_some_and(|from| memory.created_at < from)
+            || to_ms.is_some_and(|to| memory.created_at > to)
+        {
+            continue;
+        }
         if excluded_memory_ids.contains(id) {
             suppressed_visible_memory_ids.push(*id);
             continue;
@@ -795,8 +837,32 @@ fn push_unique_text(parts: &mut Vec<String>, text: &str) {
     }
 }
 
-fn first_match(text: &str, query: &str) -> Option<usize> {
-    text.to_lowercase().find(&query.to_lowercase())
+/// The byte range in `text` of the first case-insensitive occurrence of `query`.
+///
+/// Matching runs on the lowercased text, whose byte offsets are not the original's: some
+/// characters change length when lowercased (`İ` grows from two bytes to three, the
+/// Kelvin sign shrinks from three to one). Each lowercased byte is therefore mapped back
+/// to the original character it came from, so the range always lands on the matched text.
+fn first_match(text: &str, query: &str) -> Option<(usize, usize)> {
+    let lowered = text.to_lowercase();
+    let hit = lowered.find(&query.to_lowercase())?;
+    let hit_end = hit + query.to_lowercase().len();
+    // `str::to_lowercase` lowercases character by character (its one context rule, the
+    // final sigma, never changes a length), so walking the characters reproduces its
+    // offsets.
+    let mut lowered_at = 0;
+    let mut start = None;
+    for (original_at, ch) in text.char_indices() {
+        let next = lowered_at + ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        if start.is_none() && hit < next {
+            start = Some(original_at);
+        }
+        if hit_end <= next {
+            return Some((start.unwrap_or(original_at), original_at + ch.len_utf8()));
+        }
+        lowered_at = next;
+    }
+    start.map(|start| (start, text.len()))
 }
 
 fn preview_text(text: &str) -> String {
@@ -819,15 +885,14 @@ fn snippet_around_match(text: &str, query: &str) -> String {
     const CONTEXT: usize = 100;
     const MAX_CHARS: usize = 200;
 
-    let Some(hit) = first_match(text, query) else {
+    let Some((hit, hit_end)) = first_match(text, query) else {
         return text.chars().take(MAX_CHARS).collect();
     };
-    let query_len = query.len();
     let mut start = hit.saturating_sub(CONTEXT);
     while start > 0 && !text.is_char_boundary(start) {
         start -= 1;
     }
-    let mut end = (hit + query_len + CONTEXT).min(text.len());
+    let mut end = (hit_end + CONTEXT).min(text.len());
     while end < text.len() && !text.is_char_boundary(end) {
         end += 1;
     }
@@ -844,6 +909,22 @@ mod tests {
     use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
     use mc_store::{InsertMemoryInput, NoteInput, StoredCompartment};
 
+    /// Characters that change length when lowercased must not move the snippet off the
+    /// match: `İ` grows, the Kelvin sign shrinks.
+    #[test]
+    fn snippets_stay_on_the_match_when_lowercasing_changes_lengths() {
+        for filler in ["\u{130}", "\u{212a}"] {
+            let text = format!("{}needle{}", filler.repeat(150), "x".repeat(10));
+            let snippet = snippet_around_match(&text, "NEEDLE");
+            assert!(snippet.contains("needle"), "{filler:?}: {snippet:?}");
+            let (start, end) = first_match(&text, "needle").unwrap();
+            assert_eq!(&text[start..end], "needle", "{filler:?}");
+        }
+        // A match that starts inside a character's lowercase expansion covers that character.
+        let (start, end) = first_match("a\u{130}b", "i").unwrap();
+        assert_eq!(&"a\u{130}b"[start..end], "\u{130}");
+    }
+
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {
             module_id: "magic-context-test".to_string(),
@@ -856,7 +937,7 @@ mod tests {
     }
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&descriptor(dir)).unwrap()
+        McStore::open_for_test(&descriptor(dir)).unwrap()
     }
 
     fn input<'a>(
@@ -1249,6 +1330,86 @@ mod tests {
     }
 
     #[test]
+    fn dated_search_filters_memories_notes_and_compartment_summaries_before_ranking() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let project = "git:dated";
+        let session_id = "session-dated";
+        let outside_memory = insert(
+            &store,
+            project,
+            "CONSTRAINTS",
+            "dated needle outside",
+            1_000,
+        );
+        let inside_memory = insert(&store, project, "CONSTRAINTS", "dated needle inside", 3_000);
+        let outside_note = insert_note(
+            &store,
+            project,
+            session_id,
+            "dated needle outside note",
+            1_000,
+        );
+        let inside_note = insert_note(
+            &store,
+            project,
+            session_id,
+            "dated needle inside note",
+            3_000,
+        );
+        let mut outside_compartment = comp(1, "dated needle outside compartment", "body", None);
+        outside_compartment.created_at = 1_000;
+        let mut inside_compartment = comp(2, "dated needle inside compartment", "body", None);
+        inside_compartment.created_at = 3_000;
+        store
+            .replace_compartments(session_id, &[outside_compartment, inside_compartment])
+            .unwrap();
+
+        let excluded = BTreeSet::new();
+        let outcome = search_available_corpora_for_session_with_diagnostics(
+            &store,
+            project,
+            session_id,
+            "dated needle",
+            MemorySearchOptions {
+                limit: 20,
+                include_memories: true,
+                include_messages: true,
+                include_notes: true,
+                excluded_memory_ids: &excluded,
+                from_ms: Some(2_000),
+                to_ms: Some(4_000),
+            },
+        )
+        .unwrap();
+
+        assert!(outcome
+            .results
+            .iter()
+            .any(|result| result.id == inside_memory));
+        assert!(!outcome
+            .results
+            .iter()
+            .any(|result| result.id == outside_memory));
+        assert!(outcome
+            .results
+            .iter()
+            .any(|result| result.id == inside_note));
+        assert!(!outcome
+            .results
+            .iter()
+            .any(|result| result.id == outside_note));
+        assert!(outcome
+            .results
+            .iter()
+            .any(|result| result.sequence == Some(2)));
+        assert!(!outcome
+            .results
+            .iter()
+            .any(|result| result.sequence == Some(1)));
+    }
+
+    #[test]
     fn note_search_excludes_dismissed_rows_and_scores_keyword_relevance() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -1292,6 +1453,8 @@ mod tests {
                 include_messages: false,
                 include_notes: true,
                 excluded_memory_ids: &excluded,
+                from_ms: None,
+                to_ms: None,
             },
         )
         .unwrap();

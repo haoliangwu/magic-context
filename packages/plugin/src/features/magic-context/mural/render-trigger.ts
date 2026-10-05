@@ -5,9 +5,9 @@ import { log } from "../../../shared/logger";
 import { modelSupportsVision } from "../../../shared/models-dev-cache";
 import type { Database } from "../../../shared/sqlite";
 import { DEFAULT_MURAL_MEMORY_BUDGET } from "./mural-selection";
-import { renderMural } from "./render-mural";
+import { planMuralRender, renderPlannedMural } from "./render-mural";
 import type { MuralWireOptions } from "./resolve-mural";
-import { getMuralCoverage, resolveMural } from "./resolve-mural";
+import { getMuralCoverage, readMuralPool, resolveMural } from "./resolve-mural";
 import { getMural, upsertMural } from "./storage-mural";
 
 /**
@@ -27,12 +27,64 @@ export const DETERMINISTIC_MURAL_MODEL = "deterministic";
 export const MIN_MURAL_CUED_MEMORIES = 15;
 export const MIN_MURAL_COVERAGE = 0.5;
 
+// Resolve the pool on every refresh, but retain at most sixteen exact render inputs
+// per database. Weak ownership releases all PNGs when a database is discarded.
+const renderCaches = new WeakMap<
+    Database,
+    Map<
+        string,
+        {
+            key: string;
+            image: Buffer;
+            result: EnsureMuralResult;
+        }
+    >
+>();
+
+function rememberRender(
+    db: Database,
+    project: string,
+    key: string,
+    image: Buffer,
+    result: EnsureMuralResult,
+): EnsureMuralResult {
+    let cache = renderCaches.get(db);
+    if (!cache) {
+        cache = new Map();
+        renderCaches.set(db, cache);
+    }
+    cache.delete(project);
+    const size = key.length * 2 + image.length + (result.dataUrl?.length ?? 0) * 2;
+    if (size <= 16 * 1024 * 1024) {
+        cache.set(project, {
+            key,
+            image: Buffer.from(image),
+            result: { ...result, rerendered: false },
+        });
+    }
+    const retainedBytes = () =>
+        [...cache.values()].reduce(
+            (sum, entry) =>
+                sum +
+                entry.key.length * 2 +
+                entry.image.length +
+                (entry.result.dataUrl?.length ?? 0) * 2,
+            0,
+        );
+    while (cache.size > 16 || retainedBytes() > 16 * 1024 * 1024) {
+        const oldest = cache.keys().next().value;
+        if (oldest === undefined) break;
+        cache.delete(oldest);
+    }
+    return result;
+}
+
 export interface EnsureMuralResult {
     /** True when a resolved cue pool exists (the mural block should be injected). */
     hasMural: boolean;
     /** data URL of the current mural PNG, when hasMural. */
     dataUrl?: string;
-    /** sha256 of the mural PNG bytes — the m0 mural fold identity. */
+    /** SHA-256 of the deterministic layout text, used to identify the injected image. */
     contentHash?: string;
     /** True when this call re-rendered + upserted (the text changed or was new). */
     rerendered: boolean;
@@ -63,7 +115,8 @@ export function ensureMuralRendered(
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
 ): EnsureMuralResult {
-    const coverage = getMuralCoverage(db, projectIdentity);
+    const pool = readMuralPool(db, projectIdentity);
+    const coverage = getMuralCoverage(db, projectIdentity, pool);
     if (
         coverage.activeMemoryCount === 0 ||
         !muralCoverageGate(coverage.cuedMemoryCount, coverage.activeMemoryCount)
@@ -76,37 +129,48 @@ export function ensureMuralRendered(
         return { hasMural: false, rerendered: false, skipReason };
     }
 
-    const entries = resolveMural(db, projectIdentity, budgetTokens);
+    const entries = resolveMural(db, projectIdentity, budgetTokens, pool);
     if (entries.length === 0) {
         // Empty overflow pool → no mural block. Leave any stale stored row alone
         // so the dashboard can still show the last render.
         return { hasMural: false, rerendered: false };
     }
 
-    const rendered = renderMural(entries);
-    // The mural TEXT (not the PNG) is the change-detection key: it's cheap to
-    // assemble and deterministic, so an unchanged pool re-derives the same hash
-    // and we skip PNG re-encode + DB write entirely.
-    const textHash = createHash("sha256").update(rendered.sha256Input).digest("hex");
-
+    // Exact ordered entries cover ids, cues, category and importance after budget
+    // selection. Re-resolving also observes deletions and stale cue content hashes.
+    const key = JSON.stringify(entries);
     const existing = getMural(db, projectIdentity);
+    const cached = renderCaches.get(db)?.get(projectIdentity);
+    if (
+        cached?.key === key &&
+        existing &&
+        existing.contentHash === cached.result.contentHash &&
+        existing.width === cached.result.width &&
+        existing.height === cached.result.height &&
+        existing.image.equals(cached.image)
+    ) {
+        return { ...cached.result };
+    }
+    const plan = planMuralRender(entries);
+    const textHash = createHash("sha256").update(plan.layout.text).digest("hex");
     if (
         existing &&
         existing.contentHash === textHash &&
-        existing.width === rendered.width &&
-        existing.height === rendered.height
+        existing.width === plan.width &&
+        existing.height === plan.height
     ) {
         // Unchanged: reuse the stored PNG (already the right bytes) without re-encoding.
-        return {
+        return rememberRender(db, projectIdentity, key, existing.image, {
             hasMural: true,
             dataUrl: `data:image/png;base64,${existing.image.toString("base64")}`,
             contentHash: existing.contentHash,
             rerendered: false,
             width: existing.width,
             height: existing.height,
-        };
+        });
     }
 
+    const rendered = renderPlannedMural(plan);
     upsertMural(db, {
         projectPath: projectIdentity,
         image: Buffer.from(rendered.png),
@@ -121,14 +185,14 @@ export function ensureMuralRendered(
         height: rendered.height,
     });
 
-    return {
+    return rememberRender(db, projectIdentity, key, Buffer.from(rendered.png), {
         hasMural: true,
         dataUrl: rendered.dataUrl,
         contentHash: textHash,
         rerendered: true,
         width: rendered.width,
         height: rendered.height,
-    };
+    });
 }
 
 /** True only when the given model's cached provider metadata accepts images. A

@@ -5,8 +5,10 @@ import {
     renderSeedExamplesBlock,
     renderSessionReferencesBlock,
     SEED_FLOOR,
+    SESSION_REF_LIMIT,
     SESSION_REF_WINDOW,
     selectSeeds,
+    selectSessionReferences,
 } from "./reference-retrieval";
 import { REFERENCE_SEEDS } from "./reference-seeds.generated";
 
@@ -32,6 +34,123 @@ function makeCompartment(over: Partial<Compartment> & { sequence: number }): Com
     };
 }
 
+// Independent band oracle: boundary coverage must not reuse the selector's helper.
+function band(importance: number): number {
+    return importance >= 85
+        ? 0
+        : importance >= 60
+          ? 1
+          : importance >= 30
+            ? 2
+            : importance >= 10
+              ? 3
+              : 4;
+}
+
+const history = (scores: number[]) =>
+    scores.map((importance, sequence) => makeCompartment({ sequence, importance }));
+const anchors = (scores: number[]) => scores.map((importance) => ({ importance, block: "" }));
+const choose = (
+    scores: number[],
+    seedScores = [90, 70, 40],
+    sessionId = "ses-diverse",
+    chunkStart = 42,
+) => selectSessionReferences(history(scores), anchors(seedScores), sessionId, chunkStart);
+
+describe("selectSessionReferences", () => {
+    it("fills bands uncovered by seeds even when mixed recent scores cover them", () => {
+        const refs = choose([5, 20, 40, 70, 90, 5, 20, 40, 70, 90, 70, 90, 70, 90]);
+        expect(refs).toHaveLength(7);
+        expect(refs.slice(-4).map((c) => c.importance)).toEqual([70, 90, 70, 90]);
+        const diverseBands = refs.slice(0, 3).map((c) => band(c.importance ?? 50));
+        expect(diverseBands).toContain(4);
+        expect(diverseBands).toContain(3);
+        const changedRecent = choose([5, 20, 40, 70, 90, 5, 20, 40, 70, 90, 5, 20, 5, 20]);
+        expect(changedRecent.slice(0, 3)).toEqual(refs.slice(0, 3));
+        expect(refs.map((c) => c.startMessage)).toEqual(
+            refs.map((c) => c.startMessage).sort((a, b) => a - b),
+        );
+    });
+
+    it("uses least-represented bands when fewer than 3 are uncovered", () => {
+        // Only low-mid is uncovered AND available; after filling it, choose among
+        // bands with one visible anchor, not the recent rows' hidden scores.
+        const refs = choose([20, 40, 70, 90, 20, 40, 70, 90, 5, 20, 40, 70]);
+        expect(refs).toHaveLength(7);
+        const bands = refs.slice(0, 3).map((c) => band(c.importance ?? 50));
+        expect(bands).toContain(3);
+        for (const b of [0, 1, 2, 3])
+            expect(bands.filter((value) => value === b).length).toBeLessThanOrEqual(
+                b === 3 ? 2 : 1,
+            );
+        expect(new Set(refs).size).toBe(7);
+    });
+
+    it("fills all 3 diverse slots when older history lacks low bands", () => {
+        const refs = choose([40, 70, 90, 40, 70, 90, 70, 70, 70, 70]);
+        expect(refs).toHaveLength(7);
+        const scores = refs.slice(0, 3).map((c) => c.importance);
+        expect(scores).toContain(40);
+        expect(scores).toContain(90);
+        expect(scores).toContain(70);
+        expect(new Set(refs).size).toBe(7);
+    });
+
+    it("is deterministic per session/chunk and rotates within older bands", () => {
+        const scores = [...Array(20).fill(40), 70, 70, 70, 70];
+        const ids = (sid: string, start: number) =>
+            choose(scores, [90, 70, 40], sid, start).map((c) => c.startMessage);
+        expect(ids("🚀", 42)).toEqual(ids("🚀", 42));
+        expect(ids("🚀", 42)).toHaveLength(7);
+        expect(
+            new Set(Array.from({ length: 20 }, (_, i) => ids("🚀", i).join(","))).size,
+        ).toBeGreaterThan(1);
+        expect(
+            new Set(["a", "b", "c", "d"].map((sid) => ids(sid, 42).join(","))).size,
+        ).toBeGreaterThan(1);
+    });
+
+    it("excludes no-content rows before both recent and diverse selection", () => {
+        const comps = history([5, 20, 40, 70, 90, 50, 70, 90]);
+        const marker = makeCompartment({ sequence: 99, title: "", content: "" });
+        const seeds = selectSeeds("ses-diverse", 42);
+        const expected = selectSessionReferences(comps, seeds, "ses-diverse", 42);
+        expect(expected).toHaveLength(7);
+        expect(
+            selectSessionReferences(
+                [marker, ...comps.slice(0, 4), marker, ...comps.slice(4), marker],
+                seeds,
+                "ses-diverse",
+                42,
+            ),
+        ).toEqual(expected);
+    });
+
+    it("shows every eligible compartment in young sessions without duplicates", () => {
+        expect(SESSION_REF_WINDOW).toBe(4);
+        for (let count = 0; count <= 7; count++) {
+            const scores = Array(count).fill(50);
+            expect(choose(scores)).toEqual(history(scores));
+        }
+    });
+
+    it("trims diverse first, then the oldest recent, without reselection", () => {
+        const refs = choose([5, 20, 40, 70, 90, 50, 70, 90, 50, 70, 90, 50]);
+        expect(refs).toHaveLength(7);
+        for (let count = 0; count <= 7; count++) {
+            const block = renderSessionReferencesBlock(refs, count);
+            const starts = [...block.matchAll(/<compartment start="(\d+)"/g)].map((m) =>
+                Number(m[1]),
+            );
+            expect(starts).toEqual(
+                count === 0 ? [] : refs.slice(-count).map((c) => c.startMessage),
+            );
+            expect((block.match(/ importance="/g) ?? []).length).toBe(Math.max(0, count - 4));
+        }
+        expect(refs.slice(-4).map((c) => c.startMessage)).toEqual([81, 91, 101, 111]);
+    });
+});
+
 describe("reference seed corpus", () => {
     it("ships exactly 60 seeds spanning all 5 importance bands", () => {
         expect(REFERENCE_SEEDS.length).toBe(60);
@@ -47,8 +166,9 @@ describe("reference seed corpus", () => {
 });
 
 describe("selectSeeds", () => {
-    it("returns exactly SEED_FLOOR seeds by default", () => {
-        expect(selectSeeds("ses_a", 1).length).toBe(SEED_FLOOR);
+    it("returns exactly 3 seeds by default", () => {
+        expect(SEED_FLOOR).toBe(3);
+        expect(selectSeeds("ses_a", 1).length).toBe(3);
     });
 
     it("is deterministic for the same (sessionId, chunkStart)", () => {
@@ -71,12 +191,10 @@ describe("selectSeeds", () => {
         expect(combos.size).toBeGreaterThan(1);
     });
 
-    it("spans the importance range every run (not 4 clustered scores)", () => {
-        // Each pick comes from a distinct band, so the spread (max-min) is wide.
+    it("covers 3 distinct rotating bands every run", () => {
         for (let chunk = 1; chunk <= 20; chunk++) {
             const imps = selectSeeds("ses_x", chunk).map((s) => s.importance);
-            const spread = Math.max(...imps) - Math.min(...imps);
-            expect(spread).toBeGreaterThanOrEqual(40);
+            expect(new Set(imps.map(band)).size).toBe(3);
         }
     });
 
@@ -124,11 +242,34 @@ describe("renderSeedExamplesBlock", () => {
 });
 
 describe("renderSessionReferencesBlock", () => {
+    it("keeps diverse importance but hides recent scores, preserving episode_type everywhere", () => {
+        const refs = selectSessionReferences(
+            history([5, 20, 40, 70, 90, 5, 20, 40, 70, 90]).map((c) => ({
+                ...c,
+                episodeType: "feature",
+            })),
+            selectSeeds("score-visibility", 42),
+            "score-visibility",
+            42,
+        );
+        expect(refs).toHaveLength(7);
+        const block = renderSessionReferencesBlock(refs);
+        const headers = block.match(/<compartment [^>]+>/g) ?? [];
+        expect(headers).toHaveLength(7);
+        headers.forEach((header, i) => {
+            expect(header).toContain('episode_type="feature"');
+            expect(header.includes(' importance="')).toBe(i < 3);
+            if (i < 3) expect(header).toContain(`importance="${refs[i].importance}"`);
+        });
+        const young = renderSessionReferencesBlock(refs.slice(-4));
+        expect(young).not.toContain('importance="');
+        expect((young.match(/episode_type="feature"/g) ?? []).length).toBe(4);
+    });
     it("returns empty string for a young session (no compartments)", () => {
         expect(renderSessionReferencesBlock([])).toBe("");
     });
 
-    it("shows only the last SESSION_REF_WINDOW compartments", () => {
+    it("renders a selected suffix up to the 7-reference budget", () => {
         const comps = Array.from({ length: 10 }, (_, i) =>
             makeCompartment({
                 sequence: i,
@@ -139,12 +280,12 @@ describe("renderSessionReferencesBlock", () => {
             }),
         );
         const block = renderSessionReferencesBlock(comps);
-        // last 6 → sequences 4..9 present, 0..3 absent
+        // Rendering is separate from selection so fitting cannot reshuffle picks.
         expect(block).toContain("tier1-9");
-        expect(block).toContain("tier1-4");
-        expect(block).not.toContain("tier1-3");
+        expect(block).toContain("tier1-3");
+        expect(block).not.toContain("tier1-2");
         const count = (block.match(/<compartment /g) ?? []).length;
-        expect(count).toBe(SESSION_REF_WINDOW);
+        expect(count).toBe(SESSION_REF_LIMIT);
     });
 
     it("renders v2 rows with all four tiers (p4 self-closes when empty)", () => {
@@ -163,7 +304,7 @@ describe("renderSessionReferencesBlock", () => {
         expect(block).toContain("<p2>\nP2\n</p2>");
         expect(block).toContain("<p3>\nP3\n</p3>");
         expect(block).toContain("<p4/>"); // empty p4 self-closes
-        expect(block).toContain('importance="70"');
+        expect(block).not.toContain('importance="');
         expect(block).toContain('episode_type="bug"');
     });
 

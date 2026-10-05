@@ -235,7 +235,6 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 | `/ctx-status` | Debug view: tags, pending drops, cache TTL, nudge state, historian progress, compartment coverage, history budget |
 | `/ctx-flush` | Queue করা সব operations সঙ্গে সঙ্গে force করে, cache TTL bypass করে |
 | `/ctx-recomp` | raw history থেকে compartments rebuild করে (`start-end` range নেয়)। stored state ভুল মনে হলে ব্যবহার করুন |
-| `/ctx-session-upgrade` | এই session-কে latest history format-এ upgrade করে: compartments rebuild এবং project memories migrate করে |
 | `/ctx-dream` | on demand dreamer maintenance চালায়: memory, docs, smart notes এবং user-profile review maintain করে |
 
 ---

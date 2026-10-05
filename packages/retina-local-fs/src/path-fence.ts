@@ -14,7 +14,7 @@ export async function resolveAndFenceProviderPath(
     configuredPath: string,
     options: ResolveProviderPathOptions,
 ): Promise<string> {
-    const { home, dataDirectory } = await resolveFenceRoots(options);
+    const { home, dataDirectory, aliases } = await resolveFenceRoots(options);
     const expanded = configuredPath.startsWith("~/")
         ? join(home, configuredPath.slice(2))
         : configuredPath === "~"
@@ -24,7 +24,11 @@ export async function resolveAndFenceProviderPath(
         ? resolve(expanded)
         : resolve(options.cwd ?? process.cwd(), expanded);
     const canonical = await canonicalPath(absolute, options.allowMissing);
-    if (isFencedPath(canonical, home, dataDirectory)) {
+    if (
+        fenceCandidates(canonical, aliases).some((candidate) =>
+            isFencedPath(candidate, home, dataDirectory),
+        )
+    ) {
         throw new ProviderError("fenced_path", `Refusing fenced path: ${canonical}`);
     }
     return canonical;
@@ -44,9 +48,21 @@ export async function revalidateProviderPath(
     return revalidated;
 }
 
+/** Top-level CortexKit data directories whose contents are fenced. */
+const FENCED_CORTEXKIT_ROOTS = ["plexus", "claustrum", "staging", "run", "magic-context"];
+
+/**
+ * A CortexKit location reached through a symlink: `logical` is where the fence
+ * expects it (under the data directory), `canonical` is where it really is.
+ */
+interface FenceAlias {
+    logical: string;
+    canonical: string;
+}
+
 async function resolveFenceRoots(
     options: ResolveProviderPathOptions,
-): Promise<{ home: string; dataDirectory: string }> {
+): Promise<{ home: string; dataDirectory: string; aliases: FenceAlias[] }> {
     const configuredHomePath = resolve(options.homeDirectory ?? process.env.HOME ?? homedir());
     let home: string;
     try {
@@ -61,7 +77,37 @@ async function resolveFenceRoots(
         options.dataDirectory ?? process.env.XDG_DATA_HOME ?? join(home, ".local", "share"),
     );
     const dataDirectory = await canonicalPath(configuredDataDirectory, true);
-    return { home, dataDirectory };
+
+    // The watched path is fully resolved, so a `cortexkit` directory (or one of
+    // its fenced roots) that is a symlink, common when data is moved to another
+    // disk, resolves outside `<data>/cortexkit` and would skip the fence.
+    // Record where each of them really lives so a resolved path can be mapped
+    // back to its logical location before the fence check.
+    const aliases: FenceAlias[] = [];
+    const logicalCortexkit = join(dataDirectory, "cortexkit");
+    for (const logical of [
+        logicalCortexkit,
+        ...FENCED_CORTEXKIT_ROOTS.map((root) => join(logicalCortexkit, root)),
+    ]) {
+        const canonical = await canonicalPath(logical, true);
+        if (canonical !== logical) aliases.push({ logical, canonical });
+    }
+    return { home, dataDirectory, aliases };
+}
+
+/** The resolved path plus its logical location under every alias containing it. */
+function fenceCandidates(canonical: string, aliases: readonly FenceAlias[]): string[] {
+    const candidates = [canonical];
+    for (const alias of aliases) {
+        const relativeToAlias = relative(alias.canonical, canonical);
+        const inside =
+            relativeToAlias === "" ||
+            (relativeToAlias !== ".." &&
+                !relativeToAlias.startsWith(`..${sep}`) &&
+                !isAbsolute(relativeToAlias));
+        if (inside) candidates.push(join(alias.logical, relativeToAlias));
+    }
+    return candidates;
 }
 
 async function canonicalPath(path: string, allowMissing: boolean): Promise<string> {
@@ -133,9 +179,7 @@ export function isFencedPath(
         return false;
     }
 
-    const inFencedRoot =
-        insideCortexkit &&
-        ["plexus", "claustrum", "staging", "run", "magic-context"].includes(parts[0] ?? "");
+    const inFencedRoot = insideCortexkit && FENCED_CORTEXKIT_ROOTS.includes(parts[0] ?? "");
     const fencedBasename = name.includes("binding-key") || name.endsWith(".handle");
     const plexusStore = insideCortexkit && parts[0] === "plexus" && name.startsWith("store.db");
     return inFencedRoot || fencedBasename || plexusStore;

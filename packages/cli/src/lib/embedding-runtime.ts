@@ -5,7 +5,7 @@ import { dirname, join, sep } from "node:path";
 import {
     type LocalEmbeddingHost,
     type LocalEmbeddingRuntime,
-    resolveLocalEmbeddingRuntime,
+    resolveLocalEmbeddingWorkerRuntime,
 } from "@magic-context/core/features/magic-context/memory/embedding-local";
 
 /**
@@ -95,6 +95,7 @@ interface OnnxRuntimeLoadProbeChildResult {
 
 function runOnnxRuntimeNodeLoadProbeChild(packageDir: string): OnnxRuntimeLoadProbeChildResult {
     return spawnSync(process.execPath, ["-e", ONNX_RUNTIME_NODE_LOAD_PROBE_SCRIPT], {
+        windowsHide: true,
         encoding: "utf8",
         env: { ...process.env, [ONNX_LOAD_PROBE_PACKAGE_DIR_ENV]: packageDir },
         stdio: ["ignore", "pipe", "pipe"],
@@ -251,6 +252,9 @@ export function isLocalEmbeddingRuntimeBroken(
     );
 }
 
+const HUGGING_FACE_DOWNLOAD_MIRROR_HINT =
+    " If a Hugging Face model download fails because huggingface.co is unreachable, set HF_ENDPOINT to a compatible mirror.";
+
 export function formatLocalEmbeddingRuntimeDoctorWarning(
     status: BrokenLocalEmbeddingRuntimeStatus,
 ): string {
@@ -258,19 +262,24 @@ export function formatLocalEmbeddingRuntimeDoctorWarning(
         return (
             "Embedding provider: local — configured/selected onnxruntime-web (WASM) is unavailable — " +
             `${status.wasmReason}. Reinstall the plugin package or select embedding.local_runtime: native ` +
-            "only on a host where its native runtime is safe."
+            "only on a host where its native runtime is safe." +
+            HUGGING_FACE_DOWNLOAD_MIRROR_HINT
         );
     }
     if (status.state !== "both-broken") {
         const knownUnavailable = knownUnavailableNativeBinding(status);
         if (knownUnavailable) {
-            return `Embedding provider: local — ${intelMacNativeGuidance(knownUnavailable.packageVersion)} WASM fallback is unavailable, so embeddings will not work.`;
+            return (
+                `Embedding provider: local — ${intelMacNativeGuidance(knownUnavailable.packageVersion)} WASM fallback is unavailable, so embeddings will not work.` +
+                HUGGING_FACE_DOWNLOAD_MIRROR_HINT
+            );
         }
         return (
             "Embedding provider: local — onnxruntime-node native binding missing — " +
             `${describeNativeFailure(status)}; its postinstall likely failed. Embeddings will not work. ` +
             "Reinstall with network access to the npm registry and GitHub releases, " +
-            "or switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)."
+            "or switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)." +
+            HUGGING_FACE_DOWNLOAD_MIRROR_HINT
         );
     }
 
@@ -279,14 +288,16 @@ export function formatLocalEmbeddingRuntimeDoctorWarning(
         return (
             `Embedding provider: local — ${intelMacNativeGuidance(knownUnavailable.packageVersion)} ` +
             `The WASM fallback is also unavailable: ${status.wasmReason}. Reinstall may repair the WASM package only; ` +
-            "otherwise switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)."
+            "otherwise switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)." +
+            HUGGING_FACE_DOWNLOAD_MIRROR_HINT
         );
     }
     return (
         "Embedding provider: local — native runtime and WASM fallback both unavailable — " +
         `native: ${describeNativeFailure(status.nativeFailure)}; WASM: ${status.wasmReason}; ` +
         "their install or postinstall likely failed. Reinstall with network access to the npm registry and GitHub releases, " +
-        "or switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)."
+        "or switch `embedding.provider` to an HTTP endpoint (`openai-compatible`)." +
+        HUGGING_FACE_DOWNLOAD_MIRROR_HINT
     );
 }
 
@@ -299,13 +310,15 @@ export function formatLocalEmbeddingRuntimeWasmFallback(
             "Embedding provider: local — " +
             `onnxruntime-node ${knownUnavailable.packageVersion} has no native binding for darwin/x64; ` +
             `WASM fallback active at ${status.wasmPath}. Reinstalling the same package (including doctor --force) ` +
-            "cannot restore native inference. WASM is slower; for optional native speed, manually pin onnxruntime-node@1.23.0."
+            "cannot restore native inference. WASM is slower; for optional native speed, manually pin onnxruntime-node@1.23.0. " +
+            `Doctor process Bun ${process.versions.bun ?? "not detected"}; the host's embedded Bun may differ. Inference runs in a dedicated worker.`
         );
     }
     return (
         "Embedding provider: local — onnxruntime-node native binding failed " +
         `(${describeNativeFailure(status.nativeFailure)}); WASM fallback active at ${status.wasmPath}. ` +
-        "WASM inference is slower than native; a remote `openai-compatible` provider may be faster."
+        "WASM inference is slower than native; a remote `openai-compatible` provider may be faster. " +
+        `Doctor process Bun ${process.versions.bun ?? "not detected"}; the host's embedded Bun may differ. Inference runs in a dedicated worker.`
     );
 }
 
@@ -385,7 +398,9 @@ export function formatLocalEmbeddingRuntimeWasmSelected(
 ): string {
     return (
         "Embedding provider: local — onnxruntime-web (WASM) selected by embedding.local_runtime/host at " +
-        `${status.wasmPath}. The native addon was not probed or loaded. WASM inference is slower than native.`
+        `${status.wasmPath}. Doctor process Bun ${process.versions.bun ?? "not detected"} (the host's embedded Bun may differ). ` +
+        "The native addon was not probed or loaded. WASM inference runs in a dedicated embedding worker but is slower than native. " +
+        "Upgrade the host to Bun >=1.4.0 or configure a remote openai-compatible embedding provider."
     );
 }
 
@@ -445,7 +460,7 @@ export function checkLocalEmbeddingRuntimeAt(
     runtimePreference: LocalEmbeddingRuntime = "auto",
     host?: LocalEmbeddingHost,
 ): LocalEmbeddingRuntimeStatus {
-    const selectedRuntime = resolveLocalEmbeddingRuntime(runtimePreference, host);
+    const selectedRuntime = resolveLocalEmbeddingWorkerRuntime(runtimePreference, host);
     if (selectedRuntime !== "native") {
         const wasm = probeWasmRuntimeAt(installRoot);
         return wasm.state === "ok"
@@ -579,7 +594,7 @@ export function checkLocalEmbeddingRuntimeByResolution(
         return { state: "unknown", reason: "plugin package dir not found" };
     }
 
-    const selectedRuntime = resolveLocalEmbeddingRuntime(runtimePreference, host);
+    const selectedRuntime = resolveLocalEmbeddingWorkerRuntime(runtimePreference, host);
     if (selectedRuntime !== "native") {
         const wasm = probeWasmRuntimeByResolution(pluginDir);
         return wasm.state === "ok"

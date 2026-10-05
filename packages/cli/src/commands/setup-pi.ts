@@ -1,10 +1,7 @@
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
-import { stripRemovedAgentConfig } from "@magic-context/core/config/removed-agent-config";
 import { piModelRefToCanonical } from "@magic-context/core/shared/harness-provider-map";
-import { sanitizeParsedJson } from "@magic-context/core/shared/jsonc-parser";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { stringify as stringifyJsonc } from "comment-json";
 import type { PluginEntryResult } from "../adapters/types";
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
@@ -14,8 +11,9 @@ import {
 import { runDreamerSetup } from "../lib/dreamer-setup";
 import {
     assertJsoncConfigsParseable,
-    ConfigParseError,
+    editableChild,
     readJsoncConfigForUpdate,
+    readMagicContextConfigForSetup,
 } from "../lib/jsonc-config";
 import { pickModel } from "../lib/model-picker";
 import { getPiAgentConfigDir, getPiUserConfigPath, getPiUserExtensionsPath } from "../lib/paths";
@@ -157,38 +155,6 @@ function compactObject<T extends Record<string, unknown>>(obj: T): T {
     return obj;
 }
 
-function configObject(value: unknown): Record<string, unknown> {
-    return value !== null && typeof value === "object" && !Array.isArray(value)
-        ? { ...(value as Record<string, unknown>) }
-        : {};
-}
-
-/**
- * Read the shared config through the same raw-tier loader as runtime and doctor.
- * That loader performs any required per-harness migration before setup merges its
- * choices, so setup cannot reintroduce flat model fields into an existing config.
- */
-function readMagicContextConfigForSetup(configPath: string): Record<string, unknown> {
-    const raw = loadRawConfigFile({ configPath, tier: "user" });
-    if (!raw) return {};
-
-    try {
-        const rejectedKeyPaths: string[] = [];
-        const parsed = sanitizeParsedJson(parseJsonc(raw.text), {
-            onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
-        });
-        if (rejectedKeyPaths.length > 0) {
-            throw new Error(`unsafe prototype-pollution key at ${rejectedKeyPaths.join(", ")}`);
-        }
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-            throw new Error("expected a JSON object at the document root");
-        }
-        return parsed as Record<string, unknown>;
-    } catch (error) {
-        throw new ConfigParseError(configPath, raw.text, error);
-    }
-}
-
 /**
  * Compare two semver-ish strings (X.Y.Z, ignores any pre-release or build
  * suffix). Returns -1 if `a < b`, 0 if equal, 1 if `a > b`. Returns 0 when
@@ -261,7 +227,7 @@ export function writeMagicContextConfig(
         modelRefToCanonical?: (ref: string) => string;
     },
 ): void {
-    const config = stripRemovedAgentConfig(readMagicContextConfigForSetup(configPath), []);
+    const config = readMagicContextConfigForSetup(configPath);
     ensureDir(dirname(configPath));
 
     if (!config.$schema) {
@@ -270,26 +236,23 @@ export function writeMagicContextConfig(
     }
 
     // Model pickers return harness-native provider IDs. Persist only canonical
-    // OpenCode-form IDs so every harness reads the same shared config.
+    // OpenCode-form IDs so every harness reads the same shared config. Objects
+    // are edited in place so the comments comment-json attached to them are
+    // written back unchanged.
     const toCanonical = options.modelRefToCanonical ?? piModelRefToCanonical;
-    const historian = configObject(config.historian);
-    const piHistorian = configObject(historian.pi);
+    const piHistorian = editableChild(editableChild(config, "historian"), "pi");
     piHistorian.model = toCanonical(options.historianModel);
     if (options.historianThinkingLevel) {
         piHistorian.thinking_level = options.historianThinkingLevel;
     } else {
         delete piHistorian.thinking_level;
     }
-    historian.pi = piHistorian;
-    config.historian = historian;
 
-    const dreamer = configObject(config.dreamer);
-    const piDreamer = configObject(dreamer.pi);
+    const dreamer = editableChild(config, "dreamer");
     if (options.dreamerEnabled) {
         delete dreamer.disable;
         if (options.dreamerModel) {
-            piDreamer.model = toCanonical(options.dreamerModel);
-            dreamer.pi = piDreamer;
+            editableChild(dreamer, "pi").model = toCanonical(options.dreamerModel);
         }
         // Dreamer schedules are harness-independent and remain at dreamer.tasks.
         // Only write explicit wizard overrides so an existing harness's schedule
@@ -300,12 +263,8 @@ export function writeMagicContextConfig(
     } else {
         dreamer.disable = true;
     }
-    config.dreamer = dreamer;
 
-    config.embedding = {
-        ...configObject(config.embedding),
-        ...options.embedding,
-    };
+    Object.assign(editableChild(config, "embedding"), options.embedding);
     writeFileAtomic(configPath, `${stringifyJsonc(config, null, 2)}\n`);
 }
 

@@ -8,6 +8,13 @@ export const embedRunStateBySession = new Map<string, AbortController>();
 
 /** Completed auto-drains, plus temporary in-flight claims, per session and process. */
 export const autoEmbedAttemptedBySession = new Set<string>();
+/** Identity of the provider contract used by the last auto-drain attempt. */
+export const autoEmbedIdentityBySession = new Map<string, string>();
+
+export function invalidateAutoEmbedSession(sessionId: string): void {
+    autoEmbedAttemptedBySession.delete(sessionId);
+    autoEmbedIdentityBySession.delete(sessionId);
+}
 
 export type EmbedDrainUiStatus = "idle" | "running" | "paused" | "stopped";
 
@@ -44,5 +51,5 @@ export function clearEmbedSessionState(sessionId: string): void {
         ctrl.abort();
         embedRunStateBySession.delete(sessionId);
     }
-    autoEmbedAttemptedBySession.delete(sessionId);
+    invalidateAutoEmbedSession(sessionId);
 }

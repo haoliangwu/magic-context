@@ -25,3 +25,20 @@ export function closeQuietly(db: Database | null | undefined): void {
         // intentional: caller wants quiet close
     }
 }
+
+/**
+ * True only when the connection reports that no transaction is open. Caches
+ * keyed on SQLite's change counters must not keep a value read inside a
+ * transaction: a rollback restores the rows without moving total_changes(),
+ * data_version or schema_version, so the stale entry would look current.
+ * Unknown state (a proxy that cannot read the native getter) counts as "in a
+ * transaction" so callers fall back to a fresh read.
+ */
+export function isKnownAutocommit(db: Database): boolean {
+    const state = db as unknown as { inTransaction?: boolean; isTransaction?: boolean };
+    try {
+        return state.inTransaction === false || state.isTransaction === false;
+    } catch {
+        return false;
+    }
+}

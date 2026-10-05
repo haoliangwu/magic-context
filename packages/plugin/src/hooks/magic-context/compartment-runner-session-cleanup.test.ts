@@ -1,10 +1,9 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
 import {
     acquireCompartmentLease,
     releaseCompartmentLease,
@@ -15,6 +14,7 @@ import type { PluginContext } from "../../plugin/types";
 import * as shared from "../../shared";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { runCompartmentAgent } from "./compartment-runner";
 
 const tempDirs: string[] = [];
@@ -31,7 +31,7 @@ afterEach(() => {
 });
 
 function useTempDirectory(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }

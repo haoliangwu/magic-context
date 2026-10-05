@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
 	updateTagStatus,
 } from "@magic-context/core/features/magic-context/storage";
 import { getNativeToolInputs } from "@magic-context/core/features/magic-context/storage-native-replay";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
@@ -95,7 +96,11 @@ function fixture(
 			cacheTtl: "59m",
 		});
 		const messages = structuredClone(source);
-		const out = await (fake.handlers.get("context") as any)(
+		const handler = fake.handlers.get("context") as unknown as (
+			input: { messages: unknown[] },
+			ctx: unknown,
+		) => Promise<{ messages: unknown[] }>;
+		const out = await handler(
 			{ messages },
 			{
 				...fakeContext(session, process.cwd(), ids, messages),
@@ -107,7 +112,7 @@ function fixture(
 				}),
 			},
 		);
-		return out.messages as any[];
+		return out.messages;
 	};
 	const seed = async () => {
 		await pass(0);
@@ -131,10 +136,14 @@ function fixture(
 		},
 	};
 }
-const calls = (m: any[]) =>
+type TranscriptMessage = {
+	role: string;
+	content?: Array<{ type: string }>;
+};
+const calls = (m: TranscriptMessage[]) =>
 	m.flatMap((x) =>
 		x.role === "assistant"
-			? x.content.filter((p: any) => p.type === "toolCall")
+			? (x.content ?? []).filter((p) => p.type === "toolCall")
 			: [],
 	).length;
 for (const native of [false, true])
@@ -326,10 +335,13 @@ const childMode = process.env.MC_OVERWALL_RESTART_MODE;
 
 for (const native of [false, true]) {
 	test(`removal markers survive a separate-process restart (native=${native})`, () => {
-		const root = mkdtempSync(join(tmpdir(), "mc-overwall-restart-"));
+		const root = createTestTempDirFromPath(
+			join(tmpdir(), "mc-overwall-restart-"),
+		);
 		try {
 			for (const mode of ["mint", "replay"]) {
 				const child = Bun.spawnSync({
+					windowsHide: true,
 					cmd: [
 						process.execPath,
 						"test",

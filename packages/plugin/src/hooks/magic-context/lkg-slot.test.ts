@@ -11,8 +11,11 @@ import {
     incrementalLkgContentDigests,
     type LkgDigestEntry,
     type LkgSlot,
+    lkgContentDigest,
     lkgContentDigestFromFields,
     lkgContentFields,
+    memoizedLkgContentDigestFromFields,
+    noteEntry,
     registerLkgPersistence,
     resetLkgSlotsForTest,
 } from "./lkg-slot";
@@ -92,6 +95,43 @@ describe("LKG durable hydration pass", () => {
 });
 
 describe("incremental LKG content digests", () => {
+    it("shares exact digests but rehashes same-id metadata, type and nested content changes", () => {
+        resetLkgSlotsForTest();
+        const message = {
+            info: { id: "same", role: "user" },
+            parts: [{ type: "text", text: "wire", metadata: { counter: 1 as number | string } }],
+        };
+        const initial = lkgContentFields(message)!;
+        const expected = lkgContentDigest(message);
+        expect(memoizedLkgContentDigestFromFields("same", initial)).toBe(expected);
+        // A fresh tree, not reference identity, must prove the cached digest safe.
+        expect(
+            memoizedLkgContentDigestFromFields("same", lkgContentFields(structuredClone(message))!),
+        ).toBe(expected);
+        for (const counter of [2, "2", 1]) {
+            message.parts[0]!.metadata.counter = counter;
+            const fields = lkgContentFields(message)!;
+            expect(memoizedLkgContentDigestFromFields("same", fields)).toBe(
+                lkgContentDigest(message),
+            );
+        }
+        captureSlot("entry", {
+            jsonPrefix: "[]",
+            inputIdSeq: ["same"],
+            inputContentDigests: [expected!],
+            lastInputMessageId: "same",
+            modelKey: null,
+            providerKey: null,
+            capturedAt: 1,
+        });
+        expect(noteEntry("entry", [message])?.entryContentDigests).toEqual([
+            lkgContentDigest(message)!,
+        ]);
+        message.parts[0]!.text = "changed after note";
+        expect(noteEntry("entry", [message])?.entryContentDigests).toEqual([
+            lkgContentDigest(message)!,
+        ]);
+    });
     it("matches a full recompute and reuses an unchanged prefix", () => {
         const prefix = [entry("m1", "one"), entry("m2", "two"), entry("m3", "three")];
         const tail = [entry("m4", "four"), entry("m5", "five")];

@@ -1,5 +1,7 @@
 import { getHarness } from "../../shared/harness";
-import type { Database } from "../../shared/sqlite";
+import type { Database, Statement } from "../../shared/sqlite";
+
+const sourceReadStatements = new WeakMap<Database, Statement>();
 
 interface SourceContentRow {
     tag_id: number;
@@ -46,13 +48,14 @@ export function getSourceContents(
         return new Map();
     }
 
-    const placeholders = tagIds.map(() => "?").join(", ");
-    const rows = db
-        .prepare(
-            `SELECT tag_id, content FROM source_contents WHERE session_id = ? AND tag_id IN (${placeholders})`,
-        )
-        .all(sessionId, ...tagIds)
-        .filter(isSourceContentRow);
+    let statement = sourceReadStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            "SELECT tag_id, content FROM source_contents WHERE session_id = ? AND tag_id IN (SELECT value FROM json_each(?))",
+        );
+        sourceReadStatements.set(db, statement);
+    }
+    const rows = statement.all(sessionId, JSON.stringify(tagIds)).filter(isSourceContentRow);
 
     const sources = new Map<number, string>();
     for (const row of rows) {

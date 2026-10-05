@@ -2,10 +2,9 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
 import {
     appendCompartments,
     replaceAllCompartmentState,
@@ -35,11 +34,14 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { insertUserMemory } from "../../features/magic-context/user-memory/storage-user-memory";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     COMPARTMENT_RENDER_EPOCH,
     encodeCachedM0UpgradeIdentity,
+    MEMORY_RENDER_FORMAT_EPOCH,
 } from "./compartment-render-epoch";
 import {
+    capturePrefixTrimSourceOrder,
     clearInjectionCache,
     getVisibleMemoryIds,
     injectM0M1,
@@ -50,11 +52,13 @@ import {
     prepareCompartmentInjection,
     readCurrentM0SnapshotMarkers,
     renderCompartmentInjection,
+    renderHistorianMemoryBlock,
     renderM1,
     renderMemoryBlockV2,
     renderMemoryLineV2,
     trimMemoriesToBudgetV2,
 } from "./inject-compartments";
+import { withRawMessageProvider } from "./read-session-chunk";
 import { closeReadOnlySessionDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
@@ -76,7 +80,7 @@ function makeDb(): Database {
 }
 
 function makeProjectDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-renderer-test-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-renderer-test-"));
     tempDirs.push(dir);
     return dir;
 }
@@ -97,7 +101,7 @@ function createUserMemoryTable(): void {
 }
 
 function createOpenCodeMessageTimes(rows: Array<{ id: string; timestamp: number }>): void {
-    const dataHome = mkdtempSync(join(tmpdir(), "mc-inject-dates-"));
+    const dataHome = createTestTempDirFromPath(join(tmpdir(), "mc-inject-dates-"));
     tempDirs.push(dataHome);
     process.env.XDG_DATA_HOME = dataHome;
     process.env.XDG_CACHE_HOME = dataHome;
@@ -175,8 +179,14 @@ afterEach(() => {
     tempDirs.length = 0;
 });
 
-function renderMemory(id: number, category: string, content: string, importance = 50): Memory {
-    return { id, category, content, importance } as unknown as Memory;
+function renderMemory(
+    id: number,
+    category: string,
+    content: string,
+    importance = 50,
+    recency: { lastSeenAt?: number | null; verifiedAt?: number | null } = {},
+): Memory {
+    return { id, category, content, importance, ...recency } as unknown as Memory;
 }
 
 describe("compact project-memory wire", () => {
@@ -211,6 +221,29 @@ describe("compact project-memory wire", () => {
         expect(renderMemoryLineV2(memories[0]!)).toBe("#9: last");
     });
 
+    it("selects the verified memory when an importance-50 budget admits one", () => {
+        const neverVerified = renderMemory(1, "CONSTRAINTS", "memory alpha record", 50, {
+            lastSeenAt: 1_000,
+            verifiedAt: null,
+        });
+        const verifiedYesterday = renderMemory(2, "CONSTRAINTS", "memory bravo record", 50, {
+            lastSeenAt: 1_000,
+            verifiedAt: 2_000,
+        });
+        const budget = Math.max(
+            estimateTokens(renderMemoryBlockV2([neverVerified])),
+            estimateTokens(renderMemoryBlockV2([verifiedYesterday])),
+        );
+
+        const trimmed = trimMemoriesToBudgetV2(
+            SESSION_ID,
+            [neverVerified, verifiedYesterday],
+            budget,
+        );
+
+        expect(trimmed.selected.map((memory) => memory.id)).toEqual([verifiedYesterday.id]);
+    });
+
     it("measures the complete grouped block so a dropped category has no tag overhead", () => {
         const kept = renderMemory(1, "PROJECT_RULES", "always run focused tests", 100);
         const dropped = renderMemory(2, "ARCHITECTURE", "a separate category", 1);
@@ -239,6 +272,48 @@ describe("compact project-memory wire", () => {
 
         expect(after).toBe(before);
         expect(after).not.toContain("importance");
+    });
+});
+
+describe("historian project-memory block", () => {
+    // The historian's <project-memory> block is dedup context, not an addressable
+    // wire: the system prompt tells the historian to skip facts that overlap what
+    // it sees here, and it never references a memory by id. The id-prefixed form
+    // (renderMemoryBlockV2) exists so the agent-facing <memory-updates> block can
+    // point at baseline lines by id; the historian has no such mechanism, so its
+    // canonical form is the category-grouped `- fact` line. The Rust port
+    // (crates/mc-module historian_prompt.rs) renders the same bytes and the
+    // historian prompt golden pins both lanes to it.
+    it("renders id-free fact lines grouped by the 12-category historian priority", () => {
+        const memories = [
+            renderMemory(1, "NAMING", "Use Foo & Bar <Baz> in examples"),
+            renderMemory(2, "PROJECT_RULES", "Never rewrite generated files > their source"),
+            renderMemory(3, "ARCHITECTURE", "Core path is crates/mc-module"),
+            renderMemory(4, "USER_DIRECTIVES", "Legacy user directive survives"),
+            renderMemory(5, "UNKNOWN", "unknown category is not rendered"),
+        ];
+
+        const block = renderHistorianMemoryBlock(memories);
+
+        expect(block).toBe(`<project-memory>
+<PROJECT_RULES>
+- Never rewrite generated files &gt; their source
+</PROJECT_RULES>
+<ARCHITECTURE>
+- Core path is crates/mc-module
+</ARCHITECTURE>
+<NAMING>
+- Use Foo &amp; Bar &lt;Baz&gt; in examples
+</NAMING>
+<USER_DIRECTIVES>
+- Legacy user directive survives
+</USER_DIRECTIVES>
+</project-memory>`);
+    });
+
+    it("returns null when no memory survives the category filter", () => {
+        expect(renderHistorianMemoryBlock([])).toBeNull();
+        expect(renderHistorianMemoryBlock([renderMemory(1, "UNKNOWN", "not rendered")])).toBeNull();
     });
 });
 
@@ -590,6 +665,214 @@ describe("prepareCompartmentInjection — transition from empty to compartment",
     });
 });
 
+describe("user-profile baseline and delta rendering", () => {
+    it("normalizes subject prefixes in both m[0] and the new-profile delta", () => {
+        db = makeDb();
+        createUserMemoryTable();
+        const projectDirectory = makeProjectDir();
+        insertUserMemory(db, "User strongly pushes back on untested changes.", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            injectDocs: false,
+            userProfileBudgetTokens: 10_000,
+        };
+
+        const baseline = materializeM0(options);
+        expect(baseline.m0Text).toContain(
+            "<user-profile>\n- Strongly pushes back on untested changes.\n</user-profile>",
+        );
+
+        insertUserMemory(db, "User expects changes to be tested.", []);
+        setProjectState(db, "__global__", { projectUserProfileVersion: 2 });
+        expect(
+            mustMaterialize({
+                db,
+                sessionId: SESSION_ID,
+                state: readStateFromMeta(),
+                projectPath: PROJECT_PATH,
+                projectDirectory,
+            }),
+        ).toEqual({ value: false, reason: null });
+        const delta = renderM1(
+            { ...options, state: readStateFromMeta() },
+            baseline.snapshotMarkers,
+            baseline.renderedMemoryIds,
+        );
+        expect(delta).toContain("<new-user-profile>");
+        expect(delta).toContain("- Strongly pushes back on untested changes.");
+        expect(delta).toContain("- Expects changes to be tested.");
+    });
+});
+
+describe("prepared prefix source-order trimming", () => {
+    const message = (id: string, role: "user" | "assistant"): MessageLike => ({
+        info: { id, role, sessionID: SESSION_ID },
+        parts: [{ type: "text", text: id }],
+    });
+    const syntheticHead = (): MessageLike => ({
+        info: { role: "user", sessionID: SESSION_ID },
+        parts: [{ type: "text", text: "old synthetic prefix", synthetic: true }],
+    });
+    const preparedPrefix = (boundary: string) => ({
+        injected: true,
+        prependedMessageCount: 0,
+        m0RematerializedThisPass: false,
+        materializationContentionRetryExhausted: false,
+        decision: { value: false, reason: "cache_hit" },
+        m0Bytes: Buffer.from("m0"),
+        m1Text: "m1",
+        preparedMessages: [
+            {
+                info: { role: "user", sessionID: SESSION_ID },
+                parts: [{ type: "text", text: "new prefix", synthetic: true }],
+            } as MessageLike,
+        ],
+        preparedTrimBoundaryId: boundary,
+    });
+
+    it("trims surviving rows through a deleted assistant boundary without resurrecting it", () => {
+        db = makeDb();
+        const source = [
+            syntheticHead(),
+            message("before", "user"),
+            message("assistant-boundary", "assistant"),
+            message("after", "user"),
+        ];
+        const evidence = capturePrefixTrimSourceOrder(source);
+        const live = [syntheticHead(), source[1]!, source[3]!];
+
+        const result = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state: getOrCreateSessionMeta(db, SESSION_ID),
+            messages: live,
+            preparedPrefix: preparedPrefix("assistant-boundary"),
+            prefixTrimSourceOrder: evidence,
+        });
+
+        expect(result.prefixTrimStatus).toBe("applied");
+        expect(live.map((entry) => entry.info.id)).toEqual([undefined, "after"]);
+        expect(live[0]?.parts[0]).toMatchObject({ text: "new prefix", synthetic: true });
+    });
+
+    it("refuses a trim when the boundary is absent from the immutable source order", () => {
+        db = makeDb();
+        const source = [message("before", "user"), message("after", "assistant")];
+        const live = structuredClone(source);
+
+        const result = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state: getOrCreateSessionMeta(db, SESSION_ID),
+            messages: live,
+            preparedPrefix: preparedPrefix("missing-boundary"),
+            prefixTrimSourceOrder: capturePrefixTrimSourceOrder(source),
+        });
+
+        expect(result.prefixTrimStatus).toBe("refused");
+        expect(live.map((entry) => entry.info.id)).toEqual([undefined, "before", "after"]);
+    });
+
+    // OpenCode 2 renders an instruction-update row as an id-less system message.
+    // A boundary stored on such a row stands for the served row before it.
+    const hostSystem = (text: string): MessageLike => ({
+        info: { role: "system", sessionID: SESSION_ID },
+        parts: [{ type: "text", text }],
+    });
+    const withServedBoundary = <T>(served: Record<string, string>, run: () => T): T =>
+        withRawMessageProvider(
+            SESSION_ID,
+            {
+                readMessages: () => [],
+                readServedBoundaryId: (id: string) => served[id] ?? null,
+            },
+            run,
+        );
+
+    it("trims at the served row a boundary on an unserved instruction row stands for", () => {
+        db = makeDb();
+        const live = [
+            message("covered", "user"),
+            hostSystem("covered instruction"),
+            message("served-boundary", "assistant"),
+            hostSystem("instruction row"),
+            message("after", "user"),
+        ];
+
+        const result = withServedBoundary({ "instruction-row": "served-boundary" }, () =>
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages: live,
+                preparedPrefix: preparedPrefix("instruction-row"),
+            }),
+        );
+
+        expect(result.prefixTrimStatus).toBe("applied");
+        expect(live.map((entry) => entry.parts[0]?.text)).toEqual([
+            "new prefix",
+            "instruction row",
+            "after",
+        ]);
+    });
+
+    it("orders id-less host system messages by their persisted neighbours", () => {
+        db = makeDb();
+        const source = [
+            message("covered", "user"),
+            hostSystem("covered instruction"),
+            message("served-boundary", "assistant"),
+            hostSystem("instruction row"),
+            message("after", "user"),
+        ];
+        const evidence = capturePrefixTrimSourceOrder(source);
+        expect(evidence.invalidReason).toBeNull();
+        const live = [...source];
+
+        const result = withServedBoundary({ "instruction-row": "served-boundary" }, () =>
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages: live,
+                preparedPrefix: preparedPrefix("instruction-row"),
+                prefixTrimSourceOrder: evidence,
+            }),
+        );
+
+        expect(result.prefixTrimStatus).toBe("applied");
+        expect(live.map((entry) => entry.parts[0]?.text)).toEqual([
+            "new prefix",
+            "instruction row",
+            "after",
+        ]);
+    });
+
+    it("still refuses an unserved boundary when no served row stands for it", () => {
+        db = makeDb();
+        const live = [message("before", "user"), hostSystem("instruction row")];
+
+        const result = withServedBoundary({}, () =>
+            injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                state: getOrCreateSessionMeta(db, SESSION_ID),
+                messages: live,
+                preparedPrefix: preparedPrefix("instruction-row"),
+            }),
+        );
+
+        expect(result.prefixTrimStatus).toBe("refused");
+        expect(live).toHaveLength(3);
+    });
+});
+
 describe("prepareCompartmentInjection — SQLITE_BUSY handling (issue #23)", () => {
     it("swallows SQLITE_BUSY on memory_block_cache UPDATE and returns computed block anyway", () => {
         db = makeDb();
@@ -701,6 +984,42 @@ describe("m[0]/m[1] materialization", () => {
         expect(rendered.m0Text).toContain("## 1-2 · 2026-01-02→03 · dated compartment");
     });
 
+    it("renders byte-identical headings from indexed times without reopening the host store", () => {
+        db = makeDb();
+        storeDatedCompartment();
+        const start = new Date(2026, 0, 2, 12).getTime();
+        const end = new Date(2026, 0, 3, 12).getTime();
+        createOpenCodeMessageTimes([
+            { id: "m1", timestamp: start },
+            { id: "m2", timestamp: end },
+        ]);
+        const state = readStateFromMeta();
+        const fallback = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            temporalAwareness: true,
+        }).m0Text;
+
+        db.prepare(
+            `INSERT INTO message_fts_rowid_map
+                (session_id, message_ordinal, fts_rowid, message_time_ms)
+             VALUES (?, ?, ?, ?), (?, ?, ?, ?)`,
+        ).run(SESSION_ID, 1, 10_001, start, SESSION_ID, 2, 10_002, end);
+        closeReadOnlySessionDb();
+        rmSync(join(process.env.XDG_DATA_HOME!, "opencode", "opencode.db"), { force: true });
+        clearInjectionCache(SESSION_ID);
+
+        const indexed = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            temporalAwareness: true,
+        }).m0Text;
+        expect(indexed).toBe(fallback);
+        expect(indexed).toContain("## 1-2 · 2026-01-02→03 · dated compartment");
+    });
+
     it("omits compartment date ranges from m[0] when temporal awareness is disabled", () => {
         db = makeDb();
         storeDatedCompartment();
@@ -805,6 +1124,199 @@ describe("m[0]/m[1] materialization", () => {
         expect(second.m0Bytes).toEqual(first.m0Bytes);
         expect(second.m1Text).toBe(first.m1Text);
         expect(JSON.stringify(secondMessages)).toBe(JSON.stringify(firstMessages));
+    });
+
+    it("keeps policy-identified m0 frozen as proven-input budgets rise and folds a policy edit once", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const state = readStateFromMeta();
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            historyBudgetPolicyIdentity: "p0.15:percentage:40",
+            historyBudgetTokens: 13762,
+        };
+        const first = injectM0M1({ ...options, messages: [userMessage("m1", "seed")] });
+        expect(first.m0RematerializedThisPass).toBe(true);
+        for (const historyBudgetTokens of [15670, 16200, 16800]) {
+            const replay = injectM0M1({
+                ...options,
+                historyBudgetTokens,
+                messages: [userMessage("m2", "grow")],
+            });
+            expect(replay.m0RematerializedThisPass).toBe(false);
+            expect(replay.m0Bytes).toEqual(first.m0Bytes);
+            expect(replay.m0Bytes?.toString()).not.toContain("render_config");
+        }
+        const edited = {
+            ...options,
+            historyBudgetPolicyIdentity: "p0.2:percentage:40",
+            historyBudgetTokens: 22400,
+        };
+        const fold = injectM0M1({ ...edited, messages: [userMessage("m3", "edit")] });
+        expect(fold.decision.reason).toBe(
+            "render_config:budget(m8000-hp0.15:percentage:40→m8000-hp0.2:percentage:40)",
+        );
+        expect(fold.m0RematerializedThisPass).toBe(true);
+        expect(
+            injectM0M1({ ...edited, messages: [userMessage("m4", "replay")] })
+                .m0RematerializedThisPass,
+        ).toBe(false);
+    });
+
+    it("adopts legacy numeric history silently but still detects memory-budget and mural edits", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const state = readStateFromMeta();
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            historyBudgetTokens: 12000,
+        };
+        const first = injectM0M1({ ...options, messages: [userMessage("m1", "legacy")] });
+        const current = {
+            ...options,
+            historyBudgetTokens: 16000,
+            historyBudgetPolicyIdentity: "p0.15:percentage:40",
+        };
+        expect(mustMaterialize(current).value).toBe(false);
+        expect(state.cachedM0Bytes).toEqual(first.m0Bytes);
+        expect(mustMaterialize({ ...current, memoryInjectionBudgetTokens: 9000 }).reason).toBe(
+            "render_config:budget(m8000-h12000→m9000-hp0.15:percentage:40)",
+        );
+        expect(mustMaterialize({ ...current, muralEnabled: true }).reason).toBe(
+            "render_config:mural(false→true)",
+        );
+        injectM0M1({
+            ...current,
+            hardSignals: { systemHash: "new-system", modelKey: "" },
+            messages: [userMessage("m2", "hard")],
+        });
+        expect(state.cachedM0UpgradeState).toContain("hp0.15:percentage:40");
+    });
+
+    it("review: legacy policy adoption survives restart until a natural HARD", () => {
+        db = makeDb();
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+            projectDirectory: makeProjectDir(),
+            historyBudgetTokens: 12000,
+        };
+        const first = injectM0M1({ ...options, state: readStateFromMeta() });
+        const legacy =
+            readStateFromMeta().cachedM0UpgradeState?.split("|rendered-budgets:")[0] ?? null;
+        db.prepare("UPDATE session_meta SET cached_m0_upgrade_state = ? WHERE session_id = ?").run(
+            legacy,
+            SESSION_ID,
+        );
+        clearInjectionCache(SESSION_ID);
+        expect(legacy).toContain("-h12000");
+        const current = {
+            ...options,
+            historyBudgetTokens: 16000,
+            historyBudgetPolicyIdentity: "p0.15:percentage:40",
+        };
+        for (let restart = 0; restart < 2; restart++) {
+            clearInjectionCache(SESSION_ID);
+            const replay = injectM0M1({
+                ...current,
+                historyBudgetTokens: restart === 0 ? 16000 : 1,
+                state: readStateFromMeta(),
+                isCacheBustingPass: false,
+            });
+            expect(replay.m0RematerializedThisPass).toBe(false);
+            expect(replay.m0Bytes).toEqual(first.m0Bytes);
+            expect(readStateFromMeta().cachedM0UpgradeState).toBe(legacy);
+        }
+        const hard = injectM0M1({
+            ...current,
+            state: readStateFromMeta(),
+            hardSignals: {
+                systemHash: "natural-hard",
+                modelKey: "",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
+        });
+        expect(hard.decision.reason).toBe("system_hash");
+        expect(hard.m0RematerializedThisPass).toBe(true);
+        expect(readStateFromMeta().cachedM0UpgradeState).toContain("-hp0.15:percentage:40");
+    });
+
+    it("shrinking history budget refolds an oversized baseline once with empty m1", () => {
+        db = makeDb();
+        storeDatedCompartment();
+        const options = {
+            db,
+            sessionId: SESSION_ID,
+            projectPath: PROJECT_PATH,
+            projectDirectory: makeProjectDir(),
+            historyBudgetTokens: 12000,
+            hardSignals: {
+                modelKey: "review/larger-model",
+                systemHash: "",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
+            historyBudgetPolicyIdentity: "p0.15:percentage:40",
+        };
+        const first = injectM0M1({
+            ...options,
+            state: readStateFromMeta(),
+            isCacheBustingPass: true,
+        });
+        expect(first.m0Bytes?.toString()).toContain("dated compartment");
+        const shrink = { ...options, historyBudgetTokens: 1 };
+        const resized = injectM0M1({ ...shrink, state: readStateFromMeta() });
+        expect(resized.m0RematerializedThisPass).toBe(true);
+        expect(resized.decision.reason).toBe("render_config:budget_shrink(m8000-h12000→m8000-h1)");
+        expect(resized.m0Bytes?.length).toBeLessThan(first.m0Bytes?.length ?? 0);
+        expect(readStateFromMeta().cachedM0UpgradeState).toContain("|rendered-budgets:m8000-h1");
+        for (const isCacheBustingPass of [false, true, true]) {
+            const replay = injectM0M1({
+                ...shrink,
+                state: readStateFromMeta(),
+                isCacheBustingPass,
+            });
+            expect(replay.m0RematerializedThisPass).toBe(false);
+            expect(replay.m0Bytes).toEqual(resized.m0Bytes);
+        }
+        const growth = injectM0M1({ ...options, state: readStateFromMeta() });
+        expect(growth.m0RematerializedThisPass).toBe(false);
+        expect(growth.m0Bytes).toEqual(resized.m0Bytes);
+        const switched = injectM0M1({
+            ...shrink,
+            state: readStateFromMeta(),
+            hardSignals: {
+                modelKey: "review/smaller-model",
+                systemHash: "",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
+        });
+        expect(switched.decision.reason).toBe("model_change");
+        expect(switched.m0RematerializedThisPass).toBe(true);
+        expect(readStateFromMeta().cachedM0ModelKey).toBe("review/smaller-model");
+        expect(
+            injectM0M1({
+                ...shrink,
+                state: readStateFromMeta(),
+                hardSignals: {
+                    modelKey: "review/smaller-model",
+                    systemHash: "",
+                    cacheExpired: false,
+                    lastResponseTime: 0,
+                },
+            }).m0RematerializedThisPass,
+        ).toBe(false);
     });
 
     it("mustMaterialize returns true on first call", () => {
@@ -1134,6 +1646,101 @@ describe("m[0]/m[1] materialization", () => {
         ).toEqual({ value: false, reason: null });
     });
 
+    it("replays the pre-epoch memory order on defer and applies recency on one natural HARD", () => {
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        const neverVerified = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "CONSTRAINTS",
+            content: "memory alpha record",
+            importance: 50,
+        });
+        const verifiedYesterday = insertMemory(db, {
+            projectPath: PROJECT_PATH,
+            category: "CONSTRAINTS",
+            content: "memory bravo record",
+            importance: 50,
+        });
+        db.prepare(
+            "UPDATE memories SET last_seen_at = 1000, verified_at = CASE WHEN id = ? THEN 2000 ELSE NULL END WHERE id IN (?, ?)",
+        ).run(verifiedYesterday.id, neverVerified.id, verifiedYesterday.id);
+        const memories = getMemoriesByProject(db, PROJECT_PATH);
+        const budget = Math.max(
+            ...memories.map((memory) => estimateTokens(renderMemoryBlockV2([memory]))),
+        );
+        const initialState = readStateFromMeta();
+        injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state: initialState,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            memoryInjectionBudgetTokens: budget,
+            hardSignals: {
+                systemHash: "system",
+                modelKey: "provider/old",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            },
+        });
+        const oldMemory = memories.find((memory) => memory.id === neverVerified.id);
+        if (!oldMemory) throw new Error("pre-epoch memory fixture missing");
+        const oldM0 = Buffer.from(
+            `<session-history></session-history>\n\n${renderMemoryBlockV2([oldMemory])}`,
+        );
+        db.prepare(
+            "UPDATE session_meta SET cached_m0_bytes = ?, cached_m0_upgrade_state = ? WHERE session_id = ?",
+        ).run(
+            oldM0,
+            encodeCachedM0UpgradeIdentity(
+                "ready",
+                COMPARTMENT_RENDER_EPOCH,
+                false,
+                `m${budget}-h60000`,
+                null,
+            ),
+            SESSION_ID,
+        );
+        const state = readStateFromMeta();
+        const stableSignals = {
+            systemHash: "system",
+            modelKey: "provider/old",
+            cacheExpired: false,
+            lastResponseTime: 0,
+        };
+
+        const defer = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            memoryInjectionBudgetTokens: budget,
+            hardSignals: stableSignals,
+        });
+
+        expect(defer.m0RematerializedThisPass).toBe(false);
+        expect(defer.m0Bytes).toEqual(oldM0);
+        expect(state.cachedM0UpgradeState).not.toContain(MEMORY_RENDER_FORMAT_EPOCH);
+
+        const hard = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            memoryInjectionBudgetTokens: budget,
+            hardSignals: { ...stableSignals, modelKey: "provider/new" },
+        });
+        const hardText = hard.m0Bytes?.toString("utf8") ?? "";
+
+        expect(hard.m0RematerializedThisPass).toBe(true);
+        expect(hard.decision.reason).toBe("model_change");
+        expect(hardText).toContain("memory bravo record");
+        expect(hardText).not.toContain("memory alpha record");
+        expect(state.cachedM0UpgradeState).toContain(MEMORY_RENDER_FORMAT_EPOCH);
+    });
+
     it("keeps single-project m[0]/m[1] bytes identical with the no-workspace context", () => {
         const render = (explicitSingleProjectContext: boolean): string => {
             const localDb = makeDb();
@@ -1283,6 +1890,79 @@ describe("m[0]/m[1] materialization", () => {
         });
         expect(refreshed.m0RematerializedThisPass).toBe(false);
         expect(refreshed.m1Text).toContain("## 1-1 · 2026-01-04 · New");
+    });
+
+    it("a compartment marked unresolved by a store-projection rebase still renders into m[0] and m[1]", () => {
+        // The compartment summary is the history; it does not depend on the raw
+        // rows it was folded from (a host prunes those routinely). Only the
+        // coordinates are stale, and range recovery refuses them by status. The
+        // first version of this filter dropped unresolved rows from the render,
+        // which on a real store meant most of a long session's history vanishing
+        // on the flip.
+        db = makeDb();
+        const projectDirectory = makeProjectDir();
+        appendCompartments(db, SESSION_ID, [
+            {
+                sequence: 1,
+                startMessage: 1,
+                endMessage: 4,
+                startMessageId: "m1",
+                endMessageId: "m4",
+                title: "Resolved",
+                content: "Resolved summary",
+                p1: "Resolved summary",
+            },
+            {
+                sequence: 2,
+                startMessage: 5,
+                endMessage: 9,
+                startMessageId: "m5",
+                endMessageId: "m9",
+                title: "Unresolved",
+                content: "Unresolved summary",
+                p1: "Unresolved summary",
+            },
+        ]);
+        db.prepare(
+            "UPDATE compartments SET rebase_status = 'unresolved' WHERE session_id = ? AND sequence = 2",
+        ).run(SESSION_ID);
+        const baseline = materializeM0({
+            db,
+            sessionId: SESSION_ID,
+            state: readStateFromMeta(),
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+        });
+        expect(baseline.m0Text).toContain("Resolved summary");
+        expect(baseline.m0Text).toContain("Unresolved summary");
+
+        // The same rule on the delta: an unresolved row newer than the baseline
+        // renders into m[1] too.
+        const state = readStateFromMeta();
+        appendCompartments(db, SESSION_ID, [
+            {
+                sequence: 3,
+                startMessage: 10,
+                endMessage: 12,
+                startMessageId: "m10",
+                endMessageId: "m12",
+                title: "Later unresolved",
+                content: "Later unresolved summary",
+                p1: "Later unresolved summary",
+            },
+        ]);
+        db.prepare(
+            "UPDATE compartments SET rebase_status = 'unresolved' WHERE session_id = ? AND sequence = 3",
+        ).run(SESSION_ID);
+        const refreshed = injectM0M1({
+            db,
+            sessionId: SESSION_ID,
+            state,
+            projectPath: PROJECT_PATH,
+            projectDirectory,
+            isCacheBustingPass: true,
+        });
+        expect(refreshed.m1Text).toContain("Later unresolved summary");
     });
 
     it("mustMaterialize does NOT materialize m[0] on a retrospective memory write", () => {
@@ -1784,7 +2464,14 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof row.cached_m0_materialized_at).toBe("number");
         expect(row.cached_m0_session_facts_version).toBe(0);
         expect(row.cached_m0_upgrade_state).toBe(
-            encodeCachedM0UpgradeIdentity("ready", COMPARTMENT_RENDER_EPOCH, false, "m8000-h60000"),
+            encodeCachedM0UpgradeIdentity(
+                "ready",
+                COMPARTMENT_RENDER_EPOCH,
+                false,
+                "m8000-h60000",
+                MEMORY_RENDER_FORMAT_EPOCH,
+                "m8000-h60000",
+            ),
         );
     });
 
@@ -2011,7 +2698,14 @@ describe("m[0]/m[1] materialization", () => {
         expect(typeof state.cachedM0MaterializedAt).toBe("number");
         expect(state.cachedM0SessionFactsVersion).toBe(0);
         expect(state.cachedM0UpgradeState).toBe(
-            encodeCachedM0UpgradeIdentity("ready", COMPARTMENT_RENDER_EPOCH, false, "m8000-h60000"),
+            encodeCachedM0UpgradeIdentity(
+                "ready",
+                COMPARTMENT_RENDER_EPOCH,
+                false,
+                "m8000-h60000",
+                MEMORY_RENDER_FORMAT_EPOCH,
+                "m8000-h60000",
+            ),
         );
         expect(state.snapshotMarkers?.maxMemoryId).toBe(0);
         expect(
@@ -2126,7 +2820,7 @@ describe("m[0]/m[1] materialization", () => {
             // one-request replay of the memory-bearing cache.
             hardSignals: { systemHash: "memory-guidance-on", modelKey: "test/model" },
         });
-        expect(transition.decision.reason).toBe("render_config");
+        expect(transition.decision.reason).toBe("render_config:memory_disabled");
         expect(transition.m0RematerializedThisPass).toBe(true);
         expect(renderedText(off[0])).not.toContain("transition profile fact");
         const suppressedBytes = transition.m0Bytes?.toString("utf8");

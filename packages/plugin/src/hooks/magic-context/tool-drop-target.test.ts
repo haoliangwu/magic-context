@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it, mock } from "bun:test";
+import { isNeutralizedReasoningPart } from "./sentinel";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 import {
     createToolDropTarget,
@@ -55,6 +56,59 @@ function buildIndex(messages: MessageLike[]): ToolCallIndex {
 }
 
 describe("tool-drop-target", () => {
+    it("compacts many removed wrappers in place while preserving survivor references and order", () => {
+        const messages: MessageLike[] = Array.from({ length: 6000 }, (_, index) => ({
+            info: { id: `compact-${index}`, role: "user" },
+            parts: [{ type: "text", text: `content-${index}` }],
+        }));
+        const survivors = messages.filter((_, index) => index % 2 === 1);
+        const original = messages;
+        const batch = new ToolMutationBatch(messages, true);
+        for (let index = 0; index < messages.length; index += 2) {
+            batch.markForRemoval({
+                message: messages[index],
+                part: messages[index].parts[0],
+                kind: "result",
+            });
+        }
+        batch.finalize();
+        expect(messages).toBe(original);
+        expect(messages).toEqual(survivors);
+        expect(messages[0]).toBe(survivors[0]);
+        expect(messages[messages.length - 1]).toBe(survivors[survivors.length - 1]);
+        batch.finalize();
+        expect(messages).toEqual(survivors);
+    });
+
+    it("strips attachments on a newly selected skeleton but preserves legacy replay", () => {
+        const attachment = { type: "file", mime: "image/png", url: "data:image/png;base64,abcd" };
+        const original = {
+            type: "tool",
+            callID: "c1",
+            state: { input: { path: "a" }, output: "large output", attachments: [attachment] },
+        };
+        const row = message("m1", "assistant", [original]);
+        const target = createToolDropTarget(
+            "c1",
+            [],
+            buildIndex([row]),
+            new ToolMutationBatch([row]),
+            7,
+        );
+        expect(target.hasAttachments()).toBe(true);
+        expect(target.skeletonStripped()).toBe("truncated");
+        expect((row.parts[0] as typeof original).state.attachments).toEqual([]);
+        expect(original.state.attachments).toEqual([attachment]);
+        const replay = message("m1", "assistant", [structuredClone(original)]);
+        createToolDropTarget(
+            "c1",
+            [],
+            buildIndex([replay]),
+            new ToolMutationBatch([replay]),
+            7,
+        ).skeletonReal();
+        expect((replay.parts[0] as typeof original).state.attachments).toEqual([attachment]);
+    });
     let buildOutput: ReturnType<typeof mock<(suffix: string) => string>>;
 
     beforeEach(() => {
@@ -184,8 +238,12 @@ describe("tool-drop-target", () => {
                     expect(hasCall(messages, "call-1")).toBe(false);
                     expect(messages).toHaveLength(1);
                     expect(messages[0]?.info.id).toBe("m-keep");
-                    expect(thinkingParts[0]?.thinking).toBe("[cleared]");
-                    expect(thinkingParts[1]?.text).toBe("[cleared]");
+                    // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                    expect(thinkingParts[0]).toEqual({ type: "text", text: "" });
+                    expect(isNeutralizedReasoningPart(thinkingParts[0])).toBe(true);
+                    // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                    expect(thinkingParts[1]).toEqual({ type: "text", text: "" });
+                    expect(isNeutralizedReasoningPart(thinkingParts[1])).toBe(true);
                 });
             });
         });
@@ -267,6 +325,9 @@ describe("tool-drop-target", () => {
                         message("m-inv", "assistant", [{ type: "tool_use", id: "call-2" }]),
                         message("m-res", "tool", [toolPart]),
                         message("m-res-2", "assistant", [toolResultPart]),
+                        // A later prompt, so this call does not end the conversation
+                        // (drop() keeps that one as a skeleton instead of removing it).
+                        message("m-next", "user", [{ type: "text", text: "next prompt" }]),
                     ];
                     const thinkingParts: ThinkingLikePart[] = [
                         { type: "thinking", thinking: "to clear" },
@@ -285,7 +346,9 @@ describe("tool-drop-target", () => {
                     batch.finalize();
 
                     expect(hasCall(messages, "call-2")).toBe(false);
-                    expect(thinkingParts[0]?.thinking).toBe("[cleared]");
+                    // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                    expect(thinkingParts[0]).toEqual({ type: "text", text: "" });
+                    expect(isNeutralizedReasoningPart(thinkingParts[0])).toBe(true);
                 });
             });
         });
@@ -300,6 +363,8 @@ describe("tool-drop-target", () => {
                         message("m-tool", "tool", [
                             { type: "tool", callID: "call-1", state: { output: "out" } },
                         ]),
+                        // A later prompt, so this call does not end the conversation.
+                        message("m-next", "user", [{ type: "text", text: "next prompt" }]),
                     ];
                     const index = buildIndex(messages);
                     const batch = new ToolMutationBatch(messages);
@@ -307,6 +372,52 @@ describe("tool-drop-target", () => {
 
                     expect(target.drop()).toBe("removed");
                     expect(target.drop()).toBe("absent");
+                });
+            });
+        });
+
+        describe("#given the call whose result ends the conversation", () => {
+            describe("#when dropping it", () => {
+                it("#then it keeps a skeleton so the request still ends with a tool result", () => {
+                    const toolPart = {
+                        type: "tool",
+                        tool: "bash",
+                        callID: "call-last",
+                        state: { status: "completed", input: { command: "cat f" }, output: "big" },
+                    };
+                    const messages: MessageLike[] = [
+                        message("m-user", "user", [{ type: "text", text: "go" }]),
+                        message("m-last", "assistant", [
+                            { type: "step-start" },
+                            { type: "text", text: "Reading." },
+                            toolPart,
+                            { type: "step-finish", reason: "tool-calls" },
+                        ]),
+                        // A blank pending assistant shell is not what the request ends with.
+                        message("m-shell", "assistant", [{ type: "step-start" }]),
+                    ];
+                    const index: ToolCallIndex = new Map([
+                        [
+                            "call-last",
+                            {
+                                occurrences: [
+                                    { message: messages[1]!, part: toolPart, kind: "result" },
+                                ],
+                                hasResult: true,
+                            },
+                        ],
+                    ]);
+                    const batch = new ToolMutationBatch(messages);
+                    const target = createToolDropTarget("call-last", [], index, batch, 9);
+
+                    expect(target.drop()).toBe("truncated");
+                    batch.finalize();
+
+                    const kept = messages[1]?.parts.find(
+                        (part) => (part as { type?: string }).type === "tool",
+                    ) as { callID: string; state: { output: string } } | undefined;
+                    expect(kept?.callID).toBe("call-last");
+                    expect(kept?.state.output).toBe("[dropped \u00a79\u00a7]");
                 });
             });
         });
@@ -382,8 +493,12 @@ describe("tool-drop-target", () => {
                     expect(toolResultPart.content).toBe("old-result");
                     expect(wireToolPart).not.toBe(toolPart);
                     expect(wireResultPart).not.toBe(toolResultPart);
-                    expect(thinkingParts[0]?.thinking).toBe("[cleared]");
-                    expect(thinkingParts[1]?.text).toBe("[cleared]");
+                    // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                    expect(thinkingParts[0]).toEqual({ type: "text", text: "" });
+                    expect(isNeutralizedReasoningPart(thinkingParts[0])).toBe(true);
+                    // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                    expect(thinkingParts[1]).toEqual({ type: "text", text: "" });
+                    expect(isNeutralizedReasoningPart(thinkingParts[1])).toBe(true);
                 });
 
                 it("#then replaces reporter-shaped inputs with one non-executable marker", () => {
@@ -677,4 +792,36 @@ describe("tool-drop-target", () => {
             expect(hasMeaningfulPart({ type: "meta" })).toBe(false);
         });
     });
+});
+
+it("reclaim preview counts the retained skeleton without mutating the served parts", () => {
+    const messages = [
+        message("m", "assistant", [
+            {
+                type: "tool",
+                callID: "c",
+                tool: "read",
+                state: {
+                    input: { path: "sample.txt" },
+                    output: "word ".repeat(999),
+                    status: "completed",
+                },
+            },
+        ]),
+    ];
+    const bytes = JSON.stringify(messages);
+    const target = createToolDropTarget(
+        "c",
+        [],
+        buildIndex(messages),
+        new ToolMutationBatch(messages),
+        12,
+    );
+    const full = target.measureReclaim(false);
+    const skeleton = target.measureReclaim(true);
+    expect(full.beforeTools).toBeGreaterThan(1000);
+    expect(full.afterTools).toBe(0);
+    expect(skeleton.afterTools).toBeGreaterThan(0);
+    expect(skeleton.afterTools).toBeLessThan(skeleton.beforeTools);
+    expect(JSON.stringify(messages)).toBe(bytes);
 });

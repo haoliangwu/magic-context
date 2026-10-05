@@ -655,3 +655,19 @@ describe("protection-window", () => {
         });
     });
 });
+
+it("Fable protection spends real tool tokens without changing raw row mass", () => {
+    const rows = Array.from({ length: 8 }, (_, index) => ({
+        id: index + 1,
+        tag_number: index + 1,
+        type: "tool",
+        token_count: 1000,
+    }));
+    const window = computeProtectionWindow(rows, 6000, 1.551639);
+    expect([...window.protectedTagNumbers]).toEqual([5, 6, 7, 8]);
+    expect(window.status.protectedMass).toBe(6207);
+    expect(rows.map((row) => row.token_count)).toEqual(Array(8).fill(1000));
+    expect([...computeProtectionWindow(rows, 6000).protectedTagNumbers]).toEqual([
+        3, 4, 5, 6, 7, 8,
+    ]);
+});

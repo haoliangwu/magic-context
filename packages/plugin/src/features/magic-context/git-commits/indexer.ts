@@ -24,11 +24,7 @@ import {
     loadUnembeddedCommits,
     saveCommitEmbedding,
 } from "./storage-git-commit-embeddings";
-import {
-    enforceProjectCap,
-    getLatestIndexedCommitTimeMs,
-    upsertCommits,
-} from "./storage-git-commits";
+import { enforceProjectCap, getLatestIndexedCommitSha, upsertCommits } from "./storage-git-commits";
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const EMBED_BATCH_SIZE = 16;
@@ -91,19 +87,18 @@ export async function indexCommitsForProject(
     indexInProgress.add(projectPath);
 
     try {
-        // Incremental: if we've seen commits before, only fetch anything newer
-        // than the latest indexed commit. Otherwise use since_days cutoff.
-        const latestIndexed = getLatestIndexedCommitTimeMs(db, projectPath);
-        const sinceMs =
-            latestIndexed !== null
-                ? // subtract 1 minute for clock skew across systems
-                  Math.max(latestIndexed - 60_000, Date.now() - options.sinceDays * MS_PER_DAY)
-                : Date.now() - options.sinceDays * MS_PER_DAY;
+        // Incremental: skip history reachable from the latest indexed commit.
+        // A date cutoff (`--since` the latest indexed time) cannot do this: a
+        // merged branch brings in commits dated before that time, and they
+        // would never be read. since_days still bounds the window.
+        const latestIndexed = getLatestIndexedCommitSha(db, projectPath);
+        const sinceMs = Date.now() - options.sinceDays * MS_PER_DAY;
 
         const read = await readGitCommitsResult(directory, {
             sinceMs,
             maxCommits: options.maxCommits,
             projectIdentity: projectPath,
+            excludeReachableFrom: latestIndexed ?? undefined,
         });
         const commits = read.commits;
         result.scanned = commits.length;
@@ -117,13 +112,13 @@ export async function indexCommitsForProject(
             // No new commits. Still enforce the cap in case prior runs overflowed.
             result.evicted = enforceProjectCap(db, projectPath, options.maxCommits);
             log(
-                `[git-commits] no new commits for ${projectPath} (sinceMs=${sinceMs} latestIndexed=${latestIndexed ?? "none"} evicted=${result.evicted})`,
+                `[git-commits] no new commits for ${projectPath} (sinceMs=${sinceMs} latestIndexed=${latestIndexed?.slice(0, 7) ?? "none"} evicted=${result.evicted})`,
             );
             return result;
         }
 
         log(
-            `[git-commits] read ${commits.length} commits for ${projectPath} (sinceMs=${sinceMs} latestIndexed=${latestIndexed ?? "none"})`,
+            `[git-commits] read ${commits.length} commits for ${projectPath} (sinceMs=${sinceMs} latestIndexed=${latestIndexed?.slice(0, 7) ?? "none"})`,
         );
 
         const upsert = upsertCommits(db, projectPath, commits);
@@ -195,7 +190,7 @@ export async function embedUnembeddedCommits(db: Database, projectPath: string):
                         saveCommitEmbedding(db, row.sha, embedding, result.modelId);
                         embeddedThisBatch += 1;
                     }
-                })();
+                }).immediate();
                 enqueueShadowEmbeddingItems(
                     projectPath,
                     "commit",

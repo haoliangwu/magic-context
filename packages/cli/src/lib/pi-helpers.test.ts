@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { writeTestExecutable } from "@magic-context/core/shared/test-fake-executable";
 import {
     getAvailableModels,
     getPiCommandInvocation,
@@ -10,12 +9,10 @@ import {
 } from "./pi-helpers";
 
 const originalComSpec = process.env.ComSpec;
-const tempDirs: string[] = [];
 
 afterEach(() => {
     if (originalComSpec === undefined) delete process.env.ComSpec;
     else process.env.ComSpec = originalComSpec;
-    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 const HEADER = "provider      model                context  max-out  thinking  images";
@@ -76,16 +73,13 @@ describe("Pi command execution", () => {
     // gates) the default 5s test timeout produced false reds. The subprocesses
     // are trivial shell scripts, so a generous ceiling costs nothing when idle.
     it("routes cmd shims through ComSpec and parses their output", () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-pi-command-"));
-        tempDirs.push(root);
-        const comSpec = join(root, "fake-cmd");
-        writeFileSync(
-            comSpec,
+        // Shared content-addressed stub (see writeTestExecutable); never deleted per test.
+        const comSpec = writeTestExecutable(
+            "fake-cmd",
             `#!/bin/sh\nif [ "$5" = "--version" ]; then\n  printf '0.75.1\\n'\nelse\n  printf '${HEADER}\\nanthropic claude-fable-5 1M 128K yes yes\\n'\nfi\n`,
         );
-        chmodSync(comSpec, 0o755);
         process.env.ComSpec = comSpec;
-        const shim = join(root, "pi.cmd");
+        const shim = join(dirname(comSpec), "pi.cmd");
 
         expect(getPiCommandInvocation(shim, ["--version"])).toEqual({
             command: comSpec,

@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 // readFileSync and writeFileSync are used by the model-cache and (partially) the WAL test.
 import * as os from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { closeDatabase, openDatabase } from "./storage-db";
 
 /**
@@ -22,7 +23,7 @@ describe("storage-db legacy migration", () => {
     let savedXdg: string | undefined;
 
     beforeEach(() => {
-        tmpRoot = mkdtempSync(join(os.tmpdir(), "magic-context-migration-test-"));
+        tmpRoot = createTestTempDirFromPath(join(os.tmpdir(), "magic-context-migration-test-"));
         savedXdg = process.env.XDG_DATA_HOME;
         process.env.XDG_DATA_HOME = tmpRoot;
         // Make sure prior test runs haven't left an in-process DB handle for

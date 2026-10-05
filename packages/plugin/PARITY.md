@@ -1,0 +1,65 @@
+# OpenCode 2 scenario parity
+
+The general adapter contract remains in [the repository parity document](../../PARITY.md).
+This table records real-host scenario adjudications against `@opencode/cli@2.0.5`.
+
+## Native todos
+
+| Difference | Imposed or chosen | Host surface and executable evidence |
+| --- | --- | --- |
+| No native `todowrite` tool or host todo snapshot | Host-imposed | GA 2.0.5's actual provider tool inventory contains `shell`, `subagent`, `execute`, and the registered ctx_* tools, but no todo writer. `tests/todo-synthesis.test.ts` boots the real host, requires ctx_note on the wire, asserts the absence of a todo writer, and verifies the durable todo state remains empty. |
+| No replacement todo application implemented by Magic Context | Chosen | The adapter does not invent a native host tool or persist a fictional host todo snapshot. Synthetic replay and todo-triggered nudges apply only to hosts with a real todo writer. |
+
+Existing host-imposed differences also include [native fold ownership](../../PARITY.md#2-fold-ownership), unparented hidden completions, and the notification and thinking carriers documented in the repository parity contract. No new v1 behavior is waived.
+
+## Native folds
+
+| Difference | Imposed or chosen | Evidence |
+| --- | --- | --- |
+| Publication does not write a v1 pending marker; the host creates the compaction row | Host-imposed | GA `SessionCompaction.result` returns a summary, not a chosen sequence cut; `Context.session` has no `compact` method. See the [fold-ownership surface](../../PARITY.md#2-fold-ownership). The deferred-marker scenario requires a real published compartment and a completed native row with no additional provider call. |
+| Native auto-compaction is not treated as a conflicting second summarizer | Chosen integration on the imposed hook carrier | The adapter answers the host's compaction hook locally. The conflict scenario explicitly requests a real native fold, requires zero competing model calls, and observes the checkpoint on the subsequent wire request. |
+
+## Known gaps on OpenCode 2
+
+| Gap | Imposed or chosen | Host surface and evidence |
+| --- | --- | --- |
+| A model-echoed `§N§` at the start of an assistant reply is persisted and rendered verbatim | Host-imposed | OpenCode 1.x fires `experimental.text.complete` once per completed assistant text; `src/hooks/magic-context/text-complete.ts` strips the echoed tag there before the host persists the part (the tag is visible while streaming and gone on completion). OpenCode 2 has no equivalent seam: every `session` trigger site in `@opencode/core@2.0.5` and `2.0.11` (`prompt`, `context`, `compaction`, `generate`, `title`, `model.request`, `http.request`, `http.response`, `retry`, `experimental.ws.*`) is on the outbound path, `session.update` cannot rewrite messages, and the TUI renders `part.text.trim()` with no part-level render seam. The wire is unchanged (the next request strips and re-tags the echo exactly as on 1.x), so only the transcript view differs, most visibly on weak models that echo often. Rewriting the provider stream in `http.response` would work but couples us to every provider wire format and is not taken. Resolution: an upstream hook equivalent to `experimental.text.complete`; until then this is a documented OpenCode 2 limitation. |
+| The sidebar is hidden by default | Host-imposed | `sidebar.content` is toggled with `ctrl+x b` on the host. The OpenCode 1 sidebar component itself is what paints there (`src/v2/tui/sidebar-mount.ts`, loaded from `src/tui-compiled/` through the host's `opentui:runtime-module:*` registry); the plain-text projection in `src/v2/tui/index.ts` is reached only on a host that registers no runtime modules, pinned by `src/v2/tui/sidebar-fallback.test.ts`. |
+| Experimental `transform_mode: "rust"` runs the TypeScript transform | Resolved, no longer a gap | Both host lanes now build the same subc module client from one builder (`src/hooks/magic-context/module-client.ts`), so `registerContext` honours the configured mode instead of downgrading it, and the RPC status and sidebar handlers get a real `rustModeModuleClient`. The named limitation `MC-S06` is retired and its entry is removed from `src/shared/user-facing-codes.ts`: that registry is a plain TypeScript literal with no append-only constraint, no persistence and no consumer outside this repository, so a retained entry would only be a code nothing can declare. `packages/e2e-tests/tests/opencode2/rust-mode-limitation.test.ts` flipped to pin the retirement. The remaining OpenCode 2 differences are carried below. |
+| Rust mode's fold boundary is a record, not a host compaction row | Host-imposed | On OpenCode 1 the module's materialized boundary becomes a real compaction row, and the host is then what trims the array it hands the plugin on the next turn. OpenCode 2 exposes no way to write such a row (`src/v2/fold/markers.ts` is inert for that reason), so `src/v2/fold/boundary.ts` records the boundary in the existing `session_meta` marker columns and the adapter applies the trim itself before the array crosses into the module. The rule that picks the boundary is OpenCode 1's rule — the nearest user message at or before the module's baseline end — and OpenCode 1's wire encoder already drops its own injected summary row, so the array the module receives is the same array on both hosts. Advance-only and compare-and-swap behavior is the shared caller's, unchanged. Pinned by `src/v2/fold/boundary.test.ts`. |
+| Hidden-child cleanup needs a service registration | Resolved, no longer a gap | OpenCode 2.0.22 exposes `session.remove` to plugins. Magic Context requires it and `session.compact`, creates fresh parented children, and removes them on completion independently of service registration. Legacy records are drained through the native API on upgrade; `MC-H02` and offline doctor cleanup are retired. Proven by `packages/e2e-tests/tests/opencode2/hidden-child-native-remove.test.ts` and `session-api-cutover.test.ts`. |
+| `/ctx-status` opens the plain-text dialog instead of the status view | Resolved, no longer a gap | The OpenCode 1 status dialog component paints on the host's own dialog surface (`context.ui.dialog.show`) via `src/v2/tui/status-dialog-mount.ts`, loaded from `src/tui-compiled/dialogs/status-dialog.tsx` through the same runtime registry as the sidebar. `statusText` in `src/v2/tui/index.ts` remains only for a host that registers no runtime modules or publishes no component dialog surface, pinned by `src/v2/tui/status-dialog-fallback.test.ts`; the painted component is proven on the real host by `packages/e2e-tests/tests/opencode2/status-dialog.test.ts`. |
+
+## Commands
+
+| Difference | Imposed or chosen | Host surface and executable evidence |
+| --- | --- | --- |
+| The six `/ctx-*` commands are registered with the host, not only with the terminal UI | Resolved, no longer a gap | `@opencode/plugin@2.0.5` and `@2.0.11` `dist/promise/command.d.ts` declare `CommandDomain.transform` with an editor whose `add` takes `{ name, description?, execute(input: CommandInvocation) }`; `dist/promise/adapter.js:213-222` maps it onto `host.command.transform` and wraps `execute` so the host calls the plugin back. `@opencode/core` `src/command.ts` keeps the definitions in a location-scoped map, `list()` returns `{name, description}` and `execute({name, invocation})` runs the plugin's callback; `src/session/command.ts` builds that invocation from a session and `src/session.ts` exposes it as `Session.command`. `@opencode/protocol@2.0.5` `dist/groups/command.js` routes `GET /api/command` and `dist/groups/session.js:295-310` routes `POST /api/session/:sessionID/command`, so both reach every client. `src/v2/hooks/commands.ts` registers there and runs the same in-process RPC handlers the terminal UI calls; proven on the real host with no terminal UI by `packages/e2e-tests/tests/opencode2/commands-s2-host-registration.test.ts`. |
+| A command's RESULT TEXT still reaches only a connected terminal UI | Host-imposed | `CommandDefinition.execute` returns `Promise<void>` and the `session.command` route answers `NoContent`, so the host gives a command no way to return text to its caller. The only other way to put text in front of a non-terminal client would be `session.synthetic`, which is conversation input to the model rather than a status report, and OpenCode 2 has no v1-style ignored-message carrier (see the ignored-notice row below). The WORK runs on every client; a status report is drawn only where a Magic Context terminal UI is connected. A thrown command error does reach the caller, as `Command.ExecutionError`, and argument-validation failures use it. |
+| `/ctx-recomp` asks for confirmation only on a terminal UI | Chosen integration on the imposed carrier | Confirmation needs a dialog surface, which only the terminal UI has. With one connected the command pushes the confirmation dialog; without one it starts the rebuild directly, because the client already expressed the intent by invoking the command and there is nowhere to ask. |
+
+## Dreamer tasks
+
+| Difference | Imposed or chosen | Host surface and evidence |
+| --- | --- | --- |
+| Seven Dreamer tasks are unavailable | Host-imposed, named per task | `map-memories`, `verify`, `verify-broad`, `curate`, `retrospective`, `maintain-docs` and `refresh-primers` need a tool loop between model turns; the OpenCode 2 hidden-completion carrier advertises `tools: false` and strips hidden request tools. Each refusal now names the task, the code `MC-D08` and what the tool loop is for, in `/ctx-dream` output and in `/ctx-status` (`src/features/magic-context/dreamer/task-registry.ts`). Permission ownership for a tool-carrying hidden child is a separate designed change, not a global `tools: true` switch. |
+| `evaluate-smart-notes`, `review-user-memories` and `promote-primers` run | Resolved, no longer a gap | They were filtered by the same flag but need no tool loop: the first two answer with one self-contained document from no-tool prompts (the compiled check runs in the local capability sandbox, not as model tools) and the third is database work with no model call. They run through the hidden carrier, or directly for the host-only one, with a fail-closed rule that a length-capped answer is rejected before parsing. Proven on the real host by `packages/e2e-tests/tests/opencode2/dreamer-s2-carrier.test.ts`. |
+
+## Other existing host-carrier exclusions
+
+These rows were already declared before this repair; they are not newly waived failing
+assertions from the selected 20-scenario lane.
+
+| Scenario | Imposed or chosen | GA surface |
+| --- | --- | --- |
+| Parented subagent behavior | Host-imposed | GA `Context.session.create` has no parent-link input; hidden work uses unparented roots. The dedicated GA hidden-child test continues to pass. See [hidden completions](../../PARITY.md#3-hidden-completions). |
+| Ignored-notice loop race | Host-imposed | `@opencode/plugin@2.0.5/dist/promise/session.d.ts` exposes `SessionPrompt.delivery` and synthetic delivery, not v1 `noReply`/ignored MessageV2 rows and parentID loop-exit ordering. |
+| V1 signed-thinking store projection | Host-imposed carrier difference | GA stores ordered `session_message` JSON and provider metadata, not v1 message/part rows. The v1-store scenario remains excluded rather than querying a fabricated legacy store. This does not waive signed-thinking preservation. See [host store reader](../../PARITY.md#5-host-store-reader). |
+
+## Static decision calibration
+
+History budget conversion runs inside m0 rendering/HARD materialization, not invalidation. Canonical protected-window tool mass and original-source boundary class mass are calibrated without rewriting stored counts. Fit estimates expose raw components separately; unknown models use the maximum of 2 and the largest static ratio, while family-inherited seeds use their measured class ratios. Raw fallback and LKG require complete observations and a known current-model window. Missing observations can therefore refuse requests previously admitted by the byte proxy. The returned transform array is observable; provider framing and later host rewrites are not.
+
+Tail-hygiene T/U now uses the session-frozen tools/prose ratios for absolute floors, cadence/grace and reminder figures. The active calibration and `hygieneUnitsVersion=2` stamp live under the namespaced `deferred_execute_state.magicContextTokenizerCalibration` JSON object. Legacy watermarks (`last_nudge_undropped` and `last_nudge_level.postReduceGraceBaselineU`) stay raw on defer, convert once at the first authorized bust, and survive restart without a second conversion. `growthThreshold` is derived from calibrated T rather than persisted.
+
+Calibration is static-only (`seed` or `family-fallback`). OpenCode and Rust-hosted paths do not capture request L/P pairs, maintain an EMA, publish learned-candidate provenance or adapt decisions at runtime.

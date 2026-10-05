@@ -48,6 +48,13 @@ const MALFORMED_TAG_PREFIX_REGEX = /^(?:§\d+">§(?:\d+§)?\s*)+/;
 //     (`§42important` → `important`) or a sentence period; whitespace is excluded
 //     so content after a space survives (`§42 files` → ` files`).
 const DANGLING_TAG_GLOBAL_REGEX = /\u00a7\d+(?!\.\d)[^\s\u00a7\w.]?/g;
+// Do not change the leading variant without a rebuild gate. OpenCode tool
+// outputs and Pi text parts and tool results are re-prefixed from the host's own
+// text on every pass (nothing saved, no epoch), so any change to what it strips
+// changes the bytes served on the first ordinary pass after deploy and busts the
+// prompt cache from that block on. It does eat a leading section reference
+// (`§5 of the contract` → `of the contract`); fixing that is cosmetic and only
+// safe on a pass that is already rebuilding.
 const DANGLING_TAG_PREFIX_REGEX = /^(?:\u00a7\d+(?!\.\d)[^\s\u00a7\w.]?\s*)+/;
 
 /** Well-formed `§N§` pairs anywhere (persistence cargo-cult cleanup). */

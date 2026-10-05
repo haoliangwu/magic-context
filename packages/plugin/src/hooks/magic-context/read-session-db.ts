@@ -1,3 +1,4 @@
+import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     assertOpenCodeStoreGeneration,
@@ -42,9 +43,13 @@ export interface LatestPersistedMessage {
     error?: unknown;
 }
 
-/** Whether the resolved OpenCode session database currently exists. */
+/**
+ * Whether this process may read the OpenCode session database and it exists.
+ * A Pi or OMP process never reads OpenCode's store (see harnessOwnsOpenCodeStore),
+ * so it reports the store as absent there, exactly as on a Pi-only install.
+ */
 export function openCodeDbExists(): boolean {
-    return openCodeDbPathExists(resolveOpenCodeDbPath());
+    return harnessOwnsOpenCodeStore() && openCodeDbPathExists(resolveOpenCodeDbPath());
 }
 
 let cachedReadOnlyDb: { path: string; db: Database } | null = null;
@@ -64,6 +69,11 @@ function closeCachedReadOnlyDb(): void {
 }
 
 function getReadOnlySessionDb(): Database {
+    if (!harnessOwnsOpenCodeStore()) {
+        throw new Error(
+            "OpenCode session database is not readable from a Pi-compatible process; its history lives in Pi sessions",
+        );
+    }
     const resolution = resolveOpenCodeDbPath();
     const dbPath = resolution.path;
     if (!openCodeDbPathExists(resolution)) {
@@ -218,8 +228,25 @@ export function shouldHoldIgnoredNotificationFromMessages(
 }
 
 function trackedMessages(session: TrackedSession): TurnStateMessage[] {
-    return [...session.messages.values()]
-        .sort((left, right) => left.timeCreated - right.timeCreated)
+    let assistant: TrackedMessage | undefined;
+    let user: TrackedMessage | undefined;
+    for (const message of session.messages.values()) {
+        if (
+            message.role === "assistant" &&
+            (!assistant || message.timeCreated >= assistant.timeCreated)
+        )
+            assistant = message;
+        if (
+            message.role === "user" &&
+            (!user || message.timeCreated >= user.timeCreated) &&
+            (message.parts.size === 0 || ![...message.parts.values()].every(isMachineGeneratedPart))
+        )
+            user = message;
+    }
+    // Retain historical flags so removal of the newest row reveals the same
+    // predecessor, but construct only the two rows the turn predicates inspect.
+    return [user, assistant]
+        .filter((message): message is TrackedMessage => !!message)
         .map((message) => ({
             info: {
                 id: message.id,
@@ -229,6 +256,19 @@ function trackedMessages(session: TrackedSession): TurnStateMessage[] {
             },
             parts: [...message.parts.values()],
         }));
+}
+
+function turnStatePart(part: Record<string, unknown>): unknown {
+    const marker = asRecord(asRecord(part.metadata)?.marker);
+    return {
+        type: part.type === "tool" ? "tool" : undefined,
+        providerExecuted: part.providerExecuted === true,
+        synthetic: truthyStoredFlag(part.synthetic),
+        ignored: truthyStoredFlag(part.ignored),
+        ...(marker?.kind !== null && marker?.kind !== undefined
+            ? { metadata: { marker: { kind: true } } }
+            : {}),
+    };
 }
 
 function pendingMessageParts(sessionId: string, messageId: string): Map<string, unknown> {
@@ -252,7 +292,7 @@ export function observeOpenCodeTurnEvent(type: string, properties: unknown): voi
         }
         const tracked = trackedSessions.get(part.sessionID)?.messages.get(part.messageID);
         if (tracked) {
-            tracked.parts.set(part.id, part);
+            tracked.parts.set(part.id, turnStatePart(part));
             return;
         }
         let byMessage = pendingParts.get(part.sessionID);
@@ -265,7 +305,7 @@ export function observeOpenCodeTurnEvent(type: string, properties: unknown): voi
             parts = new Map();
             byMessage.set(part.messageID, parts);
         }
-        parts.set(part.id, part);
+        parts.set(part.id, turnStatePart(part));
         return;
     }
 
@@ -332,6 +372,7 @@ function resolvedDbIsAvailable(): {
     available: boolean;
 } {
     const resolution = resolveOpenCodeDbPath();
+    if (!harnessOwnsOpenCodeStore()) return { resolution, available: false };
     const available = openCodeDbPathExists(resolution);
     if (available) clearOpenCodeDbReadFailure(resolution.path);
     else logProbeFailureOnce(resolution, "opencode_db_missing");
@@ -352,6 +393,16 @@ export function assistantAwaitingTools(_deps: unknown, sessionId: string): boole
 }
 
 export const __openCodeTurnStateTest = {
+    retainedPartBytes(): number {
+        let bytes = 0;
+        for (const session of trackedSessions.values())
+            for (const message of session.messages.values())
+                for (const part of message.parts.values()) bytes += JSON.stringify(part).length;
+        for (const session of pendingParts.values())
+            for (const message of session.values())
+                for (const part of message.values()) bytes += JSON.stringify(part).length;
+        return bytes;
+    },
     reset(): void {
         trackedSessions.clear();
         pendingParts.clear();
@@ -566,7 +617,7 @@ export function getMessageTimesFromOpenCodeDb(
     messageIds: readonly string[],
 ): Map<string, number> {
     const result = new Map<string, number>();
-    if (messageIds.length === 0) return result;
+    if (messageIds.length === 0 || !harnessOwnsOpenCodeStore()) return result;
 
     try {
         withReadOnlySessionDb((db) => {
@@ -594,22 +645,63 @@ export function getMessageTimesFromOpenCodeDb(
 export function findLastAssistantModelFromOpenCodeDb(
     sessionId: string,
 ): { providerID: string; modelID: string; agent?: string } | null {
+    if (!harnessOwnsOpenCodeStore()) return null;
+    const resolution = resolveOpenCodeDbPath();
     try {
-        return withReadOnlySessionDb((db) => {
-            const row = db
-                .prepare(
-                    `SELECT json_extract(data, '$.providerID') as providerID,
-                            json_extract(data, '$.modelID') as modelID,
-                            json_extract(data, '$.agent') as agent
-                     FROM message
-                     WHERE session_id = ?
-                       AND json_extract(data, '$.role') = 'assistant'
-                       AND json_extract(data, '$.providerID') IS NOT NULL
-                       AND json_extract(data, '$.modelID') IS NOT NULL
-                     ORDER BY time_created DESC
-                     LIMIT 1`,
-                )
-                .get(sessionId) as (AssistantModelRow & { agent?: string | null }) | null;
+        if (!openCodeDbPathExists(resolution)) {
+            throw new Error(`OpenCode session database is unavailable at ${resolution.path}`);
+        }
+        const db = new Database(resolution.path, { readonly: true });
+        try {
+            const queryV2 = (): (AssistantModelRow & { agent?: string | null }) | null =>
+                db
+                    .prepare(
+                        `SELECT json_extract(data, '$.model.providerID') as providerID,
+                                json_extract(data, '$.model.id') as modelID,
+                                json_extract(data, '$.agent') as agent
+                         FROM session_message
+                         WHERE session_id = ?
+                           AND type = 'assistant'
+                           AND json_extract(data, '$.model.providerID') IS NOT NULL
+                           AND json_extract(data, '$.model.id') IS NOT NULL
+                         ORDER BY seq DESC
+                         LIMIT 1`,
+                    )
+                    .get(sessionId) as (AssistantModelRow & { agent?: string | null }) | null;
+            const queryV1 = (): (AssistantModelRow & { agent?: string | null }) | null =>
+                db
+                    .prepare(
+                        `SELECT json_extract(data, '$.providerID') as providerID,
+                                json_extract(data, '$.modelID') as modelID,
+                                json_extract(data, '$.agent') as agent
+                         FROM message
+                         WHERE session_id = ?
+                           AND json_extract(data, '$.role') = 'assistant'
+                           AND json_extract(data, '$.providerID') IS NOT NULL
+                           AND json_extract(data, '$.modelID') IS NOT NULL
+                         ORDER BY time_created DESC
+                         LIMIT 1`,
+                    )
+                    .get(sessionId) as (AssistantModelRow & { agent?: string | null }) | null;
+
+            // Because OpenCode 1.18 also creates session_message, the table's
+            // presence cannot identify the store generation. Use the shared guard
+            // for both queries; it recognizes migrated v2 stores by session_v2.
+            let row: (AssistantModelRow & { agent?: string | null }) | null = null;
+            try {
+                assertOpenCodeStoreGeneration(db, "v2", resolution.path);
+                row = queryV2();
+            } catch {
+                // If this is v1 or does not match the expected v2 schema, try v1 next.
+            }
+            if (!row) {
+                try {
+                    assertOpenCodeStoreGeneration(db, "v1", resolution.path);
+                    row = queryV1();
+                } catch {
+                    // The v1 guard rejects native v2 schemas, so no fallback applies.
+                }
+            }
             if (!row || typeof row.providerID !== "string" || typeof row.modelID !== "string") {
                 return null;
             }
@@ -620,9 +712,11 @@ export function findLastAssistantModelFromOpenCodeDb(
                 modelID: row.modelID,
                 ...(agent ? { agent } : {}),
             };
-        });
+        } finally {
+            closeQuietly(db);
+        }
     } catch (error) {
-        logProbeFailureOnce(resolveOpenCodeDbPath(), error);
+        logProbeFailureOnce(resolution, error);
         return null;
     }
 }

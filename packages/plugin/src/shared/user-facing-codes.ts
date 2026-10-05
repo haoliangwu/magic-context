@@ -1,11 +1,42 @@
 import type { EmbeddingFailureClass } from "../features/magic-context/memory/embedding-failure";
 import type { PromptFailureClass } from "./model-suggestion-retry";
+import { sanitizeDiagnosticText } from "./redaction";
 
 export const USER_FACING_FAILURES = {
     historian_unavailable: {
         code: "MC-H01",
         sentence: "History compression could not finish this turn.",
         action: "It will retry automatically.",
+    },
+    historian_saved_history_misaligned: {
+        code: "MC-H03",
+        sentence:
+            "History compression is paused because this session's saved summaries no longer line up with its messages.",
+        action: "Run /ctx-recomp to rebuild them.",
+    },
+    history_boundary_unresolved: {
+        code: "MC-H04",
+        sentence:
+            "This request was not sent: the message that marks where this session's history summary ends is missing from the OpenCode store, and without it the request is larger than the model's context window.",
+        action: "Run /ctx-recomp to rebuild the history summary.",
+    },
+    history_over_window_unmanaged: {
+        code: "MC-H06",
+        sentence:
+            "This request was not sent: this session's history is larger than the model's context window, and Magic Context does not have a summary of it yet to send in its place.",
+        action: "Send your message again once history compression has caught up, or switch to a model with a larger context window.",
+    },
+    frozen_history_over_window: {
+        code: "MC-H07",
+        sentence:
+            "This request was not sent: the conversation is larger than the context window the provider reported, and the compressed history Magic Context has ready does not fit either.",
+        action: "Run /ctx-flush to compress it now, then send your message again.",
+    },
+    historian_window_too_small: {
+        code: "MC-H05",
+        sentence:
+            "History compression is paused because the history model's context window is too small for its instructions.",
+        action: "Set historian.model in magic-context.jsonc to a model with a larger context window.",
     },
     recomp_unavailable: {
         code: "MC-R01",
@@ -21,6 +52,21 @@ export const USER_FACING_FAILURES = {
         code: "MC-D02",
         sentence: "Memory maintenance could not reach its model.",
         action: "Check the model connection, then run /ctx-dream again.",
+    },
+    dream_local_refusal: {
+        code: "MC-D12",
+        sentence: "Memory maintenance was refused before reaching the model.",
+        action: "Check the hidden-request diagnostic in the Magic Context log before retrying.",
+    },
+    dream_step_limit: {
+        code: "MC-D10",
+        sentence: "Memory maintenance stopped at its hidden agent step limit.",
+        action: "This task needs less work per run; changing the model connection will not help.",
+    },
+    dream_token_budget: {
+        code: "MC-D11",
+        sentence: "Memory maintenance reached its prompt-token budget.",
+        action: "The unfinished items will be retried on the next run.",
     },
     dream_empty_completion: {
         code: "MC-D03",
@@ -46,6 +92,17 @@ export const USER_FACING_FAILURES = {
         code: "MC-D07",
         sentence: "Memory maintenance could not finish.",
         action: "Run /ctx-dream again.",
+    },
+    dreamer_tick_blocked: {
+        code: "MC-D09",
+        sentence:
+            "Background maintenance is not running: its last pass stopped before it reached the scheduled tasks.",
+        action: "It is retried automatically; if it keeps happening, check the Magic Context log for the stage that stopped and run `npx @cortexkit/magic-context doctor`.",
+    },
+    dream_task_needs_tool_loop: {
+        code: "MC-D08",
+        sentence: "Some memory maintenance tasks need a tool loop this host does not provide.",
+        action: "The remaining tasks still run; the listed ones are skipped on this host.",
     },
     embedding_substitution_rejected: {
         code: "MC-E01",
@@ -117,10 +174,16 @@ export const USER_FACING_FAILURES = {
         sentence: "The last context update did not finish.",
         action: "Send another message to retry.",
     },
+    transform_pass_degraded: {
+        code: "MC-S06",
+        sentence:
+            "This request was not sent: Magic Context could not finish preparing it, and without that preparation it could be far larger than the previous request.",
+        action: "Send your message again.",
+    },
     configuration_warning: {
         code: "MC-S03",
         sentence: "Some configuration settings could not be applied.",
-        action: "Fix the configuration warning shown in /ctx-status diagnostics, then restart.",
+        action: "Fix the configuration warning shown in /ctx-status, then restart.",
     },
     status_log_unavailable: {
         code: "MC-S04",
@@ -157,11 +220,6 @@ export const USER_FACING_FAILURES = {
         sentence: "Partial history compression is not available in the current mode.",
         action: "Run /ctx-recomp without a range.",
     },
-    session_upgrade_unavailable: {
-        code: "MC-C07",
-        sentence: "Session upgrade is not available in the current mode.",
-        action: "Run /ctx-recomp instead.",
-    },
     smart_note_conditions_unavailable: {
         code: "MC-C08",
         sentence: "Conditional notes are not available in the current mode.",
@@ -172,10 +230,37 @@ export const USER_FACING_FAILURES = {
         sentence: "History compression is paused while the engine syncs.",
         action: "Retry in a moment.",
     },
+    history_compression_needs_message: {
+        code: "MC-C12",
+        sentence: "History compression has not seen this session since Magic Context reconnected.",
+        action: "Send a message in this session first, then run /ctx-wrapup again.",
+    },
     context_service_unavailable: {
         code: "MC-C10",
         sentence: "Magic Context is temporarily unavailable.",
         action: "Retry in a moment.",
+    },
+    context_db_missing: {
+        code: "MC-C15",
+        sentence: "Magic Context has no context.db.",
+        action: "Run `npx @cortexkit/magic-context doctor store init`, then restart ck-mc.",
+    },
+    single_store_migration_required: {
+        code: "MC-C14",
+        sentence: "Magic Context's Rust mode needs a one-time migration of its store.",
+        action: "Quit OpenCode and every ck-mc process, then run `magic-context doctor single-store migrate`.",
+    },
+    store_ahead_of_binary: {
+        code: "MC-C13",
+        sentence:
+            "Magic Context refused to start: its store (store.db) was migrated by a newer ck-mc build than the one running.",
+        action: "Update ck-mc, or roll back by restoring ck-mc together with context.db and store.db from the same backup.",
+    },
+    compaction_marker_missing: {
+        code: "MC-C11",
+        sentence:
+            "The history boundary marker is missing from the OpenCode store, so requests carry the full session.",
+        action: "It is retried on every message; if this persists, run `/ctx-flush`.",
     },
     memory_mirror_stalled: {
         code: "MC-M01",
@@ -186,6 +271,11 @@ export const USER_FACING_FAILURES = {
         code: "MC-M02",
         sentence: "Memory authority is inconsistent between the host and module.",
         action: "Run `ck doctor drain-authority` before changing Rust mode.",
+    },
+    dreamer_task_failing: {
+        code: "MC-S05",
+        sentence: "A background maintenance task keeps failing on its schedule.",
+        action: "Check the Magic Context log for the failing task and its error.",
     },
 } as const;
 
@@ -213,7 +303,6 @@ export type CapabilityRefusal =
     | "note_access"
     | "context_cleanup"
     | "partial_history"
-    | "session_upgrade"
     | "smart_note_condition"
     | "history_compression"
     | "context_service";
@@ -225,7 +314,6 @@ const CAPABILITY_FAILURES: Record<CapabilityRefusal, UserFacingFailureKey> = {
     note_access: "note_access_unavailable",
     context_cleanup: "context_cleanup_paused",
     partial_history: "partial_history_unavailable",
-    session_upgrade: "session_upgrade_unavailable",
     smart_note_condition: "smart_note_conditions_unavailable",
     history_compression: "history_compression_paused",
     context_service: "context_service_unavailable",
@@ -242,6 +330,9 @@ export function capabilityRefusalCode(capability: CapabilityRefusal): string {
 const DREAM_FAILURE_KEYS = {
     provider_timeout: "dream_provider_timeout",
     provider_error: "dream_provider_error",
+    local_refusal: "dream_local_refusal",
+    step_limit: "dream_step_limit",
+    token_budget: "dream_token_budget",
     empty_completion: "dream_empty_completion",
     no_models: "dream_no_models",
     child_aborted: "dream_child_aborted",
@@ -266,8 +357,12 @@ const EMBEDDING_FAILURE_KEYS = {
 export function renderDreamFailure(
     failureClass: PromptFailureClass,
     style: UserFacingTextStyle = "markdown",
+    refusalReason?: string | null,
 ): string {
-    return renderUserFacingFailure(DREAM_FAILURE_KEYS[failureClass], style);
+    const rendered = renderUserFacingFailure(DREAM_FAILURE_KEYS[failureClass], style);
+    return failureClass === "local_refusal" && refusalReason
+        ? `${rendered} Reason: ${sanitizeDiagnosticText(refusalReason).slice(0, 500)}`
+        : rendered;
 }
 
 export function dreamFailureCode(failureClass: PromptFailureClass): string {

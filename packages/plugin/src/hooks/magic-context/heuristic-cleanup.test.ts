@@ -8,6 +8,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { Database } from "../../shared/sqlite";
 import { applyHeuristicCleanup } from "./heuristic-cleanup";
+import { estimateTokens } from "./read-session-formatting";
 import type { MessageLike, TagTarget } from "./tag-messages";
 
 function makeMemoryDatabase(): Database {
@@ -75,6 +76,17 @@ function makeMemoryDatabase(): Database {
 function makeTarget(message: { parts: unknown[] }): TagTarget {
     return {
         message: message as TagTarget["message"],
+        measureReclaim: (skeleton) => {
+            const part = message.parts.find((p: any) => p.type === "tool") as
+                | { state?: { output?: string } }
+                | undefined;
+            return {
+                beforeTools: estimateTokens(part?.state?.output ?? ""),
+                afterTools: skeleton ? estimateTokens("[dropped]") : 0,
+                beforeProse: 0,
+                afterProse: 0,
+            };
+        },
         setContent: (content: string) => {
             const textPart = message.parts.find((p: any) => p.type === "text") as any;
             if (!textPart) return false;
@@ -192,14 +204,14 @@ describe("applyHeuristicCleanup", () => {
                             {
                                 type: "tool",
                                 tool: "bash",
-                                state: { output: "x".repeat(4000), status: "completed" },
+                                state: { output: "word ".repeat(999), status: "completed" },
                             },
                         ],
                     }),
                 );
             }
 
-            //#when 10 tags × 4000 bytes × 0.25 = 10000 tokens of tail; usage 10000,
+            //#when ten measured 1000-token outputs make 10000 tokens of tail; usage 10000,
             // ceiling 6000 → target = 0 + 0.30×6000 = 1800 → reclaim ≈ 8200 tokens.
             const result = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
                 protectedTagNumbers: new Set([9, 10]),
@@ -228,11 +240,11 @@ describe("applyHeuristicCleanup", () => {
         });
 
         it("#then clears the sample latch after abort so the retry drops more", () => {
-            for (let i = 1; i <= 10; i++) {
+            for (let i = 1; i <= 20; i++) {
                 insertTag(db, SESSION, `abort-call-${i}`, "tool", 4000, i, 0, "bash");
             }
             const targets = new Map<number, TagTarget>();
-            for (let i = 1; i <= 10; i++) {
+            for (let i = 1; i <= 20; i++) {
                 targets.set(
                     i,
                     makeTarget({
@@ -240,13 +252,13 @@ describe("applyHeuristicCleanup", () => {
                             {
                                 type: "tool",
                                 tool: "bash",
-                                state: { output: "x".repeat(4000), status: "completed" },
+                                state: { output: "word ".repeat(999), status: "completed" },
                             },
                         ],
                     }),
                 );
             }
-            const emergency = { currentTotalInputTokens: 10_000, ceilingTokens: 10_000 };
+            const emergency = { currentTotalInputTokens: 20_000, ceilingTokens: 20_000 };
 
             const first = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
                 protectedTagNumbers: new Set(),
@@ -254,7 +266,7 @@ describe("applyHeuristicCleanup", () => {
                 emergency,
             });
             expect(first.emergencyDroppedTools).toBeGreaterThan(0);
-            expect(getEmergencyInputSample(db, SESSION)).toBe(10_000);
+            expect(getEmergencyInputSample(db, SESSION)).toBe(20_000);
 
             const latched = applyHeuristicCleanup(SESSION, db, targets, new Map(), {
                 protectedTagNumbers: new Set(),

@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import type { EmbeddingConfig } from "../../config/schema/magic-context";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./memory/embedding-provider";
 import {
     _resetProjectEmbeddingRegistryForTests,
@@ -58,7 +58,7 @@ describe("recordShadowMeasurement", () => {
     const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
     function useTempDb() {
-        const dir = mkdtempSync(join(tmpdir(), "search-measurement-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "search-measurement-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
         return openDatabase();

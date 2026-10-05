@@ -82,6 +82,46 @@ describe("auto-search-runner", () => {
         }
     });
 
+    test("caps project preparation before OpenCode search and drops its late continuation", async () => {
+        const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
+        let release: (() => void) | undefined;
+        const preparation = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const messages = [makeUserMsg("u1", "What's the current status ?")];
+        const before = JSON.stringify(messages);
+        let watchdog: ReturnType<typeof setTimeout> | undefined;
+        const pass = runAutoSearchHint({
+            sessionId: "s1",
+            db,
+            messages,
+            options: {
+                ...baseOptions,
+                directory: "/copied-project",
+                ensureProjectRegistered: () => preparation,
+            },
+        });
+        try {
+            const outcome = await Promise.race([
+                pass,
+                new Promise<string>((resolve) => {
+                    watchdog = setTimeout(() => resolve("watchdog"), 3500);
+                }),
+            ]);
+            expect(outcome).toEqual({ ok: false, kind: "timeout" });
+            expect(JSON.stringify(messages)).toBe(before);
+            release?.();
+            await pass;
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            expect(spy).toHaveBeenCalledTimes(0);
+        } finally {
+            release?.();
+            await pass;
+            if (watchdog) clearTimeout(watchdog);
+            spy.mockRestore();
+        }
+    }, 6000);
+
     test("excludes Primers from transform-time auto-search hints", async () => {
         const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(async () => []);
         try {

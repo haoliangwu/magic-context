@@ -1,9 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { CANONICAL_DREAM_TASKS } from "../features/magic-context/dreamer/task-registry";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 import { loadPluginConfig } from "./index";
 import { stripUnsafeProjectConfigFields } from "./project-security";
 import {
@@ -339,8 +339,8 @@ function nestedMuralModelPaths(): string[] {
 }
 
 function loadWithUserAndProjectConfig(userConfigText: string, projectConfigText: string) {
-    const xdg = mkdtempSync(join(tmpdir(), "mc-hostile-user-"));
-    const projectDir = mkdtempSync(join(tmpdir(), "mc-hostile-proj-"));
+    const xdg = createTestTempDirFromPath(join(tmpdir(), "mc-hostile-user-"));
+    const projectDir = createTestTempDirFromPath(join(tmpdir(), "mc-hostile-proj-"));
     const configDir = join(xdg, "cortexkit");
     mkdirSync(configDir, { recursive: true });
     mkdirSync(join(projectDir, ".cortexkit"), { recursive: true });

@@ -33,9 +33,9 @@ import {
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
+import { describeHistorianPromptTrim, fitRecompHistorianPrompt } from "./historian-prompt-fit";
 import { clearInjectionCache } from "./inject-compartments";
 import { readSessionChunk } from "./read-session-chunk";
-import { buildReferenceBlocks } from "./reference-retrieval";
 import { sendStatusNotification } from "./send-session-notification";
 
 export interface PartialRecompRange {
@@ -117,6 +117,8 @@ function compartmentToInput(c: Compartment, newSequence: number): CompartmentInp
         endMessage: c.endMessage,
         startMessageId: c.startMessageId,
         endMessageId: c.endMessageId,
+        startBlockIndex: c.startBlockIndex,
+        endBlockIndex: c.endBlockIndex,
         title: c.title,
         content: c.content,
         // v2: preserve paraphrase tiers + scoring on prior/tail compartments that
@@ -199,8 +201,9 @@ export async function executePartialRecompInternal(
         const stagedFacts: { category: string; content: string }[] = [];
 
         // ── Resolve project memories for historian fact dedup context ─────
-        // Intentional: session.get failure is non-fatal — we fall back to deps.directory
-        const parentSessionResponse = await client.session
+        // Intentional: session.get failure is non-fatal — we fall back to deps.directory.
+        // OpenCode 2 hands the runner no SDK client, so the lookup is skipped there.
+        const parentSessionResponse = await client?.session
             .get({ path: { id: sessionId } })
             .catch(() => null);
         const parentSession = normalizeSDKResponse(
@@ -337,9 +340,10 @@ export async function executePartialRecompInternal(
             // v2: recompute raw chunk embeddings for the rebuilt compartments.
             // Partial recomp deletes + reinserts compartments, so their chunk
             // embeddings must be regenerated or the rebuilt rows vanish from
-            // ctx_search semantic results. Gated on memory-enabled, distinct from
-            // fact promotion (which recomp skips). Fire-and-forget, best-effort.
-            if (deps.memoryEnabled !== false) {
+            // ctx_search semantic results. Gated only by the embedding provider
+            // (not `memory.enabled`), distinct from fact promotion (which recomp
+            // skips). Fire-and-forget, best-effort.
+            {
                 const projectIdentity = resolveProjectIdentity(sessionDirectory);
                 const liveCompartments = getCompartments(db, sessionId);
                 const chunksToEmbed = liveCompartments.map((c) => ({
@@ -388,11 +392,35 @@ export async function executePartialRecompInternal(
 
         // ── Main loop: rebuild snapStart..snapEnd in historian chunks ──────
         while (offset <= snapEnd) {
+            // Size the chunk to the producer window after the fixed prompt parts;
+            // the reference blocks below come from the same fit.
+            const promptFit = fitRecompHistorianPrompt({
+                model: deps.model,
+                fallbackModelId: deps.fallbackModelId,
+                language: deps.language,
+                requestedChunkTokens: currentTokenBudget,
+                sessionId,
+                chunkStart: offset,
+                lastOrdinal: snapEnd,
+                sessionCompartments: candidateCompartments,
+            });
+            if (!promptFit.ok) {
+                log(
+                    `[magic-context] partial recomp failed session=${sessionId} code=${userFacingFailureCode("historian_window_too_small")} reason="${promptFit.reason}"`,
+                );
+                return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("historian_window_too_small")}`;
+            }
+            if (promptFit.trimmed || promptFit.chunkTokens < currentTokenBudget) {
+                log(
+                    `[magic-context] partial recomp prompt fit session=${sessionId}: ${describeHistorianPromptTrim(promptFit)} requestedChunkTokens=${currentTokenBudget}`,
+                );
+            }
             const chunk = readSessionChunk(
                 sessionId,
-                currentTokenBudget,
+                promptFit.chunkTokens,
                 offset,
                 snapEnd + 1, // exclusive upper bound — readSessionChunk stops before this ordinal
+                { expandTools: deps.historianExpandTools },
             );
             if (!chunk.text || chunk.messageCount === 0 || chunk.endIndex < offset) {
                 return `## Magic Recomp — Failed\n\nRecomp stopped because raw history ${offset}-${snapEnd} could not be turned into a valid historian chunk. Partial recomp preserved original state (staging kept for retry).`;
@@ -406,18 +434,13 @@ export async function executePartialRecompInternal(
                 return `## Magic Recomp — Failed\n\n${renderUserFacingFailure("recomp_unavailable")}`;
             }
 
-            // v2 bounded reference model: 4 rotating seeds + last-6 recency
+            // Bounded calibration: 3 seeds + 3 diverse older + 4 recent examples.
+            // Recent scores are hidden to prevent anchoring in one-compartment runs
             // (the compartments rebuilt so far in this partial-recomp run provide
             // continuity). Structural rebuild → no <project-memory> dedup block.
-            const references = buildReferenceBlocks({
-                sessionId,
-                chunkStart: chunk.startIndex,
-                sessionCompartments: candidateCompartments,
-            });
-
             const prompt = buildCompartmentAgentPrompt({
-                seedExamples: references.seedExamples,
-                sessionReferences: references.sessionReferences,
+                seedExamples: promptFit.seedExamples,
+                sessionReferences: promptFit.sessionReferences,
                 projectMemory: "",
                 inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunk.text}`,
                 // Partial recomp is structural-only — never emit facts (locked
@@ -435,6 +458,7 @@ export async function executePartialRecompInternal(
 
             const validatedPass = await runValidatedHistorianPass({
                 client,
+                hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
                 db,
                 parentSessionId: sessionId,
                 sessionDirectory,
@@ -466,13 +490,14 @@ export async function executePartialRecompInternal(
                 },
             });
             if (!validatedPass.ok) {
-                const reducedBudget = getReducedRecompTokenBudget(currentTokenBudget);
+                const reducedBudget = getReducedRecompTokenBudget(promptFit.chunkTokens);
                 if (reducedBudget !== null) {
                     const smallerChunk = readSessionChunk(
                         sessionId,
                         reducedBudget,
                         offset,
                         snapEnd + 1,
+                        { expandTools: deps.historianExpandTools },
                     );
                     if (smallerChunk.messageCount > 0 && smallerChunk.endIndex < chunk.endIndex) {
                         await sendStatusNotification(

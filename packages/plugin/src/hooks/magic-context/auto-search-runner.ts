@@ -35,52 +35,12 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { log, sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { AUTO_SEARCH_TIMEOUT_MS, withAutoSearchDeadline } from "./auto-search-deadline";
 import { buildAutoSearchHint } from "./auto-search-hint";
+import type { CavemanWordRules } from "./caveman";
 import { hasMeaningfulUserText } from "./read-session-formatting";
 import { appendReminderToUserMessageById } from "./transform-message-helpers";
 import type { MessageLike } from "./transform-operations";
-
-/** Hard cap on how long the transform hot path waits for unified search to finish.
- *  If the configured embedding provider is slow or saturated, we abandon the hint for this
- *  turn and let the next user turn try again. Transform must never hang on auto-search. */
-const AUTO_SEARCH_TIMEOUT_MS = 3_000;
-
-/** Race `unifiedSearch` against a timer. Resolves with results on success, or `null` on timeout.
- *  On timeout, the AbortController fires so the underlying HTTP embed request is cancelled —
- *  this prevents dangling fetches from piling up at the provider (e.g. LMStudio saturation). */
-async function unifiedSearchWithTimeout(
-    db: Database,
-    sessionId: string,
-    projectPath: string,
-    prompt: string,
-    options: UnifiedSearchOptions,
-    timeoutMs: number,
-): Promise<UnifiedSearchResult[] | null> {
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeoutPromise = new Promise<null>((resolve) => {
-        timer = setTimeout(() => {
-            controller.abort();
-            resolve(null);
-        }, timeoutMs);
-    });
-    try {
-        return await Promise.race([
-            unifiedSearch(db, sessionId, projectPath, prompt, {
-                ...options,
-                signal: controller.signal,
-                // Plugin-internal auto-surfacing: do NOT count these as real
-                // retrievals. The agent may never actually consume the hint,
-                // and counting inflates retrieval_count-based memory
-                // promotion decisions with false-positive signal.
-                countRetrievals: false,
-            }),
-            timeoutPromise,
-        ]);
-    } finally {
-        if (timer !== undefined) clearTimeout(timer);
-    }
-}
 
 export type AutoSearchOutcome =
     | { ok: true }
@@ -101,6 +61,8 @@ export interface AutoSearchRunnerOptions {
     /** Memory ids already rendered in the injected <session-history> block —
      *  skip fragments that just duplicate visible memories. */
     visibleMemoryIds?: Set<number>;
+    /** Caveman word rules for hint fragments, from the user-level `language` setting. */
+    wordRules?: CavemanWordRules;
 }
 
 function collectUserPromptParts(message: MessageLike): string {
@@ -246,6 +208,7 @@ export async function runAutoSearchHint(args: {
     messages: MessageLike[];
     options: AutoSearchRunnerOptions;
 }): Promise<AutoSearchOutcome> {
+    const startedAt = performance.now();
     const { sessionId, db, messages, options } = args;
     if (!options.enabled) return AUTO_SEARCH_OK;
 
@@ -306,47 +269,51 @@ export async function runAutoSearchHint(args: {
 
     let results: UnifiedSearchResult[] | null;
     try {
-        if (options.directory) {
-            await options.ensureProjectRegistered?.(options.directory, db);
-        }
-        const embeddingSnapshot = getProjectEmbeddingSnapshot(options.projectPath);
-        const memoryEnabled = embeddingSnapshot?.features.memoryEnabled ?? options.memoryEnabled;
-        const embeddingEnabled = embeddingSnapshot
-            ? embeddingSnapshot.enabled || embeddingSnapshot.gitCommitEnabled
-            : options.embeddingEnabled;
-        const gitCommitsEnabled =
-            embeddingSnapshot?.gitCommitEnabled ?? options.gitCommitsEnabled ?? false;
-        const searchOptions: UnifiedSearchOptions = {
-            limit: 10,
-            memoryEnabled,
-            embeddingEnabled,
-            gitCommitsEnabled,
-            embedQuery: async (text, signal) => {
-                const result = await embedTextForProject(
-                    options.projectPath,
-                    text,
-                    signal,
-                    "query",
-                );
-                return result;
-            },
-            isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
-            // Hard-filter memories already rendered in <session-history>.
-            // unifiedSearch applies this during memory merging so ranking
-            // can't be distorted by already-visible hits.
-            visibleMemoryIds: options.visibleMemoryIds ?? null,
-            // Primers v1 are cache-neutral: they surface via explicit ctx_search
-            // and dashboard only, never transform-time auto-search prompt hints.
-            sources: ["memory", "message", "git_commit"],
-        };
-        results = await unifiedSearchWithTimeout(
-            db,
-            sessionId,
-            options.projectPath,
-            rawPrompt,
-            searchOptions,
-            AUTO_SEARCH_TIMEOUT_MS,
-        );
+        results = await withAutoSearchDeadline(async (signal, checkDeadline) => {
+            if (options.directory) {
+                await options.ensureProjectRegistered?.(options.directory, db);
+            }
+            if (checkDeadline()) return null;
+            const embeddingSnapshot = getProjectEmbeddingSnapshot(options.projectPath);
+            const memoryEnabled =
+                embeddingSnapshot?.features.memoryEnabled ?? options.memoryEnabled;
+            // Use the snapshot's history setting for query embedding, independently
+            // of memory.enabled. Memory and git-commit retrieval have separate gates.
+            const embeddingEnabled = embeddingSnapshot
+                ? embeddingSnapshot.historyEnabled
+                : options.embeddingEnabled;
+            const gitCommitsEnabled =
+                embeddingSnapshot?.gitCommitEnabled ?? options.gitCommitsEnabled ?? false;
+            const searchOptions: UnifiedSearchOptions = {
+                limit: 10,
+                memoryEnabled,
+                embeddingEnabled,
+                gitCommitsEnabled,
+                embedQuery: async (text, signal) => {
+                    const result = await embedTextForProject(
+                        options.projectPath,
+                        text,
+                        signal,
+                        "query",
+                    );
+                    checkDeadline();
+                    return result;
+                },
+                isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
+                // Hard-filter memories already rendered in <session-history>.
+                // unifiedSearch applies this during memory merging so ranking
+                // can't be distorted by already-visible hits.
+                visibleMemoryIds: options.visibleMemoryIds ?? null,
+                // Leave primers out of automatic hints so primer updates cannot rewrite
+                // cached request prefixes. Explicit ctx_search and the dashboard expose them.
+                sources: ["memory", "message", "git_commit"],
+            };
+            return unifiedSearch(db, sessionId, options.projectPath, rawPrompt, {
+                ...searchOptions,
+                signal,
+                countRetrievals: false,
+            });
+        }, startedAt);
     } catch (error) {
         // Retryable failure — do NOT persist a permanent no-hint decision, or the
         // hint would be suppressed forever for this message even though the next
@@ -377,7 +344,7 @@ export async function runAutoSearchHint(args: {
         return writeNoHintAndReconcile("below-threshold");
     }
 
-    const hintText = buildAutoSearchHint(results);
+    const hintText = buildAutoSearchHint(results, { wordRules: options.wordRules });
     if (!hintText) {
         return writeNoHintAndReconcile("empty");
     }

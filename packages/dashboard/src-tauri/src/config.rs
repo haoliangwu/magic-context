@@ -4,17 +4,19 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Resolves paths to magic-context config files.
-pub fn resolve_user_config_path() -> PathBuf {
-    let config_dir = std::env::var("XDG_CONFIG_HOME")
+pub fn config_home() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".config"));
-    config_dir.join("cortexkit").join("magic-context.jsonc")
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".config"))
 }
 
-/// Resolves the Pi user-level magic-context config path.
-/// Harness-agnostic: Pi reads the same CortexKit user config as OpenCode.
-pub fn resolve_pi_config_path() -> PathBuf {
-    resolve_user_config_path()
+pub fn resolve_user_config_path(config_home: &Path) -> PathBuf {
+    config_home.join("cortexkit").join("magic-context.jsonc")
+}
+
+/// Pi uses the same CortexKit user config as OpenCode.
+pub fn resolve_pi_config_path(config_home: &Path) -> PathBuf {
+    resolve_user_config_path(config_home)
 }
 
 /// Resolve the project-level magic-context config path (CortexKit layout).
@@ -207,12 +209,30 @@ fn write_config_atomic(
     content: &str,
     project_root: Option<&Path>,
 ) -> Result<(), String> {
+    // A user config is often a symlink into a dotfiles repo (stow, chezmoi,
+    // home-manager). Renaming over the link would replace it with a regular
+    // file and edits would silently stop reaching the repo, so write through
+    // to the file it points at. Project configs never get here as symlinks:
+    // they are untrusted repository content and the project validation
+    // refuses a symlinked target.
+    let path = if project_root.is_none() {
+        resolve_symlinked_config(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let path = path.as_path();
     let parent = path
         .parent()
         .ok_or_else(|| "Config path has no parent directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
 
-    let temp_path = create_temp_config_file(parent, path.file_name(), content)?;
+    // Keep the existing file's permissions: a config holding API keys is
+    // often 0600, and the fresh temp file would otherwise make it 0644.
+    let permissions = std::fs::metadata(path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.permissions());
+    let temp_path = create_temp_config_file(parent, path.file_name(), content, permissions)?;
     if let Some(root) = project_root {
         if let Err(e) = validate_project_config_target(root, path) {
             let _ = std::fs::remove_file(&temp_path);
@@ -226,10 +246,34 @@ fn write_config_atomic(
     })
 }
 
+/// The file a config path finally names, following any chain of symlinks.
+/// A path that is not a symlink is returned as is; a dangling link resolves to
+/// the missing file it points at, so the write recreates it there.
+fn resolve_symlinked_config(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&current)
+                    .map_err(|e| format!("Failed to read config symlink: {e}"))?;
+                current = match current.parent() {
+                    Some(parent) if target.is_relative() => parent.join(target),
+                    _ => target,
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(format!("Failed to inspect config path: {e}")),
+        }
+    }
+    Err("Config path has too many levels of symlinks".to_string())
+}
+
 fn create_temp_config_file(
     parent: &Path,
     file_name: Option<&std::ffi::OsStr>,
     content: &str,
+    permissions: Option<std::fs::Permissions>,
 ) -> Result<PathBuf, String> {
     let file_name = file_name
         .and_then(|name| name.to_str())
@@ -256,6 +300,12 @@ fn create_temp_config_file(
         }
         match options.open(&temp_path) {
             Ok(mut file) => {
+                if let Some(permissions) = permissions.clone() {
+                    if let Err(e) = file.set_permissions(permissions) {
+                        let _ = std::fs::remove_file(&temp_path);
+                        return Err(format!("Failed to set config permissions: {e}"));
+                    }
+                }
                 if let Err(e) = file.write_all(content.as_bytes()) {
                     let _ = std::fs::remove_file(&temp_path);
                     return Err(format!("Failed to write config: {e}"));
@@ -274,34 +324,31 @@ fn create_temp_config_file(
     Err("Failed to create a unique temporary config path".to_string())
 }
 
-#[cfg(not(windows))]
+/// `std::fs::rename` replaces an existing file on every platform (on Windows
+/// it renames with replace-if-exists semantics), so there is never a moment
+/// with no config on disk. Deleting the target first, as a Windows
+/// workaround, would lose the config if the process died between the two steps.
 fn replace_with_temp(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    std::fs::rename(temp_path, path)
-}
-
-#[cfg(windows)]
-fn replace_with_temp(temp_path: &Path, path: &Path) -> std::io::Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
     std::fs::rename(temp_path, path)
 }
 
 #[tauri::command(async)]
 pub fn read_pi_config() -> Result<ConfigFileResponse, String> {
-    let path = resolve_pi_config_path();
+    let path = resolve_pi_config_path(&config_home());
     Ok(read_config(&path, "pi"))
 }
 
 #[tauri::command(async)]
 pub fn write_pi_config(content: String) -> Result<(), String> {
-    let path = resolve_pi_config_path();
+    let path = resolve_pi_config_path(&config_home());
     write_config(&path, &content)
 }
 
 #[tauri::command]
 pub fn pi_config_path() -> String {
-    resolve_pi_config_path().to_string_lossy().to_string()
+    resolve_pi_config_path(&config_home())
+        .to_string_lossy()
+        .to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -325,13 +372,21 @@ pub struct ProjectConfigEntry {
 /// pick up projects that have sessions but no Magic Context data yet. Results are
 /// deduplicated by worktree path.
 pub fn discover_project_configs() -> Vec<ProjectConfigEntry> {
-    discover_project_configs_with_db(crate::db::resolve_db_path().as_ref())
+    discover_project_configs_with_db(
+        crate::db::resolve_db_path().as_ref(),
+        &crate::db::data_home(),
+        &config_home(),
+        &crate::db::opencode_overrides(),
+    )
 }
 
 /// Internal entry point that accepts an explicit context DB path (for testing
 /// and for the serve path which already resolves the path).
 pub fn discover_project_configs_with_db(
     context_db_path: Option<&PathBuf>,
+    data_home: &Path,
+    _config_home: &Path,
+    overrides: &crate::db::OpenCodeDbOverrides,
 ) -> Vec<ProjectConfigEntry> {
     // ── 1. Collect project worktrees from context.db ──────────────
     // The Projects tab uses `get_projects` which queries context.db for project
@@ -340,9 +395,10 @@ pub fn discover_project_configs_with_db(
     let mut worktree_map: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new(); // worktree_path → display_name
 
+    let opencode_db = crate::db::resolve_opencode_db_path_for(data_home, overrides);
     if let Some(db_path) = context_db_path {
         if let Ok(conn) = crate::db::open_readonly(db_path) {
-            if let Ok(projects) = crate::db::get_projects(&conn) {
+            if let Ok(projects) = crate::db::get_projects_for_config(&conn, opencode_db.as_ref()) {
                 for p in &projects {
                     if let Some(path) = &p.path {
                         if !path.is_empty() {
@@ -355,7 +411,6 @@ pub fn discover_project_configs_with_db(
     }
 
     // ── 2. Enrich from the resolved OpenCode DB (names + extra projects) ──
-    let opencode_db = crate::db::resolve_opencode_db_path();
     if let Some(ref opencode_path) = opencode_db {
         if let Ok((conn, _generation)) = crate::db::open_opencode_readonly(opencode_path) {
             collect_opencode_db_projects(&conn, &mut worktree_map);
@@ -429,11 +484,12 @@ mod tests {
     #[test]
     fn pi_config_path_matches_cortexkit_user_path() {
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("XDG_CONFIG_HOME", dir.path());
 
         let expected = dir.path().join("cortexkit/magic-context.jsonc");
-        assert_eq!(resolve_pi_config_path(), expected);
-        assert_eq!(resolve_user_config_path(), expected);
+        assert_eq!(resolve_pi_config_path(&config_home()), expected);
+        assert_eq!(resolve_user_config_path(dir.path()), expected);
         assert_eq!(pi_config_path(), expected.to_string_lossy());
 
         let missing = read_pi_config().unwrap();
@@ -451,8 +507,6 @@ mod tests {
         assert_eq!(existing.content.as_deref(), Some(content));
         assert_eq!(existing.source, "pi");
         assert!(existing.error.is_none());
-
-        std::env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
@@ -482,6 +536,72 @@ mod tests {
             error.contains("Failed to read config"),
             "unexpected error: {error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_writes_through_a_symlinked_user_config() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles/cortexkit");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("magic-context.jsonc");
+        std::fs::write(&real, "{}\n").unwrap();
+        let config_dir = dir.path().join("config/cortexkit");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let link = config_dir.join("magic-context.jsonc");
+        // A relative link, as stow creates them.
+        symlink("../../dotfiles/cortexkit/magic-context.jsonc", &link).unwrap();
+
+        write_config(&link, "{ \"enabled\": false }\n").expect("write through link");
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "{ \"enabled\": false }\n"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&config_dir)
+            .unwrap()
+            .chain(std::fs::read_dir(&dotfiles).unwrap())
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_keeps_the_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magic-context.jsonc");
+        std::fs::write(&path, "{}\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_config(&path, "{ \"api_key\": \"secret\" }\n").expect("write");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".cortexkit")).unwrap();
+        let canonical_project = project.canonicalize().unwrap();
+        let project_config = canonical_project.join(".cortexkit/magic-context.jsonc");
+        std::fs::write(&project_config, "{}\n").unwrap();
+        std::fs::set_permissions(&project_config, std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        write_project_config(canonical_project.to_str().unwrap(), "{}\n").expect("write");
+        let mode = std::fs::metadata(&project_config)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640);
     }
 
     #[test]
@@ -606,14 +726,15 @@ mod tests {
 
     #[test]
     fn discover_project_configs_with_none_returns_no_crash() {
-        // Passing None for context DB still works (falls back to opencode.db
-        // if available). On a machine with a real opencode.db this returns
-        // project entries; without one it returns empty. Either way it must
-        // not panic.
-        let entries = discover_project_configs_with_db(None);
-        // No assertion on count since it depends on the machine state;
-        // the important thing is it didn't panic.
-        let _ = entries;
+        // No context DB or OpenCode DB in the injected home yields no projects.
+        let temp = tempfile::tempdir().unwrap();
+        let data_home = temp.path().join("data");
+        let entries =
+            discover_project_configs_with_db(None, &data_home, temp.path(), &Default::default());
+        assert!(entries
+            .iter()
+            .all(|entry| Path::new(&entry.worktree).starts_with(temp.path())));
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -639,14 +760,25 @@ mod tests {
         let oc = create_test_opencode_db(&oc_path, &[("My Project", proj_str.as_str())]);
         drop(oc);
 
-        // No context.db — simulate Desktop scenario
-        let old_xdg = std::env::var("XDG_DATA_HOME").ok();
-        std::env::set_var("XDG_DATA_HOME", &data_home);
+        // A different environment home must not leak its projects into discovery.
+        let other = tempfile::tempdir().unwrap();
+        let other_project = other.path().join("other-project");
+        std::fs::create_dir(&other_project).unwrap();
+        let other_db = other.path().join("opencode/opencode.db");
+        drop(create_test_opencode_db(
+            &other_db,
+            &[("Other Project", other_project.to_str().unwrap())],
+        ));
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("XDG_DATA_HOME", other.path());
 
-        // discover_project_configs_with_db(None) means no context.db,
-        // but opencode.db should still be found via resolve_opencode_db_path
-        let entries = discover_project_configs_with_db(None);
+        // No context.db — OpenCode discovery still finds the injected store.
+        let entries =
+            discover_project_configs_with_db(None, &data_home, temp.path(), &Default::default());
 
+        assert!(entries
+            .iter()
+            .all(|entry| Path::new(&entry.worktree).starts_with(temp.path())));
         // Should find the project with config
         let found = entries.iter().find(|e| e.worktree.contains("my-project"));
         assert!(
@@ -655,12 +787,6 @@ mod tests {
             entries
         );
         assert!(found.unwrap().exists, "project config should exist");
-
-        if let Some(old) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", old);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
     }
 
     #[test]
@@ -712,12 +838,17 @@ mod tests {
             .unwrap();
         drop(ctx_conn);
 
-        let old_xdg = std::env::var("XDG_DATA_HOME").ok();
-        std::env::set_var("XDG_DATA_HOME", &data_home);
-
         // Pass context.db — this should discover the project
-        let entries = discover_project_configs_with_db(Some(&ctx_path));
+        let entries = discover_project_configs_with_db(
+            Some(&ctx_path),
+            &data_home,
+            temp.path(),
+            &Default::default(),
+        );
 
+        assert!(entries
+            .iter()
+            .all(|entry| Path::new(&entry.worktree).starts_with(temp.path())));
         // Should find the project with config
         let found = entries.iter().find(|e| e.worktree.contains("my-project"));
         assert!(
@@ -726,12 +857,6 @@ mod tests {
             entries
         );
         assert!(found.unwrap().exists, "project config should exist");
-
-        if let Some(old) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", old);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
     }
 
     #[test]
@@ -765,11 +890,12 @@ mod tests {
         );
         drop(oc);
 
-        let old_xdg = std::env::var("XDG_DATA_HOME").ok();
-        std::env::set_var("XDG_DATA_HOME", &data_home);
+        let entries =
+            discover_project_configs_with_db(None, &data_home, temp.path(), &Default::default());
 
-        let entries = discover_project_configs_with_db(None);
-
+        assert!(entries
+            .iter()
+            .all(|entry| Path::new(&entry.worktree).starts_with(temp.path())));
         // Should only contain the real project (dead root skipped)
         assert_eq!(
             entries.len(),
@@ -779,11 +905,5 @@ mod tests {
         );
         assert!(entries[0].worktree.contains("real-project"));
         assert!(entries[0].exists, "real project config should exist");
-
-        if let Some(old) = old_xdg {
-            std::env::set_var("XDG_DATA_HOME", old);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
     }
 }

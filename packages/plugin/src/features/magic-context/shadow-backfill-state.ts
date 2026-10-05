@@ -8,6 +8,7 @@ export type ShadowBackfillWriteRefusalReason =
     | "provider_returned_no_vectors"
     | "memory_hash_guard_rejected"
     | "candidate_rows_changed"
+    | "registration_retired_during_embed"
     | "chunk_fts_mapping_incomplete"
     | "chunk_empty_canonical_text"
     | "chunk_partial_vector_set"
@@ -75,6 +76,8 @@ export function describeShadowBackfillWriteRefusal(
             return "the memory normalized-hash guard rejected vectors because content changed in flight";
         case "candidate_rows_changed":
             return "the selected source rows changed before the writer loaded them";
+        case "registration_retired_during_embed":
+            return "the shadow registration was retired or replaced while the provider call was in flight, so the vectors were discarded";
         case "chunk_fts_mapping_incomplete":
             return "the chunk writer refused rows whose transcript ordinals are not fully mapped in FTS";
         case "chunk_empty_canonical_text":

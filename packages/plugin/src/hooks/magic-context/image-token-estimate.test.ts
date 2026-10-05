@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { estimateImageTokensFromDataUrl } from "./image-token-estimate";
+import { readFileSync } from "node:fs";
+import {
+    estimateImageTokensFromDataUrl,
+    estimateToolAttachmentImageTokens,
+} from "./image-token-estimate";
 
 function makePngDataUrl(width: number, height: number): string {
     // Minimum valid PNG header + IHDR chunk with correct width/height.
@@ -39,6 +43,26 @@ function makePngDataUrl(width: number, height: number): string {
     return `data:image/png;base64,${btoa(binary)}`;
 }
 
+describe("estimateToolAttachmentImageTokens", () => {
+    test("sums image attachments by pixels and ignores other attachment types", () => {
+        const tokens = estimateToolAttachmentImageTokens({
+            output: "Image read successfully",
+            attachments: [
+                { type: "file", mime: "image/png", url: makePngDataUrl(1024, 768) },
+                { type: "file", mime: "image/png", url: "https://example.com/remote.png" },
+                { type: "file", mime: "application/pdf", url: "data:application/pdf;base64,AAAA" },
+            ],
+        });
+        // 1049 for the inline 1024x768 image, the 1200 fallback for the remote one.
+        expect(tokens).toBe(1049 + 1200);
+    });
+
+    test("is zero for a state without attachments", () => {
+        expect(estimateToolAttachmentImageTokens({ output: "text" })).toBe(0);
+        expect(estimateToolAttachmentImageTokens(undefined)).toBe(0);
+    });
+});
+
 describe("estimateImageTokensFromDataUrl", () => {
     test("PNG 1024x768 (typical screenshot)", () => {
         // Formula: (1024 × 768) / 750 = 1048.58 → ceil = 1049
@@ -74,4 +98,30 @@ describe("estimateImageTokensFromDataUrl", () => {
         const tokens = estimateImageTokensFromDataUrl("data:image/png;base64garbage");
         expect(tokens).toBeGreaterThan(0);
     });
+});
+
+// The Rust module counts image carriers with its own port of this estimator
+// (crates/mc-module/src/image_tokens.rs). Both read this shared fixture so the two
+// implementations cannot drift apart: each format, the cap, the one-token floor and
+// each fallback path.
+describe("image token parity with the Rust module", () => {
+    const fixturePath = new URL(
+        "../../../../../crates/mc-module/testdata/image-token-parity.json",
+        import.meta.url,
+    );
+    const cases = JSON.parse(readFileSync(fixturePath, "utf8")) as Array<{
+        name: string;
+        url: string;
+        tokens: number;
+    }>;
+
+    test("the shared fixture is present", () => {
+        expect(cases.length).toBeGreaterThanOrEqual(10);
+    });
+
+    for (const { name, url, tokens } of cases) {
+        test(name, () => {
+            expect(estimateImageTokensFromDataUrl(url)).toBe(tokens);
+        });
+    }
 });

@@ -23,6 +23,7 @@ async function waitForWriter(): Promise<void> {
 
 test("worker B can open its own default database while worker A is locked", async () => {
     await waitForWriter();
+    writeFileSync(join(probeDir, "worker-b-ready"), "");
 
     const opened = openDatabase();
     expect(opened).not.toBeNull();

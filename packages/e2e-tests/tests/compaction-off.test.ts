@@ -15,40 +15,26 @@
  *   5. The per-session mode record commits to "off".
  */
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { resolve as pathResolve, join } from "node:path";
-import { TestHarness } from "../src/harness";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { openTestDb } from "../src/test-db";
 
-let h: TestHarness;
-
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            compaction: { enabled: false },
-            // Deliberately armed: compaction-off must make it inert, and the
-            // prompts below must still succeed (no blocking, no cancellation).
-            fail_closed_blocking: true,
-            // Low execute threshold: in ON mode these turns would fire drops;
-            // in off mode nothing may fire.
-            execute_threshold_percentage: 5,
-        },
-    });
-});
-
-afterAll(async () => {
-    await h.dispose();
-});
+let h: ScenarioHarness;
 
 function computeDirIdentity(directory: string): string {
-    return resolveProjectIdentity(realpathSync(pathResolve(directory)));
+    return resolveProjectIdentity(h.host === "omp" ? directory : realpathSync(pathResolve(directory)));
 }
 
-function seedMemory(h: TestHarness, projectIdentity: string, content: string): void {
-    const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
+function seedMemory(h: ScenarioHarness, projectIdentity: string, content: string): void {
+    const dbPath = join(h.dataDir, "cortexkit", "magic-context", "context.db");
     const db = openTestDb(dbPath);
     try {
         const now = Date.now();
@@ -67,7 +53,7 @@ function seedMemory(h: TestHarness, projectIdentity: string, content: string): v
     }
 }
 
-function readModeRecord(h: TestHarness, sessionId: string): string | null {
+function readModeRecord(h: ScenarioHarness, sessionId: string): string | null {
     try {
         const row = h
             .contextDb()
@@ -79,7 +65,25 @@ function readModeRecord(h: TestHarness, sessionId: string): string | null {
     }
 }
 
-describe("compaction-off mode (issue #266 S3)", () => {
+forEachHost(import.meta.url, "compaction-off mode (issue #266 S3)", (host) => {
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: {
+                compaction: { enabled: false },
+                // Deliberately armed: compaction-off must make it inert, and the
+                // prompts below must still succeed (no blocking, no cancellation).
+                fail_closed_blocking: true,
+                // Low execute threshold: in ON mode these turns would fire drops;
+                // in off mode nothing may fire.
+                execute_threshold_percentage: 5,
+            },
+        });
+    });
+
+    afterAll(async () => {
+        await h.dispose();
+    });
+
     it(
         "keeps memory injection, writes no tags, creates no compartments, drops nothing",
         async () => {
@@ -103,7 +107,7 @@ describe("compaction-off mode (issue #266 S3)", () => {
             });
 
             // Seed a memory for the workdir project identity.
-            const projectIdentity = computeDirIdentity(h.opencode.env.workdir);
+            const projectIdentity = computeDirIdentity(h.workdir);
             seedMemory(
                 h,
                 projectIdentity,

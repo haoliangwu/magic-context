@@ -2,9 +2,8 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import { appendCompartments } from "../../plugin/src/features/magic-context/compartment-storage";
-import { runMigrations } from "../../plugin/src/features/magic-context/migrations";
-import { initializeDatabase } from "../../plugin/src/features/magic-context/storage-db";
 import {
 	buildModuleStateSyncPayload,
 	type ModuleStateSyncState,
@@ -37,12 +36,11 @@ function syncState(): ModuleStateSyncState {
 }
 
 async function seedParams(
+    h: RustTestHarness,
 	sessionId: string,
 	dangling: boolean,
 ): Promise<Record<string, unknown>> {
-	const db = new Database(":memory:");
-	initializeDatabase(db);
-	runMigrations(db);
+	const db = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
 	appendCompartments(db, sessionId, [
 		{
 			sequence: 0,
@@ -165,11 +163,10 @@ describe.skipIf(!rustPrereqs.ok)(
 		it("accepts the repaired seed and preserves clean served bytes", async () => {
 			const repairedSession = "ses_dangling_seed_e2e";
 			const cleanSession = "ses_clean_seed_e2e";
-			const repairedSeed = await seedParams(repairedSession, true);
-			const cleanSeed = await seedParams(cleanSession, false);
+			const repairedSeed = await seedParams(h, repairedSession, true);
+			const cleanSeed = await seedParams(h, cleanSession, false);
 			expect(
-				(repairedSeed.compartments as Array<Record<string, unknown>>)[1]
-					?.start_message,
+				(h.contextDb().query("SELECT start_message FROM compartments WHERE session_id=? AND sequence=1").get(repairedSession) as { start_message: number }).start_message,
 			).toBe(3);
 
 			for (const [sessionId, seed] of [
@@ -194,6 +191,8 @@ describe.skipIf(!rustPrereqs.ok)(
 				transformPayload(cleanSession),
 			);
 			expect(repaired.status).toBe("ok");
+            expect(h.contextDb().query("SELECT start_message_id, end_message_id FROM compartments WHERE session_id=? AND sequence=1").get(repairedSession))
+                .toEqual({ start_message_id: "missing-start", end_message_id: "m4" });
 			expect(clean.status).toBe("ok");
 			expect(servedDigest(repaired)).toMatch(/^[a-f0-9]{64}$/);
 			expect(servedDigest(clean)).toBe(

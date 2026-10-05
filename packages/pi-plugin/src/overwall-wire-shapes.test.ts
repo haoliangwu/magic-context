@@ -31,7 +31,7 @@ const result = (id: string, text = "result") => ({
 	content: [{ type: "text", text }],
 	timestamp: 2,
 });
-async function wire(messages: any[], native: boolean) {
+async function wire(messages: unknown[], native: boolean): Promise<unknown> {
 	const model = {
 		id: "test",
 		name: "test",
@@ -50,7 +50,7 @@ async function wire(messages: any[], native: boolean) {
 			{ messages } as never,
 			new Set(["openai"]),
 		);
-	let captured: any;
+	let captured: unknown;
 	await streamAnthropic(model as never, { messages } as never, {
 		apiKey: "fixture",
 		onPayload(p) {
@@ -65,7 +65,7 @@ for (const native of [false, true])
 		test(`Q4 serialized mixed shared-message arcs native=${native} thinking=${thinking}`, async () => {
 			const db = createTestDb();
 			try {
-				const source: any[] = [
+				const source: unknown[] = [
 					{
 						role: "assistant",
 						api: native ? "openai-responses" : "anthropic-messages",
@@ -105,30 +105,34 @@ for (const native of [false, true])
 				tagger.initFromDb("shapes", db);
 				const { targets } = tagTranscript("shapes", tr, tagger, db);
 				const tags = getTagsBySession(db, "shapes");
-				const target = targets.get(
-					tags.find((t) => t.messageId === "drop")!.tagNumber,
-				)!;
-				target.drop!();
-				const open = targets.get(
-					tags.find((t) => t.messageId === "open")!.tagNumber,
-				)!;
-				expect(open.drop!()).toBe("incomplete");
+				const dropTag = tags.find((t) => t.messageId === "drop");
+				if (!dropTag) throw new Error("Expected drop tool tag");
+				const target = targets.get(dropTag.tagNumber);
+				if (!target?.drop) throw new Error("Expected droppable tool target");
+				target.drop();
+				const openTag = tags.find((t) => t.messageId === "open");
+				if (!openTag) throw new Error("Expected open tool tag");
+				const open = targets.get(openTag.tagNumber);
+				if (!open?.drop) throw new Error("Expected incomplete tool target");
+				expect(open.drop()).toBe("incomplete");
 				tr.commit();
 				tr.finalizeToolRemovals();
-				const w: any = await wire(source, native);
+				const w: unknown = await wire(source, native);
 				expect(w).toBeDefined();
-				const parts = native ? w : w.messages.flatMap((m: any) => m.content);
+				const parts = native
+					? w
+					: w.messages.flatMap((m: unknown) => m.content);
 				const calls = parts
 					.filter(
-						(p: any) => p.type === (native ? "function_call" : "tool_use"),
+						(p: unknown) => p.type === (native ? "function_call" : "tool_use"),
 					)
-					.map((p: any) => (native ? p.call_id : p.id));
+					.map((p: unknown) => (native ? p.call_id : p.id));
 				const results = parts
 					.filter(
-						(p: any) =>
+						(p: unknown) =>
 							p.type === (native ? "function_call_output" : "tool_result"),
 					)
-					.map((p: any) => (native ? p.call_id : p.tool_use_id));
+					.map((p: unknown) => (native ? p.call_id : p.tool_use_id));
 				expect(calls).toContain("keep");
 				expect(calls).toContain("open");
 				expect(results).toContain("keep");
@@ -141,8 +145,8 @@ for (const native of [false, true])
 					expect(results).toContain("drop");
 					expect(
 						w.messages
-							.filter((m: any) => m.role === "assistant")
-							.every((m: any) => m.content.length > 0),
+							.filter((m: unknown) => m.role === "assistant")
+							.every((m: unknown) => m.content.length > 0),
 					).toBe(true);
 				}
 			} finally {
@@ -152,7 +156,7 @@ for (const native of [false, true])
 test("Q5 99 percent emergency skeletonizes signed arc and replay is byte stable", () => {
 	const db = createTestDb();
 	try {
-		const source: any[] = [
+		const source: unknown[] = [
 			{
 				role: "assistant",
 				timestamp: 1,
@@ -190,7 +194,7 @@ test("Q5 99 percent emergency skeletonizes signed arc and replay is byte stable"
 							currentTotalInputTokens: 100000,
 							ceilingTokens: 100000,
 						},
-					} as any,
+					} as never,
 				);
 				expect(outcome.emergencyDroppedTools).toBe(1);
 			}
@@ -203,7 +207,7 @@ test("Q5 99 percent emergency skeletonizes signed arc and replay is byte stable"
 		expect(
 			getTagsBySession(db, "emergency").find((t) => t.type === "tool")
 				?.dropMode,
-		).toBe("truncated");
+		).toBe("skeleton_real");
 		expect(JSON.stringify(serve(true))).toBe(JSON.stringify(initial));
 		expect(JSON.stringify(serve(true))).toBe(JSON.stringify(initial));
 	} finally {
@@ -221,6 +225,10 @@ test("Q6 above-wall persisted floor plus provider pressure, then below wall", as
 			lastContextPercentage: 500,
 			cacheTtl: "never",
 		});
+		// The floor was proven on the model this reply comes from; a floor with
+		// no recorded model would be dropped instead of kept.
+		const { recordPiProvenFloorModel } = await import("./pi-proven-floor");
+		recordPiProvenFloorModel(db, sessionId, "openai-codex/gpt-5.6-sol", 140000);
 		await persistPiPressureFromMessageEnd({
 			db,
 			sessionId,
@@ -263,7 +271,7 @@ test("Q6 above-wall persisted floor plus provider pressure, then below wall", as
 	}
 });
 test("Q7 skeleton-heavy tail still counts real reclaimable output but suppresses Channel2", () => {
-	const messages: any[] = [];
+	const messages: unknown[] = [];
 	for (let i = 0; i < 1000; i++)
 		messages.push(
 			{
@@ -278,7 +286,7 @@ test("Q7 skeleton-heavy tail still counts real reclaimable output but suppresses
 		{ role: "assistant", content: [call("live")] },
 		result("live", "reclaim ".repeat(1000)),
 	);
-	const tags: any[] = [
+	const tags: unknown[] = [
 		{
 			tagNumber: 1001,
 			messageId: "live",
@@ -292,7 +300,8 @@ test("Q7 skeleton-heavy tail still counts real reclaimable output but suppresses
 		messages,
 		tags,
 		protectedTagNumbers: new Set(),
-		stableId: (m: any) => (m.content?.[0]?.id === "live" ? "owner" : undefined),
+		stableId: (m: unknown) =>
+			m.content?.[0]?.id === "live" ? "owner" : undefined,
 	});
 	expect(h.u).toBeGreaterThan(1000);
 	expect(h.u / h.t).toBeLessThan(0.75);
@@ -311,7 +320,7 @@ test("Q7 skeleton-heavy tail still counts real reclaimable output but suppresses
 test("Q8 indices survive marking and commit; identity finalizer tolerates intervening history prepend", () => {
 	const db = createTestDb();
 	try {
-		const messages: any[] = [
+		const messages: unknown[] = [
 			{ role: "assistant", content: [call("old")] },
 			result("old"),
 			{ role: "user", content: "tail" },
@@ -324,7 +333,11 @@ test("Q8 indices survive marking and commit; identity finalizer tolerates interv
 		tagger.initFromDb("indices", db);
 		const { targets } = tagTranscript("indices", tr, tagger, db);
 		const tags = getTagsBySession(db, "indices");
-		targets.get(tags.find((t) => t.messageId === "old")!.tagNumber)!.drop!();
+		const oldTag = tags.find((t) => t.messageId === "old");
+		if (!oldTag) throw new Error("Expected old tool tag");
+		const oldTarget = targets.get(oldTag.tagNumber);
+		if (!oldTarget?.drop) throw new Error("Expected droppable old target");
+		oldTarget.drop();
 		expect(tr.getWorkingMessages().length).toBe(3);
 		expect(tr.messages.some((m) => m.info.id === "tail-entry")).toBe(true);
 		tr.commit();
@@ -343,7 +356,7 @@ test("Q8 indices survive marking and commit; identity finalizer tolerates interv
 test("Q4 Anthropic sole signed tool arc retains serialized separator", async () => {
 	const db = createTestDb();
 	try {
-		const messages: any[] = [
+		const messages: unknown[] = [
 			{
 				role: "assistant",
 				api: "anthropic-messages",
@@ -367,23 +380,27 @@ test("Q4 Anthropic sole signed tool arc retains serialized separator", async () 
 		const tagger = createTagger();
 		tagger.initFromDb("sole", db);
 		const { targets } = tagTranscript("sole", tr, tagger, db);
-		targets.get(
-			getTagsBySession(db, "sole").find((t) => t.type === "tool")!.tagNumber,
-		)!.drop!();
+		const soleTag = getTagsBySession(db, "sole").find((t) => t.type === "tool");
+		if (!soleTag) throw new Error("Expected sole tool tag");
+		const soleTarget = targets.get(soleTag.tagNumber);
+		if (!soleTarget?.drop) throw new Error("Expected droppable sole target");
+		soleTarget.drop();
 		tr.commit();
 		tr.finalizeToolRemovals();
-		const w: any = await wire(messages, false);
-		const assistant = w.messages.find((m: any) => m.role === "assistant");
+		const w: unknown = await wire(messages, false);
+		const assistant = w.messages.find((m: unknown) => m.role === "assistant");
 		expect(assistant.content.length).toBeGreaterThan(0);
 		expect(
 			assistant.content.some(
-				(p: any) => p.type === "tool_use" && p.id === "sole",
+				(p: unknown) => p.type === "tool_use" && p.id === "sole",
 			),
 		).toBe(true);
 		expect(
 			w.messages
-				.flatMap((m: any) => m.content)
-				.some((p: any) => p.type === "tool_result" && p.tool_use_id === "sole"),
+				.flatMap((m: unknown) => m.content)
+				.some(
+					(p: unknown) => p.type === "tool_result" && p.tool_use_id === "sole",
+				),
 		).toBe(true);
 	} finally {
 		db.close();

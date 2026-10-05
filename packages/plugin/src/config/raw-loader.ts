@@ -4,6 +4,7 @@ import {
     linkSync,
     openSync,
     readFileSync,
+    realpathSync,
     renameSync,
     statSync,
     unlinkSync,
@@ -434,9 +435,13 @@ export function loadRawConfigFile(options: RawConfigLoadOptions): RawConfigLoadR
 
         let temporaryPath: string | undefined;
         try {
-            const mode = statSync(options.configPath).mode & 0o777;
+            // Write through a symlinked config (stow, chezmoi, home-manager keep
+            // it in a dotfiles repo): the temporary file is created next to the
+            // real file and renamed onto it, so the link itself stays a link.
+            const writePath = realpathSync(options.configPath);
+            const mode = statSync(writePath).mode & 0o777;
             writeExclusiveBackup(backupPath, observedBytes, mode);
-            temporaryPath = writeTemporaryCandidate(options.configPath, migration.bytes, mode);
+            temporaryPath = writeTemporaryCandidate(writePath, migration.bytes, mode);
             options.afterTemporaryWrite?.();
 
             const currentBytes = readFileSync(options.configPath);
@@ -456,7 +461,7 @@ export function loadRawConfigFile(options: RawConfigLoadOptions): RawConfigLoadR
                 continue;
             }
 
-            renameSync(temporaryPath, options.configPath);
+            renameSync(temporaryPath, writePath);
             return {
                 configPath: options.configPath,
                 bytes: migration.bytes,

@@ -10,6 +10,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy)]
 pub enum Harness {
     Opencode,
+    /// The OpenCode 2 plugin logs under its own `opencode2` temp subtree.
+    Opencode2,
     Pi,
     Omp,
 }
@@ -18,6 +20,7 @@ impl Harness {
     fn as_str(self) -> &'static str {
         match self {
             Harness::Opencode => "opencode",
+            Harness::Opencode2 => "opencode2",
             Harness::Pi => "pi",
             Harness::Omp => "omp",
         }
@@ -29,6 +32,7 @@ impl Harness {
 /// The plugin writes separate logs per harness so a single machine running
 /// each can produce an independent issue report:
 ///   - OpenCode → `${tmpdir}/opencode/magic-context/magic-context.log`
+///   - OpenCode 2 → `${tmpdir}/opencode2/magic-context/magic-context.log`
 ///   - Pi       → `${tmpdir}/pi/magic-context/magic-context.log`
 ///   - OMP      → `${tmpdir}/omp/magic-context/magic-context.log`
 ///
@@ -78,7 +82,7 @@ fn resolve_storage_dir() -> Option<PathBuf> {
 
 /// Return every distinct legacy and fleet log the dashboard can read.
 pub fn resolve_log_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(8);
+    let mut paths = Vec::with_capacity(10);
     if let Some(override_path) = std::env::var("MAGIC_CONTEXT_LOG_PATH")
         .ok()
         .map(|value| PathBuf::from(value.trim()))
@@ -86,7 +90,12 @@ pub fn resolve_log_paths() -> Vec<PathBuf> {
     {
         paths.push(override_path);
     }
-    for harness in [Harness::Opencode, Harness::Pi, Harness::Omp] {
+    for harness in [
+        Harness::Opencode,
+        Harness::Opencode2,
+        Harness::Pi,
+        Harness::Omp,
+    ] {
         let path = resolve_log_path_from_temp_dir(&std::env::temp_dir(), harness);
         if !paths.contains(&path) {
             paths.push(path);
@@ -96,6 +105,7 @@ pub fn resolve_log_paths() -> Vec<PathBuf> {
         let logs = storage_dir.join("logs");
         for name in [
             "magic-context.opencode.log",
+            "magic-context.opencode2.log",
             "magic-context.pi.log",
             "magic-context.omp.log",
             "magic-context.log",
@@ -114,8 +124,16 @@ pub struct LogEntry {
     pub timestamp: String,
     pub level: Option<String>,
     pub component: String,
+    /// Dotted logger name the r2 line writes before its colon
+    /// (`magic-context.historian`); the bare module id for the two older
+    /// grammars, which name only the module.
+    pub logger: String,
     pub session_id: String,
     pub tags: Vec<String>,
+    /// Context bound to a scope rather than to one event: r2's bracket, r1's
+    /// leading `session=`. Values stay as written (`session=opencode:ses_x`);
+    /// `session_id` above is the bare id the session pickers show.
+    pub bound: HashMap<String, String>,
     pub message: String,
     pub kv: HashMap<String, String>,
     pub raw: String,
@@ -124,14 +142,32 @@ pub struct LogEntry {
     pub hit_ratio: Option<f64>,
 }
 
+/// The three line shapes this reader accepts, discriminated by shape alone:
+///   `FleetR2` — `<ts> <LEVEL> <logger>: [<bound fields>] <message> <fields>`
+///   `FleetR1` — `<ts> <LEVEL> magic-context <session=…> <tag=…>* <message> <fields>`
+///   `Legacy`  — `[<ts>] [magic-context][<session>] <message> <fields>`
+/// r2 replaced r1's module column and `tag=` field with a dotted logger name
+/// and moved the session into a bracket of bound context. Old files are never
+/// rewritten, so all three keep parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogGrammar {
+    FleetR2,
+    FleetR1,
+    Legacy,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedLogLine {
     pub ts: String,
     pub level: Option<String>,
+    pub logger: String,
     pub session: Option<String>,
     pub tags: Vec<String>,
+    pub bound: HashMap<String, String>,
     pub message: String,
     pub kv: HashMap<String, String>,
+    pub grammar: LogGrammar,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -162,9 +198,22 @@ lazy_static::lazy_static! {
     static ref LEGACY_LOG_LINE_RE: Regex = Regex::new(
         r"^\[([^\]]+)\] \[magic-context\]\[([^\]]*)\]\s+(.*)$"
     ).unwrap();
-    static ref FLEET_LOG_LINE_RE: Regex = Regex::new(
-        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (TRACE|DEBUG|INFO |WARN |ERROR) magic-context (.*)$"
+    static ref FLEET_ENVELOPE_RE: Regex = Regex::new(
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (TRACE|DEBUG|INFO |WARN |ERROR) (.*)$"
     ).unwrap();
+}
+
+/// The module id the two pre-r2 grammars hard-code in their envelope.
+const MODULE_ID: &str = "magic-context";
+
+/// An r2 logger name: dotted segments of `[a-z][a-z0-9-]*`, rooted at the module id.
+fn is_logger_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('.').all(|segment| {
+            let mut chars = segment.chars();
+            matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+                && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        })
 }
 
 fn tokenize(input: &str, limit: usize) -> Option<Vec<(usize, &str)>> {
@@ -211,6 +260,13 @@ fn decode_escapes(value: &str) -> Option<String> {
             'n' => decoded.push('\n'),
             '"' => decoded.push('"'),
             '\\' => decoded.push('\\'),
+            'u' => {
+                let mut codepoint = 0u32;
+                for _ in 0..4 {
+                    codepoint = codepoint * 16 + chars.next()?.to_digit(16)?;
+                }
+                decoded.push(char::from_u32(codepoint)?);
+            }
             _ => return None,
         }
     }
@@ -241,6 +297,62 @@ fn parse_field(token: &str) -> Option<(String, String)> {
     Some((key.to_string(), value))
 }
 
+/// Every token of `input` as fields, or `None` when any token is not one.
+fn parse_field_list(input: &str) -> Option<Vec<(String, String)>> {
+    tokenize(input, usize::MAX)?
+        .into_iter()
+        .map(|(_, token)| parse_field(token))
+        .collect()
+}
+
+/// Index of the `]` closing a bracket opened at index 0, or `None` when none
+/// closes it. A `]` inside a quoted value is not the end of the bracket, which
+/// is why r2 quotes a bound value containing a space.
+fn bound_bracket_end(input: &str) -> Option<usize> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in input.bytes().enumerate().skip(1) {
+        match byte {
+            _ if escaped => escaped = false,
+            b'\\' if quoted => escaped = true,
+            b'"' => quoted = !quoted,
+            b']' if !quoted => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// True when a bracketed field list trails the message. r2 puts bound context
+/// before the message so its column is stable, so a line that binds after the
+/// message is malformed rather than a line with late context.
+fn trailing_bound_bracket(input: &str) -> bool {
+    let trimmed = input.trim_end();
+    if !trimmed.ends_with(']') {
+        return false;
+    }
+    let Some(open) = trimmed.rfind('[') else {
+        return false;
+    };
+    // A space before `[` keeps an event field value such as `args=[a=1]` out of
+    // this check; a bracket at index 0 is the bound bracket itself.
+    if open == 0 || trimmed.as_bytes()[open - 1] != b' ' {
+        return false;
+    }
+    parse_field_list(&trimmed[open + 1..trimmed.len() - 1]).is_some_and(|fields| !fields.is_empty())
+}
+
+/// The bare session id a bound `session=<issuer>:<id>` carries, or `None` when
+/// the value names nothing: an id without its issuer, or the old `global`
+/// placeholder, is not a match key against any session store.
+fn raw_session_id(value: &str) -> Option<&str> {
+    if value.is_empty() || value == "global" {
+        return None;
+    }
+    let (issuer, id) = value.split_once(':')?;
+    (!issuer.is_empty() && !id.is_empty()).then_some(id)
+}
+
 fn trailing_token(input: &str, end: usize) -> Option<(usize, &str)> {
     let bytes = input.as_bytes();
     let mut index = end;
@@ -264,9 +376,15 @@ fn trailing_token(input: &str, end: usize) -> Option<(usize, &str)> {
     (!quoted).then(|| (index, &input[index..end]))
 }
 
+/// `allow_empty_message`: r2 lets a record carry fields and no message at all
+/// (`engram.retention: pruned=3 kept=14`), so its last remaining token may be
+/// consumed as a field. The older grammars keep the first token as prose
+/// instead, so a message that is itself `key=value` (`status=failed`) survives
+/// as the message it was written as.
 fn split_message_and_fields(
     input: &str,
     decode_message: bool,
+    allow_empty_message: bool,
 ) -> (String, HashMap<String, String>) {
     // Message prose is opaque: only consume a well-formed field suffix from the right.
     // An unmatched quote earlier in the message must not hide the entire record.
@@ -279,7 +397,7 @@ fn split_message_and_fields(
         let Some(field) = parse_field(token) else {
             break;
         };
-        if start == 0 {
+        if start == 0 && !allow_empty_message {
             break;
         }
         suffix.push(field);
@@ -302,50 +420,116 @@ fn split_message_and_fields(
     (message, fields)
 }
 
+/// r2: `<logger>: [<bound fields>] <message> <event fields>`. The bracket is
+/// absent whenever a scope binds nothing, never empty.
+fn parse_fleet_r2(ts: String, level: String, logger: &str, body: &str) -> Option<ParsedLogLine> {
+    if !is_logger_name(logger) {
+        return None;
+    }
+    let mut remaining = body;
+    let mut bound: HashMap<String, String> = HashMap::new();
+    if remaining.starts_with('[') {
+        if let Some(end) = bound_bracket_end(remaining) {
+            let inner = &remaining[1..end];
+            if inner.trim().is_empty() {
+                return None;
+            }
+            // A bracketed phrase that is not a field list (`[dreamer] tick fired`)
+            // is message prose: only a well-formed field list is lifted as context.
+            if let Some(fields) = parse_field_list(inner) {
+                bound = fields.into_iter().collect();
+                remaining = remaining[end + 1..].trim_start();
+            }
+        }
+    }
+    if trailing_bound_bracket(remaining) {
+        return None;
+    }
+    let session = match bound.get("session") {
+        Some(value) => Some(raw_session_id(value)?.to_string()),
+        None => None,
+    };
+    let (message, kv) = split_message_and_fields(remaining, true, true);
+    Some(ParsedLogLine {
+        ts,
+        level: Some(level),
+        logger: logger.to_string(),
+        session,
+        tags: logger.split('.').skip(1).map(str::to_string).collect(),
+        bound,
+        message,
+        kv,
+        grammar: LogGrammar::FleetR2,
+    })
+}
+
+/// r1: `magic-context <session=…> <tag=…>* <message> <event fields>`.
+fn parse_fleet_r1(ts: String, level: String, body: &str) -> Option<ParsedLogLine> {
+    let mut remaining = body;
+    let mut bound: HashMap<String, String> = HashMap::new();
+    let mut session = None;
+    let mut tags = Vec::new();
+    if remaining.starts_with("session=") {
+        let tokens = tokenize(remaining, 1)?;
+        let token = tokens.first()?.1;
+        if token.contains('\u{1b}') {
+            return None;
+        }
+        let (_, value) = parse_field(token)?;
+        session = Some(raw_session_id(&value)?.to_string());
+        // r1 has no bracket; `session=` in the column before the message is the
+        // one binding it expresses, so consumers read it from the same place.
+        bound.insert("session".to_string(), value);
+        remaining = remaining[token.len()..].trim_start();
+    }
+    while remaining.starts_with("tag=") {
+        let tokens = tokenize(remaining, 1)?;
+        let token = tokens.first()?.1;
+        if token.contains('\u{1b}') {
+            return None;
+        }
+        let (_, tag) = parse_field(token)?;
+        if tag.is_empty() {
+            return None;
+        }
+        tags.push(tag);
+        remaining = remaining[token.len()..].trim_start();
+    }
+    let (message, kv) = split_message_and_fields(remaining, true, false);
+    Some(ParsedLogLine {
+        ts,
+        level: Some(level),
+        logger: MODULE_ID.to_string(),
+        session,
+        tags,
+        bound,
+        message,
+        kv,
+        grammar: LogGrammar::FleetR1,
+    })
+}
+
 pub fn parse_log_record(line: &str) -> Option<ParsedLogLine> {
-    if let Some(caps) = FLEET_LOG_LINE_RE.captures(line) {
+    if let Some(caps) = FLEET_ENVELOPE_RE.captures(line) {
         let ts = caps.get(1)?.as_str().to_string();
         chrono::DateTime::parse_from_rfc3339(&ts).ok()?;
         let level = caps.get(2)?.as_str().trim().to_string();
-        let mut body = caps.get(3)?.as_str().trim_start();
-        let mut session = None;
-        let mut tags = Vec::new();
-        if body.starts_with("session=") {
-            let tokens = tokenize(body, 1)?;
-            let token = tokens.first()?.1;
-            if token.contains('\u{1b}') {
-                return None;
-            }
-            let (_, value) = parse_field(token)?;
-            let (issuer, id) = value.split_once(':')?;
-            if issuer.is_empty() || id.is_empty() || value == "global" {
-                return None;
-            }
-            session = Some(id.to_string());
-            body = body[token.len()..].trim_start();
+        let body = caps.get(3)?.as_str();
+        // One envelope, two fleet grammars: r2 terminates its logger with a
+        // colon and r1 puts the bare module id in the same column, so the colon
+        // is the whole discriminator. Without it the name reads as the first
+        // word of the message, which is why r2 requires it.
+        let (head, remaining) = match body.find(' ') {
+            Some(index) => (&body[..index], body[index + 1..].trim_start()),
+            None => (body, ""),
+        };
+        if let Some(logger) = head.strip_suffix(':') {
+            return parse_fleet_r2(ts, level, logger, remaining);
         }
-        while body.starts_with("tag=") {
-            let tokens = tokenize(body, 1)?;
-            let token = tokens.first()?.1;
-            if token.contains('\u{1b}') {
-                return None;
-            }
-            let (_, tag) = parse_field(token)?;
-            if tag.is_empty() {
-                return None;
-            }
-            tags.push(tag);
-            body = body[token.len()..].trim_start();
+        if head == MODULE_ID {
+            return parse_fleet_r1(ts, level, remaining);
         }
-        let (message, kv) = split_message_and_fields(body, true);
-        return Some(ParsedLogLine {
-            ts,
-            level: Some(level),
-            session,
-            tags,
-            message,
-            kv,
-        });
+        return None;
     }
     let caps = LEGACY_LOG_LINE_RE.captures(line)?;
     let ts = caps.get(1)?.as_str().to_string();
@@ -359,19 +543,119 @@ pub fn parse_log_record(line: &str) -> Option<ParsedLogLine> {
     } else {
         Some(raw_session.to_string())
     };
-    let (message, kv) = split_message_and_fields(caps.get(3)?.as_str(), false);
+    let (message, kv) = split_message_and_fields(caps.get(3)?.as_str(), false, false);
     Some(ParsedLogLine {
         ts,
         level: None,
+        logger: MODULE_ID.to_string(),
         session,
         tags: Vec::new(),
+        // The legacy session sits in a fixed bracket slot rather than in a field
+        // list, so there is nothing to lift as bound context.
+        bound: HashMap::new(),
         message,
         kv,
+        grammar: LogGrammar::Legacy,
     })
+}
+
+/// Levels in ascending order; a record is emitted when its level is at or above
+/// the threshold that applies to its logger.
+const LEVELS: [&str; 5] = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+/// No level clears this threshold, which is what `off` means.
+const LEVEL_OFF: usize = usize::MAX;
+/// The default when no directive applies and when a spec does not parse: info.
+const LEVEL_DEFAULT: usize = 2;
+
+fn level_rank(level: &str) -> Option<usize> {
+    LEVELS
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(level.trim()))
+}
+
+fn level_threshold(token: &str) -> Option<usize> {
+    if token.trim().eq_ignore_ascii_case("off") {
+        return Some(LEVEL_OFF);
+    }
+    level_rank(token)
+}
+
+fn is_logger_prefix(prefix: &str, logger: &str) -> bool {
+    logger == prefix
+        || (logger.len() > prefix.len()
+            && logger.starts_with(prefix)
+            && logger.as_bytes()[prefix.len()] == b'.')
+}
+
+/// Parse a CK_LOG spec: comma-separated directives, each either a bare level
+/// (the root default) or `<logger>=<level>`. A spec that does not parse falls
+/// back to the default, info — a logging knob with a typo in it must not
+/// silence the fleet.
+fn parse_log_level_spec(spec: &str) -> (usize, Vec<(String, usize)>) {
+    let fallback = (LEVEL_DEFAULT, Vec::new());
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return fallback;
+    }
+    let mut root = LEVEL_DEFAULT;
+    let mut directives = Vec::new();
+    for raw in trimmed.split(',') {
+        let directive = raw.trim();
+        if directive.is_empty() {
+            return fallback;
+        }
+        match directive.split_once('=') {
+            None => match level_threshold(directive) {
+                Some(threshold) => root = threshold,
+                None => return fallback,
+            },
+            Some((name, level)) => {
+                let name = name.trim();
+                match (is_logger_name(name), level_threshold(level)) {
+                    (true, Some(threshold)) => directives.push((name.to_string(), threshold)),
+                    _ => return fallback,
+                }
+            }
+        }
+    }
+    (root, directives)
+}
+
+/// Would a record at (`level`, `logger`) be emitted under this CK_LOG spec?
+///
+/// A directive names a logger prefix and applies to it and every name beneath
+/// it; the most specific matching directive decides. The prefix is matched on
+/// dotted segments, not on characters, so `aft` covers `aft.index` but not
+/// `aftershock`.
+///
+/// This reads the same grammar the writers filter on, so a reader can tell
+/// which lines a given CK_LOG would have kept out of a file it is looking at.
+pub fn log_spec_admits(spec: &str, level: &str, logger: &str) -> bool {
+    let Some(rank) = level_rank(level) else {
+        return false;
+    };
+    let (root, directives) = parse_log_level_spec(spec);
+    let mut threshold = root;
+    let mut matched_depth = 0;
+    for (name, directive_threshold) in &directives {
+        if !is_logger_prefix(name, logger) {
+            continue;
+        }
+        let depth = name.split('.').count();
+        if depth >= matched_depth {
+            matched_depth = depth;
+            threshold = *directive_threshold;
+        }
+    }
+    rank >= threshold
 }
 
 pub fn parse_log_line(line: &str) -> Option<LogEntry> {
     let record = parse_log_record(line)?;
+    // `component` stays a message heuristic and keeps its established
+    // vocabulary (event/transform/dreamer/…) because the log page filters and
+    // colours on those exact values. An r2 line also names its component in
+    // `logger`, which is reported beside it rather than in place of it.
     let component = if record.message.starts_with("event ") {
         "event"
     } else if record.message.starts_with("transform") {
@@ -380,10 +664,12 @@ pub fn parse_log_line(line: &str) -> Option<LogEntry> {
         "dreamer"
     } else if record.message.contains("historian") || record.message.contains("compartment") {
         "historian"
+    } else if record.message.contains("note-nudge") || record.message.contains("note nudge") {
+        // Checked before the generic "nudge" match, which would otherwise
+        // claim every note-nudge line too.
+        "note-nudge"
     } else if record.message.contains("nudge") {
         "nudge"
-    } else if record.message.contains("note-nudge") || record.message.contains("note nudge") {
-        "note-nudge"
     } else {
         "general"
     }
@@ -413,8 +699,10 @@ pub fn parse_log_line(line: &str) -> Option<LogEntry> {
         timestamp: record.ts,
         level: record.level,
         component,
+        logger: record.logger,
         session_id: record.session.unwrap_or_default(),
         tags: record.tags,
+        bound: record.bound,
         message: record.message,
         kv: record.kv,
         raw: line.to_string(),
@@ -630,7 +918,10 @@ fn detect_bust_cause(entries: &[LogEntry], event_idx: usize) -> String {
     if causes.is_empty() {
         "Unknown cause".to_string()
     } else {
-        causes.dedup();
+        // Several lines in the window can name the same cause, not always next
+        // to each other; keep the first mention of each.
+        let mut seen = std::collections::HashSet::new();
+        causes.retain(|cause| seen.insert(cause.clone()));
         causes.join(", ")
     }
 }
@@ -711,79 +1002,270 @@ pub fn read_log_tails(paths: &[PathBuf], max_lines: usize) -> Vec<LogEntry> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_cache_events, parse_log_line, parse_log_record, read_log_tail, read_log_tails,
-        resolve_log_path_for, resolve_log_path_from_temp_dir, resolve_log_paths, Harness,
+        detect_bust_cause, extract_cache_events, log_spec_admits, parse_log_line, parse_log_record, read_log_tail,
+        read_log_tails, resolve_log_path_for, resolve_log_path_from_temp_dir, resolve_log_paths,
+        Harness, LogEntry, LogGrammar, Regex,
     };
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
 
-    // The env var is process-global; serialize the tests that mutate it.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    #[test]
-    fn parses_authority_fixture_and_legacy_grammar() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+    fn golden_fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
             "../../../cli/src/lib/__fixtures__/log_format_golden.json"
         ))
-        .unwrap();
-        let fleet_case = fixture["cases"]
+        .unwrap()
+    }
+
+    fn pairs(value: &serde_json::Value) -> HashMap<String, String> {
+        value
             .as_array()
             .unwrap()
             .iter()
-            .find(|case| case["event"]["module"] == "magic-context")
-            .unwrap();
-        let parsed = parse_log_record(fleet_case["line"].as_str().unwrap()).unwrap();
-        assert_eq!(parsed.ts, "2026-09-05T10:41:03.130Z");
-        assert_eq!(parsed.level.as_deref(), Some("WARN"));
-        assert_eq!(parsed.session.as_deref(), Some("ses_00fc88222ffe"));
-        assert_eq!(parsed.tags, vec!["perf"]);
-        assert_eq!(parsed.message, "transform stage folded");
-        assert_eq!(parsed.kv.get("ms").map(String::as_str), Some("412"));
-        assert_eq!(parsed.kv.get("retry").map(String::as_str), Some("2"));
+            .map(|pair| {
+                (
+                    pair[0].as_str().unwrap().to_string(),
+                    pair[1].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
 
-        let legacy = parse_log_record(
-            "[2026-09-05T10:41:04.130Z] [magic-context][global] transform complete cache.read=7 cache.write=2",
-        )
-        .unwrap();
-        assert_eq!(legacy.level, None);
-        assert_eq!(legacy.session, None);
-        assert_eq!(legacy.message, "transform complete");
-        assert_eq!(legacy.kv.get("cache.read").map(String::as_str), Some("7"));
+    // One event, written by the three producers a developer box can still have
+    // on disk. Each line is the shape of exactly one grammar, and the reader
+    // must not read any of them as another.
+    const R2_LINE: &str = "2026-09-05T10:41:03.130Z WARN  magic-context.perf: [harness=opencode session=opencode:ses_00fc88222ffe] transform stage folded ms=412 retry=2";
+    const R1_LINE: &str = "2026-09-05T10:41:03.130Z WARN  magic-context session=opencode:ses_00fc88222ffe tag=perf transform stage folded ms=412 retry=2";
+    const LEGACY_LINE: &str = "[2026-09-05T10:41:03.130Z] [magic-context][ses_00fc88222ffe] transform stage folded ms=412 retry=2";
+
+    /// The writer removes complete CSI escape sequences (7-bit `ESC [` or the C1
+    /// byte U+009B, then parameter bytes 0x30-0x3F, intermediate bytes 0x20-0x2F
+    /// and one final byte 0x40-0x7E) before rendering, so a reader can never
+    /// recover them. The fixture's `event` still holds the colored input; the
+    /// expected record is the event with those sequences removed. A lone ESC and
+    /// other control characters are escaped, not removed, and round-trip.
+    fn strip_complete_csi(value: &str) -> String {
+        let chars: Vec<char> = value.chars().collect();
+        let mut out = String::with_capacity(value.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let start = if chars[i] == '\u{1b}' && chars.get(i + 1) == Some(&'[') {
+                Some(i + 2)
+            } else if chars[i] == '\u{9b}' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(mut j) = start {
+                while j < chars.len() && ('\u{30}'..='\u{3f}').contains(&chars[j]) {
+                    j += 1;
+                }
+                while j < chars.len() && ('\u{20}'..='\u{2f}').contains(&chars[j]) {
+                    j += 1;
+                }
+                if j < chars.len() && ('\u{40}'..='\u{7e}').contains(&chars[j]) {
+                    i = j + 1;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
     }
 
     #[test]
-    fn preserves_every_golden_message_and_field_suffix() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../cli/src/lib/__fixtures__/log_format_golden.json"
-        ))
-        .unwrap();
+    fn reads_every_render_case_of_the_authority_fleet_r2_fixture() {
+        let fixture = golden_fixture();
         for case in fixture["cases"].as_array().unwrap() {
-            let module = case["event"]["module"].as_str().unwrap();
-            let line = case["line"].as_str().unwrap().replacen(
-                &format!(" {module} "),
-                " magic-context ",
-                1,
+            let name = case["name"].as_str().unwrap();
+            let event = &case["event"];
+            let logger = event["logger"].as_str().unwrap();
+            let bound = pairs(&event["bound"]);
+            // The reader hands consumers the bare id: `session=` carries the
+            // issuer so the id can be matched against a session store, and the
+            // pickers that filter on it show the id alone.
+            let session = bound
+                .get("session")
+                .map(|value| value.split_once(':').unwrap().1.to_string());
+
+            let record = parse_log_record(case["line"].as_str().unwrap())
+                .unwrap_or_else(|| panic!("{name} did not parse"));
+
+            assert_eq!(
+                record.level.as_deref(),
+                Some(event["level"].as_str().unwrap().to_uppercase().as_str()),
+                "{name}"
             );
-            let record = parse_log_record(&line).unwrap();
-            assert_eq!(record.message, case["event"]["message"].as_str().unwrap());
-            let fields: std::collections::HashMap<String, String> = case["event"]["fields"]
-                .as_array()
-                .unwrap()
+            assert_eq!(record.logger, logger, "{name}");
+            assert_eq!(record.session, session, "{name}");
+            assert_eq!(
+                record.tags,
+                logger.split('.').skip(1).collect::<Vec<_>>(),
+                "{name}"
+            );
+            assert_eq!(record.bound, bound, "{name}");
+            assert_eq!(
+                record.message,
+                strip_complete_csi(event["message"].as_str().unwrap()),
+                "{name}"
+            );
+            let mut expected_kv = pairs(&event["fields"]);
+            for value in expected_kv.values_mut() {
+                *value = strip_complete_csi(value);
+            }
+            assert_eq!(record.kv, expected_kv, "{name}");
+            assert_eq!(record.grammar, LogGrammar::FleetR2, "{name}");
+        }
+    }
+
+    #[test]
+    fn admits_or_filters_every_ck_log_case_of_the_authority_fixture() {
+        let fixture = golden_fixture();
+        for case in fixture["level_filter"]["cases"].as_array().unwrap() {
+            let spec = case["spec"].as_str().unwrap();
+            let level = case["level"].as_str().unwrap();
+            let logger = case["logger"].as_str().unwrap();
+            assert_eq!(
+                log_spec_admits(spec, level, logger),
+                case["emit"].as_bool().unwrap(),
+                "{spec} @ {level} {logger}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_the_r2_shape_as_r2_and_nothing_else() {
+        let record = parse_log_record(R2_LINE).unwrap();
+        assert_eq!(record.grammar, LogGrammar::FleetR2);
+        assert_eq!(record.ts, "2026-09-05T10:41:03.130Z");
+        assert_eq!(record.level.as_deref(), Some("WARN"));
+        assert_eq!(record.logger, "magic-context.perf");
+        assert_eq!(record.session.as_deref(), Some("ses_00fc88222ffe"));
+        assert_eq!(record.tags, vec!["perf"]);
+        assert_eq!(
+            record.bound,
+            HashMap::from([
+                ("harness".to_string(), "opencode".to_string()),
+                (
+                    "session".to_string(),
+                    "opencode:ses_00fc88222ffe".to_string()
+                ),
+            ])
+        );
+        assert_eq!(record.message, "transform stage folded");
+    }
+
+    #[test]
+    fn reads_the_r1_shape_as_r1_and_nothing_else() {
+        let record = parse_log_record(R1_LINE).unwrap();
+        assert_eq!(record.grammar, LogGrammar::FleetR1);
+        assert_eq!(record.level.as_deref(), Some("WARN"));
+        assert_eq!(record.logger, "magic-context");
+        assert_eq!(record.session.as_deref(), Some("ses_00fc88222ffe"));
+        assert_eq!(record.tags, vec!["perf"]);
+        assert_eq!(
+            record.bound,
+            HashMap::from([(
+                "session".to_string(),
+                "opencode:ses_00fc88222ffe".to_string()
+            )])
+        );
+        assert_eq!(record.message, "transform stage folded");
+    }
+
+    #[test]
+    fn reads_message_updated_identifiers_as_fields() {
+        let record = parse_log_record("[2026-09-05T10:41:03.130Z] [magic-context][ses_538] event message.updated: provider=mock model=test hasUsageTokens=true tokens.input=10 cache.read=2 cache.write=0 message.id=msg_538 session.id=ses_538").unwrap();
+        assert_eq!(record.session.as_deref(), Some("ses_538"));
+        assert_eq!(record.message, "event message.updated:");
+        assert_eq!(
+            record.kv.get("message.id").map(String::as_str),
+            Some("msg_538")
+        );
+        assert_eq!(
+            record.kv.get("session.id").map(String::as_str),
+            Some("ses_538")
+        );
+    }
+
+    #[test]
+    fn reads_the_legacy_shape_as_legacy_and_maps_global_to_no_session() {
+        let record = parse_log_record(LEGACY_LINE).unwrap();
+        assert_eq!(record.grammar, LogGrammar::Legacy);
+        assert_eq!(record.level, None);
+        assert_eq!(record.logger, "magic-context");
+        assert_eq!(record.session.as_deref(), Some("ses_00fc88222ffe"));
+        assert!(record.tags.is_empty());
+        assert!(record.bound.is_empty());
+        assert_eq!(record.message, "transform stage folded");
+
+        let global = parse_log_record(
+            "[2026-09-05T10:41:04.130Z] [magic-context][global] transform complete cache.read=7 cache.write=2",
+        )
+        .unwrap();
+        assert_eq!(global.session, None);
+        assert_eq!(global.message, "transform complete");
+        assert_eq!(global.kv.get("cache.read").map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn maps_one_event_written_in_all_three_grammars_onto_one_record_shape() {
+        let records: Vec<_> = [R2_LINE, R1_LINE, LEGACY_LINE]
+            .iter()
+            .map(|line| parse_log_record(line).unwrap())
+            .collect();
+        assert_eq!(
+            records
                 .iter()
-                .map(|field| {
-                    (
-                        field[0].as_str().unwrap().to_string(),
-                        field[1].as_str().unwrap().to_string(),
-                    )
-                })
-                .collect();
-            assert_eq!(record.kv, fields, "{}", case["name"]);
+                .map(|record| record.grammar)
+                .collect::<Vec<_>>(),
+            vec![LogGrammar::FleetR2, LogGrammar::FleetR1, LogGrammar::Legacy]
+        );
+        let fields = HashMap::from([
+            ("ms".to_string(), "412".to_string()),
+            ("retry".to_string(), "2".to_string()),
+        ]);
+        for record in &records {
+            assert_eq!(record.session.as_deref(), Some("ses_00fc88222ffe"));
+            assert_eq!(record.message, "transform stage folded");
+            assert_eq!(record.kv, fields);
+        }
+        // What r1 wrote as `tag=perf` is r2's logger component; the legacy
+        // grammar had no way to express it at all.
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.tags.clone())
+                .collect::<Vec<_>>(),
+            vec![vec!["perf".to_string()], vec!["perf".to_string()], vec![]]
+        );
+    }
+
+    #[test]
+    fn writer_side_fixture_sections_are_read_and_drive_no_reader() {
+        // `segment_name` and `retention_prune` pin the WRITER: which file a
+        // module opens for today's UTC day and which old segments it unlinks by
+        // filename. magic-context still writes one `magic-context.log` rotated
+        // to `.1` (packages/plugin/src/shared/logger.ts) and this reader
+        // resolves no daemon log, so nothing here opens or prunes a dated
+        // segment. Read the two sections anyway: when the writer does move,
+        // this is the assertion that fails and asks for a dated-segment
+        // resolver.
+        let fixture = golden_fixture();
+        assert!(!fixture["segment_name"]["cases"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(!fixture["retention_prune"]["cases"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let dated = Regex::new(r"\.\d{4}-\d{2}-\d{2}\.log$").unwrap();
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
+        for path in resolve_log_paths() {
+            assert!(!dated.is_match(&path.to_string_lossy()), "{path:?}");
         }
     }
 
@@ -837,17 +1319,48 @@ mod tests {
 
     #[test]
     fn fleet_fields_feed_existing_cache_telemetry() {
-        let entry = parse_log_line(
+        // The cache page keys on the event fields and the session id, so both
+        // fleet grammars have to arrive at the same entry.
+        for line in [
             "2026-09-05T10:41:03.130Z INFO  magic-context session=opencode:ses_cache cache event cache.read=70 cache.write=20 tokens.input=10",
-        )
-        .unwrap();
-        assert_eq!(entry.message, "cache event");
-        assert_eq!(entry.cache_read, Some(70));
-        assert_eq!(entry.cache_write, Some(20));
-        let events = extract_cache_events(&[entry]);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].input_tokens, 10);
-        assert_eq!(events[0].hit_ratio, 0.7);
+            "2026-09-05T10:41:03.130Z INFO  magic-context.transform: [session=opencode:ses_cache] cache event cache.read=70 cache.write=20 tokens.input=10",
+        ] {
+            let entry = parse_log_line(line).unwrap();
+            assert_eq!(entry.message, "cache event");
+            assert_eq!(entry.session_id, "ses_cache");
+            assert_eq!(entry.cache_read, Some(70));
+            assert_eq!(entry.cache_write, Some(20));
+            let events = extract_cache_events(&[entry]);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].input_tokens, 10);
+            assert_eq!(events[0].hit_ratio, 0.7);
+        }
+    }
+
+    #[test]
+    fn note_nudge_lines_get_their_own_component() {
+        let line = "2026-09-05T10:41:03.130Z INFO  magic-context session=opencode:ses_n note nudge delivered";
+        assert_eq!(parse_log_line(line).unwrap().component, "note-nudge");
+        let line = "2026-09-05T10:41:03.130Z INFO  magic-context session=opencode:ses_n nudge sent";
+        assert_eq!(parse_log_line(line).unwrap().component, "nudge");
+    }
+
+    #[test]
+    fn bust_causes_name_each_cause_once_even_when_not_adjacent() {
+        let entries: Vec<LogEntry> = [
+            "2026-09-05T10:41:01.000Z INFO  magic-context session=opencode:ses_b cache event cache.read=70 cache.write=20 tokens.input=10",
+            "2026-09-05T10:41:02.000Z INFO  magic-context session=opencode:ses_b Execute pass started",
+            "2026-09-05T10:41:02.100Z INFO  magic-context session=opencode:ses_b heuristic cleanup ran",
+            "2026-09-05T10:41:02.200Z INFO  magic-context session=opencode:ses_b Execute pass finished",
+            "2026-09-05T10:41:03.000Z INFO  magic-context session=opencode:ses_b cache event cache.read=0 cache.write=90 tokens.input=10",
+        ]
+        .iter()
+        .map(|line| parse_log_line(line).unwrap())
+        .collect();
+        assert_eq!(
+            detect_bust_cause(&entries, 4),
+            "Execute pass, Heuristic cleanup"
+        );
     }
 
     #[test]
@@ -856,10 +1369,7 @@ mod tests {
             "2026-09-05T10:41:03.130Z WARN magic-context session=opencode:ses_bad transform failed: boom"
         )
         .is_none());
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../cli/src/lib/__fixtures__/log_format_golden.json"
-        ))
-        .unwrap();
+        let fixture = golden_fixture();
         for case in fixture["parse_rejects"].as_array().unwrap() {
             assert!(
                 parse_log_record(case["line"].as_str().unwrap()).is_none(),
@@ -871,8 +1381,8 @@ mod tests {
 
     #[test]
     fn resolve_log_path_for_uses_harness_fallback_when_env_unset() {
-        let _guard = env_lock();
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
 
         assert_eq!(
             resolve_log_path_for(Harness::Opencode),
@@ -930,13 +1440,24 @@ mod tests {
 
     #[test]
     fn resolve_log_paths_reads_all_harnesses_when_no_override_is_set() {
-        let _guard = env_lock();
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
 
         let paths = resolve_log_paths();
-        for harness in [Harness::Opencode, Harness::Pi, Harness::Omp] {
+        for harness in [
+            Harness::Opencode,
+            Harness::Opencode2,
+            Harness::Pi,
+            Harness::Omp,
+        ] {
             assert!(paths.contains(&resolve_log_path_for(harness)));
         }
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with("opencode2/magic-context/magic-context.log")));
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with("logs/magic-context.opencode2.log")));
         assert!(paths
             .iter()
             .any(|path| path.ends_with("logs/magic-context.opencode.log")));
@@ -953,11 +1474,11 @@ mod tests {
 
     #[test]
     fn resolve_log_paths_keeps_standard_families_with_a_shared_override() {
-        let _guard = env_lock();
+        let mut env = crate::test_env::EnvGuard::new();
         let custom = std::env::temp_dir()
             .join("custom")
             .join("magic-context.log");
-        std::env::set_var(
+        env.set(
             "MAGIC_CONTEXT_LOG_PATH",
             custom.to_string_lossy().to_string(),
         );
@@ -970,7 +1491,7 @@ mod tests {
             Harness::Omp
         )));
 
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
     }
 
     #[test]
@@ -998,11 +1519,11 @@ mod tests {
 
     #[test]
     fn resolve_log_path_for_honors_magic_context_log_path_override() {
-        let _guard = env_lock();
+        let mut env = crate::test_env::EnvGuard::new();
         let custom = std::env::temp_dir()
             .join("custom")
             .join("magic-context.log");
-        std::env::set_var(
+        env.set(
             "MAGIC_CONTEXT_LOG_PATH",
             custom.to_string_lossy().to_string(),
         );
@@ -1013,13 +1534,13 @@ mod tests {
         );
         assert_eq!(resolve_log_path_for(Harness::Pi), PathBuf::from(&custom));
 
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
     }
 
     #[test]
     fn resolve_log_path_for_ignores_blank_magic_context_log_path() {
-        let _guard = env_lock();
-        std::env::set_var("MAGIC_CONTEXT_LOG_PATH", "   ");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MAGIC_CONTEXT_LOG_PATH", "   ");
 
         assert_eq!(
             resolve_log_path_for(Harness::Pi),
@@ -1029,6 +1550,6 @@ mod tests {
                 .join("magic-context.log")
         );
 
-        std::env::remove_var("MAGIC_CONTEXT_LOG_PATH");
+        env.remove("MAGIC_CONTEXT_LOG_PATH");
     }
 }

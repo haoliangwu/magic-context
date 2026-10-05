@@ -1,7 +1,12 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createFreshSession,
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 
 /**
  * Memory injection — regression test for v0.9.1.
@@ -16,15 +21,7 @@ import { TestHarness } from "../src/harness";
  * directive — proving injection works even with zero compartments.
  */
 
-let h: TestHarness;
-
-beforeAll(async () => {
-    h = await TestHarness.create();
-});
-
-afterAll(async () => {
-    await h.dispose();
-});
+let h: ScenarioHarness;
 
 function emitMemoryWriteOnce(content: string): void {
     let emitted = false;
@@ -36,7 +33,7 @@ function emitMemoryWriteOnce(content: string): void {
             (tool) =>
                 tool !== null &&
                 typeof tool === "object" &&
-                (tool as { name?: unknown }).name === "ctx_memory",
+                ["ctx_memory", "_ctx_memory"].includes(String((tool as { name?: unknown }).name)),
         ) as { name: string } | undefined;
         if (!memoryTool) return null;
         emitted = true;
@@ -60,7 +57,15 @@ function emitMemoryWriteOnce(content: string): void {
     });
 }
 
-describe("memory injection", () => {
+forEachHost(import.meta.url, "memory injection", (host) => {
+    beforeAll(async () => {
+        h = await createScenarioHarness(host);
+    });
+
+    afterAll(async () => {
+        await h.dispose();
+    });
+
     it("injects <project-memory> on first turn even with no compartments", async () => {
         h.mock.reset();
         h.mock.setDefault({
@@ -80,7 +85,7 @@ describe("memory injection", () => {
         emitMemoryWriteOnce(directive);
         await h.sendPrompt(writerSessionId, "remember the project package-manager rule");
 
-        const memorySessionId = await h.createSession();
+        const memorySessionId = await createFreshSession(h);
 
         // Clear captured requests so the assertion targets only the fresh session.
         h.mock.reset();

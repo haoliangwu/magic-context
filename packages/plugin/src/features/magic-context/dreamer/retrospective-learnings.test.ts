@@ -46,6 +46,17 @@ describe("parseRetrospectiveLearnings", () => {
         expect(learnings[1].route).toBe("observation");
     });
 
+    test("decodes each XML entity exactly once (escaped entities stay literal)", () => {
+        // `&amp;lt;` is the model escaping the literal text `&lt;`; decoding
+        // `&amp;` first and then `&lt;` would wrongly yield `<`.
+        const xml = `<learnings>
+            <learning route="observation">Write &amp;lt; and &amp;amp; literally; plain &lt;tag&gt; is a tag.</learning>
+        </learnings>`;
+        const learnings = parseRetrospectiveLearnings(xml);
+        expect(learnings.length).toBe(1);
+        expect(learnings[0].content).toBe("Write &lt; and &amp; literally; plain <tag> is a tag.");
+    });
+
     test("returns [] when there is no <learnings> block", () => {
         expect(parseRetrospectiveLearnings("no xml here")).toEqual([]);
     });

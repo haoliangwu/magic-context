@@ -4,6 +4,7 @@ import {
     __resetNotificationStateForTests,
     drainNotifications,
 } from "../../shared/rpc-notifications";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 /**
@@ -18,7 +19,7 @@ import {
  */
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { replaceAllCompartments } from "../../features/magic-context/compartment-storage";
@@ -53,7 +54,7 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import type { PluginContext } from "../../plugin/types";
 import { clearModelsDevCache } from "../../shared/models-dev-cache";
-import { Database } from "../../shared/sqlite";
+import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import { __ignoredNotificationTest } from "./send-session-notification";
@@ -98,7 +99,7 @@ afterEach(() => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     process.env.XDG_CACHE_HOME = dir;
@@ -191,7 +192,6 @@ function makeOffTransform(args: {
         rustModeModuleClient: args.rustModuleCall
             ? ({ call: args.rustModuleCall } as never)
             : undefined,
-        rustModeAllowAuthorityProtocolBypassForTests: true,
     });
     return { db, transform };
 }
@@ -737,6 +737,40 @@ describe("compaction-off transform — additive-only proof (issue #266 S3)", () 
         }
         expect(allText(guarded)).not.toContain("persisted note reminder");
         expect(allText(guarded)).not.toContain("persisted search hint");
+    });
+
+    it("does not lend the foreground retry budget to automatic embedding work", async () => {
+        useTempDataHome("co-embedding-scope-");
+        let launches = 0;
+        let attempts = 0;
+        let failure: unknown;
+        const { db, transform } = makeOffTransform({
+            sessionId: "ses-1",
+            maybeAutoEmbedSession: () => {
+                launches++;
+                const exec = spyOn(db, "exec").mockImplementation(() => {
+                    attempts++;
+                    throw Object.assign(new Error("embedding busy"), { code: "SQLITE_BUSY" });
+                });
+                const wait = spyOn(Atomics, "wait").mockReturnValue("timed-out");
+                try {
+                    withPrivilegedWriter(db, () => undefined);
+                } catch (error) {
+                    failure = error;
+                } finally {
+                    exec.mockRestore();
+                    wait.mockRestore();
+                }
+            },
+        });
+        const handler = createMessagesTransformHandler({
+            magicContext: { "experimental.chat.messages.transform": transform },
+            compactionOff: true,
+        });
+        await handler({}, { messages: makeMessages("ses-1") });
+        expect(launches).toBe(1);
+        expect(attempts).toBe(1);
+        expect((failure as Error).message).toBe("embedding busy");
     });
 
     it("keeps retained inputs read-only and shallow-restores them after a full-pass exception", async () => {

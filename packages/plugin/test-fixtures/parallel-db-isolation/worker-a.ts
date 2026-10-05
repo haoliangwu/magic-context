@@ -1,7 +1,12 @@
 import { test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { closeDatabase, openDatabase, resolveDatabasePath } from "../../src/features/magic-context/storage-db";
+import {
+    closeDatabase,
+    LATEST_SUPPORTED_VERSION,
+    openDatabase,
+    resolveDatabasePath,
+} from "../../src/features/magic-context/storage-db";
 import { Database } from "../../src/shared/sqlite";
 import { closeQuietly } from "../../src/shared/sqlite-helpers";
 
@@ -26,6 +31,15 @@ function record(name: string): void {
     );
 }
 
+async function waitForContender(): Promise<void> {
+    const ready = join(probeDir, "worker-b-ready");
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(ready)) {
+        if (Date.now() >= deadline) throw new Error("worker B never reached the database open");
+        await Bun.sleep(20);
+    }
+}
+
 test("worker A holds its default database write lock", async () => {
     const { dbPath } = resolveDatabasePath();
     mkdirSync(dirname(dbPath), { recursive: true });
@@ -37,9 +51,14 @@ test("worker A holds its default database write lock", async () => {
     const lock = new Database(dbPath);
     try {
         lock.exec("PRAGMA busy_timeout=0");
+        lock.prepare("DELETE FROM schema_migrations WHERE version = ?").run(
+            LATEST_SUPPORTED_VERSION,
+        );
+        lock.exec("DROP TABLE single_store_state");
         lock.exec("BEGIN IMMEDIATE");
         record("worker-a.json");
-        await Bun.sleep(6_000);
+        await waitForContender();
+        await Bun.sleep(12_000);
         lock.exec("COMMIT");
     } finally {
         closeQuietly(lock);

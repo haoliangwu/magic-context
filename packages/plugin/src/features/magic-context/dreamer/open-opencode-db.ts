@@ -1,4 +1,5 @@
 import { getErrorMessage } from "../../../shared/error-message";
+import { harnessOwnsOpenCodeStore } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
 import {
     assertOpenCodeStoreGeneration,
@@ -15,8 +16,11 @@ import { Database } from "../../../shared/sqlite";
  * history, e.g. the retrospective scanner and the orphaned-child sweep).
  * Returns null when absent or unopenable — callers degrade gracefully.
  * Absence is normal on Pi-only installs, so it is not logged as an error.
+ * A Pi or OMP process never opens OpenCode's store, even when one exists on
+ * the machine: its sessions belong to OpenCode, not to the Pi project.
  */
 export function openOpenCodeDb(): Database | null {
+    if (!harnessOwnsOpenCodeStore()) return null;
     const resolution = resolveOpenCodeDbPath();
     const dbPath = resolution.path;
     if (!openCodeDbPathExists(resolution)) {

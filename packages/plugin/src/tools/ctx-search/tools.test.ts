@@ -5,6 +5,7 @@ import { indexMessagesAfterOrdinal } from "../../features/magic-context/message-
 import { runMigrations } from "../../features/magic-context/migrations";
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
 import * as searchModule from "../../features/magic-context/search";
+import { MAX_UNIFIED_SEARCH_LIMIT } from "../../features/magic-context/search";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
@@ -47,6 +48,23 @@ describe("createCtxSearchTools", () => {
         const result = await tools.ctx_search.execute({ query: "   " }, toolContext());
 
         expect(result).toBe("Error: 'query' is required.");
+    });
+
+    it("rejects an invalid date instead of silently searching without it", async () => {
+        const tools = createCtxSearchTools({
+            db,
+            resolveProjectPath: () => "/repo/project",
+            memoryEnabled: false,
+            embeddingEnabled: false,
+            readMessages: () => [],
+        });
+
+        const result = await tools.ctx_search.execute(
+            { query: "needle", from: "2026-02-30" },
+            toolContext(),
+        );
+
+        expect(result).toBe("Error: Invalid 'from' date; use YYYY-MM-DD or a full ISO datetime.");
     });
 
     it("formats empty search results", async () => {
@@ -227,6 +245,36 @@ describe("createCtxSearchTools", () => {
         expect(clean).toContain("first result");
         expect(clean).toContain("second result");
         expect(clean).toContain("third result");
+    });
+
+    // A model-supplied limit is the only bound on the result size, so an
+    // unbounded one (limit: 1e6) could dump the archive into a single tool
+    // result. The cap matches the Rust module's ctx_search.
+    it("caps a huge limit at the maximum result count", async () => {
+        const isolated = createTestDb();
+        try {
+            for (let index = 0; index < 40; index += 1) {
+                insertMemory(isolated, {
+                    projectPath: "/repo/project",
+                    category: "ARCHITECTURE",
+                    content: `Needle bravo entry number ${index} result.`,
+                });
+            }
+            const isolatedTools = createCtxSearchTools({
+                db: isolated,
+                resolveProjectPath: () => "/repo/project",
+                memoryEnabled: true,
+                embeddingEnabled: false,
+                readMessages: () => [],
+            });
+            const result = await isolatedTools.ctx_search.execute(
+                { query: "Needle bravo", sources: ["memory"], limit: 1_000_000 },
+                toolContext(),
+            );
+            expect(result).toContain(`Found ${MAX_UNIFIED_SEARCH_LIMIT} results`);
+        } finally {
+            closeQuietly(isolated);
+        }
     });
 
     it("formats message results with inline ranges and one trailing expand hint", async () => {

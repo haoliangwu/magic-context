@@ -1,4 +1,4 @@
-# m1bench is the dedicated private-source release runner.
+# Retained for workflow validation of the retired self-hosted runner label.
 self-hosted-runner:
   labels:
     - m1bench

@@ -1,0 +1,93 @@
+[
+	{
+		"type": "message",
+		"id": "s0",
+		"message": {
+			"role": "system",
+			"content": "INITIAL_SYSTEM_NOT_HISTORIAN_PROSE",
+			"toolsAdded": [
+				{
+					"name": "read",
+					"description": "Read a file",
+					"parameters": { "type": "object" }
+				}
+			],
+			"timestamp": 0
+		}
+	},
+	{
+		"type": "message",
+		"id": "u0",
+		"message": {
+			"role": "user",
+			"content": "Inspect the source file",
+			"timestamp": 1
+		}
+	},
+	{
+		"type": "message",
+		"id": "a0",
+		"message": {
+			"role": "assistant",
+			"content": [
+				{
+					"type": "toolCall",
+					"id": "call0",
+					"name": "read",
+					"arguments": { "path": "source.ts" }
+				}
+			],
+			"timestamp": 2
+		}
+	},
+	{
+		"type": "message",
+		"id": "r0",
+		"message": {
+			"role": "toolResult",
+			"toolCallId": "call0",
+			"toolName": "read",
+			"content": [{ "type": "text", "text": "Source contents" }],
+			"timestamp": 3
+		}
+	},
+	{
+		"type": "message",
+		"id": "s1",
+		"message": {
+			"role": "system",
+			"content": [
+				{ "type": "text", "text": "DELTA_SYSTEM_NOT_HISTORIAN_PROSE" }
+			],
+			"sections": { "policy": "Updated policy" },
+			"toolsAdded": [
+				{
+					"name": "edit",
+					"description": "Edit a file",
+					"parameters": { "type": "object" }
+				}
+			],
+			"timestamp": 4
+		}
+	},
+	{
+		"type": "message",
+		"id": "u1",
+		"message": {
+			"role": "user",
+			"content": "Explain the result",
+			"timestamp": 5
+		}
+	},
+	{
+		"type": "message",
+		"id": "a1",
+		"message": {
+			"role": "assistant",
+			"content": [
+				{ "type": "text", "text": "The source implements a reader." }
+			],
+			"timestamp": 6
+		}
+	}
+]

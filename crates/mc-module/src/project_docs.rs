@@ -7,8 +7,8 @@
 //!    regular file (a symlinked doc — e.g. pointed at ~/.ssh/id_rsa to exfiltrate it
 //!    into the prompt — fingerprints as absent and is skipped),
 //!  - a size cap rejects an oversized doc before it can blow up the prompt,
-//!  - the regular-file + size check is RE-DONE at read time to close the TOCTOU gap
-//!    between fingerprint and read.
+//!  - the file is opened once and checked on that handle (same file the stat saw, read
+//!    no further than the cap), closing the gap between checking the path and reading it.
 //!
 //! The canonical hash drives a deferred-HARD on docs edits (the trigger wiring is the
 //! slice-4d integration question, Q1); the read + render + hash here are independent of
@@ -16,6 +16,7 @@
 
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 const PROJECT_DOC_FILES: [&str; 2] = ["ARCHITECTURE.md", "STRUCTURE.md"];
@@ -56,22 +57,57 @@ fn escape_xml_content(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Read a doc safely: a regular file (NOT a symlink) within the size cap, re-checked at
-/// read time. Returns the canonical content, or None if absent/unsafe/oversized.
+/// Read a doc safely: a regular file (NOT a symlink) within the size cap. Returns the
+/// canonical content, or None if absent/unsafe/oversized.
+///
+/// Checking the path and then reading it is a race: the file can be swapped for a
+/// symlink in between, and the read would follow it. So the file is opened once and
+/// everything is decided on that open handle: it must be the same file the non-following
+/// stat saw (same device and inode), so a swap between the stat and the open is refused,
+/// and a swap after the open no longer matters. The read itself stops one byte past the
+/// cap, so a file that grows after the check cannot pull an unbounded amount into m0.
 fn read_safe_canonical(path: &Path) -> Option<String> {
     // symlink_metadata does NOT follow a symlink (matches the TS lstat guard).
     let meta = fs::symlink_metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_PROJECT_DOC_BYTES {
         return None;
     }
-    // Re-check at read time to close the TOCTOU gap (a path swapped to a symlink after
-    // the first stat). std::fs::read follows symlinks, so the re-check is what protects.
-    let meta2 = fs::symlink_metadata(path).ok()?;
-    if !meta2.is_file() || meta2.len() > MAX_PROJECT_DOC_BYTES {
+    #[cfg(test)]
+    tests::BETWEEN_STAT_AND_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(path);
+        }
+    });
+    let file = fs::File::open(path).ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || !same_file(&meta, &opened) {
         return None;
     }
-    let raw = fs::read_to_string(path).ok()?;
+    let mut raw = Vec::new();
+    file.take(MAX_PROJECT_DOC_BYTES + 1)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() as u64 > MAX_PROJECT_DOC_BYTES {
+        return None;
+    }
+    let raw = String::from_utf8(raw).ok()?;
     Some(canonicalize_doc_content(&raw))
+}
+
+/// Whether two stats describe the same file.
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+/// Whether two stats describe the same file. Without inode numbers in the standard
+/// library, the type, length and modification time stand in for them.
+#[cfg(not(unix))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
 }
 
 /// Read + render + hash the project docs in `project_directory`. Pure over the
@@ -121,7 +157,64 @@ pub fn read_project_docs_canonical(project_directory: &str) -> ProjectDocs {
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use std::cell::RefCell;
     use std::io::Write;
+
+    type Hook = Box<dyn Fn(&Path)>;
+
+    thread_local! {
+        /// Runs between the non-following stat and the open, where a racing writer can act.
+        pub(super) static BETWEEN_STAT_AND_OPEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    fn with_hook<T>(hook: impl Fn(&Path) + 'static, body: impl FnOnce() -> T) -> T {
+        BETWEEN_STAT_AND_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let result = body();
+        BETWEEN_STAT_AND_OPEN.with(|slot| *slot.borrow_mut() = None);
+        result
+    }
+
+    /// A doc swapped for a symlink after it was checked must not be followed into the
+    /// prompt.
+    #[cfg(unix)]
+    #[test]
+    fn a_doc_swapped_for_a_symlink_after_the_check_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, "PRIVATE KEY").unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        write_doc(&project, "ARCHITECTURE.md", "# Architecture\n");
+        let docs = with_hook(
+            move |path| {
+                fs::remove_file(path).unwrap();
+                std::os::unix::fs::symlink(&secret, path).unwrap();
+            },
+            || read_project_docs_canonical(project.to_str().unwrap()),
+        );
+        assert!(
+            !docs.rendered_block.contains("PRIVATE KEY"),
+            "{}",
+            docs.rendered_block
+        );
+        assert_eq!(docs, ProjectDocs::default());
+    }
+
+    /// A doc that grows past the cap after it was checked is skipped, not read whole.
+    #[test]
+    fn a_doc_that_grows_past_the_cap_after_the_check_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_doc(dir.path(), "ARCHITECTURE.md", "# Architecture\n");
+        let docs = with_hook(
+            |path| {
+                let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(&vec![b'x'; MAX_PROJECT_DOC_BYTES as usize + 1])
+                    .unwrap();
+            },
+            || read_project_docs_canonical(dir.path().to_str().unwrap()),
+        );
+        assert_eq!(docs, ProjectDocs::default());
+    }
 
     fn write_doc(dir: &Path, name: &str, body: &str) {
         let mut f = fs::File::create(dir.join(name)).unwrap();

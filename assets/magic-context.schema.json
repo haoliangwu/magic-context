@@ -12,7 +12,7 @@
     },
     "allow_home_project": {
       "default": false,
-      "description": "Allow Magic Context sessions launched from the exact canonical home directory. The home session uses its deterministic dir: identity so pre-gate memories reconnect. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
+      "description": "Allow Magic Context sessions launched from the exact canonical home directory. A non-git home uses its deterministic dir: identity; a home repository uses its git: identity. USER-LEVEL ONLY: project config is ignored. The home identity is excluded from registry seed exports, never resolves descendants by containment, and cannot join a workspace.",
       "type": "boolean"
     },
     "mural": {
@@ -28,6 +28,7 @@
         },
         "model": {
           "description": "Model for the compress-cues task that compresses each memory into a mural cue. The mural image itself is rendered deterministically (no author model).",
+          "x-mc-live-reload": true,
           "type": "string",
           "minLength": 1
         }
@@ -708,13 +709,34 @@
         },
         "maxTokens": {
           "description": "Maximum output tokens",
+          "x-mc-live-reload": true,
           "type": "number"
+        },
+        "expand_tools": {
+          "description": "Readable historian tool expansions, keyed by exact host tool name. Templates override built-in defaults; false disables an expansion. Supports ${input.path}, ${output.path}, bare ${output}, array [N], [*].field, .each(\"${field}\"), .join(\"separator\"), .count and final .truncate(N). Missing fields are empty; placeholders default to 300 characters, lists to 10 elements, expansions to 1000 characters. Valid in user and project config; affects historian/recomp and verbose ctx_expand only, never the wire or default ctx_expand transcript.",
+          "x-mc-live-reload": true,
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "boolean",
+                "const": false
+              }
+            ]
+          }
         },
         "opencode": {
           "type": "object",
           "properties": {
             "model": {
               "description": "Primary OpenCode model entry.",
+              "x-mc-live-reload": true,
               "anyOf": [
                 {
                   "type": "string"
@@ -740,6 +762,7 @@
             },
             "fallback_models": {
               "description": "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+              "x-mc-live-reload": true,
               "type": "array",
               "items": {
                 "anyOf": [
@@ -768,6 +791,7 @@
             },
             "variant": {
               "description": "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+              "x-mc-live-reload": true,
               "type": "string"
             }
           },
@@ -779,6 +803,7 @@
           "properties": {
             "model": {
               "description": "Primary Pi model entry.",
+              "x-mc-live-reload": true,
               "anyOf": [
                 {
                   "type": "string"
@@ -813,6 +838,7 @@
             },
             "fallback_models": {
               "description": "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+              "x-mc-live-reload": true,
               "type": "array",
               "items": {
                 "anyOf": [
@@ -850,6 +876,7 @@
             },
             "thinking_level": {
               "description": "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+              "x-mc-live-reload": true,
               "type": "string",
               "enum": [
                 "off",
@@ -870,6 +897,7 @@
           "properties": {
             "model": {
               "description": "Primary OMP model entry.",
+              "x-mc-live-reload": true,
               "anyOf": [
                 {
                   "type": "string"
@@ -906,6 +934,7 @@
             },
             "fallback_models": {
               "description": "Ordered fallback OMP entries.",
+              "x-mc-live-reload": true,
               "type": "array",
               "items": {
                 "anyOf": [
@@ -945,6 +974,7 @@
             },
             "thinking_level": {
               "description": "OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+              "x-mc-live-reload": true,
               "type": "string",
               "enum": [
                 "off",
@@ -962,14 +992,33 @@
           "additionalProperties": false,
           "description": "Strict OMP model-resolution block. It accepts no OpenCode vocabulary."
         },
+        "runner": {
+          "description": "Which side runs the historian completion in Rust transform mode: \"host\" queues it for this process to run on the configured historian model, \"broca\" routes it to the Broca module. When unset the harness decides: OpenCode 1 and OpenCode 2 use \"host\", Claude Code (through the Thalamus gateway, which has no host to run a completion) uses \"broca\". User-level config only — it decides whose provider account pays for the call.",
+          "type": "string",
+          "enum": [
+            "broca",
+            "host"
+          ]
+        },
+        "host_runner": {
+          "description": "Controls for this process's historian pull loop, which answers runs the Rust module queues for the host runner (`historian.runner: \"host\"`, or unset on OpenCode 1 and OpenCode 2). User-level config only — it decides whether this machine's provider account is spent on folds.",
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "description": "Whether this process answers historian runs queued for a claimant (default true). Setting it to false stops the pull loop without changing historian.runner, so an operator can take one machine out of the lane and leave the queued runs for another claimant or for the runner setting to be changed deliberately.",
+              "type": "boolean"
+            }
+          }
+        },
         "two_pass": {
           "default": false,
           "description": "Run a second editor pass over historian output to clean low-signal U: lines and cross-compartment duplicates. Adds ~1 extra API call and ~1.3x cost per historian run. Useful for models without extended thinking support. (default: false)",
+          "x-mc-live-reload": true,
           "type": "boolean"
         },
         "disallowed_tools": {
           "default": [],
-          "description": "OpenCode only. Tools to REMOVE from the historian's default allow-list [read, aft_outline, aft_zoom, aft_search]. Applies to both historian and historian-editor agents. Use [\"*\"] to strip all tool definitions from the model request — this prevents weak instruction-following models (e.g. mistral-small-latest) from entering tool-calling loops. Individual tool names remove just that tool. Note: a user-supplied historian.permission override can re-allow a tool that disallowed_tools removed — disallowed_tools sets the baseline, permission overrides take precedence. (default: [])",
+          "description": "Legacy compatibility setting. Historians, recomp and editor passes always run with zero tools and locked permissions; this list no longer changes their tool surface. (default: [])",
           "type": "array",
           "items": {
             "type": "string",
@@ -1106,13 +1155,23 @@
         },
         "maxTokens": {
           "description": "Maximum output tokens",
+          "x-mc-live-reload": true,
           "type": "number"
+        },
+        "runner": {
+          "description": "Which side runs the dreamer completions the Rust module routes (classify-memories) in Rust transform mode: \"host\" runs them on this process's carrier, \"broca\" routes them to the Broca module. When unset, historian.runner applies, and when that is unset too the harness decides the same way it does for the historian. User-level config only.",
+          "type": "string",
+          "enum": [
+            "broca",
+            "host"
+          ]
         },
         "opencode": {
           "type": "object",
           "properties": {
             "model": {
               "description": "Primary OpenCode model entry.",
+              "x-mc-live-reload": true,
               "anyOf": [
                 {
                   "type": "string"
@@ -1138,6 +1197,7 @@
             },
             "fallback_models": {
               "description": "Ordered fallback OpenCode entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+              "x-mc-live-reload": true,
               "type": "array",
               "items": {
                 "anyOf": [
@@ -1166,10 +1226,12 @@
             },
             "variant": {
               "description": "OpenCode reasoning variant for the primary entry when it declares none. Fallback entries declare variants per-entry.",
+              "x-mc-live-reload": true,
               "type": "string"
             },
             "tasks": {
               "description": "OpenCode task execution overrides. Each named task accepts only model, fallback_models, variant, and timeout_minutes.",
+              "x-mc-live-reload": true,
               "type": "object",
               "propertyNames": {
                 "type": "string"
@@ -1252,6 +1314,7 @@
           "properties": {
             "model": {
               "description": "Primary Pi model entry.",
+              "x-mc-live-reload": true,
               "anyOf": [
                 {
                   "type": "string"
@@ -1286,6 +1349,7 @@
             },
             "fallback_models": {
               "description": "Ordered fallback Pi entries. New-shape configuration requires an array; legacy singleton values migrate to a one-element array.",
+              "x-mc-live-reload": true,
               "type": "array",
               "items": {
                 "anyOf": [
@@ -1323,6 +1387,7 @@
             },
             "thinking_level": {
               "description": "Pi thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+              "x-mc-live-reload": true,
               "type": "string",
               "enum": [
                 "off",
@@ -1336,6 +1401,7 @@
             },
             "tasks": {
               "description": "Pi task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.",
+              "x-mc-live-reload": true,
               "type": "object",
               "propertyNames": {
                 "type": "string"
@@ -1445,6 +1511,7 @@
           "properties": {
             "model": {
               "description": "Primary OMP model entry.",
+              "x-mc-live-reload": true,
               "anyOf": [
                 {
                   "type": "string"
@@ -1481,6 +1548,7 @@
             },
             "fallback_models": {
               "description": "Ordered fallback OMP entries.",
+              "x-mc-live-reload": true,
               "type": "array",
               "items": {
                 "anyOf": [
@@ -1520,6 +1588,7 @@
             },
             "thinking_level": {
               "description": "OMP thinking level for the primary entry when it declares none. Fallback entries declare thinking levels per-entry.",
+              "x-mc-live-reload": true,
               "type": "string",
               "enum": [
                 "off",
@@ -1535,6 +1604,7 @@
             },
             "tasks": {
               "description": "OMP task execution overrides. Each named task accepts only model, fallback_models, thinking_level, and timeout_minutes.",
+              "x-mc-live-reload": true,
               "type": "object",
               "propertyNames": {
                 "type": "string"
@@ -1666,10 +1736,12 @@
               "schedule": "0 6 * * *"
             },
             "retrospective": {
-              "schedule": "0 5 * * *"
+              "schedule": "0 5 * * *",
+              "recency_days": 30
             },
             "maintain-docs": {
-              "schedule": ""
+              "schedule": "",
+              "max_tokens": 12000
             },
             "evaluate-smart-notes": {
               "schedule": "0 3 * * *"
@@ -1696,8 +1768,15 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1710,8 +1789,15 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1724,8 +1810,15 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1738,8 +1831,15 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1752,8 +1852,15 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1766,36 +1873,74 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
             },
             "retrospective": {
               "default": {
-                "schedule": "0 5 * * *"
+                "schedule": "0 5 * * *",
+                "recency_days": 30
               },
               "type": "object",
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "recency_days": {
+                  "default": 30,
+                  "description": "retrospective: collect source messages from only the most recent N days",
+                  "x-mc-live-reload": true,
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3650
                 }
               },
               "additionalProperties": false
             },
             "maintain-docs": {
               "default": {
-                "schedule": ""
+                "schedule": "",
+                "max_tokens": 12000
               },
               "type": "object",
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "max_tokens": {
+                  "default": 12000,
+                  "description": "Maximum combined token count of proposed ARCHITECTURE.md and STRUCTURE.md",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1808,8 +1953,15 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1823,11 +1975,20 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
                 },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
                 "promotion_threshold": {
+                  "default": 3,
                   "description": "review-user-memories: min candidate observations before promotion is considered (default: 3)",
+                  "x-mc-live-reload": true,
                   "type": "number",
                   "minimum": 2,
                   "maximum": 20
@@ -1844,11 +2005,20 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
                 },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
                 "promotion_threshold": {
+                  "default": 2,
                   "description": "promote-primers: min recurring source days before promotion is considered (default: 2)",
+                  "x-mc-live-reload": true,
                   "type": "number",
                   "minimum": 2,
                   "maximum": 20
@@ -1864,8 +2034,15 @@
               "properties": {
                 "schedule": {
                   "default": "",
+                  "x-mc-live-reload": true,
                   "type": "string",
                   "description": "5-field cron schedule (e.g. \"0 3 * * *\"), or \"\" to disable this task."
+                },
+                "token_budget": {
+                  "description": "Cumulative prompt-token investigation budget (input + cache read + cache write) for one tool-loop child. Defaults: 2,500,000 for map-memories and verify; 3,000,000 for verify-broad; other tool-loop tasks vary. Completed answers are retained even if their usage crosses the budget.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
                 }
               },
               "additionalProperties": false
@@ -1896,7 +2073,7 @@
     },
     "cache_ttl": {
       "default": "5m",
-      "description": "How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. \"5m\", \"1h\", \"30s\") or per-model object ({ default: \"5m\", \"provider/model\": \"1h\", \"provider/*\": \"never\" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). Set to \"never\" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).",
+      "description": "How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. \"5m\", \"1h\", \"30s\") or per-model object ({ default: \"5m\", \"provider/model\": \"1h\", \"provider/*\": \"never\" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard). Explicit per-model entries win; otherwise GPT-5.6 and later (including gpt-6*, through any provider prefix) use a built-in 30m lifetime before the object default or 5m fallback. An unset or global \"5m\" opts into built-in defaults; any other global string is an explicit policy and wins. Policy is frozen per session, including across restarts; a model switch resolves against that frozen policy. /ctx-status shows the effective value and source. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to \"never\" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).",
       "anyOf": [
         {
           "type": "string"
@@ -2001,6 +2178,7 @@
     "toast_duration_ms": {
       "default": 5000,
       "description": "TUI toast lifetime in milliseconds for Magic Context notifications. Set to 0 to disable Magic Context toasts entirely (min: 0, max: 60000, default: 5000)",
+      "x-mc-live-reload": true,
       "type": "number",
       "minimum": 0,
       "maximum": 60000
@@ -2075,7 +2253,8 @@
     },
     "historian_timeout_ms": {
       "default": 600000,
-      "description": "Timeout for each historian prompt call in milliseconds (default: 600000)",
+      "description": "Timeout for each historian prompt call in both TypeScript and Rust transform modes, in milliseconds (default: 600000)",
+      "x-mc-live-reload": true,
       "type": "number",
       "minimum": 60000
     },
@@ -2090,11 +2269,13 @@
         "enabled": {
           "default": true,
           "description": "Enable commit-cluster based historian triggering (default: true)",
+          "x-mc-live-reload": true,
           "type": "boolean"
         },
         "min_clusters": {
           "default": 3,
           "description": "Minimum commit clusters required to trigger historian (min: 1, default: 3)",
+          "x-mc-live-reload": true,
           "type": "number",
           "minimum": 1
         }
@@ -2171,7 +2352,7 @@
       "properties": {
         "provider": {
           "default": "local",
-          "description": "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings.",
+          "description": "Embedding provider. 'local' uses Xenova/all-MiniLM-L6-v2, 'openai-compatible' requires endpoint and model, 'synapse' uses the certified local Synapse lane with an explicit fallback provider, and 'off' disables embeddings. Session history is embedded for semantic ctx_search whenever the provider is not 'off', regardless of memory.enabled; memories are embedded only while memory.enabled is true.",
           "type": "string",
           "enum": [
             "local",
@@ -2237,7 +2418,7 @@
         },
         "local_runtime": {
           "default": "auto",
-          "description": "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Set 'native' only to prefer speed while accepting that pre-1.4.0 Bun crash risk, or 'wasm' to avoid loading the native addon.",
+          "description": "Local provider only: ONNX runtime selection. 'auto' uses native under Node and uses WASM under Bun versions before 1.4.0, where Bun's NAPI teardown race can panic on quit; native is restored automatically on Bun 1.4.0+. Inference runs in a dedicated worker. On Bun before 1.4.0, even explicit 'native' uses WASM because native worker teardown can crash the process. Set 'wasm' to avoid loading the native addon on newer hosts too.",
           "type": "string",
           "enum": [
             "auto",
@@ -2301,7 +2482,7 @@
     },
     "keep_subagents": {
       "default": false,
-      "description": "Debug: keep the child sessions Magic Context spawns for its own subagents (historian, dreamer, memory-migration) instead of deleting them on success. Useful for short-term inspection/data collection — their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect.",
+      "description": "Debug: keep every settled Magic Context child session instead of deleting it after success: historian, all Dreamer tasks, smart-note evaluation and compilation, user-memory review, and memory migration. Kept Dreamer children can contain memory-pool text and user messages from other sessions of the same operator; their full transcript (prompt, tool calls, token usage, output) stays in the host session store. Kept sessions accumulate until manually cleared; leave false for normal use. Requires a restart to take effect. On OpenCode 2, one hidden session holds many runs; it is kept once any of its runs settled, and only a Dreamer session none of whose runs settled is still deleted.",
       "type": "boolean"
     },
     "debug_rpc": {
@@ -2323,22 +2504,22 @@
       "properties": {
         "enabled": {
           "default": true,
-          "description": "When false, Magic Context stops managing the context window and keeps its knowledge layer: memory and docs/user-profile/key-files injection through additive m[0]/m[1], raw-message FTS indexing, dreamer, notes, ctx_search, ctx_expand, ctx_memory, and /ctx-embed remain available. MC's historian/compartment preparation, tagging, markers, pruning, folding, drops, strips, splicing, synthetic context-management todos, temporal markers, nudges, and fail-closed blocking stop; ctx_expand remains a knowledge-surface tool. fail_closed_blocking is inert: a transform failure passes the input messages through without blocking or cancelling. This setting does not enable native compaction: OpenCode's compaction.auto / compaction.prune or Pi's equivalent owns the window, or nothing does. MC's compaction.enabled in magic-context.jsonc is distinct from OpenCode's compaction.auto / compaction.prune in opencode.jsonc; they are different files and different owners. On the first turn after disabling, a long session may trigger one native compaction cycle; MC removes only its own marker boundary, leaves native boundaries and stored compartments intact, and does no pre-trimming mitigation. Marker cleanup is lazy per session, so an unresumed session is cleaned when it is next resumed. If compaction is enabled again, run /ctx-wrapup when the historian is runnable to catch up. OpenCode peer verification against v1.18.4 confirms native compaction covers child sessions: subagents receive additive memory/docs injection and no MC reclaim in this mode, so keep subagent tasks small or leave compaction.enabled on for long subagent runs. This is boot-resolved and requires a process restart; project-tier compaction.enabled is stripped so a cloned repository cannot disable the user's setting. The sidebar reports raw usage as Context: <pct>% · native compaction or Context: <pct>% · no active compaction and does not show an MC execute-threshold fill. /ctx-wrapup, /ctx-recomp, /ctx-flush, and /ctx-session-upgrade refuse without context-management side effects; /ctx-embed remains functional. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed.",
+          "description": "When false, Magic Context stops managing the context window and keeps its knowledge layer: memory and docs/user-profile/key-files injection through additive m[0]/m[1], raw-message FTS indexing, dreamer, notes, ctx_search, ctx_expand, ctx_memory, and /ctx-embed remain available. MC's historian/compartment preparation, tagging, markers, pruning, folding, drops, strips, splicing, synthetic context-management todos, temporal markers, nudges, and fail-closed blocking stop; ctx_expand remains a knowledge-surface tool. fail_closed_blocking is inert: a transform failure passes the input messages through without blocking or cancelling. This setting does not enable native compaction: OpenCode's compaction.auto / compaction.prune or Pi's equivalent owns the window, or nothing does. MC's compaction.enabled in magic-context.jsonc is distinct from OpenCode's compaction.auto / compaction.prune in opencode.jsonc; they are different files and different owners. On the first turn after disabling, a long session may trigger one native compaction cycle; MC removes only its own marker boundary, leaves native boundaries and stored compartments intact, and does no pre-trimming mitigation. Marker cleanup is lazy per session, so an unresumed session is cleaned when it is next resumed. If compaction is enabled again, run /ctx-wrapup when the historian is runnable to catch up. OpenCode peer verification against v1.18.4 confirms native compaction covers child sessions: subagents receive additive memory/docs injection and no MC reclaim in this mode, so keep subagent tasks small or leave compaction.enabled on for long subagent runs. This is boot-resolved and requires a process restart; project-tier compaction.enabled is stripped so a cloned repository cannot disable the user's setting. The sidebar reports raw usage as Context: <pct>% · native compaction or Context: <pct>% · no active compaction and does not show an MC execute-threshold fill. /ctx-wrapup, /ctx-recomp, and /ctx-flush refuse without context-management side effects; /ctx-embed remains functional. Raw content hidden by a native boundary before Magic Context's first pass is not retroactively indexed.",
           "type": "boolean"
         }
       }
     },
     "todowrite": {
       "default": {
-        "enabled": true,
+        "enabled": false,
         "overlay": true
       },
       "description": "Pi-only todowrite tool and overlay controls. Pi registers tools and widgets at extension boot, so changing this after /cd requires /reload or restart.",
       "type": "object",
       "properties": {
         "enabled": {
-          "default": true,
-          "description": "Pi only: register Magic Context's todowrite task-list tool. Disable if you use your own todo extension. OpenCode ships its own built-in todowrite; this setting has no effect there.",
+          "default": false,
+          "description": "Pi only: off by default. Set todowrite.enabled=true to register Magic Context's todowrite task-list tool and /todos command. OpenCode ships its own built-in todowrite; this setting has no effect there.",
           "type": "boolean"
         },
         "overlay": {
@@ -2411,7 +2592,7 @@
       "properties": {
         "enabled": {
           "default": true,
-          "description": "Enable cross-session memory (default: true)",
+          "description": "Enable cross-session memory (default: true). Does not affect history embedding or semantic ctx_search over session history; set embedding.provider to 'off' to stop all embedding.",
           "type": "boolean"
         },
         "injection_budget_tokens": {
@@ -2424,6 +2605,7 @@
         "auto_promote": {
           "default": true,
           "description": "Automatically promote eligible session facts into memory (default: true)",
+          "x-mc-live-reload": true,
           "type": "boolean"
         },
         "retrieval_count_promotion_threshold": {
@@ -2474,11 +2656,13 @@
             "enabled": {
               "default": false,
               "description": "Index HEAD git commits for ctx_search (git_commit source). Graduated from experimental.git_commit_indexing; opt-in, default off. Independent of memory.enabled.",
+              "x-mc-live-reload": true,
               "type": "boolean"
             },
             "since_days": {
               "default": 365,
               "description": "Days of HEAD history to index (min: 7, max: 3650, default: 365)",
+              "x-mc-live-reload": true,
               "type": "number",
               "minimum": 7,
               "maximum": 3650
@@ -2486,6 +2670,7 @@
             "max_commits": {
               "default": 2000,
               "description": "Max commits kept per project; oldest evicted (min: 100, max: 20000, default: 2000)",
+              "x-mc-live-reload": true,
               "type": "number",
               "minimum": 100,
               "maximum": 20000

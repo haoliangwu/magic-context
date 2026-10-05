@@ -1,7 +1,11 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 
 /**
  * Context-limit resolution from custom provider config.
@@ -19,22 +23,22 @@ import { TestHarness } from "../src/harness";
  * or ~10% instead.
  */
 
-let h: TestHarness;
+forEachHost(import.meta.url, "context-limit resolution", (host) => {
+    let h: ScenarioHarness;
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            execute_threshold_percentage: 80,
-        },
-        modelContextLimit: 50_000,
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: {
+                execute_threshold_percentage: 80,
+            },
+            modelContextLimit: 50_000,
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
+    afterAll(async () => {
+        await h.dispose();
+    });
 
-describe("context-limit resolution", () => {
     it("uses custom provider limit.context when computing percentage", async () => {
         h.mock.reset();
         h.mock.setDefault({

@@ -1,4 +1,5 @@
 import { Database } from "../../shared/sqlite";
+import { configureContextDatabasePragmas } from "../../shared/sqlite-context-pragmas";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getDatabasePath } from "./storage-db";
 
@@ -37,7 +38,8 @@ export type CanonicalMaterializeReason =
     | "ttl_expiry"
     | "epoch_change"
     | "coverage_fold"
-    | "profile_transition";
+    | "profile_transition"
+    | "host_compaction";
 
 export interface PendingTransformDecision {
     tsMs: number;
@@ -118,6 +120,7 @@ const canonicalReasons = new Set<string>([
     "epoch_change",
     "coverage_fold",
     "profile_transition",
+    "host_compaction",
 ]);
 
 const piReasonAliases: Record<string, CanonicalMaterializeReason> = {
@@ -186,7 +189,9 @@ export function writeRustTransformDecision(args: {
     const mapped =
         decisionUpper === "HARD" || decisionUpper === "MIGRATE_HARD"
             ? { decision: "execute" as const, materialized: true, bustedThisPass: true }
-            : decisionUpper === "SOFT" || decisionUpper === "EXECUTE"
+            : decisionUpper === "SOFT" ||
+                decisionUpper === "EXECUTE" ||
+                args.materializeReason === "ttl_idle"
               ? { decision: "execute" as const, materialized: false, bustedThisPass: true }
               : decisionUpper === "SOFT+"
                 ? { decision: "defer" as const, materialized: false, bustedThisPass: false }
@@ -426,6 +431,8 @@ function writeTransformDecisionBestEffort(dbPath: string, row: TransformDecision
 function writeTransformDecisionRow(dbPath: string, row: TransformDecisionRow): void {
     const db = new Database(dbPath);
     try {
+        db.exec("PRAGMA busy_timeout=0");
+        configureContextDatabasePragmas(db);
         writeTransformDecisionRowOnDatabase(db, row, true);
     } finally {
         closeQuietly(db);

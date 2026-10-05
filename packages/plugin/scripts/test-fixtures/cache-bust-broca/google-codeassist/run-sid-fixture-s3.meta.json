@@ -1,0 +1,14 @@
+{
+  "attempt": 0,
+  "createdAt": "2026-10-02T16:46:13.000Z",
+  "files": {
+    "body": "run-sid-fixture-s3.body.json",
+    "response": "run-sid-fixture-s3.response.json"
+  },
+  "model": "antigravity-gemini-fixture",
+  "run_id": "run-sid-fixture",
+  "session": "alfonso:bg_geminiFixture",
+  "step": 3,
+  "verified": true,
+  "wire_family": "google_codeassist"
+}

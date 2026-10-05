@@ -1,8 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
@@ -11,13 +10,17 @@ import {
     addProcessedImageStrippedIds,
     addStaleReduceStrippedIds,
     applyStrippedPlaceholderDelta,
-    getCompartments,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
-import { setChannel2NudgeState } from "../../features/magic-context/storage-meta-persisted";
+import {
+    appendNoteNudgeAnchor,
+    setChannel2NudgeState,
+    setPersistedCompactionMarkerState,
+} from "../../features/magic-context/storage-meta-persisted";
 import { setProjectState } from "../../features/magic-context/storage-project-state";
 import {
+    getDroppedTagsBySession,
     insertTag,
     updateTagDropMode,
     updateTagStatus,
@@ -26,14 +29,13 @@ import { insertUserMemory } from "../../features/magic-context/user-memory/stora
 import { flushLogger, getLogFilePath } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     __moduleStateSyncTest,
     buildModuleStateSyncPayload,
     buildPagedModuleStateSyncPayloads,
     loadModuleWatermarks,
     type ModuleStateSyncState,
-    mirrorModuleCompartments,
-    resetCompartmentMirrorCursorsForTest,
     syncModuleState,
 } from "./module-state-sync";
 import { StateSyncTiming } from "./module-state-sync-timing";
@@ -49,20 +51,35 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 const originalLogPath = process.env.MAGIC_CONTEXT_LOG_PATH;
 
+it("sorts canonical seeds byte-identically with one key read per seed", () => {
+    let reads = 0;
+    const seeds = ["strip2", "strip10", "strip1", "strip1"].map((id) => ({
+        get message_id() {
+            reads++;
+            return id;
+        },
+        strip_kind: "placeholder",
+    }));
+    const sorted = __moduleStateSyncTest.sortCanonicalSeeds(seeds);
+    expect(reads).toBe(seeds.length);
+    expect(sorted).toEqual([seeds[2], seeds[3], seeds[1], seeds[0]]);
+    expect(sorted[0]).toBe(seeds[2]);
+    expect(sorted[1]).toBe(seeds[3]);
+});
+
 afterEach(() => {
     for (const db of databases.splice(0)) closeQuietly(db);
     closeReadOnlySessionDb();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
     else process.env.XDG_DATA_HOME = originalXdgDataHome;
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-    resetCompartmentMirrorCursorsForTest();
-    __moduleStateSyncTest.setBoundaryDiagnosticObserver(null);
+
     if (originalLogPath === undefined) delete process.env.MAGIC_CONTEXT_LOG_PATH;
     else process.env.MAGIC_CONTEXT_LOG_PATH = originalLogPath;
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     process.env.MAGIC_CONTEXT_LOG_PATH = join(dir, "state-sync.log");
@@ -401,35 +418,7 @@ describe("authority cold-start sequence matrix", () => {
     });
 });
 
-describe("module state external epochs", () => {
-    it("carries dashboard project and profile epochs on the completed sync page", async () => {
-        const db = createContextDb();
-        setProjectState(db, "/tmp/project", { projectMemoryEpoch: 9 });
-        setProjectState(db, "__global__", { projectUserProfileVersion: 4 });
-        const calls: unknown[] = [];
-        await syncModuleState({
-            client: {
-                async call(args) {
-                    calls.push(args.body);
-                    return { result: { shadow_seq: 1 } };
-                },
-            },
-            state: syncState(),
-            pass: { db, sessionId: "ses-epoch", projectPath: "/tmp/project", nowMs: 1 },
-            projectRoot: "/tmp/project",
-            force: true,
-        });
-        const body = calls.at(-1) as Record<string, unknown>;
-        expect(body.project_memory_epoch).toBe(9);
-        expect(body.user_profile_version).toBe(4);
-        expect(body.acked_watermarks).toEqual(
-            expect.objectContaining({
-                project_memory_epoch: 9,
-                project_user_profile_version: 4,
-            }),
-        );
-    });
-});
+describe("module note evaluation capability sync", () => {});
 
 describe("module state sync section deltas", () => {
     function createWorkspace(db: Database): void {
@@ -446,7 +435,7 @@ describe("module state sync section deltas", () => {
         setProjectState(db, "/tmp/foreign", { projectMemoryEpoch: 1 });
     }
 
-    async function buildDeltaPayload(args: {
+    async function _buildDeltaPayload(args: {
         db: Database;
         state: ModuleStateSyncState;
         sessionId: string;
@@ -470,44 +459,6 @@ describe("module state sync section deltas", () => {
         }
         return payload.params as Record<string, unknown>;
     }
-
-    it("omits unchanged profile and workspace sections but preserves explicit changes", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-state-sync-deltas";
-        createWorkspace(db);
-        insertUserMemory(db, "likes deltas", []);
-        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
-        const baseline = loadModuleWatermarks({ db, sessionId, projectPath: "/tmp/project" });
-        const state = {
-            ...syncState(),
-            lastAckedWatermarks: baseline,
-            seedPassPending: false,
-        };
-
-        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"todo"}]' });
-        const unrelated = await buildDeltaPayload({ db, state, sessionId });
-        expect(unrelated).not.toHaveProperty("user_profile");
-        expect(unrelated).not.toHaveProperty("workspace");
-
-        setProjectState(db, "__global__", { projectUserProfileVersion: 2 });
-        const profileChanged = await buildDeltaPayload({ db, state, sessionId });
-        expect(profileChanged.user_profile).toEqual(["likes deltas"]);
-        expect(profileChanged).not.toHaveProperty("workspace");
-        state.lastAckedWatermarks = loadModuleWatermarks({
-            db,
-            sessionId,
-            projectPath: "/tmp/project",
-        });
-
-        setProjectState(db, "/tmp/foreign", { projectMemoryEpoch: 2 });
-        const workspaceChanged = await buildDeltaPayload({ db, state, sessionId });
-        expect(workspaceChanged).toHaveProperty("workspace");
-        expect(workspaceChanged).not.toHaveProperty("user_profile");
-
-        const forced = await buildDeltaPayload({ db, state, sessionId, force: true });
-        expect(forced.user_profile).toEqual(["likes deltas"]);
-        expect(forced.workspace).toEqual(expect.objectContaining({ members: expect.any(Array) }));
-    });
 
     it("uses omitted sections only after the module advertises the delta capability", async () => {
         const db = createContextDb();
@@ -688,325 +639,16 @@ describe("module state sync section deltas", () => {
 
         expect(statusCalls).toBe(1);
         expect(stateSyncBodies).toHaveLength(2);
-        expect(stateSyncBodies[1]).toHaveProperty("user_profile", ["profile survives reconnect"]);
-        expect(stateSyncBodies[1]).toHaveProperty("workspace");
-        expect(moduleProfile).toEqual(["profile survives reconnect"]);
-        expect(moduleWorkspace).toEqual(expect.objectContaining({ members: expect.any(Array) }));
-    });
-
-    it("uses a re-probed capability shape without leaking module-owned memories", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-state-sync-capability-reprobe";
-        createWorkspace(db);
-        insertUserMemory(db, "likes capability deltas", []);
-        setProjectState(db, "__global__", { projectUserProfileVersion: 1 });
-        const state = {
-            ...syncState(),
-            lastAckedWatermarks: loadModuleWatermarks({
-                db,
-                sessionId,
-                projectPath: "/tmp/project",
-            }),
-            seedPassPending: false,
-        };
-        let generation = 1;
-        let cached = {
-            generation,
-            capabilities: { state_sync_deltas: true },
-        };
-        let statusCalls = 0;
-        const stateSyncBodies: Record<string, unknown>[] = [];
-        const transport = {
-            getCachedStateSyncCapabilities: () =>
-                cached.generation === generation ? cached.capabilities : undefined,
-            async stateSyncCapabilities() {
-                statusCalls += 1;
-                const capabilities = { state_sync_deltas: false };
-                cached = { generation, capabilities };
-                return capabilities;
-            },
-            async call(args: { body: unknown }) {
-                stateSyncBodies.push(args.body as Record<string, unknown>);
-                return { result: { shadow_seq: 1 } };
-            },
-        };
-        const sync = () =>
-            syncModuleState({
-                client: transport,
-                state,
-                pass: { db, sessionId, projectPath: "/tmp/project", nowMs: 1 },
-                projectRoot: "/tmp/project",
-                force: false,
-                options: { authority: true, authorityState: "MODULE" },
-            });
-
-        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"first"}]' });
-        await expect(sync()).resolves.toMatchObject({ status: "acked" });
-        const deltaBody = stateSyncBodies.at(-1);
-        expect(deltaBody).not.toHaveProperty("user_profile");
-        expect(deltaBody).not.toHaveProperty("workspace");
-        expect(deltaBody).not.toHaveProperty("memories");
-        expect(deltaBody).not.toHaveProperty("memory_mutations");
-
-        generation += 1;
-        updateSessionMeta(db, sessionId, { lastTodoState: '[{"content":"second"}]' });
-        await expect(sync()).resolves.toMatchObject({ status: "acked" });
-        const legacyBody = stateSyncBodies.at(-1);
-        expect(statusCalls).toBe(1);
-        expect(legacyBody).toHaveProperty("user_profile");
-        expect(legacyBody).toHaveProperty("workspace");
-        expect(legacyBody).not.toHaveProperty("memories");
-        expect(legacyBody).not.toHaveProperty("memory_mutations");
+        expect(stateSyncBodies[1]).not.toHaveProperty("user_profile");
+        expect(stateSyncBodies[1]).not.toHaveProperty("workspace");
+        expect(moduleProfile).toBeUndefined();
+        expect(moduleWorkspace).toBeUndefined();
     });
 });
 
-describe("module state authority direction", () => {
-    it("omits module-owned memory sections from the TypeScript sender payload", async () => {
-        const db = createContextDb();
-        db.prepare(
-            `INSERT INTO memories
-                (project_path, category, content, normalized_hash, first_seen_at, created_at,
-                 updated_at, last_seen_at, classified_at)
-             VALUES (?, 'CONSTRAINTS', 'module-owned fact', 'hash', 0, 0, 0, 0, 1234)`,
-        ).run("/tmp/project");
-        const calls: unknown[] = [];
-        const state = syncState();
-
-        await syncModuleState({
-            client: {
-                async call(args) {
-                    calls.push(args.body);
-                    return { result: { shadow_seq: 1, memories_skipped: true } };
-                },
-            },
-            state,
-            pass: {
-                db,
-                sessionId: "ses-authority-direction",
-                projectPath: "/tmp/project",
-                nowMs: 1,
-            },
-            projectRoot: "/tmp/project",
-            force: true,
-            options: { authority: true, authorityState: "MODULE" },
-        });
-
-        const body = calls[0] as Record<string, unknown>;
-        expect(body).not.toHaveProperty("memories");
-        expect(body).not.toHaveProperty("memory_mutations");
-        expect(state.authorityMemorySyncSkipLogged).toBe(true);
-    });
-});
+describe("module state authority direction", () => {});
 
 describe("module compartment ordinal serialization", () => {
-    it("uses canonical ordinals when stored boundaries include a summary row", async () => {
-        useTempDataHome("module-state-sync-ordinal-basis-");
-        const sessionId = "ses-ordinal-basis";
-        createOpenCodeDb(sessionId, [
-            { id: "m1", role: "user" },
-            { id: "summary", role: "assistant", summary: true },
-            { id: "m2", role: "assistant" },
-            { id: "m3", role: "user" },
-        ]);
-        const db = createContextDb();
-        appendCompartments(db, sessionId, [
-            {
-                sequence: 0,
-                startMessage: 3,
-                endMessage: 4,
-                startMessageId: "m2",
-                endMessageId: "m3",
-                title: "After summary",
-                content: "content",
-            },
-        ]);
-
-        const state = syncState(7);
-        const inputMessage = wireMessage(sessionId, "m2");
-        const wire = await resolveOrdinalsForModule({
-            sessionId,
-            messages: [inputMessage],
-            generation: state.moduleGeneration,
-            memoGeneration: state.idOrdinalMemoGeneration,
-            memo: state.idOrdinalMemo,
-        });
-        expect(wire).toEqual(
-            expect.objectContaining({
-                ok: true,
-                annotatedInput: [expect.objectContaining({ absolute_ordinal: 2 })],
-            }),
-        );
-        expect(state.idOrdinalMemo.get("m2")).toBe(2);
-        expect(inputMessage).not.toHaveProperty("absolute_ordinal");
-
-        const calls: unknown[] = [];
-        await syncModuleState({
-            client: {
-                async call(args) {
-                    calls.push(args.body);
-                    return { result: { shadow_seq: 1 } };
-                },
-            },
-            state,
-            pass: { db, sessionId, nowMs: 1 },
-            projectRoot: "/tmp/project",
-            force: true,
-        });
-
-        const body = calls[0] as {
-            compartments: Array<{ start_message: number; end_message: number }>;
-        };
-        expect(body.compartments).toEqual([
-            expect.objectContaining({ start_message: 2, end_message: 3 }),
-        ]);
-    });
-
-    it("repairs dangling boundaries without refusing the entire cold seed", async () => {
-        useTempDataHome("module-state-sync-dangling-boundary-");
-        const sessionId = "ses-dangling-boundary";
-        createOpenCodeDb(
-            sessionId,
-            Array.from({ length: 8 }, (_, index) => ({
-                id: `m${index + 1}`,
-                role: index % 2 === 0 ? "user" : "assistant",
-            })),
-        );
-        const db = createContextDb();
-        appendCompartments(db, sessionId, [
-            {
-                sequence: 0,
-                startMessage: 1,
-                endMessage: 2,
-                startMessageId: "missing-first-start",
-                endMessageId: "m2",
-                title: "First",
-                content: "first",
-            },
-            {
-                sequence: 1,
-                startMessage: 3,
-                endMessage: 3,
-                startMessageId: "m3",
-                endMessageId: "m3",
-                title: "Prior",
-                content: "prior",
-            },
-            {
-                sequence: 2,
-                startMessage: 4,
-                endMessage: 5,
-                startMessageId: "missing-interior-start",
-                endMessageId: "m5",
-                title: "Incident",
-                content: "incident",
-            },
-            {
-                sequence: 3,
-                startMessage: 6,
-                endMessage: 7,
-                startMessageId: "m6",
-                endMessageId: "missing-interior-end",
-                title: "End repair",
-                content: "end repair",
-            },
-            {
-                sequence: 4,
-                startMessage: 8,
-                endMessage: 8,
-                startMessageId: "m8",
-                endMessageId: "m8",
-                title: "Next",
-                content: "next",
-            },
-            {
-                sequence: 5,
-                startMessage: 9,
-                endMessage: 9,
-                startMessageId: "missing-both-start",
-                endMessageId: "missing-both-end",
-                title: "Skipped",
-                content: "skipped",
-            },
-        ]);
-
-        const boundaryDiagnostics: string[] = [];
-        __moduleStateSyncTest.setBoundaryDiagnosticObserver((message) => {
-            boundaryDiagnostics.push(message);
-        });
-        const payload = await buildModuleStateSyncPayload({
-            state: syncState(),
-            pass: { db, sessionId, nowMs: 1 },
-            force: true,
-        });
-
-        expect(payload).toBeObject();
-        if (!payload || typeof payload !== "object") throw new Error("expected state-sync payload");
-        expect(payload.params.compartments).toEqual([
-            expect.objectContaining({ sequence: 0, start_message: 1, end_message: 2 }),
-            expect.objectContaining({ sequence: 1, start_message: 3, end_message: 3 }),
-            expect.objectContaining({ sequence: 2, start_message: 4, end_message: 5 }),
-            expect.objectContaining({ sequence: 3, start_message: 6, end_message: 7 }),
-            expect.objectContaining({ sequence: 4, start_message: 8, end_message: 8 }),
-        ]);
-
-        expect(boundaryDiagnostics).toContain(
-            "state-sync boundary repaired session=ses-dangling-boundary sequence=0 side=start missing_id=missing-first-start resolved_ordinal=1 method=raw_store_first_ordinal",
-        );
-        expect(boundaryDiagnostics).toContain(
-            "state-sync boundary repaired session=ses-dangling-boundary sequence=2 side=start missing_id=missing-interior-start resolved_ordinal=4 method=previous_compartment_end_plus_one",
-        );
-        expect(boundaryDiagnostics).toContain(
-            "state-sync boundary repaired session=ses-dangling-boundary sequence=3 side=end missing_id=missing-interior-end resolved_ordinal=7 method=next_compartment_start_minus_one",
-        );
-        expect(boundaryDiagnostics).toContain(
-            "state-sync compartment skipped session=ses-dangling-boundary sequence=5 missing_start_id=missing-both-start missing_end_id=missing-both-end method=both_boundaries_dangling",
-        );
-    });
-
-    it("pins clean compartment seed bytes when every boundary still resolves", async () => {
-        useTempDataHome("module-state-sync-clean-boundary-");
-        const sessionId = "ses-clean-boundary";
-        createOpenCodeDb(sessionId, [
-            { id: "m1", role: "user" },
-            { id: "m2", role: "assistant" },
-            { id: "m3", role: "user" },
-        ]);
-        const db = createContextDb();
-        appendCompartments(db, sessionId, [
-            {
-                sequence: 0,
-                startMessage: 1,
-                endMessage: 2,
-                startMessageId: "m1",
-                endMessageId: "m2",
-                title: "Clean one",
-                content: "first clean summary",
-            },
-            {
-                sequence: 1,
-                startMessage: 3,
-                endMessage: 3,
-                startMessageId: "m3",
-                endMessageId: "m3",
-                title: "Clean two",
-                content: "second clean summary",
-            },
-        ]);
-
-        db.prepare("UPDATE compartments SET created_at = 1234 WHERE session_id = ?").run(sessionId);
-        const payload = await buildModuleStateSyncPayload({
-            state: syncState(),
-            pass: { db, sessionId, nowMs: 1 },
-            force: true,
-        });
-        expect(payload).toBeObject();
-        if (!payload || typeof payload !== "object") throw new Error("expected state-sync payload");
-        const digest = createHash("sha256")
-            .update(JSON.stringify(payload.params.compartments))
-            .digest("hex");
-        expect(digest).toBe("48b79d5c8864fbbc6ffb9c639e5ae058c3f99f81d67ff7bc917ecd8552abe1bf");
-    });
-
     it("keeps canonical ordinal drift fail-loud when the wire resolver finds a conflict", async () => {
         useTempDataHome("module-state-sync-ordinal-drift-");
         const sessionId = "ses-ordinal-drift";
@@ -1031,48 +673,6 @@ describe("module compartment ordinal serialization", () => {
         });
 
         expect(result).toEqual(expect.objectContaining({ ok: false, reason: "mismatch" }));
-    });
-
-    it("preserves stored ordinals when a session has no summary rows", async () => {
-        useTempDataHome("module-state-sync-no-summary-");
-        const sessionId = "ses-no-summary";
-        createOpenCodeDb(sessionId, [
-            { id: "m1", role: "user" },
-            { id: "m2", role: "assistant" },
-        ]);
-        const db = createContextDb();
-        appendCompartments(db, sessionId, [
-            {
-                sequence: 0,
-                startMessage: 1,
-                endMessage: 2,
-                startMessageId: "m1",
-                endMessageId: "m2",
-                title: "No summary",
-                content: "content",
-            },
-        ]);
-
-        const calls: unknown[] = [];
-        await syncModuleState({
-            client: {
-                async call(args) {
-                    calls.push(args.body);
-                    return { result: { shadow_seq: 1 } };
-                },
-            },
-            state: syncState(),
-            pass: { db, sessionId, nowMs: 1 },
-            projectRoot: "/tmp/project",
-            force: true,
-        });
-
-        const body = calls[0] as {
-            compartments: Array<{ start_message: number; end_message: number }>;
-        };
-        expect(body.compartments).toEqual([
-            expect.objectContaining({ start_message: 1, end_message: 2 }),
-        ]);
     });
 
     it("keeps persisted ordinals stable around an interior synthetic wire message", async () => {
@@ -1159,8 +759,8 @@ describe("module incremental and paged assembly", () => {
             reasoning_cleared_through_tag: 0,
         };
         const items = Array.from({ length: 900 }, (_, index) => ({
-            id: index,
-            content: "x".repeat(1200),
+            message_id: String(index),
+            text: "x".repeat(1200),
         }));
         const originalStringify = JSON.stringify;
         let serializedBytes = 0;
@@ -1177,8 +777,7 @@ describe("module incremental and paged assembly", () => {
                     expectedShadowSeq: 0,
                     seedId: "seed",
                     seedBoundaryId: null,
-                    compartments: items,
-                    memories: [],
+                    noteNudgeAnchors: items,
                     memoryMutations: [],
                     userProfile: [],
                     workspace: null,
@@ -1192,7 +791,7 @@ describe("module incremental and paged assembly", () => {
         }
 
         expect(pages.length).toBeGreaterThan(1);
-        expect(pages.flatMap((page) => page.params.compartments)).toEqual(items);
+        expect(pages.flatMap((page) => page.params.note_nudge_anchors)).toEqual(items);
         expect(serializedBytes).toBeLessThan(10_000_000);
         for (const page of pages) {
             expect(
@@ -1248,106 +847,6 @@ describe("module incremental and paged assembly", () => {
 });
 
 describe("module compartment mirror-back", () => {
-    it("copies the authoritative row set idempotently", async () => {
-        const db = new Database(":memory:");
-        databases.push(db);
-        initializeDatabase(db);
-        runMigrations(db);
-        const calls: number[] = [];
-        const reader = {
-            async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
-                calls.push(afterSequence);
-                return afterSequence < 2
-                    ? {
-                          max_sequence: 2,
-                          compartments: [
-                              {
-                                  sequence: 1,
-                                  start_message: 1,
-                                  end_message: 2,
-                                  start_message_id: "m1#0",
-                                  end_message_id: "m2#0",
-                                  title: "First",
-                                  content: "first content",
-                                  created_at: 10,
-                              },
-                              {
-                                  sequence: 2,
-                                  start_message: 3,
-                                  end_message: 4,
-                                  start_message_id: "m3#0",
-                                  end_message_id: "m4#0",
-                                  title: "Second",
-                                  content: "second content",
-                                  created_at: 20,
-                              },
-                          ],
-                      }
-                    : { max_sequence: 2, compartments: [] };
-            },
-        };
-
-        await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
-        await mirrorModuleCompartments({ db, sessionId: "ses-mirror", reader });
-
-        expect(calls).toEqual([-1, 2]);
-        expect(getCompartments(db, "ses-mirror").map((row) => row.sequence)).toEqual([1, 2]);
-    });
-
-    it("replaces a recut suffix and truncates rows absent from the module set", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-mirror-recut";
-        let rows = Array.from({ length: 5 }, (_, index) => {
-            const sequence = index + 1;
-            return {
-                sequence,
-                start_message: sequence * 2 - 1,
-                end_message: sequence * 2,
-                start_message_id: `m${sequence * 2 - 1}#0`,
-                end_message_id: `m${sequence * 2}#0`,
-                title: `Compartment ${sequence}`,
-                content: `original content ${sequence}`,
-                created_at: sequence,
-            };
-        });
-        const reader = {
-            async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
-                return {
-                    max_sequence: rows.at(-1)?.sequence ?? -1,
-                    compartments: rows.filter((row) => row.sequence > afterSequence).slice(0, 2),
-                };
-            },
-        };
-
-        await mirrorModuleCompartments({ db, sessionId, reader });
-        expect(getCompartments(db, sessionId)).toHaveLength(5);
-
-        rows = [
-            rows[0]!,
-            rows[1]!,
-            {
-                ...rows[2]!,
-                end_message: 30,
-                end_message_id: "recut-m30#0",
-                title: "Recut third compartment",
-                content: "authoritative recut content",
-            },
-        ];
-        await mirrorModuleCompartments({ db, sessionId, reader });
-
-        const mirrored = getCompartments(db, sessionId);
-        expect(mirrored).toHaveLength(3);
-        expect(mirrored.map((row) => row.sequence)).toEqual([1, 2, 3]);
-        expect(mirrored[2]).toEqual(
-            expect.objectContaining({
-                endMessage: 30,
-                endMessageId: "recut-m30#0",
-                title: "Recut third compartment",
-                content: "authoritative recut content",
-            }),
-        );
-    });
-
     function mirrorRow(
         sequence: number,
         extras: Partial<{
@@ -1369,7 +868,7 @@ describe("module compartment mirror-back", () => {
         };
     }
 
-    function pagingReader(
+    function _pagingReader(
         getRows: () => Array<ReturnType<typeof mirrorRow>>,
         extra: () => {
             set_changed?: boolean;
@@ -1396,154 +895,6 @@ describe("module compartment mirror-back", () => {
             },
         };
     }
-
-    it("skips every local statement on the unchanged fast path", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-mirror-fast";
-        const rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3)];
-        const { calls, reader } = pagingReader(() => rows);
-
-        await mirrorModuleCompartments({ db, sessionId, reader });
-        expect(calls[0]).toBe(-1);
-
-        const originalPrepare = db.prepare.bind(db);
-        let statements = 0;
-        db.prepare = ((sql: string) => {
-            statements += 1;
-            return originalPrepare(sql);
-        }) as typeof db.prepare;
-        const originalTransaction = db.transaction.bind(db);
-        let transactions = 0;
-        db.transaction = ((fn: Parameters<typeof db.transaction>[0]) => {
-            transactions += 1;
-            return originalTransaction(fn);
-        }) as typeof db.transaction;
-
-        calls.length = 0;
-        await mirrorModuleCompartments({ db, sessionId, reader });
-
-        expect(calls).toEqual([3]);
-        expect(statements).toBe(0);
-        expect(transactions).toBe(0);
-        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 3]);
-    });
-
-    it("full-resyncs a recut that regresses max_sequence", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-mirror-recut-arm";
-        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3), mirrorRow(4)];
-        const { calls, reader } = pagingReader(() => rows);
-
-        await mirrorModuleCompartments({ db, sessionId, reader });
-        rows = [
-            mirrorRow(1),
-            mirrorRow(2),
-            mirrorRow(3, {
-                end_message: 30,
-                end_message_id: "recut-m30#0",
-                title: "Recut",
-                content: "recut content",
-            }),
-        ];
-        calls.length = 0;
-        await mirrorModuleCompartments({ db, sessionId, reader });
-
-        expect(calls[0]).toBe(4);
-        expect(calls.slice(1)).toContain(-1);
-        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 3]);
-        expect(getCompartments(db, sessionId)[2]).toEqual(
-            expect.objectContaining({ title: "Recut", content: "recut content" }),
-        );
-    });
-
-    it("full-resyncs a revert that truncates the published suffix", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-mirror-revert-arm";
-        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3), mirrorRow(4), mirrorRow(5)];
-        let revertEpoch = 0;
-        const { calls, reader } = pagingReader(
-            () => rows,
-            () => ({ revert_epoch: revertEpoch }),
-        );
-
-        await mirrorModuleCompartments({ db, sessionId, reader });
-        rows = [mirrorRow(1), mirrorRow(2)];
-        revertEpoch = 1;
-        calls.length = 0;
-        await mirrorModuleCompartments({ db, sessionId, reader });
-
-        expect(calls[0]).toBe(5);
-        expect(calls.slice(1)).toContain(-1);
-        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2]);
-    });
-
-    it("full-resyncs a recomp that rewrites the set at the same max_sequence", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-mirror-recomp-arm";
-        let rows = [mirrorRow(1), mirrorRow(2), mirrorRow(3)];
-        let setChanged = false;
-        const { calls, reader } = pagingReader(
-            () => rows,
-            () => (setChanged ? { set_changed: true } : {}),
-        );
-
-        await mirrorModuleCompartments({ db, sessionId, reader });
-        rows = [
-            mirrorRow(1, { title: "Rebuilt 1", content: "recomp 1" }),
-            mirrorRow(2, { title: "Rebuilt 2", content: "recomp 2" }),
-            mirrorRow(3, { title: "Rebuilt 3", content: "recomp 3" }),
-        ];
-        setChanged = true;
-        calls.length = 0;
-        await mirrorModuleCompartments({ db, sessionId, reader });
-
-        expect(calls[0]).toBe(3);
-        expect(calls.slice(1)).toContain(-1);
-        expect(getCompartments(db, sessionId).map((row) => row.content)).toEqual([
-            "recomp 1",
-            "recomp 2",
-            "recomp 3",
-        ]);
-    });
-
-    it("full-resyncs when a sequence gap appears after the cursor", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-mirror-gap-arm";
-        let rows = [mirrorRow(1), mirrorRow(2)];
-        const { calls, reader } = pagingReader(() => rows);
-
-        await mirrorModuleCompartments({ db, sessionId, reader });
-        rows = [mirrorRow(1), mirrorRow(2), mirrorRow(4)];
-        calls.length = 0;
-        await mirrorModuleCompartments({ db, sessionId, reader });
-
-        expect(calls[0]).toBe(2);
-        expect(calls.slice(1)).toContain(-1);
-        expect(getCompartments(db, sessionId).map((row) => row.sequence)).toEqual([1, 2, 4]);
-    });
-
-    it("still rejects an authoritative set that changes while it is read", async () => {
-        const db = createContextDb();
-        const sessionId = "ses-mirror-changed-while-read";
-        let maxSequence = 3;
-        const reader = {
-            async getCompartmentsAfter(_sessionId: string, afterSequence: number) {
-                const page = {
-                    max_sequence: maxSequence,
-                    compartments: [
-                        mirrorRow(afterSequence + 1),
-                        mirrorRow(afterSequence + 2),
-                    ].filter((row) => row.sequence <= 3),
-                };
-                maxSequence = 4;
-                return page;
-            },
-        };
-
-        await expect(mirrorModuleCompartments({ db, sessionId, reader })).rejects.toThrow(
-            "module compartment mirror changed while its authoritative set was read",
-        );
-    });
 });
 
 describe("state-sync resumable series", () => {
@@ -1552,19 +903,8 @@ describe("state-sync resumable series", () => {
         const sessionId = "ses-resume";
         createOpenCodeDb(sessionId, [{ id: "m1", role: "user" }]);
         const db = createContextDb();
-        appendCompartments(
-            db,
-            sessionId,
-            Array.from({ length: 5 }, (_, sequence) => ({
-                sequence,
-                startMessage: 1,
-                endMessage: 1,
-                startMessageId: "m1",
-                endMessageId: "m1",
-                title: "large",
-                content: "x".repeat(20 * 1024 * 1024),
-            })),
-        );
+        for (let i = 0; i < 5; i++)
+            appendNoteNudgeAnchor(db, sessionId, `m${i}`, "x".repeat(20 * 1024 * 1024));
         const state = syncState();
         let next = 0;
         let seedId: unknown;
@@ -1686,6 +1026,7 @@ it("AFT warm inventory sends only boundary-owned seeds with one raw batch", asyn
                             generation: 1,
                             max_compartment_sequence: 1499,
                             boundary_id: "tail0#0",
+                            context_boundaries_resolved: true,
                         },
                     };
                 if (args.method === "session.status") return { state_sync: null };
@@ -1703,7 +1044,7 @@ it("AFT warm inventory sends only boundary-owned seeds with one raw batch", asyn
                 .find((line) => line.includes("stage=rust.state_sync_detail")),
         );
     }
-    expect(bodies.flatMap((body) => body.compartments as unknown[])).toHaveLength(0);
+    expect(bodies.flatMap((body) => (body.compartments ?? []) as unknown[])).toHaveLength(0);
     const seeds = bodies.flatMap((body) => body.drop_seeds as Array<{ block_id: string }>);
     expect(seeds).toHaveLength(282);
     expect(seeds.every((seed) => seed.block_id.startsWith("tail"))).toBe(true);
@@ -1861,9 +1202,6 @@ it("an old module without state_sync_resume keeps the previous paged protocol", 
             seed_batch_index: 0,
             seed_batch_total: 1,
             seed_complete: true,
-            compartments: [],
-            memories: [],
-            memory_mutations: [],
         });
     }
 });
@@ -1884,4 +1222,137 @@ it("a batched seed read refuses ordinal drift instead of overwriting the wire me
         }),
     ).resolves.toBe("mismatch");
     expect(state.idOrdinalMemo.get("m1")).toBe(99);
+});
+
+it("cold inventory bounds 100K-message seeds at the published host marker", async () => {
+    useTempDataHome("cold-large-seed-");
+    const sessionId = "ses-cold-large";
+    createOpenCodeDb(sessionId, [{ id: "tail", role: "user" }]);
+    const rawDb = new Database(join(process.env.XDG_DATA_HOME ?? "", "opencode", "opencode.db"));
+    rawDb.exec(`UPDATE message SET time_created=100001;
+        CREATE INDEX parts_by_message ON part(message_id);
+        CREATE INDEX messages_by_session ON message(session_id, time_created, id);`);
+    rawDb
+        .prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100000)
+        INSERT INTO message SELECT 'old'||i, ?, i, i, json_object('id','old'||i,'role','user') FROM n`)
+        .run(sessionId);
+    rawDb
+        .prepare(`INSERT INTO part(message_id, session_id, time_created, time_updated, data)
+        SELECT id, session_id, time_created, time_updated, '{"type":"text","text":"old"}' FROM message WHERE id LIKE 'old%'`)
+        .run();
+    closeQuietly(rawDb);
+    const db = createContextDb();
+    db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100000)
+        INSERT INTO tags(session_id, tag_number, message_id, type, status, byte_size)
+        SELECT ?, i, 'old'||i||':p0', 'message', 'dropped', 100 FROM n`).run(sessionId);
+    insertTag(db, sessionId, "tail:p0", "message", 100, 100001);
+    updateTagStatus(db, sessionId, 100001, "dropped");
+    setPersistedCompactionMarkerState(db, sessionId, {
+        boundaryMessageId: "old100000",
+        summaryMessageId: "summary",
+        compactionPartId: "marker",
+        summaryPartId: "summary-part",
+        boundaryOrdinal: 100000,
+        targetEndMessageId: "tail",
+    });
+    appendNoteNudgeAnchor(db, sessionId, "old1", "hidden");
+    appendNoteNudgeAnchor(db, sessionId, "tail", "visible");
+    addStaleReduceStrippedIds(db, sessionId, ["old1", "tail"]);
+    const timing = new StateSyncTiming();
+    const started = performance.now();
+    const payload = await buildModuleStateSyncPayload({
+        state: syncState(),
+        pass: { db, sessionId },
+        force: true,
+        options: { timing, seedInventory: { boundaryId: null, contextBoundariesResolved: true } },
+    });
+    expect(performance.now() - started).toBeLessThan(2000);
+    expect(payload && typeof payload === "object").toBe(true);
+    if (!payload || typeof payload !== "object") throw new Error("missing seed payload");
+    expect(payload.params.drop_seeds?.map((seed) => seed.block_id)).toEqual([
+        "old100000#0",
+        "tail#0",
+    ]);
+    expect(payload.params.note_nudge_anchors).toEqual([{ message_id: "tail", text: "visible" }]);
+    expect(payload.params.strip_seeds).toEqual([
+        { message_id: "tail", strip_kind: "stale_reduce" },
+    ]);
+    expect(timing.rawMessages).toBe(2);
+    expect(timing.rawReads).toBe(1);
+    // Omitting seeds for hidden host messages must not also tell the module to
+    // discard its cached prefix: that requires a separately resolved boundary.
+    expect(payload.params.seed_boundary_id).toBeNull();
+});
+
+it("forced seed timing is logged when boundary assembly fails", async () => {
+    useTempDataHome("failed-seed-timing-");
+    const db = createContextDb();
+    appendCompartments(db, "missing-session", [
+        {
+            sequence: 0,
+            startMessage: 1,
+            endMessage: 2,
+            startMessageId: "missing",
+            endMessageId: "missing",
+            title: "missing",
+            content: "x",
+        },
+    ]);
+    const timing = new StateSyncTiming();
+    const logged: Array<{ sessionId: string; phase: string | undefined }> = [];
+    timing.log = (sessionId, phase) => {
+        logged.push({ sessionId, phase });
+    };
+    await expect(
+        buildModuleStateSyncPayload({
+            state: syncState(),
+            pass: { db, sessionId: "missing-session" },
+            force: true,
+            options: { timing },
+        }),
+    ).rejects.toThrow("context_compartment_boundary_unresolved");
+    expect(logged).toEqual([{ sessionId: "missing-session", phase: "seed" }]);
+});
+
+it("scoped drop seeds use address indexes instead of scanning dropped history", () => {
+    const db = createContextDb();
+    db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<100000)
+        INSERT INTO tags(session_id, tag_number, message_id, type, status, byte_size)
+        SELECT 'indexed-seed', i, 'old'||i||':p0', 'message', 'dropped', 100 FROM n`).run();
+    const scope = { ownerIds: ["tail"], messageAddresses: ["tail:p0"] };
+    const plans: string[] = [];
+    const traced = new Proxy(db, {
+        get(target, key) {
+            if (key === "prepare")
+                return (sql: string) => {
+                    if (sql.includes("json_each")) {
+                        const query = target.prepare(`EXPLAIN QUERY PLAN ${sql}`);
+                        const args = sql.includes("UNION ALL")
+                            ? [
+                                  "indexed-seed",
+                                  JSON.stringify(scope.ownerIds),
+                                  "indexed-seed",
+                                  JSON.stringify(scope.messageAddresses),
+                              ]
+                            : [
+                                  "indexed-seed",
+                                  JSON.stringify(scope.ownerIds),
+                                  JSON.stringify(scope.messageAddresses),
+                              ];
+                        plans.push(
+                            ...(query.all(...args) as Array<{ detail: string }>).map(
+                                (row) => row.detail,
+                            ),
+                        );
+                    }
+                    return target.prepare(sql);
+                };
+            const value = Reflect.get(target, key);
+            return typeof value === "function" ? value.bind(target) : value;
+        },
+    });
+    expect(getDroppedTagsBySession(traced, "indexed-seed", scope)).toEqual([]);
+    expect(plans.join("\n")).toContain("idx_tags_pi_fallback_tool_owner");
+    expect(plans.join("\n")).toContain("idx_tags_session_message_id");
+    expect(plans.join("\n")).not.toContain("idx_tags_dropped_session_tag_number");
 });

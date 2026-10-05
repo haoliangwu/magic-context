@@ -1,13 +1,18 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Scheduler } from "../../features/magic-context/scheduler";
-import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
+import {
+    closeDatabase,
+    getTagsBySession,
+    openDatabase,
+} from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
 import type { ContextUsage } from "../../features/magic-context/types";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { createTransform } from "./transform";
 
 type TestPart =
@@ -27,13 +32,13 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -136,6 +141,75 @@ function makeTestDirectory(prefix: string): string {
 }
 
 describe("createTransform heuristic cleanup persistence", () => {
+    it("replays caveman compression before inline reasoning strips on defer", async () => {
+        useTempDataHome("context-transform-caveman-inline-");
+        const sessionId = "ses-caveman-inline";
+        const schedulerDecision = mock<Scheduler["shouldExecute"]>(() => "execute");
+        const db = openDatabase();
+        const pendingMaterializationSessions = new Set([sessionId]);
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: schedulerDecision },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 90, inputTokens: 180_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            historyRefreshSessions: new Set(),
+            pendingMaterializationSessions,
+            lastHeuristicsTurnId: new Map(),
+            clearReasoningAge: 1,
+            protectedTokens: 1,
+            cavemanTextCompression: { enabled: true, minChars: 20 },
+            directory: makeTestDirectory("context-transform-caveman-inline-dir-"),
+            getHistorianChunkTokens: () => 20_000,
+        });
+        const messages = (): TestMessage[] => [
+            {
+                info: { id: "u1", role: "user", sessionID: sessionId },
+                parts: [
+                    {
+                        type: "text",
+                        text: "Please review the implementation and verify the results carefully.",
+                    },
+                ],
+            },
+            {
+                info: { id: "a1", role: "assistant" },
+                parts: [
+                    {
+                        type: "text",
+                        text: "The implementation has been completed <think>stale private thought</think> and the verification results are available for the reviewer.",
+                    },
+                ],
+            },
+            {
+                info: { id: "u2", role: "user" },
+                parts: [
+                    {
+                        type: "text",
+                        text: "Continue with the implementation and review the results carefully.",
+                    },
+                ],
+            },
+            {
+                info: { id: "a2", role: "assistant" },
+                parts: [{ type: "text", text: "latest answer" }],
+            },
+            { info: { id: "u3", role: "user" }, parts: [{ type: "text", text: "latest request" }] },
+        ];
+        const executed = messages();
+        await transform({}, { messages: executed });
+        expect(JSON.stringify(executed)).not.toContain("stale private thought");
+        expect(getTagsBySession(db, sessionId).some((tag) => tag.cavemanDepth > 0)).toBe(true);
+        schedulerDecision.mockImplementation(() => "defer");
+        const deferred = messages();
+        await transform({}, { messages: deferred });
+        expect(JSON.stringify(deferred)).toBe(JSON.stringify(executed));
+    });
+
     it("keeps execute-time heuristic truncation on the execute pass before later defer replay", async () => {
         useTempDataHome("context-transform-heuristic-persist-");
         const testDirectory = makeTestDirectory("context-transform-heuristic-dir-");

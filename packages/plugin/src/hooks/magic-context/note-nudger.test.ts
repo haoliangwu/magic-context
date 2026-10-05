@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
 import {
     appendNoteNudgeAnchor,
     getNoteNudgeAnchors,
@@ -12,11 +12,14 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     clearNoteNudgeState,
     clearNoteNudgeTriggerOnly,
+    getNoteNudgeCooldownCountForTest,
     getNoteNudgeText,
     getStickyNoteNudge,
     markNoteNudgeDelivered,
     onNoteTrigger,
     peekNoteNudgeText,
+    recordNoteNudgeDeliveryTime,
+    resetNoteNudgeCooldownOnly,
 } from "./note-nudger";
 
 const dbs: Database[] = [];
@@ -114,7 +117,8 @@ describe("note-nudger", () => {
         });
 
         const text = peekNoteNudgeText(db, "ses-trigger", "u-2");
-        expect(text).toContain("You have 1 deferred note");
+        expect(text).toContain("0 notes ready, 1 active");
+        expect(text).toContain("#1 Follow up later.");
 
         markNoteNudgeDelivered(db, "ses-trigger", text!, "u-2");
 
@@ -173,7 +177,7 @@ describe("note-nudger", () => {
         // read is NO LONGER visible (compactified, ctx_reduce'd, or aged out).
         // The agent has lost note visibility, so re-surface the reminder.
         expect(peekNoteNudgeText(db, "ses-read-dropped", "u-2", undefined, false)).toContain(
-            "You have 1 deferred note",
+            "0 notes ready, 1 active",
         );
     });
 
@@ -211,7 +215,7 @@ describe("note-nudger", () => {
         // On the next user message, the nudge fires because one note is newer
         // than the last read watermark.
         expect(peekNoteNudgeText(db, "ses-new-activity", "u-2")).toContain(
-            "You have 2 deferred notes",
+            "0 notes ready, 2 active",
         );
     });
 
@@ -236,7 +240,89 @@ describe("note-nudger", () => {
 
         onNoteTrigger(db, "ses-clear", "todos_complete");
 
-        expect(getNoteNudgeText(db, "ses-clear")).toContain("You have 1 deferred note");
+        expect(getNoteNudgeText(db, "ses-clear")).toContain("0 notes ready, 1 active");
+    });
+
+    it("suppresses a later trigger inside the cooldown window whichever arm fired it", () => {
+        const db = makeDb();
+        addNote(db, "session", { sessionId: "ses-cooldown", content: "Circle back." });
+
+        onNoteTrigger(db, "ses-cooldown", "todos_complete");
+        expect(peekNoteNudgeText(db, "ses-cooldown", "u-1")).toBeNull();
+        const text = peekNoteNudgeText(db, "ses-cooldown", "u-2");
+        expect(text).toContain("0 notes ready, 1 active");
+        markNoteNudgeDelivered(db, "ses-cooldown", text!, "u-2");
+
+        // A second work boundary — here the historian-publish arm, which rust mode also
+        // uses — lands inside the 15-minute window, so the peek consumes the trigger
+        // instead of nudging again.
+        onNoteTrigger(db, "ses-cooldown", "historian_complete");
+        expect(peekNoteNudgeText(db, "ses-cooldown", "u-3")).toBeNull();
+        expect(peekNoteNudgeText(db, "ses-cooldown", "u-4")).toBeNull();
+        expect(getPersistedRow(db, "ses-cooldown")?.triggerPending).toBe(0);
+
+        // With the window expired, the same arm delivers again — the suppression above
+        // was the cooldown and nothing else.
+        onNoteTrigger(db, "ses-cooldown", "historian_complete");
+        resetNoteNudgeCooldownOnly("ses-cooldown");
+        expect(peekNoteNudgeText(db, "ses-cooldown", "u-5")).toBeNull();
+        expect(peekNoteNudgeText(db, "ses-cooldown", "u-6")).toContain("0 notes ready, 1 active");
+    });
+
+    it("shows a different note on each delivery and replays a delivery byte-identically", () => {
+        const db = makeDb();
+        const sessionId = "ses-pick";
+        for (const content of [
+            "First deferred item",
+            "Second deferred item",
+            "Third deferred item",
+        ]) {
+            addNote(db, "session", { sessionId, content });
+        }
+
+        // Two consecutive deliveries: each is a fresh trigger after the
+        // previous one was marked delivered, so the pick counter advances.
+        onNoteTrigger(db, sessionId, "historian_complete");
+        expect(peekNoteNudgeText(db, sessionId, "u-1")).toBeNull();
+        const first = peekNoteNudgeText(db, sessionId, "u-2");
+        expect(first).not.toBeNull();
+        markNoteNudgeDelivered(db, sessionId, first!, "u-2");
+
+        resetNoteNudgeCooldownOnly(sessionId);
+        onNoteTrigger(db, sessionId, "todos_complete");
+        expect(peekNoteNudgeText(db, sessionId, "u-3")).toBeNull();
+        const second = peekNoteNudgeText(db, sessionId, "u-4");
+        expect(second).not.toBeNull();
+        markNoteNudgeDelivered(db, sessionId, second!, "u-4");
+
+        expect(second).not.toBe(first);
+
+        // Replay: the delivered text is stored with its anchor, so every later
+        // pass re-injects exactly the bytes that were delivered.
+        const anchors = getNoteNudgeAnchors(db, sessionId);
+        expect(anchors).toEqual([
+            { messageId: "u-2", text: first! },
+            { messageId: "u-4", text: second! },
+        ]);
+        expect(getStickyNoteNudge(db, sessionId)).toBeNull();
+    });
+
+    it("shows a ready smart note instead of the random pick when one exists", () => {
+        const db = makeDb();
+        const sessionId = "ses-ready-pick";
+        addNote(db, "session", { sessionId, content: "Plain deferred item" });
+        db.prepare(
+            `INSERT INTO notes (type, status, content, project_path, surface_condition, created_at, updated_at, ready_at)
+             VALUES ('smart', 'ready', ?, 'git:project-a', 'condition', 1, 1, 1)`,
+        ).run("Ready smart item");
+
+        onNoteTrigger(db, sessionId, "historian_complete");
+        expect(peekNoteNudgeText(db, sessionId, "u-1", "git:project-a")).toBeNull();
+        const text = peekNoteNudgeText(db, sessionId, "u-2", "git:project-a");
+
+        expect(text).toContain("1 notes ready, 1 active");
+        expect(text).toContain("#2 Ready smart item");
+        expect(text).not.toContain("Plain deferred item");
     });
 
     it("clearNoteNudgeTriggerOnly preserves delivered anchors", () => {
@@ -253,5 +339,26 @@ describe("note-nudger", () => {
             { messageId: "m1", text: "one" },
             { messageId: "m2", text: "two" },
         ]);
+    });
+
+    it("drops cooldown entries once their window has passed instead of keeping one per session forever", () => {
+        // Far ahead of the real clock, so entries other tests left behind count as expired.
+        const start = new Date("2100-01-01T00:00:00Z").getTime();
+        try {
+            setSystemTime(start);
+            for (let index = 0; index < 50; index += 1) {
+                recordNoteNudgeDeliveryTime(`ses-cooldown-prune-${index}`);
+            }
+            expect(getNoteNudgeCooldownCountForTest()).toBeGreaterThanOrEqual(50);
+
+            // Sixteen minutes later every earlier window has closed, so the next
+            // delivery leaves only its own entry behind.
+            setSystemTime(start + 16 * 60 * 1000);
+            recordNoteNudgeDeliveryTime("ses-cooldown-prune-late");
+            expect(getNoteNudgeCooldownCountForTest()).toBe(1);
+        } finally {
+            setSystemTime();
+            resetNoteNudgeCooldownOnly("ses-cooldown-prune-late");
+        }
     });
 });

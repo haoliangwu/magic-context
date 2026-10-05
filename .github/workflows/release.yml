@@ -12,21 +12,17 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Pipeline shape (each stage gates the next via `needs:`):
+# Pipeline shape:
 #
 #   test, test-pi, test-cli                                (unit tests, parallel)
+#          ↓                    ↓
+#   e2e-opencode             e2e-pi                           (Docker smoke, respective unit gates)
+#   e2e-host-opencode        e2e-host-pi                      (host behavior, respective unit gates)
+#   e2e-rust-hermetic-build → e2e-rust-hermetic (4 shards)   (independent Rust build and suite)
 #                  ↓
-#   e2e-opencode, e2e-pi                                   (Docker install + smoke, parallel — gated by unit tests)
+#   publish-npm, publish-npm-pi, publish-npm-cli           (gated by every test and e2e job)
 #                  ↓
-#   e2e-host-opencode, e2e-host-pi                         (host behavior suite from packages/e2e-tests, parallel — gated by Docker)
-#                  ↓
-#   e2e-rust-hermetic                                      (private-source Rust behavior suite on hosted Ubuntu)
-#                  ↓
-#   publish-npm, publish-npm-pi, publish-npm-cli           (npm publishes, parallel — gated by host + Rust e2e)
-#                  ↓
-#   github-release                                         (GH release tag — gated by all publishes)
-#                  ↓
-#   discord-announce                                       (Discord post — gated by github-release)
+#   github-release → discord-announce
 #
 # Two e2e layers cover different concerns:
 #   - Docker e2e: fresh-install smoke (plugin loads, doctor clean, one mock turn writes DB
@@ -35,9 +31,8 @@ env:
 #     historian publish behavior, tag-owner collision, synthetic todowrite, cross-harness
 #     memory, etc. Spawns real `opencode serve` / Pi subprocesses against the embedded
 #     mock provider. Catches cache-stability + correctness regressions that the smoke
-#     layer cannot see. The Rust hermetic lane uses a scoped cortexkit-ci GitHub App
-#     token to clone its private sibling sources. Its credential preflight warns visibly
-#     when the App secrets are absent rather than claiming an unrun suite passed.
+#     layer cannot see. The Rust hermetic lane checks public sibling sources in an
+#     independent build and four parallel test shards.
 #
 # Prior to v0.21.x the Docker e2e ran in a separate workflow (e2e-docker.yml) on the
 # same tag push, so publishes could complete even if e2e failed. Folding both e2e
@@ -233,9 +228,7 @@ jobs:
   e2e-host-opencode:
     name: E2E (OpenCode, host behavior)
     runs-on: ubuntu-latest
-    # Gated on Docker e2e: no point exercising the deep behavior suite if
-    # the simpler install+smoke path is broken.
-    needs: [e2e-opencode]
+    needs: [test, test-cli]
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -253,7 +246,7 @@ jobs:
         # Float to LATEST (the version users run). See ci.yml for the rationale
         # + re-pin escape hatch for known-bad upstream builds.
         run: |
-          curl -fsSL https://opencode.ai/install | bash
+          OPENCODE_VERSION=latest bash tests/docker/install-opencode.sh
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
       - name: Verify opencode on PATH
@@ -270,22 +263,23 @@ jobs:
       - name: Run host e2e suite (OpenCode tests only)
         env:
           NODE_ENV: ""
+          MC_E2E_MODE: ts
+          MC_E2E_HOST: opencode
         run: |
           cd packages/e2e-tests
-          # Match every test file except pi-*.test.ts, plus the cache-bust oracle
-          # unit test (src/cache-analysis.test.ts) that backs the cache-invariant
-          # suite — a regression in it would silently neuter those guards.
-           # shellcheck disable=SC2010 # The suite intentionally excludes Pi test files from this glob.
-           files=$(ls tests/*.test.ts | grep -v "/pi-" | tr '\n' ' ')
-           files="$files src/cache-analysis.test.ts"
-           echo "Running OpenCode host tests: $files"
-           # shellcheck disable=SC2086 # The repository-controlled file list must expand into Bun arguments.
-           bun test --timeout 600000 $files
+          # The validated manifest selects canonical scenarios for this host.
+          set -o pipefail
+          files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness opencode | tr '\n' ' ')
+          if [ -z "${files// /}" ]; then echo 'mode manifest selected no files'; exit 1; fi
+          echo "Running OpenCode host tests: $files"
+          # shellcheck disable=SC2086 # The repository-controlled file list must expand into Bun arguments.
+          bun test --timeout 600000 $files
+          bun test --timeout 600000 src/cache-analysis.test.ts
 
   e2e-host-pi:
     name: E2E (Pi, host behavior)
     runs-on: ubuntu-latest
-    needs: [e2e-pi]
+    needs: [test-pi, test-cli]
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
@@ -306,7 +300,7 @@ jobs:
       # (see ci.yml for the rationale + re-pin escape hatch).
       - name: Install opencode
         run: |
-          curl -fsSL https://opencode.ai/install | bash
+          OPENCODE_VERSION=latest bash tests/docker/install-opencode.sh
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
       - name: Verify opencode on PATH
@@ -324,107 +318,48 @@ jobs:
       - name: Run host e2e suite (Pi tests only)
         env:
           NODE_ENV: ""
+          MC_E2E_MODE: ts
+          MC_E2E_HOST: pi
         run: |
           cd packages/e2e-tests
-          bun test --timeout 600000 tests/pi-*.test.ts
+          set -o pipefail
+          files=$(bun scripts/validate-mode-manifest.ts --mode ts --harness pi | tr '\n' ' ')
+          if [ -z "${files// /}" ]; then echo 'mode manifest selected no files'; exit 1; fi
+          # shellcheck disable=SC2086 # The repository-controlled file list must expand into Bun arguments.
+          bun test --timeout 600000 $files
 
-  rust-e2e-preflight:
-    name: Rust hermetic E2E credential preflight
+  e2e-rust-hermetic-build:
+    name: E2E (Rust hermetic build)
+    if: ${{ vars.RELEASE_SKIP_RUST_E2E != github.ref_name }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      enabled: ${{ steps.credentials.outputs.enabled }}
-    steps:
-      - id: credentials
-        name: Report private-source credential state
-        env:
-          CK_CI_APP_ID: ${{ secrets.CK_CI_APP_ID }}
-          CK_CI_APP_PRIVATE_KEY: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          missing_secrets=()
-          [[ -n "$CK_CI_APP_ID" ]] || missing_secrets+=("CK_CI_APP_ID")
-          [[ -n "$CK_CI_APP_PRIVATE_KEY" ]] || missing_secrets+=("CK_CI_APP_PRIVATE_KEY")
-
-          if (( ${#missing_secrets[@]} > 0 )); then
-            missing_prerequisite="$(IFS=','; echo "${missing_secrets[*]}")"
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Rust hermetic E2E skipped::Missing prerequisite: Actions secret(s) ${missing_prerequisite}. Configure the cortexkit-ci GitHub App secrets documented in .github/RUST_E2E_CI.md."
-            {
-              echo "## Rust hermetic E2E"
-              echo "SKIPPED: Missing prerequisite: Actions secret(s) ${missing_prerequisite}."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "Rust hermetic E2E is SKIPPED: cortexkit-ci GitHub App secrets are absent. This release does not claim the Rust suite passed."
-          else
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "Rust hermetic E2E credentials are available for the hosted release runner."
-          fi
-
-  e2e-rust-hermetic:
-    name: E2E (Rust hermetic)
-    # This job is reachable only from this tag-only release workflow because it
-    # reads private sibling source with a scoped cortexkit-ci GitHub App token.
-    # Never copy it to a pull_request trigger or an unprotected workflow.
-    if: ${{ needs.rust-e2e-preflight.outputs.enabled == 'true' }}
-    runs-on: ubuntu-latest
-    needs: [e2e-host-opencode, e2e-host-pi, rust-e2e-preflight]
     timeout-minutes: 120
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v5
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-
-      - name: Create scoped cortexkit-ci GitHub App token
-        id: cortexkit-ci-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CK_CI_APP_ID }}
-          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
-          owner: cortexkit
-          repositories: subconscious,commons
-
-      # actions/checkout refuses paths outside $GITHUB_WORKSPACE, so the private
-      # siblings land in .siblings/ and symlinks recreate the ../commons and
-      # ../subconscious layout the harness and later steps expect. First live
-      # run of this leg caught this: the preflight only proves secrets exist.
       - name: Check out commons
         uses: actions/checkout@v5
         with:
           repository: cortexkit/commons
-          token: ${{ steps.cortexkit-ci-token.outputs.token }}
           path: .siblings/commons
-          persist-credentials: false
-
       - name: Check out subconscious
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
-          token: ${{ steps.cortexkit-ci-token.outputs.token }}
           path: .siblings/subconscious
-          persist-credentials: false
-
       - name: Link siblings at the expected relative paths
         shell: bash
         run: |
           set -euo pipefail
           ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
           ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
-          # commons does not commit a Cargo.lock (library workspace); the harness
-          # prerequisite detector requires only its Cargo.toml. Asserting the lock
-          # here failed the first live run: local checkouts carry a build-generated
-          # lock that fresh CI checkouts never have.
           test -f "$GITHUB_WORKSPACE/../commons/Cargo.toml"
           test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
-
-      - name: Record private sibling revisions
+      - name: Record public sibling revisions
         shell: bash
         run: |
           set -euo pipefail
@@ -433,7 +368,6 @@ jobs:
           summary="Rust hermetic sibling checkouts: commons=${commons_sha}; subconscious=${subconscious_sha}"
           echo "$summary"
           echo "$summary" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Derive hermetic Cargo cache key
         id: cargo-cache-key
         shell: bash
@@ -441,34 +375,82 @@ jobs:
           set -euo pipefail
           digest="$(sha256sum Cargo.lock ../commons/Cargo.toml ../subconscious/Cargo.lock | sha256sum | awk '{print $1}')"
           echo "key=rust-hermetic-${RUNNER_OS}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
-
       - name: Restore ck-subc and ckdev-mc-e2e Cargo target cache
         uses: actions/cache@v4
         with:
           path: packages/e2e-tests/.cache/rust-e2e-cargo-target
           key: ${{ steps.cargo-cache-key.outputs.key }}
+      - name: Build hermetic binary pair (including fault-injection variant)
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$GITHUB_WORKSPACE/packages/e2e-tests/.cache/rust-e2e-cargo-target"
+          mkdir -p "$target/prebuilt"
+          CARGO_TARGET_DIR="$target" cargo build --release -p mc-module
+          cp "$target/release/ck-mc" "$target/prebuilt/ckdev-mc-e2e"
+          CARGO_TARGET_DIR="$target" cargo build --release -p mc-module --features drive-fault
+          cp "$target/release/ck-mc" "$target/prebuilt/ckdev-mc-e2e-drive-fault"
+          (cd ../subconscious && CARGO_TARGET_DIR="$target" cargo build --release -p subc-core --bins)
+          cp "$target/release/ck-subc" "$target/prebuilt/ck-subc"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-hermetic-binaries
+          path: packages/e2e-tests/.cache/rust-e2e-cargo-target/prebuilt/
+          if-no-files-found: error
+          retention-days: 1
 
+  e2e-rust-hermetic:
+    name: E2E (Rust hermetic ${{ matrix.shard }}/4)
+    if: ${{ vars.RELEASE_SKIP_RUST_E2E != github.ref_name }}
+    runs-on: ubuntu-latest
+    needs: [e2e-rust-hermetic-build]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/checkout@v5
+        with:
+          repository: cortexkit/commons
+          path: .siblings/commons
+      - uses: actions/checkout@v5
+        with:
+          repository: cortexkit/subconscious
+          path: .siblings/subconscious
+      - name: Link sibling workspaces
+        run: |
+          ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
+          ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
       - name: Install workspace dependencies
         run: bun install --frozen-lockfile
-
-      - name: Install OpenCode
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-hermetic-binaries
+          path: packages/e2e-tests/.cache/prebuilt
+      - name: Make downloaded binaries executable
+        run: chmod +x packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e-drive-fault packages/e2e-tests/.cache/prebuilt/ck-subc
+      - name: Install pinned OpenCode
         run: |
-          curl -fsSL https://opencode.ai/install | bash
+          OPENCODE_VERSION=1.18.32 bash tests/docker/install-opencode.sh
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-
-      - name: Verify OpenCode on PATH
-        run: opencode --version
-
-      - name: Build OpenCode plugin
-        run: bun run --cwd packages/plugin build
-
-      # The hermetic manifest includes Pi-mode suites that load the Pi dist;
-      # the first live run failed on its absence (local checkouts always carry
-      # it from build:dists, fresh CI checkouts never do).
-      - name: Build Pi plugin
-        run: bun run --cwd packages/pi-plugin build
-
-      - name: Build ck-subc and ckdev-mc-e2e, then run Rust hermetic e2e
+      - name: Build host plugins
+        run: |
+          bun run --cwd packages/plugin build
+          bun run --cwd packages/pi-plugin build
+      - name: Run manifest shard
+        env:
+          MC_E2E_SHARD: ${{ matrix.shard }}/4
+          MC_E2E_CK_MC_PREBUILT_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e
+          MC_E2E_CK_MC_DRIVE_FAULT_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e-drive-fault
+          MC_E2E_CK_SUBC_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ck-subc
         run: scripts/run-rust-hermetic-e2e.sh
   publish-npm:
     name: Publish plugin to npm
@@ -476,10 +458,9 @@ jobs:
     # Publishes are gated on the full e2e suite (OpenCode + Pi) so a tag
     # push can never produce a published npm package whose runtime fails
     # the install + first-turn smoke test.
-    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, rust-e2e-preflight, e2e-rust-hermetic]
-    # A disabled runner has already emitted a warning in rust-e2e-preflight and
-    # leaves e2e-rust-hermetic visibly skipped. An enabled Rust failure still
-    # blocks publication.
+    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
+    # Every Rust shard must pass; a tag-scoped operator skip skips the build
+    # and every shard together.
     if: >-
       always() &&
       needs.test.result == 'success' &&
@@ -489,8 +470,8 @@ jobs:
       needs.e2e-pi.result == 'success' &&
       needs.e2e-host-opencode.result == 'success' &&
       needs.e2e-host-pi.result == 'success' &&
-      needs.rust-e2e-preflight.result == 'success' &&
-      (needs.e2e-rust-hermetic.result == 'success' || needs.e2e-rust-hermetic.result == 'skipped')
+      ((needs.e2e-rust-hermetic-build.result == 'success' && needs.e2e-rust-hermetic.result == 'success') ||
+      (vars.RELEASE_SKIP_RUST_E2E == github.ref_name && needs.e2e-rust-hermetic-build.result == 'skipped' && needs.e2e-rust-hermetic.result == 'skipped'))
     steps:
       - uses: actions/checkout@v5
 
@@ -529,10 +510,9 @@ jobs:
   publish-npm-pi:
     name: Publish pi-plugin to npm
     runs-on: ubuntu-latest
-    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, rust-e2e-preflight, e2e-rust-hermetic]
-    # A disabled runner has already emitted a warning in rust-e2e-preflight and
-    # leaves e2e-rust-hermetic visibly skipped. An enabled Rust failure still
-    # blocks publication.
+    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
+    # Every Rust shard must pass; a tag-scoped operator skip skips the build
+    # and every shard together.
     if: >-
       always() &&
       needs.test.result == 'success' &&
@@ -542,8 +522,8 @@ jobs:
       needs.e2e-pi.result == 'success' &&
       needs.e2e-host-opencode.result == 'success' &&
       needs.e2e-host-pi.result == 'success' &&
-      needs.rust-e2e-preflight.result == 'success' &&
-      (needs.e2e-rust-hermetic.result == 'success' || needs.e2e-rust-hermetic.result == 'skipped')
+      ((needs.e2e-rust-hermetic-build.result == 'success' && needs.e2e-rust-hermetic.result == 'success') ||
+      (vars.RELEASE_SKIP_RUST_E2E == github.ref_name && needs.e2e-rust-hermetic-build.result == 'skipped' && needs.e2e-rust-hermetic.result == 'skipped'))
     steps:
       - uses: actions/checkout@v5
 
@@ -577,10 +557,9 @@ jobs:
   publish-npm-cli:
     name: Publish unified CLI to npm
     runs-on: ubuntu-latest
-    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, rust-e2e-preflight, e2e-rust-hermetic]
-    # A disabled runner has already emitted a warning in rust-e2e-preflight and
-    # leaves e2e-rust-hermetic visibly skipped. An enabled Rust failure still
-    # blocks publication.
+    needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, e2e-rust-hermetic-build, e2e-rust-hermetic]
+    # Every Rust shard must pass; a tag-scoped operator skip skips the build
+    # and every shard together.
     if: >-
       always() &&
       needs.test.result == 'success' &&
@@ -590,8 +569,8 @@ jobs:
       needs.e2e-pi.result == 'success' &&
       needs.e2e-host-opencode.result == 'success' &&
       needs.e2e-host-pi.result == 'success' &&
-      needs.rust-e2e-preflight.result == 'success' &&
-      (needs.e2e-rust-hermetic.result == 'success' || needs.e2e-rust-hermetic.result == 'skipped')
+      ((needs.e2e-rust-hermetic-build.result == 'success' && needs.e2e-rust-hermetic.result == 'success') ||
+      (vars.RELEASE_SKIP_RUST_E2E == github.ref_name && needs.e2e-rust-hermetic-build.result == 'skipped' && needs.e2e-rust-hermetic.result == 'skipped'))
     steps:
       - uses: actions/checkout@v5
 
@@ -632,11 +611,9 @@ jobs:
     # from npm.
     needs: [test, test-pi, test-cli, e2e-opencode, e2e-pi, e2e-host-opencode, e2e-host-pi, publish-npm, publish-npm-pi, publish-npm-cli]
     # Explicit per-need conditions instead of the default success(): the default
-    # evaluates the TRANSITIVE needs chain, so the rust-hermetic leg's designed
-    # loud-skip (missing CI credentials) silently skipped this job and the
-    # Discord announcement behind it at v0.40.1 — publishes succeeded while the
-    # release page never appeared. Mirror the publish jobs' armor: run whenever
-    # every DIRECT need succeeded, regardless of upstream skips.
+    # evaluates the TRANSITIVE needs chain. This keeps the release job governed by
+    # the results of its direct needs, including the publish jobs' explicit
+    # handling of a tag-scoped Rust-suite skip.
     if: >-
       always() &&
       needs.test.result == 'success' &&

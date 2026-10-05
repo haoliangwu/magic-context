@@ -10,6 +10,8 @@
 // fixtures may replace this root, while MAGIC_CONTEXT_STORAGE_DIR can never
 // escape test isolation. Do not remove.
 import { afterAll } from "bun:test";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
 import {
 	createTestTempDir,
 	installTestTempDirCleanup,
@@ -25,3 +27,24 @@ const { dir: isolatedDataHome } = createTestTempDir("mc-pi-test-xdg-");
 process.env.MAGIC_CONTEXT_TEST_DATA_DIR = isolatedDataHome;
 process.env.XDG_DATA_HOME = isolatedDataHome;
 process.env.XDG_CONFIG_HOME = isolatedDataHome;
+
+afterAll(() => {
+    const packageDir = process.cwd();
+    const violations: string[] = [];
+    const scan = (directory: string): void => {
+        for (const entry of readdirSync(directory, { withFileTypes: true })) {
+            const path = join(directory, entry.name);
+            if (entry.isDirectory()) {
+                if (entry.name === "node_modules" || entry.name === ".git") continue;
+                if (entry.name === "undefined") violations.push(path);
+                scan(path);
+            } else if (entry.isFile() && entry.name === "context.db") {
+                violations.push(path);
+            }
+        }
+    };
+    scan(packageDir);
+    if (violations.length > 0) {
+        throw new Error(`Test storage leaked into the package directory:\n${violations.join("\n")}`);
+    }
+});

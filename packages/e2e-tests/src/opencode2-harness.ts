@@ -19,6 +19,10 @@ export interface OpenCode2TestHarnessOptions {
     openCodeConfigExtra?: Record<string, unknown>;
     modelContextLimit?: number;
     mockDefault?: MockResponse;
+    expectMagicContext?: boolean;
+    /** Absolute path to a second plugin, loaded after Magic Context so its own
+     * session hooks observe the draft Magic Context hands back to the host. */
+    probePlugin?: string;
 }
 
 const DEFAULT_MOCK_RESPONSE: MockResponse = {
@@ -47,15 +51,18 @@ export class OpenCode2TestHarness implements HostHarness {
     private readonly spawnOptions: OpenCode2SpawnOptions;
     private readonly requestEvidence = new Map<string, { offset: number; prompt: string }>();
     private contextDbCached: Database | null = null;
+    private readonly expectMagicContext: boolean;
 
     private constructor(
         host: OpenCode2Host,
         client: OpenCode2Client,
         spawnOptions: OpenCode2SpawnOptions,
+        expectMagicContext: boolean,
     ) {
         this.hostInstance = host;
         this.clientInstance = client;
         this.spawnOptions = spawnOptions;
+        this.expectMagicContext = expectMagicContext;
     }
 
     static async create(options: OpenCode2TestHarnessOptions = {}): Promise<OpenCode2TestHarness> {
@@ -63,10 +70,20 @@ export class OpenCode2TestHarness implements HostHarness {
             magicContextConfig: options.magicContextConfig ?? {},
             extraConfig: options.openCodeConfigExtra,
             modelContextLimit: options.modelContextLimit,
+            // Use the other test hosts' output limit so context-pressure assertions
+            // reserve the same number of output tokens on every host.
+            modelOutputLimit: 8192,
+            providerID: "anthropic",
             mockResponse: options.mockDefault ?? DEFAULT_MOCK_RESPONSE,
+            probePlugin: options.probePlugin,
         };
         const host = await spawnOpencode2(spawnOptions);
-        return new OpenCode2TestHarness(host, OpenCode2TestHarness.clientFor(host), spawnOptions);
+        return new OpenCode2TestHarness(
+            host,
+            OpenCode2TestHarness.clientFor(host),
+            spawnOptions,
+            options.expectMagicContext !== false,
+        );
     }
 
     get mock() {
@@ -75,6 +92,18 @@ export class OpenCode2TestHarness implements HostHarness {
 
     get opencode() {
         return this.hostInstance;
+    }
+
+    get serverUrl(): string {
+        return this.hostInstance.url;
+    }
+
+    get workdir(): string {
+        return this.hostInstance.cwd;
+    }
+
+    get dataDir(): string {
+        return this.hostInstance.env.XDG_DATA_HOME!;
     }
 
     private static clientFor(host: OpenCode2Host): OpenCode2Client {
@@ -101,6 +130,10 @@ export class OpenCode2TestHarness implements HostHarness {
         this.requestEvidence.clear();
     }
 
+    async reloadPlugin(): Promise<void> {
+        await this.restart();
+    }
+
     async createSession(): Promise<string> {
         const session = await this.clientInstance.session.create({
             location: { directory: this.hostInstance.cwd },
@@ -111,6 +144,15 @@ export class OpenCode2TestHarness implements HostHarness {
         });
         await waitForPluginActive(this.clientInstance, this.hostInstance.cwd);
         return session.id;
+    }
+
+    async compactSession(sessionId: string): Promise<void> {
+        await this.clientInstance.session.compact({ sessionID: sessionId });
+        await this.clientInstance.session.wait({ sessionID: sessionId }, { signal: AbortSignal.timeout(60_000) });
+    }
+
+    async removeSession(sessionId: string): Promise<void> {
+        await this.clientInstance.session.remove({ sessionID: sessionId });
     }
 
     async sendPrompt(
@@ -153,6 +195,7 @@ export class OpenCode2TestHarness implements HostHarness {
     }
 
     assertMagicContextProcessed(sessionId: string): void {
+        if (!this.expectMagicContext) return;
         const evidence = this.requestEvidence.get(sessionId);
         if (!evidence) {
             throw new Error(`OpenCode 2 has no submitted prompt evidence for session ${sessionId}`);
@@ -168,7 +211,7 @@ export class OpenCode2TestHarness implements HostHarness {
                 return hasTransformedHead && body.includes(serializedPrompt);
             });
         if (!transformed) {
-            throw new Error(`OpenCode 2 Magic Context did not transform session ${sessionId}`);
+            throw new Error(`OpenCode 2 Magic Context did not transform session ${sessionId}\n${this.hostInstance.stderr()}`);
         }
     }
 
@@ -209,9 +252,9 @@ export class OpenCode2TestHarness implements HostHarness {
         throw new Error(`waitFor timed out after ${timeoutMs}ms${opts.label ? ` (${opts.label})` : ""}`);
     }
 
-    private contextDbPath(): string {
+    contextDbPath(): string {
         return join(
-            this.hostInstance.env.XDG_DATA_HOME!,
+            this.dataDir,
             "cortexkit",
             "magic-context",
             "context.db",
@@ -264,6 +307,10 @@ export class OpenCode2TestHarness implements HostHarness {
 
     requests() {
         return this.mock.requests();
+    }
+
+    diagnostics(): string {
+        return `stdout:\n${this.hostInstance.stdout()}\nstderr:\n${this.hostInstance.stderr()}`;
     }
 
     assertHistorianRequestsUseMock(): void {

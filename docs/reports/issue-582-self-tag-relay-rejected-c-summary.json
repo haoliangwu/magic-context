@@ -1,0 +1,22 @@
+{
+  "root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/self-tag-trial/run-CYS41v",
+  "calls": [
+    {
+      "index": 29,
+      "model": "deepseek-flash",
+      "messages": 5,
+      "tools": 5,
+      "text": "",
+      "reasoning": "",
+      "calls": [],
+      "thinking": "enabled",
+      "maxTokens": 4096,
+      "reasoningTokens": null,
+      "servedDroppedTags": [],
+      "status": 400,
+      "error": "Required dropped tool-result tag was absent; upstream model call prevented"
+    }
+  ],
+  "reason": "Restarted C target guard leaked into a subsequent D session; no upstream call was made. Reset per-session guard fixed before standalone D supplemental run.",
+  "copiedCredentialDeleted": true
+}

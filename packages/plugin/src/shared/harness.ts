@@ -54,6 +54,20 @@ export function getHarness(): HarnessId {
 }
 
 /**
+ * Whether this process may read OpenCode's own session store (opencode.db).
+ *
+ * Only the OpenCode plugins own that store. A Pi or OMP process keeps its
+ * history in Pi JSONL sessions and shares only Magic Context's context.db with
+ * OpenCode. Any history read in a Pi process for a session with no Pi provider
+ * used to fall through to opencode.db, which let background work load another
+ * project's OpenCode sessions into Pi's heap. Pi therefore treats the OpenCode
+ * store as absent, the same as on a Pi-only install.
+ */
+export function harnessOwnsOpenCodeStore(harness: HarnessId = currentHarness): boolean {
+    return harness === "opencode" || harness === "opencode2";
+}
+
+/**
  * Test-only helper to reset harness state between test cases. Do NOT call
  * from production code paths.
  */

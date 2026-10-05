@@ -1,10 +1,29 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DreamerConfigSchema } from "../config/schema/magic-context";
+import {
+    deleteTaskScheduleRowsForProject,
+    writeTaskScheduleState,
+} from "../features/magic-context/dreamer/storage-task-schedule";
+import {
+    clearDreamerTickFailure,
+    formatDreamerTickFailure,
+    getDreamerTickFailure,
+} from "../features/magic-context/dreamer/tick-failure";
+import { insertMemory } from "../features/magic-context/memory/storage-memory";
 import { recordSessionProjectIdentity } from "../features/magic-context/session-project-storage";
 import { markSessionCleanupPending, openDatabase } from "../features/magic-context/storage";
-import { _resetDreamTimerForTests, startDreamScheduleTimer } from "./dream-timer";
+import { _resetHarnessForTesting, type HarnessId, setHarness } from "../shared/harness";
+import type { StatusDetail } from "../shared/rpc-types";
+import { statusSummaryFromDetail } from "../shared/status-summary";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
+import {
+    _resetDreamTimerForTests,
+    _setDreamTimerStagesForTests,
+    startDreamScheduleTimer,
+} from "./dream-timer";
 
 /**
  * Regression coverage for the schema-fence / null-DB crash:
@@ -19,7 +38,7 @@ import { _resetDreamTimerForTests, startDreamScheduleTimer } from "./dream-timer
  */
 describe("schema-fence null-DB contract", () => {
     test("openDatabase returns falsy (never throws) when DB schema exceeds supported version", () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-fence-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-fence-"));
         const dbPath = join(dir, "context.db");
         try {
             // First open migrates the fresh DB to the current LATEST schema.
@@ -49,8 +68,61 @@ describe("dream-timer registration cleanup", () => {
     afterEach(() => {
         _resetDreamTimerForTests();
     });
+    test("does not overlap maintenance ticks and releases the guard after completion", async () => {
+        const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-timer-overlap-"));
+        let interval: (() => void) | undefined;
+        const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
+            callback: () => void,
+        ) => {
+            interval = callback;
+            return { unref() {} } as unknown as ReturnType<typeof setInterval>;
+        }) as typeof setInterval);
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        let maintenanceCalls = 0;
+        let projectCalls = 0;
+        const restoreStages = _setDreamTimerStagesForTests({
+            runMessageHistoryMaintenance: async () => {
+                maintenanceCalls++;
+                await held;
+            },
+            runProjectMaintenance: async () => {
+                projectCalls++;
+            },
+        });
+        let cleanup: (() => void) | undefined;
+        try {
+            cleanup = await startDreamScheduleTimer({
+                directory,
+                projectIdentity: "git:timer-overlap",
+                harness: "pi",
+                client: {} as never,
+                ensureRegistered: async () => {},
+            });
+            interval?.();
+            interval?.();
+            expect(maintenanceCalls).toBe(1);
+            release();
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            expect(projectCalls).toBe(1);
+            interval?.();
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            expect(maintenanceCalls).toBe(2);
+            expect(projectCalls).toBe(2);
+        } finally {
+            release();
+            for (let i = 0; i < 10; i++) await Promise.resolve();
+            cleanup?.();
+            restoreStages();
+            setIntervalSpy.mockRestore();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     test("stale same-directory cleanup preserves the replacement registration", async () => {
-        const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-cleanup-"));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-timer-cleanup-"));
         const timerHandle = {
             unref: mock(() => {}),
         } as unknown as ReturnType<typeof setInterval>;
@@ -88,8 +160,34 @@ describe("dream-timer registration cleanup", () => {
         }
     });
 
+    // An unresolved project (home directory, filesystem root) has no identity.
+    // Registering it under "" would run every per-project task for a blank
+    // project key, so the timer refuses the registration outright.
+    test("refuses a registration whose project identity is empty", async () => {
+        const directory = createTestTempDirFromPath(
+            join(tmpdir(), "mc-dream-timer-empty-identity-"),
+        );
+        const setIntervalSpy = spyOn(globalThis, "setInterval");
+        try {
+            for (const projectIdentity of ["", "  "]) {
+                const cleanup = await startDreamScheduleTimer({
+                    directory,
+                    projectIdentity,
+                    harness: "pi" as const,
+                    client: {} as never,
+                    ensureRegistered: async () => undefined,
+                });
+                expect(cleanup).toBeUndefined();
+            }
+            expect(setIntervalSpy).not.toHaveBeenCalled();
+        } finally {
+            setIntervalSpy.mockRestore();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
     test("picks up a durable Rust deletion from the cold-boot startup tick", async () => {
-        const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-rust-delete-"));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-timer-rust-delete-"));
         const timerHandle = {
             unref: mock(() => {}),
         } as unknown as ReturnType<typeof setInterval>;
@@ -97,9 +195,13 @@ describe("dream-timer registration cleanup", () => {
             unref: mock(() => {}),
         } as unknown as ReturnType<typeof setTimeout>;
         let startupCallback: (() => void) | undefined;
+        const nativeTimeout = globalThis.setTimeout;
         const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
             callback: () => void,
+            delay?: number,
         ) => {
+            // Maintenance yields are real timer turns, not startup schedules.
+            if (delay === 0) return nativeTimeout(callback, 0);
             startupCallback ??= callback;
             return timeoutHandle;
         }) as typeof setTimeout);
@@ -134,7 +236,7 @@ describe("dream-timer registration cleanup", () => {
                     .get(sessionId) as { count: number };
             for (let attempt = 0; attempt < 100; attempt += 1) {
                 if (pendingCount().count === 0) break;
-                await Promise.resolve();
+                await new Promise<void>((resolve) => nativeTimeout(resolve, 0));
             }
 
             expect(deleteSession).toHaveBeenCalledWith(sessionId, directory);
@@ -149,7 +251,7 @@ describe("dream-timer registration cleanup", () => {
     });
 
     test("stops the singleton when a tick removes the last dead directory", async () => {
-        const directory = mkdtempSync(join(tmpdir(), "mc-dream-timer-dead-dir-"));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-timer-dead-dir-"));
         const timerHandle = {
             unref: mock(() => {}),
         } as unknown as ReturnType<typeof setInterval>;
@@ -327,3 +429,369 @@ describe("dream-timer dead-directory guard (static)", () => {
         expect(gcIdx).toBeGreaterThan(guardIdx);
     });
 });
+
+/**
+ * Issue 496: message-history maintenance ran before the per-project loop inside
+ * one try, so a throw from it ended the tick before a single task could be
+ * dispatched. On Pi and OMP the orphan sweep threw on every tick, which left
+ * the dreamer completely dead on those hosts while looking idle from outside.
+ * Each stage is now contained on its own, and a stage that fails is recorded so
+ * the difference between "nothing to do" and "never ran" is visible.
+ */
+describe("dreamer tick stage containment", () => {
+    interface TickFixture {
+        /** Fire one interval tick and wait for its asynchronous body to settle. */
+        tick: () => Promise<void>;
+        dispose: () => void;
+    }
+
+    async function startTickFixture(
+        projectIdentities: string[],
+        registration:
+            | Partial<Parameters<typeof startDreamScheduleTimer>[0]>
+            | ((
+                  projectIdentity: string,
+              ) => Partial<Parameters<typeof startDreamScheduleTimer>[0]>) = {},
+    ): Promise<TickFixture> {
+        const timerHandle = { unref: mock(() => {}) } as unknown as ReturnType<typeof setInterval>;
+        const timeoutHandle = { unref: mock(() => {}) } as unknown as ReturnType<typeof setTimeout>;
+        const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(
+            (() => timeoutHandle) as typeof setTimeout,
+        );
+        const clearTimeoutSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
+            (() => undefined) as typeof clearTimeout,
+        );
+        let intervalCallback: (() => void) | undefined;
+        const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
+            callback: () => void,
+        ) => {
+            intervalCallback = callback;
+            return timerHandle;
+        }) as typeof setInterval);
+        const clearIntervalSpy = spyOn(globalThis, "clearInterval").mockImplementation(
+            (() => undefined) as typeof clearInterval,
+        );
+        const directories: string[] = [];
+        const cleanups: Array<(() => void) | undefined> = [];
+        for (const projectIdentity of projectIdentities) {
+            const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-tick-"));
+            directories.push(directory);
+            cleanups.push(
+                await startDreamScheduleTimer({
+                    directory,
+                    projectIdentity,
+                    harness: "pi",
+                    client: {} as never,
+                    dreamerConfig: { disable: false } as never,
+                    ensureRegistered: async () => undefined,
+                    ...(typeof registration === "function"
+                        ? registration(projectIdentity)
+                        : registration),
+                }),
+            );
+        }
+        return {
+            tick: async () => {
+                intervalCallback?.();
+                // The tick body is a detached async function; yielding the loop
+                // repeatedly lets it run to completion before assertions.
+                for (let attempt = 0; attempt < 50; attempt += 1) await Bun.sleep(0);
+            },
+            dispose: () => {
+                for (const cleanup of cleanups) cleanup?.();
+                setTimeoutSpy.mockRestore();
+                clearTimeoutSpy.mockRestore();
+                setIntervalSpy.mockRestore();
+                clearIntervalSpy.mockRestore();
+                for (const directory of directories) {
+                    rmSync(directory, { recursive: true, force: true });
+                }
+            },
+        };
+    }
+
+    function timerDb() {
+        const db = openDatabase();
+        if (!db) throw new Error("test database unavailable");
+        return db;
+    }
+
+    afterEach(() => {
+        _resetDreamTimerForTests();
+        _resetHarnessForTesting();
+        clearDreamerTickFailure(timerDb());
+    });
+
+    for (const harness of ["pi", "omp"] as const satisfies readonly HarnessId[]) {
+        test(`dispatches per-project maintenance on ${harness}, where the orphan sweep cannot run`, async () => {
+            setHarness(harness);
+            clearDreamerTickFailure(timerDb());
+            const maintained: string[] = [];
+            // Only the project stage is replaced: the real message-history
+            // stage has to run, because that is the stage whose throw used to
+            // end the tick on this host.
+            const restoreStages = _setDreamTimerStagesForTests({
+                runProjectMaintenance: async (reg) => {
+                    maintained.push(reg.projectIdentity);
+                },
+            });
+            const fixture = await startTickFixture([
+                `git:tick-${harness}-first`,
+                `git:tick-${harness}-second`,
+            ]);
+
+            try {
+                await fixture.tick();
+
+                expect(maintained).toEqual([
+                    `git:tick-${harness}-first`,
+                    `git:tick-${harness}-second`,
+                ]);
+                // A sweep this host cannot run is parked, not failed, so the
+                // tick is a clean one and reports nothing to the user.
+                expect(getDreamerTickFailure(timerDb())).toBeNull();
+            } finally {
+                restoreStages();
+                fixture.dispose();
+            }
+        });
+    }
+
+    // The timer is how OpenCode 1 and Pi reach the scheduler, so the project's
+    // memory switch has to travel from the registration into the scheduler.
+    test("a tick schedules nothing for a project with memory disabled and leaves its rows", async () => {
+        const off = "git:tick-memory-off";
+        const on = "git:tick-memory-on";
+        const db = timerDb();
+        for (const projectIdentity of [off, on]) {
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "PROJECT_RULES",
+                content: "r",
+            });
+            writeTaskScheduleState(db, {
+                projectPath: projectIdentity,
+                task: "verify",
+                lastRunAt: null,
+                // Not due, so the enabled project finishes without running a task.
+                nextDueAt: Date.now() + 60 * 60_000,
+                schedule: "0 3 * * *",
+                lastStatus: null,
+                lastError: null,
+                retryCount: 0,
+            });
+        }
+        const readTasks = (projectIdentity: string) =>
+            (
+                db
+                    .prepare("SELECT task FROM task_schedule_state WHERE project_path = ?")
+                    .all(projectIdentity) as Array<{ task: string }>
+            ).map((row) => row.task);
+        const restoreStages = _setDreamTimerStagesForTests({
+            runMessageHistoryMaintenance: async () => undefined,
+        });
+        // A tick visits registrations in order, so once the memory-on project
+        // (registered second) has been scheduled, the memory-off one is done.
+        const fixture = await startTickFixture([off, on], (projectIdentity) => ({
+            dreamerConfig: DreamerConfigSchema.parse({}),
+            memoryEnabled: projectIdentity === on,
+        }));
+
+        try {
+            await fixture.tick();
+            // The scheduler pass is observable as map-memories being seeded
+            // next to the existing verify row.
+            for (
+                let attempt = 0;
+                attempt < 400 && !readTasks(on).includes("map-memories");
+                attempt += 1
+            ) {
+                await Bun.sleep(5);
+            }
+            expect(readTasks(on)).toContain("map-memories");
+            expect(readTasks(off)).toEqual(["verify"]);
+        } finally {
+            restoreStages();
+            fixture.dispose();
+            deleteTaskScheduleRowsForProject(db, off);
+            deleteTaskScheduleRowsForProject(db, on);
+        }
+    });
+
+    test("keeps running the projects when message-history maintenance throws", async () => {
+        const maintained: string[] = [];
+        const restoreStages = _setDreamTimerStagesForTests({
+            runMessageHistoryMaintenance: async () => {
+                throw new Error("pending cleanup retry exploded");
+            },
+            runProjectMaintenance: async (reg) => {
+                maintained.push(reg.projectIdentity);
+            },
+        });
+        const fixture = await startTickFixture([
+            "git:tick-throwing-first",
+            "git:tick-throwing-second",
+        ]);
+
+        try {
+            await fixture.tick();
+
+            expect(maintained).toEqual(["git:tick-throwing-first", "git:tick-throwing-second"]);
+            const failure = getDreamerTickFailure(timerDb());
+            expect(failure?.stage).toBe("message-history maintenance");
+            expect(failure?.message).toContain("pending cleanup retry exploded");
+        } finally {
+            restoreStages();
+            fixture.dispose();
+        }
+    });
+
+    test("keeps running the remaining projects when one project throws", async () => {
+        const maintained: string[] = [];
+        const restoreStages = _setDreamTimerStagesForTests({
+            runMessageHistoryMaintenance: async () => undefined,
+            runProjectMaintenance: async (reg) => {
+                if (reg.projectIdentity === "git:tick-project-a") {
+                    throw new Error("git sweep exploded");
+                }
+                maintained.push(reg.projectIdentity);
+            },
+        });
+        const fixture = await startTickFixture(["git:tick-project-a", "git:tick-project-b"]);
+
+        try {
+            await fixture.tick();
+
+            expect(maintained).toEqual(["git:tick-project-b"]);
+            const failure = getDreamerTickFailure(timerDb());
+            expect(failure?.stage).toBe("project git:tick-project-a");
+            expect(failure?.message).toContain("git sweep exploded");
+        } finally {
+            restoreStages();
+            fixture.dispose();
+        }
+    });
+
+    test("shows a stopped pass on the status and doctor surfaces, and clears it after a good one", async () => {
+        let stageThrows = true;
+        const restoreStages = _setDreamTimerStagesForTests({
+            runMessageHistoryMaintenance: async () => {
+                if (stageThrows) throw new Error("orphan sweep cannot read this host store");
+            },
+            runProjectMaintenance: async () => undefined,
+        });
+        const fixture = await startTickFixture(["git:tick-surface"]);
+
+        try {
+            await fixture.tick();
+
+            const failure = getDreamerTickFailure(timerDb());
+            expect(failure).not.toBeNull();
+            if (!failure) throw new Error("the stopped pass was not recorded");
+
+            // Doctor prints one line naming the stage and its code.
+            const doctorLine = formatDreamerTickFailure(failure);
+            expect(doctorLine).toContain("MC-D09");
+            expect(doctorLine).toContain("message-history maintenance");
+
+            // /ctx-status raises the matching warning on both hosts, which
+            // share this selector.
+            const summary = statusSummaryFromDetail({
+                ...STATUS_DETAIL_STUB,
+                dreamerTickFailure: failure,
+            } as unknown as StatusDetail);
+            expect(summary.warnings).toContain("dreamer_tick_blocked");
+            expect(
+                statusSummaryFromDetail(STATUS_DETAIL_STUB as unknown as StatusDetail).warnings,
+            ).not.toContain("dreamer_tick_blocked");
+
+            // A pass that gets all the way through takes the warning back down.
+            stageThrows = false;
+            await fixture.tick();
+            expect(getDreamerTickFailure(timerDb())).toBeNull();
+        } finally {
+            restoreStages();
+            fixture.dispose();
+        }
+    });
+
+    // The per-project startup run is scheduled on its own timer, detached from
+    // the tick that scheduled it. A throw in it (ensureRegistered can hit
+    // SQLITE_BUSY) must not escape as an unhandled rejection, which can end the
+    // host process.
+    test("contains a failure in a project's startup maintenance run", async () => {
+        const timeoutCallbacks: Array<() => void> = [];
+        const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+            callback: () => void,
+        ) => {
+            timeoutCallbacks.push(callback);
+            return { unref: () => {} };
+        }) as unknown as typeof setTimeout);
+        const clearTimeoutSpy = spyOn(globalThis, "clearTimeout").mockImplementation(
+            (() => undefined) as typeof clearTimeout,
+        );
+        const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation((() => ({
+            unref: () => {},
+        })) as unknown as typeof setInterval);
+        const clearIntervalSpy = spyOn(globalThis, "clearInterval").mockImplementation(
+            (() => undefined) as typeof clearInterval,
+        );
+        const restoreStages = _setDreamTimerStagesForTests({
+            runMessageHistoryMaintenance: async () => undefined,
+        });
+        const unhandled: unknown[] = [];
+        const onUnhandled = (reason: unknown) => {
+            unhandled.push(reason);
+        };
+        process.on("unhandledRejection", onUnhandled);
+        const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-startup-"));
+        let cleanup: (() => void) | undefined;
+        try {
+            cleanup = await startDreamScheduleTimer({
+                directory,
+                projectIdentity: "git:startup-throws",
+                harness: "pi",
+                client: {} as never,
+                dreamerConfig: { disable: false } as never,
+                ensureRegistered: async () => {
+                    throw new Error("SQLITE_BUSY: database is locked");
+                },
+            });
+            // Fire the startup tick, then the per-project startup run it schedules.
+            for (let fired = 0; fired < 10 && timeoutCallbacks.length > 0; fired += 1) {
+                const callback = timeoutCallbacks.shift();
+                callback?.();
+                for (let attempt = 0; attempt < 50; attempt += 1) await Bun.sleep(0);
+            }
+            for (let attempt = 0; attempt < 20; attempt += 1) await Bun.sleep(1);
+
+            expect(unhandled).toEqual([]);
+            const failure = getDreamerTickFailure(timerDb());
+            expect(failure?.stage).toBe("project git:startup-throws");
+            expect(failure?.message).toContain("SQLITE_BUSY");
+        } finally {
+            process.off("unhandledRejection", onUnhandled);
+            cleanup?.();
+            restoreStages();
+            setTimeoutSpy.mockRestore();
+            clearTimeoutSpy.mockRestore();
+            setIntervalSpy.mockRestore();
+            clearIntervalSpy.mockRestore();
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+});
+
+/** The status fields the warning selector reads, at their empty-but-healthy values. */
+const STATUS_DETAIL_STUB = {
+    inputTokens: 0,
+    contextLimit: 0,
+    usagePercentage: 0,
+    cacheTtl: "1h",
+    cacheTtlSource: "default",
+    executeThreshold: 65,
+    compartmentCount: 0,
+    historianRunning: false,
+    compartmentInProgress: false,
+    memoryCount: 0,
+};

@@ -14,8 +14,13 @@ import { findLastAssistantModelFromOpenCodeDb } from "../../../plugin/src/hooks/
 import {
 	createTransform,
 	resolveTransformHostSeams,
+	sendEmergencyRefusalNotice,
 } from "../../../plugin/src/hooks/magic-context/transform";
 import { abortSessionFailClosed } from "../../../plugin/src/hooks/magic-context/transform-postprocess-phase";
+import {
+	__resetNotificationStateForTests,
+	drainNotifications,
+} from "../../../plugin/src/shared/rpc-notifications";
 import {
 	deliverSynthetic,
 	isAdmittedSynthetic,
@@ -23,6 +28,8 @@ import {
 import { createHostSeams } from "../../../plugin/src/v2/hooks/context";
 import { adaptPayload, HEAD_IDS } from "../../../plugin/src/v2/hooks/payload";
 import {
+	INTERRUPT_CONFIRMATION_TIMEOUT_MS,
+	type InterruptTimers,
 	interruptBeforeProvider,
 	V2ContextRefusal,
 } from "../../../plugin/src/v2/hooks/refusal";
@@ -36,19 +43,21 @@ const sha = (value: unknown) =>
 	createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const root = resolve(import.meta.dir, "../../../..");
 
-test("I14 sdk_renames: v2 supplies all four host seams, v1 defaults retain function identity", () => {
+test("I14 sdk_renames: v2 supplies every host seam, v1 defaults retain function identity", () => {
 	const defaults = resolveTransformHostSeams({});
 	expect(defaults).toEqual({
 		hostRawMessages: readRawSessionMessages,
+		hostMessageReconciliationSource: readRawSessionMessages,
 		hostProtectedTailBoundary: resolveOpenCodeProtectedTailBoundary,
 		hostModelFallback: findLastAssistantModelFromOpenCodeDb,
+		hostRefusalNotice: sendEmergencyRefusalNotice,
 		hostRefuse: abortSessionFailClosed,
 	});
 	const read = Object.assign(() => [], {
 		readPage: () => [],
 		getCount: () => 0,
 	});
-	const supplied = createHostSeams({} as V2Context, read, new Map());
+	const supplied = createHostSeams({} as V2Context, read, read, new Map());
 	const resolved = resolveTransformHostSeams(supplied);
 	for (const key of Object.keys(defaults) as Array<keyof typeof defaults>) {
 		expect(typeof supplied[key]).toBe("function");
@@ -56,6 +65,7 @@ test("I14 sdk_renames: v2 supplies all four host seams, v1 defaults retain funct
 	}
 	expect(supplied.hostRawMessages).toBe(read);
 	expect(supplied.hostRawMessages).not.toBe(defaults.hostRawMessages);
+	expect(supplied.hostRefusalNotice).not.toBe(defaults.hostRefusalNotice);
 	expect(supplied.hostRefuse).not.toBe(defaults.hostRefuse);
 	expect(supplied.hostProtectedTailBoundary).not.toBe(
 		defaults.hostProtectedTailBoundary,
@@ -72,10 +82,59 @@ test("I14 sdk_renames: v2 supplies all four host seams, v1 defaults retain funct
 			join(root, "packages/plugin/src/v2", file),
 			"utf8",
 		);
-		expect(source).not.toMatch(/\.\s*(abort|delete|promptAsync)\s*\(/);
+		expect(source).not.toMatch(/\.\s*session\s*\.\s*(abort|delete|promptAsync)\s*\(/);
 		expect(source).not.toMatch(/import\s+(?!type\b).*from\s+["']@opencode\//);
 		expect(source).not.toMatch(/live-session-state/);
 	}
+});
+
+test("I9b v2 fail-closed notice is TUI-visible and synthetic-visible before interruption", async () => {
+	__resetNotificationStateForTests();
+	const records = new Map<string, unknown>();
+	const order: string[] = [];
+	const visible: Array<{ sessionID: string; text: string }> = [];
+	const context = {
+		storage: {
+			get: async (key: string) => records.get(key),
+			set: async (key: string, value: unknown) => {
+				records.set(key, value);
+			},
+		},
+		session: {
+			synthetic: async (input: { sessionID: string; text: string }) => {
+				order.push("notice");
+				visible.push(input);
+			},
+			interrupt: async () => {
+				order.push("interrupt");
+				return { interrupted: true };
+			},
+		},
+	} as unknown as V2Context;
+	const read = Object.assign(() => [], {
+		readPage: () => [],
+		getCount: () => 0,
+	});
+	const seams = createHostSeams(context, read, new Map());
+	const notice = "Context full — /ctx-flush or /clear to continue.";
+
+	await seams.hostRefusalNotice(undefined, "ses-emergency", notice, {});
+	await seams.hostRefuse(undefined, "ses-emergency");
+
+	expect(order).toEqual(["notice", "interrupt"]);
+	expect(visible).toHaveLength(1);
+	expect(visible[0]).toMatchObject({ sessionID: "ses-emergency", text: notice });
+	expect(drainNotifications(0, "ses-emergency", { sessionOnly: true })).toEqual([
+		expect.objectContaining({
+			type: "toast",
+			payload: { message: notice, variant: "error" },
+			sessionId: "ses-emergency",
+		}),
+	]);
+	expect(
+		[...records.keys()].some((key) => key.startsWith("synthetic/ses-emergency/msg_")),
+	).toBe(true);
+	__resetNotificationStateForTests();
 });
 
 test("I9b interrupt resolved confirmation returns normally", async () => {
@@ -106,16 +165,56 @@ test("I9b interrupt idle no-op refuses rather than permitting a provider request
 		),
 	).rejects.toBeInstanceOf(V2ContextRefusal);
 });
+// A manual clock drives the deadline. Measuring real elapsed time around a
+// 2000 ms timer failed whenever other work in the same test process held the
+// event loop, so the test checks the scheduled delay and the ordering instead.
+function manualTimers() {
+	const scheduled: Array<{ ms: number; fire: () => void; cleared: boolean }> = [];
+	const timers: InterruptTimers = {
+		setTimeout: (fire, ms) => {
+			const entry = { ms, fire, cleared: false };
+			scheduled.push(entry);
+			return entry;
+		},
+		clearTimeout: (handle) => {
+			(handle as { cleared: boolean }).cleared = true;
+		},
+	};
+	return { scheduled, timers };
+}
+
 test("I9b interrupt timed-out is bounded to 2000 ms and throws typed refusal", async () => {
-	const start = performance.now();
+	const clock = manualTimers();
+	let settled = false;
+	const refused = interruptBeforeProvider(
+		{ interrupt: () => new Promise(() => {}) },
+		"ses-fixture",
+		clock.timers,
+	).finally(() => {
+		settled = true;
+	});
+	expect(clock.scheduled.map((entry) => entry.ms)).toEqual([2000]);
+	expect(INTERRUPT_CONFIRMATION_TIMEOUT_MS).toBe(2000);
+	// A host that never answers must not be refused before the deadline fires.
+	for (let turn = 0; turn < 10; turn++) await Promise.resolve();
+	expect(settled).toBe(false);
+	clock.scheduled[0]!.fire();
+	const error = await refused.catch((caught: unknown) => caught);
+	expect(error).toBeInstanceOf(V2ContextRefusal);
+	expect(((error as Error).cause as Error).message).toBe("interrupt exceeded 2000 ms");
+});
+
+test("I9b interrupt confirmed before the deadline clears the deadline timer", async () => {
+	const clock = manualTimers();
 	await expect(
 		interruptBeforeProvider(
-			{ interrupt: () => new Promise(() => {}) },
+			{ interrupt: async () => ({ interrupted: true }) },
 			"ses-fixture",
+			clock.timers,
 		),
-	).rejects.toBeInstanceOf(V2ContextRefusal);
-	expect(performance.now() - start).toBeGreaterThanOrEqual(1900);
-	expect(performance.now() - start).toBeLessThan(2500);
+	).resolves.toBeUndefined();
+	expect(clock.scheduled).toHaveLength(1);
+	expect(clock.scheduled[0]!.cleared).toBe(true);
 });
 
 function fixture(sessionID: string): SessionContext {

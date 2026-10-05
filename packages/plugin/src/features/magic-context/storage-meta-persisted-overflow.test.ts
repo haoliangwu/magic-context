@@ -144,6 +144,29 @@ describe("recordDetectedContextLimit", () => {
         });
     });
 
+    it("persists overflow-reported input mass as the next recovery usage sample", () => {
+        recordOverflowDetected(
+            db,
+            "ses_provider_mass",
+            1_048_576,
+            "ollama-cloud/deepseek-v4.1-flash",
+            "provider_overflow",
+            "prompt_only",
+            1_091_002,
+        );
+
+        const row = db
+            .prepare(
+                "SELECT last_input_tokens, last_context_percentage FROM session_meta WHERE session_id = ?",
+            )
+            .get("ses_provider_mass") as {
+            last_input_tokens: number;
+            last_context_percentage: number;
+        };
+        expect(row.last_input_tokens).toBe(1_091_002);
+        expect(row.last_context_percentage).toBe((1_091_002 / 1_048_576) * 100);
+    });
+
     it("treats a legacy armed row with a detected limit as provider-proven", () => {
         ensureSessionMetaRow(db, "ses_legacy_provider");
         db.prepare(

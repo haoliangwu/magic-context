@@ -222,7 +222,9 @@ export function formatFailClosedBlockingMessage(reason: FailClosedReason): strin
         }
         return [
             `Magic Context cannot migrate the shared database (one database serves every project on this machine) because ${formatFailClosedBlockingProcesses(reason.blockingProcesses)} may be running an older Magic Context build that would fail against the migrated database.`,
+            `The database is at upstream migration v${reason.persistedVersion}; this build needs v${reason.supportedVersion}.`,
             "Restart the blocking process — even one from a different project — and it will pick up the new build and migrate on start; or shut it down and retry.",
+            "If that host loads a pinned or cached older Magic Context build, a restart alone is not enough: stop it or update its Magic Context build, then start this host once so it migrates the database with nothing older attached.",
             `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
         ].join(" ");
     }
@@ -238,6 +240,30 @@ export function formatFailClosedBlockingMessage(reason: FailClosedReason): strin
         "The plugin will not silently degrade to native compaction while enabled.",
         `Recovery: ${FAIL_CLOSED_DOCTOR_COMMAND}`,
     ].join(" ");
+}
+
+/**
+ * One-line form of {@link formatFailClosedBlockingMessage} for surfaces that
+ * must stay short or that leave the machine (a toast, a notice stored in the
+ * conversation): it names each blocking process by kind and PID but leaves out
+ * their command lines, which only the log and doctor need.
+ */
+export function formatFailClosedBlockingSummary(reason: FailClosedReason): string {
+    if (reason.kind === "migration_guard") {
+        if (reason.unreadableFile) {
+            return `Magic Context cannot migrate the shared database from v${reason.persistedVersion} to v${reason.supportedVersion}: RPC discovery file ${reason.unreadableFile} could not be read, so an older host may still be attached.`;
+        }
+        const blockers = reason.blockingProcesses
+            .filter((process) => Number.isInteger(process.pid) && process.pid > 0)
+            .map((process) => `${normalizeFailClosedProcessKind(process)} (PID ${process.pid})`);
+        const named = blockers.length > 0 ? blockers.join(", ") : "a live process";
+        return `Magic Context cannot migrate the shared database from v${reason.persistedVersion} to v${reason.supportedVersion} while ${named} may still run an older Magic Context build. Stop or update that host, then start this one once.`;
+    }
+    if (reason.kind === "schema_fence") {
+        return `Magic Context cannot operate: the shared database is at v${reason.persistedVersion}, newer than this build supports (v${reason.supportedVersion}). Update and restart this host.`;
+    }
+    const cause = reason.cause.trim().length > 0 ? reason.cause.trim() : "unknown storage error";
+    return `Magic Context cannot operate: persistent storage failed (${cause}).`;
 }
 
 export function createFailClosedBlockingError(

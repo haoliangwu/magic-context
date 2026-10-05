@@ -54,6 +54,7 @@ import {
 	embedTextForProject,
 	getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
+import { isUsableProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type {
 	UnifiedSearchOptions,
 	UnifiedSearchResult,
@@ -65,7 +66,12 @@ import {
 	appendAutoSearchHintDecision,
 	getAutoSearchHintDecisions,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
+import {
+	AUTO_SEARCH_TIMEOUT_MS,
+	withAutoSearchDeadline,
+} from "@magic-context/core/hooks/magic-context/auto-search-deadline";
 import { buildAutoSearchHint } from "@magic-context/core/hooks/magic-context/auto-search-hint";
+import type { CavemanWordRules } from "@magic-context/core/hooks/magic-context/caveman";
 import { log, sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
@@ -92,44 +98,12 @@ export interface PiAutoSearchOptions {
 	minPromptChars: number;
 	projectPath: string;
 	visibleMemoryIds?: Set<number> | null;
+	/** Caveman word rules for hint fragments, from the user-level `language` setting. */
+	wordRules?: CavemanWordRules;
 }
 
-const AUTO_SEARCH_TIMEOUT_MS = 3_000;
 const DEFAULT_SCORE_THRESHOLD = 0.55;
 const DEFAULT_MIN_PROMPT_CHARS = 20;
-
-async function unifiedSearchWithTimeout(
-	db: Database,
-	sessionId: string,
-	projectPath: string,
-	prompt: string,
-	options: UnifiedSearchOptions,
-	timeoutMs: number,
-): Promise<UnifiedSearchResult[] | null> {
-	const controller = new AbortController();
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const timeoutPromise = new Promise<null>((resolve) => {
-		timer = setTimeout(() => {
-			controller.abort();
-			resolve(null);
-		}, timeoutMs);
-	});
-
-	try {
-		return await Promise.race([
-			unifiedSearch(db, sessionId, projectPath, prompt, {
-				...options,
-				signal: controller.signal,
-				// Auto hints are plugin-internal surfacing, not explicit agent
-				// retrievals; match OpenCode lines 69-73 and search.ts lines 77-84.
-				countRetrievals: false,
-			}),
-			timeoutPromise,
-		]);
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-	}
-}
 
 function collectUserPromptParts(message: UserMessage): string {
 	const { content } = message;
@@ -290,6 +264,7 @@ export async function runAutoSearchHintForPi(args: {
 	/** Per-context projection loaded with note anchors so sticky replay reads session_meta once. */
 	decisions?: readonly AutoSearchHintDecision[];
 }): Promise<AgentMessage[]> {
+	const startedAt = performance.now();
 	const { sessionId, db, messages, options, entryIdByRef } = args;
 	const entryIds =
 		args.entryIds === undefined
@@ -339,8 +314,9 @@ export async function runAutoSearchHintForPi(args: {
 	// Persisted decisions were replayed above because replay is byte restoration,
 	// not a new mutation.
 	if (found.index !== messages.length - 1) return messages;
-
-	await args.ensureProjectRegistered?.();
+	// A directory outside any project has no identity to search memories,
+	// commits or history embeddings under; never search the blank key.
+	if (!isUsableProjectIdentity(options.projectPath)) return messages;
 
 	const writeNoHintAndReconcile = (
 		reason: AutoSearchHintNoHintReason,
@@ -380,40 +356,42 @@ export async function runAutoSearchHintForPi(args: {
 
 	let results: UnifiedSearchResult[] | null;
 	try {
-		const snapshot = getProjectEmbeddingSnapshot(options.projectPath);
-		const memoryEnabled = snapshot?.features.memoryEnabled ?? true;
-		const embeddingEnabled = snapshot
-			? snapshot.enabled || snapshot.gitCommitEnabled
-			: true;
-		const gitCommitsEnabled = snapshot?.gitCommitEnabled ?? false;
-		const searchOptions: UnifiedSearchOptions = {
-			limit: 10,
-			memoryEnabled,
-			embeddingEnabled,
-			gitCommitsEnabled,
-			embedQuery: async (text, signal) => {
-				const result = await embedTextForProject(
-					options.projectPath,
-					text,
-					signal,
-					"query",
-				);
-				return result?.vector ?? null;
-			},
-			isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
-			visibleMemoryIds: options.visibleMemoryIds ?? null,
-			// Primers v1 are cache-neutral: explicit ctx_search/dashboard only,
-			// never transform-time auto-search prompt hints.
-			sources: ["memory", "message", "git_commit"],
-		};
-		results = await unifiedSearchWithTimeout(
-			db,
-			sessionId,
-			options.projectPath,
-			rawPrompt,
-			searchOptions,
-			AUTO_SEARCH_TIMEOUT_MS,
-		);
+		results = await withAutoSearchDeadline(async (signal, checkDeadline) => {
+			await args.ensureProjectRegistered?.();
+			if (checkDeadline()) return null;
+			const snapshot = getProjectEmbeddingSnapshot(options.projectPath);
+			const memoryEnabled = snapshot?.features.memoryEnabled ?? true;
+			// Use the snapshot's history setting for query embedding, independently
+			// of memory.enabled. Memory and git-commit retrieval have separate gates.
+			const embeddingEnabled = snapshot ? snapshot.historyEnabled : true;
+			const gitCommitsEnabled = snapshot?.gitCommitEnabled ?? false;
+			const searchOptions: UnifiedSearchOptions = {
+				limit: 10,
+				memoryEnabled,
+				embeddingEnabled,
+				gitCommitsEnabled,
+				embedQuery: async (text, signal) => {
+					const result = await embedTextForProject(
+						options.projectPath,
+						text,
+						signal,
+						"query",
+					);
+					checkDeadline();
+					return result?.vector ?? null;
+				},
+				isEmbeddingRuntimeEnabled: () => embeddingEnabled === true,
+				visibleMemoryIds: options.visibleMemoryIds ?? null,
+				// Leave primers out of automatic hints so primer updates cannot rewrite
+				// cached request prefixes. Explicit ctx_search and the dashboard expose them.
+				sources: ["memory", "message", "git_commit"],
+			};
+			return unifiedSearch(db, sessionId, options.projectPath, rawPrompt, {
+				...searchOptions,
+				signal,
+				countRetrievals: false,
+			});
+		}, startedAt);
 	} catch (error) {
 		// Retryable failure — do not persist a permanent no-hint decision, or the
 		// same user message would be suppressed even though a later pass may succeed.
@@ -447,7 +425,9 @@ export async function runAutoSearchHintForPi(args: {
 		return messages;
 	}
 
-	const hintText = buildAutoSearchHint(results);
+	const hintText = buildAutoSearchHint(results, {
+		wordRules: options.wordRules,
+	});
 	if (!hintText) {
 		writeNoHintAndReconcile("empty");
 		return messages;

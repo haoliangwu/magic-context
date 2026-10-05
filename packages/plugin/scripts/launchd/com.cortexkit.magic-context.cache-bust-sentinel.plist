@@ -9,6 +9,7 @@
     <string>__BUN_PATH__</string>
     <string>__REPO_ROOT__/packages/plugin/scripts/cache-bust-sentinel.ts</string>
     <string>--once</string>
+    <string>--send</string>
   </array>
   <key>WorkingDirectory</key>
   <string>__REPO_ROOT__</string>

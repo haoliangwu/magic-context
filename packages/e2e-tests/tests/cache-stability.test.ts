@@ -1,7 +1,11 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 
 /**
  * Cache stability across defer passes.
@@ -27,19 +31,7 @@ import { TestHarness } from "../src/harness";
  * this test catches it.
  */
 
-let h: TestHarness;
-
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            execute_threshold_percentage: 80,
-        },
-    });
-});
-
-afterAll(async () => {
-    await h.dispose();
-});
+let h: ScenarioHarness;
 
 /** Remove cache_control fields so only durable content is compared. */
 function stripCacheControl(value: unknown): unknown {
@@ -59,7 +51,19 @@ function serialize(value: unknown): string {
     return JSON.stringify(stripCacheControl(value));
 }
 
-describe("cache stability", () => {
+forEachHost(import.meta.url, "cache stability", (host) => {
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: {
+                execute_threshold_percentage: 80,
+            },
+        });
+    });
+
+    afterAll(async () => {
+        await h.dispose();
+    });
+
     it("system prompt stays stable across defer passes", async () => {
         h.mock.reset();
         h.mock.setDefault({

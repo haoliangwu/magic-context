@@ -164,12 +164,15 @@ export interface Tagger {
     resetCounter(sessionId: string, db: Database): void;
     getCounter(sessionId: string): number;
     initFromDb(sessionId: string, db: Database, floor?: number): void;
+    /** Returns the database tag version recorded when this session's map was last loaded. */
+    getLoadedTagsVersion?(sessionId: string, db: Database): number | undefined;
     cleanup(sessionId: string): void;
     /** Present on the production tagger; optional keeps lightweight test doubles source-compatible. */
     getHeapStats?(): TaggerHeapStats;
 }
 
 const GET_COUNTER_SQL = `SELECT counter FROM session_meta WHERE session_id = ?`;
+const GET_TAGS_VERSION_SQL = `SELECT tags_version FROM session_meta WHERE session_id = ?`;
 // Layer C: pull tool_owner_message_id and type so we can compose the
 // in-memory key correctly. NULL-owner tool rows are intentionally NOT
 // placed in the in-memory map; the lazy-adoption DB path discovers them
@@ -184,27 +187,17 @@ const GET_ASSIGNMENTS_SCOPED_SQL =
     "SELECT message_id, tag_number, type, tool_owner_message_id, byte_size, token_count, input_byte_size, input_token_count FROM tags WHERE session_id = ? AND tag_number >= ? ORDER BY tag_number ASC";
 
 /**
- * SQLite change-detection signal for the `initFromDb` cache.
- *
- * `PRAGMA main.data_version` bumps when ANOTHER connection commits to this
- * DB. It intentionally does NOT bump for writes on the current connection:
- * the tagger is the sole same-connection writer of the assignment mapping,
- * and those write paths update `sessionAssignments`/`counters` in memory in
- * the same call. Non-mapping writes on this connection therefore no longer
- * force a full assignments scan every transform pass.
- *
- * The probe is <0.005ms vs ~15ms for the full assignments scan on a
- * 49k-tag session, so cache hits are effectively free.
+ * Session-local change signal for the `initFromDb` cache. Triggers advance it
+ * only when a tag identity changes, so writes for the other active sessions in
+ * a shared database cannot evict this session's in-memory assignment map.
  */
-const PROBE_DATA_VERSION_SQL = "PRAGMA main.data_version";
+const probeTagsVersionStatements = new WeakMap<Database, PreparedStatement>();
 
-const probeDataVersionStatements = new WeakMap<Database, PreparedStatement>();
-
-function getProbeDataVersionStatement(db: Database): PreparedStatement {
-    let stmt = probeDataVersionStatements.get(db);
+function getProbeTagsVersionStatement(db: Database): PreparedStatement {
+    let stmt = probeTagsVersionStatements.get(db);
     if (!stmt) {
-        stmt = db.prepare(PROBE_DATA_VERSION_SQL);
-        probeDataVersionStatements.set(db, stmt);
+        stmt = db.prepare(GET_TAGS_VERSION_SQL);
+        probeTagsVersionStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -228,7 +221,7 @@ interface AssignmentRow {
  */
 interface LoadSignature {
     db: Database;
-    dataVersion: number;
+    tagsVersion: number;
     /**
      * Live-wire load-scoping floor in effect for the cached map. A floor change
      * (compaction boundary advanced, or a revert lowered it) must force exactly
@@ -334,8 +327,8 @@ export function createTagger(): Tagger {
     // successful initFromDb() reload. A subsequent initFromDb() call can
     // skip the full DB scan when (a) the signature exists for this session,
     // (b) the recorded `db` object is identical to the current one, and
-    // (c) `data_version` still matches. A different Database object or an
-    // external commit (data_version bump) falls through to the full reload.
+    // (c) the session-local tags version still matches. A different Database
+    // object or a mapping write for this session falls through to a reload.
     // Same-connection tagger writes update this map directly and do not
     // invalidate the signature.
     //
@@ -451,6 +444,10 @@ export function createTagger(): Tagger {
 
             try {
                 db.transaction(() => {
+                    // Ensure session_meta exists before the tags INSERT fires the
+                    // per-session tags_version trigger. The transaction rolls both
+                    // writes back if tag allocation fails.
+                    getUpsertCounterStatement(db).run(sessionId, next, getHarness());
                     insertTag(
                         db,
                         sessionId,
@@ -465,8 +462,7 @@ export function createTagger(): Tagger {
                         entryFingerprint,
                         tokenCounts,
                     );
-                    getUpsertCounterStatement(db).run(sessionId, next, getHarness());
-                })();
+                }).immediate();
             } catch (error: unknown) {
                 if (!isUniqueConstraintError(error)) {
                     throw error;
@@ -491,6 +487,12 @@ export function createTagger(): Tagger {
 
             heapHolder.counters.set(sessionId, next);
             sessionAssignments.set(mapKey, next);
+            const signature = heapHolder.loadSignatures.get(sessionId);
+            if (signature?.db === db) {
+                // The INSERT trigger advanced exactly once. Mirror our own write
+                // so same-connection allocations retain the hot cache path.
+                signature.tagsVersion += 1;
+            }
             if (type === "tool") {
                 getSessionToolAccounting(sessionId).set(next, {
                     byteSize,
@@ -732,16 +734,14 @@ export function createTagger(): Tagger {
         return heapHolder.counters.get(sessionId) ?? 0;
     }
 
-    /**
-     * Read the current cross-connection change-detection signature for `db`.
-     */
-    function probeSignature(db: Database): { dataVersion: number } {
-        const dvRow = getProbeDataVersionStatement(db).get() as
-            | { data_version: number }
+    /** Read the current mapping version for one session. */
+    function probeSignature(sessionId: string, db: Database): { tagsVersion: number } {
+        const row = getProbeTagsVersionStatement(db).get(sessionId) as
+            | { tags_version: number }
             | null
             | undefined;
         return {
-            dataVersion: dvRow?.data_version ?? 0,
+            tagsVersion: row?.tags_version ?? 0,
         };
     }
 
@@ -749,9 +749,9 @@ export function createTagger(): Tagger {
      * Load (or refresh) per-session tagger state from the DB.
      *
      * Cache-hit fast path: if this session's last successful full reload used
-     * the same `Database` object and the current `data_version` still matches,
-     * trust the in-memory map/counter and skip the full assignments scan
-     * (~0.005 ms vs ~15 ms on a 49k-tag session).
+     * the same `Database` object and the current session-local tags version
+     * still matches, trust the in-memory map/counter and skip the full
+     * assignments scan.
      *
      * Cache-miss slow path: re-read assignments + counter from disk to pick
      * up writes made by sibling connections/processes. Same-connection tagger
@@ -767,20 +767,20 @@ export function createTagger(): Tagger {
      * (stale process or concurrent writer), it could never self-heal — every
      * `assignTag` would keep proposing already-claimed tag numbers and either
      * bounce through the collision-recovery path or fail outright. The
-     * data_version signature keeps cross-connection refresh correctness
-     * without the per-pass same-connection rescan.
+     * session-local version keeps cross-connection refresh correctness without
+     * unrelated sessions forcing a per-pass rescan.
      *
      * Record the cached signature only after a successful full reload so a
      * thrown query never leaves fresh signature metadata pointing at stale
      * in-memory state.
      */
     function initFromDb(sessionId: string, db: Database, floor = 0): void {
-        const probe = probeSignature(db);
+        const probe = probeSignature(sessionId, db);
         const cached = heapHolder.loadSignatures.get(sessionId);
         if (
             cached !== undefined &&
             cached.db === db &&
-            cached.dataVersion === probe.dataVersion &&
+            cached.tagsVersion === probe.tagsVersion &&
             cached.floor === floor
         ) {
             return;
@@ -859,9 +859,14 @@ export function createTagger(): Tagger {
         // at stale in-memory state.
         heapHolder.loadSignatures.set(sessionId, {
             db,
-            dataVersion: probe.dataVersion,
+            tagsVersion: probe.tagsVersion,
             floor,
         });
+    }
+
+    function getLoadedTagsVersion(sessionId: string, db: Database): number | undefined {
+        const signature = heapHolder.loadSignatures.get(sessionId);
+        return signature?.db === db ? signature.tagsVersion : undefined;
     }
 
     function cleanup(sessionId: string): void {
@@ -912,6 +917,7 @@ export function createTagger(): Tagger {
         resetCounter,
         getCounter,
         initFromDb,
+        getLoadedTagsVersion,
         cleanup,
         getHeapStats,
     };

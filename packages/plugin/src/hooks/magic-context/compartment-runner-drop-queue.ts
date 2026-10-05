@@ -1,5 +1,5 @@
 import { queuePendingOp } from "../../features/magic-context/storage-ops";
-import { getTagsBySession } from "../../features/magic-context/storage-tags";
+import { getActiveTagsBySession } from "../../features/magic-context/storage-tags";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { getRawSessionTagKeysThrough, type RawSessionTagKeys } from "./read-session-chunk";
@@ -24,12 +24,14 @@ export function queueDropsForCompartmentalizedMessages(
     sessionId: string,
     upToMessageIndex: number,
     observedKeys: RawSessionTagKeys,
+    fromMessageIndex?: number,
 ): void;
 export function queueDropsForCompartmentalizedMessages(
     db: Database,
     sessionId: string,
     upToMessageIndex: number,
     observedKeys?: RawSessionTagKeys,
+    fromMessageIndex = 1,
 ): Promise<void> | void {
     if (!observedKeys) {
         return getRawSessionTagKeysThrough(sessionId, upToMessageIndex, { db }).then((keys) =>
@@ -37,7 +39,7 @@ export function queueDropsForCompartmentalizedMessages(
         );
     }
 
-    const tags = getTagsBySession(db, sessionId);
+    const tags = getActiveTagsBySession(db, sessionId);
     let dropsQueued = 0;
 
     for (const tag of tags) {
@@ -64,6 +66,6 @@ export function queueDropsForCompartmentalizedMessages(
 
     sessionLog(
         sessionId,
-        `compartment agent: queued ${dropsQueued} drops for messages 0-${upToMessageIndex}`,
+        `compartment agent: queued ${dropsQueued} drops for messages ${fromMessageIndex}-${upToMessageIndex}`,
     );
 }

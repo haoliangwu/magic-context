@@ -1,0 +1,97 @@
+{
+  "location": {
+    "directory": "/private/tmp/mc-oc2-catalog-uhR8sd/home"
+  },
+  "data": [
+    {
+      "id": "claude-opus-5-5",
+      "modelID": "claude-opus-5-5",
+      "providerID": "anthropic",
+      "family": "claude-opus",
+      "name": "Claude Opus 5.5",
+      "package": "@opencode/ai/providers/anthropic",
+      "capabilities": {
+        "tools": true,
+        "input": [
+          "text",
+          "image",
+          "pdf"
+        ],
+        "output": [
+          "text"
+        ]
+      },
+      "variants": [
+        {
+          "id": "low",
+          "settings": {
+            "thinking": {
+              "type": "adaptive",
+              "display": "summarized"
+            },
+            "effort": "low"
+          }
+        },
+        {
+          "id": "medium",
+          "settings": {
+            "thinking": {
+              "type": "adaptive",
+              "display": "summarized"
+            },
+            "effort": "medium"
+          }
+        },
+        {
+          "id": "high",
+          "settings": {
+            "thinking": {
+              "type": "adaptive",
+              "display": "summarized"
+            },
+            "effort": "high"
+          }
+        },
+        {
+          "id": "xhigh",
+          "settings": {
+            "thinking": {
+              "type": "adaptive",
+              "display": "summarized"
+            },
+            "effort": "xhigh"
+          }
+        },
+        {
+          "id": "max",
+          "settings": {
+            "thinking": {
+              "type": "adaptive",
+              "display": "summarized"
+            },
+            "effort": "max"
+          }
+        }
+      ],
+      "time": {
+        "released": 1790035200000
+      },
+      "cost": [
+        {
+          "input": 4,
+          "output": 20,
+          "cache": {
+            "read": 0.2,
+            "write": 5
+          }
+        }
+      ],
+      "status": "active",
+      "enabled": true,
+      "limit": {
+        "context": 1000000,
+        "output": 128000
+      }
+    }
+  ]
+}

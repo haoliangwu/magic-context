@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 /**
  * Tagger collision-recovery and counter-drift tests.
@@ -18,7 +19,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database as DatabaseType } from "../../shared/sqlite";
@@ -391,7 +392,7 @@ describe("initFromDb signature cache", () => {
         // data_version probe is wired correctly. Requires WAL + a real
         // file-backed DB because :memory: databases are private to one
         // connection.
-        const tmpDir = mkdtempSync(join(tmpdir(), "magic-context-tagger-"));
+        const tmpDir = createTestTempDirFromPath(join(tmpdir(), "magic-context-tagger-"));
         try {
             const dbPath = join(tmpDir, "ctx.db");
             const dbA = openFileBackedTestDb(dbPath);

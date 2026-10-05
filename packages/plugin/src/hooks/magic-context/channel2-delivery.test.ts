@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import { join } from "node:path";
-
 import {
     casChannel2NudgeState,
     claimChannel2NudgeState,
@@ -13,6 +12,7 @@ import {
     updateSessionMeta,
 } from "../../features/magic-context/storage";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     rearmChannel2AfterCoverageAdvancingHardFold,
     rearmChannel2AfterMeasuredCollapse,
@@ -23,9 +23,8 @@ import { closeReadOnlySessionDb } from "./read-session-db";
 const openCodeDbs: Database[] = [];
 
 function useTempDataHome(prefix: string): void {
-    const { mkdtempSync } = require("node:fs");
     const { tmpdir } = require("node:os");
-    process.env.XDG_DATA_HOME = mkdtempSync(join(tmpdir(), prefix));
+    process.env.XDG_DATA_HOME = createTestTempDirFromPath(join(tmpdir(), prefix));
 }
 
 function createOpenCodeAssistantTail(sessionId: string, finish: string): Database {

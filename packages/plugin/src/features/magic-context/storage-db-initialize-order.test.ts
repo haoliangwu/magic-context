@@ -1,11 +1,12 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     FORK_MIGRATION_VERSION_FLOOR,
     LATEST_MIGRATION_VERSION,
@@ -129,7 +130,7 @@ function buildHistoricalStore(version: number): Database {
 }
 
 function seedHistoricalStoreFile(version: number): { dir: string; path: string } {
-    const dir = mkdtempSync(join(tmpdir(), "magic-context-index-order-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "magic-context-index-order-"));
     const path = join(dir, "context.db");
     const db = new Database(path);
     try {

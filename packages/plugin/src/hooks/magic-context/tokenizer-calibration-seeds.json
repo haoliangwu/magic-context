@@ -1,0 +1,335 @@
+[
+  {
+    "prefix": "google/gemini-3.8-flash",
+    "systemRatio": 0.961167,
+    "toolsRatio": 0.967504,
+    "proseRatio": 1.006909
+  },
+  {
+    "prefix": "google/gemini-3.7-flash",
+    "systemRatio": 0.961167,
+    "toolsRatio": 0.967504,
+    "proseRatio": 1.006909
+  },
+  {
+    "prefix": "google/gemini-3.1-pro-preview",
+    "systemRatio": 0.961167,
+    "toolsRatio": 0.967504,
+    "proseRatio": 1.006909
+  },
+  {
+    "prefix": "anthropic/claude-fable-5-1",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.551639,
+    "proseRatio": 1.571778
+  },
+  {
+    "prefix": "anthropic/claude-opus-5",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.551639,
+    "proseRatio": 1.571778
+  },
+  {
+    "prefix": "anthropic/claude-sonnet-5",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.554814,
+    "proseRatio": 1.571815
+  },
+  {
+    "prefix": "openrouter/anthropic/claude-fable-5-1",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.551639,
+    "proseRatio": 1.571778
+  },
+  {
+    "prefix": "openrouter/anthropic/claude-opus-5",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.551639,
+    "proseRatio": 1.571778
+  },
+  {
+    "prefix": "openrouter/anthropic/claude-sonnet-5",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.554814,
+    "proseRatio": 1.571815
+  },
+  {
+    "prefix": "github-copilot/claude-fable-5-1",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.551639,
+    "proseRatio": 1.571778
+  },
+  {
+    "prefix": "github-copilot/claude-opus-5",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.551639,
+    "proseRatio": 1.571778
+  },
+  {
+    "prefix": "github-copilot/claude-sonnet-5",
+    "systemRatio": 1.511497,
+    "toolsRatio": 1.554814,
+    "proseRatio": 1.571815
+  },
+  {
+    "prefix": "anthropic/claude-opus-4-8",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "anthropic/claude-opus-4.8",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "anthropic/claude-opus-4-7",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57,
+    "proseRatio": 1.571778
+  },
+  {
+    "prefix": "anthropic/claude-opus-4.7",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "anthropic/claude-opus-4-5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "anthropic/claude-opus-4.5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "anthropic/claude-opus-4-6",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "anthropic/claude-opus-4.6",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "anthropic/claude-sonnet-4-5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "anthropic/claude-sonnet-4.5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "anthropic/claude-sonnet-4-6",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.14,
+    "proseRatio": 1.057976
+  },
+  {
+    "prefix": "anthropic/claude-sonnet-4.6",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.14
+  },
+  {
+    "prefix": "anthropic/claude-haiku-4-5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "anthropic/claude-haiku-4.5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "openrouter/anthropic/claude-opus-4-8",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "openrouter/anthropic/claude-opus-4.8",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "github-copilot/claude-opus-4-8",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "github-copilot/claude-opus-4.8",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "openrouter/anthropic/claude-opus-4-7",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "openrouter/anthropic/claude-opus-4.7",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "github-copilot/claude-opus-4-7",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "github-copilot/claude-opus-4.7",
+    "systemRatio": 1.51,
+    "toolsRatio": 1.57
+  },
+  {
+    "prefix": "openrouter/anthropic/claude-sonnet-4.6",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.14
+  },
+  {
+    "prefix": "github-copilot/claude-sonnet-4.6",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.14
+  },
+  {
+    "prefix": "github-copilot/claude-sonnet-4.5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "github-copilot/claude-opus-4.5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "github-copilot/claude-haiku-4.5",
+    "systemRatio": 1.02,
+    "toolsRatio": 1.16
+  },
+  {
+    "prefix": "openai/gpt-5.5",
+    "systemRatio": 1.000278,
+    "toolsRatio": 0.850953,
+    "proseRatio": 1.000017
+  },
+  {
+    "prefix": "openai/gpt-6-astra",
+    "systemRatio": 1.000278,
+    "toolsRatio": 0.850953,
+    "proseRatio": 1.000017
+  },
+  {
+    "prefix": "openai/gpt-6-sol",
+    "systemRatio": 1.000278,
+    "toolsRatio": 0.850953,
+    "proseRatio": 1.000017,
+    "provenance": "Mirrored from openai/gpt-6-astra; prose inherited-unmeasured. Reported OAuth system/tools counts match GPT-5.5; no independent API-key measurement."
+  },
+  {
+    "prefix": "openai/gpt-6.1-sol",
+    "systemRatio": 1.000278,
+    "toolsRatio": 0.850953,
+    "proseRatio": 1.000017,
+    "provenance": "Mirrored from openai/gpt-6-astra; prose inherited-unmeasured. Reported OAuth system/tools counts match GPT-5.5; no independent API-key measurement."
+  },
+  {
+    "prefix": "openai/gpt-5",
+    "systemRatio": 1,
+    "toolsRatio": 0.84
+  },
+  {
+    "prefix": "xai/grok-4-latest",
+    "systemRatio": 0.817751,
+    "toolsRatio": 0.880494,
+    "proseRatio": 0.880137
+  },
+  {
+    "prefix": "xai/grok-code-fast-1",
+    "systemRatio": 0.817751,
+    "toolsRatio": 0.880494,
+    "proseRatio": 0.880137
+  },
+  {
+    "prefix": "xai/grok-4",
+    "systemRatio": 0.82,
+    "toolsRatio": 0.88
+  },
+  {
+    "prefix": "xai/grok-code-fast",
+    "systemRatio": 0.82,
+    "toolsRatio": 0.89
+  },
+  {
+    "prefix": "cerebras/qwen-3-235b",
+    "systemRatio": 1,
+    "toolsRatio": 1.1
+  },
+  {
+    "prefix": "cerebras/zai-glm-4.7",
+    "systemRatio": 1,
+    "toolsRatio": 1.09
+  },
+  {
+    "prefix": "cerebras/gpt-oss-120b",
+    "systemRatio": 0.84,
+    "toolsRatio": 0.79
+  },
+  {
+    "prefix": "fireworks-ai/accounts/fireworks/models/glm-5p1",
+    "systemRatio": 1,
+    "toolsRatio": 1.06
+  },
+  {
+    "prefix": "fireworks-ai/accounts/fireworks/models/deepseek-v3p2",
+    "systemRatio": 1.05,
+    "toolsRatio": 1.09
+  },
+  {
+    "prefix": "opencode-go/glm-5.1",
+    "systemRatio": 1,
+    "toolsRatio": 1.06
+  },
+  {
+    "prefix": "opencode-go/glm-5",
+    "systemRatio": 1,
+    "toolsRatio": 1.06
+  },
+  {
+    "prefix": "opencode-go/kimi-k2.6",
+    "systemRatio": 0.87,
+    "toolsRatio": 0.86,
+    "proseRatio": 0.925501
+  },
+  {
+    "prefix": "moonshot/kimi-k2.6",
+    "systemRatio": 0.872126,
+    "toolsRatio": 0.863853,
+    "proseRatio": 0.925501
+  },
+  {
+    "prefix": "moonshot/kimi-for-coding",
+    "systemRatio": 0.872126,
+    "toolsRatio": 0.863853,
+    "proseRatio": 0.925501
+  },
+  {
+    "prefix": "zai/glm-4.7",
+    "systemRatio": 0.999721,
+    "toolsRatio": 1.056823,
+    "proseRatio": 1.000875
+  },
+  {
+    "prefix": "meta/muse-spark",
+    "systemRatio": 0.865949,
+    "toolsRatio": 1.024605,
+    "proseRatio": 0.923366
+  },
+  {
+    "prefix": "opencode/muse-spark",
+    "systemRatio": 0.865949,
+    "toolsRatio": 1.024605,
+    "proseRatio": 0.923366
+  }
+]

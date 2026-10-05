@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, sep } from "node:path";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 
 import { substituteConfigVariables } from "./variable";
 
@@ -10,7 +11,7 @@ describe("substituteConfigVariables", () => {
     let tmpDir: string;
 
     beforeEach(() => {
-        tmpDir = mkdtempSync(join(tmpdir(), "mc-variable-test-"));
+        tmpDir = createTestTempDirFromPath(join(tmpdir(), "mc-variable-test-"));
     });
 
     afterEach(() => {

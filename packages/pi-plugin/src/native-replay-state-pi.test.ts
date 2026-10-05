@@ -10,12 +10,14 @@ import {
 import {
 	getNativeReasoningIds,
 	getNativeToolInputs,
+	saveNativeToolInputs,
 } from "@magic-context/core/features/magic-context/storage-native-replay";
 import {
 	clearContextHandlerSession,
 	registerPiContextHandler,
 	signalPiPendingMaterialization,
 } from "./context-handler";
+import { NATIVE_TOOL_REMOVAL_MARKER } from "./native-replay-pi";
 import {
 	applyNativeReasoningReplayPi,
 	applyNativeToolInputReplayPi,
@@ -495,6 +497,40 @@ describe("native upgrade application", () => {
 			).toBe(0);
 			expect(run(false)).toBe(after);
 			expect(run(false)).toBe(after);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("never replaces a recorded arc removal with the arguments of a kept pair", () => {
+		const db = createTestDb();
+		const sessionId = "ses-native-removal-kept";
+		try {
+			getOrCreateSessionMeta(db, sessionId);
+			saveNativeToolInputs(
+				db,
+				sessionId,
+				new Map([[callId, NATIVE_TOOL_REMOVAL_MARKER]]),
+			);
+			// A model that keeps tool pairs beside reasoning serves the removed arc
+			// as a paired shell on a busting pass.
+			const kept = oldAssistant() as unknown as {
+				content: Array<{ arguments?: Record<string, unknown> }>;
+			};
+			kept.content[2].arguments = { dropped: "[dropped §3§]" };
+			applyNativeToolInputReplayPi(
+				{
+					db,
+					sessionId,
+					messages: [kept],
+					changes: new Map([[0, new Set([callId])]]),
+					canApply: true,
+				},
+				getNativeToolInputs(db, sessionId),
+			);
+			expect(getNativeToolInputs(db, sessionId).get(callId)).toBe(
+				NATIVE_TOOL_REMOVAL_MARKER,
+			);
 		} finally {
 			db.close();
 		}

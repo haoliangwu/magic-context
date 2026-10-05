@@ -71,4 +71,32 @@ describe("subagent invocation storage", () => {
             totalCacheWrite: 1,
         });
     });
+
+    test("round-trips timed_out and empty with error details", () => {
+        const db = dbWithTable();
+        for (const [status, error] of [
+            ["timed_out", "prompt timed out after 20ms"],
+            ["empty", "returned no output"],
+        ] as const) {
+            recordSubagentInvocation(db, {
+                sessionId: "ses",
+                harness: "opencode",
+                subagent: "dreamer",
+                startedAt: 1,
+                endedAt: 2,
+                status,
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheReadTokens: 0,
+                cacheWriteTokens: 0,
+                error,
+            });
+        }
+        expect(
+            getSubagentInvocations(db, "ses").map(({ status, error }) => ({ status, error })),
+        ).toEqual([
+            { status: "timed_out", error: "prompt timed out after 20ms" },
+            { status: "empty", error: "returned no output" },
+        ]);
+    });
 });

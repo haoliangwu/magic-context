@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -15,6 +15,7 @@ import {
     getProjectMagicContextDir,
     getProjectMagicContextHistorianDir,
 } from "./data-path";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 const savedEnv = {
     XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
@@ -29,7 +30,7 @@ const savedEnv = {
 describe("data-path", () => {
     beforeEach(() => {
         process.env.XDG_CACHE_HOME = undefined;
-        process.env.XDG_DATA_HOME = undefined;
+        process.env.XDG_DATA_HOME = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         delete process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
         delete process.env.NODE_ENV;
         process.env.LOCALAPPDATA = undefined;
@@ -286,7 +287,7 @@ describe("data-path", () => {
 
 describe("ensureCortexKitArtifactGitignore", () => {
     test("creates .cortexkit/.gitignore with a fenced magic-context block", () => {
-        const dir = mkdtempSync(path.join(os.tmpdir(), "mc-gi-"));
+        const dir = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-gi-"));
         try {
             ensureCortexKitArtifactGitignore(dir);
             const gi = readFileSync(path.join(dir, ".cortexkit", ".gitignore"), "utf8");
@@ -299,7 +300,7 @@ describe("ensureCortexKitArtifactGitignore", () => {
     });
 
     test("is idempotent — a second call does not duplicate the block", () => {
-        const dir = mkdtempSync(path.join(os.tmpdir(), "mc-gi-"));
+        const dir = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-gi-"));
         try {
             ensureCortexKitArtifactGitignore(dir);
             ensureCortexKitArtifactGitignore(dir);
@@ -312,7 +313,7 @@ describe("ensureCortexKitArtifactGitignore", () => {
     });
 
     test("preserves a sibling module's existing entries (appends, never clobbers)", () => {
-        const dir = mkdtempSync(path.join(os.tmpdir(), "mc-gi-"));
+        const dir = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-gi-"));
         try {
             const ckDir = path.join(dir, ".cortexkit");
             mkdirSync(ckDir, { recursive: true });
@@ -333,7 +334,7 @@ describe("ensureCortexKitArtifactGitignore", () => {
     });
 
     test("does not ignore the project config — only the artifact dir", () => {
-        const dir = mkdtempSync(path.join(os.tmpdir(), "mc-gi-"));
+        const dir = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-gi-"));
         try {
             ensureCortexKitArtifactGitignore(dir);
             const gi = readFileSync(path.join(dir, ".cortexkit", ".gitignore"), "utf8");

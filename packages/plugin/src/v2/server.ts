@@ -1,7 +1,7 @@
 import { loadPluginConfigDetailed } from "../config";
+import { bindStaleBuildNotice } from "../plugin/stale-build-notice";
 import { setHarness } from "../shared/harness";
-import { log } from "../shared/logger";
-import { registerContext } from "./hooks/context";
+import { flushLogger, log } from "../shared/logger";
 import type { V2Context } from "./hooks/types";
 import { startUpdateChecks } from "./hooks/update-check";
 
@@ -44,13 +44,21 @@ export async function setup(context: V2Context) {
         );
         return async () => {};
     }
+    // The union entry is also imported and probed by OpenCode 1. Load the v2
+    // adapter only after the host-shape check, retaining the same setup callback.
+    const { registerContext } = await import("./hooks/context");
     setHarness("opencode2");
+    bindStaleBuildNotice({}, import.meta.url, "opencode2");
     const duties = await registerContext(context);
     const checks =
         loadPluginConfigDetailed(context.location.directory).config.auto_update === false
             ? undefined
             : startUpdateChecks(context);
-    console.info("[magic-context] @cortexkit/opencode-magic-context v2 setup");
+    // The plugin log, not the console: the host passes plugin output straight
+    // through to the operator's terminal. Flushed now so a host that dies
+    // during boot still leaves a record that setup completed.
+    log("[magic-context] @cortexkit/opencode-magic-context v2 setup");
+    flushLogger();
     return async () => {
         await checks?.dispose();
         await duties?.dispose();

@@ -235,7 +235,6 @@ Hatırlama **oturumlar arasında** (yeni oturum her şeyi devralır) ve **harnes
 | `/ctx-status` | Debug görünümü: tags, pending drops, cache TTL, nudge state, historian ilerlemesi, bölme kapsamı, geçmiş bütçesi |
 | `/ctx-flush` | Kuyruktaki tüm operasyonları cache TTL atlayarak hemen zorla |
 | `/ctx-recomp` | Ham geçmişten bölmeleri yeniden oluştur (`start-end` aralığı kabul eder). Saklanan durum yanlış görünürse kullan |
-| `/ctx-session-upgrade` | Bu oturumu en yeni geçmiş formatına yükselt: bölmeleri yeniden oluştur ve proje anılarını taşı |
 | `/ctx-dream` | İstek üzerine dreamer bakımı çalıştır: bellek, docs, smart notes ve user-profile review bakımı |
 
 ---

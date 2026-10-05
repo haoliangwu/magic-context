@@ -64,6 +64,12 @@ impl ProtectionWindow {
     /// tie group is accumulated before testing the floor, then the mass suffix is unioned with the
     /// newest three distinct tool-tag groups.
     pub fn from_persisted_rows(rows: &[McTagRow], floor: u64) -> Self {
+        Self::from_persisted_rows_calibrated(rows, floor, 1.0)
+    }
+
+    /// Multiply stored local counts by the tool ratio before comparing with the
+    /// provider-token protection floor; never overwrite the original member rows.
+    pub fn from_persisted_rows_calibrated(rows: &[McTagRow], floor: u64, tools_ratio: f64) -> Self {
         let mut tool_rows = rows
             .iter()
             .filter(|row| is_tool_kind(&row.kind))
@@ -98,7 +104,9 @@ impl ProtectionWindow {
             if group_count <= 3 {
                 structural_cutoff = Some(TagNumber(tag_number));
             }
-            if mass_cutoff.is_none() && (cumulative_mass >= floor || start == 0) {
+            if mass_cutoff.is_none()
+                && ((cumulative_mass as f64 * tools_ratio).ceil() >= floor as f64 || start == 0)
+            {
                 mass_cutoff = Some(TagNumber(tag_number));
             }
             end = start;
@@ -118,7 +126,10 @@ impl ProtectionWindow {
                 .cloned()
                 .collect()
         });
-        Self::from_members(floor, cutoff, member_rows)
+        let mut window = Self::from_members(floor, cutoff, member_rows);
+        window.status.protected_mass =
+            (window.status.protected_mass as f64 * tools_ratio).ceil() as u64;
+        window
     }
 
     fn empty(floor: u64) -> Self {
@@ -261,7 +272,7 @@ mod tests {
             kind: kind.to_string(),
             token_count,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
     }
 
@@ -336,7 +347,7 @@ mod tests {
         );
         null_backfill[8].token_count = 4_000;
         for row in &mut null_backfill {
-            row.source_bytes = b"[edit_marker]".to_vec();
+            row.source_bytes = b"[edit_marker]".to_vec().into();
         }
         assert_eq!(
             ProtectionWindow::from_persisted_rows(&null_backfill, 16_000).row_identities,
@@ -365,7 +376,7 @@ mod lifecycle_and_coordinate_tests {
             kind: "tool_result".to_string(),
             token_count,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
     }
 
@@ -496,5 +507,27 @@ mod lifecycle_and_coordinate_tests {
             resolve_floor_snapshot(None, moved_geometry.persisted, 40_000, FloorPass::CacheBust);
         assert_eq!(next_bust.effective, 40_000);
         assert_eq!(next_bust.persisted, Some(40_000));
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    use super::*;
+    #[test]
+    fn fable_protection_spends_real_tool_tokens_without_changing_rows() {
+        let rows: Vec<_> = (1..=8)
+            .map(|n| McTagRow {
+                tag_number: n,
+                block_id: format!("b{n}"),
+                kind: "tool".into(),
+                token_count: 1000,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            })
+            .collect();
+        let window = ProtectionWindow::from_persisted_rows_calibrated(&rows, 6000, 1.551639);
+        assert_eq!(window.cutoff.cutoff, Some(TagNumber(5)));
+        assert_eq!(window.status.protected_mass, 6207);
+        assert!(rows.iter().all(|r| r.token_count == 1000));
     }
 }

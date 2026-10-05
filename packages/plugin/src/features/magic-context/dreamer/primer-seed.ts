@@ -22,7 +22,7 @@
  */
 import {
     cleanUserText,
-    readRawSessionMessages,
+    visitRawSessionMessages,
 } from "../../../hooks/magic-context/read-session-chunk";
 import {
     estimateTokens,
@@ -31,9 +31,8 @@ import {
     hasMeaningfulUserText,
     normalizeText,
 } from "../../../hooks/magic-context/read-session-formatting";
-import type { RawMessage } from "../../../hooks/magic-context/read-session-raw";
 import type { Database } from "../../../shared/sqlite";
-import { getPrimerCandidatesByIds, type Primer } from "../storage-primers";
+import { getPrimerCandidatesByIds, type Primer, type PrimerCandidate } from "../storage-primers";
 
 /** Token cap for the rendered orientation seed — a huge origin compartment must
  *  not blow the prompt; the investigator digs via tools, it does not need the
@@ -65,42 +64,71 @@ interface CompartmentP1Row {
  * Render ONLY user text (`U:`) and tool-call summaries (`TC:`) for the raw
  * messages in [startOrdinal, endOrdinal]. Assistant narrative is structurally
  * excluded — there is no code path that emits an `A:` line here.
+ *
+ * The range is streamed page by page in the summary projection and reading
+ * stops at the token cap, so a huge origin compartment (or a session with
+ * thousands of multi-kilobyte tool outputs) never sits in memory at once.
+ * Returns null when no message exists in the range.
  */
 function renderUserAndToolOrientation(
-    messages: RawMessage[],
+    sessionId: string,
     startOrdinal: number,
     endOrdinal: number,
     capTokens: number,
-): string {
+): string | null {
     const lines: string[] = [];
     let tokens = 0;
-    for (const msg of messages) {
-        if (msg.ordinal < startOrdinal || msg.ordinal > endOrdinal) continue;
-        const out: string[] = [];
-        if (msg.role === "user" && hasMeaningfulUserText(msg.parts)) {
-            const text = extractTexts(msg.parts)
-                .map((t) => cleanUserText(t))
-                .map(normalizeText)
-                .filter((t) => t.length > 0)
-                .join(" / ");
-            if (text) out.push(`U: ${text}`);
-        }
-        // Tool-call inputs (no outputs) — what the agent looked at. Applies to
-        // both assistant tool-use messages and tool-result user messages.
-        for (const tc of extractToolCallSummaries(msg.parts)) out.push(tc);
-        for (const line of out) {
-            const lineTokens = estimateTokens(line);
-            if (tokens + lineTokens > capTokens && lines.length > 0) {
-                lines.push("… (orientation truncated; investigate the current source directly)");
-                return lines.join("\n");
+    let sawMessage = false;
+    visitRawSessionMessages(
+        sessionId,
+        startOrdinal,
+        endOrdinal,
+        (msg) => {
+            sawMessage = true;
+            const out: string[] = [];
+            if (msg.role === "user" && hasMeaningfulUserText(msg.parts)) {
+                const text = extractTexts(msg.parts)
+                    .map((t) => cleanUserText(t))
+                    .map(normalizeText)
+                    .filter((t) => t.length > 0)
+                    .join(" / ");
+                if (text) out.push(`U: ${text}`);
             }
-            lines.push(line);
-            tokens += lineTokens;
-        }
-    }
-    return lines.join("\n");
+            // Tool-call inputs (no outputs) — what the agent looked at. Applies to
+            // both assistant tool-use messages and tool-result user messages.
+            for (const tc of extractToolCallSummaries(msg.parts)) out.push(tc);
+            for (const line of out) {
+                const lineTokens = estimateTokens(line);
+                if (tokens + lineTokens > capTokens && lines.length > 0) {
+                    lines.push(
+                        "… (orientation truncated; investigate the current source directly)",
+                    );
+                    return false;
+                }
+                lines.push(line);
+                tokens += lineTokens;
+            }
+            return true;
+        },
+        { summary: true },
+    );
+    return sawMessage ? lines.join("\n") : null;
 }
 
+/**
+ * The candidate whose origin compartment seeds the investigation: the most
+ * recent occurrence that belongs to the primer's own project. A candidate
+ * recorded under another project is never used, so building a seed can never
+ * read another project's session history.
+ */
+export function selectPrimerOriginCandidate(
+    db: Database,
+    primer: Primer,
+): PrimerCandidate | undefined {
+    return getPrimerCandidatesByIds(db, primer.sourceCandidateIds)
+        .filter((candidate) => candidate.projectPath === primer.projectPath)
+        .sort((a, b) => b.sourceMessageTime - a.sourceMessageTime || b.id - a.id)[0];
+}
 function loadPrePostP1(db: Database, sessionId: string, originStartMessage: number): string {
     const origin = db
         .prepare(
@@ -111,7 +139,9 @@ function loadPrePostP1(db: Database, sessionId: string, originStartMessage: numb
     const originSeq = origin.sequence;
     const rows = db
         .prepare(
-            `SELECT sequence, start_message, end_message, title, p1, content
+            `SELECT sequence, start_message, end_message,
+                    substr(title, 1, 512) AS title,
+                    substr(p1, 1, 1200) AS p1, substr(content, 1, 1200) AS content
              FROM compartments
              WHERE session_id = ? AND sequence IN (?, ?)
              ORDER BY sequence ASC`,
@@ -134,7 +164,9 @@ function closedBookOriginP1(
 ): { orientation: string; sessionId: string } {
     const row = db
         .prepare(
-            "SELECT title, p1, content FROM compartments WHERE session_id = ? AND start_message = ? ORDER BY sequence ASC LIMIT 1",
+            `SELECT substr(title, 1, 512) AS title,
+                    substr(p1, 1, 2000) AS p1, substr(content, 1, 2000) AS content
+             FROM compartments WHERE session_id = ? AND start_message = ? ORDER BY sequence ASC LIMIT 1`,
         )
         .get(sessionId, originStartMessage) as
         | { title?: string; p1?: string | null; content?: string | null }
@@ -145,17 +177,13 @@ function closedBookOriginP1(
 }
 
 /**
- * Build the orientation seed for a primer from its most-recent occurrence's
- * origin compartment. MUST be called inside a `withRawSessionMessageCache` scope
- * (and, on Pi, with a RawMessageProvider registered for the session) so the raw
- * read is cached across the run.
+ * Build the orientation seed for a primer from its most-recent same-project
+ * occurrence's origin compartment. On Pi, a RawMessageProvider must be
+ * registered for the session; Pi never falls back to OpenCode's store.
  */
 export function buildPrimerSeed(db: Database, primer: Primer): PrimerSeed {
-    const candidates = getPrimerCandidatesByIds(db, primer.sourceCandidateIds);
     // Most-recent occurrence drives the seed (freshest code context).
-    const mostRecent = candidates
-        .slice()
-        .sort((a, b) => b.sourceMessageTime - a.sourceMessageTime || b.id - a.id)[0];
+    const mostRecent = selectPrimerOriginCandidate(db, primer);
     if (
         !mostRecent ||
         typeof mostRecent.sourceCompartmentStart !== "number" ||
@@ -168,14 +196,13 @@ export function buildPrimerSeed(db: Database, primer: Primer): PrimerSeed {
     const start = mostRecent.sourceCompartmentStart;
     const end = mostRecent.sourceCompartmentEnd;
 
-    let raw: RawMessage[] = [];
+    let orientation: string | null = null;
     try {
-        raw = readRawSessionMessages(sessionId);
+        orientation = renderUserAndToolOrientation(sessionId, start, end, PRIMER_SEED_CAP_TOKENS);
     } catch {
-        raw = [];
+        orientation = null;
     }
-    const inRange = raw.some((m) => m.ordinal >= start && m.ordinal <= end);
-    if (!inRange) {
+    if (orientation === null) {
         // Deleted session, or Pi with no provider registered: do NOT proceed with
         // an empty orientation — fall back to the origin compartment's P1.
         const closed = closedBookOriginP1(db, sessionId, start);
@@ -187,7 +214,6 @@ export function buildPrimerSeed(db: Database, primer: Primer): PrimerSeed {
         };
     }
 
-    const orientation = renderUserAndToolOrientation(raw, start, end, PRIMER_SEED_CAP_TOKENS);
     return {
         kind: "raw",
         orientation,

@@ -1,0 +1,33 @@
+name: Harness coverage advisory
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+
+concurrency:
+  group: harness-coverage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  harness-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      # Only the trusted base checkout runs; the token can update advisory comments.
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Mint advisory token
+        id: app_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CK_CI_APP_ID }}
+          private-key: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}
+      - name: Check conventional harness twins
+        continue-on-error: true
+        run: node scripts/harness-coverage-check.mjs
+        env:
+          GITHUB_TOKEN: ${{ steps.app_token.outputs.token }}

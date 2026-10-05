@@ -235,7 +235,6 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 | `/ctx-status` | عرض debug: tags، pending drops، cache TTL، حالة nudge، تقدم historian، تغطية الحجرات، ميزانية التاريخ |
 | `/ctx-flush` | إجبار كل العمليات المصطفة فورا، مع تجاوز cache TTL |
 | `/ctx-recomp` | إعادة بناء الحجرات من التاريخ الخام (يقبل نطاق `start-end`). استخدمه عندما تبدو الحالة المخزنة خاطئة |
-| `/ctx-session-upgrade` | ترقية هذه الجلسة إلى أحدث تنسيق تاريخ: إعادة بناء الحجرات وترحيل ذكريات المشروع |
 | `/ctx-dream` | تشغيل صيانة dreamer عند الطلب: صيانة الذاكرة و docs و smart notes ومراجعة user-profile |
 
 ---

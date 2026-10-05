@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 // Cache-stability gate for the SOFT+ / SOFT / HARD materialization taxonomy.
 //
@@ -14,15 +15,19 @@
 // delta that folds into m[0] only on a HARD bust.
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { loadPluginConfigDetailed } from "../../config";
+import { historianRunConfig } from "../../config/live-run-config";
+import { LiveConfigReader } from "../../config/live-snapshot";
 import {
     appendCompartments,
     type CompartmentInput,
 } from "../../features/magic-context/compartment-storage";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
+import { resolveHistorianModel } from "../../shared/model-resolution";
 import { Database } from "../../shared/sqlite";
 import { clearInjectionCache, injectM0M1, type M0HardSignals } from "./inject-compartments";
 
@@ -42,7 +47,7 @@ function makeDb(): Database {
 }
 
 function makeProjectDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-taxonomy-test-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-taxonomy-test-"));
     tempDirs.push(dir);
     return dir;
 }
@@ -418,4 +423,54 @@ describe("m[0]/m[1] materialization taxonomy", () => {
         expect(realSwitch.rematerialized).toBe(true);
         expect(realSwitch.reason).toBe("model_change");
     });
+});
+
+it("class-B protected_tokens edit remains boot-bound across a live-config defer pass", () => {
+    const projectDirectory = makeProjectDir();
+    const configHome = makeProjectDir();
+    const oldHome = process.env.HOME;
+    const oldConfigHome = process.env.XDG_CONFIG_HOME;
+    process.env.HOME = configHome;
+    process.env.XDG_CONFIG_HOME = configHome;
+    const configDir = join(configHome, "cortexkit");
+    mkdirSync(configDir, { recursive: true });
+    const configFile = join(configDir, "magic-context.jsonc");
+    try {
+        writeFileSync(
+            configFile,
+            JSON.stringify({
+                protected_tokens: 16000,
+                toast_duration_ms: 1500,
+                historian: { opencode: { model: "old/model" } },
+            }),
+        );
+        const load = () => loadPluginConfigDetailed(projectDirectory, false).config;
+        const boot = load();
+        const reader = new LiveConfigReader(projectDirectory, boot, load, () => {});
+        reader.poll();
+        db = makeDb();
+        appendCompartments(db, SESSION_ID, [compartment(0, "A", "Alpha baseline")]);
+        const seeded = pass({ projectDirectory, isCacheBustingPass: true });
+        writeFileSync(
+            configFile,
+            JSON.stringify({
+                protected_tokens: 24000,
+                toast_duration_ms: 2900,
+                historian: { opencode: { model: "new/model-long" } },
+            }),
+        );
+        const run = historianRunConfig(boot, reader.poll().effective);
+        expect(run.protected_tokens).toBe(16000);
+        expect(run.toast_duration_ms).toBe(2900);
+        expect(resolveHistorianModel(run, "opencode").primary?.model).toBe("new/model-long");
+        const deferred = pass({ projectDirectory, isCacheBustingPass: false });
+        expect(deferred.m0).toBe(seeded.m0);
+        expect(deferred.m1).toBe(seeded.m1);
+        expect(deferred.rematerialized).toBe(false);
+    } finally {
+        if (oldHome === undefined) delete process.env.HOME;
+        else process.env.HOME = oldHome;
+        if (oldConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = oldConfigHome;
+    }
 });

@@ -1,6 +1,14 @@
 import type { createOpencodeClient } from "@opencode-ai/sdk";
-
+import { DreamTokenBudgetExceeded } from "../features/magic-context/dreamer/token-budget";
 import { detectOverflow } from "../features/magic-context/overflow-detection";
+import { HiddenCompletionRefusal } from "../hooks/magic-context/compartment-runner-types";
+import { HiddenAgentStepLimit } from "../v2/hooks/hidden-child";
+import {
+    describeAssistantError,
+    describeAssistantSettlement,
+    extractLatestAssistantFailure,
+    extractLatestAssistantText,
+} from "./assistant-message-extractor";
 import { log } from "./logger";
 import type { ModelInput } from "./model-resolution";
 import { sanitizeDiagnosticText } from "./redaction";
@@ -109,6 +117,9 @@ export interface ValidatedPromptRetryResult<TOutput, TValidated> {
 export type PromptFailureClass =
     | "provider_timeout"
     | "provider_error"
+    | "local_refusal"
+    | "step_limit"
+    | "token_budget"
     | "empty_completion"
     | "no_models"
     | "child_aborted"
@@ -123,9 +134,33 @@ export interface PromptFailureDetail {
     providerError: string | null;
     timeoutMs: number | null;
     childSessionId: string | null;
+    refusalReason?: string | null;
 }
 
 const promptFailureDetails = new WeakMap<object, PromptFailureDetail>();
+
+/**
+ * True for a request timer that fired inside the host client rather than ours.
+ * Bun's fetch rejects with a DOMException named "TimeoutError" ("The operation
+ * timed out.", legacy code 23) when its default per-request timer expires, and
+ * `AbortSignal.timeout` produces the same shape. Some OpenCode 1 builds hand
+ * plugins an SDK client whose fetch keeps Bun's default timer (about five to six
+ * minutes), so a synchronous `session.prompt` that stays open for a whole agent
+ * loop fails this way while the host keeps running the child session.
+ */
+export function isHostTimeoutError(error: unknown): boolean {
+    return (
+        error !== null &&
+        typeof error === "object" &&
+        (error as { name?: unknown }).name === "TimeoutError"
+    );
+}
+
+/** Our own slice expiry (see `promptWithTimeout`) or a host request timer. */
+export function isPromptTimeoutError(error: unknown): boolean {
+    if (isHostTimeoutError(error)) return true;
+    return error instanceof Error && /^prompt timed out after \d+ms$/.test(error.message);
+}
 
 export function getPromptFailureDetail(error: unknown): PromptFailureDetail | null {
     return error !== null && typeof error === "object"
@@ -200,6 +235,11 @@ export function parseModelSuggestion(error: unknown): ModelSuggestionInfo | null
     };
 }
 
+function externalAbortMessage(signal: AbortSignal): string {
+    const reason = signal.reason;
+    return `prompt aborted by external signal${reason instanceof Error && /^lease_(?:lost|expired):/.test(reason.message) ? `: ${reason.message}` : ""}`;
+}
+
 async function promptWithTimeout(
     client: Client,
     args: PromptArgs,
@@ -214,7 +254,7 @@ async function promptWithTimeout(
     // and avoids one wasted upstream `client.session.prompt` round-trip
     // before `isNonRetryable` catches the cancellation at the chain loop.
     if (signal?.aborted) {
-        throw new Error("prompt aborted by external signal");
+        throw new Error(externalAbortMessage(signal));
     }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -238,7 +278,7 @@ async function promptWithTimeout(
             if (!transport || transport.childSessionId) {
                 await abortChildRun(client, transport?.childSessionId ?? args.path.id);
             }
-            throw new Error("prompt aborted by external signal");
+            throw new Error(externalAbortMessage(signal));
         }
         if (controller.signal.aborted) {
             // Our timeout fired. Same problem: abort the server-side run loop, not
@@ -249,10 +289,31 @@ async function promptWithTimeout(
             }
             throw new Error(`prompt timed out after ${timeoutMs}ms`);
         }
+        if (isHostTimeoutError(error)) {
+            // The host client's own request timer fired. Only our side of the
+            // request ended: the child's run loop is still going on the server and
+            // would keep calling the model, so stop it the same way as above. The
+            // original error is kept so the ledger still shows which timer fired.
+            if (!transport || transport.childSessionId) {
+                await abortChildRun(client, transport?.childSessionId ?? args.path.id);
+            }
+        }
         throw error;
     } finally {
         clearTimeout(timeout);
         signal?.removeEventListener("abort", onExternalAbort);
+    }
+    // Some transports resolve with an error result when their fetch is aborted.
+    // A resolved fetch does not mean the server-side child run has stopped.
+    if (signal?.aborted || controller.signal.aborted) {
+        if (!transport || transport.childSessionId) {
+            await abortChildRun(client, transport?.childSessionId ?? args.path.id);
+        }
+        throw new Error(
+            signal?.aborted
+                ? externalAbortMessage(signal)
+                : `prompt timed out after ${timeoutMs}ms`,
+        );
     }
 }
 
@@ -296,7 +357,13 @@ async function abortChildRun(client: Client, sessionId: string): Promise<void> {
  * different model.
  */
 function isNonRetryable(error: unknown, externalSignal?: AbortSignal): boolean {
-    if (externalSignal?.aborted) return true;
+    if (
+        externalSignal?.aborted ||
+        (error instanceof HiddenCompletionRefusal && error.terminal) ||
+        error instanceof HiddenAgentStepLimit ||
+        error instanceof DreamTokenBudgetExceeded
+    )
+        return true;
 
     if (error instanceof Error) {
         if (error.name === "AbortError") return true;
@@ -305,6 +372,9 @@ function isNonRetryable(error: unknown, externalSignal?: AbortSignal): boolean {
         if (error.message === "prompt aborted by external signal") return true;
         if (/^prompt timed out after \d+ms$/.test(error.message)) return true;
     }
+    // A host request timer is a timeout too. Retrying would send the next model
+    // into the same child session, where it meets the same timer.
+    if (isHostTimeoutError(error)) return true;
 
     if (detectOverflow(error).isOverflow) return true;
 
@@ -334,10 +404,15 @@ function classifyPromptFailure(
     externalSignal?: AbortSignal,
 ): PromptFailureClass {
     const message = extractMessage(error);
+    if (error instanceof HiddenCompletionRefusal) return "local_refusal";
+    if (error instanceof HiddenAgentStepLimit) return "step_limit";
+    if (error instanceof DreamTokenBudgetExceeded) return "token_budget";
     if (externalSignal?.aborted || message === "prompt aborted by external signal") {
         return "child_aborted";
     }
-    if (/^prompt timed out after \d+ms$/.test(message)) return "provider_timeout";
+    if (/^prompt timed out after \d+ms$/.test(message) || isHostTimeoutError(error)) {
+        return "provider_timeout";
+    }
     if (phase === "validation") {
         if (/returned no (?:assistant )?output|no assistant output/i.test(message)) {
             return "empty_completion";
@@ -372,6 +447,11 @@ function throwWithPromptFailure(
         providerError,
         timeoutMs: failureClass === "provider_timeout" ? timeoutMs : null,
         childSessionId: transport ? (transport.childSessionId ?? null) : args.path.id || null,
+        ...(last?.error instanceof HiddenCompletionRefusal
+            ? {
+                  refusalReason: sanitizeDiagnosticText(last.error.message).slice(0, 500),
+              }
+            : {}),
     });
     throw error;
 }
@@ -587,9 +667,25 @@ async function attemptAndValidate<TOutput, TValidated>(
     }
 
     try {
+        if (!extractLatestAssistantText(output)) {
+            const assistantFailure = extractLatestAssistantFailure(output);
+            if (assistantFailure) {
+                const error = new Error(
+                    `Host recorded assistant error: ${describeAssistantError(assistantFailure.error)}`,
+                );
+                Object.assign(error, {
+                    name: "DreamerProviderOutputFailureError",
+                    transient: true,
+                });
+                throw error;
+            }
+        }
         const validated = await options.validateOutput(output, attempt);
         return { output, validated, attempt };
     } catch (error) {
+        if (error instanceof Error && /no (?:assistant )?output/i.test(error.message)) {
+            error.message += ` (${describeAssistantSettlement(output)})`;
+        }
         throw {
             error,
             failureClass: classifyPromptFailure(error, "validation", signal),
@@ -735,11 +831,11 @@ export async function promptSyncWithValidatedOutputRetry<TOutput, TValidated = T
     log(
         `[${callContext}] all models exhausted; tried: ${failedAttempts.map((failure) => failure.attempt.label).join(", ")}; original error: ${shortErr(firstError)}; last error: ${shortErr(lastError)}`,
     );
-    throwWithPromptFailure(
-        firstError ?? lastError ?? new Error("All fallback models failed validation"),
-        failedAttempts,
-        args,
-        timeoutMs,
-        options.transport,
-    );
+    const cause = lastError ?? firstError;
+    const exhausted =
+        cause instanceof Error
+            ? cause
+            : new Error(String(cause ?? "All fallback models failed validation"));
+    exhausted.message = `All models exhausted (${failedAttempts.map((failure) => failure.attempt.label).join(", ")}): ${exhausted.message}`;
+    throwWithPromptFailure(exhausted, failedAttempts, args, timeoutMs, options.transport);
 }

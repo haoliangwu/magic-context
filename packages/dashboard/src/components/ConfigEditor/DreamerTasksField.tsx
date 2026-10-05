@@ -1,6 +1,8 @@
 import { createSignal, Index, Show } from "solid-js";
 
 import { describeCron, isValidCronShape } from "../../lib/cron";
+import { configDefault } from "./config-schema";
+import { patchTaskConfig, scheduleSummary, toggledSchedule } from "./dreamer-schedule";
 import {
   type Harness,
   type ModelEntry,
@@ -39,74 +41,74 @@ export const TASKS: TaskMeta[] = [
     name: "map-memories",
     label: "Map memories",
     description: "Maps each memory to its backing files so verify knows what to re-check",
-    defaultSchedule: "0 2 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.map-memories.schedule")),
   },
   {
     name: "verify",
     label: "Verify changed memories",
     description: "Checks changed-file memories against code and fixes/removes stale ones",
-    defaultSchedule: "0 3 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.verify.schedule")),
   },
   {
     name: "verify-broad",
     label: "Verify all memories",
     description: "Periodic full re-check of the whole memory pool (catches drift)",
-    defaultSchedule: "0 4 * * 0",
+    defaultSchedule: String(configDefault("dreamer.tasks.verify-broad.schedule")),
   },
   {
     name: "curate",
     label: "Curate memories",
     description: "Deduplicates, tightens, and prunes the memory pool",
-    defaultSchedule: "0 4 * * 0",
+    defaultSchedule: String(configDefault("dreamer.tasks.curate.schedule")),
   },
   {
     name: "compress-cues",
     label: "Compress mural cues",
     description:
       "Compresses each overflow memory into a mural cue (the mural image renders deterministically)",
-    defaultSchedule: "0 4 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.compress-cues.schedule")),
   },
   {
     name: "classify-memories",
     label: "Classify memories",
     description: "Scores memory importance, scope, and shareability",
-    defaultSchedule: "0 6 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.classify-memories.schedule")),
   },
   {
     name: "retrospective",
     label: "Retrospective",
     description: "Learns from moments you had to correct or re-explain, and records the lesson",
-    defaultSchedule: "0 5 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.retrospective.schedule")),
   },
   {
     name: "maintain-docs",
     label: "Maintain docs",
     description: "Keep ARCHITECTURE.md / STRUCTURE.md in sync",
-    defaultSchedule: "",
+    defaultSchedule: String(configDefault("dreamer.tasks.maintain-docs.schedule")),
   },
   {
     name: "evaluate-smart-notes",
     label: "Evaluate smart notes",
     description: "Surface smart notes whose conditions are now met",
-    defaultSchedule: "0 3 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.evaluate-smart-notes.schedule")),
   },
   {
     name: "review-user-memories",
     label: "Review user memories",
     description: "Promote recurring behaviors into your user profile",
-    defaultSchedule: "0 3 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.review-user-memories.schedule")),
   },
   {
     name: "promote-primers",
     label: "Promote primers",
     description: "Promote recurring project questions into Primers",
-    defaultSchedule: "0 3 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.promote-primers.schedule")),
   },
   {
     name: "refresh-primers",
     label: "Refresh primers",
     description: "Refresh answers for active project Primers",
-    defaultSchedule: "0 3 * * *",
+    defaultSchedule: String(configDefault("dreamer.tasks.refresh-primers.schedule")),
   },
 ];
 
@@ -124,9 +126,7 @@ function isPresetCron(cron: string): boolean {
 }
 
 function promotionThresholdDefault(taskName: string): number | undefined {
-  if (taskName === "review-user-memories") return 3;
-  if (taskName === "promote-primers") return 2;
-  return undefined;
+  return configDefault(`dreamer.tasks.${taskName}.promotion_threshold`) as number | undefined;
 }
 
 function promotionThresholdDescription(taskName: string): string {
@@ -145,6 +145,8 @@ interface DreamerTasksFieldProps {
 }
 
 export default function DreamerTasksField(props: DreamerTasksFieldProps) {
+  const [expanded, setExpanded] = createSignal<string | null>(null);
+  const previousSchedules = new Map<string, string>();
   const [customMode, setCustomMode] = createSignal<Set<string>>(
     new Set(
       TASKS.filter((meta) => {
@@ -174,24 +176,10 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
   // Scheduling stays in dreamer.tasks, while model resolution lives under the
   // selected harness. Start from stored objects so advanced fields survive edits.
   const updateSchedule = (name: string, patch: Partial<DreamTaskConfig>): void => {
-    const next: Record<string, DreamTaskConfig> = {};
-    const canonicalNames = new Set(TASKS.map((task) => task.name));
-    for (const [taskName, taskConfig] of Object.entries(props.value ?? {})) {
-      if (!canonicalNames.has(taskName)) next[taskName] = { ...taskConfig };
-    }
-    for (const meta of TASKS) {
-      const stored = props.value?.[meta.name];
-      const entry: DreamTaskConfig = {
-        ...(stored ?? {}),
-        schedule: stored?.schedule ?? meta.defaultSchedule,
-      };
-      if (meta.name === name) Object.assign(entry, patch);
-      entry.schedule = entry.schedule ?? "";
-      for (const key of Object.keys(entry)) {
-        if (entry[key] === undefined) delete entry[key];
-      }
-      next[meta.name] = entry;
-    }
+    const current = props.value?.[name]?.schedule;
+    if (patch.schedule === "" && current?.trim()) previousSchedules.set(name, current);
+    const next = patchTaskConfig(props.value, name, patch);
+    if (patch.schedule?.trim()) previousSchedules.set(name, patch.schedule);
     props.onChange(next);
   };
 
@@ -210,143 +198,226 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
   const qualifierKey = () => (props.harness === "opencode" ? "variant" : "thinking_level");
 
   return (
-    <div class="dreamer-tasks" data-harness={props.harness}>
-      <Index each={TASKS}>
-        {(meta) => {
-          const cfg = () => taskCfg(meta());
-          const taskModel = () => modelCfg(meta().name);
-          const schedule = () => cfg().schedule ?? "";
-          const enabled = () => schedule().trim() !== "";
-          const selectValue = () =>
-            inCustomMode(meta().name) || (schedule().trim() !== "" && !isPresetCron(schedule()))
-              ? CUSTOM
-              : schedule();
-          return (
-            <div class="dreamer-task-row">
-              <div class="dreamer-task-head">
-                <span class="config-field-label">{meta().label}</span>
-                <span class="config-field-desc">
-                  <code>{meta().name}</code> — {meta().description}
-                </span>
-              </div>
-              <div class="dreamer-task-controls">
-                <div class="select-wrap">
-                  <select
-                    class="config-input config-select"
-                    value={selectValue()}
-                    onChange={(event) => {
-                      const next = event.currentTarget.value;
-                      if (next === CUSTOM) {
-                        setTaskCustom(meta().name, true);
-                        if (schedule().trim() === "") {
-                          updateSchedule(meta().name, { schedule: "0 3 * * *" });
-                        }
-                      } else {
-                        setTaskCustom(meta().name, false);
-                        updateSchedule(meta().name, { schedule: next });
-                      }
+    <div class="config-table-wrap" data-harness={props.harness}>
+      <table class="config-task-table">
+        <thead>
+          <tr>
+            <th scope="col">Task</th>
+            <th scope="col">Schedule</th>
+            <th scope="col">Model override</th>
+            <th scope="col">On/off</th>
+          </tr>
+        </thead>
+        <tbody>
+          <Index each={TASKS}>
+            {(meta) => {
+              const cfg = () => taskCfg(meta());
+              const taskModel = () => modelCfg(meta().name);
+              const schedule = () => cfg().schedule ?? "";
+              const enabled = () => schedule().trim() !== "";
+              const selectValue = () =>
+                inCustomMode(meta().name) || (schedule().trim() !== "" && !isPresetCron(schedule()))
+                  ? CUSTOM
+                  : schedule();
+              return (
+                <>
+                  <tr
+                    onClick={(event) => {
+                      if ((event.target as HTMLElement).closest("[data-task-control]")) return;
+                      setExpanded(expanded() === meta().name ? null : meta().name);
                     }}
                   >
-                    <Index each={PRESETS}>
-                      {(preset) => <option value={preset().cron}>{preset().label}</option>}
-                    </Index>
-                    <option value={CUSTOM}>Custom cron…</option>
-                  </select>
-                </div>
-                <ModelSelect
-                  models={props.models}
-                  value={modelId(taskModel().model)}
-                  onChange={(next) =>
-                    updateModel(meta().name, {
-                      model: modelEntryWithModel(
-                        taskModel().model,
-                        props.harness,
-                        next || undefined,
-                      ),
-                    })
-                  }
-                  placeholder="— inherit harness model —"
-                />
-              </div>
-              <div class="dreamer-task-param">
-                <span class="config-field-desc">{qualifierLabel()}</span>
-                <Show
-                  when={props.harness === "opencode"}
-                  fallback={
-                    <select
-                      class="config-input config-select"
-                      value={String(taskModel()[qualifierKey()] ?? "")}
-                      onChange={(event) =>
-                        updateModel(meta().name, {
-                          [qualifierKey()]: event.currentTarget.value || undefined,
-                        })
-                      }
-                    >
-                      <option value="">Use harness default</option>
-                      <Index each={thinkingLevelsForHarness(props.harness)}>
-                        {(level) => <option value={level()}>{level()}</option>}
-                      </Index>
-                    </select>
-                  }
-                >
-                  <input
-                    class="config-input"
-                    type="text"
-                    value={String(taskModel()[qualifierKey()] ?? "")}
-                    placeholder="Use harness default"
-                    onInput={(event) =>
-                      updateModel(meta().name, {
-                        [qualifierKey()]: event.currentTarget.value || undefined,
-                      })
-                    }
-                  />
-                </Show>
-              </div>
-              <Show when={selectValue() === CUSTOM}>
-                <div class="dreamer-cron-custom">
-                  <input
-                    class="config-input"
-                    classList={{ "config-input-invalid": !isValidCronShape(schedule()) }}
-                    type="text"
-                    value={schedule()}
-                    placeholder="0 3 * * *  (min hour day month weekday)"
-                    onInput={(event) =>
-                      updateSchedule(meta().name, { schedule: event.currentTarget.value })
-                    }
-                  />
-                  <span
-                    class="dreamer-cron-human"
-                    classList={{ invalid: !isValidCronShape(schedule()) }}
-                  >
-                    {isValidCronShape(schedule())
-                      ? describeCron(schedule())
-                      : "Invalid cron — need 5 fields: min hour day month weekday"}
-                  </span>
-                </div>
-              </Show>
-              <Show when={enabled() && promotionThresholdDefault(meta().name) !== undefined}>
-                <div class="dreamer-task-param">
-                  <span class="config-field-desc">
-                    {promotionThresholdDescription(meta().name)}
-                  </span>
-                  <input
-                    class="config-input"
-                    type="number"
-                    min={2}
-                    max={20}
-                    value={cfg().promotion_threshold ?? promotionThresholdDefault(meta().name) ?? 3}
-                    onInput={(event) =>
-                      updateSchedule(meta().name, {
-                        promotion_threshold: Number(event.currentTarget.value),
-                      })
-                    }
-                  />
-                </div>
-              </Show>
-            </div>
-          );
-        }}
-      </Index>
+                    <td>
+                      <button
+                        type="button"
+                        class="config-schedule-btn"
+                        aria-expanded={expanded() === meta().name}
+                        aria-controls={`task-detail-${meta().name}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setExpanded(expanded() === meta().name ? null : meta().name);
+                        }}
+                      >
+                        {meta().label}
+                      </button>
+                      <code class="config-field-key">{meta().name}</code>
+                      <span class="config-field-desc">{meta().description}</span>
+                    </td>
+                    <td>{scheduleSummary(schedule())}</td>
+                    <td data-task-control>
+                      <ModelSelect
+                        models={props.models}
+                        value={modelId(taskModel().model)}
+                        onChange={(next) =>
+                          updateModel(meta().name, {
+                            model: modelEntryWithModel(
+                              taskModel().model,
+                              props.harness,
+                              next || undefined,
+                            ),
+                          })
+                        }
+                        placeholder="Use harness model"
+                      />
+                    </td>
+                    <td data-task-control>
+                      <label class="toggle-switch">
+                        <input
+                          type="checkbox"
+                          aria-label={`Enable ${meta().label}`}
+                          checked={enabled()}
+                          onChange={(event) => {
+                            if (enabled()) previousSchedules.set(meta().name, schedule());
+                            updateSchedule(meta().name, {
+                              schedule: toggledSchedule(
+                                event.currentTarget.checked,
+                                previousSchedules.get(meta().name),
+                                meta().defaultSchedule,
+                              ),
+                            });
+                          }}
+                        />
+                        <span class="toggle-slider" />
+                      </label>
+                    </td>
+                  </tr>
+                  <Show when={expanded() === meta().name}>
+                    <tr class="config-task-detail" id={`task-detail-${meta().name}`}>
+                      <td colSpan={4}>
+                        <div class="config-task-edit-grid">
+                          <div>
+                            <span class="config-field-label">Schedule</span>
+                            <code class="config-field-key">
+                              dreamer.tasks.{meta().name}.schedule
+                            </code>
+                            <div class="select-wrap">
+                              <select
+                                class="config-input config-select"
+                                value={selectValue()}
+                                onChange={(event) => {
+                                  const next = event.currentTarget.value;
+                                  if (next === CUSTOM) {
+                                    setTaskCustom(meta().name, true);
+                                    if (schedule().trim() === "") {
+                                      updateSchedule(meta().name, {
+                                        schedule: toggledSchedule(
+                                          true,
+                                          previousSchedules.get(meta().name),
+                                          meta().defaultSchedule,
+                                        ),
+                                      });
+                                    }
+                                  } else {
+                                    setTaskCustom(meta().name, false);
+                                    updateSchedule(meta().name, { schedule: next });
+                                  }
+                                }}
+                              >
+                                <Index each={PRESETS}>
+                                  {(preset) => (
+                                    <option value={preset().cron}>{preset().label}</option>
+                                  )}
+                                </Index>
+                                <option value={CUSTOM}>Custom cron…</option>
+                              </select>
+                            </div>
+                            <input
+                              class="config-input"
+                              aria-label={`${meta().label} cron`}
+                              type="text"
+                              classList={{ "config-input-invalid": !isValidCronShape(schedule()) }}
+                              value={schedule()}
+                              placeholder="Empty: disabled"
+                              onInput={(event) =>
+                                updateSchedule(meta().name, { schedule: event.currentTarget.value })
+                              }
+                            />
+                            <span class="config-field-desc">
+                              minute · hour · day of month · month · weekday
+                            </span>
+                            <span
+                              class="dreamer-cron-human"
+                              classList={{ invalid: !isValidCronShape(schedule()) }}
+                            >
+                              {isValidCronShape(schedule())
+                                ? describeCron(schedule())
+                                : "Invalid cron — need 5 fields in range"}
+                            </span>
+                          </div>
+                          <div class="dreamer-task-param">
+                            <span class="config-field-label">
+                              Task {qualifierLabel().toLowerCase()}
+                            </span>
+                            <code class="config-field-key">
+                              dreamer.{props.harness}.tasks.{meta().name}.{qualifierKey()}
+                            </code>
+                            <Show
+                              when={props.harness === "opencode"}
+                              fallback={
+                                <select
+                                  class="config-input config-select"
+                                  value={String(taskModel()[qualifierKey()] ?? "")}
+                                  onChange={(event) =>
+                                    updateModel(meta().name, {
+                                      [qualifierKey()]: event.currentTarget.value || undefined,
+                                    })
+                                  }
+                                >
+                                  <option value="">Use harness default</option>
+                                  <Index each={thinkingLevelsForHarness(props.harness)}>
+                                    {(level) => <option value={level()}>{level()}</option>}
+                                  </Index>
+                                </select>
+                              }
+                            >
+                              <input
+                                class="config-input"
+                                type="text"
+                                value={String(taskModel()[qualifierKey()] ?? "")}
+                                placeholder="Use harness default"
+                                onInput={(event) =>
+                                  updateModel(meta().name, {
+                                    [qualifierKey()]: event.currentTarget.value || undefined,
+                                  })
+                                }
+                              />
+                            </Show>
+                          </div>
+                          <Show when={promotionThresholdDefault(meta().name) !== undefined}>
+                            <div class="dreamer-task-param">
+                              <span class="config-field-desc">
+                                {promotionThresholdDescription(meta().name)}
+                              </span>
+                              <code class="config-field-key">
+                                dreamer.tasks.{meta().name}.promotion_threshold
+                              </code>
+                              <input
+                                class="config-input"
+                                type="number"
+                                min={2}
+                                max={20}
+                                value={cfg().promotion_threshold ?? ""}
+                                placeholder={`Default: ${promotionThresholdDefault(meta().name)}`}
+                                onInput={(event) =>
+                                  updateSchedule(meta().name, {
+                                    promotion_threshold: event.currentTarget.value
+                                      ? Number(event.currentTarget.value)
+                                      : undefined,
+                                  })
+                                }
+                              />
+                            </div>
+                          </Show>
+                        </div>
+                      </td>
+                    </tr>
+                  </Show>
+                </>
+              );
+            }}
+          </Index>
+        </tbody>
+      </table>
     </div>
   );
 }

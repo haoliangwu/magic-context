@@ -1,9 +1,10 @@
 import { drainNotifications } from "../../shared/rpc-notifications";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
@@ -14,7 +15,12 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { getActiveCompartmentRun, registerActiveCompartmentRun } from "./compartment-runner";
 import { createDefaultBoundarySnapshotForTests } from "./protected-tail-boundary";
 import { __ignoredNotificationTest } from "./send-session-notification";
-import { runCompartmentPhase } from "./transform-compartment-phase";
+import {
+    HISTORIAN_INLINE_JOIN_BUDGET_MS,
+    historianJoinFailClosedMessage,
+    resolveHistorianInlineJoinBudget,
+    runCompartmentPhase,
+} from "./transform-compartment-phase";
 
 function createOpenCodeDb(
     sessionId: string,
@@ -67,7 +73,7 @@ let tempDir: string | undefined;
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), "mc-compartment-phase-"));
+    tempDir = createTestTempDirFromPath(join(tmpdir(), "mc-compartment-phase-"));
     process.env.XDG_DATA_HOME = tempDir;
     __ignoredNotificationTest.setHoldDetector(() => false);
 });
@@ -265,6 +271,158 @@ describe("runCompartmentPhase - 95% emergency notification idempotency", () => {
         expect(notifText).toBeDefined();
         expect(notifText).toContain("Context at 97%");
     });
+    it("bounds a stuck historian join at 60 seconds and adopts its later publication", async () => {
+        const sessionId = "ses-bounded-historian-join";
+        const db = openDatabase();
+        const deferredHistoryRefreshSessions = new Set<string>();
+        let finishHistorian!: () => void;
+        const historian = new Promise<void>((resolve) => {
+            finishHistorian = resolve;
+        });
+        const activeRun = registerActiveCompartmentRun(sessionId, historian);
+        const args = {
+            canRunCompartments: true,
+            fullFeatureMode: true,
+            sessionMeta: { compartmentInProgress: true },
+            contextUsage: { percentage: 97 },
+            boundaryContextLimit: 100_000,
+            boundaryExecuteThresholdPercentage: 65,
+            boundaryUsage: { percentage: 97, inputTokens: 97_000 },
+            boundaryUsageSource: "live" as const,
+            db,
+            sessionId,
+            resolvedSessionId: sessionId,
+            historianChunkTokens: 25_000,
+            historianTimeoutMs: 15,
+            skipAwaitForThisPass: true,
+            compartmentDirectory: "/tmp",
+            messages: [
+                { info: { id: "m1", role: "user" }, parts: [] },
+                { info: { id: "m2", role: "assistant" }, parts: [] },
+                { info: { id: "m3", role: "user" }, parts: [] },
+            ],
+            pendingCompartmentInjection: null,
+            deferredHistoryRefreshSessions,
+        };
+
+        try {
+            expect(resolveHistorianInlineJoinBudget(600_000)).toBe(HISTORIAN_INLINE_JOIN_BUDGET_MS);
+            const started = performance.now();
+            const timedOut = await runCompartmentPhase(args);
+            expect(performance.now() - started).toBeLessThan(250);
+            expect(timedOut.historianJoinTimedOut).toBe(true);
+            expect(timedOut.historianJoinBudgetMs).toBe(15);
+
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 2,
+                    startMessageId: "m1",
+                    endMessageId: "m2",
+                    title: "Published later",
+                    content: "The background historian completed after the inline join budget.",
+                },
+            ]);
+            activeRun.published = true;
+            deferredHistoryRefreshSessions.add(sessionId);
+            finishHistorian();
+
+            // Start the next pass before the completed historian run leaves the active registry.
+            // That pass adopts the publication inline; the run's finally-handler then clears it.
+            const nextPass = await runCompartmentPhase({ ...args, messages: [...args.messages] });
+            expect(nextPass.awaitedCompartmentRun).toBe(true);
+            expect(nextPass.justAwaitedPublication).toBe(true);
+            expect(nextPass.pendingCompartmentInjection?.block).toContain("Published later");
+        } finally {
+            finishHistorian();
+        }
+    });
+
+    it("proceeds only when post-timeout emergency reclaim proves the wire fits", () => {
+        expect(
+            historianJoinFailClosedMessage({
+                timedOut: true,
+                budgetMs: HISTORIAN_INLINE_JOIN_BUDGET_MS,
+                finalWireEstimate: { tokens: 64_000, trusted: true },
+                contextLimitTokens: 100_000,
+                lastHistorianError: "provider is slow",
+            }),
+        ).toBeNull();
+        expect(
+            historianJoinFailClosedMessage({
+                timedOut: true,
+                budgetMs: HISTORIAN_INLINE_JOIN_BUDGET_MS,
+                finalWireEstimate: { tokens: 104_000, trusted: true },
+                contextLimitTokens: 100_000,
+                lastHistorianError: "provider is slow",
+            }),
+        ).toBe("historian did not complete within 60 s: provider is slow");
+        expect(
+            historianJoinFailClosedMessage({
+                timedOut: true,
+                budgetMs: HISTORIAN_INLINE_JOIN_BUDGET_MS,
+                finalWireEstimate: { tokens: 64_000, trusted: false },
+                contextLimitTokens: 100_000,
+            }),
+        ).toBe("historian did not complete within 60 s: background historian is still running");
+    });
+
+    it("keeps an in-budget historian completion on the inline fold path", async () => {
+        const sessionId = "ses-fast-historian-join";
+        const db = openDatabase();
+        let finishHistorian!: () => void;
+        const activeRun = registerActiveCompartmentRun(
+            sessionId,
+            new Promise<void>((resolve) => {
+                finishHistorian = resolve;
+            }),
+        );
+        appendCompartments(db, sessionId, [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                title: "Fast fold",
+                content: "The historian completed within the inline join budget.",
+            },
+        ]);
+        activeRun.published = true;
+        const deferredHistoryRefreshSessions = new Set([sessionId]);
+        const pass = runCompartmentPhase({
+            canRunCompartments: true,
+            fullFeatureMode: true,
+            sessionMeta: { compartmentInProgress: true },
+            contextUsage: { percentage: 97 },
+            boundaryContextLimit: 100_000,
+            boundaryExecuteThresholdPercentage: 65,
+            boundaryUsage: { percentage: 97, inputTokens: 97_000 },
+            boundaryUsageSource: "live",
+            db,
+            sessionId,
+            resolvedSessionId: sessionId,
+            historianChunkTokens: 25_000,
+            historianTimeoutMs: 600_000,
+            skipAwaitForThisPass: true,
+            compartmentDirectory: "/tmp",
+            messages: [
+                { info: { id: "m1", role: "user" }, parts: [] },
+                { info: { id: "m2", role: "assistant" }, parts: [] },
+                { info: { id: "m3", role: "user" }, parts: [] },
+            ],
+            pendingCompartmentInjection: null,
+            deferredHistoryRefreshSessions,
+        });
+        finishHistorian();
+        const result = await pass;
+        expect(result.awaitedCompartmentRun).toBe(true);
+        expect(result.historianJoinTimedOut).toBe(false);
+        expect(result.justAwaitedPublication).toBe(true);
+        expect(result.pendingCompartmentInjection?.block).toContain("Fast fold");
+    });
+
     it("does not start independent compressor when historian is disabled", async () => {
         const sessionId = "ses-compressor-disabled";
         const db = openDatabase();

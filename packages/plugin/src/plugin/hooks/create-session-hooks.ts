@@ -1,4 +1,6 @@
 import type { MagicContextPluginConfig } from "../../config";
+import { dreamerRunConfig, historianRunConfig } from "../../config/live-run-config";
+import type { LiveConfigReader } from "../../config/live-snapshot";
 import { getProtectedTokensTierOverrides } from "../../config/project-security";
 import { DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE } from "../../config/schema/magic-context";
 import { createCompactionHandler } from "../../features/magic-context/compaction";
@@ -42,11 +44,13 @@ export function buildMagicContextHookConfig(pluginConfig: MagicContextPluginConf
 export function createSessionHooks(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
+    liveConfigReader?: LiveConfigReader<MagicContextPluginConfig>;
     liveSessionState: LiveSessionState;
     rustModeModuleClient?: RustModeModuleClient;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
 }) {
     const { ctx, pluginConfig, liveSessionState } = args;
+    const liveConfigReader = args.liveConfigReader;
 
     if (pluginConfig.enabled !== true) {
         return { magicContext: null, rustToolBackends: undefined };
@@ -69,6 +73,18 @@ export function createSessionHooks(args: {
         rustModeModuleClient: args.rustModeModuleClient,
         promptSurfaceRuntime: args.promptSurfaceRuntime,
         config: buildMagicContextHookConfig(pluginConfig),
+        sampleHistorianConfig: liveConfigReader
+            ? () =>
+                  buildMagicContextHookConfig(
+                      historianRunConfig(pluginConfig, liveConfigReader.poll().effective),
+                  )
+            : undefined,
+        sampleDreamConfig: liveConfigReader
+            ? () =>
+                  buildMagicContextHookConfig(
+                      dreamerRunConfig(pluginConfig, liveConfigReader.poll().effective),
+                  )
+            : undefined,
     });
 
     return {
@@ -80,12 +96,14 @@ export function createSessionHooks(args: {
 export async function createSessionHooksAsync(args: {
     ctx: PluginContext;
     pluginConfig: MagicContextPluginConfig;
+    liveConfigReader?: LiveConfigReader<MagicContextPluginConfig>;
     liveSessionState: LiveSessionState;
     rustModeModuleClient?: RustModeModuleClient;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     onStorageBootTimings?: (timings: DatabaseBootTimings) => void;
 }) {
     const { ctx, pluginConfig, liveSessionState } = args;
+    const liveConfigReader = args.liveConfigReader;
 
     if (pluginConfig.enabled !== true) {
         return { magicContext: null, rustToolBackends: undefined };
@@ -109,6 +127,18 @@ export async function createSessionHooksAsync(args: {
         promptSurfaceRuntime: args.promptSurfaceRuntime,
         onStorageBootTimings: args.onStorageBootTimings,
         config: buildMagicContextHookConfig(pluginConfig),
+        sampleHistorianConfig: liveConfigReader
+            ? () =>
+                  buildMagicContextHookConfig(
+                      historianRunConfig(pluginConfig, liveConfigReader.poll().effective),
+                  )
+            : undefined,
+        sampleDreamConfig: liveConfigReader
+            ? () =>
+                  buildMagicContextHookConfig(
+                      dreamerRunConfig(pluginConfig, liveConfigReader.poll().effective),
+                  )
+            : undefined,
     });
 
     return {

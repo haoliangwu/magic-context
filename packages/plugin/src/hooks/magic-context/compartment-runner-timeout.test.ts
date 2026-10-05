@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { closeDatabase, openDatabase } from "../../features/magic-context/storage";
@@ -9,6 +9,7 @@ import type { PluginContext } from "../../plugin/types";
 import * as shared from "../../shared";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { executeContextRecomp, runCompartmentAgent } from "./compartment-runner";
 
 const tempDirs: string[] = [];
@@ -133,7 +134,7 @@ function createHistorianClient(directory: string, output: string): PluginContext
 }
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }

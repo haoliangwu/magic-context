@@ -171,9 +171,9 @@ export class OmpAdapter implements HarnessAdapter {
         return "Install OMP: https://omp.sh (npm: @oh-my-pi/pi-coding-agent)";
     }
 
-    getPluginCacheInfo(): PluginCacheInfo {
+    getPluginCacheInfo(): PluginCacheInfo[] {
         const path = join(getOmpPluginsDir(), "cache");
-        return { path, exists: existsSync(path), sizeBytes: dirSizeBytes(path) };
+        return [{ path, exists: existsSync(path), sizeBytes: dirSizeBytes(path) }];
     }
 
     getLogPath(): string {

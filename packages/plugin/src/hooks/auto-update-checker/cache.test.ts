@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 const tempDirs: string[] = [];
 const PACKAGE_NAME = "@cortexkit/opencode-magic-context";
 
 function fixture(version = "0.15.5") {
-    const root = mkdtempSync(join(tmpdir(), "mc-auto-update-cache-"));
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-auto-update-cache-"));
     tempDirs.push(root);
     const installDir = join(root, "install");
     const packageDir = join(installDir, "node_modules", "@cortexkit", "opencode-magic-context");

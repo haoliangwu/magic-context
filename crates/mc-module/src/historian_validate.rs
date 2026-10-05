@@ -188,6 +188,10 @@ pub struct ParsedCompartmentOutput {
     pub compartments: Vec<ParsedCompartment>,
     #[serde(default)]
     pub facts: Vec<FactCandidate>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_fact_blocks: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_facts: usize,
     #[serde(default)]
     pub events: Vec<ParsedEvent>,
     #[serde(default)]
@@ -227,6 +231,10 @@ pub struct ValidatedCompartment {
 pub struct ValidatedChunk {
     pub compartments: Vec<ValidatedCompartment>,
     pub facts: Vec<FactCandidate>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_fact_blocks: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_facts: usize,
     pub events: Vec<ParsedEvent>,
     pub primer_candidates: Vec<PrimerCandidate>,
     pub user_observations: Vec<UserObservationCandidate>,
@@ -273,7 +281,10 @@ pub fn parse_compartment_output(
         .name("body")
         .map(|capture| capture.as_str())
         .unwrap_or_default();
-    if output_tag_regex().is_match(root_body) {
+    // A compartment body may mention `<output>` as text; only tags outside the
+    // compartment elements can open or close a second root.
+    let root_elements = find_compartment_elements(root_body);
+    if output_tag_regex().is_match(&text_outside_compartments(root_body, &root_elements)) {
         return Err(validation_error(
             "Historian output must contain exactly one <output> root document.",
         ));
@@ -281,10 +292,13 @@ pub fn parse_compartment_output(
 
     let mut compartments = Vec::new();
     let mut facts = Vec::new();
+    let mut dropped_fact_blocks = 0;
+    let mut dropped_facts = 0;
 
-    for caps in compartment_regex().captures_iter(text) {
-        let attrs = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let inner = caps.get(2).map(|m| m.as_str()).unwrap_or_default();
+    let elements = find_compartment_elements(text);
+    for element in &elements {
+        let attrs = element.attrs;
+        let inner = element.inner;
 
         let start_message = match capture_u64(attr_start_regex(), attrs) {
             Some(v) => v,
@@ -305,11 +319,11 @@ pub fn parse_compartment_output(
         let episode_type = capture_string(attr_episode_regex(), attrs).map(|s| unescape_xml(&s));
         let importance = capture_u64(attr_importance_regex(), attrs);
 
-        let p1 = extract_tier(inner, 0);
-        if let Some(p1_value) = p1.filter(|s| !s.is_empty()) {
-            let p2 = extract_tier(inner, 1);
-            let p3 = extract_tier(inner, 2);
-            let p4 = extract_tier(inner, 3);
+        let mut tiers = extract_tiers(inner);
+        if let Some(p1_value) = tiers.remove(&1).filter(|s| !s.is_empty()) {
+            let p2 = tiers.remove(&2);
+            let p3 = tiers.remove(&3);
+            let p4 = tiers.remove(&4);
             let p2_value = p2.clone().unwrap_or_else(|| p1_value.clone());
             let p3_value = p3
                 .clone()
@@ -347,24 +361,38 @@ pub fn parse_compartment_output(
         }
     }
 
-    let facts_scope = if let Some(caps) = facts_block_regex().captures(text) {
+    // Every side channel is read outside the compartment elements, so a body
+    // that mentions `<facts>` or `<events>` cannot be mistaken for the real block.
+    let outside = text_outside_compartments(text, &elements);
+    let facts_scope = if let Some(caps) = facts_block_regex().captures(&outside) {
         caps.get(1)
             .map(|m| m.as_str().to_string())
             .unwrap_or_default()
     } else {
-        let without_events = events_block_regex().replace_all(text, "");
-        compartment_regex()
-            .replace_all(&without_events, "")
+        let without_events = events_block_regex().replace_all(&outside, "");
+        let without_side_channels = facts_side_channel_regex().replace_all(&without_events, "");
+        facts_envelope_regex()
+            .replace_all(&without_side_channels, "")
             .to_string()
     };
 
-    for category_caps in category_block_regex().captures_iter(&facts_scope) {
-        let category = category_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let closing = category_caps.get(3).map(|m| m.as_str()).unwrap_or_default();
-        if category != closing {
+    for (category, block) in paired_elements(&facts_scope, category_open_regex()) {
+        if !HISTORIAN_CATEGORIES.contains(&category) {
+            let count = fact_item_regex()
+                .captures_iter(block)
+                .filter(|caps| {
+                    caps.get(1)
+                        .is_some_and(|m| !unescape_xml(m.as_str().trim()).is_empty())
+                })
+                .count();
+            if count == 0 {
+                continue;
+            }
+            dropped_fact_blocks += 1;
+            dropped_facts += count;
+            tracing::warn!("{}", format_dropped_fact_category(category, count));
             continue;
         }
-        let block = category_caps.get(2).map(|m| m.as_str()).unwrap_or_default();
         for item_caps in fact_item_regex().captures_iter(block) {
             let raw = item_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
             let unescaped = unescape_xml(raw.trim());
@@ -379,10 +407,10 @@ pub fn parse_compartment_output(
         }
     }
 
-    let unprocessed_from = capture_u64(unprocessed_regex(), text);
+    let unprocessed_from = capture_u64(unprocessed_regex(), &outside);
 
     let mut user_observations = Vec::new();
-    if let Some(caps) = user_observations_regex().captures(text) {
+    if let Some(caps) = user_observations_regex().captures(&outside) {
         let block = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
         for item_caps in user_obs_item_regex().captures_iter(block) {
             let raw = item_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
@@ -398,7 +426,7 @@ pub fn parse_compartment_output(
     }
 
     let mut primer_candidates = Vec::new();
-    if let Some(caps) = primer_candidates_regex().captures(text) {
+    if let Some(caps) = primer_candidates_regex().captures(&outside) {
         let block = caps.get(1).map(|m| m.as_str()).unwrap_or_default();
         let mut saw_element = false;
         for primer_caps in primer_element_regex().captures_iter(block) {
@@ -432,12 +460,52 @@ pub fn parse_compartment_output(
         }
     }
 
-    let events = parse_events(text);
+    let mut events = parse_events(&outside);
+
+    // Compartments are returned sorted by start, but `at_compartment` anchors
+    // count compartments in the order the model emitted them. When the model
+    // emits them out of order, re-point each in-range anchor at the same
+    // compartment's sorted position, since every consumer indexes the sorted
+    // list. Out-of-range anchors are left for validation to discard. Mirrors the
+    // TypeScript parser; the Rust-only fact and observation anchors use the same
+    // convention and are remapped too.
+    let mut emitted_order: Vec<usize> = (0..compartments.len()).collect();
+    emitted_order.sort_by_key(|&emitted| compartments[emitted].start_message);
+    let mut sorted_position = vec![0_u64; compartments.len()];
+    for (sorted, &emitted) in emitted_order.iter().enumerate() {
+        sorted_position[emitted] = sorted as u64 + 1;
+    }
+    let remap_anchor = |anchor: &mut Option<u64>| {
+        if let Some(index) = anchor.as_mut() {
+            if let Some(&position) = usize::try_from(*index)
+                .ok()
+                .and_then(|index| index.checked_sub(1))
+                .and_then(|slot| sorted_position.get(slot))
+            {
+                *index = position;
+            }
+        }
+    };
+    for event in &mut events {
+        remap_anchor(&mut event.at_compartment);
+    }
+    for candidate in &mut primer_candidates {
+        remap_anchor(&mut candidate.origin_compartment_index);
+    }
+    for fact in &mut facts {
+        remap_anchor(&mut fact.origin_compartment_index);
+    }
+    for observation in &mut user_observations {
+        remap_anchor(&mut observation.origin_compartment_index);
+    }
+    // Stable, so equal starts keep emission order exactly as `emitted_order` did.
     compartments.sort_by_key(|c| c.start_message);
 
     Ok(ParsedCompartmentOutput {
         compartments,
         facts,
+        dropped_fact_blocks,
+        dropped_facts,
         events,
         unprocessed_from,
         user_observations,
@@ -628,6 +696,8 @@ pub fn validate_historian_output(
     Ok(ValidatedChunk {
         compartments,
         facts,
+        dropped_fact_blocks: parsed.dropped_fact_blocks,
+        dropped_facts: parsed.dropped_facts,
         events,
         primer_candidates,
         user_observations,
@@ -831,16 +901,8 @@ fn parse_events(text: &str) -> Vec<ParsedEvent> {
         let body = &block[body_start..body_start + relative_body_end];
 
         let mut fields = BTreeMap::new();
-        for field_caps in event_field_regex().captures_iter(body) {
-            let name = field_caps.get(1).map(|m| m.as_str()).unwrap_or_default();
-            let closing = field_caps.get(3).map(|m| m.as_str()).unwrap_or_default();
-            if name != closing {
-                continue;
-            }
-            let value = field_caps
-                .get(2)
-                .map(|m| unescape_xml(m.as_str().trim()))
-                .unwrap_or_default();
+        for (name, raw_value) in paired_elements(body, event_field_open_regex()) {
+            let value = unescape_xml(raw_value.trim());
             if !value.is_empty() {
                 fields.insert(name.to_string(), value);
             }
@@ -1109,28 +1171,175 @@ fn capture_u64(regex: &Regex, haystack: &str) -> Option<u64> {
         .and_then(|caps| caps.get(1).and_then(|m| m.as_str().parse::<u64>().ok()))
 }
 
-fn extract_tier(inner: &str, index: usize) -> Option<String> {
-    let open_match = tier_open_regexes()[index].captures(inner)?;
-    let full = open_match.get(0)?;
-    // Self-close form (<p4/> or <p4 />) → empty tier.
-    if open_match.get(1).map(|m| m.as_str()) == Some("/") {
-        return Some(String::new());
+/// True when `inner` opens tier `digit` anywhere at or after `from`.
+fn has_tier_opener_from(inner: &str, digit: u32, from: usize) -> bool {
+    tier_open_regex()
+        .captures_iter(&inner[from..])
+        .any(|open| tier_digit(&open) == digit)
+}
+
+fn tier_digit(caps: &regex::Captures<'_>) -> u32 {
+    caps.get(1)
+        .and_then(|m| m.as_str().parse::<u32>().ok())
+        .expect("tier regexes capture exactly one ASCII digit")
+}
+
+/// Find the close of tier `digit` whose body starts at `body_start`, when the
+/// tier is properly closed: the first `</pN>` with the same digit that is
+/// followed only by another tier tag or the end of the compartment. Tier tags
+/// before that close are body text (a summary that talks about `<p2>` tags),
+/// unless one of them opens a tier that is not found anywhere else: then it is
+/// really the next tier after an unclosed one (`<p1>alpha<p2>beta</p1>`), and
+/// `None` sends the caller to the lenient bounds. Mirrors the TypeScript
+/// `findMatchingTierClose`.
+fn find_matching_tier_close(
+    inner: &str,
+    body_start: usize,
+    digit: u32,
+    found: &BTreeMap<u32, String>,
+) -> Option<(usize, usize)> {
+    for close in tier_close_regex().captures_iter(&inner[body_start..]) {
+        let whole = close.get(0)?;
+        let (start, end) = (body_start + whole.start(), body_start + whole.end());
+        if tier_digit(&close) != digit {
+            continue;
+        }
+        if !tier_close_follower_regex().is_match(&inner[end..]) {
+            continue;
+        }
+        let otherwise_missing = tier_open_regex()
+            .captures_iter(&inner[body_start..start])
+            .any(|open| {
+                let other = tier_digit(&open);
+                (1..=4).contains(&other)
+                    && other != digit
+                    && !found.contains_key(&other)
+                    && !has_tier_opener_from(inner, other, end)
+            });
+        if otherwise_missing {
+            return None;
+        }
+        return Some((start, end));
     }
-    let rest = &inner[full.end()..];
-    // Bound the body at the next closing tier tag (any digit). When there is no
-    // close at all, run to the end of the compartment and let the guard below
-    // trim at the next opener if one is present.
-    let end = tier_close_any_regex()
-        .find(rest)
-        .map(|m| m.start())
-        .unwrap_or(rest.len());
-    let mut body = &rest[..end];
-    // Over-capture guard: never swallow a subsequent tier's opening tag into
-    // this tier's content. If an opener appears before the close, cut there.
-    if let Some(open_inside) = tier_open_any_regex().find(body) {
-        body = &body[..open_inside.start()];
+    None
+}
+
+/// Extract the tier bodies from a compartment inner string, walking the tiers
+/// in the order they appear. Each digit keeps its first occurrence; the map has
+/// no entry for an absent tier and "" for a self-closed or empty one.
+///
+/// A properly closed tier keeps any tier tags written inside it as text (see
+/// `find_matching_tier_close`). Otherwise the parser is lenient about the
+/// close: an opened `<pN>` is terminated by the next closing tier tag of any
+/// digit, because some models mismatch the close (`<p1>…</p2>`); if the close
+/// is missing, the next opening tier tag or the end of the compartment bounds
+/// the body. Mirrors the TypeScript `extractTiers`.
+fn extract_tiers(inner: &str) -> BTreeMap<u32, String> {
+    let mut tiers = BTreeMap::new();
+    let mut pos = 0;
+    while let Some(open) = tier_open_regex().captures_at(inner, pos) {
+        let Some(whole) = open.get(0) else {
+            break;
+        };
+        let digit = tier_digit(&open);
+        let body_start = whole.end();
+        let mut body_end = body_start;
+        pos = body_start;
+        // Self-close form (<p4/> or <p4 />) → empty tier.
+        if open.get(2).map(|m| m.as_str()) != Some("/") {
+            if let Some((close_start, close_end)) =
+                find_matching_tier_close(inner, body_start, digit, &tiers)
+            {
+                body_end = close_start;
+                pos = close_end;
+            } else {
+                // Lenient bounds: the next closing tier tag of any digit, or the
+                // end of the compartment when there is none.
+                let close_at = tier_close_any_regex()
+                    .find_at(inner, body_start)
+                    .map(|m| m.start());
+                body_end = close_at.unwrap_or(inner.len());
+                pos = close_at.map_or(inner.len(), |at| at + 1);
+                // Over-capture guard: never swallow a subsequent tier's opening
+                // tag into this tier's content. If an opener appears before the
+                // close, cut there and resume the walk at that opener.
+                if let Some(open_inside) =
+                    tier_open_any_regex().find_at(&inner[..body_end], body_start)
+                {
+                    body_end = open_inside.start();
+                    pos = body_end;
+                }
+            }
+        }
+        tiers
+            .entry(digit)
+            .or_insert_with(|| unescape_xml(inner[body_start..body_end].trim()));
     }
-    Some(unescape_xml(body.trim()))
+    tiers
+}
+
+/// One `<compartment …>…</compartment>` element; offsets index the parsed text.
+struct CompartmentElement<'a> {
+    start: usize,
+    end: usize,
+    attrs: &'a str,
+    inner: &'a str,
+}
+
+/// Locate every compartment element in emission order. A compartment ends at
+/// the first `</compartment>` before the next compartment's open tag that is
+/// followed by output structure, so the closing tag written as text inside a
+/// body does not end the compartment early. When no close qualifies, the first
+/// `</compartment>` ends it, as a plain non-greedy match would. Mirrors the
+/// TypeScript `findCompartmentElements`.
+fn find_compartment_elements(text: &str) -> Vec<CompartmentElement<'_>> {
+    const CLOSE_TAG: &str = "</compartment>";
+    let find_close_from = |from: usize| text[from..].find(CLOSE_TAG).map(|at| from + at);
+    let mut elements = Vec::new();
+    let mut cursor = 0;
+    while let Some(open) = compartment_open_regex().captures_at(text, cursor) {
+        let Some(whole) = open.get(0) else {
+            break;
+        };
+        let body_start = whole.end();
+        let window_end = compartment_open_regex()
+            .find_at(text, body_start)
+            .map_or(text.len(), |next| next.start());
+        let Some(first_close) = find_close_from(body_start) else {
+            break;
+        };
+        let mut close_at = first_close;
+        let mut candidate = Some(first_close);
+        while let Some(at) = candidate.filter(|at| *at < window_end) {
+            if compartment_close_follower_regex().is_match(&text[at + CLOSE_TAG.len()..]) {
+                close_at = at;
+                break;
+            }
+            candidate = find_close_from(at + 1);
+        }
+        let end = close_at + CLOSE_TAG.len();
+        elements.push(CompartmentElement {
+            start: whole.start(),
+            end,
+            attrs: open.get(1).map_or("", |m| m.as_str()),
+            inner: &text[body_start..close_at],
+        });
+        cursor = end;
+    }
+    elements
+}
+
+/// The text with every compartment element removed; side channels are read
+/// from it.
+fn text_outside_compartments(text: &str, elements: &[CompartmentElement<'_>]) -> String {
+    let mut outside = String::with_capacity(text.len());
+    let mut last = 0;
+    for element in elements {
+        outside.push_str(&text[last..element.start]);
+        last = element.end;
+    }
+    outside.push_str(&text[last..]);
+    outside
 }
 
 fn split_anchor_prefix(text: &str) -> (Option<u64>, String) {
@@ -1145,12 +1354,28 @@ fn split_anchor_prefix(text: &str) -> (Option<u64>, String) {
     (None, text.trim().to_string())
 }
 
+/// Decode the five predefined XML entities in a single left-to-right pass, so
+/// every entity is decoded exactly once. Chained replacements that decode
+/// `&amp;` first would turn the escaped literal `&amp;lt;` into `<` instead of
+/// the text `&lt;`. Mirrors `unescapeXml` in packages/plugin/src/shared/xml-unescape.ts.
 fn unescape_xml(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&apos;", "'")
-        .replace("&quot;", "\"")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
+    xml_entity_regex()
+        .replace_all(s, |caps: &regex::Captures<'_>| {
+            match caps.get(1).map(|m| m.as_str()) {
+                Some("amp") => "&",
+                Some("apos") => "'",
+                Some("quot") => "\"",
+                Some("lt") => "<",
+                Some("gt") => ">",
+                _ => unreachable!("xml_entity_regex only captures the five predefined entities"),
+            }
+        })
+        .into_owned()
+}
+
+fn xml_entity_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"&(amp|apos|quot|lt|gt);").unwrap())
 }
 
 fn output_document_regex() -> &'static Regex {
@@ -1165,9 +1390,24 @@ fn output_tag_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?is)</?output(?:\s[^>]*)?>").unwrap())
 }
 
-fn compartment_regex() -> &'static Regex {
+/// Compartment open tag; group 1 = the attribute string. Matches the TypeScript
+/// `COMPARTMENT_OPEN_REGEX`: quoted attribute values are consumed whole, so a raw
+/// `>` inside one (a title like "Migrate store -> SQLite") does not end the open
+/// tag. A value may not span a line, so a stray unbalanced quote cannot swallow
+/// the body.
+fn compartment_open_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(?s)<compartment\s+([^>]*?)\s*>(.*?)</compartment>"#).unwrap())
+    RE.get_or_init(|| Regex::new(r#"<compartment\s+((?:[^>"]|"[^"\n]*")*?)\s*>"#).unwrap())
+}
+
+/// What may follow a compartment's real closing tag: the next compartment, the
+/// end of the compartment list or document, or one of the output's own blocks.
+/// A `</compartment>` written as text inside a body is followed by more prose.
+fn compartment_close_follower_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\A\s*(?:\z|<(?:compartment\s|/compartments\s*>|/output\s*>|(?:facts|events|meta|user_observations|primer_candidates|unprocessed_from)\s*>))").unwrap()
+    })
 }
 
 fn attr_start_regex() -> &'static Regex {
@@ -1195,34 +1435,48 @@ fn attr_importance_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"\bimportance="(\d+)""#).unwrap())
 }
 
-/// Per-tier opener: matches `<p1>` / `<p1 >` (group 1 empty) or the self-close
-/// `<p1/>` / `<p1 />` (group 1 = "/"). The body that follows an opener is
-/// bounded procedurally in `extract_tier` rather than by an exact `</pN>` close,
-/// because some models mismatch the closing digit (e.g. `<p1>…</p2>`).
-fn tier_open_regexes() -> &'static [Regex; 4] {
-    static RE: OnceLock<[Regex; 4]> = OnceLock::new();
-    RE.get_or_init(|| {
-        [
-            Regex::new(r"<p1\s*(/?)>").unwrap(),
-            Regex::new(r"<p2\s*(/?)>").unwrap(),
-            Regex::new(r"<p3\s*(/?)>").unwrap(),
-            Regex::new(r"<p4\s*(/?)>").unwrap(),
-        ]
-    })
+/// Tier opener: matches `<p1>` / `<p1 >` (group 2 empty) or the self-close
+/// `<p4/>` / `<p4 />` (group 2 = "/"). Group 1 = tier digit. Digits are ASCII
+/// (`[0-9]`) to match JavaScript's `\d`.
+fn tier_open_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"<p([0-9])\s*(/?)>").unwrap())
 }
 
-/// Any tier's closing tag (`</p1>`…`</p9>`) — bounds an opened tier's body
-/// regardless of whether the close digit matches the opener.
+/// A complete tier closing tag; group 1 = tier digit.
+fn tier_close_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"</p([0-9])\s*>").unwrap())
+}
+
+/// What may follow a tier's real closing tag: another tier tag or the end of the
+/// compartment. A tier tag written as text inside a body is followed by prose.
+fn tier_close_follower_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\A\s*(?:\z|</?p[0-9]\s*/?>)").unwrap())
+}
+
+/// Lenient fallback bound: the start of any tier's closing tag (`</p1`…`</p9`).
 fn tier_close_any_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"</p\d").unwrap())
+    RE.get_or_init(|| Regex::new(r"</p[0-9]").unwrap())
 }
 
-/// Any tier's OPENING tag (`<p1>`…`<p9>`) — the over-capture guard: a tier body
-/// must never swallow a following tier's opener.
+/// The over-capture guard for the lenient bounds: the start of any tier's
+/// opening tag, which a tier body must never swallow.
 fn tier_open_any_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"<p\d").unwrap())
+    RE.get_or_init(|| Regex::new(r"<p[0-9]").unwrap())
+}
+
+fn facts_side_channel_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?s)<meta>.*?</meta>|<user_observations>.*?</user_observations>|<primer_candidates>.*?</primer_candidates>").unwrap())
+}
+
+fn facts_envelope_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"</?(?:output|compartments)>").unwrap())
 }
 
 fn facts_block_regex() -> &'static Regex {
@@ -1235,14 +1489,52 @@ fn events_block_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"(?s)<events>(.*?)</events>"#).unwrap())
 }
 
-fn category_block_regex() -> &'static Regex {
+const HISTORIAN_CATEGORIES: &[&str] = &[
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+];
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn format_dropped_fact_category(category: &str, count: usize) -> String {
+    format!("[historian] Dropped <facts> category {category} ({count} facts)")
+}
+
+/// Opening tag of a fact category block; group 1 = the category name.
+fn category_open_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(
-            r#"(?s)<(PROJECT_RULES|ARCHITECTURE|CONSTRAINTS|CONFIG_VALUES|NAMING)>(.*?)</(PROJECT_RULES|ARCHITECTURE|CONSTRAINTS|CONFIG_VALUES|NAMING)>"#,
-        )
-        .unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r"<([A-Za-z_][A-Za-z0-9_-]*)>").unwrap())
+}
+
+/// Scan `text` for `<name …>body</name>` elements the way the TypeScript parser's
+/// backreference regexes (`/<(name)…>(.*?)<\/\1>/gs`) do, which Rust's regex
+/// engine cannot express: from each opening tag (group 1 = name), the body runs
+/// to the first closing tag with the SAME name, so a different closing tag
+/// written as text in the body (`</compartment>`) does not end it. An opening
+/// tag with no matching close is skipped and the scan resumes just after its `<`.
+fn paired_elements<'a>(text: &'a str, open_regex: &Regex) -> Vec<(&'a str, &'a str)> {
+    let mut elements = Vec::new();
+    let mut pos = 0;
+    while let Some(open) = open_regex.captures_at(text, pos) {
+        let (Some(whole), Some(name)) = (open.get(0), open.get(1)) else {
+            break;
+        };
+        let close_tag = format!("</{}>", name.as_str());
+        match text[whole.end()..].find(&close_tag) {
+            Some(body_len) => {
+                let body_end = whole.end() + body_len;
+                elements.push((name.as_str(), &text[whole.end()..body_end]));
+                pos = body_end + close_tag.len();
+            }
+            None => pos = whole.start() + 1,
+        }
+    }
+    elements
 }
 
 fn fact_item_regex() -> &'static Regex {
@@ -1287,9 +1579,10 @@ fn event_open_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"<([a-z_]+)\s+at_compartment="(\d+)"\s*>"#).unwrap())
 }
 
-fn event_field_regex() -> &'static Regex {
+/// Opening tag of an event field; group 1 = the field name.
+fn event_field_open_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(?s)<([a-z_]+)\s*>(.*?)</([a-z_]+)>"#).unwrap())
+    RE.get_or_init(|| Regex::new(r"<([a-z_]+)\s*>").unwrap())
 }
 
 fn side_channel_anchor_regex() -> &'static Regex {
@@ -1305,6 +1598,27 @@ fn side_channel_anchor_regex() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_fact_categories_report_every_drop() {
+        let parsed = parse_compartment_output("<output><facts><PROJECT_RULS>\n* One\n* Two\n</PROJECT_RULS><USER_DIRECTIVES>\n* Three\n</USER_DIRECTIVES><project-ruls>\n* Four\n</project-ruls></facts></output>").unwrap();
+        assert!(parsed.facts.is_empty());
+        assert_eq!(parsed.dropped_fact_blocks, 3);
+        assert_eq!(parsed.dropped_facts, 4);
+        assert_eq!(
+            format_dropped_fact_category("PROJECT_RULS", 2),
+            "[historian] Dropped <facts> category PROJECT_RULS (2 facts)"
+        );
+    }
+
+    #[test]
+    fn fallback_ignores_tags_without_fact_items() {
+        let parsed = parse_compartment_output("<output><PROJECT_RULS>\n* One\n* Two\n</PROJECT_RULS><unprocessed_from>12</unprocessed_from></output>").unwrap();
+        assert!(parsed.facts.is_empty());
+        assert_eq!(parsed.unprocessed_from, Some(12));
+        assert_eq!(parsed.dropped_fact_blocks, 1);
+        assert_eq!(parsed.dropped_facts, 2);
+    }
 
     #[derive(Debug, Deserialize)]
     struct GoldenInput {
@@ -1411,6 +1725,69 @@ mod tests {
                 case.label
             );
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ParseGoldenCase {
+        label: String,
+        text: String,
+        parsed: ParsedCompartmentOutput,
+    }
+
+    /// Parser parity with the TypeScript host: the golden records what
+    /// `parseCompartmentOutput` returns for each raw historian output
+    /// (regenerate with `bun crates/mc-module/gen/gen-historian-parse-golden.ts`).
+    #[test]
+    fn parse_golden_matches_typescript_parser() {
+        let raw = include_str!("../testdata/historian-parse-golden.json");
+        let cases: Vec<ParseGoldenCase> =
+            serde_json::from_str(raw).expect("parse historian parse golden");
+        assert!(!cases.is_empty(), "empty historian parse golden");
+        // Collect every mismatching case so one run names all diverging labels.
+        let mut mismatches = Vec::new();
+        for case in &cases {
+            match parse_compartment_output(&case.text) {
+                Ok(parsed) if parsed == case.parsed => {}
+                Ok(parsed) => mismatches.push(format!(
+                    "{}:\n  rust: {parsed:?}\n  ts:   {:?}",
+                    case.label, case.parsed
+                )),
+                Err(error) => mismatches.push(format!("{}: failed to parse: {error}", case.label)),
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "parsed mismatch in {} case(s):\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn rust_only_side_channel_anchors_follow_out_of_order_compartments() {
+        // Emission order: compartment 1 covers 3-4, compartment 2 covers 1-2.
+        let text = "<output><compartments>\
+<compartment start=\"3\" end=\"4\" title=\"later\"><p1>later</p1><p2>l</p2><p3>l</p3><p4/></compartment>\
+<compartment start=\"1\" end=\"2\" title=\"earlier\"><p1>earlier</p1><p2>e</p2><p3>e</p3><p4/></compartment>\
+</compartments><facts><PROJECT_RULES>\n* [at_compartment=1] Fact from later.\n</PROJECT_RULES></facts>\
+<user_observations>\n* (origin_compartment=2) Observation from earlier.\n</user_observations></output>";
+        let parsed = parse_compartment_output(text).expect("parse out-of-order output");
+        let titles: Vec<&str> = parsed
+            .compartments
+            .iter()
+            .map(|c| c.title.as_str())
+            .collect();
+        assert_eq!(titles, ["earlier", "later"]);
+        assert_eq!(parsed.facts[0].content, "Fact from later.");
+        assert_eq!(parsed.facts[0].origin_compartment_index, Some(2));
+        assert_eq!(
+            parsed.user_observations[0].content,
+            "Observation from earlier."
+        );
+        assert_eq!(
+            parsed.user_observations[0].origin_compartment_index,
+            Some(1)
+        );
     }
 
     #[test]

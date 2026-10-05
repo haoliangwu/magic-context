@@ -62,6 +62,30 @@ Configure the historian independently for each harness. There is no built-in pro
 
 If your compartments read badly, first choose a stronger historian model or reasoning setting. `historian.two_pass` can add a second cleanup call for models that need help removing low-signal lines and duplicates, at additional cost.
 
+## Expand meaningful tool calls
+
+`historian.expand_tools` makes selected tool calls readable to the historian, including their inputs and results. Built-in templates cover notes, memories, todos, questions, tasks, and fleet communication (`ask`, `peer_send`, `board`, `room`, `work`, `knowhow`). Other tools keep their compact `TC: name(arg)` behavior. Expanded calls remain visible alongside assistant text, in original part order.
+
+```jsonc
+{
+  "historian": {
+    "expand_tools": {
+      "ask": "Asked: ${input.question.truncate(200)} → ${output}",
+      "peer_send": "PM to ${input.agent}: ${input.message.truncate(300)}",
+      "board": false
+    }
+  }
+}
+```
+
+Keys are exact tool names from the host, not aliases. User and project entries override built-ins; project entries override matching user entries. `false` disables an expansion, restoring the compact summary. This option changes only future historian/recomp input and verbose `ctx_expand` previews: it does not rewrite compartments, stored history, permissions, or the provider wire. The default `ctx_expand` transcript deliberately stays compact.
+
+Templates support `${input.path}` and `${output.path}` with dotted fields. Bare `${output}` is the original result text; field access parses JSON object results. Missing fields and pending results are empty. Non-string values use compact JSON with sorted object keys. Newlines become spaces.
+
+For arrays, use `[N]` for an index, `[*].field` for projection, `.each("${field}")` for a relative element template (`${.}` means the element), `.join("separator")`, or `.count`. Lists default to comma-separated projections or semicolon-separated `.each` results. For example, `${input.todos.each("${status}: ${content}").join(" | ").truncate(250)}`. Only one `.each` level is allowed. There are no expressions, conditions, or other functions; invalid templates are config errors.
+
+Each placeholder defaults to 300 characters; optional `.truncate(N)` must come last. Lists show at most 10 elements, then `… +N more`, and the complete expansion is capped at 1,000 characters (with `…` marking a cut). Expansions count toward the chunk token budget, while call/result boundary rules remain unchanged. Keep templates short when a tool carries long prompts or board updates.
+
 ## Compare automatic folds with /ctx-wrapup
 
 Automatic runs react to pressure and settled work. `/ctx-wrapup [messages_to_keep]` is the on-demand version: it advances the historian over older live history now while leaving the newest messages raw. The default keep count is 20.
@@ -77,7 +101,7 @@ Use `/ctx-wrapup` before switching to a smaller-window model, ending a long work
   </TabItem>
 </Tabs>
 
-`/ctx-recomp` serves a different purpose: it rebuilds stored compartments from raw history when compartment state is wrong. `/ctx-session-upgrade` migrates an older session to the current history format. See the [commands reference](/reference/commands/) for syntax.
+`/ctx-recomp` serves a different purpose: it rebuilds stored compartments from raw history when compartment state is wrong, including compartments still written in an older history layout. See the [commands reference](/reference/commands/) for syntax.
 
 ## Read what the agent sees
 

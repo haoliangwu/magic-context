@@ -17,7 +17,7 @@
 const MAX_PROBES = 5;
 const MIN_PROBE_LENGTH = 3;
 
-// Slash command: /ctx-status, /ctx-session-upgrade
+// Slash command: /ctx-status, /ctx-recomp
 const SLASH_COMMAND_RE = /\/[a-z][a-z0-9]*(?:-[a-z0-9]+)+/gi;
 // hyphen/underscore identifiers: ctx-status, git_sweep_coordinator, memory_block_ids
 const KEBAB_SNAKE_RE = /[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+/gi;

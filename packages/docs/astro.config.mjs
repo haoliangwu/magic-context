@@ -43,6 +43,7 @@ export default defineConfig({
                     items: [
                         { slug: "getting-started/introduction" },
                         { slug: "getting-started/installation" },
+                        { slug: "getting-started/opencode-2" },
                         { slug: "getting-started/first-session" },
                         { slug: "getting-started/migrating-between-harnesses" },
                     ],

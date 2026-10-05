@@ -43,6 +43,8 @@ import {
     normalizeRequestBody,
 } from "./cache-bust-body-sources";
 
+import { withSchedulerLogFallback } from "./cache-bust-scheduler-log";
+
 type Json = Record<string, unknown>;
 type ByteVerdict = "BUST" | "STABLE";
 type MeterVerdict = ByteVerdict | "LATENCY" | "UNMETERED";
@@ -61,6 +63,8 @@ interface DumpSource {
 interface Args {
     sessionPrefix: string;
     sources: DumpSource[];
+    /** Read every request with this meter, overriding the dump's wire family. */
+    meter?: BodyProvider;
     since?: string;
     until?: string;
     limit?: number;
@@ -68,6 +72,7 @@ interface Args {
     allBusts: boolean;
     allRows: boolean;
     help: boolean;
+    mcLogPath?: string;
 }
 
 interface MeterUsage {
@@ -75,6 +80,8 @@ interface MeterUsage {
     cacheCreation?: number;
     input: number;
     total: number;
+    /** Generated tokens; only the Gemini meter records it (candidates + thoughts). */
+    output?: number;
     source: string;
     provider: BodyProvider;
     rule: string;
@@ -89,11 +96,53 @@ interface Snapshot {
     session: string;
     messagesCount: number;
     provider: BodyProvider;
+    wireModel?: string;
     sourceDir: string;
     segments: Segment[];
     usage?: MeterUsage;
     orderCreatedAt: string;
     sequence: number;
+    /** `wire_family` from the dump's meta.json (Broca cache-dump exports write it). */
+    wireFamily?: string;
+    /** Meter the usage was read with; undefined when the wire family has no meter here. */
+    meter?: BodyProvider;
+    meterForced?: boolean;
+}
+
+/**
+ * Broca's cache-dump exporter names the wire grammar of every request in
+ * meta.json. That name decides both the body shape and the usage meter, because
+ * the directory a dump sits in says nothing about which provider produced it.
+ * Families absent here (openai_chat, bedrock_converse) get no meter: the
+ * analyzer refuses them instead of reading a meter they do not carry.
+ */
+const WIRE_FAMILY_PROVIDERS: Readonly<Record<string, BodyProvider>> = {
+    anthropic_messages: "anthropic",
+    openai_responses: "openai",
+    openai_responses_chatgpt: "openai",
+    gemini: "gemini",
+    google_codeassist: "gemini",
+};
+
+const METER_RULES: Readonly<Record<BodyProvider, string>> = {
+    anthropic: "Anthropic explicit cache: cache_read_input_tokens/cache_creation_input_tokens",
+    openai: "OpenAI implicit-prefix cache: prompt_tokens_details.cached_tokens; no write premium",
+    gemini: "Gemini implicit-prefix cache: usageMetadata.cachedContentTokenCount inside promptTokenCount; no write premium",
+};
+
+const METER_FIELDS: Readonly<Record<BodyProvider, string>> = {
+    anthropic: "input_tokens/cache_read_input_tokens",
+    openai: "prompt_tokens|input_tokens + cached_tokens",
+    gemini: "promptTokenCount/cachedContentTokenCount",
+};
+
+/** OpenAI and Gemini cache any byte-identical prompt prefix; there are no breakpoints. */
+function isImplicitPrefixCache(provider: BodyProvider): boolean {
+    return provider === "openai" || provider === "gemini";
+}
+
+function finiteNumber(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value);
 }
 
 export interface AnalysisRow {
@@ -104,6 +153,8 @@ export interface AnalysisRow {
     verdict: MeterVerdict | "BASE";
     meterVsBytes?: MeterVsBytes;
     prevTotal?: number;
+    /** Set when the meter floor came from an earlier request than `previous`. */
+    meterReference?: Snapshot;
     epsilon?: number;
     meterFloor?: number;
     comparableRead?: number;
@@ -120,6 +171,11 @@ export interface OpenCodeCacheBustAnalysisOptions {
     anthropicDir?: string;
     openaiDir?: string;
     decisions?: readonly CacheBustDecisionAttribution[];
+    /** Use scheduler lines when a pass has no DB row; null disables this additional evidence source. */
+    mcLogPath?: string | null;
+    scanCursor?: string;
+    scanDeadlineMs?: number;
+    scanNow?: () => number;
 }
 
 interface DumpCandidate {
@@ -144,12 +200,14 @@ function parseArgs(argv: string[]): Args {
     };
     const valueOptions = new Set([
         "--session",
+        "--mc-log",
         "--dir",
         "--anthropic-dir",
         "--openai-dir",
         "--since",
         "--until",
         "--limit",
+        "--meter",
     ]);
     let positionalSession = "";
     for (let index = 0; index < args.length; index += 1) {
@@ -185,9 +243,15 @@ function parseArgs(argv: string[]): Args {
                   label: "openai-auth",
               },
           ];
+    const meterRaw = getOpt("--meter");
+    if (meterRaw !== undefined && !(meterRaw in METER_RULES)) {
+        throw new Error(`Invalid --meter ${meterRaw}; expected anthropic, openai, or gemini`);
+    }
     return {
         sessionPrefix: getOpt("--session") ?? positionalSession,
+        mcLogPath: getOpt("--mc-log"),
         sources,
+        meter: meterRaw as BodyProvider | undefined,
         since: getOpt("--since"),
         until: getOpt("--until"),
         limit: limitRaw ? Number.parseInt(limitRaw, 10) : undefined,
@@ -248,6 +312,10 @@ function buildSegments(
     };
 }
 
+function wireModel(body: Json): string | undefined {
+    return typeof body.model === "string" && body.model.length > 0 ? body.model : undefined;
+}
+
 function asJson(value: unknown): Json | undefined {
     return value && typeof value === "object" && !Array.isArray(value)
         ? (value as Json)
@@ -261,6 +329,34 @@ function meterUsage(
 ): MeterUsage | undefined {
     const usage = asJson(value);
     if (!usage) return undefined;
+    if (provider === "gemini") {
+        // Broca's exporter documents promptTokenCount as fresh input PLUS cached
+        // content (the Gemini wire semantics), so the cached tokens are already
+        // inside the total and are subtracted, never added, for the direct input.
+        // Google omits zero-valued counts, so an absent cachedContentTokenCount next
+        // to a prompt count is a zero read. Without a prompt count there is no total
+        // to compare against, so the request is unmetered.
+        const promptTokens = usage.promptTokenCount;
+        const cachedTokens = usage.cachedContentTokenCount ?? 0;
+        if (!finiteNumber(promptTokens) || !finiteNumber(cachedTokens)) return undefined;
+        const candidates = usage.candidatesTokenCount;
+        const thoughts = usage.thoughtsTokenCount;
+        const output =
+            finiteNumber(candidates) || finiteNumber(thoughts)
+                ? (finiteNumber(candidates) ? candidates : 0) +
+                  (finiteNumber(thoughts) ? thoughts : 0)
+                : undefined;
+        return {
+            cacheRead: cachedTokens,
+            cacheCreation: undefined,
+            input: Math.max(0, promptTokens - cachedTokens),
+            total: promptTokens,
+            output,
+            source,
+            provider,
+            rule: METER_RULES.gemini,
+        };
+    }
     if (provider === "openai") {
         const promptTokens = usage.prompt_tokens ?? usage.input_tokens;
         const details = asJson(usage.prompt_tokens_details) ?? asJson(usage.input_tokens_details);
@@ -326,12 +422,19 @@ function collectUsageCandidates(
     const eventType = typeof object.type === "string" ? object.type : source;
     const direct = meterUsage(object.usage, `${eventType}.usage`, provider);
     if (direct) candidates.push(direct);
+    // Raw Gemini and Code Assist responses name the meter `usageMetadata`
+    // (Code Assist nests it under `response`, which the recursion below reaches).
+    if (provider === "gemini") {
+        const metadata = meterUsage(object.usageMetadata, `${eventType}.usageMetadata`, provider);
+        if (metadata) candidates.push(metadata);
+    }
     const message = asJson(object.message);
     const messageUsage = meterUsage(message?.usage, `${eventType}.message.usage`, provider);
     if (messageUsage) candidates.push(messageUsage);
 
     for (const [key, child] of Object.entries(object)) {
         if (key === "usage" || key === "message") continue;
+        if (provider === "gemini" && key === "usageMetadata") continue;
         if (typeof child === "string" && key === "data") {
             try {
                 collectUsageCandidates(JSON.parse(child), `${source}.data`, provider, candidates);
@@ -461,11 +564,11 @@ function discoverDumpCandidates(opts: Args): DumpCandidate[] {
     );
 }
 
-function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args): Snapshot[] {
+function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args, selectedFiles?: readonly string[]): Snapshot[] {
     const since = resolveTimeBound(opts.since);
     const until = resolveTimeBound(opts.until);
     const snapshots: Snapshot[] = [];
-    for (const metaFile of readdirSync(candidate.source.dir).filter((file) =>
+    for (const metaFile of selectedFiles ?? readdirSync(candidate.source.dir).filter((file) =>
         file.endsWith(".meta.json"),
     )) {
         const dumpName = parseDumpFilename(metaFile);
@@ -483,13 +586,25 @@ function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args): Snapshot[
         if (until && createdAt > until) continue;
         const { bodyPath, responsePath } = artifactPaths(candidate.source, metaFile, meta);
         if (!bodyPath) continue;
+        // A recorded wire family decides the body shape and the meter; the
+        // directory or filename only decides them when the dump does not say.
+        const wireFamily =
+            typeof meta.wire_family === "string" && meta.wire_family.length > 0
+                ? meta.wire_family
+                : undefined;
+        const familyProvider = wireFamily ? WIRE_FAMILY_PROVIDERS[wireFamily] : undefined;
         try {
             const rawBody = readFileSync(bodyPath);
             const body = JSON.parse(rawBody.toString("utf8")) as Json;
             const normalized = buildSegments(
                 body,
-                candidate.source.label === "explicit --dir" ? undefined : candidate.source.provider,
+                familyProvider ??
+                    (candidate.source.label === "explicit --dir"
+                        ? undefined
+                        : candidate.source.provider),
             );
+            // An unsupported family has no meter unless --meter forces one.
+            const meter = opts.meter ?? (wireFamily ? familyProvider : normalized.provider);
             snapshots.push({
                 file: metaFile,
                 bodyPath,
@@ -499,11 +614,17 @@ function loadCandidateSnapshots(candidate: DumpCandidate, opts: Args): Snapshot[
                 session: candidate.session,
                 messagesCount: normalized.segments.length,
                 provider: normalized.provider,
+                wireModel: wireModel(body),
                 sourceDir: candidate.source.dir,
                 segments: normalized.segments,
-                usage: loadMeterUsage(responsePath, normalized.provider),
+                usage: meter ? loadMeterUsage(responsePath, meter) : undefined,
                 orderCreatedAt: dumpName?.createdAt ?? createdAt,
-                sequence: dumpName?.sequence ?? 0,
+                // Broca exports name files by run and step, not by time and
+                // sequence; meta.step keeps same-millisecond steps in order.
+                sequence: dumpName?.sequence ?? (finiteNumber(meta.step) ? meta.step : 0),
+                ...(wireFamily ? { wireFamily } : {}),
+                meter,
+                ...(opts.meter ? { meterForced: true } : {}),
             });
         } catch {
             // Ignore malformed or partially written request bodies.
@@ -553,6 +674,7 @@ function openCodeAnalyzerCommand(
         "--show-diff",
         "--all-rows",
     ];
+    if (options.mcLogPath) args.push("--mc-log", shellQuote(options.mcLogPath));
     if (options.anthropicDir) {
         args.push("--anthropic-dir", shellQuote(options.anthropicDir));
     }
@@ -565,7 +687,7 @@ function openCodeAnalyzerCommand(
 /** Analyze one exact OpenCode session without printing or mutating any source store. */
 export function analyzeOpenCodeCacheBustSession(
     options: OpenCodeCacheBustAnalysisOptions,
-): CacheBustSessionAnalysis {
+): CacheBustSessionAnalysis & { filesExamined: number; scanBounded: boolean; scanCursor?: string } {
     const sources: DumpSource[] = [
         {
             provider: "anthropic",
@@ -592,18 +714,57 @@ export function analyzeOpenCodeCacheBustSession(
         allRows: true,
         help: false,
     };
-    const snapshots = discoverDumpCandidates(args)
-        .filter((candidate) => candidate.session === options.sessionId)
-        .flatMap((candidate) => loadCandidateSnapshots(candidate, args));
+    const scanNow = options.scanNow ?? Date.now;
+    let filesExamined = 0;
+    let nextCursor: string | undefined;
+    let scanBounded = false;
+    const snapshots = options.scanDeadlineMs === undefined
+        ? discoverDumpCandidates(args)
+            .filter((candidate) => candidate.session === options.sessionId)
+            .flatMap((candidate) => loadCandidateSnapshots(candidate, args))
+        : (() => {
+            // Filenames carry session and request time; only open new files and two
+            // preceding requests needed for the first comparison in the batch.
+            const indexed = sources.flatMap((source) => existsSync(source.dir)
+                ? readdirSync(source.dir).flatMap((file) => {
+                    if (!file.endsWith(".meta.json")) return [];
+                    const parsed = parseDumpFilename(file);
+                    if (!parsed || parsed.session !== options.sessionId) return [];
+                    return [{ source, file, timestamp: Date.parse(parsed.createdAt), sequence: parsed.sequence }];
+                }) : []);
+            indexed.sort((a, b) => a.timestamp - b.timestamp || a.sequence - b.sequence ||
+                a.file.localeCompare(b.file) || a.source.provider.localeCompare(b.source.provider));
+            const key = (entry: typeof indexed[number]) => `${String(entry.timestamp).padStart(16, "0")}:${String(entry.sequence).padStart(8, "0")}:${entry.file}:${entry.source.provider}`;
+            const pending = indexed.filter((entry) => entry.timestamp <= (options.untilInclusiveMs ?? Infinity) &&
+                (options.scanCursor ? key(entry) > options.scanCursor : entry.timestamp > (options.sinceExclusiveMs ?? -Infinity)));
+            const chosen: typeof indexed = [];
+            for (const entry of pending) {
+                if (chosen.length && (chosen.length >= 32 || scanNow() >= options.scanDeadlineMs!)) {
+                    scanBounded = true;
+                    break;
+                }
+                chosen.push(entry);
+            }
+            filesExamined = chosen.length;
+            if (chosen.length) nextCursor = key(chosen.at(-1)!);
+            const first = indexed.indexOf(chosen[0]);
+            const selected = first < 0 ? [] : [...indexed.slice(Math.max(0, first - 2), first), ...chosen];
+            return sources.flatMap((source) => loadCandidateSnapshots(
+                { source, session: options.sessionId, latestMtimeMs: 0, totalBytes: 0, dumpCount: 0 },
+                args, selected.filter((entry) => entry.source === source).map((entry) => entry.file),
+            ));
+        })();
     snapshots.sort(
         (left, right) =>
             left.orderCreatedAt.localeCompare(right.orderCreatedAt) ||
             left.sequence - right.sequence ||
             left.file.localeCompare(right.file),
     );
-    const inWindow = (timestampMs: number): boolean =>
-        (options.sinceExclusiveMs === undefined || timestampMs > options.sinceExclusiveMs) &&
-        (options.untilInclusiveMs === undefined || timestampMs <= options.untilInclusiveMs);
+    const inWindow = (snapshot: Snapshot): boolean =>
+        (options.scanCursor
+            ? `${String(Date.parse(snapshot.createdAt)).padStart(16, "0")}:${String(snapshot.sequence).padStart(8, "0")}:${snapshot.file}:${sources.find((source) => source.dir === snapshot.sourceDir)?.provider}` > options.scanCursor
+            : options.sinceExclusiveMs === undefined || Date.parse(snapshot.createdAt) > options.sinceExclusiveMs) &&
+        (options.untilInclusiveMs === undefined || Date.parse(snapshot.createdAt) <= options.untilInclusiveMs);
     const boundedSnapshots = snapshots.filter((snapshot) => {
         const timestampMs = Date.parse(snapshot.createdAt);
         return (
@@ -612,7 +773,7 @@ export function analyzeOpenCodeCacheBustSession(
         );
     });
     const firstNewIndex = boundedSnapshots.findIndex((snapshot) =>
-        inWindow(Date.parse(snapshot.createdAt)),
+        inWindow(snapshot),
     );
     const analysisSnapshots =
         firstNewIndex < 0
@@ -620,10 +781,10 @@ export function analyzeOpenCodeCacheBustSession(
             : boundedSnapshots.slice(
                   options.sinceExclusiveMs === undefined ? 0 : Math.max(0, firstNewIndex - 2),
               );
-    const rows = analyzeSnapshots(analysisSnapshots, options.decisions);
+    const rows = analyzeSnapshots(analysisSnapshots, withSchedulerLogFallback(options.decisions ?? [], options.sessionId, options.mcLogPath));
     const requests: AnalyzedCacheRequest[] = rows.flatMap((row) => {
         const timestampMs = Date.parse(row.current.createdAt);
-        if (!Number.isFinite(timestampMs) || !inWindow(timestampMs)) return [];
+            if (!Number.isFinite(timestampMs) || !inWindow(row.current)) return [];
         const segment =
             row.divergenceIndex < 0
                 ? undefined
@@ -642,17 +803,29 @@ export function analyzeOpenCodeCacheBustSession(
                         ? "(first request)"
                         : (segment?.id ?? "(identical normalized prefix)"),
                 analyzerCmd: openCodeAnalyzerCommand(row, options),
+                ...(row.decision?.identityDelta
+                    ? { identityDelta: row.decision.identityDelta }
+                    : {}),
             },
         ];
     });
     const analyzedRequestTimestamps = boundedSnapshots
-        .map((snapshot) => Date.parse(snapshot.createdAt))
-        .filter(inWindow);
+        .filter((snapshot) => !isUsageMissing(snapshot))
+        .filter(inWindow)
+        .map((snapshot) => Date.parse(snapshot.createdAt));
     return {
         requests,
         highWaterMarkMs:
             analyzedRequestTimestamps.length > 0 ? Math.max(...analyzedRequestTimestamps) : null,
+        filesExamined,
+        scanBounded,
+        scanCursor: scanBounded ? nextCursor : undefined,
     };
+}
+
+function isUsageMissing(snapshot: Snapshot): boolean {
+    const usage = snapshot.usage;
+    return usage === undefined || (usage.cacheRead === 0 && usage.input === 0);
 }
 
 /** First wire-order segment index where prev/cur diverge (added/removed/changed). */
@@ -688,32 +861,78 @@ function lastBreakpointIndex(segs: Segment[]): number {
     return last;
 }
 
+/**
+ * Does the divergence land inside the prefix the previous request left cached?
+ *
+ * Anthropic writes the cache at the breakpoints of the request that was sent, so
+ * the reusable prefix ends at the PREVIOUS request's last breakpoint. Measuring
+ * against the CURRENT request's last breakpoint instead made every appended
+ * message look like a bust: this client moves its tail cache_control marker onto
+ * the newest message, so the marker always sat at or after the append and the
+ * append always looked like it fell inside a cached prefix that did not yet
+ * exist. OpenAI has no breakpoints — its prefix cache is implicit, so only an
+ * in-place change or removal inside the previous prompt busts it.
+ */
+function bustsReusablePrefix(
+    previous: Snapshot,
+    current: Snapshot,
+    divergenceIndex: number,
+): boolean {
+    if (divergenceIndex < 0) return false;
+    return isImplicitPrefixCache(current.provider)
+        ? divergenceIndex < previous.segments.length
+        : divergenceIndex <= lastBreakpointIndex(previous.segments);
+}
+
 export function analyzeSnapshots(
     snaps: readonly Snapshot[],
-    decisions: readonly CacheBustDecisionAttribution[] = [],
+    decisionsAndMarkers: readonly CacheBustDecisionAttribution[] = [],
 ): AnalysisRow[] {
+    // Disruption markers explain a following epoch HARD but never serve a request, so
+    // they stay out of every request join.
+    const decisions = decisionsAndMarkers.filter((record) => record.disruption === undefined);
+    const disruptions = decisionsAndMarkers.filter(
+        (record) =>
+            record.disruption !== undefined ||
+            ["error", "need_full_sync", "parked"].includes(record.decision.toLowerCase()),
+    );
+    // Only an adapter log that recorded this session's passes can show that nothing
+    // disrupted it; without one the disruption question stays unanswered.
+    const disruptionEvidence = decisionsAndMarkers.some(
+        (record) => record.source === "rust pass log",
+    );
+    const precedingDisruption = (
+        pass: CacheBustDecisionAttribution | undefined,
+    ): string | null | undefined => {
+        if (!pass || !disruptionEvidence) return undefined;
+        const latest = disruptions
+            .filter(
+                (record) =>
+                    record.timestampMs <= pass.timestampMs &&
+                    pass.timestampMs - record.timestampMs <= 60_000,
+            )
+            .sort((left, right) => left.timestampMs - right.timestampMs)
+            .at(-1);
+        return latest ? (latest.disruption ?? latest.decision.toLowerCase()) : null;
+    };
     let previousShortRead = false;
     let previousBustDivergenceIndex: number | undefined;
+    let previousMetered: Snapshot | undefined;
+    // Last metered request before the current run of LATENCY rows (Gemini only).
+    let latencyReference: Snapshot | undefined;
     const rows: AnalysisRow[] = [];
     for (let index = 0; index < snaps.length; index += 1) {
         const current = snaps[index];
-        if (index === 0) {
-            rows.push({ current, divergenceIndex: -1, verdict: "BASE" });
-            continue;
-        }
-        const previous = snaps[index - 1];
-        const divergenceIndex = firstDivergence(previous.segments, current.segments);
-        // Anthropic exposes explicit breakpoints. OpenAI's cache is an implicit prefix,
-        // so an in-place change/removal busts while ordinary appended input does not.
-        const byteBust =
-            current.provider === "openai"
-                ? divergenceIndex >= 0 && divergenceIndex < previous.segments.length
-                : divergenceIndex !== -1 &&
-                  divergenceIndex <= lastBreakpointIndex(current.segments);
-        const byteVerdict: ByteVerdict = byteBust ? "BUST" : "STABLE";
-        if (!current.usage || !previous.usage) {
-            previousShortRead = false;
-            previousBustDivergenceIndex = undefined;
+        if (isUsageMissing(current)) {
+            const previous = previousMetered;
+            const divergenceIndex = previous
+                ? firstDivergence(previous.segments, current.segments)
+                : -1;
+            const byteVerdict = previous
+                ? bustsReusablePrefix(previous, current, divergenceIndex)
+                    ? "BUST"
+                    : "STABLE"
+                : undefined;
             rows.push({
                 current,
                 previous,
@@ -721,19 +940,52 @@ export function analyzeSnapshots(
                 byteVerdict,
                 verdict: "UNMETERED",
                 meterVsBytes: "UNMETERED",
+                divergenceClass: "usage_missing",
             });
             continue;
         }
-        const prevTotal = previous.usage.total;
-        const epsilon = Math.max(64, previous.usage.input);
+        if (!previousMetered) {
+            rows.push({ current, divergenceIndex: -1, verdict: "BASE" });
+            previousMetered = current;
+            continue;
+        }
+        const previous = previousMetered;
+        if (!previous.usage || !current.usage) continue;
+        const divergenceIndex = firstDivergence(previous.segments, current.segments);
+        const byteVerdict: ByteVerdict = bustsReusablePrefix(previous, current, divergenceIndex)
+            ? "BUST"
+            : "STABLE";
+        // Implicit-prefix forgiveness is the previous request's uncached input: its
+        // tail may not be cached yet. After a provider-side miss that input is the
+        // whole prompt, which would forgive any read at all, so a Gemini request
+        // that follows a run of LATENCY rows is measured against the last request
+        // before the run. The run kept the prefix byte-identical (that is what
+        // makes it LATENCY), so that earlier read is still owed. A BUST resets the
+        // reference because it really did rewrite the prefix.
+        const reference =
+            previous.usage.provider === "gemini" && latencyReference?.usage
+                ? latencyReference
+                : previous;
+        const referenceUsage = reference.usage ?? previous.usage;
+        const prevTotal = referenceUsage.total;
+        // Gemini's cachedContentTokenCount over a byte-identical prefix routinely
+        // reads a few tokens (8-9 in Code Assist exports) below the previous read,
+        // so the 64-token allowance is added on top of the previous uncached input
+        // instead of only standing in for a smaller one. Without it every such dip
+        // reads as a short read.
+        const epsilon =
+            referenceUsage.provider === "gemini"
+                ? 64 + referenceUsage.input
+                : Math.max(64, referenceUsage.input);
         const meterFloor = prevTotal - epsilon;
         // Anthropic separates direct input from cache writes, so it belongs in the
         // comparable read. OpenAI's uncached prompt tokens include rewritten prefix
-        // tokens; adding them back would make every prompt look fully cached.
-        const comparableRead =
-            current.provider === "openai"
-                ? current.usage.cacheRead
-                : current.usage.cacheRead + current.usage.input;
+        // tokens; adding them back would make every prompt look fully cached. Gemini's
+        // promptTokenCount works the same way. The meter's own kind decides, since
+        // the body provider and the meter differ when --meter forces one.
+        const comparableRead = isImplicitPrefixCache(current.usage.provider)
+            ? current.usage.cacheRead
+            : current.usage.cacheRead + current.usage.input;
         // A rewrite cannot use the prior rewrite's direct input as forgiveness
         // while cacheRead remains at the same floor.
         const rebust: boolean =
@@ -745,6 +997,7 @@ export function analyzeSnapshots(
                 ? "BUST"
                 : "LATENCY"
             : "STABLE";
+        latencyReference = verdict === "LATENCY" ? reference : undefined;
         const meterVsBytes: MeterVsBytes =
             verdict === "LATENCY"
                 ? "LATENCY"
@@ -765,9 +1018,12 @@ export function analyzeSnapshots(
             divergenceIndex < 0
                 ? undefined
                 : (current.segments[divergenceIndex] ?? previous.segments[divergenceIndex]);
+        // A LATENCY row is also classified: a short read over an unchanged reusable
+        // prefix is a provider-side fact and deserves a name, not a blank cell.
         const divergenceClass =
-            verdict === "BUST"
+            verdict === "BUST" || verdict === "LATENCY"
                 ? classifyCacheBust({
+                      providerShortReadWithIdenticalPrefix: verdict === "LATENCY",
                       divergenceIndex,
                       previousMessageCount: previous.segments.length,
                       previousBustDivergenceIndex,
@@ -775,10 +1031,30 @@ export function analyzeSnapshots(
                       currentProvider: current.provider,
                       firstDivergenceRole: divergentSegment?.role,
                       firstDivergenceSize: divergentSegment?.bytes,
-                      rewrittenTokens,
-                      cacheCreationTokens: current.usage.cacheCreation,
-                      promptTokens: prevTotal,
-                      inheritedFold: attributionDecision !== decision,
+                       rewrittenTokens,
+                       cacheCreationTokens: current.usage.cacheCreation,
+                       promptTokens: prevTotal,
+                       providerComparableRead: current.usage.cacheRead,
+                       directInput: current.usage.input,
+                       previousTotal: prevTotal,
+                       previousModel: previous.wireModel,
+                       currentModel: current.wireModel,
+                       ocInputStepRatio: (() => {
+                           if (attributionDecision?.inputCount === undefined) return undefined;
+                           const recentCounts = decisions
+                               .filter(
+                                   (candidate) =>
+                                       candidate.inputCount !== undefined &&
+                                       candidate.inputCount > 0 &&
+                                       candidate.timestampMs < attributionDecision.timestampMs &&
+                                       attributionDecision.timestampMs - candidate.timestampMs <= 120_000,
+                               )
+                               .map((candidate) => candidate.inputCount as number);
+                           return recentCounts.length > 0
+                               ? attributionDecision.inputCount / Math.min(...recentCounts)
+                               : undefined;
+                       })(),
+                        inheritedFold: attributionDecision !== decision,
                       contentEvidence: [previous, current]
                           .flatMap((snapshot) =>
                               snapshot.segments.slice(
@@ -789,9 +1065,21 @@ export function analyzeSnapshots(
                           .map((segment) => segment.canonical)
                           .join("\n"),
                       decision: attributionDecision,
+                      previousEpochHard: attributionDecision
+                          ? decisions
+                                .filter(
+                                    (candidate) =>
+                                        candidate.timestampMs < attributionDecision.timestampMs &&
+                                        candidate.materialized &&
+                                        candidate.materializeReason?.toLowerCase() === "epoch_change",
+                                )
+                                .at(-1)
+                          : undefined,
+                      precedingDisruption: precedingDisruption(attributionDecision),
                   })
                 : undefined;
         previousBustDivergenceIndex = verdict === "BUST" ? divergenceIndex : undefined;
+        previousMetered = current;
         rows.push({
             current,
             previous,
@@ -800,6 +1088,7 @@ export function analyzeSnapshots(
             verdict,
             meterVsBytes,
             prevTotal,
+            ...(reference !== previous ? { meterReference: reference } : {}),
             epsilon,
             meterFloor,
             comparableRead,
@@ -859,11 +1148,19 @@ function meterCell(row: AnalysisRow): string {
             ? ""
             : `; rewritten≈${row.rewrittenTokens.toLocaleString()}`;
     const directInput = row.current.usage?.input ?? 0;
-    const comparable =
-        row.current.provider === "openai"
-            ? `cached=${read.toLocaleString()}`
-            : `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}`;
-    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${rewritten}`;
+    const comparable = isImplicitPrefixCache(row.current.usage?.provider ?? row.current.provider)
+        ? `cached=${read.toLocaleString()}`
+        : `read=${read.toLocaleString()} + input=${directInput.toLocaleString()} = ${row.comparableRead?.toLocaleString()}`;
+    const wireModel =
+        row.previous?.wireModel &&
+        row.current.wireModel &&
+        row.previous.wireModel !== row.current.wireModel
+            ? `; wireModel=${row.previous.wireModel} → ${row.current.wireModel}`
+            : "";
+    const reference = row.meterReference
+        ? `; ref=${fmtTime(row.meterReference.createdAt)} (last read before the LATENCY run)`
+        : "";
+    return `${comparable}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()}, ε=${row.epsilon?.toLocaleString()})${reference}${rewritten}${wireModel}`;
 }
 
 const HELP = `usage: bun scripts/analyze-cache-busts.ts --session <prefix> [options]
@@ -875,11 +1172,21 @@ Sources (both searched by default):
              Responses instructions + input[] bodies; implicit prefix cache,
              prompt_tokens_details.cached_tokens, and no write premium.
              WebSocket captures can have no response file and are UNMETERED.
+  Broca:     cache-dump exports (pass the export dir as --dir). meta.json
+             wire_family picks the body shape and meter: anthropic_messages,
+             openai_responses(_chatgpt), gemini and google_codeassist (Gemini
+             usageMetadata: promptTokenCount includes cachedContentTokenCount).
+
+Any analysed request without a usable meter reading makes the run refuse with
+a named reason (meter_missing / wire_family_unsupported) and exit 2 instead of
+printing a clean result.
 
 Options:
+  --mc-log <path>       scheduler log fallback (default: MAGIC_CONTEXT_LOG_PATH or harness log)
   --dir <path>          inspect one explicit directory (legacy override)
   --anthropic-dir <p>   override the Anthropic source
   --openai-dir <path>   override the OpenAI source
+  --meter <kind>        force the anthropic, openai, or gemini meter for every request
   --since/--until <t>   ISO timestamp or duration ago (for example 2h)
   --limit <N>           keep the last N requests in range
   --show-diff           print both versions of the first-diverging message
@@ -915,20 +1222,43 @@ function main(): void {
         );
         console.log("");
     }
-    const rows = analyzeSnapshots(snaps);
+    const rows = analyzeSnapshots(snaps, withSchedulerLogFallback([], snaps[0].session, opts.mcLogPath));
     const provider = snaps[0].provider;
+    const meterKind = snaps[0].meter ?? provider;
     const meterRule =
-        snaps.find((snapshot) => snapshot.usage)?.usage?.rule ??
-        (provider === "openai"
-            ? "OpenAI implicit-prefix cache: prompt_tokens_details.cached_tokens; no write premium"
-            : "Anthropic explicit cache: cache_read_input_tokens/cache_creation_input_tokens");
+        snaps.find((snapshot) => snapshot.usage)?.usage?.rule ?? METER_RULES[meterKind];
+    const wireFamilies = [
+        ...new Set(snaps.flatMap((snapshot) => (snapshot.wireFamily ? [snapshot.wireFamily] : []))),
+    ];
+    const meterKinds = [
+        ...new Set(snaps.map((snapshot) => snapshot.meter ?? "none")),
+    ];
+    // Dumps without a recorded wire family and without --meter keep the original
+    // header byte for byte; the extra lines describe a choice those dumps never had.
+    const describeMeterChoice = wireFamilies.length > 0 || opts.meter !== undefined;
     console.log(`Session:  ${snaps[0].session}`);
-    console.log(`Provider: ${provider} (${selection.selected?.source.label})`);
+    console.log(
+        wireFamilies.length > 0
+            ? `Provider: ${provider} (from wire_family; searched as ${selection.selected?.source.label})`
+            : `Provider: ${provider} (${selection.selected?.source.label})`,
+    );
+    if (describeMeterChoice) {
+        console.log(
+            `Wire family: ${wireFamilies.length > 0 ? wireFamilies.join(", ") : "absent (filename/directory detection)"}`,
+        );
+        console.log(
+            `Meter:    ${meterKinds.map((kind) => (kind === "none" ? "none (wire family has no meter)" : `${kind} (${METER_FIELDS[kind]})`)).join(", ")}${opts.meter ? " (forced by --meter)" : ""}`,
+        );
+    }
     console.log(`Dumps:    ${snaps.length}  (dir: ${snaps[0].sourceDir})`);
     console.log("");
     console.log("Dashboard times are local (UTC+2); table times are UTC.");
+    const shortRule =
+        meterKind === "gemini"
+            ? "ε=64 + previous uncached input, measured from the last request before a run of LATENCY rows"
+            : "ε=max(64, previous direct/uncached input)";
     console.log(
-        `Meter rule (${provider}): ${meterRule}. Short when the provider-comparable read < prevTotal - ε, ε=max(64, previous direct/uncached input); bytes distinguish BUST from LATENCY.`,
+        `Meter rule (${meterKind}): ${meterRule}. Short when the provider-comparable read < prevTotal - ε, ${shortRule}; bytes distinguish BUST from LATENCY.`,
     );
     console.log(
         "time(UTC)          | segs | verdict          | meter                                                  | meterVsBytes | first-divergence                | prevBodyBytes → curBodyBytes | reusableNormalizedPrefix@breakpoint",
@@ -959,7 +1289,15 @@ function main(): void {
         if (row.verdict === "LATENCY") latencyCount += 1;
         if (row.verdict === "UNMETERED" && row.byteVerdict === "BUST") unmeteredBustCount += 1;
 
-        const previous = row.previous as Snapshot;
+        const previous = row.previous;
+        if (!previous) {
+            // An unmetered request with no metered predecessor has nothing to diff
+            // against; it is still listed so the refusal below has visible rows.
+            console.log(
+                `${fmtTime(row.current.createdAt)} | ${String(row.current.segments.length).padStart(4)} | ${"UNMETERED".padEnd(16)} | ${"unavailable; no metered predecessor".padEnd(54)} | ${(row.meterVsBytes ?? "").padEnd(12)} | ${"(no metered predecessor)".padEnd(31)} | ${`${row.current.bodyBytes.toLocaleString()}B`.padEnd(27)} |`,
+            );
+            continue;
+        }
         const index = row.divergenceIndex;
         const segment =
             index < 0 ? undefined : (row.current.segments[index] ?? previous.segments[index]);
@@ -1007,7 +1345,22 @@ function main(): void {
     }
 
     console.log("");
-    if (bustCount === 0) {
+    const coverage = meterCoverage(snaps);
+    if (describeMeterChoice || coverage.refusals.length > 0) {
+        console.log(
+            `Metered:  ${coverage.metered} of ${coverage.analysed} analysed request(s) carry a usable meter reading.`,
+        );
+    }
+    if (coverage.refusals.length > 0) {
+        // A request whose meter was never read cannot count as "not a bust", so
+        // a clean summary would be vacuous. Positive findings on the metered
+        // requests are still printed; the clean-result line never is.
+        if (bustCount > 0) {
+            console.log(
+                `${bustCount} metered bust(s) across ${coverage.metered} metered request(s).`,
+            );
+        }
+    } else if (bustCount === 0) {
         console.log(`No metered busts across ${snaps.length} request(s).`);
     } else {
         console.log(
@@ -1024,12 +1377,57 @@ function main(): void {
             `${unmeteredBustCount} unmetered byte-attributed bust candidate(s); response usage was unavailable.`,
         );
     }
+    if (coverage.refusals.length > 0) {
+        for (const refusal of coverage.refusals) console.log(refusal);
+        console.log(
+            "Refusing to report a clean result: the meter was not read on every analysed request.",
+        );
+        process.exitCode = 2;
+    }
+}
+
+interface MeterCoverage {
+    analysed: number;
+    metered: number;
+    /** One named reason per (wire family, meter) group of unmetered requests. */
+    refusals: string[];
+}
+
+/**
+ * Count the requests whose meter was actually read and name every group that
+ * was not. A missing meter is not a cache hit: before this check a Gemini dump
+ * read with the OpenAI meter looked unmetered on every request and the analyzer
+ * still printed "No metered busts".
+ */
+function meterCoverage(snaps: readonly Snapshot[]): MeterCoverage {
+    const groups = new Map<string, { count: number; snapshot: Snapshot }>();
+    let metered = 0;
+    for (const snapshot of snaps) {
+        if (!isUsageMissing(snapshot)) {
+            metered += 1;
+            continue;
+        }
+        const key = `${snapshot.wireFamily ?? ""}\0${snapshot.meter ?? ""}`;
+        const group = groups.get(key) ?? { count: 0, snapshot };
+        group.count += 1;
+        groups.set(key, group);
+    }
+    const refusals = [...groups.values()].map(({ count, snapshot }) => {
+        const family = `wire_family=${snapshot.wireFamily ?? "absent"}`;
+        if (!snapshot.meter) {
+            return `wire_family_unsupported: ${count} of ${snaps.length} requests carry ${family}, which has no meter in this analyzer`;
+        }
+        const forced = snapshot.meterForced ? "; meter forced by --meter" : "";
+        return `meter_missing: ${count} of ${snaps.length} requests carry no ${snapshot.meter} usage (${METER_FIELDS[snapshot.meter]}) (${family}${forced})`;
+    });
+    return { analysed: snaps.length, metered, refusals };
 }
 
 export const __test = {
     analyzeSnapshots,
     loadMeterUsage,
     loadSnapshots,
+    meterCoverage,
     parseArgs,
     parseDumpFilename,
     resolveTimeBound,

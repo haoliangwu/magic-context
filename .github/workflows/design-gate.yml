@@ -1,0 +1,24 @@
+# Contributor PRs are reviewable only once their linked issue carries a
+# maintainer's `design-approved` label (or the PR carries `trivial`). The gate
+# itself is the fleet's shared reusable workflow in cortexkit/subconscious; see
+# its docs/contribution-gate.md for the rules. This file is the canonical caller
+# from that doc, unchanged, so every CortexKit repo runs the same gate.
+name: Design gate
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  issues:
+    types: [labeled]
+
+jobs:
+  design-gate:
+    permissions:
+      contents: read # fetch the gate action
+      issues: read # read the linked issue's labels
+      pull-requests: write # gate comment, draft conversion, ready for review
+      checks: write # publish the design-gate check run
+    uses: cortexkit/subconscious/.github/workflows/design-gate.yml@master
+    secrets:
+      CK_CI_APP_ID: ${{ secrets.CK_CI_APP_ID }}
+      CK_CI_APP_PRIVATE_KEY: ${{ secrets.CK_CI_APP_PRIVATE_KEY }}

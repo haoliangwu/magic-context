@@ -1,6 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     deriveMinForceEligibleTokens,
     deriveProtectedTailTokenTarget,
@@ -47,7 +48,7 @@ describe("protected-tail N clamp", () => {
     });
 });
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
@@ -74,7 +75,7 @@ afterEach(() => {
 });
 
 function useBoundaryTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     boundaryTempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }

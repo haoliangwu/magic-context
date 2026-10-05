@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 /**
  * Tests for `applyDeferredCompactionMarker` (plan v6 §5).
@@ -21,7 +22,7 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findBoundaryUserMessage } from "../../features/magic-context/compaction-marker";
@@ -54,7 +55,7 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function useTempDataHome(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     mkdirSync(join(dir, "opencode"), { recursive: true });
@@ -205,6 +206,60 @@ afterEach(() => {
 });
 
 describe("applyDeferredCompactionMarker — outcomes", () => {
+    it("a native marker after a partial end cannot erase its uncovered suffix", () => {
+        const dataHome = useTempDataHome("partial-adjacent-marker-");
+        const opencodeDb = createOpenCodeDb(dataHome);
+        insertUserMessage(opencodeDb, "msg-boundary", "ses-partial-adjacent", 1_000);
+        insertUserMessage(opencodeDb, "msg-next", "ses-partial-adjacent", 2_000);
+        closeQuietly(opencodeDb);
+        const db = openDatabase();
+        insertCompartment(db, "ses-partial-adjacent", 10, "msg-boundary");
+        db.prepare(
+            "UPDATE compartments SET end_block_index=0 WHERE session_id='ses-partial-adjacent'",
+        ).run();
+        appendCompartments(db, "ses-partial-adjacent", [
+            {
+                sequence: 1,
+                startMessage: 11,
+                endMessage: 11,
+                startMessageId: "msg-next",
+                endMessageId: "msg-next",
+                title: "next",
+                content: "next",
+            },
+        ]);
+        db.prepare("INSERT INTO session_meta(session_id) VALUES ('ses-partial-adjacent')").run();
+        const outcome = applyDeferredCompactionMarker(
+            db,
+            "ses-partial-adjacent",
+            makePending({ ordinal: 11, endMessageId: "msg-next" }),
+            dataHome,
+        );
+        expect(outcome).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
+        expect(getPersistedCompactionMarkerState(db, "ses-partial-adjacent")).toBeNull();
+    });
+
+    it("never places a whole-message native marker over a partial block boundary", () => {
+        const dataHome = useTempDataHome("partial-block-marker-");
+        const opencodeDb = createOpenCodeDb(dataHome);
+        insertUserMessage(opencodeDb, "msg-boundary", "ses-partial", 1_000);
+        closeQuietly(opencodeDb);
+        const db = openDatabase();
+        insertCompartment(db, "ses-partial", 10, "msg-boundary");
+        db.prepare(
+            "UPDATE compartments SET end_block_index=0 WHERE session_id='ses-partial'",
+        ).run();
+        db.prepare("INSERT INTO session_meta(session_id) VALUES ('ses-partial')").run();
+        for (const trusted of [
+            undefined,
+            { ordinal: 10, endMessageId: "msg-boundary", rowVersion: 1 },
+        ]) {
+            expect(
+                applyDeferredCompactionMarker(db, "ses-partial", makePending(), dataHome, trusted),
+            ).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
+            expect(getPersistedCompactionMarkerState(db, "ses-partial")).toBeNull();
+        }
+    });
     it("returns `applied` on the happy path (no existing marker)", () => {
         const dataHome = useTempDataHome("apply-deferred-applied-");
         const opencodeDb = createOpenCodeDb(dataHome);
@@ -470,7 +525,7 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         // Don't create the opencode dir at all — this makes the writable
         // OpenCode DB handle fail to open, which throws inside
         // getOpenCodeMessageById and trips the outer try/catch.
-        const dataHome = mkdtempSync(join(tmpdir(), "apply-deferred-db-err-"));
+        const dataHome = createTestTempDirFromPath(join(tmpdir(), "apply-deferred-db-err-"));
         tempDirs.push(dataHome);
         process.env.XDG_DATA_HOME = dataHome;
         mkdirSync(join(dataHome, "cortexkit", "magic-context"), { recursive: true });
@@ -510,6 +565,96 @@ describe("applyDeferredCompactionMarker — outcomes", () => {
         expect(getPersistedCompactionMarkerState(db, "ses-1")?.summaryMessageId).toBe(
             "msg-old-summary",
         );
+    });
+
+    it("keeps the old marker when BEGIN IMMEDIATE cannot acquire the host-store lock", () => {
+        const dataHome = useTempDataHome("apply-deferred-atomic-lock-");
+        const opencodeDb = createOpenCodeDb(dataHome);
+        insertUserMessage(opencodeDb, "msg-old-boundary", "ses-lock", 500);
+        insertUserMessage(opencodeDb, "msg-boundary", "ses-lock", 1_000);
+        const oldState: PersistedCompactionMarkerState = {
+            boundaryMessageId: "msg-old-boundary",
+            summaryMessageId: "msg-old-summary",
+            compactionPartId: "prt-old-compaction",
+            summaryPartId: "prt-old-summary",
+            boundaryOrdinal: 5,
+            targetEndMessageId: "msg-old-boundary",
+        };
+        insertMarkerRows(opencodeDb, "ses-lock", oldState);
+        closeQuietly(opencodeDb);
+
+        const db = openDatabase();
+        insertCompartment(db, "ses-lock", 10, "msg-boundary");
+        db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-lock");
+        setPersistedCompactionMarkerState(db, "ses-lock", oldState);
+
+        const locker = new Database(join(dataHome, "opencode", "opencode.db"));
+        locker.exec("BEGIN IMMEDIATE");
+        try {
+            const startedAt = Date.now();
+            const outcome = applyDeferredCompactionMarker(db, "ses-lock", makePending(), dataHome);
+            expect(outcome.kind).toBe("retryable-failure");
+            // This OpenCode-owned handle is not routed by the shared SQLite wrapper.
+            // Its native timeout expires before the deferred marker is retried.
+            expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4500);
+        } finally {
+            locker.exec("ROLLBACK");
+            closeQuietly(locker);
+        }
+
+        const inspect = new Database(join(dataHome, "opencode", "opencode.db"));
+        expect(
+            inspect
+                .prepare("SELECT COUNT(*) AS n FROM message WHERE id = ?")
+                .get(oldState.summaryMessageId),
+        ).toEqual({ n: 1 });
+        expect(
+            inspect
+                .prepare("SELECT COUNT(*) AS n FROM part WHERE id IN (?, ?)")
+                .get(oldState.compactionPartId, oldState.summaryPartId),
+        ).toEqual({ n: 2 });
+        closeQuietly(inspect);
+        expect(getPersistedCompactionMarkerState(db, "ses-lock")).toEqual(oldState);
+    }, 10_000);
+
+    it("rolls direct publication replacement back when insertion fails", () => {
+        const dataHome = useTempDataHome("direct-marker-atomic-rollback-");
+        const opencodeDb = createOpenCodeDb(dataHome);
+        insertUserMessage(opencodeDb, "msg-old-boundary", "ses-direct", 500);
+        insertUserMessage(opencodeDb, "msg-boundary", "ses-direct", 1_000);
+        const oldState: PersistedCompactionMarkerState = {
+            boundaryMessageId: "msg-old-boundary",
+            summaryMessageId: "msg-old-summary",
+            compactionPartId: "prt-old-compaction",
+            summaryPartId: "prt-old-summary",
+            boundaryOrdinal: 5,
+            targetEndMessageId: "msg-old-boundary",
+        };
+        insertMarkerRows(opencodeDb, "ses-direct", oldState);
+        opencodeDb.exec(`CREATE TRIGGER reject_new_marker BEFORE INSERT ON message
+            WHEN NEW.id <> 'msg-old-summary'
+            BEGIN SELECT RAISE(ABORT, 'simulated insert failure'); END`);
+        closeQuietly(opencodeDb);
+
+        const db = openDatabase();
+        insertCompartment(db, "ses-direct", 10, "msg-boundary");
+        db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-direct");
+        setPersistedCompactionMarkerState(db, "ses-direct", oldState);
+
+        expect(updateCompactionMarkerAfterPublication(db, "ses-direct", 10, dataHome)).toBe(false);
+        const inspect = new Database(join(dataHome, "opencode", "opencode.db"));
+        expect(
+            inspect
+                .prepare("SELECT COUNT(*) AS n FROM message WHERE id = ?")
+                .get(oldState.summaryMessageId),
+        ).toEqual({ n: 1 });
+        expect(
+            inspect
+                .prepare("SELECT COUNT(*) AS n FROM part WHERE id IN (?, ?)")
+                .get(oldState.compactionPartId, oldState.summaryPartId),
+        ).toEqual({ n: 2 });
+        closeQuietly(inspect);
+        expect(getPersistedCompactionMarkerState(db, "ses-direct")).toEqual(oldState);
     });
 
     it("repairs an equal-ordinal marker whose boundary is after the target endMessageId", () => {

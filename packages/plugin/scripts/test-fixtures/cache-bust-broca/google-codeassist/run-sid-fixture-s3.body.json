@@ -1,0 +1,87 @@
+{
+  "model": "gemini-fixture-flash",
+  "project": "fixture-project",
+  "request": {
+    "systemInstruction": {
+      "parts": [
+        {
+          "text": "You are a fixture agent."
+        }
+      ]
+    },
+    "tools": [
+      {
+        "functionDeclarations": [
+          {
+            "name": "glob",
+            "description": "find files"
+          }
+        ]
+      }
+    ],
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "read the repository layout"
+          }
+        ]
+      },
+      {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "name": "glob",
+              "args": {
+                "pattern": "src/0/**"
+              }
+            },
+            "thoughtSignature": "sig0"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "glob",
+              "response": {
+                "output": "src/0/a.ts"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "model",
+        "parts": [
+          {
+            "functionCall": {
+              "name": "glob",
+              "args": {
+                "pattern": "src/1/**"
+              }
+            },
+            "thoughtSignature": "sig1"
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "parts": [
+          {
+            "functionResponse": {
+              "name": "glob",
+              "response": {
+                "output": "src/1/a.ts"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

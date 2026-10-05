@@ -2,7 +2,7 @@ import { isRecord } from "../../shared/record-type-guard";
 import type { Database } from "../../shared/sqlite";
 import {
     type ReplayDocument,
-    readReplayDocument,
+    readReplayEnvelope,
     updateReplayDocument,
 } from "./storage-replay-document";
 
@@ -110,7 +110,7 @@ function replaceNativeReplayState(
  * missing v1/native namespace is empty; a present namespace is all-or-nothing.
  */
 export function getNativeReplayState(db: Database, sessionId: string): NativeReplayState {
-    return parseNativeReplayState(readReplayDocument(db, sessionId), sessionId);
+    return parseNativeReplayState(readReplayEnvelope(db, sessionId), sessionId);
 }
 
 /**

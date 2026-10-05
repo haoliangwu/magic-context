@@ -1,7 +1,8 @@
 /// <reference types="bun-types" />
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import { forEachHost } from "../src/scenario-hosts";
 
 /**
  * Subagent-specific behavior.
@@ -60,8 +61,7 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
 
 /**
  * Detects whether an outgoing provider request carries a §N§ tag prefix on any
- * user-message text. Subagents MUST NOT have this injected even though their
- * tags are still tracked in context.db.
+ * user-message text. An enabled subagent needs these tags to use ctx_reduce.
  */
 function hasTagPrefixedUserMessage(body: Record<string, unknown>): boolean {
     const messages = body.messages as
@@ -84,31 +84,30 @@ function hasTagPrefixedUserMessage(body: Record<string, unknown>): boolean {
 
 let h: TestHarness;
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        modelContextLimit: 200_000,
-        magicContextConfig: {
-            execute_threshold_percentage: 40,
-            // Reasonable protected-tail that still leaves older tags eligible
-            // for dropping once we cross execute threshold.
-            protected_tags: 5,
-            // Keep noise out of the test — no compaction markers (they touch
-            // opencode.db and aren't part of the subagent invariant set), no
-            // No dreamer or auto-search hints in subagent mode.
-            dreamer: { disable: true },
-        },
+forEachHost(import.meta.url, "subagent behavior", () => {
+    beforeAll(async () => {
+        h = await TestHarness.create({
+            modelContextLimit: 200_000,
+            magicContextConfig: {
+                execute_threshold_percentage: 40,
+                // Reasonable protected-tail that still leaves older tags eligible
+                // for dropping once we cross execute threshold.
+                protected_tags: 5,
+                // Keep noise out of the test — no compaction markers (they touch
+                // opencode.db and aren't part of the subagent invariant set), no
+                // dreamer or auto-search hints in subagent mode.
+                dreamer: { disable: true },
+            },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
+    afterAll(async () => {
+        await h.dispose();
+    });
 
-afterEach(() => {
-    h.mock.reset();
-});
-
-describe("subagent behavior", () => {
+    afterEach(() => {
+        h.mock.reset();
+    });
     it(
         "session.created sets is_subagent=1 when parentID is present",
         async () => {
@@ -182,7 +181,11 @@ describe("subagent behavior", () => {
             await h.sendPrompt(child, "subagent turn 1: hello from a child session");
             await h.sendPrompt(child, "subagent turn 2: another message");
 
-            expect(h.countTags(child)).toBeGreaterThan(0);
+            // The TypeScript tag table does not contain Rust module tags. Both modes must
+            // put a §N§ tag on a child user message in the provider's request by turn two.
+            if (process.env.MC_E2E_MODE !== "rust") {
+                expect(h.countTags(child)).toBeGreaterThan(0);
+            }
 
             const requests = h.mock.requests();
             expect(requests.length).toBeGreaterThanOrEqual(2);

@@ -7,25 +7,43 @@ import { once } from "node:events";
 import { chmodSync, createWriteStream, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { isCompactionEnabled } from "../config/agent-disable";
+import { COMPACTION_ENABLED_PATH, isCompactionEnabled } from "../config/agent-disable";
+import { currentPluginConfigReader, historianRunConfig } from "../config/live-run-config";
 import type { MagicContextConfig } from "../config/schema/magic-context";
+
 import {
-    getAuthorityManagedMarker,
-    getMemoryMirrorStatus,
-} from "../features/magic-context/context-authority";
-import { getMostRecentTaskRunAt } from "../features/magic-context/dreamer/storage-task-schedule";
+    getFailingDreamTasks,
+    getMostRecentTaskRunAt,
+    getSkippedDreamTasks,
+} from "../features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "../features/magic-context/dreamer/task-gates";
 import {
     CANONICAL_DREAM_TASKS,
     type DreamTaskBacklogMap,
+    type DreamTaskFailureState,
+    toolLoopDreamTasks,
 } from "../features/magic-context/dreamer/task-registry";
+import {
+    type DreamerTickFailure,
+    getDreamerTickFailure,
+} from "../features/magic-context/dreamer/tick-failure";
 import { getLocalEmbeddingNativeMemoryStats } from "../features/magic-context/memory/embedding-local";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import {
+    emptyMemoryImportanceHistogram,
+    getActiveMemoryImportanceHistogram,
+} from "../features/magic-context/memory/memory-diagnostics";
+import {
+    ProjectIdentityError,
+    resolveProjectIdentity,
+    resolveProjectIdentityForSession,
+    shouldSkipHomeProjectMemory,
+} from "../features/magic-context/memory/project-identity";
 import { getMessageIndexQueueHeapStats } from "../features/magic-context/message-index-async";
 import { getMural } from "../features/magic-context/mural/storage-mural";
 import { getEmbeddingCoverageStatus } from "../features/magic-context/project-embedding-registry";
 import { getProtectionWindowForSession } from "../features/magic-context/protection-window";
 import { parseCacheTtl } from "../features/magic-context/scheduler";
+import { readSessionCacheTtl } from "../features/magic-context/session-cache-ttl";
 import { getQuickJsNativeMemoryStats } from "../features/magic-context/smart-notes/sandbox-runner";
 import {
     type ContextDatabase as Database,
@@ -34,28 +52,39 @@ import {
 } from "../features/magic-context/storage";
 import {
     getPersistedSchemaVersion,
+    getUnconfirmedMigrationHolders,
     LATEST_SUPPORTED_VERSION,
 } from "../features/magic-context/storage-db";
-import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
+import {
+    getCompactionMarkerHealth,
+    getObservedEpochFloor,
+} from "../features/magic-context/storage-meta-persisted";
 import { getMeasuredToolDefinitionTokens } from "../features/magic-context/tool-definition-tokens";
 import {
     computeOpenCodeWorkMetricsIncremental,
     emptyWorkMetricsCarry,
     type WorkMetricsCarry,
 } from "../features/magic-context/work-metrics";
+import type { HiddenCompletionExecutor } from "../hooks/magic-context/compartment-runner-types";
+import {
+    type EmbedHistoryDeps,
+    pauseEmbedHistoryDrain,
+    runEmbedHistoryDrain,
+} from "../hooks/magic-context/embed-history-runner";
 import { getEmbedDrainUiStatus } from "../hooks/magic-context/embed-session-state";
 import {
     resolveContextLimit,
     resolveContextWindowGeometry,
     resolveExecuteThresholdDetail,
 } from "../hooks/magic-context/event-resolvers";
+import { executeFlush } from "../hooks/magic-context/execute-flush";
 import { formatEmbedStatusText } from "../hooks/magic-context/format-embed-status";
+import type { RunnerRefusalCanonicalCause } from "../hooks/magic-context/historian-no-fire-cause";
 import { getLiveNotificationParams } from "../hooks/magic-context/hook-handlers";
 import type { LiveSessionState } from "../hooks/magic-context/live-session-state";
 import { getLkgSlotHeapStats } from "../hooks/magic-context/lkg-slot";
 import { computeM0BlockTokens } from "../hooks/magic-context/m0-token-breakdown";
-import { RUST_SESSION_UPGRADE_REFUSAL } from "../hooks/magic-context/maintenance-authority";
-import { getCompartmentMirrorHeapStats } from "../hooks/magic-context/module-state-sync";
+
 import {
     findLastAssistantModelFromOpenCodeDb,
     openCodeDbExists,
@@ -78,22 +107,30 @@ import {
 import { resolveCacheTtlDisplay } from "../shared/cache-ttl-display";
 import type { ConfigParseFailure } from "../shared/config-diagnostics";
 import { getMagicContextStorageDir } from "../shared/data-path";
+import { listHiddenVariantWarnings } from "../shared/hidden-variant-warnings";
+import { activeHostLimitations } from "../shared/host-limitations";
 import { getLoggerDiagnostics, log } from "../shared/logger";
+import { pluginPackageVersion } from "../shared/plugin-package-version";
+import { canonicalProjectDirectory } from "../shared/project-directory-key";
+import { pushNotification } from "../shared/rpc-notifications";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import type {
     DebugHeapSnapshotResponse,
     DebugMemoryHolders,
     DebugMemoryUsageResponse,
     EmbedDetail,
+    RunnerStatus,
     SidebarSnapshot,
     StatusDetail,
 } from "../shared/rpc-types";
 import { getSqliteMemoryStats } from "../shared/sqlite";
+import { importPluginModule } from "../shared/stale-plugin-build";
 import { shouldEnforcePrivateStoragePermissions } from "../shared/storage-permissions";
 import {
     resolveTailHygieneStatus,
     type WireTailHygieneBaseline,
 } from "../shared/tail-hygiene-status";
+import { renderCapabilityRefusal } from "../shared/user-facing-codes";
 import { applyStickySnapshotCache } from "./sidebar-snapshot-cache";
 
 // Per-process incremental work-metrics state, keyed by session. The RPC server
@@ -151,6 +188,36 @@ export interface RustSessionStatus {
     pending_m1_age_ms?: number | null;
     wrapup_active?: boolean;
     wrapup_rounds?: number | null;
+    historian?: {
+        last_outcome?: string;
+        last_failure?: string | null;
+        last_no_fire?: string | null;
+        refusal_stage?: "credential" | "provider" | "model" | "resolution" | null;
+        canonical_cause?: RunnerRefusalCanonicalCause | null;
+        runner?: ModuleRunnerStatus;
+    };
+    dreamer?: {
+        runner?: ModuleRunnerStatus;
+    };
+}
+
+/** The module's account of which completion runner a session used, and why. */
+interface ModuleRunnerStatus {
+    runner?: string;
+    source?: string;
+    harness?: string;
+    observed?: string;
+}
+
+function runnerStatusFromModule(status: ModuleRunnerStatus | undefined): RunnerStatus | undefined {
+    if (status?.runner !== "host" && status?.runner !== "broca") return undefined;
+    if (status.source !== "configured" && status.source !== "default_for_harness") return undefined;
+    return {
+        runner: status.runner,
+        source: status.source,
+        harness: typeof status.harness === "string" ? status.harness : "",
+        observed: status.observed === "last_completion" ? "last_completion" : "resolved_for_route",
+    };
 }
 const rustStatusInFlight = new Map<string, Promise<RustSessionStatus | undefined>>();
 
@@ -287,7 +354,13 @@ export function buildSidebarSnapshot(
     compactionEnabled = true,
 ): SidebarSnapshot {
     try {
-        const projectIdentity = resolveProjectIdentity(directory);
+        const projectIdentity = resolveProjectIdentityForSession(directory);
+        if (projectIdentity === undefined)
+            throw new ProjectIdentityError(
+                "git_identity_unavailable",
+                directory,
+                "Memory features paused while project identity is unavailable",
+            );
 
         const meta = db
             .prepare<[string], Record<string, unknown>>(
@@ -404,15 +477,15 @@ export function buildSidebarSnapshot(
         // session-history) is computed by the SHARED helper so the OpenCode
         // sidebar and the Pi /ctx-status dialog can never diverge on what the
         // categories are or how they're measured.
-        const m0Bytes = meta?.cached_m0_bytes;
-        const m0Text =
-            m0Bytes instanceof Uint8Array
-                ? Buffer.from(m0Bytes).toString("utf8")
-                : typeof m0Bytes === "string"
-                  ? (m0Bytes as string)
+        const decodeCachedBytes = (bytes: unknown): string =>
+            bytes instanceof Uint8Array
+                ? Buffer.from(bytes).toString("utf8")
+                : typeof bytes === "string"
+                  ? bytes
                   : "";
         const m0Blocks = computeM0BlockTokens(db, sessionId, {
-            m0Text,
+            m0Text: decodeCachedBytes(meta?.cached_m0_bytes),
+            m1Text: decodeCachedBytes(meta?.cached_m1_bytes),
             projectIdentity,
             injectionBudgetTokens,
             memoryBlockCount,
@@ -426,6 +499,8 @@ export function buildSidebarSnapshot(
 
         let lastDreamerRunAt: number | null = null;
         let dreamerBacklog: DreamTaskBacklogMap | undefined;
+        let dreamerFailures: DreamTaskFailureState[] | undefined;
+        let dreamerSkipped: string[] | undefined;
         const dreamerProgress = projectIdentity
             ? (liveSessionState?.dreamerProgressByProject?.get(projectIdentity) ?? null)
             : null;
@@ -442,6 +517,10 @@ export function buildSidebarSnapshot(
                 // the live "last successful run" is MAX(last_run_at) across the
                 // project's task_schedule_state rows (issue #194).
                 lastDreamerRunAt = getMostRecentTaskRunAt(db, projectIdentity);
+                // A scheduled task can fail on every slot for weeks. Without this the
+                // only in-session trace is a backlog count that never falls.
+                dreamerFailures = getFailingDreamTasks(db, projectIdentity);
+                dreamerSkipped = getSkippedDreamTasks(db, projectIdentity);
             } catch {
                 // task_schedule_state may not exist on a pre-V2 DB
             }
@@ -559,6 +638,7 @@ export function buildSidebarSnapshot(
         const nativeContextUsagePercentage =
             nativeContextLimit > 0 ? (effectiveInputTokens / nativeContextLimit) * 100 : undefined;
 
+        const hostLimitations = activeHostLimitations();
         const calibration = resolveModelCalibration(activeProviderID, activeModelID);
         const tailHygiene = resolveTailHygieneStatus(
             liveSessionState?.channel1StateBySession.get(sessionId),
@@ -604,6 +684,8 @@ export function buildSidebarSnapshot(
             projectIdentity,
             dreamerBacklog,
             dreamerProgress,
+            ...(dreamerFailures === undefined ? {} : { dreamerFailures }),
+            ...(dreamerSkipped === undefined ? {} : { dreamerSkipped }),
             compartmentTokens: calibrated.compartmentTokens,
             factTokens: calibrated.factTokens,
             memoryTokens: calibrated.memoryTokens,
@@ -612,6 +694,7 @@ export function buildSidebarSnapshot(
             conversationTokens: calibrated.conversationTokens,
             toolCallTokens: calibrated.toolCallTokens,
             toolDefinitionTokens: calibrated.toolDefinitionTokens,
+            ...(hostLimitations.length > 0 ? { hostLimitations } : {}),
             ...(tailHygiene === undefined ? {} : { tailHygiene }),
             executeThreshold,
             executeThresholdClamped,
@@ -640,7 +723,7 @@ export function buildSidebarSnapshot(
         // last good breakdown instead of letting the bar flicker.
         return applyStickySnapshotCache(sessionId, fresh);
     } catch (err) {
-        log("[rpc] sidebar-snapshot error:", err);
+        if (!(err instanceof ProjectIdentityError)) log("[rpc] sidebar-snapshot error:", err);
         throw err;
     }
 }
@@ -657,6 +740,9 @@ export function buildSidebarSnapshotRpcResponse(
     moduleStatus?: RustSessionStatus,
     compactionEnabled = true,
 ): Record<string, unknown> {
+    if (shouldSkipHomeProjectMemory(directory)) return { sessionId, disabled: true };
+    if (resolveProjectIdentityForSession(directory) === undefined)
+        return { sessionId, disabled: true, paused: true };
     try {
         return buildSidebarSnapshot(
             db,
@@ -670,6 +756,15 @@ export function buildSidebarSnapshotRpcResponse(
         ) as unknown as Record<string, unknown>;
     } catch {
         return { error: "sidebar snapshot unavailable" };
+    }
+}
+
+/** The recorded maintenance-tick failure; storage trouble here reports none. */
+function safeTickFailure(db: Database): DreamerTickFailure | null {
+    try {
+        return getDreamerTickFailure(db);
+    } catch {
+        return null;
     }
 }
 
@@ -695,20 +790,37 @@ export function buildStatusDetail(
         compactionEnabled,
     );
     const rustMode = config?.transform_mode === "rust";
-    const projectIdentity = rustMode ? resolveProjectIdentity(directory) : null;
     const moduleMemoryAuthority = moduleStatus?.authority?.memories;
-    const moduleMemoryState = moduleMemoryAuthority?.state;
-    const moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
+    const _moduleMemoryState = moduleMemoryAuthority?.state;
+    const _moduleFeedHead = moduleStatus?.memory_mirror?.feed_head;
+    const moduleHistorian = moduleStatus?.historian;
+    const historianRefusalDetail =
+        moduleHistorian?.last_failure ?? moduleHistorian?.last_no_fire ?? null;
+    const historianRefusal =
+        moduleHistorian?.refusal_stage && moduleHistorian.canonical_cause && historianRefusalDetail
+            ? {
+                  stage: moduleHistorian.refusal_stage,
+                  canonicalCause: moduleHistorian.canonical_cause,
+                  detail: historianRefusalDetail,
+              }
+            : undefined;
+    const liveConfig = currentPluginConfigReader(directory);
+    const liveFailure = liveConfig?.lastFailure();
     const detail: StatusDetail = {
         ...base,
+        configGeneration: liveConfig?.current().generation,
+        configAdoptedAt: liveConfig?.current().adoptedAt,
+        configReloadFailure: liveFailure
+            ? { path: liveFailure.path, message: liveFailure.message }
+            : undefined,
+        memoryImportanceHistogram: emptyMemoryImportanceHistogram(),
+        // Not project-scoped: the maintenance timer is one per process, and a
+        // pass that ends early costs every project its work, so this is read
+        // from the shared store rather than from a project's schedule rows.
+        dreamerTickFailure: safeTickFailure(db),
+        hiddenVariantWarnings: listHiddenVariantWarnings(),
         hostBackendsModuleSide: rustMode,
-        memoryMirror: rustMode ? getMemoryMirrorStatus(db, moduleFeedHead) : undefined,
-        memoryAuthorityMismatch:
-            rustMode &&
-            moduleStatus?.authority !== undefined &&
-            projectIdentity !== null &&
-            getAuthorityManagedMarker(db, projectIdentity) !== null &&
-            (moduleMemoryState === "TS" || moduleMemoryAuthority === null),
+        compactionMarker: getCompactionMarkerHealth(db, sessionId),
         activeProfile: typeof config?.profile === "string" ? config.profile : null,
         tagCounter: 0,
         activeTags: 0,
@@ -720,6 +832,9 @@ export function buildStatusDetail(
         lastNudgeTokens: 0,
         lastTransformError: null,
         historianFailureCount: 0,
+        historianRefusal,
+        historianRunner: runnerStatusFromModule(moduleHistorian?.runner),
+        dreamerRunner: runnerStatusFromModule(moduleStatus?.dreamer?.runner),
         isSubagent: false,
         pendingOps: [],
         contextLimit: 0,
@@ -759,6 +874,12 @@ export function buildStatusDetail(
             context_db_schema_version: getPersistedSchemaVersion(db),
             plugin_supported_version: LATEST_SUPPORTED_VERSION,
         };
+        if (base.projectIdentity) {
+            detail.memoryImportanceHistogram = getActiveMemoryImportanceHistogram(
+                db,
+                base.projectIdentity,
+            );
+        }
         const muralConfig = config?.mural as { enabled?: boolean } | undefined;
         if (muralConfig?.enabled && base.projectIdentity) {
             const row = getMural(db, base.projectIdentity);
@@ -886,6 +1007,7 @@ export function buildStatusDetail(
             }
 
             const ttlDisplay = resolveCacheTtlDisplay({
+                frozen: readSessionCacheTtl(db, sessionId),
                 configured: (config.cache_ttl ?? "5m") as MagicContextConfig["cache_ttl"],
                 configuredExplicitly: config.cacheTtlConfigured === true,
                 modelKey,
@@ -1088,7 +1210,7 @@ export function buildDebugMemoryUsage(
     const lkg = getLkgSlotHeapStats();
     const tagger = runtimeHolders.taggerCache ?? EMPTY_TAGGER_HEAP_STATS;
     const wire = runtimeHolders.wireCache ?? EMPTY_WIRE_HEAP_STATS;
-    const mirrors = getCompartmentMirrorHeapStats();
+
     const messageIndexQueue = getMessageIndexQueueHeapStats();
     const sessions = new Map<string, DebugMemoryHolders["sessions"][number]>();
     const session = (sessionId: string) => {
@@ -1154,7 +1276,7 @@ export function buildDebugMemoryUsage(
                 rawContentSnapshots: wire.rawContentSnapshots,
                 estimatedBytes: wire.estimatedBytes,
             },
-            compartmentMirrors: { entries: mirrors.entries },
+            compartmentMirrors: { entries: 0 },
             messageIndexQueue,
             sessions: [...sessions.values()].sort((a, b) => a.sessionId.localeCompare(b.sessionId)),
         },
@@ -1289,6 +1411,37 @@ async function generateDebugHeapSnapshot(
 }
 
 /**
+ * The session's directory from the host's own session record, or null when the
+ * host client has no session API or the lookup fails.
+ */
+async function readHostSessionDirectory(
+    client: unknown,
+    sessionId: string,
+): Promise<string | null> {
+    if (typeof client !== "object" || client === null || !("session" in client)) return null;
+    const session = client.session;
+    if (typeof session !== "object" || session === null || !("get" in session)) return null;
+    const get = session.get;
+    if (typeof get !== "function") return null;
+    try {
+        const response: unknown = await get.call(session, { path: { id: sessionId } });
+        const data =
+            typeof response === "object" && response !== null && "data" in response
+                ? response.data
+                : null;
+        const sessionDirectory =
+            typeof data === "object" && data !== null && "directory" in data
+                ? data.directory
+                : null;
+        return typeof sessionDirectory === "string" && sessionDirectory.length > 0
+            ? sessionDirectory
+            : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Register all RPC handlers on the server.
  */
 export function registerRpcHandlers(
@@ -1299,11 +1452,14 @@ export function registerRpcHandlers(
         client: unknown;
         liveSessionState: LiveSessionState;
         rustModeModuleClient?: RustModeModuleClient;
+        hiddenCompletionExecutor?: HiddenCompletionExecutor;
         storageDir?: string;
         getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
+        getDatabase?: () => Database | null;
     },
 ): void {
     const { directory, config, liveSessionState, rustModeModuleClient } = args;
+    const readDatabase = args.getDatabase ?? getDb;
     // Resolve mode once at the RPC boundary. The TUI receives this data and
     // never reads the config itself.
     const compactionEnabled = isCompactionEnabled(config);
@@ -1316,7 +1472,8 @@ export function registerRpcHandlers(
             liveSessionState.liveModelBySession,
             liveSessionState.variantBySession,
             liveSessionState.agentBySession,
-            config.toast_duration_ms,
+            currentPluginConfigReader(directory)?.poll().effective.toast_duration_ms ??
+                config.toast_duration_ms,
         );
 
     const injectionBudgetTokens = config.memory?.injection_budget_tokens;
@@ -1335,7 +1492,7 @@ export function registerRpcHandlers(
     rpcServer.handle("sidebar-snapshot", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
@@ -1358,12 +1515,36 @@ export function registerRpcHandlers(
         );
     });
 
+    // A TUI whose session directory matched no discovery directory asks every
+    // local server whether it owns the session. The host's own session record
+    // decides, compared in the canonical spelling this server's discovery file
+    // is filed under.
+    rpcServer.handle("session-owner", async (params) => {
+        const sessionId = String(params.sessionId ?? "");
+        if (!sessionId) return { owner: false };
+        const sessionDirectory =
+            liveSessionState.sessionDirectoryBySession.get(sessionId) ??
+            (await readHostSessionDirectory(args.client, sessionId));
+        if (!sessionDirectory) return { owner: false };
+        return {
+            owner:
+                canonicalProjectDirectory(sessionDirectory) ===
+                canonicalProjectDirectory(directory),
+        };
+    });
+
     rpcServer.handle("status-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
+        // Every reply names this server's version so the TUI can tell the user
+        // when it is talking to a server from a different release.
+        const pluginVersion = pluginPackageVersion() ?? undefined;
+        if (shouldSkipHomeProjectMemory(dir)) return { sessionId, disabled: true, pluginVersion };
+        if (resolveProjectIdentityForSession(dir) === undefined)
+            return { sessionId, disabled: true, paused: true, pluginVersion };
         const modelKey = params.modelKey ? String(params.modelKey) : undefined;
-        const db = getDb();
-        if (!db || !sessionId) return { error: "unavailable" };
+        const db = readDatabase();
+        if (!db || !sessionId) return { error: "unavailable", pluginVersion };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
             ? await loadRustSessionStatus(rustModeModuleClient, sessionId, dir)
@@ -1371,9 +1552,10 @@ export function registerRpcHandlers(
         if (rustMode && !moduleStatus) {
             return {
                 error: "Rust module status unavailable; canonical session state was not read",
+                pluginVersion,
             };
         }
-        return buildStatusDetail(
+        const detail = buildStatusDetail(
             db,
             sessionId,
             dir,
@@ -1383,13 +1565,27 @@ export function registerRpcHandlers(
             injectionBudgetTokens,
             moduleStatus,
             compactionEnabled,
-        ) as unknown as Record<string, unknown>;
+        );
+        // Name the tasks this host cannot run. Only the RPC boundary knows which
+        // completion transport the host supplies, and a user who never sees the
+        // list has no way to tell a task that is unavailable here from one that
+        // simply has no backlog.
+        if (args.hiddenCompletionExecutor?.capabilities.tools === false) {
+            detail.dreamerUnsupportedTasks = toolLoopDreamTasks();
+        }
+        detail.pluginVersion = pluginVersion;
+        const unconfirmedHolders = getUnconfirmedMigrationHolders();
+        if (unconfirmedHolders) detail.unconfirmedMigrationHolders = unconfirmedHolders;
+        return detail as unknown as Record<string, unknown>;
     });
 
     rpcServer.handle("embed-detail", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        if (shouldSkipHomeProjectMemory(dir)) return { sessionId, disabled: true };
+        if (resolveProjectIdentityForSession(dir) === undefined)
+            return { sessionId, disabled: true, paused: true };
+        const db = readDatabase();
         if (!db || !sessionId) return { error: "unavailable" };
         try {
             return buildEmbedDetail(db, sessionId, dir, liveSessionState) as unknown as Record<
@@ -1405,7 +1601,7 @@ export function registerRpcHandlers(
     rpcServer.handle("compartment-count", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         const dir = String(params.directory ?? directory);
-        const db = getDb();
+        const db = readDatabase();
         if (!db || !sessionId) return { count: 0 };
         const rustMode = config.transform_mode === "rust";
         const moduleStatus = rustMode
@@ -1420,38 +1616,51 @@ export function registerRpcHandlers(
         return { count: buildCompartmentCount(db, sessionId, moduleStatus) };
     });
 
-    // Under TypeScript authority, the RPC dialogs share the same recomp/upgrade
-    // orchestrators as /ctx-* commands. Rust authority branches below: recomp goes
-    // to session.recomp, while session upgrade refuses because the module owns state.
+    // Under TypeScript authority, the RPC dialogs share the same recomp
+    // orchestrator as the /ctx-* commands. Rust authority branches below: recomp
+    // goes to session.recomp because the module owns state.
     const buildManagedCtx = async (
         db: NonNullable<ReturnType<typeof getDb>>,
     ): Promise<ManagedRecompContext> => {
-        const { deriveHistorianChunkTokens, resolveHistorianContextLimit } = await import(
-            "../hooks/magic-context/derive-budgets"
+        const { deriveHistorianChunkTokens, resolveHistorianContextLimit } =
+            await importPluginModule(() => import("../hooks/magic-context/derive-budgets"));
+        const { resolveHistorianModel } = await importPluginModule(
+            () => import("../shared/model-resolution"),
         );
-        const { resolveHistorianModel } = await import("../shared/model-resolution");
-        const { userMemoryCollectionEnabled } = await import(
-            "../features/magic-context/dreamer/task-config"
+        const { userMemoryCollectionEnabled } = await importPluginModule(
+            () => import("../features/magic-context/dreamer/task-config"),
         );
         const DEFAULT_HISTORIAN_TIMEOUT_MS = 10 * 60 * 1000;
-        const historianModel = resolveHistorianModel(config, "opencode");
+        const runConfig = historianRunConfig(
+            config,
+            currentPluginConfigReader(directory)?.poll().effective ?? config,
+        );
+        const historianModel = resolveHistorianModel(runConfig, "opencode");
         return {
             client: args.client as ManagedRecompContext["client"],
+            hiddenCompletionExecutor: args.hiddenCompletionExecutor,
             db,
             liveSessionState,
             directory,
             historianChunkTokens: deriveHistorianChunkTokens(
                 resolveHistorianContextLimit(historianModel.primary?.model),
             ),
-            historianTimeoutMs: config.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
+            historianTimeoutMs: runConfig.historian_timeout_ms ?? DEFAULT_HISTORIAN_TIMEOUT_MS,
             memoryEnabled: config.memory?.enabled ?? true,
-            autoPromote: config.memory?.auto_promote ?? true,
+            autoPromote: runConfig.memory?.auto_promote ?? true,
             historianModel: historianModel.primary,
             fallbackModels: historianModel.fallbacks,
-            runMigration: config.memory?.enabled !== false && !!historianModel.primary?.model,
-            userMemoriesEnabled: userMemoryCollectionEnabled(config.dreamer),
-            historianTwoPass: config.historian?.two_pass === true,
-            getNotificationParams,
+            userMemoriesEnabled: userMemoryCollectionEnabled(runConfig.dreamer),
+            historianTwoPass: runConfig.historian?.two_pass === true,
+            historianExpandTools: runConfig.historian?.expand_tools,
+            getNotificationParams: (sessionId) =>
+                getLiveNotificationParams(
+                    sessionId,
+                    liveSessionState.liveModelBySession,
+                    liveSessionState.variantBySession,
+                    liveSessionState.agentBySession,
+                    runConfig.toast_duration_ms,
+                ),
         };
     };
 
@@ -1462,19 +1671,37 @@ export function registerRpcHandlers(
         if (config.transform_mode === "rust") {
             return executeRustRecompRpc(rustModeModuleClient, sessionId, dir);
         }
-        const db = getDb();
+        const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
 
-        const { runManagedRecomp } = await import("../hooks/magic-context/recomp-orchestrator");
-        const { sendIgnoredMessage } = await import(
-            "../hooks/magic-context/send-session-notification"
+        const { runManagedRecomp } = await importPluginModule(
+            () => import("../hooks/magic-context/recomp-orchestrator"),
+        );
+        const { sendIgnoredMessage } = await importPluginModule(
+            () => import("../hooks/magic-context/send-session-notification"),
         );
         log(`[rpc] recomp requested for session ${sessionId}`);
+        // The historian needs a way to run hidden completions: OpenCode 1 opens
+        // child sessions through its SDK client, OpenCode 2 through the hidden
+        // completion executor. With neither there is nothing to run it on, and
+        // saying so beats a generic rebuild failure.
+        if (!args.client && !args.hiddenCompletionExecutor) {
+            return {
+                ok: false,
+                error: "History rebuild is unavailable: this host gave Magic Context no way to run the historian.",
+            };
+        }
         const ctx = await buildManagedCtx(db);
-        // Fire-and-forget; outcome is force-persisted so a multi-minute recomp's
-        // result stays visible in scrollback instead of a 5s toast.
+        // Fire-and-forget. OpenCode 1 force-persists the outcome as a chat row so a
+        // multi-minute recomp's result stays in scrollback instead of a 5s toast.
+        // OpenCode 2 has no SDK client to write that row with, so the outcome goes
+        // to the result dialog on the notification channel, as wrapup's does.
         void runManagedRecomp(ctx, sessionId)
             .then((message) => {
+                if (!args.client) {
+                    pushResultDialog(sessionId, "Recomp", message);
+                    return;
+                }
                 void sendIgnoredMessage(
                     args.client,
                     sessionId,
@@ -1487,65 +1714,150 @@ export function registerRpcHandlers(
         return { ok: true };
     });
 
-    // TUI-triggered `/ctx-session-upgrade`: full recomp + once-per-project memory
-    // migration. Fired from the upgrade dialog's "Run upgrade now" action.
-    rpcServer.handle("upgrade", async (params) => {
+    // The three handlers below exist for a host whose only command seam is the
+    // TUI (OpenCode 2 registers /ctx-* through its keymap layer, and its lane
+    // never runs the OpenCode 1 `command.execute.before` hook). Each performs the
+    // same server-side work as the matching command branch and returns its text,
+    // so the caller can render it in a dialog or toast instead of a chat row.
+    const compactionOffRefusal = (command: string): string =>
+        `Magic Context compaction is disabled (${COMPACTION_ENABLED_PATH}: false) — /${command} manages compacted history and has no effect in this mode.`;
+
+    /** Show a completed background run's text on whichever TUI is listening. */
+    const pushResultDialog = (sessionId: string, title: string, message: string): void => {
+        pushNotification("action", { action: "show-result-dialog", title, message }, sessionId);
+    };
+
+    rpcServer.handle("flush", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
-        if (config.transform_mode === "rust") {
-            return { ok: false, error: RUST_SESSION_UPGRADE_REFUSAL };
-        }
-        const db = getDb();
-        if (!db) return { ok: false, error: "db unavailable" };
-
-        const { runManagedUpgrade } = await import("../hooks/magic-context/recomp-orchestrator");
-        const { sendIgnoredMessage } = await import(
-            "../hooks/magic-context/send-session-notification"
-        );
-        log(`[rpc] session-upgrade requested for session ${sessionId}`);
-        const ctx = await buildManagedCtx(db);
-        void runManagedUpgrade(ctx, sessionId)
-            .then((message) => {
-                void sendIgnoredMessage(
-                    args.client,
+        if (!compactionEnabled) return { ok: true, message: compactionOffRefusal("ctx-flush") };
+        let message: string;
+        if (config.transform_mode === "rust" && rustModeModuleClient) {
+            try {
+                const response = await rustModeModuleClient.call({
                     sessionId,
-                    message,
-                    getNotificationParams(sessionId),
-                    true, // force-persist: a multi-minute upgrade's outcome must stay visible
-                ).catch(() => {});
-            })
-            .catch((error: unknown) => log("[rpc] session-upgrade failed:", error));
-        return { ok: true };
+                    projectRoot: String(params.directory ?? directory),
+                    method: "session.flush",
+                    body: { method: "session.flush", v: 1, session_id: sessionId },
+                });
+                const value = (response ?? {}) as Record<string, unknown>;
+                message =
+                    value.armed === false
+                        ? "No pending operations to flush."
+                        : "Flushed: Changes take effect on next message.";
+            } catch (error) {
+                log("[rpc] flush failed:", error);
+                return { ok: false, error: renderCapabilityRefusal("context_cleanup") };
+            }
+        } else {
+            const db = readDatabase();
+            if (!db) return { ok: false, error: "db unavailable" };
+            message = executeFlush(db, sessionId);
+        }
+        // The user asked for a full refresh, so signal all three one-shot sets:
+        // rebuild <session-history>, re-read the system-prompt adjuncts, and force
+        // the queued drops to materialize. That makes the next request a priced
+        // pass instead of leaving the flush invisible until one happens anyway.
+        liveSessionState.historyRefreshSessions.add(sessionId);
+        liveSessionState.systemPromptRefreshSessions.add(sessionId);
+        liveSessionState.pendingMaterializationSessions.add(sessionId);
+        return { ok: true, message };
     });
 
-    // The user made an explicit choice on the upgrade dialog (Confirm or Cancel).
-    // Set the durable stamp so the FRESH reminder won't re-show. We deliberately
-    // do NOT stamp when the dialog is merely displayed — a display that the user
-    // closed/ctrl-c'd before acting must re-show on the next process (dogfood
-    // 2026-05-30). Resume prompts are staging-driven and unaffected by this stamp.
-    rpcServer.handle("dismiss-upgrade-reminder", async (params) => {
+    rpcServer.handle("wrapup", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
-        const db = getDb();
+        if (!compactionEnabled) return { ok: true, message: compactionOffRefusal("ctx-wrapup") };
+        const requested = Number(params.messagesToKeep ?? 20);
+        const messagesToKeep = Number.isSafeInteger(requested) && requested > 0 ? requested : 20;
+        if (config.transform_mode === "rust") {
+            return { ok: false, error: renderCapabilityRefusal("history_compression") };
+        }
+        const db = readDatabase();
         if (!db) return { ok: false, error: "db unavailable" };
+
+        const { runManagedWrapup } = await importPluginModule(
+            () => import("../hooks/magic-context/wrapup-orchestrator"),
+        );
+        const model = liveSessionState.liveModelBySession.get(sessionId);
+        const contextLimit = model
+            ? resolveContextLimit(model.providerID, model.modelID, { db, sessionID: sessionId })
+            : 128_000;
+        const ctx = {
+            ...(await buildManagedCtx(db)),
+            contextLimit,
+            executeThresholdPercentage: resolveExecuteThresholdDetail(
+                config.execute_threshold_percentage ?? 65,
+                model ? `${model.providerID}/${model.modelID}` : undefined,
+                65,
+                {
+                    tokensConfig: config.execute_threshold_tokens,
+                    contextLimit,
+                    sessionId,
+                },
+            ).percentage,
+            hasPendingNaturalBust: (sid: string) =>
+                liveSessionState.historyRefreshSessions.has(sid) ||
+                liveSessionState.systemPromptRefreshSessions.has(sid) ||
+                liveSessionState.pendingMaterializationSessions.has(sid),
+        };
+        log(`[rpc] wrapup requested for session ${sessionId} (keep ${messagesToKeep})`);
+        // Fire-and-forget: a wrapup runs the historian over the live tail and can
+        // take minutes, which is far longer than an RPC caller can wait.
+        void runManagedWrapup(ctx, sessionId, { messagesToKeep })
+            .then((message) => pushResultDialog(sessionId, "Wrapup", message))
+            .catch((error: unknown) => log("[rpc] wrapup failed:", error));
+        return { ok: true, started: true };
+    });
+
+    rpcServer.handle("embed", async (params) => {
+        const sessionId = String(params.sessionId ?? "");
+        if (!sessionId) return { ok: false, error: "no session" };
+        const db = readDatabase();
+        if (!db) return { ok: false, error: "db unavailable" };
+        const action = String(params.action ?? "status");
+        const embedDeps: EmbedHistoryDeps = {
+            db,
+            resolveDirectory: (id) =>
+                liveSessionState.sessionDirectoryBySession.get(id) ??
+                String(params.directory ?? directory),
+            allowHomeProject: config.allow_home_project,
+            recompProgressBySession: liveSessionState.recompProgressBySession,
+        };
+        if (action === "pause") {
+            return { ok: true, message: pauseEmbedHistoryDrain(embedDeps, sessionId) };
+        }
+        if (action === "start") {
+            log(`[rpc] embed start requested for session ${sessionId}`);
+            // Same reason as wrapup: a backfill over a long session's compartments
+            // outlives the request, so the outcome arrives as a dialog.
+            void runEmbedHistoryDrain(embedDeps, sessionId)
+                .then((message) => pushResultDialog(sessionId, "Embed", message))
+                .catch((error: unknown) => log("[rpc] embed start failed:", error));
+            return { ok: true, started: true };
+        }
         try {
-            const { updateSessionMeta } = await import(
-                "../features/magic-context/storage-meta-session"
-            );
-            updateSessionMeta(db, sessionId, { upgradeRemindedAt: Date.now() });
-            return { ok: true };
+            return {
+                ok: true,
+                message: buildEmbedDetail(
+                    db,
+                    sessionId,
+                    String(params.directory ?? directory),
+                    liveSessionState,
+                ).statusText,
+            };
         } catch (error) {
-            log("[rpc] dismiss-upgrade-reminder failed:", error);
-            return { ok: false, error: String(error) };
+            log("[rpc] embed status error:", error);
+            return { ok: false, error: "unavailable" };
         }
     });
 
     rpcServer.handle("toast-duration", async () => {
+        const duration =
+            currentPluginConfigReader(directory)?.poll().effective.toast_duration_ms ??
+            config.toast_duration_ms;
         const resolved =
-            typeof config.toast_duration_ms === "number" &&
-            Number.isFinite(config.toast_duration_ms)
-                ? config.toast_duration_ms
-                : 5000;
+            typeof duration === "number" && Number.isFinite(duration) ? duration : 5000;
         return { toastDurationMs: resolved };
     });
 

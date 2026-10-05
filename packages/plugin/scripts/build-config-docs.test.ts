@@ -49,3 +49,29 @@ describeRender("generated reference table cell escaping", () => {
         expectRender(cells[4]).not.toMatch(/provider\/\*[^\\]/);
     });
 });
+
+test("GitHub live key list and generated site badges match schema marks", async () => {
+    const { buildSchema } = await import("./build-schema");
+    const schema = buildSchema() as { properties: Record<string, unknown> };
+    const marked: string[] = [];
+    const walk = (value: unknown, path = "") => {
+        const node = value as { properties?: Record<string, unknown>; "x-mc-live-reload"?: boolean };
+        if (node["x-mc-live-reload"] === true) marked.push(path);
+        for (const [key, child] of Object.entries(node.properties ?? {})) {
+            walk(child, path ? `${path}.${key}` : key);
+        }
+    };
+    walk(schema);
+    const github = fs.readFileSync(path.resolve(import.meta.dir, "../../..", "CONFIGURATION.md"), "utf8");
+    const { buildGitHubLiveKeys } = await import("./build-config-docs");
+    expect(github).toBe(buildGitHubLiveKeys(github));
+    const block = github.match(/<!-- LIVE-CONFIG-KEYS-START -->([\s\S]*?)<!-- LIVE-CONFIG-KEYS-END -->/);
+    expect(block).not.toBeNull();
+    const listed = [...(block?.[1] ?? "").matchAll(/^- `([^`]+)`$/gm)].map((match) => match[1]);
+    expect(listed).toEqual(marked.sort());
+    const site = fs.readFileSync(path.resolve(import.meta.dir, "../../docs/src/content/docs/reference/configuration.md"), "utf8");
+    expect(site).toContain("## Changing config without a restart");
+    for (const key of marked) {
+        expect(site).toContain(`| \`${key}\` **Live** |`);
+    }
+});

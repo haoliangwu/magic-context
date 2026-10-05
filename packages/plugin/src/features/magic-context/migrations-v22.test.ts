@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { runMigrations } from "./migrations";
 import { closeDatabase, initializeDatabase, openDatabase } from "./storage-db";
 import { getOrCreateSessionMeta } from "./storage-meta-session";
@@ -338,7 +339,7 @@ describe("migration v22", () => {
     });
 
     test("schema fence refuses to open a newer schema than the binary supports", () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-v22-fence-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-v22-fence-"));
         const dbPath = join(dir, "context.db");
         const seed = new Database(dbPath);
         try {

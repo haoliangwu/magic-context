@@ -54,6 +54,7 @@ export function getPiVersion(piPath: string): string | null {
     try {
         const invocation = getPiCommandInvocation(piPath, ["--version"]);
         const result = spawnSync(invocation.command, invocation.args, {
+            windowsHide: true,
             encoding: "utf-8",
             timeout: 10_000,
         });
@@ -71,6 +72,7 @@ export function runPiCommand(piPath: string, args: string[], timeout = 20_000): 
     try {
         const invocation = getPiCommandInvocation(piPath, args);
         return execFileSync(invocation.command, invocation.args, {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "ignore"],
             timeout,

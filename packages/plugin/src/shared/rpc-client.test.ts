@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -12,6 +12,7 @@ import {
 } from "./rpc-notifications";
 import { MagicContextRpcServer } from "./rpc-server";
 import { parseRpcPortFile, type RpcPortFileRecord, rpcPortDir, rpcPortFilePath } from "./rpc-utils";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 interface TestServer {
     port: number;
@@ -36,7 +37,7 @@ afterEach(async () => {
 });
 
 function makeTempDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-rpc-client-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-rpc-client-"));
     tempDirs.push(dir);
     return dir;
 }

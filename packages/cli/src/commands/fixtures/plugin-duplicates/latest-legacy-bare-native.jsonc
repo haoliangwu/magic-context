@@ -1,0 +1,6 @@
+{
+  // from 1.x setup
+  "plugin": ["@cortexkit/opencode-magic-context@latest"],
+  // appended by `opencode plugin add @cortexkit/opencode-magic-context`
+  "plugins": ["@cortexkit/opencode-magic-context", "opencode-other-plugin"]
+}

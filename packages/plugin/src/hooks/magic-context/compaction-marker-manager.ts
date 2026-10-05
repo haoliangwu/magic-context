@@ -17,14 +17,14 @@ import {
     compareOpenCodeMessagesByCanonicalOrder,
     findBoundaryUserMessage,
     getOpenCodeMessageById,
-    injectCompactionMarker,
     listSessionCompactionMarkers,
     removeCompactionMarker,
     removeForeignCompactionMarker,
+    replaceCompactionMarker,
 } from "../../features/magic-context/compaction-marker";
 import {
-    getCompartments,
     getCompartmentsByEndMessageId,
+    hasPartialCompartmentEndThrough,
 } from "../../features/magic-context/compartment-storage";
 import {
     getPersistedCompactionMarkerState,
@@ -63,13 +63,14 @@ function persistMarkerStateAndDropReplacedTag(
     state: PersistedCompactionMarkerState | null,
     replacedSummaryMessageId: string | null,
 ): void {
-    const transactionStartedAt = performance.now();
+    let transactionStartedAt = 0;
     db.transaction(() => {
+        transactionStartedAt = performance.now();
         setPersistedCompactionMarkerState(db, sessionId, state);
         if (replacedSummaryMessageId !== null) {
             dropMarkerSummaryTag(db, sessionId, replacedSummaryMessageId);
         }
-    })();
+    }).immediate();
     logSlowWriteTransaction("marker-drain", transactionStartedAt);
 }
 
@@ -88,7 +89,7 @@ export type MarkerUpdateOutcome =
     | { kind: "already-current" }
     | {
           kind: "stale-skip";
-          reason: "compartment-removed" | "target-superseded";
+          reason: "compartment-removed" | "target-superseded" | "partial-message-boundary";
       }
     | { kind: "retryable-failure"; error: Error };
 
@@ -119,7 +120,7 @@ function validatePendingTarget(
     db: Database,
     sessionId: string,
     pending: PendingCompactionMarker,
-): "ok" | "compartment-removed" | "target-superseded" {
+): "ok" | "compartment-removed" | "target-superseded" | "partial-message-boundary" {
     // 1. PRIMARY: raw OpenCode message must still exist. May throw on DB
     //    failure; caller catches and returns retryable-failure.
     const ocMessage = getOpenCodeMessageById(sessionId, pending.endMessageId);
@@ -128,22 +129,7 @@ function validatePendingTarget(
     }
 
     // 2. SECONDARY: compartment row keyed by endMessageId.
-    const exactCompartments = getCompartmentsByEndMessageId(db, sessionId, pending.endMessageId);
-    // Rust stores compartment anchors as flat block ids (`<mid>#<index>`), while
-    // OpenCode marker rows and the shared pending blob address the owning message.
-    // Accept that vocabulary only when the suffix is a canonical numeric block index.
-    const compartments =
-        exactCompartments.length > 0
-            ? exactCompartments
-            : getCompartments(db, sessionId).filter((compartment) => {
-                  const separator = compartment.endMessageId.lastIndexOf("#");
-                  if (separator < 1) return false;
-                  const blockIndex = compartment.endMessageId.slice(separator + 1);
-                  return (
-                      compartment.endMessageId.slice(0, separator) === pending.endMessageId &&
-                      /^\d+$/.test(blockIndex)
-                  );
-              });
+    const compartments = getCompartmentsByEndMessageId(db, sessionId, pending.endMessageId);
     if (compartments.length === 0) {
         return "compartment-removed";
     }
@@ -157,6 +143,7 @@ function validatePendingTarget(
         return "compartment-removed";
     }
     const compartment = compartments[0];
+    if (compartment.endBlockIndex != null) return "partial-message-boundary";
     if (compartment.endMessage !== pending.ordinal) {
         // Same end-message id but different ordinal — a later publish already
         // moved the marker past us. Skip this stale pending and let the newer
@@ -271,9 +258,13 @@ export function applyDeferredCompactionMarker(
             trustedBoundary.rowVersion > 0 &&
             trustedBoundary.ordinal === pending.ordinal &&
             trustedBoundary.endMessageId === pending.endMessageId;
-        const validation = responseFencesTarget
-            ? "ok"
-            : validatePendingTarget(db, sessionId, pending);
+        // Host compaction markers discard whole messages. An indexed end may leave
+        // later blocks unsummarized, so such a marker would lose those blocks.
+        const validation = hasPartialCompartmentEndThrough(db, sessionId, pending.ordinal)
+            ? "partial-message-boundary"
+            : responseFencesTarget
+              ? "ok"
+              : validatePendingTarget(db, sessionId, pending);
         if (validation !== "ok") {
             sessionLog(
                 sessionId,
@@ -310,34 +301,10 @@ export function applyDeferredCompactionMarker(
             };
         }
 
-        // Remove old marker if present. `removeCompactionMarker` returns false
-        // only when the DELETE transaction itself failed (e.g. SQLITE_BUSY).
-        // Keep the summary id so its tag drops atomically when marker state advances.
+        // Replace both host-store row sets under one BEGIN IMMEDIATE. A busy
+        // store fails before deletion; any later failure rolls the deletion back.
         const removedSummaryMessageId = existing?.summaryMessageId ?? null;
-        // No-op success on already-missing rows is fine — that's why retry is
-        // safe. False here means we couldn't even attempt the delete cleanly;
-        // bail to retryable WITHOUT calling inject (avoids leaving two marker
-        // rows for the same boundary).
-        if (existing) {
-            const removed = removeCompactionMarker(existing);
-            if (!removed) {
-                return {
-                    kind: "retryable-failure",
-                    error: new Error(
-                        `failed to remove old compaction marker at ordinal ${existing.boundaryOrdinal}`,
-                    ),
-                };
-            }
-            sessionLog(
-                sessionId,
-                `compaction-marker drain: removed old boundary at ordinal ${existing.boundaryOrdinal}, advancing to ${pending.ordinal}`,
-            );
-        }
-
-        // Inject new marker. The boundary was pre-resolved above, so a null
-        // return here means the INSERT transaction failed and rolled back
-        // cleanly (no half-write); retrying is safe.
-        const result = injectCompactionMarker({
+        const result = replaceCompactionMarker(existing, {
             sessionId,
             endOrdinal: pending.ordinal,
             endMessageId: pending.endMessageId,
@@ -349,7 +316,7 @@ export function applyDeferredCompactionMarker(
             return {
                 kind: "retryable-failure",
                 error: new Error(
-                    `injectCompactionMarker returned null for ordinal ${pending.ordinal}; will retry`,
+                    `atomic marker replacement failed for ordinal ${pending.ordinal}; will retry`,
                 ),
             };
         }
@@ -429,6 +396,9 @@ export function updateCompactionMarkerAfterPublication(
         return false;
     }
 
+    if (hasPartialCompartmentEndThrough(db, sessionId, lastCompartmentEnd)) {
+        return false;
+    }
     const existing = getPersistedCompactionMarkerState(db, sessionId);
     const removedSummaryMessageId = existing?.summaryMessageId ?? null;
 
@@ -459,30 +429,7 @@ export function updateCompactionMarkerAfterPublication(
         return false;
     }
 
-    if (existing) {
-        // Boundary moved forward — remove old marker and inject new one.
-        // removeCompactionMarker returns false on failure (it does NOT throw),
-        // so honor the boolean: only clear persisted state after a SUCCESSFUL
-        // removal. Clearing it on a failed removal would orphan the old marker
-        // rows AND, if the injection below also fails, lose the durable retry
-        // path entirely. On removal failure we abort WITHOUT clearing — the
-        // caller (and the next pass) can retry against the still-persisted state.
-        const removed = removeCompactionMarker(existing);
-        if (!removed) {
-            sessionLog(
-                sessionId,
-                `compaction-marker: failed to remove old boundary at ordinal ${existing.boundaryOrdinal}; preserving persisted state for retry (not injecting new marker this pass)`,
-            );
-            return false;
-        }
-        persistMarkerStateAndDropReplacedTag(db, sessionId, null, removedSummaryMessageId);
-        sessionLog(
-            sessionId,
-            `compaction-marker: removed old boundary at ordinal ${existing.boundaryOrdinal}, moving to ${lastCompartmentEnd}`,
-        );
-    }
-
-    const result = injectCompactionMarker({
+    const result = replaceCompactionMarker(existing, {
         sessionId,
         endOrdinal: lastCompartmentEnd,
         endMessageId: targetEndMessageId,

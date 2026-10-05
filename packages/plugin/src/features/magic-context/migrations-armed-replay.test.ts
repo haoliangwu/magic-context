@@ -1,15 +1,17 @@
 /// <reference types="bun-types" />
 
 import { expect, test } from "bun:test";
-import { isAbsolute } from "node:path";
+import { readFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
-    applyMirrorPage,
     ensureContextStoreUuid,
     installAuthorityManagedMarker,
-} from "./context-authority";
+} from "./legacy-authority-fixture.test-support";
 import { getMemoriesByProject, insertMemory } from "./memory/storage-memory";
 import { MIGRATIONS, runMigrations } from "./migrations";
 import { recordSessionProjectIdentity } from "./session-project-storage";
@@ -22,6 +24,8 @@ const PROJECT_PATH = "/armed-migration-replay";
 const V84_SESSION_ID = "armed-replay-session-meta-v84";
 const V85_SESSION_ID = "armed-replay-v85-o2";
 const V85_TWIN_SESSION_ID = "armed-replay-v85-twin";
+const V87_V1_SESSION_ID = "armed-replay-v87-v1-seat";
+const V86_TAG_SESSION_ID = "armed-replay-v86-tag-version";
 const STATE_TABLE_PREDICATE =
     "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
 const MEMORY_REFUSAL = "context.db memory writes are managed by the Rust module";
@@ -42,6 +46,8 @@ interface ReplayState {
     expectedNoteContents: Set<string>;
     memoryMirrorCursor: number;
     nextModuleMemoryId: number;
+    /** Path of the OpenCode store built for v87, once that populate step has run. */
+    openCodeStorePath: string | null;
 }
 
 function installMigrationLedgerFromSource(db: DatabaseType): void {
@@ -115,6 +121,24 @@ const CLAIMED_ARM_SIGNATURES = [
         table: "session_meta",
         column: "session_id",
         like: V84_SESSION_ID,
+    },
+    {
+        arm: "populateHarnessMislabelsAtV84",
+        table: "session_meta",
+        column: "session_id",
+        like: V85_SESSION_ID,
+    },
+    {
+        arm: "populateHarnessEvidenceAtV86",
+        table: "session_meta",
+        column: "session_id",
+        like: V87_V1_SESSION_ID,
+    },
+    {
+        arm: "populateTagVersionSessionAtV86",
+        table: "tags",
+        column: "session_id",
+        like: V86_TAG_SESSION_ID,
     },
 ] as const;
 
@@ -240,7 +264,7 @@ function assertV84SessionMetaArm(db: DatabaseType): void {
     expect(getPersistedEpochFloor(db, V84_SESSION_ID)).toBeNull();
 }
 
-function populateV85MislabelsAtV84(db: DatabaseType): void {
+function populateHarnessMislabelsAtV84(db: DatabaseType): void {
     db.exec(`
         INSERT INTO session_meta (session_id, harness, counter)
         VALUES ('${V85_SESSION_ID}', 'opencode2', 2);
@@ -251,75 +275,216 @@ function populateV85MislabelsAtV84(db: DatabaseType): void {
     `);
 }
 
-function assertV85RelabelArm(db: DatabaseType): void {
+function assertV85InertArm(db: DatabaseType): void {
+    // v85 is inert since v87: the rows it used to rewrite must survive it
+    // untouched, so the OpenCode store gets to decide them one migration later.
     expect(
         db
             .prepare("SELECT harness, counter FROM session_meta WHERE session_id = ?")
             .get(V85_SESSION_ID),
-    ).toEqual({ harness: "opencode", counter: 2 });
+    ).toEqual({ harness: "opencode2", counter: 2 });
+    expect(
+        db
+            .prepare(
+                "SELECT harness, project_path FROM session_projects WHERE session_id = ? ORDER BY harness",
+            )
+            .all(V85_TWIN_SESSION_ID),
+    ).toEqual([
+        { harness: "opencode", project_path: "/old" },
+        { harness: "opencode2", project_path: "/new" },
+    ]);
+}
+
+function populateTagVersionSessionAtV86(db: DatabaseType): void {
+    db.prepare(
+        "INSERT INTO tags (session_id, message_id, type, byte_size, tag_number, harness) VALUES (?, ?, 'message', 1, 1, 'opencode')",
+    ).run(V86_TAG_SESSION_ID, `${V86_TAG_SESSION_ID}:m0`);
+}
+
+function assertV86TagVersionArm(db: DatabaseType): void {
+    // The v86 triggers count tag identity changes per session; a row inserted
+    // right after v86 applied must already be counted.
+    expect(
+        db
+            .prepare("SELECT tags_version FROM session_meta WHERE session_id = ?")
+            .get(V86_TAG_SESSION_ID),
+    ).toEqual({ tags_version: 1 });
+}
+
+/**
+ * Give v87 the OpenCode store it decides harness labels from: one session last
+ * written by an OpenCode 2.x host and one last written by an OpenCode 1.18.x
+ * host. The store is built from the shapes captured from those real binaries, so
+ * the walk reads the schema OpenCode actually writes.
+ */
+function populateHarnessEvidenceAtV86(db: DatabaseType, state: ReplayState): void {
+    db.prepare(
+        "INSERT INTO session_meta (session_id, harness, counter) VALUES (?, 'opencode2', 3)",
+    ).run(V87_V1_SESSION_ID);
+
+    const shape = (
+        JSON.parse(
+            readFileSync(join(import.meta.dir, "__fixtures__/opencode-store-shapes.json"), "utf8"),
+        ) as {
+            shapes: Record<string, { tables: string[]; ddl: Record<string, string> }>;
+        }
+    ).shapes.migrated_v1_v2;
+    if (!shape) throw new Error("captured store shapes are missing migrated_v1_v2");
+
+    const storePath = join(
+        createTestTempDirFromPath(
+            join(process.env.MAGIC_CONTEXT_TEST_DATA_DIR as string, "armed-host-"),
+        ),
+        "opencode.db",
+    );
+    const store = new Database(storePath);
+    try {
+        for (const table of shape.tables) {
+            const ddl = shape.ddl[table];
+            if (ddl) store.exec(ddl);
+        }
+        const insertV1Session = store.prepare(
+            `INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+             VALUES (?, 'global', 'armed', '/armed', 'armed', '1.18.30', ?, ?)`,
+        );
+        const insertV2Session = store.prepare(
+            `INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated)
+             VALUES (?, 'global', 'armed', '/armed', '2.0.7', ?, ?)`,
+        );
+        const insertV2Message = store.prepare(
+            `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?, ?, 'user', 1, ?, ?, '{}')`,
+        );
+        const insertV1Message = store.prepare(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, '{}')",
+        );
+        for (const sessionId of [V85_SESSION_ID, V85_TWIN_SESSION_ID]) {
+            insertV1Session.run(sessionId, 1_000, 1_000);
+            insertV2Session.run(sessionId, 1_000, 1_000);
+            insertV2Message.run(`${sessionId}-sm`, sessionId, 9_000, 9_000);
+        }
+        insertV1Session.run(V87_V1_SESSION_ID, 2_000, 2_000);
+        insertV1Message.run(`${V87_V1_SESSION_ID}-m`, V87_V1_SESSION_ID, 8_000, 8_000);
+    } finally {
+        store.close();
+    }
+
+    state.openCodeStorePath = storePath;
+    process.env.OPENCODE_DB = storePath;
+    resetOpenCodeDbPathStateForTesting();
+}
+
+function assertV87RelabelArm(db: DatabaseType): void {
+    // Each session lands on the OpenCode generation that wrote it most recently,
+    // in both directions. Where both labels already hold a row for the same
+    // session and key, the newer of the two rows survives.
+    expect(
+        db
+            .prepare("SELECT harness, counter FROM session_meta WHERE session_id = ?")
+            .get(V85_SESSION_ID),
+    ).toEqual({ harness: "opencode2", counter: 2 });
     expect(
         db
             .prepare("SELECT harness, project_path FROM session_projects WHERE session_id = ?")
             .all(V85_TWIN_SESSION_ID),
-    ).toEqual([{ harness: "opencode", project_path: "/new" }]);
+    ).toEqual([{ harness: "opencode2", project_path: "/new" }]);
     expect(
-        db.prepare("SELECT COUNT(*) AS count FROM session_meta WHERE harness = 'opencode2'").get(),
-    ).toEqual({ count: 0 });
+        db.prepare("SELECT harness FROM session_meta WHERE session_id = ?").get(V87_V1_SESSION_ID),
+    ).toEqual({ harness: "opencode" });
+}
+
+const V88_SESSION_ID = "ses-v88-coordinates";
+
+/**
+ * Give v88 a session that already stores conversational coordinates, so the
+ * columns it adds land on populated rows rather than an empty table.
+ */
+function populateCoordinateSessionAtV87(db: DatabaseType): void {
+    db.prepare(
+        "INSERT INTO session_meta (session_id, harness, counter, prior_boundary_ordinal) VALUES (?, 'opencode', 1, 4)",
+    ).run(V88_SESSION_ID);
+    db.prepare(
+        `INSERT INTO compartments
+            (session_id, sequence, start_message, end_message, start_message_id, end_message_id,
+             title, content, importance, legacy, created_at, harness)
+         VALUES (?, 1, 1, 4, 'msg-start', 'msg-end', 'title', 'body', 50, 0, 1000, 'opencode')`,
+    ).run(V88_SESSION_ID);
+    db.prepare(
+        `INSERT INTO recomp_compartments
+            (session_id, sequence, start_message, end_message, start_message_id, end_message_id,
+             title, content, importance, pass_number, created_at, harness)
+         VALUES (?, 1, 1, 4, 'msg-start', 'msg-end', 'title', 'body', 50, 1, 1000, 'opencode')`,
+    ).run(V88_SESSION_ID);
+}
+
+function assertV88CoordinateArm(db: DatabaseType): void {
+    // Existing compartments are usable immediately (NOT NULL DEFAULT backfills
+    // them), while the session's projection stays unrecorded so only the runtime
+    // rebase decides it.
+    expect(
+        db
+            .prepare("SELECT rebase_status FROM compartments WHERE session_id = ?")
+            .get(V88_SESSION_ID),
+    ).toEqual({ rebase_status: "ok" });
+    expect(
+        db
+            .prepare("SELECT rebase_status FROM recomp_compartments WHERE session_id = ?")
+            .get(V88_SESSION_ID),
+    ).toEqual({ rebase_status: "ok" });
+    expect(
+        db
+            .prepare(
+                "SELECT coordinate_generation AS generation FROM session_meta WHERE session_id = ?",
+            )
+            .get(V88_SESSION_ID),
+    ).toEqual({ generation: null });
+}
+
+function assertV91EmbeddingWatermarkArm(db: DatabaseType): void {
+    // The mark starts empty on an upgraded install: no other writer has produced a
+    // memory yet, so there is no backlog to claim. It must also accept a row — an
+    // upgrade that created an unusable table would look identical until the first
+    // module-written memory arrived.
+    expect(db.prepare("SELECT COUNT(*) AS count FROM memory_embedding_watermarks").get()).toEqual({
+        count: 0,
+    });
+    db.prepare(
+        `INSERT INTO memory_embedding_watermarks
+            (project_path, written_memory_id, embedded_memory_id, updated_at)
+         VALUES ('git:armed-replay', 9, 4, 1)`,
+    ).run();
+    expect(
+        db
+            .prepare(
+                "SELECT written_memory_id, embedded_memory_id FROM memory_embedding_watermarks WHERE project_path = 'git:armed-replay'",
+            )
+            .get(),
+    ).toEqual({ written_memory_id: 9, embedded_memory_id: 4 });
+    db.prepare(
+        "DELETE FROM memory_embedding_watermarks WHERE project_path = 'git:armed-replay'",
+    ).run();
 }
 
 function populateModuleOwnedRows(db: DatabaseType, version: number, state: ReplayState): void {
-    if (!state.contextStoreUuid) throw new Error("armed replay has no context store identity");
-
     const memoryContent = `module memory populated after v${version}`;
     const noteContent = `module note populated after v${version}`;
-    const nextCursor = state.memoryMirrorCursor + 1;
-    applyMirrorPage({
-        db,
-        page: {
-            domain: "memories",
-            cursor: state.memoryMirrorCursor,
-            next_cursor: nextCursor,
-            has_more: false,
-            rows: [
-                {
-                    feed_seq: nextCursor,
-                    domain: "memories",
-                    op: "insert",
-                    module_row_id: state.nextModuleMemoryId,
-                    content_hash: `module-memory-hash-v${version}`,
-                    full_row_snapshot: {
-                        context_store_uuid: state.contextStoreUuid,
-                        project_path: PROJECT_PATH,
-                        category: "CONSTRAINTS",
-                        content: memoryContent,
-                        normalized_hash: `module-memory-hash-v${version}`,
-                        importance: 50,
-                        scope: "project",
-                        shareable: 0,
-                        source_type: "historian",
-                        seen_count: 1,
-                        retrieval_count: 0,
-                        first_seen_at: version,
-                        created_at: version,
-                        updated_at: version,
-                        last_seen_at: version,
-                        status: "active",
-                        verification_status: "unverified",
-                    },
-                },
-            ],
-        },
-    });
     withPrivilegedWriter(db, () => {
+        db.prepare(`INSERT INTO memories(project_path, category, content, normalized_hash, source_type, first_seen_at, last_seen_at, created_at, updated_at)
+            VALUES (?, 'CONSTRAINTS', ?, ?, 'historian', ?, ?, ?, ?)`).run(
+            PROJECT_PATH,
+            memoryContent,
+            `module-memory-hash-v${version}`,
+            version,
+            version,
+            version,
+            version,
+        );
         addNote(db, "smart", {
             projectPath: PROJECT_PATH,
             content: noteContent,
             surfaceCondition: "always",
         });
     });
-
-    state.memoryMirrorCursor = nextCursor;
-    state.nextModuleMemoryId += 1;
     state.expectedMemoryContents.add(memoryContent);
     state.expectedNoteContents.add(noteContent);
     assertPrivilegeClosed(db);
@@ -446,12 +611,103 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
         case 84:
             if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
             assertV84SessionMetaArm(db);
-            populateV85MislabelsAtV84(db);
+            populateHarnessMislabelsAtV84(db);
             populateModuleOwnedRows(db, version, state);
             return;
         case 85:
             if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
-            assertV85RelabelArm(db);
+            assertV85InertArm(db);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 86:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            populateTagVersionSessionAtV86(db);
+            assertV86TagVersionArm(db);
+            populateHarnessEvidenceAtV86(db, state);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 87:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            assertV87RelabelArm(db);
+            populateCoordinateSessionAtV87(db);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 88:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            assertV88CoordinateArm(db);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 89:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                (
+                    db.prepare("PRAGMA table_info(message_fts_rowid_map)").all() as Array<{
+                        name: string;
+                    }>
+                ).map((column) => column.name),
+            ).toContain("message_time_ms");
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 90:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                (
+                    db.prepare("PRAGMA table_info(compartment_state_lease)").all() as Array<{
+                        name: string;
+                    }>
+                ).map((column) => column.name),
+            ).toContain("owner_pid");
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 91:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            assertV91EmbeddingWatermarkArm(db);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 92:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(db.prepare("SELECT id, state FROM single_store_state").all()).toEqual([
+                { id: 1, state: "required" },
+            ]);
+            populateModuleOwnedRows(db, version, state);
+            return;
+        case 93:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'compartment_history_%' ORDER BY name",
+                    )
+                    .all(),
+            ).toEqual([
+                { name: "compartment_history_ad" },
+                { name: "compartment_history_ai" },
+                { name: "compartment_history_au" },
+            ]);
+            populateModuleOwnedRows(db, version, state);
+            expect(
+                db
+                    .prepare(
+                        "SELECT count(*) AS n FROM compartments c LEFT JOIN compartment_history_versions v ON v.session_id=c.session_id WHERE v.session_id IS NULL",
+                    )
+                    .get(),
+            ).toEqual({ n: 0 });
+            return;
+        case 94:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            // The LKG prefix and the trailing-blank decisions live in their own tables.
+            expect(
+                (db.prepare("PRAGMA table_info(lkg_slots)").all() as Array<{ name: string }>).map(
+                    (column) => column.name,
+                ),
+            ).not.toContain("json_prefix");
+            expect(
+                db
+                    .prepare(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('lkg_slot_chunks', 'session_replay_decisions') ORDER BY name",
+                    )
+                    .all(),
+            ).toEqual([{ name: "lkg_slot_chunks" }, { name: "session_replay_decisions" }]);
             populateModuleOwnedRows(db, version, state);
             return;
         default:
@@ -499,7 +755,9 @@ test("every migration lands on populated rows and v72+ stores stay armed", () =>
         expectedNoteContents: new Set(),
         memoryMirrorCursor: 0,
         nextModuleMemoryId: 1,
+        openCodeStorePath: null,
     };
+    const originalOpenCodeDb = process.env.OPENCODE_DB;
 
     try {
         initializeDatabase(db);
@@ -522,5 +780,8 @@ test("every migration lands on populated rows and v72+ stores stay armed", () =>
         );
     } finally {
         closeQuietly(db);
+        if (originalOpenCodeDb === undefined) delete process.env.OPENCODE_DB;
+        else process.env.OPENCODE_DB = originalOpenCodeDb;
+        resetOpenCodeDbPathStateForTesting();
     }
 });

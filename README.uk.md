@@ -235,7 +235,6 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 | `/ctx-status` | Debug view: tags, pending drops, cache TTL, nudge state, прогрес historian, покриття компартментів, бюджет історії |
 | `/ctx-flush` | Негайно примусово виконати всі операції в черзі, оминаючи cache TTL |
 | `/ctx-recomp` | Перебудувати компартменти із сирої історії (приймає діапазон `start-end`). Використовуйте, коли збережений стан здається неправильним |
-| `/ctx-session-upgrade` | Оновити цю сесію до найновішого формату історії: перебудувати компартменти і мігрувати пам'ять проєкту |
 | `/ctx-dream` | Запустити обслуговування dreamer на вимогу: пам'ять, docs, smart notes і user-profile review |
 
 ---

@@ -28,7 +28,10 @@ export function registerCtxDreamCommand(
 		dreamerEnabled?: boolean;
 		resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
 		onProjectSeen?: (projectIdentity: string) => void;
-		ensureRegistered?: (ctx: { cwd: string }) => void | Promise<void>;
+		ensureRegistered?: (ctx: {
+			cwd: string;
+			modelRegistry?: { find(provider: string, modelId: string): unknown };
+		}) => void | Promise<void>;
 		registrationOwner: object;
 	},
 ): void {
@@ -111,77 +114,108 @@ export function registerCtxDreamCommand(
 			);
 
 			// Dreamer v2: run due/forced tasks now via the per-task scheduler.
-			try {
-				await deps.ensureRegistered?.(ctx);
-				const result = await runPiDreamForProject(
-					project.projectIdentity,
-					task,
-					deps.registrationOwner,
-				);
-				const lines: string[] = [];
-				if (result.ran.length > 0) lines.push(`Ran: ${result.ran.join(", ")}`);
-				if ((result.details?.length ?? 0) > 0) {
-					lines.push(
-						"Details:",
-						...(result.details ?? []).map((detail) => `- ${detail}`),
+			const run = async () => {
+				try {
+					await deps.ensureRegistered?.(ctx);
+					const result = await runPiDreamForProject(
+						project.projectIdentity,
+						task,
+						deps.registrationOwner,
 					);
-				}
-				if (result.failed.length > 0)
-					lines.push(`Failed: ${result.failed.join(", ")}`);
-				if ((result.failureDetails?.length ?? 0) > 0) {
-					lines.push(
-						"Failure details:",
-						...(result.failureDetails ?? []).map((detail) => `- ${detail}`),
+					const backlogAfter = getDreamTaskBacklogs(
+						deps.db,
+						project.projectIdentity,
+						backlogTasks,
 					);
-				}
-				if (result.skippedNoWork.length > 0)
-					lines.push(`Skipped (no work): ${result.skippedNoWork.join(", ")}`);
-				if (result.deferredBusy.length > 0)
-					lines.push(
-						// "Busy" means the task's DOMAIN lease is held — usually
-						// a sibling task (e.g. a scheduled verify blocking a
-						// manual curate), not this task itself.
-						`Busy: ${result.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
-					);
-				if (Object.keys(result.backlogAfter ?? {}).length > 0) {
-					lines.push(
-						"",
-						"Backlog at run end:",
-						formatDreamTaskBacklogs(result.backlogAfter),
-					);
-				}
-				if (lines.length === 0) lines.push("No enabled dream tasks to run.");
+					const lines: string[] = [];
+					if (result.ran.length > 0)
+						lines.push(`Ran: ${result.ran.join(", ")}`);
+					if ((result.details?.length ?? 0) > 0) {
+						lines.push(
+							"Details:",
+							...(result.details ?? []).map((detail) => `- ${detail}`),
+						);
+					}
+					if (result.failed.length > 0)
+						lines.push(`Failed: ${result.failed.join(", ")}`);
+					if ((result.failureDetails?.length ?? 0) > 0) {
+						lines.push(
+							"Failure details:",
+							...(result.failureDetails ?? []).map((detail) => `- ${detail}`),
+						);
+					}
+					if (result.skippedNoWork.length > 0)
+						lines.push(`Skipped (no work): ${result.skippedNoWork.join(", ")}`);
+					if (result.skipped?.length)
+						lines.push(`Skipped: ${result.skipped.join("; ")}`);
+					if (result.deferredBusy.length > 0)
+						lines.push(
+							// "Busy" means the task's DOMAIN lease is held — usually
+							// a sibling task (e.g. a scheduled verify blocking a
+							// manual curate), not this task itself.
+							`Busy: ${result.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
+						);
+					if (Object.keys(backlogAfter).length > 0) {
+						lines.push(
+							"",
+							"Backlog at run end:",
+							formatDreamTaskBacklogs(backlogAfter, backlogTasks),
+						);
+					}
+					if (lines.length === 0) lines.push("No enabled dream tasks to run.");
 
-				sendStatus(
-					{
-						title: "/ctx-dream",
-						text: ["## /ctx-dream", "", ...lines].join("\n"),
-						level: result.ran.length > 0 ? "success" : "info",
-						rpcDisplay: "dialog",
-					},
-					{
-						projectDir: project.projectDir,
-						projectIdentity: project.projectIdentity,
-					},
-				);
-			} catch (error) {
-				sessionLog(
-					project.projectIdentity,
-					`/ctx-dream failed code=${userFacingFailureCode("dream_unknown")}`,
-					error,
-				);
-				sendStatus(
-					{
-						title: "/ctx-dream",
-						text: renderUserFacingFailure("dream_unknown"),
-						level: "error",
-					},
-					{
-						projectDir: project.projectDir,
-						projectIdentity: project.projectIdentity,
-					},
-				);
+					sendStatus(
+						{
+							title: "/ctx-dream",
+							text: ["## /ctx-dream", "", ...lines].join("\n"),
+							level: result.ran.length > 0 ? "success" : "info",
+							rpcDisplay: "dialog",
+						},
+						{
+							projectDir: project.projectDir,
+							projectIdentity: project.projectIdentity,
+						},
+					);
+				} catch (error) {
+					sessionLog(
+						project.projectIdentity,
+						`/ctx-dream failed code=${userFacingFailureCode("dream_unknown")}`,
+						error,
+					);
+					sendStatus(
+						{
+							title: "/ctx-dream",
+							text: renderUserFacingFailure("dream_unknown"),
+							level: "error",
+						},
+						{
+							projectDir: project.projectDir,
+							projectIdentity: project.projectIdentity,
+						},
+					);
+				}
+			};
+
+			// In interactive Pi the command handler IS the user's turn, so
+			// awaiting a dream run (up to 30 minutes per task) would freeze the
+			// REPL. Run it detached, like /ctx-recomp, and report the outcome
+			// through the same status messages when it ends. The manual run is
+			// tracked per registration owner, so session_shutdown still aborts
+			// and drains it. Without a UI (print mode) the command is the whole
+			// invocation and the process exits once it returns, so it waits.
+			if (ctx.hasUI) {
+				void run().catch((error) => {
+					// Reporting the outcome failed (for example a stale context
+					// after a session switch); nothing awaits this promise.
+					sessionLog(
+						project.projectIdentity,
+						"/ctx-dream report failed",
+						error,
+					);
+				});
+				return;
 			}
+			await run();
 		},
 	});
 }

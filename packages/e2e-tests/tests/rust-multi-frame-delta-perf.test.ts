@@ -168,15 +168,17 @@ describe.skipIf(!rustPrereqs.ok)("rust transport: large tail delta", () => {
         );
         expect(missedBusts).toEqual([]);
         expect(smallDeltas.every((pass) => pass.applied)).toBe(true);
-        // The fixed guard budget belongs to the synthetic payload size. A replay
-        // can carry much larger tool payloads; its measured timings stay in the report.
-        if (!replayDb) expect(smallDelta.prefixGuardMs).toBeLessThan(10);
-        expect(smallDelta.stateSyncMs).toBeLessThan(15);
-        expect(smallDelta.wireBuildMs).toBeLessThan(10);
+        // Steady updates must resolve message positions and serialize only the new
+        // tail, not the 2,000-message history. Shared runners cannot enforce ms limits.
+        expect(smallDeltas.every((pass) => /ordinal_mode:incremental\b/.test(pass.raw))).toBe(true);
+        expect(smallDeltas.every((pass) => {
+            const rows = /\bordinal_rows:(\d+)\b/.exec(pass.raw);
+            return rows !== null && Number(rows[1]) > 0 && Number(rows[1]) <= 4;
+        })).toBe(true);
         // The hermetic daemon uses ck-mc over external TCP, which can add scheduling overhead.
         // Apply timing limits only in strict production-like environments; enforce message,
         // page-count, and payload-size limits in every environment.
-        if (process.env.MC_RUST_E2E_STRICT_PERF === "1") {
+        if (process.env.MC_PERF_GATE === "1") {
             expect(smallDelta.transportMs).toBeLessThan(STRICT_TRANSPORT_BUDGET_MS);
             expect(smallDelta.adapterElapsedMs).toBeLessThan(100);
         } else {
@@ -188,9 +190,9 @@ describe.skipIf(!rustPrereqs.ok)("rust transport: large tail delta", () => {
                 `[rust-e2e] strict transport gate=off observed_ms=${smallDelta.transportMs} strict_budget_ms=30`,
             );
         }
-        expect(smallDeltas.every((pass) => pass.wireMessages <= 4)).toBe(true);
+        expect(smallDeltas.every((pass) => pass.wireMessages > 0 && pass.wireMessages <= 4)).toBe(true);
         expect(smallDeltas.every((pass) => pass.transportPages === 1)).toBe(true);
-        // Steady-state deltas are a few KB; "small" is bounded against the ballast, not the cap.
+        // Small steady-state deltas carry only a few KB, not the entire history.
         expect(smallDeltas.every((pass) => pass.transportBytes < 160_000)).toBe(true);
 
         // SOFT+ may reuse the caller-owned tail in one small module request or retransmit the
@@ -202,6 +204,8 @@ describe.skipIf(!rustPrereqs.ok)("rust transport: large tail delta", () => {
         expect(largeTailDelta.transportPages).toBeGreaterThanOrEqual(1);
         expect(largeTailDelta.transportPages).toBeLessThanOrEqual(6);
         expect(largeTailDelta.wireMessages).toBeLessThanOrEqual(4);
+        expect(largeTailDelta.raw).toMatch(/ordinal_mode:incremental\b/);
+        expect(Number(/\bordinal_rows:(\d+)\b/.exec(largeTailDelta.raw)?.[1])).toBeLessThanOrEqual(4);
         expect(largeTailDelta.transportBytes).toBeGreaterThan(160_000);
         if (largeTailDelta.transportPages === 1) {
             expect(largeTailDelta.transportBytes).toBeLessThanOrEqual(MODULE_PAGE_MAX_BYTES);

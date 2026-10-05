@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 /**
  * `announcement.ts` reads/writes a single `last_announced_version` file under
@@ -23,7 +24,7 @@ let tmpRoot = "";
 let originalXdg: string | undefined;
 
 beforeEach(() => {
-    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mc-announcement-test-"));
+    tmpRoot = createTestTempDirFromPath(path.join(os.tmpdir(), "mc-announcement-test-"));
     originalXdg = process.env.XDG_DATA_HOME;
     process.env.XDG_DATA_HOME = tmpRoot;
 });

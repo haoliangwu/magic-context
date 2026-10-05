@@ -26,7 +26,7 @@ import {
 } from "../src/served-array-ledger";
 
 type Json = Record<string, unknown>;
-type Verdict = "BASE" | "BUST" | "STABLE";
+type Verdict = "BASE" | "BUST" | "STABLE" | "UNMETERED";
 
 interface Args {
 	sessionPrefix: string;
@@ -88,6 +88,8 @@ export interface AnalysisRow {
 	divergenceIndex: number;
 	divergenceClass?: CacheBustDivergenceClass;
 	decision?: CacheBustDecisionAttribution;
+	previousModel?: string;
+	currentModel?: string;
 }
 
 export interface PiCacheBustAnalysisOptions {
@@ -477,6 +479,10 @@ export function nearestPiPassDecision(
 	)[0];
 }
 
+function isUsageMissing(pass: JoinedPass): boolean {
+	return pass.usage.cacheRead === 0 && pass.usage.input === 0;
+}
+
 export function analyzeJoinedPasses(
 	joined: readonly JoinedPass[],
 	options: {
@@ -486,9 +492,23 @@ export function analyzeJoinedPasses(
 ): AnalysisRow[] {
 	let previousBust = false;
 	let previousBustDivergenceIndex: number | undefined;
-	return joined.map((current, index) => {
+	let previousMetered: JoinedPass | undefined;
+	return joined.map((current) => {
 		const divergenceIndex = current.ledger.first_divergence_message_index ?? -1;
-		if (index === 0) {
+		if (isUsageMissing(current)) {
+			return {
+				current,
+				previous: previousMetered,
+				verdict: "UNMETERED",
+				attribution: previousMetered
+					? digestAttribution(previousMetered, current)
+					: "usage unavailable",
+				divergenceIndex,
+				divergenceClass: "usage_missing",
+			};
+		}
+		if (!previousMetered) {
+			previousMetered = current;
 			return {
 				current,
 				verdict: "BASE",
@@ -496,7 +516,7 @@ export function analyzeJoinedPasses(
 				divergenceIndex,
 			};
 		}
-		const previous = joined[index - 1];
+		const previous = previousMetered;
 		const prevTotal = previous.usage.total;
 		const meterFloor = prevTotal - Math.max(64, previous.usage.input);
 		const comparableRead = current.usage.cacheRead + current.usage.input;
@@ -564,8 +584,17 @@ export function analyzeJoinedPasses(
 			),
 			...current.intervening.map((entry) => entry.toolName ?? entry.type),
 		].join("\n");
+		// A first divergence at or past the previous body's length is a pure append:
+		// every byte the provider could have reused is unchanged, so a short read on
+		// that request is the provider serving a shallower prefix entry (seen after an
+		// unmetered, failed request on openai-codex), not a prompt rewrite by MC.
+		const pureAppend =
+			bodyDivergence !== undefined &&
+			previousBody !== undefined &&
+			bodyDivergence.index >= previousBody.messages.length;
 		const divergenceClass = bust
 			? classifyCacheBust({
+					providerShortReadWithIdenticalPrefix: pureAppend,
 					divergenceIndex,
 					previousMessageCount:
 						previousBody?.messages.length ?? previous.ledger.message_count,
@@ -581,6 +610,11 @@ export function analyzeJoinedPasses(
 						: undefined,
 					rewrittenTokens,
 					promptTokens: prevTotal,
+					providerComparableRead: current.usage.cacheRead,
+					directInput: current.usage.input,
+					previousTotal: prevTotal,
+					previousModel: previousBody?.wireModel,
+					currentModel: currentBody?.wireModel,
 					contentEvidence,
 					compactionSeam,
 					inheritedFold: attributionDecision !== decision,
@@ -588,6 +622,7 @@ export function analyzeJoinedPasses(
 				})
 			: undefined;
 		previousBustDivergenceIndex = bust ? divergenceIndex : undefined;
+		previousMetered = current;
 		return {
 			current,
 			previous,
@@ -596,6 +631,8 @@ export function analyzeJoinedPasses(
 			meterFloor,
 			comparableRead,
 			rewrittenTokens,
+			previousModel: previousBody?.wireModel,
+			currentModel: currentBody?.wireModel,
 			attribution,
 			divergenceIndex,
 			divergenceClass,
@@ -707,6 +744,7 @@ export async function analyzePiCacheBustSession(
 		];
 	});
 	const analyzedRequestTimestamps = selected.usage
+		.filter((usage) => usage.cacheRead !== 0 || usage.input !== 0)
 		.map((usage) => usage.timestamp)
 		.filter(inWindow);
 	return {
@@ -729,7 +767,13 @@ function meterCell(row: AnalysisRow): string {
 		row.rewrittenTokens === undefined
 			? ""
 			: `; rewritten≈${row.rewrittenTokens.toLocaleString()}`;
-	return `read=${row.current.usage.cacheRead.toLocaleString()} + input=${row.current.usage.input.toLocaleString()} = ${row.comparableRead?.toLocaleString()}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()})${rewritten}`;
+	const wireModel =
+		row.previousModel &&
+		row.currentModel &&
+		row.previousModel !== row.currentModel
+			? `; wireModel=${row.previousModel} → ${row.currentModel}`
+			: "";
+	return `read=${row.current.usage.cacheRead.toLocaleString()} + input=${row.current.usage.input.toLocaleString()} = ${row.comparableRead?.toLocaleString()}; floor=${row.meterFloor?.toLocaleString()} (prevTotal=${row.prevTotal?.toLocaleString()})${rewritten}${wireModel}`;
 }
 
 const HELP = `usage: bun scripts/analyze-pi-cache-busts.ts --session <prefix> [options]

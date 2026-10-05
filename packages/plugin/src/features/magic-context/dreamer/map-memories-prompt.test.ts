@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 
 import {
     buildMapMemoriesPrompt,
@@ -117,7 +118,7 @@ describe("parseMapMemoriesManifest", () => {
 });
 
 describe("extractMemoryCandidatePaths", () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "mc-map-prompt-"));
+    const dir = createTestTempDirFromPath(path.join(tmpdir(), "mc-map-prompt-"));
     writeFileSync(path.join(dir, "real.ts"), "x");
     const sub = path.join(dir, "pkg");
     require("node:fs").mkdirSync(sub, { recursive: true });

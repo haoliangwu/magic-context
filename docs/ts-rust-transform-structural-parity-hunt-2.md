@@ -190,7 +190,7 @@ Fresh wire layout and common-source renderers agree:
 
 The byte producers match on the requested internals: TypeScript `renderM0`, `renderM1WithMetadata`, `renderMemoryUpdatesBlock`, and `compartmentHeading` at `inject-compartments.ts:2012-2059,2471-2684` and `decay-render.ts:62-66`; Rust `render_m0`, `assemble_m1`, `render_memory_updates`, and `compartment_heading` at `memory_render.rs:205-337` and `decay_render.rs:123-136`. Shared cross-language memory/project-doc goldens additionally pin escaping, profile lines, update branches, and ordering.
 
-Rust's optional `<covered-system-messages>` and module-owned `<new-notes>` extensions did not occur in this OpenCode snapshot. They are outside the listed common blocks and remain evidence gaps rather than invented divergences.
+Rust's optional `<covered-system-messages>` extension did not occur in this OpenCode snapshot. It is outside the listed common blocks and remains an evidence gap rather than an invented divergence. (The module's former `<new-notes>` m1 block has since been removed: ready smart notes reach Rust sessions through the host's deferred-notes reminder and `ctx_note read`, as in TypeScript mode.)
 
 ### 7. Additional differ output
 

@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as logger from "../../shared/logger";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 const PACKAGE_NAME = "@cortexkit/opencode-magic-context";
 const hasExplicitNonExactPluginVersion = (spec: string) =>
@@ -61,7 +62,7 @@ async function waitForCalls(fn: { mock: { calls: unknown[] } }, minCalls = 1): P
 const tempDirs: string[] = [];
 
 function makeTempStorageDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-auto-update-test-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-auto-update-test-"));
     tempDirs.push(dir);
     return dir;
 }

@@ -235,7 +235,6 @@ Nhớ lại hoạt động **xuyên phiên** (phiên mới thừa hưởng mọi
 | `/ctx-status` | Màn hình debug: tags, pending drops, cache TTL, trạng thái nudge, tiến độ historian, độ phủ khoang, ngân sách lịch sử |
 | `/ctx-flush` | Buộc tất cả thao tác đang xếp hàng chạy ngay, bỏ qua cache TTL |
 | `/ctx-recomp` | Dựng lại khoang từ lịch sử thô (nhận khoảng `start-end`). Dùng khi trạng thái lưu trữ có vẻ sai |
-| `/ctx-session-upgrade` | Nâng cấp phiên này lên định dạng lịch sử mới nhất: dựng lại khoang và di chuyển ký ức dự án |
 | `/ctx-dream` | Chạy bảo trì dreamer theo yêu cầu: duy trì bộ nhớ, docs, smart notes và review user-profile |
 
 ---

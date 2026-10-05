@@ -1,0 +1,894 @@
+{
+  "runAt": "2026-10-01T08:40:52.327Z",
+  "callCap": 200,
+  "used": 15,
+  "results": [
+    {
+      "scenario": "openai:age",
+      "route": "openai",
+      "model": "gpt-5-nano",
+      "hostVersion": "1.18.30",
+      "pluginCommit": "7e61ac82fd4af47c6faf9e90d78dd34763daedc7",
+      "startedAt": "2026-10-01T08:38:42.606Z",
+      "finishedAt": "2026-10-01T08:40:52.326Z",
+      "outcome": "completed",
+      "abortReason": null,
+      "calls": [
+        {
+          "index": 1,
+          "at": "2026-10-01T08:40:10.127Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9409,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 0,
+            "cacheWrite": null,
+            "output": 242,
+            "reasoning": 192,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9409,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 0
+              },
+              "output_tokens": 242,
+              "output_tokens_details": {
+                "reasoning_tokens": 192
+              },
+              "total_tokens": 9651
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 46008,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 0
+            }
+          },
+          "durationMs": 4670
+        },
+        {
+          "index": 2,
+          "at": "2026-10-01T08:40:16.117Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9668,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9472,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9668,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9472
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9689
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 48828,
+            "reasoningMap": "R",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 1,
+            "toolResults": 1,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 2292
+        },
+        {
+          "index": 3,
+          "at": "2026-10-01T08:40:19.236Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9704,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9600,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9704,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9600
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9725
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 49051,
+            "reasoningMap": "R-",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 2,
+            "toolResults": 2,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 1451
+        },
+        {
+          "index": 4,
+          "at": "2026-10-01T08:40:21.358Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9740,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9600,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9740,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9600
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9761
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 49274,
+            "reasoningMap": "R--",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 3,
+            "toolResults": 3,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 1425
+        },
+        {
+          "index": 5,
+          "at": "2026-10-01T08:40:23.727Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9776,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9728,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9776,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9728
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9797
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 49497,
+            "reasoningMap": "R---",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 4,
+            "toolResults": 4,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 807
+        },
+        {
+          "index": 6,
+          "at": "2026-10-01T08:40:25.201Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9812,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9728,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9812,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9728
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9833
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 49720,
+            "reasoningMap": "R----",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 5,
+            "toolResults": 5,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 1497
+        },
+        {
+          "index": 7,
+          "at": "2026-10-01T08:40:27.412Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9848,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9728,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9848,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9728
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9869
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 49943,
+            "reasoningMap": "R-----",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 6,
+            "toolResults": 6,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 1498
+        },
+        {
+          "index": 8,
+          "at": "2026-10-01T08:40:30.052Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9884,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9728,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9884,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9728
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9905
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 50166,
+            "reasoningMap": "R------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 7,
+            "toolResults": 7,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 772
+        },
+        {
+          "index": 9,
+          "at": "2026-10-01T08:40:30.994Z",
+          "phase": "turn-1",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9920,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9856,
+            "cacheWrite": null,
+            "output": 5,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9920,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9856
+              },
+              "output_tokens": 5,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9925
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 50390,
+            "reasoningMap": "R-------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 8,
+            "toolResults": 8,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 734
+        },
+        {
+          "index": 10,
+          "at": "2026-10-01T08:40:32.920Z",
+          "phase": "turn-2",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9821,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9344,
+            "cacheWrite": null,
+            "output": 295,
+            "reasoning": 256,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9821,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9344
+              },
+              "output_tokens": 295,
+              "output_tokens_details": {
+                "reasoning_tokens": 256
+              },
+              "total_tokens": 10116
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 50905,
+            "reasoningMap": "R--------",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 8,
+            "toolResults": 8,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 1
+            }
+          },
+          "durationMs": 2498
+        },
+        {
+          "index": 11,
+          "at": "2026-10-01T08:40:35.530Z",
+          "phase": "turn-2",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 10131,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9984,
+            "cacheWrite": null,
+            "output": 8,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 10131,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9984
+              },
+              "output_tokens": 8,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 10139
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 53950,
+            "reasoningMap": "R--------R",
+            "reasoningItems": 2,
+            "emptyReasoning": 0,
+            "toolCalls": 9,
+            "toolResults": 9,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 2
+            }
+          },
+          "durationMs": 795
+        },
+        {
+          "index": 12,
+          "at": "2026-10-01T08:40:37.128Z",
+          "phase": "turn-3",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9895,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9728,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9895,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9728
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9916
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 54172,
+            "reasoningMap": "R--------R-",
+            "reasoningItems": 2,
+            "emptyReasoning": 0,
+            "toolCalls": 9,
+            "toolResults": 9,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 2
+            }
+          },
+          "durationMs": 966
+        },
+        {
+          "index": 13,
+          "at": "2026-10-01T08:40:38.501Z",
+          "phase": "turn-3",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9931,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9856,
+            "cacheWrite": null,
+            "output": 8,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9931,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9856
+              },
+              "output_tokens": 8,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9939
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 54396,
+            "reasoningMap": "R--------R--",
+            "reasoningItems": 2,
+            "emptyReasoning": 0,
+            "toolCalls": 10,
+            "toolResults": 10,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 2
+            }
+          },
+          "durationMs": 1420
+        },
+        {
+          "index": 14,
+          "at": "2026-10-01T08:40:40.360Z",
+          "phase": "turn-4",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 9969,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9856,
+            "cacheWrite": null,
+            "output": 21,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 9969,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9856
+              },
+              "output_tokens": 21,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 9990
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 54618,
+            "reasoningMap": "R--------R---",
+            "reasoningItems": 2,
+            "emptyReasoning": 0,
+            "toolCalls": 10,
+            "toolResults": 10,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 2
+            }
+          },
+          "durationMs": 918
+        },
+        {
+          "index": 15,
+          "at": "2026-10-01T08:40:41.546Z",
+          "phase": "turn-4",
+          "path": "/v1/responses",
+          "model": "gpt-5-nano",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 10005,
+            "inputField": "input_tokens (includes cached)",
+            "cachedRead": 9856,
+            "cacheWrite": null,
+            "output": 8,
+            "reasoning": 0,
+            "cost": null,
+            "raw": {
+              "input_tokens": 10005,
+              "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 9856
+              },
+              "output_tokens": 8,
+              "output_tokens_details": {
+                "reasoning_tokens": 0
+              },
+              "total_tokens": 10013
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 54842,
+            "reasoningMap": "R--------R----",
+            "reasoningItems": 2,
+            "emptyReasoning": 0,
+            "toolCalls": 11,
+            "toolResults": 11,
+            "flags": {
+              "store": false,
+              "include": [
+                "reasoning.encrypted_content"
+              ],
+              "reasoning": {
+                "effort": "low",
+                "summary": "auto"
+              },
+              "previousResponseId": null,
+              "itemReferences": 0,
+              "encryptedReasoning": 2
+            }
+          },
+          "durationMs": 702
+        }
+      ],
+      "removalLog": [
+        "[2026-10-01T08:40:02.517Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=1 fetched=0",
+        "[2026-10-01T08:40:02.590Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL APPLY — reason=m0_hard_fold (drain folded into executed m[0] bust, scheduler=defer), pendingOps=0, context=3.3%",
+        "[2026-10-01T08:40:02.591Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=applyPendingOperations elapsed=0.7ms",
+        "[2026-10-01T08:40:02.592Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=applyHeuristicCleanup elapsed=0.9ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0",
+        "[2026-10-01T08:40:15.445Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=3 fetched=0",
+        "[2026-10-01T08:40:15.447Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.5%",
+        "[2026-10-01T08:40:18.905Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=4 fetched=0",
+        "[2026-10-01T08:40:18.969Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:21.243Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.4ms targets=5 fetched=0",
+        "[2026-10-01T08:40:21.244Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:23.363Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=6 fetched=0",
+        "[2026-10-01T08:40:23.364Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:24.775Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=7 fetched=0",
+        "[2026-10-01T08:40:24.776Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:26.963Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=1.6ms targets=8 fetched=0",
+        "[2026-10-01T08:40:26.964Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:29.158Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=9 fetched=0",
+        "[2026-10-01T08:40:29.159Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:30.923Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=10 fetched=0",
+        "[2026-10-01T08:40:30.924Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:32.103Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] command ctx-flush handled via command.execute.before",
+        "[2026-10-01T08:40:32.344Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=13 fetched=0",
+        "[2026-10-01T08:40:32.420Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL APPLY — reason=explicit_flush, pendingOps=0, context=3.6%",
+        "[2026-10-01T08:40:32.421Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=applyPendingOperations elapsed=0.4ms",
+        "[2026-10-01T08:40:32.421Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=applyHeuristicCleanup elapsed=0.3ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0",
+        "[2026-10-01T08:40:35.497Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=14 fetched=0",
+        "[2026-10-01T08:40:35.498Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:36.702Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=16 fetched=0",
+        "[2026-10-01T08:40:36.702Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.7%",
+        "[2026-10-01T08:40:38.318Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=17 fetched=0",
+        "[2026-10-01T08:40:38.319Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.6%",
+        "[2026-10-01T08:40:39.998Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=19 fetched=0",
+        "[2026-10-01T08:40:39.998Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.7%",
+        "[2026-10-01T08:40:41.354Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=20 fetched=0",
+        "[2026-10-01T08:40:41.355Z] [magic-context][ses_f09613983fferk130DM1Q8mK0O] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=3.7%"
+      ],
+      "isolation": {
+        "dbFiles": [
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db",
+          "/private<root>/data/cortexkit/magic-context/context.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db"
+        ],
+        "rootRemoved": true
+      },
+      "summary": {
+        "loopCalls": 15,
+        "rejectedCalls": 0,
+        "firstRemovalCall": null,
+        "acceptedAfterRemoval": null,
+        "callsAfterRemoval": 0,
+        "before": null,
+        "after": null
+      }
+    }
+  ]
+}

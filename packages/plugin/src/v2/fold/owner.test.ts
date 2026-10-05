@@ -108,3 +108,31 @@ test("R3 local same-cut replay and later-cut fresh materialization", async () =>
     expect((await f.supply(12, 30)).submittedSha).not.toBe(first.submittedSha);
     expect(f.count()).toBe(2);
 });
+
+test("unchanged observations preserve persisted identity without rewriting it", async () => {
+    const f = fixture();
+    let writes = 0;
+    const owner = new FoldOwner({
+        get: f.storage.get,
+        set: async (key, value) => {
+            writes++;
+            await f.storage.set(key, value);
+        },
+    });
+    const pending = await f.supply(12);
+    const args = {
+        sessionID: "s",
+        cutSeq: 20,
+        summary: pending.submitted,
+        rendered: f.rendered(pending.submitted),
+        onHard: () => {},
+    };
+    const first = await owner.observe(args);
+    expect(writes).toBe(1);
+    const persisted = await owner.read("s");
+    for (let i = 0; i < 10; i++) expect(await owner.observe(args)).toEqual(first);
+    expect(writes).toBe(1);
+    expect(await owner.read("s")).toEqual(persisted);
+    await owner.observe({ ...args, summary: "different", rendered: f.rendered("different") });
+    expect(writes).toBe(2);
+});

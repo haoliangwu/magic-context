@@ -75,7 +75,11 @@ function readFenceValue(text: string): number | null {
     return values.size === 1 ? ([...values][0] ?? null) : null;
 }
 
-function readFenceFromDist(packageDirectory: string): number | null {
+/**
+ * The schema fence (`LATEST_SUPPORTED_VERSION`) compiled into an installed
+ * plugin package's `dist/`, or null when no single value can be found.
+ */
+export function readFenceFromDist(packageDirectory: string): number | null {
     const distDirectory = join(packageDirectory, "dist");
     if (!existsSync(distDirectory)) return null;
 

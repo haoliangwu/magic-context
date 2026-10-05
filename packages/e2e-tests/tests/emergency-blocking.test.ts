@@ -1,7 +1,11 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 /**
@@ -43,21 +47,20 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
     return false;
 }
 
-let h: TestHarness;
+forEachHost(import.meta.url, "emergency >=95%", (host) => {
+    let h: ScenarioHarness;
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            execute_threshold_percentage: 40,
-        },
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: {
+                execute_threshold_percentage: 40,
+            },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("emergency >=95%", () => {
+    afterAll(async () => {
+        await h.dispose();
+    });
     it(
         "historian is invoked when usage crosses 95%",
         async () => {

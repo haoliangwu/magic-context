@@ -36,3 +36,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+
+# The tool-provider role crates on crates.io depend on subc-protocol from
+# crates.io. Point that at the same sibling source the workspace builds, so
+# their ErrorBody and the module's are one type.
+[patch.crates-io]
+subc-protocol = { path = "../subconscious/crates/subc-protocol" }

@@ -3,13 +3,37 @@
  * All data is fetched from the server plugin via HTTP RPC.
  */
 import { getMagicContextStorageDir } from "../../shared/data-path";
-import { MagicContextRpcClient } from "../../shared/rpc-client";
+import { pluginPackageVersion } from "../../shared/plugin-package-version";
+import { MagicContextRpcClient, RpcServerNotFoundError } from "../../shared/rpc-client";
 import type { EmbedDetail, SidebarSnapshot, StatusDetail } from "../../shared/rpc-types";
+import {
+    checkStatusDetailPayload,
+    type OpenCodeStatusExtras,
+    type StatusCheck,
+    statusRpcFailure,
+} from "../../shared/status-view-check";
 
 export type { EmbedDetail, SidebarSnapshot, StatusDetail };
 
 let rpcClient: MagicContextRpcClient | null = null;
+let rpcClientDirectory: string | null = null;
 let rpcGeneration = 0;
+
+/**
+ * Clients for session directories other than the one the TUI started in.
+ *
+ * OpenCode runs one Magic Context server instance per directory, and each one
+ * writes its RPC discovery file under that directory's hash. A TUI started in
+ * one directory (commonly the home directory) can show a session whose
+ * directory is another project; asking the startup directory's server about
+ * that session returns the startup directory's answer (for the home directory:
+ * no project state at all), so the sidebar and `/ctx-status` showed nothing.
+ * Session-scoped calls therefore go to the client for the session's own
+ * directory. The startup client stays as it is for the notification socket and
+ * the process-wide calls.
+ */
+const sessionDirectoryClients = new Map<string, MagicContextRpcClient>();
+const MAX_SESSION_DIRECTORY_CLIENTS = 16;
 
 /** Initialize the RPC client. Call once on TUI startup. */
 export function initRpcClient(directory: string): void {
@@ -19,6 +43,127 @@ export function initRpcClient(directory: string): void {
     // new generation and abandons its in-flight connect).
     rpcGeneration += 1;
     rpcClient = new MagicContextRpcClient(storageDir, directory);
+    rpcClientDirectory = directory;
+    resetSessionDirectoryClients();
+}
+
+function resetSessionDirectoryClients(): void {
+    for (const client of sessionDirectoryClients.values()) client.reset();
+    sessionDirectoryClients.clear();
+}
+
+/**
+ * The client for the server instance that owns `directory`: the startup client
+ * when the directory is the one the TUI started in (or unknown), otherwise a
+ * client discovering that directory's own server. Null before init.
+ */
+function clientForDirectory(directory: string): MagicContextRpcClient | null {
+    if (!rpcClient) return null;
+    if (!directory || directory === rpcClientDirectory) return rpcClient;
+    const existing = sessionDirectoryClients.get(directory);
+    if (existing) return existing;
+    if (sessionDirectoryClients.size >= MAX_SESSION_DIRECTORY_CLIENTS) {
+        const oldest = sessionDirectoryClients.keys().next().value;
+        if (oldest !== undefined) {
+            sessionDirectoryClients.get(oldest)?.reset();
+            sessionDirectoryClients.delete(oldest);
+        }
+    }
+    // Short resolution: when this directory has no discovery file the caller
+    // falls back to asking every local server (see `callSessionRpc`) instead of
+    // retrying the miss for fifteen seconds.
+    const client = new MagicContextRpcClient(getMagicContextStorageDir(), directory, {
+        resolveAttempts: 2,
+        reresolveAttempts: 1,
+    });
+    sessionDirectoryClients.set(directory, client);
+    return client;
+}
+
+/**
+ * The server the notification socket should subscribe to: the one that owns
+ * the shown session's directory, so a push from the command that session runs
+ * (for example `/ctx-status` asking to open its dialog) reaches this TUI. That
+ * is the startup directory's server when no session is shown or the session is
+ * in the startup directory. A session directory with no discovery file falls
+ * back to the server that claims the session, then to the startup server so
+ * session-less notifications still arrive.
+ */
+export async function resolveNotificationTarget(
+    sessionDirectory: string | null,
+    sessionId: string | null,
+): Promise<{
+    client: MagicContextRpcClient;
+    directory: string;
+    endpoint: { port: number; token: string | null; instanceId: string | null };
+} | null> {
+    const startup = rpcClient;
+    if (!startup) return null;
+    const directory = sessionDirectory ?? "";
+    let client = clientForDirectory(directory) ?? startup;
+    let endpoint = await client.resolveEndpoint();
+    if (!endpoint && client !== startup && sessionId) {
+        const owner = await MagicContextRpcClient.findSessionOwner(
+            getMagicContextStorageDir(),
+            sessionId,
+        );
+        if (owner) {
+            sessionDirectoryClients.get(directory)?.reset();
+            sessionDirectoryClients.set(directory, owner);
+            client = owner;
+            endpoint = await owner.resolveEndpoint();
+        }
+    }
+    if (endpoint) {
+        return {
+            client,
+            directory: client === startup ? (rpcClientDirectory ?? "") : directory,
+            endpoint,
+        };
+    }
+    if (client === startup) return null;
+    const startupEndpoint = await startup.resolveEndpoint();
+    return startupEndpoint
+        ? { client: startup, directory: rpcClientDirectory ?? "", endpoint: startupEndpoint }
+        : null;
+}
+
+/** The directory whose server a notification subscription for `sessionDirectory` targets first. */
+export function notificationDirectoryFor(sessionDirectory: string | null): string {
+    const directory = sessionDirectory ?? "";
+    if (!directory || directory === rpcClientDirectory) return rpcClientDirectory ?? "";
+    return directory;
+}
+
+/**
+ * Call a session-scoped RPC on the server that owns the session's directory.
+ * When no server is filed under that directory (the host spelled it in a way
+ * the canonical form still does not match), every live local server is asked
+ * whether it owns the session, and the owner, if any, answers this call and
+ * later ones for the directory. Only when no server claims the session does
+ * the call fail as before.
+ */
+async function callSessionRpc<T>(
+    directory: string,
+    sessionId: string,
+    method: string,
+    params: Record<string, unknown>,
+): Promise<T> {
+    const client = clientForDirectory(directory);
+    if (!client) throw new Error("RPC client is not initialized");
+    try {
+        return await client.call<T>(method, params);
+    } catch (error) {
+        if (!(error instanceof RpcServerNotFoundError) || client === rpcClient) throw error;
+        const owner = await MagicContextRpcClient.findSessionOwner(
+            getMagicContextStorageDir(),
+            sessionId,
+        );
+        if (!owner) throw error;
+        sessionDirectoryClients.get(directory)?.reset();
+        sessionDirectoryClients.set(directory, owner);
+        return owner.call<T>(method, params);
+    }
 }
 
 export function getRpcGeneration(): number {
@@ -38,6 +183,8 @@ export function closeRpc(): void {
     rpcGeneration += 1;
     rpcClient?.reset();
     rpcClient = null;
+    rpcClientDirectory = null;
+    resetSessionDirectoryClients();
 }
 
 const EMPTY_SNAPSHOT: SidebarSnapshot = {
@@ -134,10 +281,15 @@ export async function loadSidebarSnapshot(
     const empty: SidebarSnapshot = { ...EMPTY_SNAPSHOT, sessionId };
     if (!rpcClient) return recallSidebarSnapshot(sessionId, empty);
     try {
-        const result = await rpcClient.call<SidebarSnapshot>("sidebar-snapshot", {
-            sessionId,
+        const result = await callSessionRpc<SidebarSnapshot>(
             directory,
-        });
+            sessionId,
+            "sidebar-snapshot",
+            {
+                sessionId,
+                directory,
+            },
+        );
         if ((result as unknown as Record<string, unknown>).error) {
             // Snapshot-build errors are explicit failure envelopes, equivalent to
             // a transport failure: retain the last known-good client snapshot.
@@ -162,26 +314,29 @@ export async function loadSidebarSnapshot(
     }
 }
 
-export type StatusDetailResult = { ok: true; detail: StatusDetail } | { ok: false; error: string };
+export type StatusDetailResult = StatusCheck<OpenCodeStatusExtras>;
 
-/** Fetch full status detail without presenting transport failure as an empty session. */
+/**
+ * Fetch the status for the `/ctx-status` dialog. Every reply, including a
+ * transport failure, comes back as a checked result: either a snapshot the
+ * view model can draw, or the reason there is none. The dialog never receives
+ * an unchecked payload.
+ */
 export async function loadStatusDetail(
     sessionId: string,
     directory: string,
     modelKey?: string,
 ): Promise<StatusDetailResult> {
-    if (!rpcClient) return { ok: false, error: "RPC client is not initialized" };
+    if (!rpcClient) return statusRpcFailure("RPC client is not initialized");
     try {
-        const result = await rpcClient.call<StatusDetail>("status-detail", {
+        const reply = await callSessionRpc<unknown>(directory, sessionId, "status-detail", {
             sessionId,
             directory,
             modelKey,
         });
-        const error = (result as unknown as Record<string, unknown>).error;
-        if (typeof error === "string") return { ok: false, error };
-        return { ok: true, detail: result };
+        return checkStatusDetailPayload(reply, pluginPackageVersion() ?? "unknown");
     } catch (error) {
-        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        return statusRpcFailure(error instanceof Error ? error.message : String(error));
     }
 }
 
@@ -199,7 +354,7 @@ const EMPTY_EMBED_DETAIL: EmbedDetail = {
 export async function loadEmbedDetail(sessionId: string, directory: string): Promise<EmbedDetail> {
     if (!rpcClient) return EMPTY_EMBED_DETAIL;
     try {
-        const result = await rpcClient.call<EmbedDetail>("embed-detail", {
+        const result = await callSessionRpc<EmbedDetail>(directory, sessionId, "embed-detail", {
             sessionId,
             directory,
         });
@@ -221,9 +376,14 @@ export async function getCompartmentCount(
 ): Promise<CompartmentCountResult> {
     if (!rpcClient) return { ok: false, error: "RPC client is not initialized" };
     try {
-        const result = await rpcClient.call<{ count?: number; error?: string }>(
+        const result = await callSessionRpc<{ count?: number; error?: string }>(
+            directory ?? "",
+            sessionId,
             "compartment-count",
-            { sessionId, directory },
+            {
+                sessionId,
+                directory,
+            },
         );
         if (typeof result.error === "string") return { ok: false, error: result.error };
         if (typeof result.count !== "number" || !Number.isFinite(result.count)) {
@@ -235,42 +395,83 @@ export async function getCompartmentCount(
     }
 }
 
-/** Send recomp request to server via RPC. */
-export async function requestRecomp(sessionId: string): Promise<boolean> {
+/**
+ * Send recomp request to server via RPC. `directory` is the session's
+ * directory, so the request reaches the server instance that owns the session
+ * (the same one the recomp dialog read its compartment count from).
+ */
+export async function requestRecomp(sessionId: string, directory?: string): Promise<boolean> {
     if (!rpcClient) return false;
     try {
-        const result = await rpcClient.call<{ ok: boolean }>("recomp", { sessionId });
-        return result.ok ?? false;
-    } catch {
-        return false;
-    }
-}
-
-/** Run `/ctx-session-upgrade` for the session (full recomp + once-per-project
- *  memory migration). Fired from the upgrade dialog's "Run upgrade now" action. */
-export async function requestUpgrade(sessionId: string): Promise<boolean> {
-    if (!rpcClient) return false;
-    try {
-        const result = await rpcClient.call<{ ok: boolean }>("upgrade", { sessionId });
-        return result.ok ?? false;
-    } catch {
-        return false;
-    }
-}
-
-/** Mark the upgrade reminder dismissed (the user made an explicit Confirm/Cancel
- *  choice), setting the durable stamp so the FRESH dialog won't re-show. Resume
- *  prompts are staging-driven and unaffected. */
-export async function dismissUpgradeReminder(sessionId: string): Promise<boolean> {
-    if (!rpcClient) return false;
-    try {
-        const result = await rpcClient.call<{ ok: boolean }>("dismiss-upgrade-reminder", {
+        const result = await callSessionRpc<{ ok: boolean }>(directory ?? "", sessionId, "recomp", {
             sessionId,
         });
         return result.ok ?? false;
     } catch {
         return false;
     }
+}
+
+/** Start a manual `/ctx-dream` run (optionally one named task) via RPC. The
+ *  server starts the pass in the background and pushes the summary when done. */
+export async function requestDream(sessionId: string, task?: string): Promise<boolean> {
+    if (!rpcClient) return false;
+    try {
+        const result = await rpcClient.call<{ ok: boolean }>("dream", {
+            sessionId,
+            ...(task ? { task } : {}),
+        });
+        return result.ok ?? false;
+    } catch {
+        return false;
+    }
+}
+
+/** What a command RPC reports back: finished text, an acknowledgement that
+ *  background work started (no text yet), or the failure. */
+export type CommandRpcResult =
+    | { ok: true; message?: string; started?: boolean }
+    | { ok: false; error?: string };
+
+async function callCommandRpc(
+    method: string,
+    params: Record<string, unknown>,
+): Promise<CommandRpcResult> {
+    if (!rpcClient) return { ok: false };
+    try {
+        const result = await rpcClient.call<CommandRpcResult>(method, params);
+        return result.ok === true
+            ? result
+            : { ok: false, error: (result as { error?: string }).error };
+    } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+}
+
+/** Run `/ctx-flush` for the session: apply the queued operations now. */
+export async function requestFlush(sessionId: string): Promise<CommandRpcResult> {
+    return callCommandRpc("flush", { sessionId });
+}
+
+/** Start `/ctx-wrapup`: compact the older live tail, keeping the newest N raw. */
+export async function requestWrapup(
+    sessionId: string,
+    messagesToKeep: number,
+): Promise<CommandRpcResult> {
+    return callCommandRpc("wrapup", { sessionId, messagesToKeep });
+}
+
+/** `/ctx-embed`: read coverage, or start/pause the history embedding drain. */
+export async function requestEmbed(
+    sessionId: string,
+    action: "status" | "start" | "pause",
+    directory?: string,
+): Promise<CommandRpcResult> {
+    return callCommandRpc("embed", {
+        sessionId,
+        action,
+        ...(directory ? { directory } : {}),
+    });
 }
 
 /** Resolve global toast duration from server config via RPC. */

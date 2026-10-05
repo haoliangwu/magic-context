@@ -18,6 +18,7 @@ test("Pi preload isolates storage and user config", () => {
 			MAGIC_CONTEXT_TEST_DATA_DIR: testDataDir as string,
 			MAGIC_CONTEXT_STORAGE_DIR: "/tmp/magic-context-production-override",
 		},
+		windowsHide: true,
 	});
 
 	expect(completed.exitCode).toBe(0);

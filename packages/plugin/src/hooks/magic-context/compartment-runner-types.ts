@@ -12,9 +12,9 @@ import type {
 import type { NotificationParams } from "./send-session-notification";
 
 /**
- * Live progress for a running recomp / session-upgrade, surfaced in the TUI
- * sidebar + /ctx-status so users can watch a long rebuild instead of staring at
- * a single "started" toast. Lives in `LiveSessionState.recompProgressBySession`
+ * Live progress for a running recomp, surfaced in the TUI sidebar + /ctx-status
+ * so users can watch a long rebuild instead of staring at a single "started"
+ * toast. Lives in `LiveSessionState.recompProgressBySession`
  * (process-local, in-memory — if the process restarts mid-recomp the recomp
  * itself is interrupted, so losing the progress entry is correct).
  *
@@ -25,14 +25,14 @@ import type { NotificationParams } from "./send-session-notification";
  */
 export interface RecompProgress {
     sessionId: string;
-    /** Which user-facing flow this progress belongs to. `/ctx-recomp` rebuilds
-     *  compartments and is labeled "Recomp"; `/ctx-session-upgrade` (legacy→v2 +
-     *  memory migration) is labeled "Upgrade". Without this the sidebar/status
-     *  hardcoded "Upgrade" wording for BOTH, so a plain recomp showed
-     *  "Recomp / ✗ Upgrade failed" — a self-contradiction (dogfood 2026-06-04,
-     *  a 0-compartment session in a project whose other sessions had them).
-     *  Optional + defaults to "recomp" so runner-emitted per-pass entries (which
-     *  don't know the flow) inherit the kind set by setRecompStarting. */
+    /** Which user-facing flow this progress belongs to, so the sidebar/status
+     *  wording follows the flow that started the run instead of hardcoding one
+     *  verb for all of them (dogfood 2026-06-04: a plain recomp showed
+     *  "Recomp / ✗ Upgrade failed", a self-contradiction). Optional + defaults
+     *  to "recomp" so runner-emitted per-pass entries (which don't know the
+     *  flow) inherit the kind set by setRecompStarting. "upgrade" is no longer
+     *  produced — the session-upgrade flow is gone — and the renderers keep its
+     *  arm only so an in-flight entry from an older process still labels. */
     kind?: "recomp" | "upgrade" | "embed" | "wrapup";
     /** "skipped" is a TRANSIENT non-failure outcome: the incremental historian
      *  briefly held the compartment-state lease (or another process is mutating
@@ -82,6 +82,14 @@ export interface HiddenRunIdentity {
     model?: ModelInput;
     configuredModels?: readonly ModelInput[];
     timeoutMs: number;
+    /**
+     * Output cap the user configured for this run (`historian.maxTokens`), or
+     * absent when they configured none. The OpenCode 2 carrier turns a present
+     * value into a wire parameter, so the OpenCode 2 lane must pass the
+     * configured value through unchanged instead of substituting a fallback:
+     * some backends reject the parameter outright, and the chunk-sizing
+     * arithmetic that reserves output room supplies its own default separately.
+     */
     maxOutputTokens?: number;
     title: string;
     directory: string;
@@ -98,6 +106,7 @@ export interface HiddenCompletion {
     reasoning?: string | null;
     usage: TokenTotals;
     lengthCapped: boolean;
+    tokenLog?: import("../../shared/run-token-log").RunTokenLog;
     /** Original host messages are retained only by transports that expose them. */
     messages?: unknown[];
     providerId?: string;
@@ -171,6 +180,7 @@ export interface CompartmentRunnerDeps<
     /** When true, run an editor pass after successful historian output to clean
      *  low-signal U: lines and cross-compartment duplicates. */
     historianTwoPass?: boolean;
+    historianExpandTools?: Record<string, string | false>;
     /**
      * Cross-session memory feature gate (`memory.enabled` config). When false,
      * historian/recomp must NOT promote session facts into project memories
@@ -234,6 +244,8 @@ export interface CandidateCompartment {
     endMessage: number;
     startMessageId: string;
     endMessageId: string;
+    startBlockIndex?: number | null;
+    endBlockIndex?: number | null;
     title: string;
     /** v2: P1 tier text (mirror). v1/compressor: flat content. */
     content: string;
@@ -264,6 +276,8 @@ export type ValidatedHistorianPassResult =
           ok: true;
           compartments: CandidateCompartment[];
           facts: Array<{ category: string; content: string }>;
+          droppedFactBlocks?: number;
+          droppedFacts?: number;
           userObservations?: string[];
           /** Durable standing-question candidates for Primers v1 (stored side-table only).
            *  `originCompartmentIndex` is the 1-based index into THIS publish's

@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import type { CapturedRequest } from "./mock-provider/server";
+import type { CapturedRequest, MockProvider } from './mock-provider/server';
 import type { PiRunResult } from "./pi-runner/spawn";
 import type { PiMessage, PiSessionStats, PiState } from "./pi-runner/rpc-client";
 
@@ -20,12 +20,18 @@ export interface HostPromptOptions {
 /** The host-neutral surface used by behavior scenarios. */
 export interface HostHarness {
     readonly host: HostKind;
+    readonly mock: MockProvider;
     /** Value persisted in Magic Context's harness column for this host. */
     readonly harnessId: HostKind;
     readonly capabilities: HostCapabilities;
+    readonly workdir: string;
+    readonly dataDir: string;
+    readonly serverUrl: string | null;
 
     restart(): Promise<void>;
+    reloadPlugin(): Promise<void>;
     createSession(): Promise<string>;
+    removeSession(sessionId: string): Promise<void>;
     sendPrompt(sessionId: string, text: string, options?: HostPromptOptions): Promise<unknown>;
     ballast(tokens: number): string;
     assertMagicContextProcessed(sessionId: string): void;
@@ -34,6 +40,7 @@ export interface HostHarness {
         predicate: () => T | null | undefined | false,
         options?: { timeoutMs?: number; intervalMs?: number; label?: string },
     ): Promise<T>;
+    contextDbPath(): string;
     contextDb(): Database;
     hasContextDb(): boolean;
     countCompartments(sessionId: string): number;
@@ -41,6 +48,7 @@ export interface HostHarness {
     countTagsByStatus(sessionId: string, status: string): number;
     requests(): CapturedRequest[];
     assertHistorianRequestsUseMock(): void;
+    diagnostics(): string;
     dispose(): Promise<void>;
 }
 

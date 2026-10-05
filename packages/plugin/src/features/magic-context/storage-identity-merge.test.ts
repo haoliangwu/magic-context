@@ -58,7 +58,7 @@ describe("project identity merge", () => {
 
     test("rekeys audited rows, supersedes memory collisions, bumps epoch, and logs each mutation", () => {
         const database = makeDb();
-        const sourceId = insertMemory(database, "dir:old", "legacy", "same-hash");
+        const sourceId = insertMemory(database, "dir:old", "canonical", "same-hash");
         const targetId = insertMemory(database, "git:new", "canonical", "same-hash");
         database
             .prepare("INSERT INTO project_state(project_path, project_memory_epoch) VALUES (?, 4)")
@@ -123,7 +123,7 @@ describe("project identity merge", () => {
 
     test("preserves the oldest open broad cycle when task schedule rows collide", async () => {
         const database = makeDb();
-        insertMemory(database, "dir:old", "legacy", "same-hash");
+        insertMemory(database, "dir:old", "canonical", "same-hash");
         const targetId = insertMemory(database, "git:new", "canonical", "same-hash");
         database
             .prepare(
@@ -173,7 +173,7 @@ describe("project identity merge", () => {
 
     test("moves newer classification, mural cue, and verifications to a collision survivor", () => {
         const database = makeDb();
-        const sourceId = insertMemory(database, "dir:old", "legacy", "same-hash");
+        const sourceId = insertMemory(database, "dir:old", "canonical", "same-hash");
         const targetId = insertMemory(database, "git:new", "canonical", "same-hash");
         database
             .prepare(
@@ -262,7 +262,7 @@ describe("project identity merge", () => {
 
     test("timestamps a classification transfer to the collision survivor", () => {
         const database = makeDb();
-        const sourceId = insertMemory(database, "dir:old", "legacy", "same-hash");
+        const sourceId = insertMemory(database, "dir:old", "canonical", "same-hash");
         const targetId = insertMemory(database, "git:new", "canonical", "same-hash");
         database
             .prepare(
@@ -290,7 +290,7 @@ describe("project identity merge", () => {
 
     test("timestamps a mural-cue transfer to the collision survivor", () => {
         const database = makeDb();
-        const sourceId = insertMemory(database, "dir:old", "legacy", "same-hash");
+        const sourceId = insertMemory(database, "dir:old", "canonical", "same-hash");
         const targetId = insertMemory(database, "git:new", "canonical", "same-hash");
         database
             .prepare(
@@ -317,7 +317,7 @@ describe("project identity merge", () => {
 
     test("timestamps merged seen-count changes on the collision survivor", () => {
         const database = makeDb();
-        const sourceId = insertMemory(database, "dir:old", "legacy", "same-hash");
+        const sourceId = insertMemory(database, "dir:old", "canonical", "same-hash");
         const targetId = insertMemory(database, "git:new", "canonical", "same-hash");
         database.prepare("UPDATE memories SET seen_count = 3 WHERE id = ?").run(sourceId);
 
@@ -327,7 +327,7 @@ describe("project identity merge", () => {
             database
                 .prepare("SELECT seen_count, status, updated_at FROM memories WHERE id = ?")
                 .get(targetId),
-        ).toEqual({ seen_count: 3, status: "active", updated_at: 50 });
+        ).toEqual({ seen_count: 4, status: "active", updated_at: 50 });
     });
 
     test("rekeys a memory with an audit timestamp", () => {
@@ -360,4 +360,163 @@ describe("project identity merge", () => {
             project_path: "dir:module",
         });
     });
+});
+
+describe("offline merge safety", () => {
+    test("rerunning a merge is a no-op including audit and epoch", () => {
+        const database = makeDb();
+        insertMemory(database, "dir:old", "same", "same");
+        insertMemory(database, "git:new", "same", "same");
+        mergeProjectIdentities(database, "dir:old", "git:new", { now: 10 });
+        const before = database.serialize();
+        expect(
+            mergeProjectIdentities(database, "dir:old", "git:new", { now: 20 }).changedRows,
+        ).toBe(0);
+        expect(database.serialize()).toEqual(before);
+    });
+
+    test("different workspaces refuse before any mutation", () => {
+        const database = makeDb();
+        database.exec(`INSERT INTO workspaces(id,name,created_at,updated_at) VALUES (1,'one',1,1),(2,'two',1,1);
+            INSERT INTO workspace_members VALUES (1,'dir:old','old','/same',1),(2,'git:new','new','/same',1)`);
+        const before = database.serialize();
+        expect(() => mergeProjectIdentities(database, "dir:old", "git:new")).toThrow("one");
+        expect(database.serialize()).toEqual(before);
+    });
+
+    test("failure mid-transaction rolls back every table", () => {
+        const database = makeDb();
+        insertMemory(database, "dir:old", "old", "old");
+        database.exec(
+            `CREATE TRIGGER abort_merge BEFORE INSERT ON project_state BEGIN SELECT RAISE(ABORT, 'injected failure'); END`,
+        );
+        const before = database.serialize();
+        expect(() => mergeProjectIdentities(database, "dir:old", "git:new")).toThrow(
+            "injected failure",
+        );
+        expect(database.serialize()).toEqual(before);
+    });
+});
+
+test("split fixture preserves notes, history, windows, queues, review memories and membership", () => {
+    const database = makeDb();
+    const source = insertMemory(database, "dir:old", "same", "same");
+    const target = insertMemory(database, "git:new", "same", "same");
+    const conflict = insertMemory(database, "dir:old", "different constraint", "different");
+    database.exec(`
+        INSERT INTO memory_verifications VALUES (${source},'src/file.ts',20,10,'mapper');
+        INSERT INTO memory_embeddings VALUES (${conflict},X'01020304','model');
+        INSERT INTO notes(type,status,content,project_path,created_at,updated_at) VALUES ('smart','ready','note','dir:old',1,1);
+        INSERT INTO dream_queue(project_path,reason,enqueued_at) VALUES ('dir:old','scheduled',1),('git:new','scheduled',2);
+        INSERT INTO dream_runs(project_path,started_at,finished_at,holder_id,tasks_json) VALUES ('dir:old',1,2,'holder','[]');
+        INSERT INTO task_schedule_state(project_path,task,last_run_at,schedule,last_status,retrospective_watermark_ms) VALUES ('dir:old','retrospective',100,'0 * * * *','completed',500),('git:new','retrospective',50,'*/5 * * * *','completed',300);
+        INSERT INTO retrospective_processed_windows VALUES ('dir:old','shared',20),('git:new','shared',10),('dir:old','unique',30);
+        INSERT INTO workspaces VALUES (1,'shared',1,1,'[]');
+        INSERT INTO workspace_members VALUES (1,'dir:old','old','/same',1),(1,'git:new','new','/same',1);
+        INSERT INTO primers(project_path,question,created_at,updated_at) VALUES ('dir:old','question',1,1);
+        INSERT INTO primer_candidates(project_path,session_id,question,normalized_question,source_message_time,created_at) VALUES ('dir:old','session','question','question',1,1);
+        INSERT INTO project_key_files VALUES ('dir:old','file','content','hash',1,1,NULL,'config',NULL);
+        INSERT INTO memory_embedding_watermarks VALUES ('dir:old',50,40,2),('git:new',30,20,1);
+        INSERT INTO git_sweep_coordinator VALUES ('dir:old','stale-holder',1000,1);
+        INSERT INTO embedding_identity_active VALUES ('dir:old','memory','model',1);
+        INSERT INTO embedding_registrations(project_path) VALUES ('dir:old');
+        INSERT INTO shadow_embedding_registrations(project_path,scope,model_id) VALUES ('dir:old','memory','model');
+    `);
+    const before = database.serialize();
+    const preview = mergeProjectIdentities(database, "dir:old", "git:new", {
+        dryRun: true,
+        now: 1000,
+    });
+    expect(preview.duplicateMemoryIds).toEqual([source]);
+    expect(preview.reviewMemoryIds).toEqual([conflict]);
+    expect(database.serialize()).toEqual(before);
+    mergeProjectIdentities(database, "dir:old", "git:new", { now: 1000 });
+    expect(database.prepare("SELECT seen_count FROM memories WHERE id = ?").get(target)).toEqual({
+        seen_count: 2,
+    });
+    expect(database.prepare("SELECT memory_id FROM memory_verifications").get()).toEqual({
+        memory_id: target,
+    });
+    expect(database.prepare("SELECT memory_id FROM memory_embeddings").get()).toEqual({
+        memory_id: conflict,
+    });
+    expect(
+        database
+            .prepare(
+                "SELECT project_path, json_extract(metadata_json,'$.identity_merge_review') AS review FROM memories WHERE id = ?",
+            )
+            .get(conflict),
+    ).toEqual({ project_path: "git:new", review: "dir:old" });
+    expect(database.prepare("SELECT project_path,status FROM notes").get()).toEqual({
+        project_path: "git:new",
+        status: "ready",
+    });
+    expect(database.prepare("SELECT project_path FROM dream_runs").get()).toEqual({
+        project_path: "git:new",
+    });
+    expect(
+        database.prepare("SELECT project_path,reason,started_at FROM dream_queue").all(),
+    ).toEqual([{ project_path: "git:new", reason: "scheduled", started_at: null }]);
+    expect(
+        database
+            .prepare(
+                "SELECT last_run_at,schedule,next_due_at,retrospective_watermark_ms FROM task_schedule_state",
+            )
+            .get(),
+    ).toEqual({
+        last_run_at: 100,
+        schedule: "*/5 * * * *",
+        next_due_at: 300000,
+        retrospective_watermark_ms: 500,
+    });
+    expect(
+        database
+            .prepare(
+                "SELECT window_key,processed_at FROM retrospective_processed_windows ORDER BY window_key",
+            )
+            .all(),
+    ).toEqual([
+        { window_key: "shared", processed_at: 20 },
+        { window_key: "unique", processed_at: 30 },
+    ]);
+    expect(database.prepare("SELECT project_path FROM workspace_members").all()).toEqual([
+        { project_path: "git:new" },
+    ]);
+    expect(
+        database
+            .prepare("SELECT written_memory_id,embedded_memory_id FROM memory_embedding_watermarks")
+            .get(),
+    ).toEqual({ written_memory_id: 50, embedded_memory_id: 40 });
+    expect(
+        database.prepare("SELECT lease_holder,last_swept_at FROM git_sweep_coordinator").get(),
+    ).toEqual({ lease_holder: null, last_swept_at: null });
+    expect(auditIdentityMerge(database, "dir:old", "git:new").changedRows).toBe(0);
+    const after = database.serialize();
+    expect(mergeProjectIdentities(database, "dir:old", "git:new").changedRows).toBe(0);
+    expect(database.serialize()).toEqual(after);
+});
+
+test("a colliding hash with different content is retained for review, not superseded", () => {
+    const database = makeDb();
+    const source = insertMemory(database, "dir:old", "never delete this", "collision");
+    const target = insertMemory(database, "git:new", "different content", "collision");
+    const preview = mergeProjectIdentities(database, "dir:old", "git:new", { dryRun: true });
+    expect(preview.duplicateMemoryIds).toEqual([]);
+    expect(preview.reviewMemoryIds).toEqual([source]);
+    mergeProjectIdentities(database, "dir:old", "git:new");
+    expect(
+        database
+            .prepare("SELECT id, project_path, content, status FROM memories ORDER BY id")
+            .all(),
+    ).toEqual([
+        { id: source, project_path: "git:new", content: "never delete this", status: "active" },
+        { id: target, project_path: "git:new", content: "different content", status: "active" },
+    ]);
+    expect(
+        database
+            .prepare(
+                "SELECT json_extract(metadata_json, '$.identity_merge_original_hash') AS original FROM memories WHERE id = ?",
+            )
+            .get(source),
+    ).toEqual({ original: "collision" });
 });

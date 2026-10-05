@@ -1,3 +1,5 @@
+import calibrationSeeds from "./tokenizer-calibration-seeds.json";
+
 /**
  * Per-model tokenizer calibration ratios.
  *
@@ -21,90 +23,48 @@
 export interface ModelCalibration {
     systemRatio: number;
     toolsRatio: number;
+    /** Table prefix the ratios were inherited from when the model itself is unmeasured. */
+    derivedFrom?: string;
+    /** A provider without measurements matched the model id against another provider's seeds. */
+    matchedByModelId?: boolean;
+    proseRatio: number;
 }
 
-interface CalibrationEntry extends ModelCalibration {
+interface CalibrationEntry extends Omit<ModelCalibration, "proseRatio"> {
+    proseRatio?: number;
     /** Match against `${providerID}/${modelID}` (case-insensitive). Longest wins. */
     prefix: string;
 }
 
-/**
- * Empirically measured drift ratios. Order does not matter - longest prefix
- * is selected at lookup time. Verified models only; unknown models fall back
- * to 1.0/1.0 which is safer than guessing.
- */
-const CALIBRATION_TABLE: CalibrationEntry[] = [
-    // Anthropic Opus 4.8 — same new tokenizer family as 4.7 (not in ai-tokenizer's
-    // claude encoding). Without these it falls to NEUTRAL (1.0/1.0) and the
-    // sidebar undercounts System+ToolDefs by ~50%, starving the Conversation
-    // bucket. Reuse 4.7's empirically-measured ratios until 4.8 is calibrated.
-    { prefix: "anthropic/claude-opus-4-8", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "anthropic/claude-opus-4.8", systemRatio: 1.51, toolsRatio: 1.57 },
-    // Anthropic Opus 4.7 — new tokenizer not yet in ai-tokenizer's claude encoding.
-    { prefix: "anthropic/claude-opus-4-7", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "anthropic/claude-opus-4.7", systemRatio: 1.51, toolsRatio: 1.57 },
-    // Claude 4.5/4.6 family — ai-tokenizer's claude encoding matches well.
-    { prefix: "anthropic/claude-opus-4-5", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "anthropic/claude-opus-4.5", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "anthropic/claude-opus-4-6", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "anthropic/claude-opus-4.6", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "anthropic/claude-sonnet-4-5", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "anthropic/claude-sonnet-4.5", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "anthropic/claude-sonnet-4-6", systemRatio: 1.02, toolsRatio: 1.14 },
-    { prefix: "anthropic/claude-sonnet-4.6", systemRatio: 1.02, toolsRatio: 1.14 },
-    { prefix: "anthropic/claude-haiku-4-5", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "anthropic/claude-haiku-4.5", systemRatio: 1.02, toolsRatio: 1.16 },
-    // Claude through OpenRouter / GitHub Copilot — same upstream tokenizer.
-    // Opus 4.7 routed via OpenRouter / GitHub Copilot uses Anthropic's new
-    // tokenizer too; without these entries the longest-prefix matcher falls
-    // through to NEUTRAL (1.0/1.0) and the sidebar misattributes ~30K tokens
-    // from System+ToolDefs into Conversation/ToolCalls. Sum-to-inputTokens is
-    // still preserved (residuals absorb), but the per-bucket numbers drift.
-    { prefix: "openrouter/anthropic/claude-opus-4-8", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "openrouter/anthropic/claude-opus-4.8", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "github-copilot/claude-opus-4-8", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "github-copilot/claude-opus-4.8", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "openrouter/anthropic/claude-opus-4-7", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "openrouter/anthropic/claude-opus-4.7", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "github-copilot/claude-opus-4-7", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "github-copilot/claude-opus-4.7", systemRatio: 1.51, toolsRatio: 1.57 },
-    { prefix: "openrouter/anthropic/claude-sonnet-4.6", systemRatio: 1.02, toolsRatio: 1.14 },
-    { prefix: "github-copilot/claude-sonnet-4.6", systemRatio: 1.02, toolsRatio: 1.14 },
-    { prefix: "github-copilot/claude-sonnet-4.5", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "github-copilot/claude-opus-4.5", systemRatio: 1.02, toolsRatio: 1.16 },
-    { prefix: "github-copilot/claude-haiku-4.5", systemRatio: 1.02, toolsRatio: 1.16 },
-    // OpenAI gpt-5.x — ai-tokenizer's o200k_base matches exactly, tools overcounted ~16%.
-    { prefix: "openai/gpt-5", systemRatio: 1.0, toolsRatio: 0.84 },
-    // xAI Grok — ai-tokenizer overcounts (uses p50k_base which doesn't match Grok exactly).
-    { prefix: "xai/grok-4", systemRatio: 0.82, toolsRatio: 0.88 },
-    { prefix: "xai/grok-code-fast", systemRatio: 0.82, toolsRatio: 0.89 },
-    // Cerebras — qwen tokenizer accurate, glm close, gpt-oss-120b overcounts heavily.
-    { prefix: "cerebras/qwen-3-235b", systemRatio: 1.0, toolsRatio: 1.1 },
-    { prefix: "cerebras/zai-glm-4.7", systemRatio: 1.0, toolsRatio: 1.09 },
-    { prefix: "cerebras/gpt-oss-120b", systemRatio: 0.84, toolsRatio: 0.79 },
-    // Fireworks — DeepSeek and GLM close, kimi diverges significantly.
-    {
-        prefix: "fireworks-ai/accounts/fireworks/models/glm-5p1",
-        systemRatio: 1.0,
-        toolsRatio: 1.06,
-    },
-    {
-        prefix: "fireworks-ai/accounts/fireworks/models/deepseek-v3p2",
-        systemRatio: 1.05,
-        toolsRatio: 1.09,
-    },
-    // OpenCode-Go — same upstream open-weight providers.
-    { prefix: "opencode-go/glm-5.1", systemRatio: 1.0, toolsRatio: 1.06 },
-    { prefix: "opencode-go/glm-5", systemRatio: 1.0, toolsRatio: 1.06 },
-    { prefix: "opencode-go/kimi-k2.6", systemRatio: 0.87, toolsRatio: 0.86 },
-];
+// Shared with the Rust resolver; measurement values must remain identical across engines.
+const CALIBRATION_TABLE: CalibrationEntry[] = calibrationSeeds;
 
-const NEUTRAL: ModelCalibration = { systemRatio: 1.0, toolsRatio: 1.0 };
+const NEUTRAL: ModelCalibration = { systemRatio: 1.0, toolsRatio: 1.0, proseRatio: 1.0 };
+
+/** Version of the static measurements and family-inheritance rules, independent of session usage samples. */
+export const CALIBRATION_TABLE_REVISION = "2026-09-30-sol-tokenizer-seeds-v3";
+
+export const UNKNOWN_FIT_RATIO = Math.max(
+    2,
+    ...CALIBRATION_TABLE.flatMap((entry) => [
+        entry.systemRatio,
+        entry.toolsRatio,
+        entry.proseRatio ?? 1,
+    ]),
+);
+
+/** Whether the resolver found a measured or family-inherited seed, including neutral measurements. */
+export function hasModelCalibration(
+    providerId: string | undefined,
+    modelId: string | undefined,
+): boolean {
+    return resolveModelCalibration(providerId, modelId) !== NEUTRAL;
+}
 
 /**
  * Look up calibration ratios for a given `providerID/modelID` key. Performs
- * longest-prefix match (case-insensitive). Returns neutral ratios (1.0/1.0)
- * for unknown models so the calibration is a no-op rather than incorrect.
+ * longest-prefix match (case-insensitive), then same-family inheritance.
+ * Unknown models retain neutral decision ratios; fit callers must instead use UNKNOWN_FIT_RATIO.
  */
 export function resolveModelCalibration(
     providerId: string | undefined,
@@ -120,7 +80,155 @@ export function resolveModelCalibration(
             best = entry;
         }
     }
-    return best ?? NEUTRAL;
+    if (best) return { ...best, proseRatio: best.proseRatio ?? 1.0 };
+    const provider = providerId.toLowerCase();
+    const model = modelId.toLowerCase();
+    if (CALIBRATION_TABLE.some((entry) => entry.prefix.toLowerCase().startsWith(`${provider}/`))) {
+        return resolveFamilyFallback(provider, model) ?? NEUTRAL;
+    }
+    // No provider measurements exist: match the model portion, with canonical seeds
+    // winning ties over relays that happen to advertise the same model.
+    const canonical = canonicalProvider(model);
+    let modelMatch: CalibrationEntry | null = null;
+    for (const entry of CALIBRATION_TABLE) {
+        const seedModel = entry.prefix.toLowerCase().split("/").slice(1).join("/");
+        if (!model.startsWith(seedModel)) continue;
+        const oldModel = modelMatch?.prefix.toLowerCase().split("/").slice(1).join("/") ?? "";
+        if (
+            seedModel.length > oldModel.length ||
+            (seedModel.length === oldModel.length &&
+                entry.prefix.toLowerCase().startsWith(`${canonical}/`) &&
+                !modelMatch?.prefix.toLowerCase().startsWith(`${canonical}/`))
+        )
+            modelMatch = entry;
+    }
+    if (modelMatch)
+        return {
+            ...modelMatch,
+            proseRatio: modelMatch.proseRatio ?? 1.0,
+            derivedFrom: modelMatch.prefix,
+            matchedByModelId: true,
+        };
+    const inherited = canonical ? resolveFamilyFallback(canonical, model) : null;
+    return inherited ? { ...inherited, matchedByModelId: true } : NEUTRAL;
+}
+
+/**
+ * A model id split into the parts that decide tokenizer kinship: the family
+ * name before the first numeric token, the numeric version, and the variant
+ * words after it. `claude-fable-5-2` is family `claude-fable`, version [5, 2],
+ * no variant; `gpt-6-astra` is family `gpt`, version [6], variant `astra`;
+ * `gemini-3.8-flash` is family `gemini`, version [3, 8], variant `flash`.
+ * Ids with no numeric token (`kimi-k2.6`) have no version and never fall back.
+ */
+interface ModelLineage {
+    family: string;
+    version: number[];
+    variant: string;
+}
+
+function parseModelLineage(modelId: string): ModelLineage | null {
+    const tokens = modelId.split("-");
+    const versionAt = tokens.findIndex((token) => /^\d+(\.\d+)*$/.test(token));
+    if (versionAt <= 0) return null;
+    const version: number[] = [];
+    let end = versionAt;
+    while (end < tokens.length && /^\d+(\.\d+)*$/.test(tokens[end] ?? "")) {
+        for (const part of (tokens[end] ?? "").split(".")) version.push(Number(part));
+        end += 1;
+    }
+    return {
+        family: tokens.slice(0, versionAt).join("-"),
+        version,
+        variant: tokens.slice(end).join("-"),
+    };
+}
+
+function canonicalProvider(model: string): string {
+    if (model.startsWith("claude-")) return "anthropic";
+    if (model.startsWith("gpt-")) return "openai";
+    if (model.startsWith("gemini-")) return "google";
+    return "";
+}
+
+function compareVersions(a: number[], b: number[]): number {
+    const length = Math.max(a.length, b.length);
+    for (let i = 0; i < length; i++) {
+        const delta = (a[i] ?? 0) - (b[i] ?? 0);
+        if (delta !== 0) return delta;
+    }
+    return 0;
+}
+
+/**
+ * A model the table has never measured inherits the ratios of its nearest
+ * measured relative: same provider, same family, same variant, preferring the
+ * newest version below the requested one, else the oldest above it. If that
+ * relative crosses a clear major generation, a measured sibling in the same
+ * generation wins. A new release (Fable 5.2 the week it ships) is more likely to keep its
+ * predecessor's tokenizer than to match NEUTRAL, which is not a tokenizer at
+ * all but the absence of one; the learned session scalar corrects any drift
+ * once it exists. The chosen source is reported in `derivedFrom` so logs can
+ * tell a measurement from an inheritance.
+ */
+function resolveFamilyFallback(providerId: string, modelId: string): ModelCalibration | null {
+    const wanted = parseModelLineage(modelId);
+    if (!wanted) return null;
+    let below: { entry: CalibrationEntry; version: number[] } | null = null;
+    let above: { entry: CalibrationEntry; version: number[] } | null = null;
+    for (const entry of CALIBRATION_TABLE) {
+        const prefix = entry.prefix.toLowerCase();
+        if (!prefix.startsWith(`${providerId}/`)) continue;
+        const lineage = parseModelLineage(prefix.slice(providerId.length + 1));
+        if (!lineage || lineage.family !== wanted.family || lineage.variant !== wanted.variant)
+            continue;
+        const order = compareVersions(lineage.version, wanted.version);
+        if (order === 0) continue;
+        if (order < 0) {
+            if (!below || compareVersions(lineage.version, below.version) > 0) {
+                below = { entry, version: lineage.version };
+            }
+        } else if (!above || compareVersions(lineage.version, above.version) < 0) {
+            above = { entry, version: lineage.version };
+        }
+    }
+    let source = below ?? above;
+    // A new major tokenizer generation is closer to a measured sibling of that
+    // generation than to the previous generation of the same family.
+    if (source?.version[0] !== wanted.version[0] && canonicalProvider(modelId) !== "") {
+        let sibling: { entry: CalibrationEntry; version: number[] } | null = null;
+        for (const entry of CALIBRATION_TABLE) {
+            const prefix = entry.prefix.toLowerCase();
+            if (!prefix.startsWith(`${providerId}/`)) continue;
+            const lineage = parseModelLineage(prefix.slice(providerId.length + 1));
+            if (
+                !lineage ||
+                lineage.version[0] !== wanted.version[0] ||
+                lineage.variant !== wanted.variant ||
+                lineage.family.split("-")[0] !== wanted.family.split("-")[0]
+            )
+                continue;
+            const candidate = { entry, version: lineage.version };
+            if (
+                !sibling ||
+                (compareVersions(candidate.version, wanted.version) <= 0 &&
+                    compareVersions(sibling.version, wanted.version) > 0) ||
+                (compareVersions(candidate.version, wanted.version) <= 0 &&
+                    compareVersions(candidate.version, sibling.version) > 0) ||
+                (compareVersions(sibling.version, wanted.version) > 0 &&
+                    compareVersions(candidate.version, sibling.version) < 0)
+            )
+                sibling = candidate;
+        }
+        source = sibling ?? source;
+    }
+    if (!source) return null;
+    return {
+        systemRatio: source.entry.systemRatio,
+        toolsRatio: source.entry.toolsRatio,
+        proseRatio: source.entry.proseRatio ?? 1.0,
+        derivedFrom: source.entry.prefix,
+    };
 }
 
 /**
@@ -131,12 +239,9 @@ export function resolveModelCalibration(
  *   1. **Calibrated** (System, Tool Defs) — local count × measured per-model
  *      ratio. We have empirically derived ratios from `scripts/calibrate-tokenizer/`,
  *      so these match the API to within ~5%.
- *   2. **Verbatim** (Compartments, Facts, Memories) — local raw count, no
- *      scaling. Magic-context owns this content end-to-end (rendered XML,
- *      injected via `prepareCompartmentInjection`), and the compressor uses
- *      the same local count for budget math (`execute-status.ts` "History
- *      block"). Showing a different number here would confuse users and
- *      desync the sidebar from `/ctx-status`.
+ *   2. **Calibrated prose** (Compartments, Facts, Memories, Docs, Profile) —
+ *      local count × measured prose ratio (1.0 when unmeasured). Display-only:
+ *      transform budgets and served bytes continue to use raw local counts.
  *   3. **Residual absorbers** (Conversation, Tool Calls) — proportionally
  *      scaled to absorb whatever's left after (1) and (2). These have the
  *      most genuine drift (mixed user/assistant text + tool I/O) and the
@@ -148,7 +253,7 @@ export function resolveModelCalibration(
  *   - residual local sum === 0 (no conversation or tool calls yet) →
  *     conversation absorbs the full remainder so the bar still adds up.
  *   - non-residual buckets together exceed inputTokens (rare clamp case) →
- *     residuals = 0; calibrated + verbatim are scaled down proportionally so
+ *     residuals = 0; calibrated system/tools + prose are scaled down proportionally so
  *     the sum never exceeds inputTokens.
  *   - rounding: residual ±1 token from rounding lands in the larger residual
  *     bucket so exact equality is preserved.
@@ -171,13 +276,13 @@ export interface CalibrationInput {
     systemLocal: number;
     /** Local raw count (ai-tokenizer) for the tool definitions. */
     toolDefsLocal: number;
-    /** Verbatim — local raw counts displayed unchanged so the sidebar matches `/ctx-status`. */
+    /** Raw first-message (m0) prose counts, calibrated for display only; budgets remain local. */
     compartmentsLocal: number;
     factsLocal: number;
     memoriesLocal: number;
-    /** Verbatim — <project-docs> block in m[0] (stable scaffolding, own budget). */
+    /** Raw — <project-docs> block in the first message (stable scaffolding, own budget). */
     docsLocal: number;
-    /** Verbatim — <user-profile> block in m[0] (stable scaffolding, own budget). */
+    /** Raw — <user-profile> block in the first message (stable scaffolding, own budget). */
     profileLocal: number;
     /** Residual absorbers — proportionally scaled to absorb the remainder. */
     conversationLocal: number;
@@ -203,16 +308,15 @@ export function calibrateBuckets(input: CalibrationInput): CalibratedBuckets {
     let calibratedSystem = Math.round(input.systemLocal * input.calibration.systemRatio);
     let calibratedToolDefs = Math.round(input.toolDefsLocal * input.calibration.toolsRatio);
 
-    // (2) Verbatim buckets: Compartments / Facts / Memories — local raw counts,
-    // no scaling. Same numbers shown in `/ctx-status` "History block" so the
-    // sidebar and status dialog match exactly.
-    let compartments = Math.max(0, input.compartmentsLocal);
-    let facts = Math.max(0, input.factsLocal);
-    let memories = Math.max(0, input.memoriesLocal);
-    let docs = Math.max(0, input.docsLocal);
-    let profile = Math.max(0, input.profileLocal);
+    // (2) First-message prose is calibrated for display, independently of budget accounting.
+    const proseRatio = input.calibration.proseRatio;
+    let compartments = Math.round(Math.max(0, input.compartmentsLocal) * proseRatio);
+    let facts = Math.round(Math.max(0, input.factsLocal) * proseRatio);
+    let memories = Math.round(Math.max(0, input.memoriesLocal) * proseRatio);
+    let docs = Math.round(Math.max(0, input.docsLocal) * proseRatio);
+    let profile = Math.round(Math.max(0, input.profileLocal) * proseRatio);
 
-    // Edge case: calibrated + verbatim already exceed inputTokens. Clamp them
+    // Edge case: calibrated system/tools + prose already exceed inputTokens. Clamp them
     // down proportionally so the residual buckets stay non-negative.
     const nonResidualTotal =
         calibratedSystem + calibratedToolDefs + compartments + facts + memories + docs + profile;

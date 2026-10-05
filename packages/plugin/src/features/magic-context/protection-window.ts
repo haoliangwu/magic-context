@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import { sessionDecisionCalibration } from "./session-decision-calibration";
 import { TAG_SELECT_COLUMNS } from "./storage-tags";
 
 export type CoordinateSpace = "tag-number" | "row-identity";
@@ -113,6 +114,7 @@ export function compareRowsAscending(a: ProtectionWindowRow, b: ProtectionWindow
 export function computeProtectionWindow<TRow extends ProtectionWindowRow = ProtectionWindowRow>(
     rows: readonly TRow[],
     floor: number,
+    toolsRatio = 1,
 ): ProtectionWindowResult<TRow> {
     // Only persisted TOOL rows are considered
     const toolRows = rows.filter((r) => getRowKind(r) === "tool");
@@ -172,7 +174,7 @@ export function computeProtectionWindow<TRow extends ProtectionWindowRow = Prote
             massWindowRows.push(row);
             cumulativeMass += rowWindowMass(row);
         }
-        if (cumulativeMass >= floor) {
+        if (Math.ceil(cumulativeMass * toolsRatio) >= floor) {
             break;
         }
     }
@@ -205,7 +207,9 @@ export function computeProtectionWindow<TRow extends ProtectionWindowRow = Prote
     const protectedRowIdentities = new Set(memberRows.map(getRowIdentity));
 
     const protectedCount = memberRows.length;
-    const protectedMass = memberRows.reduce((sum, row) => sum + rowWindowMass(row), 0);
+    const protectedMass = Math.ceil(
+        memberRows.reduce((sum, row) => sum + rowWindowMass(row), 0) * toolsRatio,
+    );
 
     const isProtected = (row: ProtectionWindowRow): boolean => {
         return getRowKind(row) === "tool" && cutoff !== null && getRowTagNumber(row) >= cutoff;
@@ -275,6 +279,7 @@ export function getProtectionWindowForSession(
             ? floor
             : (readEpochFloorSnapshot(db, sessionId) ?? 0);
 
+    const toolsRatio = sessionDecisionCalibration(db, sessionId).toolsRatio;
     const pageSize = 256;
     // Exclude the tool-owner partial index from planning: without ANALYZE it can
     // win over chronology and force a whole-session sort before each small page.
@@ -291,8 +296,8 @@ export function getProtectionWindowForSession(
         for (const row of page) {
             const tagNumber = getRowTagNumber(row);
             if (tagNumber !== currentTag) {
-                if (distinctTags >= 3 && mass >= effectiveFloor) {
-                    return computeProtectionWindow(rows, effectiveFloor);
+                if (distinctTags >= 3 && Math.ceil(mass * toolsRatio) >= effectiveFloor) {
+                    return computeProtectionWindow(rows, effectiveFloor, toolsRatio);
                 }
                 distinctTags++;
                 currentTag = tagNumber;
@@ -307,5 +312,5 @@ export function getProtectionWindowForSession(
             .all(sessionId, getRowTagNumber(last), getRowIdentity(last)) as ProtectionWindowRow[];
     }
 
-    return computeProtectionWindow(rows, effectiveFloor);
+    return computeProtectionWindow(rows, effectiveFloor, toolsRatio);
 }

@@ -26,6 +26,7 @@ import {
   updateNote,
   updateSessionFact,
 } from "../../lib/api";
+import { LoadMoreTrigger } from "../../lib/load-more";
 import { ask } from "../../lib/platform";
 import type {
   Compartment,
@@ -178,9 +179,21 @@ function loadStoredValue(key: string): string {
   }
 }
 
+export const sessionHarnessOptions: { value: HarnessFilter; label: string }[] = [
+  { value: "all", label: "Harness: All" },
+  { value: "opencode", label: "OpenCode" },
+  { value: "opencode2", label: "OpenCode 2" },
+  { value: "pi", label: "Pi" },
+  { value: "omp", label: "OMP" },
+];
+
+/** The saved harness filter, or "all" when nothing (or an unknown value) is saved. */
+export function parseStoredHarnessFilter(stored: string): HarnessFilter {
+  return sessionHarnessOptions.find((option) => option.value === stored)?.value ?? "all";
+}
+
 function loadHarnessFilter(): HarnessFilter {
-  const stored = loadStoredValue(HARNESS_FILTER_KEY);
-  return stored === "opencode" || stored === "pi" || stored === "omp" ? stored : "all";
+  return parseStoredHarnessFilter(loadStoredValue(HARNESS_FILTER_KEY));
 }
 
 interface SessionViewerProps {
@@ -306,10 +319,15 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
           setTotalSessions(fresh.total);
           setHasMore(fresh.has_more);
           setSessionPage(1);
+          return true;
         }
+        return false;
       })
       .finally(() => {
         if (requestId === sessionRequestId) setSessionsLoading(false);
+      })
+      .then((loaded) => {
+        if (loaded) loadMoreTrigger.onPageLoaded();
       });
   });
 
@@ -322,7 +340,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
 
     void listSessionsPaged({ ...filter, offset: sessions().length, limit: PAGE_SIZE })
       .then((fresh) => {
-        if (requestId !== sessionRequestId) return;
+        if (requestId !== sessionRequestId) return false;
         const nextRows = [...sessions(), ...fresh.rows];
         setSessions(nextRows);
         setSessionScanConditions(fresh.conditions);
@@ -331,16 +349,23 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
         setSessionPage((page) => page + 1);
         sessionsCache.set(key, nextRows);
         sessionsTotalCache.set(key, fresh.total);
+        return true;
       })
       .finally(() => {
         if (requestId === sessionRequestId) setLoadingMore(false);
+      })
+      .then((loaded) => {
+        if (loaded) loadMoreTrigger.onPageLoaded();
       });
   };
+  // A page too short to scroll the sentinel away never produces another
+  // observer event, so the trigger asks again after each page while visible.
+  const loadMoreTrigger = new LoadMoreTrigger(loadMoreSessions);
 
   onMount(() => {
     loadMoreObserver = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) loadMoreSessions();
+        loadMoreTrigger.onVisibilityChange(entries.some((entry) => entry.isIntersecting));
       },
       { rootMargin: "200px" },
     );
@@ -747,12 +772,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
             onChange={(value) => setHarnessFilter(value as HarnessFilter)}
             placeholder="Harness"
             align="right"
-            options={[
-              { value: "all", label: "Harness: All" },
-              { value: "opencode", label: "OpenCode" },
-              { value: "pi", label: "Pi" },
-              { value: "omp", label: "OMP" },
-            ]}
+            options={sessionHarnessOptions}
           />
           <label
             style={{
@@ -1195,7 +1215,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                               <span
                                 class="pill amber"
                                 style={{ "margin-left": "6px" }}
-                                title="Legacy pre-v2 compartment — no paraphrase tiers; renders degraded. Run /ctx-session-upgrade to rebuild."
+                                title="Legacy pre-v2 compartment — no paraphrase tiers; renders degraded. Run /ctx-recomp to rebuild."
                               >
                                 legacy
                               </span>
@@ -1717,7 +1737,13 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                         <td>{formatDateTime(row.started_at)}</td>
                         <td>{row.parent_invocation_id ? `↳ ${row.subagent}` : row.subagent}</td>
                         <td>{row.model_id ?? row.provider_id ?? "—"}</td>
-                        <td>{row.status}</td>
+                        <td>
+                          {row.status === "timed_out"
+                            ? "Timed out"
+                            : row.status === "empty"
+                              ? "Empty output"
+                              : row.status}
+                        </td>
                         <td>
                           {row.ended_at
                             ? `${Math.max(0, row.ended_at - row.started_at).toLocaleString()}ms`

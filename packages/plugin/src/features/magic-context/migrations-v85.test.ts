@@ -1,9 +1,13 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, test } from "bun:test";
-
+import { afterEach, describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     LATEST_MIGRATION_VERSION,
     runMigrations,
@@ -11,6 +15,29 @@ import {
     V85_OPTIONAL_OPENCODE2_RELABEL_TABLES,
 } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
+
+const tempDirs: string[] = [];
+const originalOpenCodeDb = process.env.OPENCODE_DB;
+
+afterEach(() => {
+    if (originalOpenCodeDb === undefined) delete process.env.OPENCODE_DB;
+    else process.env.OPENCODE_DB = originalOpenCodeDb;
+    resetOpenCodeDbPathStateForTesting();
+    for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+    tempDirs.length = 0;
+});
+
+/**
+ * Point the harness-evidence lookup at a path with no store, so the only thing
+ * these tests can observe is what the migrations themselves do to the rows. With
+ * evidence absent, v87 changes nothing — so any row that moves moved in v85.
+ */
+function useAbsentHostStore(): void {
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-v85-"));
+    tempDirs.push(dir);
+    process.env.OPENCODE_DB = join(dir, "opencode.db");
+    resetOpenCodeDbPathStateForTesting();
+}
 
 function seedAppliedVersion(db: Database, version: number): void {
     db.exec(`
@@ -44,7 +71,7 @@ function harnessTablesFromDdl(db: Database): string[] {
         .sort();
 }
 
-describe("migration v85: relabel OpenCode 1.x opencode2 mislabels", () => {
+describe("migration v85: inert since v87 decides labels from host-store evidence", () => {
     test("fresh databases keep the v84 schema and align the schema fence", () => {
         const db = new Database(":memory:");
         try {
@@ -53,7 +80,6 @@ describe("migration v85: relabel OpenCode 1.x opencode2 mislabels", () => {
 
             expect(columnNames(db, "session_meta")).toContain("protected_tokens_effective");
             expect(columnNames(db, "session_meta")).toContain("harness");
-            expect(LATEST_SUPPORTED_VERSION).toBe(85);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
             expect(
                 db
@@ -72,7 +98,7 @@ describe("migration v85: relabel OpenCode 1.x opencode2 mislabels", () => {
         }
     });
 
-    test("v85 names every table whose DDL has a harness column", () => {
+    test("the relabel set still names every table whose DDL has a harness column", () => {
         const db = new Database(":memory:");
         try {
             initializeDatabase(db);
@@ -87,9 +113,10 @@ describe("migration v85: relabel OpenCode 1.x opencode2 mislabels", () => {
         }
     });
 
-    test("v84 upgrades relabel populated opencode2 rows and resolve session_projects twins", () => {
+    test("a v84 upgrade keeps its opencode2 rows: v85 no longer rewrites them, twins and all", () => {
         const db = new Database(":memory:");
         try {
+            useAbsentHostStore();
             initializeDatabase(db);
             seedAppliedVersion(db, 84);
 
@@ -108,22 +135,7 @@ describe("migration v85: relabel OpenCode 1.x opencode2 mislabels", () => {
                 VALUES
                     ('ses-twin', 'opencode', '/old', 100),
                     ('ses-twin', 'opencode2', '/new', 200),
-                    ('ses-twin-old-o2', 'opencode', '/keep', 300),
-                    ('ses-twin-old-o2', 'opencode2', '/drop', 150),
                     ('ses-o2-only', 'opencode2', '/solo', 50);
-
-                CREATE TABLE IF NOT EXISTS notes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    type TEXT NOT NULL DEFAULT 'session',
-                    status TEXT NOT NULL DEFAULT 'active',
-                    content TEXT NOT NULL,
-                    session_id TEXT,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    harness TEXT NOT NULL DEFAULT 'opencode'
-                );
-                INSERT INTO notes (type, status, content, session_id, created_at, updated_at, harness)
-                VALUES ('session', 'active', 'mislabelled', 'ses-only-o2', 1, 1, 'opencode2');
 
                 INSERT INTO message_history_orphan_sweep (harness, cursor_session_id, last_swept_at)
                 VALUES
@@ -140,64 +152,53 @@ describe("migration v85: relabel OpenCode 1.x opencode2 mislabels", () => {
                         "SELECT harness, counter FROM session_meta WHERE session_id = 'ses-only-o2'",
                     )
                     .get(),
-            ).toEqual({ harness: "opencode", counter: 4 });
+            ).toEqual({ harness: "opencode2", counter: 4 });
             expect(
                 db.prepare("SELECT COUNT(*) AS count FROM tags WHERE harness = 'opencode2'").get(),
-            ).toEqual({ count: 0 });
-            expect(
-                db
-                    .prepare(
-                        "SELECT COUNT(*) AS count FROM tags WHERE session_id = 'ses-only-o2' AND harness = 'opencode'",
-                    )
-                    .get(),
             ).toEqual({ count: 1 });
+            // Both twin rows survive: v85 no longer picks a winner, and without
+            // host-store evidence v87 does not either.
             expect(
                 db
                     .prepare(
-                        "SELECT harness, project_path, updated_at FROM session_projects WHERE session_id = 'ses-twin'",
+                        "SELECT harness, project_path FROM session_projects WHERE session_id = 'ses-twin' ORDER BY harness",
                     )
                     .all(),
-            ).toEqual([{ harness: "opencode", project_path: "/new", updated_at: 200 }]);
-            expect(
-                db
-                    .prepare(
-                        "SELECT harness, project_path, updated_at FROM session_projects WHERE session_id = 'ses-twin-old-o2'",
-                    )
-                    .all(),
-            ).toEqual([{ harness: "opencode", project_path: "/keep", updated_at: 300 }]);
+            ).toEqual([
+                { harness: "opencode", project_path: "/old" },
+                { harness: "opencode2", project_path: "/new" },
+            ]);
             expect(
                 db
                     .prepare(
                         "SELECT harness, project_path FROM session_projects WHERE session_id = 'ses-o2-only'",
                     )
                     .get(),
-            ).toEqual({ harness: "opencode", project_path: "/solo" });
+            ).toEqual({ harness: "opencode2", project_path: "/solo" });
             expect(
-                db.prepare("SELECT harness FROM notes WHERE content = 'mislabelled'").get(),
-            ).toEqual({ harness: "opencode" });
-            expect(
-                db.prepare("SELECT harness, last_swept_at FROM message_history_orphan_sweep").all(),
-            ).toEqual([{ harness: "opencode", last_swept_at: 500 }]);
+                db
+                    .prepare(
+                        "SELECT harness, last_swept_at FROM message_history_orphan_sweep ORDER BY harness",
+                    )
+                    .all(),
+            ).toEqual([
+                { harness: "opencode", last_swept_at: 500 },
+                { harness: "opencode2", last_swept_at: null },
+            ]);
             expect(
                 db
                     .prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 85")
                     .get(),
             ).toEqual({ count: 1 });
-
-            for (const table of harnessTablesFromDdl(db)) {
-                const remaining = db
-                    .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE harness = 'opencode2'`)
-                    .get() as { count: number };
-                expect(remaining.count, `${table} still has opencode2 rows`).toBe(0);
-            }
         } finally {
             closeQuietly(db);
         }
     });
 
-    test("v85 prefers a completed backfill cursor over a mislabelled running lease", () => {
+    test("the per-harness backfill cursor is left where it is, in both directions", () => {
         const db = new Database(":memory:");
         try {
+            useAbsentHostStore();
             initializeDatabase(db);
             seedAppliedVersion(db, 84);
             db.exec(`
@@ -218,13 +219,18 @@ describe("migration v85: relabel OpenCode 1.x opencode2 mislabels", () => {
 
             runMigrations(db);
 
+            // A cursor is keyed by harness alone, so no session's evidence speaks
+            // for it: each lane keeps its own row instead of one being merged away.
             expect(
                 db
                     .prepare(
-                        "SELECT harness, status, started_at FROM session_project_backfill_state",
+                        "SELECT harness, status, started_at FROM session_project_backfill_state ORDER BY harness",
                     )
                     .all(),
-            ).toEqual([{ harness: "opencode", status: "completed", started_at: 100 }]);
+            ).toEqual([
+                { harness: "opencode", status: "completed", started_at: 100 },
+                { harness: "opencode2", status: "running", started_at: 900 },
+            ]);
         } finally {
             closeQuietly(db);
         }

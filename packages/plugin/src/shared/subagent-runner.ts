@@ -71,6 +71,8 @@ export interface SubagentRunOptions {
     temperature?: number | undefined;
     /** Requested output-token budget for the provider request. */
     maxOutputTokens?: number | undefined;
+    /** Per-child cumulative prompt tokens for tool-loop dreamer tasks. */
+    tokenBudget?: number | undefined;
     cwd?: string | undefined;
     signal?: AbortSignal | undefined;
     /**
@@ -208,6 +210,8 @@ export type SubagentRunResult =
     | {
           ok: false;
           reason:
+              | "step_limit"
+              | "token_budget"
               | "invalid_prompt"
               | "timeout"
               | "abort"

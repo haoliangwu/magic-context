@@ -1,5 +1,8 @@
+import { observeEmbeddingActivity } from "../../shared/embedding-activity";
 import { getErrorMessage } from "../../shared/error-message";
 import { sessionLog } from "../../shared/logger";
+import { isDefaultSessionTitle } from "../../shared/safe-notification-target";
+import { importPluginModule } from "../../shared/stale-plugin-build";
 import { shouldHoldIgnoredNotification } from "./read-session-db";
 
 export interface NotificationParams {
@@ -84,11 +87,15 @@ async function trySendTuiToast(
     const message = text.length > 200 ? `${text.slice(0, 200)}…` : text;
     const toastVariant = inferToastVariant(text);
     const duration = params.toastDurationMs ?? 5000;
-    const { isTuiConnected: checkTui } = await import("../../shared/rpc-notifications");
+    const { isTuiConnected: checkTui } = await importPluginModule(
+        () => import("../../shared/rpc-notifications"),
+    );
     if (!checkTui(sessionId)) return false;
 
     try {
-        const { pushNotification } = await import("../../shared/rpc-notifications");
+        const { pushNotification } = await importPluginModule(
+            () => import("../../shared/rpc-notifications"),
+        );
         pushNotification(
             "toast",
             {
@@ -221,7 +228,9 @@ async function sendIgnoredMessageNow(
     // user message — one post into a not-yet-titled session permanently
     // suppresses that session's title generation. Only persist into sessions
     // that already have a real title (the toast path above is unaffected).
-    const { waitForSafeNotificationTarget } = await import("../../shared/safe-notification-target");
+    const { waitForSafeNotificationTarget } = await importPluginModule(
+        () => import("../../shared/safe-notification-target"),
+    );
     if ((await waitForSafeNotificationTarget(client, sessionId)) === "skip") {
         sessionLog(sessionId, "notification skipped (session not titled yet)");
         return "skipped";
@@ -267,7 +276,9 @@ async function sendIgnoredMessageNow(
             : undefined;
     if (!agent || !model || !variant) {
         try {
-            const { resolvePromptContext } = await import("../../shared/prompt-context");
+            const { resolvePromptContext } = await importPluginModule(
+                () => import("../../shared/prompt-context"),
+            );
             const resolved = await resolvePromptContext(client, sessionId);
             if (resolved) {
                 agent = agent ?? resolved.agent;
@@ -431,6 +442,57 @@ async function revertNoticeIfUnsafe(notification: {
     return true;
 }
 
+export async function sendCommandResult(
+    client: unknown,
+    sessionId: string,
+    text: string,
+    params: NotificationParams,
+): Promise<NotificationDeliveryDisposition> {
+    // A command intercepted before prompt persistence has no run-loop idle event.
+    // Do not infer an idle boundary if a real turn is awaiting its answer.
+    if (shouldHoldIgnoredNotification(sessionId)) {
+        return sendIgnoredMessage(client, sessionId, text, params);
+    }
+    const { isTuiConnected } = await importPluginModule(
+        () => import("../../shared/rpc-notifications"),
+    );
+    if (isTuiConnected(sessionId)) return sendIgnoredMessage(client, sessionId, text, params);
+    const session = (
+        client as {
+            session?: {
+                get?: (input: unknown) => Promise<{ data?: { title?: string } }>;
+                update?: (input: unknown) => Promise<{ error?: unknown }>;
+                abort?: (input: unknown) => Promise<unknown>;
+            };
+        }
+    )?.session;
+    try {
+        const title = (await session?.get?.({ path: { id: sessionId } }))?.data?.title;
+        if (title && isDefaultSessionTitle(title)) {
+            // Ignored output is a non-synthetic user row (Desktop renders only that
+            // shape). Give the otherwise empty session a title before appending it;
+            // the host would not generate one after a second user row appears.
+            if (!session?.update) return "failed";
+            const updated = await session.update({
+                path: { id: sessionId },
+                body: { title: "Magic Context" },
+            });
+            if (updated.error) return "failed";
+        }
+        idleSessions.add(sessionId);
+        const disposition = await sendIgnoredMessage(client, sessionId, text, params);
+        // The 204 suppression exits before OpenCode starts a runner. Desktop's
+        // optimistic busy state needs the host's idle event to clear its stop button.
+        if (disposition === "sent" && !shouldHoldIgnoredNotification(sessionId)) {
+            await session?.abort?.({ path: { id: sessionId } });
+        }
+        return disposition;
+    } catch (error) {
+        sessionLog(sessionId, "command result delivery failed:", getErrorMessage(error));
+        return "failed";
+    }
+}
+
 export async function sendIgnoredMessage(
     client: unknown,
     sessionId: string,
@@ -438,8 +500,8 @@ export async function sendIgnoredMessage(
     params: NotificationParams,
     // When true, always persist as an ignored message instead of using the TUI
     // toast path, so the content remains in scrollback. Use this for outcomes of
-    // long-running background work, such as a session-upgrade result, when a
-    // transient five-second toast may be missed.
+    // long-running background work, such as a recomp result, when a transient
+    // five-second toast may be missed.
     forcePersist = false,
 ): Promise<NotificationDeliveryDisposition> {
     // TUI notifications are already out-of-band and do not create a user row.
@@ -514,6 +576,7 @@ export function observeIgnoredNotificationEvent(event: {
     type: string;
     properties?: unknown;
 }): void {
+    observeEmbeddingActivity(event);
     const record = (value: unknown): Record<string, unknown> | undefined =>
         value !== null && typeof value === "object"
             ? (value as Record<string, unknown>)
@@ -551,7 +614,9 @@ export async function sendStatusNotification(
     params: NotificationParams,
 ): Promise<NotificationDeliveryDisposition> {
     try {
-        const { pushNotification } = await import("../../shared/rpc-notifications");
+        const { pushNotification } = await importPluginModule(
+            () => import("../../shared/rpc-notifications"),
+        );
         pushNotification(
             "toast",
             {

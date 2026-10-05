@@ -66,9 +66,12 @@ import {
     stripWellFormedLeadingTagPrefix,
 } from "../hooks/magic-context/tag-content-primitives";
 import type { TagTarget } from "../hooks/magic-context/tag-messages";
-import type { Transcript, TranscriptPart } from "./transcript";
+import { toolInputStringBytes } from "../hooks/magic-context/tool-input-size";
+import { TEXT_TAG_IDENTITY_MARKER } from "./tag-owner-id";
+import type { Transcript, TranscriptMessage, TranscriptPart } from "./transcript";
 
-export const TEXT_TAG_IDENTITY_MARKER = ":mc-text-v1:";
+// Re-exported so existing importers keep one source for the marker.
+export { TEXT_TAG_IDENTITY_MARKER };
 
 export interface TagTranscriptOptions {
     /**
@@ -161,6 +164,12 @@ interface ToolOccurrence {
     message: { info: { id?: string; role: string } };
     part: TranscriptPart;
     kind: "tool_use" | "tool_result";
+    /**
+     * The call's real input, captured the first time this pass overwrote it
+     * with the legacy marker, so a later real-argument render in the same pass
+     * can put it back.
+     */
+    originalInput?: Record<string, unknown>;
 }
 
 interface TagTranscriptTiming {
@@ -236,6 +245,8 @@ export function tagTranscript(
     // atomicity we need. Removing the wrapper matches OpenCode's
     // tag-messages.ts design — see the long comment there for the
     // rationale (cache-bust amplifier story).
+    const conversationEnd = new ConversationEndGuard(transcript.messages);
+
     for (let msgIndex = 0; msgIndex < transcript.messages.length; msgIndex += 1) {
         const message = transcript.messages[msgIndex];
         if (message === undefined) continue;
@@ -436,6 +447,7 @@ export function tagTranscript(
                         aggregate: existing,
                         targets,
                         timing,
+                        conversationEnd,
                     });
                     if (part.kind === "tool_result") {
                         markToolAggregateResolved(
@@ -566,6 +578,7 @@ export function tagTranscript(
                     aggregate,
                     targets,
                     timing,
+                    conversationEnd,
                 });
                 if (part.kind === "tool_result") {
                     markToolAggregateResolved(callId, aggregateKey, openToolAggregateKeysByCallId);
@@ -678,6 +691,56 @@ interface ApplyToolPrefixAndTargetArgs {
     aggregate: ToolAggregate;
     targets: Map<number, TagTarget>;
     timing: TagTranscriptTiming | undefined;
+    conversationEnd: ConversationEndGuard;
+}
+
+function partHasContent(part: TranscriptPart): boolean {
+    return part.kind !== "text" || (part.getText() ?? "").trim().length > 0;
+}
+
+/**
+ * Keeps structural tool removal from ending the provider request on an
+ * assistant turn, which models without assistant prefill support reject.
+ *
+ * The request ends with the newest message that has any content. Tool results
+ * there are what close the conversation with a user turn, so removal may take
+ * one only while that message keeps other content. Shared by every target one
+ * tagging pass builds, so drops earlier in the same pass count as removed.
+ */
+class ConversationEndGuard {
+    private readonly end: TranscriptMessage | undefined;
+    private readonly removed = new Set<unknown>();
+
+    constructor(messages: readonly TranscriptMessage[]) {
+        for (let index = messages.length - 1; index >= 0 && !this.end; index -= 1) {
+            const message = messages[index];
+            if (message?.parts.some(partHasContent)) this.end = message;
+        }
+    }
+
+    wouldStrand(occurrences: readonly ToolOccurrence[]): boolean {
+        const end = this.end;
+        if (!end || !occurrences.some((occ) => occ.message === end)) return false;
+        const leaving = new Set(occurrences.map((occ) => partKey(occ.part)));
+        const survives = (part: TranscriptPart) =>
+            !leaving.has(partKey(part)) && !this.removed.has(partKey(part));
+        return end.info.role === "assistant"
+            ? !end.parts.some((part) => part.kind === "tool_result" && survives(part))
+            : !end.parts.some((part) => partHasContent(part) && survives(part));
+    }
+
+    noteRemoved(occurrences: readonly ToolOccurrence[]): void {
+        for (const occ of occurrences) this.removed.add(partKey(occ.part));
+    }
+}
+
+/**
+ * Adapters may hand out a fresh proxy object per read of `message.parts`, so
+ * tool parts are matched by kind and tool-call id; parts without an id fall
+ * back to object identity.
+ */
+function partKey(part: TranscriptPart): unknown {
+    return part.id === undefined ? part : `${part.kind}\u0000${part.id}`;
 }
 
 function applyToolPrefixAndTarget(args: ApplyToolPrefixAndTargetArgs): void {
@@ -693,6 +756,7 @@ function applyToolPrefixAndTarget(args: ApplyToolPrefixAndTargetArgs): void {
             args.tagId,
             args.aggregate.occurrences,
             args.aggregate.requiresToolArcSkeleton,
+            args.conversationEnd,
         ),
     );
     if (args.timing) args.timing.targets += performance.now() - targetStart;
@@ -910,7 +974,14 @@ function applyTextPrefixAndTarget(args: TagTextPartArgs, tagId: number, text: st
     }
 
     const targetStart = args.timing ? performance.now() : 0;
-    args.targets.set(tagId, buildTextTarget(args.part, args.message));
+    args.targets.set(
+        tagId,
+        buildTextTarget(
+            args.part,
+            args.message,
+            args.skipPrefixInjection ? "" : prependTag(tagId, ""),
+        ),
+    );
     if (args.timing) args.timing.targets += performance.now() - targetStart;
 }
 
@@ -1030,11 +1101,93 @@ function buildAggregateTarget(
     tagId: number,
     occurrences: ToolOccurrence[],
     requiresToolArcSkeleton: boolean,
+    conversationEnd?: ConversationEndGuard,
 ): TagTarget {
     const role = occurrences[0]?.message.info.role ?? "user";
     const messageId = occurrences[0]?.message.info.id;
 
+    const truncate = (): "truncated" | "absent" => {
+        // Keep the tool call and its result, but replace the call arguments with
+        // a non-executable marker and the result content with the dropped marker.
+        // Legacy render, replayed only for `drop_mode = 'truncated'` tags until a
+        // HARD fold converts them; new drops use skeletonReal().
+        const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
+        let any = false;
+        for (const occ of occurrences) {
+            if (occ.kind === "tool_use" && occ.part.setToolInput) {
+                occ.originalInput ??= occ.part.getToolInput?.() ?? undefined;
+                if (occ.part.setToolInput(droppedInputMarker(tagId))) any = true;
+            } else if (setToolContentOrText(occ.part, sentinel)) {
+                any = true;
+            }
+        }
+        return any ? "truncated" : "absent";
+    };
+
+    const complete = (): boolean =>
+        occurrences.some((occ) => occ.kind === "tool_use") &&
+        occurrences.some((occ) => occ.kind === "tool_result");
+
+    const skeletonReal = (): "truncated" | "absent" | "incomplete" => {
+        // Keep the tool call with the arguments the host gave it and replace
+        // only the result content with the dropped marker. Nothing is written
+        // into the argument position unless an earlier render this pass did,
+        // in which case the real input goes back.
+        if (!complete()) return "incomplete";
+        const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
+        let any = false;
+        for (const occ of occurrences) {
+            if (occ.kind === "tool_use") {
+                if (occ.originalInput && occ.part.setToolInput?.(occ.originalInput)) any = true;
+            } else if (setToolContentOrText(occ.part, sentinel)) {
+                any = true;
+            }
+        }
+        return any ? "truncated" : "absent";
+    };
+
+    // Adapters without structural removal (or arcs that must keep their pair
+    // beside native reasoning) cannot remove the call; drop() would keep it.
+    const cannotRemove = (): boolean => {
+        if (requiresToolArcSkeleton) return true;
+        const authorization = occurrences.map((occ) => occ.part.canRemove?.());
+        return !occurrences.every(
+            (occ, index) => occ.part.remove && authorization[index] !== false,
+        );
+    };
+
     return {
+        measureReclaim(skeleton) {
+            let beforeTools = 0;
+            let afterTools = 0;
+            const authorization = occurrences.map((occ) => occ.part.canRemove?.());
+            const removable =
+                !requiresToolArcSkeleton &&
+                occurrences.every(
+                    (occ, index) =>
+                        occ.part.remove &&
+                        authorization[index] !== false &&
+                        authorization[index] !== "defer",
+                );
+            for (const occ of occurrences) {
+                const before =
+                    occ.kind === "tool_use"
+                        ? JSON.stringify(occ.part.getToolInput?.() ?? {})
+                        : (occ.part.getText() ?? "");
+                beforeTools += estimateTokens(before);
+                if (skeleton || !removable) {
+                    // A kept call keeps its real arguments; only the result shrinks.
+                    const after = occ.kind === "tool_use" ? before : `[dropped §${tagId}§]`;
+                    afterTools += estimateTokens(after);
+                }
+            }
+            return {
+                beforeTools,
+                afterTools: !skeleton && authorization.includes("defer") ? beforeTools : afterTools,
+                beforeProse: 0,
+                afterProse: 0,
+            };
+        },
         setContent(content: string): boolean {
             // Walk all occurrences; mutate every one. Return true if at
             // least one occurrence's content actually changed (used to
@@ -1058,11 +1211,8 @@ function buildAggregateTarget(
             }
             return occurrences[0]?.part.getText() ?? null;
         },
-        drop(): "removed" | "absent" | "incomplete" {
-            const complete =
-                occurrences.some((occ) => occ.kind === "tool_use") &&
-                occurrences.some((occ) => occ.kind === "tool_result");
-            if (!complete) return "incomplete";
+        drop(): "removed" | "truncated" | "absent" | "incomplete" {
+            if (!complete()) return "incomplete";
             if (!requiresToolArcSkeleton) {
                 const authorization = occurrences.map((occ) => occ.part.canRemove?.());
                 // A failed durable marker is not permission to substitute a new
@@ -1073,12 +1223,24 @@ function buildAggregateTarget(
                         (occ, index) => occ.part.remove && authorization[index] !== false,
                     )
                 ) {
+                    // If removing this call's result would leave the provider
+                    // request ending on an assistant turn, keep the call with its
+                    // REAL arguments plus the placeholder result instead.
+                    // "truncated" tells callers to persist that mode
+                    // (`skeleton_real`), so later passes serve the same bytes.
+                    // (The sentinel fallback below keeps call and result in place,
+                    // so it needs no exception.)
+                    if (conversationEnd?.wouldStrand(occurrences)) return skeletonReal();
                     let removed = false;
                     for (const occ of occurrences) removed = occ.part.remove?.() || removed;
+                    if (removed) conversationEnd?.noteRemoved(occurrences);
                     return removed ? "removed" : "absent";
                 }
             }
-            // Adapters without structural removal retain paired sentinels.
+            // Adapters without structural removal retain paired sentinels. This
+            // writes a marker into the call's arguments, so only replays of
+            // existing `full` tags reach it: new drops check cannotRemove() and
+            // use skeletonReal(), and a HARD fold converts the existing ones.
             const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
             let any = false;
             for (const occ of occurrences) {
@@ -1086,19 +1248,18 @@ function buildAggregateTarget(
             }
             return any ? "removed" : "absent";
         },
-        truncate(): "truncated" | "absent" {
-            // Keep the paired call shell, but replace its arguments with one
-            // non-executable marker; result halves carry the matching sentinel.
-            const sentinel = `[dropped \u00a7${tagId}\u00a7]`;
-            let any = false;
+        truncate,
+        skeletonReal,
+        cannotRemove,
+        inputStringBytes(): number | null {
             for (const occ of occurrences) {
-                if (occ.kind === "tool_use" && occ.part.setToolInput) {
-                    if (occ.part.setToolInput(droppedInputMarker(tagId))) any = true;
-                } else if (setToolContentOrText(occ.part, sentinel)) {
-                    any = true;
-                }
+                if (occ.kind !== "tool_use") continue;
+                return toolInputStringBytes(occ.originalInput ?? occ.part.getToolInput?.() ?? null);
             }
-            return any ? "truncated" : "absent";
+            return null;
+        },
+        wouldStrandConversationEnd(): boolean {
+            return conversationEnd?.wouldStrand(occurrences) ?? false;
         },
         editMarker(): "truncated" | "absent" {
             // Edit-marker: preserve the tool_use input's filePath + a region
@@ -1123,12 +1284,7 @@ function buildAggregateTarget(
             return any ? "truncated" : "absent";
         },
         // Open invocations still belong to the current turn; only complete arcs reclaim.
-        canDrop(): boolean {
-            return (
-                occurrences.some((occ) => occ.kind === "tool_use") &&
-                occurrences.some((occ) => occ.kind === "tool_result")
-            );
-        },
+        canDrop: () => complete() && !occurrences.some((occ) => occ.part.hasUserAnswer?.()),
         requiresToolArcSkeleton,
         // Non-mutating read of the invocation input (the tool_use occurrence
         // carries the arguments). Used by smart-drops supersession selection.
@@ -1160,8 +1316,10 @@ function buildAggregateTarget(
 function buildTextTarget(
     part: TranscriptPart,
     message: { info: { id?: string; role: string } },
+    textPrefix: string,
 ): TagTarget {
     return {
+        textPrefix,
         setContent(content: string): boolean {
             return part.setText(content);
         },
@@ -1211,10 +1369,28 @@ function buildToolTarget(
             return replaced ? "removed" : "absent";
         },
         truncate(): "truncated" | "absent" {
+            // Legacy render, replayed only for unconverted `truncated` tags.
             const changed = part.setToolInput
                 ? part.setToolInput(droppedInputMarker(tagId))
                 : setToolContentOrText(part, `[dropped \u00a7${tagId}\u00a7]`);
             return changed ? "truncated" : "absent";
+        },
+        skeletonReal(): "truncated" | "absent" {
+            // An invocation part keeps its real arguments untouched; a result
+            // part's content becomes the dropped marker.
+            if (part.setToolInput) return "truncated";
+            return setToolContentOrText(part, `[dropped \u00a7${tagId}\u00a7]`)
+                ? "truncated"
+                : "absent";
+        },
+        // drop() replaces an invocation part's arguments with a marker, so a
+        // new drop of one keeps its real arguments instead.
+        cannotRemove: () => part.setToolInput !== undefined,
+        // Without a paired tool call, an answer marker can forbid automatic dropping,
+        // but must not make ordinary results newly eligible for automatic reclaim.
+        ...(part.hasUserAnswer?.() ? { canDrop: () => false } : {}),
+        inputStringBytes(): number | null {
+            return part.setToolInput ? toolInputStringBytes(part.getToolInput?.() ?? null) : 0;
         },
         message: {
             info: { id: message.info.id, role: message.info.role },

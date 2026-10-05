@@ -48,7 +48,7 @@ describe("prompt-surface CI gates", () => {
             writeFileSync(mutatedPath, JSON.stringify(fixture));
 
             const result = validateBudgetFixture({ fixturePath: mutatedPath });
-            expect(result.errors.some((error) => error.includes("ratified literal 1825"))).toBe(
+            expect(result.errors.some((error) => error.includes("ratified literal 1917"))).toBe(
                 true,
             );
         });
@@ -74,7 +74,7 @@ describe("prompt-surface CI gates", () => {
                 result.errors.some(
                     (error) =>
                         error.includes("light guidance + light descriptions") &&
-                        error.includes("exceeds ceiling 1825"),
+                        error.includes("exceeds ceiling 1917"),
                 ),
             ).toBe(true);
         });
@@ -106,7 +106,7 @@ describe("prompt-surface CI gates", () => {
                 result.errors.some(
                     (error) =>
                         error.includes("Claude Code light guidance") &&
-                        error.includes("exceeds ceiling 1825"),
+                        error.includes("exceeds ceiling 1917"),
                 ),
             ).toBe(true);
         });
@@ -122,7 +122,7 @@ describe("prompt-surface CI gates", () => {
         const assets = builtInLightMappingAssets();
         const mappedLine = assets["guidance:primary"]
             .split("\n")
-            .find((line) => line.startsWith("In primary sessions with ctx_reduce"));
+            .find((line) => line.startsWith("Your context is a desk."));
         if (!mappedLine) throw new Error("mapped primary tag line is missing from the test fixture");
         assets["guidance:primary"] = assets["guidance:primary"]
             .split("\n")

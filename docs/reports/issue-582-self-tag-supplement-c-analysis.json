@@ -1,0 +1,117 @@
+{
+  "responseModels": [
+    "deepseek-flash"
+  ],
+  "variants": {
+    "C": {
+      "sessions": 1,
+      "sessionsStarted": 1,
+      "calls": 28,
+      "usage": {
+        "input": 201567,
+        "output": 1067,
+        "cacheHit": 174976,
+        "cacheMiss": 26591
+      },
+      "text": {
+        "rows": 24,
+        "wellFormed": 24,
+        "canonicalPrefix": 24,
+        "correct": 24,
+        "wrong": 0,
+        "untagged": 0,
+        "malformed": 0,
+        "misplaced": 0,
+        "byteIdentity": 24
+      },
+      "toolOnly": 4,
+      "toolOnlyMisplaced": 0,
+      "signedDeltas": {}
+    }
+  },
+  "sessions": [
+    {
+      "session": "ses_f0c60a4d0ffe5JyxT1v7RJJwpO",
+      "variant": "C",
+      "scenario": "reduced",
+      "replicate": 1,
+      "completed": true,
+      "lastCompletedTurn": 18,
+      "replies": 28,
+      "parallelSeen": true,
+      "placeholderSeen": true,
+      "providerHookTextEqual": true,
+      "reductionTarget": 25,
+      "providerSawReductionTarget": true,
+      "reductionStatus": "dropped",
+      "rows": 24,
+      "wellFormed": 24,
+      "canonicalPrefix": 24,
+      "correct": 24,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 24
+    }
+  ],
+  "buckets": [
+    {
+      "variant": "C",
+      "bucket": "1",
+      "rows": 1,
+      "wellFormed": 1,
+      "canonicalPrefix": 1,
+      "correct": 1,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 1
+    },
+    {
+      "variant": "C",
+      "bucket": "2–5",
+      "rows": 4,
+      "wellFormed": 4,
+      "canonicalPrefix": 4,
+      "correct": 4,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 4
+    },
+    {
+      "variant": "C",
+      "bucket": "6–20",
+      "rows": 12,
+      "wellFormed": 12,
+      "canonicalPrefix": 12,
+      "correct": 12,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 12
+    },
+    {
+      "variant": "C",
+      "bucket": ">20",
+      "rows": 7,
+      "wellFormed": 7,
+      "canonicalPrefix": 7,
+      "correct": 7,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 7
+    }
+  ],
+  "errors": [],
+  "credentials": {
+    "copiedDeleted": true,
+    "stagedDeleted": false
+  }
+}

@@ -27,6 +27,10 @@ The recent protected window is measured by **token mass**, not a fixed number of
 
 When a drop lands, the original content is replaced by a small dropped or truncated marker. The raw transcript remains in the local database for later retrieval.
 
+:::caution[Known limitation: branch navigation]
+Drops aren't yet tied to the branch of the conversation that requested them. After Pi's `/tree` or OpenCode's `/undo`, a `ctx_reduce` stamp from the abandoned branch can still hide a message on the new one. The agent can recover it with `ctx_expand`.
+:::
+
 ## Reclaim old tool output automatically
 
 Magic Context also has positional, age-based reclaim. It considers tool output from before the last execute boundary, ignores small tool arcs below 250 tokens, and keeps the newest `todowrite` result plus the newest three `ctx_reduce` results.

@@ -225,6 +225,23 @@ describe("stripUnsafeProjectConfigFields", () => {
         expect(warning).toContain("historian.pi.thinking_level");
     });
 
+    it("strips the historian runner from project config so a repo cannot redirect the completion", () => {
+        const raw: Record<string, unknown> = {
+            historian: {
+                runner: "host",
+                opencode: { runner: "host" },
+                temperature: 0.2,
+            },
+        };
+
+        const warnings = stripUnsafeProjectConfigFields(raw);
+
+        expect(raw.historian).toEqual({ opencode: {}, temperature: 0.2 });
+        const warning = warnings.join("\n");
+        expect(warning).toContain("historian.runner");
+        expect(warning).toContain("historian.opencode.runner");
+    });
+
     it("strips mural.model from project config but keeps the feature switch", () => {
         const raw: Record<string, unknown> = {
             mural: { enabled: true, model: "repo-controlled-model" },

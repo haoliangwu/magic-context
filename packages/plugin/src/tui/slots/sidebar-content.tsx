@@ -4,7 +4,9 @@ import type { TuiSlotPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/
 import packageJson from "../../../package.json"
 import { badgeTextColor } from '../badge-contrast';
 import { loadSidebarSnapshot, type SidebarSnapshot } from "../data/context-db"
+import { directoryForSession } from "../data/session-directory"
 import { formatThresholdPercent } from "../../shared/format-threshold"
+import { renderUserFacingFailure } from "../../shared/user-facing-codes"
 import { compactionOffSidebarRows, nativeCompactionContextLabel } from "../compaction-off"
 import {
     computeEffectiveOrder,
@@ -102,7 +104,10 @@ function createSidebarController(initialPrefs: MagicContextTuiPrefs): SidebarCon
 function compactTokens(value: number): string {
     if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
     if (value >= 1_000) return `${(value / 1_000).toFixed(0)}K`
-    return String(value)
+    // Token counts are whole numbers to the reader even when the tokenizer
+    // calibration leaves them fractional; a raw `522.4` beside a `63K` reads as
+    // a measurement error rather than as precision.
+    return String(Math.round(value))
 }
 
 /**
@@ -369,9 +374,9 @@ const SectionHeader = (props: { theme: TuiThemeCurrent; title: string }) => (
     </box>
 )
 
-// Live recomp / session-upgrade progress. Renders while an upgrade runs (and
-// briefly after it finishes) so a multi-minute rebuild is visible instead of a
-// single missed toast (dogfood 2026-05-30).
+// Live recomp progress. Renders while a rebuild runs (and briefly after it
+// finishes) so a multi-minute rebuild is visible instead of a single missed
+// toast (dogfood 2026-05-30).
 const RecompProgressSection = (props: {
     theme: TuiThemeCurrent
     progress: NonNullable<SidebarSnapshot["recompProgress"]>
@@ -530,7 +535,10 @@ const SidebarContent = (props: {
         const sid = props.sessionID()
         if (!sid) return
         const sequence = ++snapshotRequestSequence
-        const directory = props.api.state.path.directory ?? ""
+        const directory = directoryForSession(
+            props.api.state.session?.get?.(sid)?.directory,
+            props.api.state.path.directory ?? "",
+        )
         void loadSidebarSnapshot(sid, directory)
             .then((data) => {
                 // Guard against a session switch while this load was in flight:
@@ -596,7 +604,10 @@ const SidebarContent = (props: {
             return
         }
         const sequence = ++snapshotRequestSequence
-        const directory = props.api.state.path.directory ?? ""
+        const directory = directoryForSession(
+            props.api.state.session?.get?.(sid)?.directory,
+            props.api.state.path.directory ?? "",
+        )
         void loadSidebarSnapshot(sid, directory)
             .then((data) => {
                 if (
@@ -773,6 +784,18 @@ const SidebarContent = (props: {
                 </box>
             )}
 
+            {/* Named limitations of the host itself (for example an experimental
+                mode this OpenCode version cannot run). They stay for as long as
+                the process runs, so they are drawn like the transform error
+                rather than as a one-shot toast. */}
+            <For each={s()?.hostLimitations ?? []}>
+                {(limitation) => (
+                    <box marginTop={1} width="100%">
+                        <text fg={props.theme.warning}>⚠ {renderUserFacingFailure(limitation, "plain")}</text>
+                    </box>
+                )}
+            </For>
+
             {s()?.dreamerProgress && (
                 <box marginTop={1} width="100%">
                     <text fg={props.theme.warning}>
@@ -898,7 +921,7 @@ const SidebarContent = (props: {
                 value={String(s()?.compartmentCount ?? 0)}
             />
 
-            {/* Recomp / session-upgrade live progress */}
+            {/* Recomp live progress */}
             <Show when={s()?.recompProgress}>
                 {(progress) => (
                     <RecompProgressSection theme={props.theme} progress={progress()} />

@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
@@ -20,6 +20,11 @@ import {
     createPromptSurfaceRuntime,
     LIGHT_TOOL_DESCRIPTIONS,
 } from "../shared/prompt-surface-runtime";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
+import {
+    FULL_PARAMETER_DESCRIPTIONS,
+    LIGHT_PARAMETER_DESCRIPTIONS,
+} from "../tools/parameter-descriptions";
 import type { RustToolBackends } from "./rust-tool-backends";
 import { createToolRegistry, getCompactionOffRemovedToolIds } from "./tool-registry";
 import type { PluginContext } from "./types";
@@ -46,7 +51,7 @@ afterEach(() => {
 });
 
 function isolateDb(): void {
-    const dir = mkdtempSync(join(tmpdir(), "tool-registry-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "tool-registry-"));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -60,6 +65,7 @@ function buildRegistry(
     rustToolBackends?: RustToolBackends,
     promptSurfaceRuntime?: PromptSurfaceRuntime,
     registrationPromptSurface?: MagicContextPluginConfig["prompt_surface"],
+    includeDreamerOnlyTools = false,
 ): Record<string, ToolDefinition> {
     return createToolRegistry({
         ctx,
@@ -67,6 +73,7 @@ function buildRegistry(
         rustToolBackends,
         promptSurfaceRuntime,
         registrationPromptSurface,
+        includeDreamerOnlyTools,
     });
 }
 
@@ -76,7 +83,7 @@ describe("createToolRegistry — memory gating", () => {
         const tools = buildRegistry({});
         const expectedFields: Record<string, string[]> = {
             ctx_reduce: ["drop"],
-            ctx_expand: ["start", "end", "verbose", "message"],
+            ctx_expand: ["start", "end", "verbose", "message", "tag"],
             ctx_note: [
                 "action",
                 "content",
@@ -86,8 +93,10 @@ describe("createToolRegistry — memory gating", () => {
                 "offset",
                 "note_ids",
             ],
-            ctx_search: ["query", "limit", "sources"],
-            ctx_memory: ["action", "content", "category", "ids", "limit", "reason"],
+            ctx_search: ["query", "limit", "from", "to", "sources"],
+            // No `limit`: it only sized the dreamer-only list action, which now
+            // lives on ctx_memory_list (issue 575).
+            ctx_memory: ["action", "content", "category", "ids", "reason"],
         };
 
         for (const [name, fields] of Object.entries(expectedFields)) {
@@ -102,11 +111,32 @@ describe("createToolRegistry — memory gating", () => {
         }
     });
 
-    it("registers ctx_memory when memory is enabled (default)", () => {
+    it("keeps the primary memory surface free of the dreamer-only list tool and action", () => {
         isolateDb();
         const tools = buildRegistry({});
         expect(Object.keys(tools)).toContain("ctx_memory");
+        expect(Object.keys(tools)).not.toContain("ctx_memory_list");
         expect(Object.keys(tools)).toContain("ctx_search");
+        const memorySchema = tool.schema.toJSONSchema(
+            tool.schema.object(tools.ctx_memory?.args ?? {}),
+        ) as { properties?: { action?: { enum?: string[] } } };
+        expect(memorySchema.properties?.action?.enum).toEqual([
+            "write",
+            "update",
+            "archive",
+            "merge",
+            "get",
+        ]);
+    });
+
+    it("registers ctx_memory_list only for the permission-filtered runtime map", () => {
+        isolateDb();
+        const tools = buildRegistry({}, undefined, undefined, undefined, true);
+        expect(Object.keys(tools)).toContain("ctx_memory_list");
+        const listSchema = tool.schema.toJSONSchema(
+            tool.schema.object(tools.ctx_memory_list?.args ?? {}),
+        ) as { properties?: Record<string, unknown> };
+        expect(Object.keys(listSchema.properties ?? {}).sort()).toEqual(["category", "limit"]);
     });
 
     it("keeps ctx_note on context.db in rust mode", async () => {
@@ -238,6 +268,16 @@ function readA1GoldenTools(): Record<string, GoldenTool> {
     );
 }
 
+function withoutDescriptions(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(withoutDescriptions);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(
+        Object.entries(value)
+            .filter(([key]) => key !== "description")
+            .map(([key, child]) => [key, withoutDescriptions(child)]),
+    );
+}
+
 function providerParameters(definition: ToolDefinition): Record<string, unknown> {
     return Object.fromEntries(
         Object.entries(definition.args ?? {}).map(([name, schema]) => {
@@ -329,7 +369,7 @@ describe("createToolRegistry — prompt-surface registration", () => {
         expect(warnings).toEqual([]);
     });
 
-    it("registers the built-in light descriptions without changing schemas", () => {
+    it("registers built-in light descriptions without changing non-prose schema fields", () => {
         const warnings: string[] = [];
         const runtime = createPromptSurfaceRuntime({
             userConfigDirectory: process.cwd(),
@@ -348,7 +388,24 @@ describe("createToolRegistry — prompt-surface registration", () => {
             expect(light[toolId]?.description).toBe(
                 LIGHT_TOOL_DESCRIPTIONS[toolId as keyof typeof LIGHT_TOOL_DESCRIPTIONS],
             );
-            expect(providerParameters(light[toolId])).toEqual(providerParameters(full[toolId]));
+            const lightParameters = providerParameters(light[toolId]);
+            const fullParameters = providerParameters(full[toolId]);
+            expect(lightParameters).not.toEqual(fullParameters);
+            expect(withoutDescriptions(lightParameters)).toEqual(
+                withoutDescriptions(fullParameters),
+            );
+            for (const [name, description] of Object.entries(
+                LIGHT_PARAMETER_DESCRIPTIONS[toolId as keyof typeof LIGHT_PARAMETER_DESCRIPTIONS],
+            )) {
+                expect((lightParameters[name] as { description?: string }).description).toBe(
+                    description,
+                );
+                expect((fullParameters[name] as { description?: string }).description).toBe(
+                    (FULL_PARAMETER_DESCRIPTIONS as Record<string, Record<string, string>>)[
+                        toolId
+                    ]?.[name],
+                );
+            }
         }
         expect(warnings).toEqual([]);
     });

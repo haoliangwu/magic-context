@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 
+import { getMagicContextBuiltinCommands } from "../shared/builtin-commands";
 import {
     CONFIG_WARNING_CLASS,
     type ConfigParseFailure,
@@ -10,6 +11,7 @@ import {
     isPrototypePollutionKey,
     parseJsoncRecovering,
 } from "../shared/jsonc-parser";
+import { log } from "../shared/logger";
 import { setOutputReserveConfig } from "../shared/models-dev-cache";
 import type { PromptSurfaceConfig } from "../shared/prompt-surface";
 import { setWindowOverlayPath } from "../shared/window-geometry";
@@ -26,8 +28,10 @@ import { migrateLegacyExperimental } from "./migrate-experimental";
 import { resolveConfigProfile } from "./profiles";
 import {
     attachProtectedTokensTierOverrides,
+    constrainProjectCommands,
     constrainProjectThresholdOverrides,
     dropInheritedEmbeddingKeyOnRedirect,
+    restoreTrustedValuesOverInvalidProjectValues,
     stripUnsafeProjectConfigFields,
 } from "./project-security";
 import { pruneNestedConfigLeaf } from "./prune-config-leaf";
@@ -339,6 +343,45 @@ export function formatProtectedTokensBelowMinWarning(value: number): string {
     return `protected_tokens is a token floor (minimum ${PROTECTED_TOKENS_MIN}, default derived from the context window); ${value} looks like the old protected_tags count. Remove the key to use the default, or set a token count such as 16000.`;
 }
 
+/** The blocks `resolveHistorianModel` and `resolveDreamerTaskModel` actually read. */
+const MODEL_HARNESS_BLOCKS = ["opencode", "pi", "omp"] as const;
+
+/**
+ * Warn when an agent's model is configured somewhere the resolver never looks.
+ *
+ * Agent models are resolved per harness: `historian.opencode.model`,
+ * `historian.pi.model`, `historian.omp.model`. A bare `historian.model` is
+ * schema-valid and reads naturally, but nothing consumes it —
+ * `resolveHistorianModel({historian:{model}}, "opencode")` returns no models at
+ * all, and the only outward sign is a historian that silently never runs (the
+ * Rust module reports it as `historian_no_fire=no_models`). Saying so at load
+ * time is the difference between a five-minute fix and a subsystem that looks
+ * configured and is not.
+ */
+export function misplacedAgentModelWarnings(rawConfig: Record<string, unknown>): string[] {
+    const warnings: string[] = [];
+    for (const agent of ["historian", "dreamer"]) {
+        const block = rawConfig[agent];
+        if (!block || typeof block !== "object" || Array.isArray(block)) continue;
+        const record = block as Record<string, unknown>;
+        if (!Object.hasOwn(record, "model")) continue;
+        const harnessWithModel = MODEL_HARNESS_BLOCKS.find((harness) => {
+            const sub = record[harness];
+            return (
+                sub !== null &&
+                typeof sub === "object" &&
+                !Array.isArray(sub) &&
+                Object.hasOwn(sub as Record<string, unknown>, "model")
+            );
+        });
+        if (harnessWithModel) continue;
+        warnings.push(
+            `${agent}.model is not read: the ${agent} model is resolved per harness, so it has to be ${agent}.opencode.model (OpenCode 1 and 2), ${agent}.pi.model, or ${agent}.omp.model. As written the ${agent} resolves to no models and never runs.`,
+        );
+    }
+    return warnings;
+}
+
 export function resetProtectedTagsDeprecationWarningForTest(): void {
     warnedProtectedTagsDeprecation = false;
 }
@@ -346,7 +389,7 @@ export function resetProtectedTagsDeprecationWarningForTest(): void {
 export function warnProtectedTagsDeprecationOnce(): void {
     if (!warnedProtectedTagsDeprecation) {
         warnedProtectedTagsDeprecation = true;
-        console.warn(
+        log(
             "[magic-context] protected_tags is deprecated and ignored; use protected_tokens instead.",
         );
     }
@@ -366,6 +409,7 @@ export function parsePluginConfig(
             "protected_tags is deprecated and ignored; use protected_tokens instead.",
         );
     }
+    preMigrationWarnings.push(...misplacedAgentModelWarnings(rawConfig));
     const migratedExperimental = migrateLegacyExperimental(
         configWithoutRemovedAgent,
         preMigrationWarnings,
@@ -548,6 +592,29 @@ export function parsePluginConfig(
     };
 }
 
+/**
+ * Every schema issue path the loader's real parse would report for `rawConfig`,
+ * after the same pre-schema migrations parsePluginConfig runs (their warnings
+ * are discarded here; the real parse reports them). Empty when valid.
+ */
+function collectSchemaIssuePaths(rawConfig: Record<string, unknown>): PropertyKey[][] {
+    const scratch: string[] = [];
+    const migrated = migrateLegacyAgentEnabledInMemory(
+        migrateDreamerV2(
+            migrateLegacyExperimental(stripRemovedAgentConfig(rawConfig, scratch), scratch),
+            scratch,
+        ),
+        scratch,
+    );
+    const parsed = MagicContextConfigSchema.safeParse(migrated);
+    if (parsed.success) return [];
+    return parsed.error.issues.flatMap((issue) =>
+        issue.code === "unrecognized_keys"
+            ? issue.keys.map((key) => [...issue.path, key])
+            : [[...issue.path]],
+    );
+}
+
 export function loadPluginConfig(
     directory: string,
 ): MagicContextPluginConfig & { configWarnings?: string[] } {
@@ -618,7 +685,10 @@ function combinedOutcome(args: {
     return "ok";
 }
 
-export function loadPluginConfigDetailed(directory: string): LoadResultDetailed {
+export function loadPluginConfigDetailed(
+    directory: string,
+    applyRuntimeGlobals = true,
+): LoadResultDetailed {
     const userDetected = detectConfigFile(getUserConfigBasePath());
     const projectDetected = detectConfigFile(getProjectConfigBasePath(directory));
     // Both-harness sources drive the GC-suppression signal; this-harness sources
@@ -723,6 +793,7 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
     // a cloned repo may delay compaction, but it may not lower thresholds in a
     // way that forces extra historian work on the user's account.
     const trustedBaseConfig = parsePluginConfig(trustedProfiledRaw);
+    let projectRestoredTopLevelKeys: string[] = [];
 
     if (projectLoaded) {
         mergedRaw = deepMergeRawConfig(mergedRaw, profileResolution.projectBase);
@@ -740,18 +811,44 @@ export function loadPluginConfigDetailed(directory: string): LoadResultDetailed 
         })) {
             allWarnings.push(`[project config] ${warning}`);
         }
+        const restoredOverProject = restoreTrustedValuesOverInvalidProjectValues({
+            mergedRaw,
+            trustedRaw: trustedProfiledRaw,
+            projectRaw: profileResolution.projectBase,
+            collectIssuePaths: collectSchemaIssuePaths,
+        });
+        for (const warning of restoredOverProject.warnings) {
+            allWarnings.push(`[project config] ${warning}`);
+        }
+        projectRestoredTopLevelKeys = restoredOverProject.restoredTopLevelKeys;
+        for (const warning of constrainProjectCommands({
+            mergedRaw,
+            trustedRaw: trustedProfiledRaw,
+            projectRaw: profileResolution.projectBase,
+            reservedNames: Object.keys(getMagicContextBuiltinCommands()),
+        })) {
+            allWarnings.push(`[project config] ${warning}`);
+        }
     }
 
     const recoveredTopLevelKeys: string[] = [];
     const cacheTtlConfigured = Object.hasOwn(mergedRaw, "cache_ttl");
     const config = parsePluginConfig(mergedRaw, recoveredTopLevelKeys);
+    // An ignored invalid project value is still a config the user must fix, so
+    // keep reporting it as schema recovery (live reload keeps the last good
+    // config on that outcome, as it did before the user's value was restored).
+    for (const key of projectRestoredTopLevelKeys) {
+        if (!recoveredTopLevelKeys.includes(key)) recoveredTopLevelKeys.push(key);
+    }
     attachProtectedTokensTierOverrides(config, {
         trustedUser: trustedBaseConfig.protected_tokens,
         project: projectLoaded ? profileResolution.projectBase.protected_tokens : undefined,
     });
     if (profileResolution.activeProfile) config.profile = profileResolution.activeProfile;
-    setOutputReserveConfig(config.output_reserve);
-    setWindowOverlayPath(config.models?.window_overlay_path);
+    if (applyRuntimeGlobals) {
+        setOutputReserveConfig(config.output_reserve);
+        setWindowOverlayPath(config.models?.window_overlay_path);
+    }
     const leafValidationWarnings = [...(config.configWarnings ?? [])];
     if (config.configWarnings?.length) {
         allWarnings.push(

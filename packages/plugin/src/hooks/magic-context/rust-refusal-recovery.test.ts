@@ -8,7 +8,10 @@ import { createRustRefusalRecovery, RUST_REFUSAL_RECOVERY_PROMPT } from "./rust-
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function waitUntil(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+// The budget only bounds how long a passing condition may take to appear; the
+// assertions that follow still decide pass or fail. 500 ms lost to a loaded
+// machine in the release gate while the recovery itself behaved correctly.
+async function waitUntil(predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         if (predicate()) return;

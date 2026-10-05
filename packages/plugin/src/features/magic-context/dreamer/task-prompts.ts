@@ -8,6 +8,9 @@ export interface CuratePromptMemory {
     content: string;
     mappedFiles: string[];
     hasNoFileSentinel: boolean;
+    importance: number;
+    retrievalCount: number;
+    seenCount: number;
 }
 
 // ── System Prompt ──────────────────────────────────────────────────────────
@@ -36,8 +39,8 @@ Project memory uses exactly 5 categories. Every memory belongs to one:
 // the codebase-tool framing is deliberately absent.
 export const CURATE_SYSTEM_PROMPT = `You are a memory-pool curator for the magic-context system. You run during a scheduled dream window to keep a project's cross-session memory store lean and well-formed.
 
-## Memory operations (ctx_memory)
-- \`action="list"\` — browse active memories, optionally filter by category
+## Memory operations
+- The scoped category snapshot arrives in the first message. Do not list or get it again; track mutation deltas.
 - \`action="merge", ids=[N,M,...], content="...", category="..."\` — consolidate duplicates into one canonical memory
 - \`action="update", ids=[N], content="...", superseded_by=M\` — rewrite content; name where removed detail survives when cutting more than half
 - \`action="write", category="...", content="..."\` — create a memory (SPLITS ONLY — never mint new facts)
@@ -53,27 +56,17 @@ export const CURATE_SYSTEM_PROMPT = `You are a memory-pool curator for the magic
 
 ${PROJECT_MEMORY_TAXONOMY}`;
 
-// maintain-docs: edits ARCHITECTURE.md / STRUCTURE.md only. It needs codebase
-// read + doc-write tools and the protected-region rule, and NONE of the memory
-// machinery.
-export const MAINTAIN_DOCS_SYSTEM_PROMPT = `You are a documentation maintainer for the magic-context system. You run during a scheduled dream window to keep a project's root \`ARCHITECTURE.md\` and \`STRUCTURE.md\` synchronized with the actual code.
-
-## Tools
-- Read files, grep, glob, bash — explore the codebase to verify current state.
-- Write / edit — update the two docs (project root only, never \`.planning/\`).
-
-## Rules
-- **NEVER touch protected regions.** Any content between \`<!-- mc:protected START ... -->\` and \`<!-- mc:protected END -->\` is hand-authored and cache-critical. Reproduce it BYTE-FOR-BYTE — do not edit, reword, reorder, summarize, trim, or drop a single line, and keep the marker comments. Only a human edits that region.
-- **Preserve an existing doc's structure, voice, and density.** When a doc already exists, it is the source of truth for shape: keep its headings, ordering, level of detail, and writing style. Make the SMALLEST edits that bring it back in sync with the code. NEVER reshape hand-written prose into a generic template, collapse a dense section into bullet stubs, or drop hard-won detail (specific invariants, edge cases, mechanism descriptions) because it does not fit a standard layout. A doc denser and more specific than a template is BETTER, not worse: leave it that way.
-- **Be prescriptive** ("Use X pattern", not "X pattern is used"). **Current state only** — no temporal language, no history.
-- **Verify before writing** — read the actual files, never guess. All file paths in the docs must point to files that exist.`;
+// The docs investigator can only inspect source and return section proposals.
+// It keeps the "for the magic-context system" identity phrase: isMagicContextInternalAgent
+// keys on it to keep MC's own guidance out of this child's system prompt.
+export const MAINTAIN_DOCS_SYSTEM_PROMPT = `You are a read-only documentation investigator for the magic-context system. Use read, grep, glob and navigation tools to verify source. Never edit any file or run commands. Return only a proposed change to the project's ARCHITECTURE.md and STRUCTURE.md, not a change log. The protected regions between <!-- mc:protected START ... --> and <!-- mc:protected END --> must remain byte-identical. If the docs are accurate, return [].`;
 
 // review-user-memories: a pure JSON reviewer of behavioral observations about the
 // human user (the GLOBAL user profile, NOT project memories). It calls no tools
 // and the host applies the verdict, so it needs no memory ops or taxonomy.
 export const REVIEW_USER_MEMORIES_SYSTEM_PROMPT = `You are a user-profile reviewer for the magic-context system. You run during a scheduled dream window to decide which recurring behavioral observations about the human user are real, persistent patterns worth keeping in their global user profile.
 
-You do NOT call any tools and you do NOT touch project memories — you read the candidate observations the host gives you and return a JSON verdict. Distill durable patterns; never transcribe a single moment. Output only the JSON the task asks for, with no surrounding prose.`;
+You do NOT call any tools and you do NOT touch project memories — you read the candidate observations the host gives you and return a JSON verdict. Distill durable patterns; never transcribe a single moment. Phrase promoted or updated memories as concise, present-tense verb-first statements without a subject (for example, "Prefers concise explanations" or "Expects changes to be tested"). Output only the JSON the task asks for, with no surrounding prose.`;
 
 // refresh-primers: a read-only code investigator that answers ONE standing
 // question about the current codebase. It runs on the locked
@@ -96,7 +89,7 @@ function renderMemoryList(memories: CuratePromptMemory[]): string {
             const files = memory.mappedFiles.length
                 ? memory.mappedFiles.join(", ")
                 : "(none mapped yet)";
-            return `[${memory.id}] ${memory.category}\nContent: ${memory.content}\nMapped files: ${files}${memory.hasNoFileSentinel ? " (file-independent)" : ""}`;
+            return `[${memory.id}] ${memory.category} importance=${memory.importance} retrieval_count=${memory.retrievalCount} seen_count=${memory.seenCount}\nContent: ${memory.content}\nMapped files: ${files}${memory.hasNoFileSentinel ? " (file-independent)" : ""}`;
         })
         .join("\n\n");
 }
@@ -105,6 +98,7 @@ export function buildCuratePrompt(args: {
     projectPath: string;
     category: CurateMemoryCategory;
     memories: CuratePromptMemory[];
+    crossChunkCandidates?: string[];
 }): string {
     // adapted from validated shadow-trial prompt; further tuning happens in the harness
     return `## Task: Curate Project Memory Pool (hygiene)
@@ -127,8 +121,51 @@ Rewrite narrative/historical → operational present tense ("X uses Y because Z"
 Archive a redundant memory only when a better ACTIVE memory in the same project and category preserves its information; name that survivor with \`superseded_by\`. A bare "redundant" verdict is deletion and will be refused. Leave standalone low-value or stale entries unchanged for a human to review. The global user profile describes the operator and is never a substitute for project knowledge, so it cannot justify an archive.
 KEEP (overrides archive): constraint/rule language (must/never/always) · explains WHY (because/so that/to prevent) · EXTERNAL-system limit (CONSTRAINTS: archive only if word-for-word duplicated) · path/config WITH context · retrieval_count>0 · priority/philosophy.
 
-### Memory pool
+### Cross-chunk duplicate candidates (normalized content matches)
+${args.crossChunkCandidates?.join("\n") || "(none)"}
+
+### Category snapshot (do not re-enumerate)
 ${renderMemoryList(args.memories)}`;
+}
+
+export function chunkCurateMemories(
+    memories: CuratePromptMemory[],
+    maxCharacters: number,
+): Array<{ memories: CuratePromptMemory[]; crossChunkCandidates: string[] }> {
+    const chunks: CuratePromptMemory[][] = [];
+    let current: CuratePromptMemory[] = [];
+    let size = 0;
+    for (const memory of memories) {
+        const length = renderMemoryList([memory]).length + 2;
+        if (current.length && size + length > maxCharacters) {
+            chunks.push(current);
+            current = [];
+            size = 0;
+        }
+        current.push(memory);
+        size += length;
+    }
+    if (current.length) chunks.push(current);
+    const keys = new Map<string, Array<{ id: number; chunk: number }>>();
+    chunks.forEach((chunk, index) => {
+        chunk.forEach((memory) => {
+            const key = memory.content
+                .toLowerCase()
+                .replace(/[^\p{L}\p{N}]+/gu, " ")
+                .trim();
+            keys.set(key, [...(keys.get(key) ?? []), { id: memory.id, chunk: index }]);
+        });
+    });
+    return chunks.map((chunk, index) => ({
+        memories: chunk,
+        crossChunkCandidates: [...keys.values()]
+            .filter(
+                (matches) =>
+                    matches.some((match) => match.chunk === index) &&
+                    matches.some((match) => match.chunk !== index),
+            )
+            .map((matches) => `IDs ${matches.map((match) => match.id).join(", ")}`),
+    }));
 }
 
 // ── Retrospective ───────────────────────────────────────────────────────────
@@ -215,162 +252,31 @@ Return only XML in this exact shape:
 
 export function buildMaintainDocsPrompt(
     projectPath: string,
-    lastDreamAt: string | null,
+    changeSet: string,
     existingDocs: { architecture: boolean; structure: boolean },
+    budget = 12000,
+    currentTokens = 0,
+    currentDocs?: { architecture: string; structure: string },
 ): string {
-    const hasAny = existingDocs.architecture || existingDocs.structure;
-    const gitSinceClause = lastDreamAt
-        ? `Run \`git log --oneline --since="${new Date(Number(lastDreamAt)).toISOString()}"\` to see what changed since the last dream.`
-        : "No previous dream timestamp — treat this as a full analysis.";
+    return `## Task: Propose documentation corrections
 
-    const modeIntro = hasAny
-        ? `Some docs already exist and are the source of truth for shape. Make SURGICAL \`edit\` changes to only the sections affected by recent code changes; preserve every other section, the existing structure, and the existing density verbatim. Do NOT regenerate a whole file, do NOT reshape prose into a template, and do NOT use the templates below (they are for creation only). If nothing material changed, change nothing.`
-        : `No docs exist yet. Create both ARCHITECTURE.md and STRUCTURE.md from scratch using the templates below as a STARTING shape, then go deeper than the template wherever the code warrants it.`;
+Project: ${projectPath}
+Existing docs: ARCHITECTURE.md ${existingDocs.architecture ? "exists" : "missing"}; STRUCTURE.md ${existingDocs.structure ? "exists" : "missing"}.
+Current combined token count: ${currentTokens}. Combined budget: ${budget} tokens.
 
-    return `## Task: Maintain Codebase Documentation
+Host-collected code changes (diff stat and hunks, or file/line ranges when oversized):
+${changeSet}
 
-**Project:** ${projectPath}
-**Last dream:** ${lastDreamAt ? new Date(Number(lastDreamAt)).toISOString() : "never"}
-**Existing docs:** ARCHITECTURE.md: ${existingDocs.architecture ? "exists" : "missing"}, STRUCTURE.md: ${existingDocs.structure ? "exists" : "missing"}
+Current ARCHITECTURE.md:
+${currentDocs?.architecture ?? "(read from project)"}
 
-### Goal
-Keep ARCHITECTURE.md and STRUCTURE.md at the project root synchronized with the actual codebase.
+Current STRUCTURE.md:
+${currentDocs?.structure ?? "(read from project)"}
 
-${modeIntro}
+Find claims in these sections that the diff makes wrong or incomplete. Propose one focused change per claim or section. Do not investigate unrelated areas. Read the docs and relevant source with read-only tools. These files are short maps read by every agent in every session. Describe how the system works now, never what changed or when: no change log, dates, or commit lists. One short paragraph per subsystem at most. Mechanism detail belongs in docs/architecture/; you may name a docs page for it but never move that detail into these two files. Propose a change only when code contradicts the docs or a major piece is missing. Prefer rewriting a stale sentence to adding one. Propose nothing when nothing is wrong. Keep both files within the combined budget. Never touch protected regions (<!-- mc:protected START ... --> through <!-- mc:protected END -->); preserve their bytes.
 
-### Process
-
-1. **Check what changed.** ${gitSinceClause}
-2. **Read existing docs** (if they exist) IN FULL to understand their current structure, depth, and voice; you will preserve all of it except what code changes force you to touch.
-3. **Explore the codebase** to verify and update:
-   - Directory structure: \`find . -type d -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/dist/*' | head -60\`
-   - Entry points: \`ls src/index.* src/main.* 2>/dev/null\`
-   - Key imports: \`grep -r "^import\\|^export" src/ --include="*.ts" | head -80\`
-4. **Apply the change.** If the doc EXISTS: use \`edit\` for the specific sections that drifted, never rewrite the whole file with \`write\`. If the doc is MISSING: create it with \`write\`. Always at project root, NOT \`.planning/\`.
-
-### Rules
-- **NEVER touch protected regions**: any content between \`<!-- mc:protected START ... -->\` and \`<!-- mc:protected END -->\` is hand-authored and cache-critical. Reproduce it BYTE-FOR-BYTE in your rewrite — do not edit, reword, reorder, summarize, trim, or drop a single line of it, and keep the marker comments themselves. Only a human edits that region.
-- **Preserve existing structure and density**: when a doc exists, keep its headings, ordering, level of detail, and voice. Make the smallest edits that re-sync it with the code. NEVER flatten dense hand-written prose into the generic template, collapse a detailed section into bullet stubs, or drop specific invariants/edge-cases/mechanism detail because it does not match a standard layout. Denser and more specific than the template is BETTER.
-- **Be prescriptive**: "Use X pattern" not "X pattern is used"
-- **Always include file paths** in backticks
-- **Write current state only**: no temporal language, no history
-- **Verify before writing**: read actual files, don't guess
-- **Never read .env, credentials, or key files** — note existence only
-- **Do not commit** — the user handles git
-
-${!existingDocs.architecture ? ARCHITECTURE_TEMPLATE : ""}
-${!existingDocs.structure ? STRUCTURE_TEMPLATE : ""}
-
-### Success criteria
-- ARCHITECTURE.md accurately describes current layers, data flows, entry points, and abstractions
-- STRUCTURE.md accurately describes directory layout with guidance for where to add new code
-- All file paths in docs point to files that actually exist
-- Docs are at project root: \`${projectPath}/ARCHITECTURE.md\` and \`${projectPath}/STRUCTURE.md\``;
+Return ONLY a JSON array (or []), with each entry {"file":"ARCHITECTURE.md"|"STRUCTURE.md","action":"replace"|"add"|"remove","heading":"## Exact section heading","text":"## Full replacement section including heading and body (empty for remove)","reason":"one-line reason"}. A replacement includes the entire section, including its heading. Additions are appended at the end of the file. Do not include any unmodified sections. No file writes.`;
 }
-
-// ── Templates ──────────────────────────────────────────────────────────────
-
-const ARCHITECTURE_TEMPLATE = `
-### ARCHITECTURE.md Template (use when creating from scratch)
-
-\`\`\`markdown
-# Architecture
-
-## Pattern Overview
-
-**Overall:** [Pattern name — e.g., Plugin-based hook system]
-
-**Key Characteristics:**
-- [Characteristic 1]
-- [Characteristic 2]
-
-## Layers
-
-**[Layer Name]:**
-- Purpose: [What this layer does]
-- Location: \\\`[path]\\\`
-- Contains: [Types of code]
-- Depends on: [What it uses]
-- Used by: [What uses it]
-
-## Data Flow
-
-**[Flow Name]:** (e.g., "Transform Pipeline", "Memory Promotion")
-
-1. [Step 1] — \\\`[file]\\\`
-2. [Step 2] — \\\`[file]\\\`
-3. [Step 3] — \\\`[file]\\\`
-
-## Key Abstractions
-
-**[Abstraction Name]:**
-- Purpose: [What it represents]
-- Location: \\\`[file paths]\\\`
-- Pattern: [Pattern used]
-
-## Entry Points
-
-**[Entry Point]:**
-- Location: \\\`[path]\\\`
-- Triggers: [What invokes it]
-- Responsibilities: [What it does]
-
-## Error Handling
-
-**Strategy:** [Approach — e.g., fail closed, sentinel throws, try/catch with logging]
-
-## Cross-Cutting Concerns
-
-**Logging:** [Approach]
-**Caching:** [Approach]
-**Storage:** [Approach]
-\`\`\``;
-
-const STRUCTURE_TEMPLATE = `
-### STRUCTURE.md Template (use when creating from scratch)
-
-\`\`\`markdown
-# Codebase Structure
-
-## Directory Layout
-
-\\\`\\\`\\\`
-[project-root]/
-├── [dir]/          # [Purpose]
-├── [dir]/          # [Purpose]
-└── [file]          # [Purpose]
-\\\`\\\`\\\`
-
-## Directory Purposes
-
-**[Directory Name]:**
-- Purpose: [What lives here]
-- Contains: [Types of files]
-- Key files: \\\`[important files]\\\`
-
-## Key File Locations
-
-**Entry Points:** \\\`[path]\\\`: [Purpose]
-**Configuration:** \\\`[path]\\\`: [Purpose]
-**Core Logic:** \\\`[path]\\\`: [Purpose]
-**Tests:** \\\`[path]\\\`: [Purpose]
-
-## Naming Conventions
-
-**Files:** [Pattern]: [Example]
-**Directories:** [Pattern]: [Example]
-
-## Where to Add New Code
-
-**New hook:** \\\`src/hooks/[hook-name]/\\\` — follow existing hook structure
-**New tool:** \\\`src/tools/[tool-name]/\\\` — register in tool-registry.ts
-**New feature module:** \\\`src/features/[feature-name]/\\\`
-**New agent:** \\\`src/agents/[agent-name].ts\\\`
-**Shared utilities:** \\\`src/shared/\\\`
-**Tests:** co-located with source as \\\`*.test.ts\\\`
-\`\`\``;
-
-// ── Dispatcher ─────────────────────────────────────────────────────────────
 
 export function buildDreamTaskPrompt(
     task: DreamingTask,
@@ -378,9 +284,14 @@ export function buildDreamTaskPrompt(
         projectPath: string;
         lastDreamAt?: string | null;
         existingDocs?: { architecture: boolean; structure: boolean };
+        docsChangeSet?: string;
+        docsBudget?: number;
+        docsCurrentTokens?: number;
+        docsContents?: { architecture: string; structure: string };
         curate?: {
             category: CurateMemoryCategory;
             memories: CuratePromptMemory[];
+            crossChunkCandidates?: string[];
         };
     },
 ): string {
@@ -390,12 +301,16 @@ export function buildDreamTaskPrompt(
                 projectPath: args.projectPath,
                 category: args.curate?.category ?? "PROJECT_RULES",
                 memories: args.curate?.memories ?? [],
+                crossChunkCandidates: args.curate?.crossChunkCandidates,
             });
         case "maintain-docs":
             return buildMaintainDocsPrompt(
                 args.projectPath,
-                args.lastDreamAt ?? null,
+                args.docsChangeSet ?? "",
                 args.existingDocs ?? { architecture: false, structure: false },
+                args.docsBudget,
+                args.docsCurrentTokens,
+                args.docsContents,
             );
     }
 }

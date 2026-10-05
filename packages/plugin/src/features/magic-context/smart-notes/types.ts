@@ -1,4 +1,4 @@
-import type { Note } from "../storage-notes";
+import type { Note, NoteCheckStatus } from "../storage-notes";
 
 export const SMART_NOTE_CHECK_POLICY_VERSION = 1;
 
@@ -10,7 +10,7 @@ export const SMART_NOTE_CHECK_LIVENESS_RECHECK_MS = 24 * 60 * 60 * 1000;
 
 export type SmartNoteCapabilityName = "readFile" | "gitHeadSha" | "gitTag" | "gitLog" | "httpGet";
 
-export type SmartNoteCheckStatus = "uncompiled" | "compiled" | "failing" | "fallback";
+export type SmartNoteCheckStatus = NoteCheckStatus;
 
 export interface SmartNoteCheckManifest {
     capabilities: SmartNoteCapabilityName[];
@@ -44,16 +44,26 @@ export interface SmartNoteCheckResult {
 
 export interface SmartNoteNetworkErrorOptions {
     terminal?: boolean;
+    persistent?: boolean;
+    /** The unauthenticated transport cannot check this source; owner repair is required. */
+    uncheckable?: boolean;
+    retryAt?: number;
 }
 
 export class SmartNoteNetworkError extends Error {
     readonly isSmartNoteNetworkError = true;
     readonly terminal: boolean;
+    readonly persistent: boolean;
+    readonly uncheckable: boolean;
+    readonly retryAt?: number;
 
     constructor(message: string, options: SmartNoteNetworkErrorOptions = {}) {
         super(message);
         this.name = "SmartNoteNetworkError";
         this.terminal = options.terminal ?? false;
+        this.persistent = options.persistent ?? false;
+        this.uncheckable = options.uncheckable ?? false;
+        this.retryAt = options.retryAt;
     }
 }
 

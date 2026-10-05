@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
 	__test,
 	capturePiServedArray,
+	clearPiServedArraySession,
 	flushPiServedArrayLedger,
 	getPiServedArrayBodyPath,
 	getPiServedArrayLedgerPath,
@@ -22,7 +24,9 @@ afterEach(() => {
 });
 
 function temporaryDirectory(): string {
-	const directory = mkdtempSync(join(tmpdir(), "pi-served-array-ledger-"));
+	const directory = createTestTempDirFromPath(
+		join(tmpdir(), "pi-served-array-ledger-"),
+	);
 	temporaryDirectories.push(directory);
 	return directory;
 }
@@ -36,6 +40,54 @@ function message(index: number): Record<string, unknown> {
 }
 
 describe("Pi served-array digest ledger", () => {
+	test("reuses the same-pass LKG bytes without walking messages again", () => {
+		const storageDir = temporaryDirectory();
+		const messages = Array.from({ length: 45 }, (_, index) => message(index));
+		const jsonMessages = messages.map((message) => JSON.stringify(message));
+		const json = JSON.stringify(messages);
+		// The tail vectors still inspect the last 40 entries, but the full-array
+		// digest must use the detached snapshot rather than serialize the head.
+		Object.defineProperty(messages[0], "toJSON", {
+			value: () => {
+				throw new Error("head serialized twice");
+			},
+		});
+		const record = capturePiServedArray("reuse", messages, {
+			storageDir,
+			fullBodyCapture: true,
+			serializedOutput: { jsonMessages, json },
+		});
+		flushPiServedArrayLedger();
+		expect(record?.sha256).toBe(
+			createHash("sha256").update(json).digest("hex"),
+		);
+		const body = JSON.parse(
+			readFileSync(getPiServedArrayBodyPath("reuse", storageDir), "utf8"),
+		);
+		expect(JSON.stringify(body.messages)).toBe(json);
+		expect(__test.getDiagnostics().swallowedWriteCount).toBe(0);
+	});
+
+	test("session cleanup releases previous bytes but preserves queued records", () => {
+		const storageDir = temporaryDirectory();
+		const first = capturePiServedArray("clear", [message(0)], { storageDir });
+		capturePiServedArray("other", [message(0)], { storageDir });
+		clearPiServedArraySession("clear");
+		const next = capturePiServedArray("clear", [message(1)], { storageDir });
+		const other = capturePiServedArray("other", [message(1)], { storageDir });
+		expect(next?.previous_sha256).toBeNull();
+		expect(next?.sequence).toBe(1);
+		expect(other?.sequence).toBe(2);
+		flushPiServedArrayLedger();
+		const rows = readFileSync(
+			getPiServedArrayLedgerPath("clear", storageDir),
+			"utf8",
+		)
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(rows).toEqual([first, next]);
+	});
 	test("persists one full-array digest and exact first divergence per pass", () => {
 		const storageDir = temporaryDirectory();
 		const sessionId = "019-test-session";

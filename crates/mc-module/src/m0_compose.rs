@@ -11,7 +11,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use mc_store::{McStore, McStoreError, MemoryRevision};
+use mc_store::{McStore, McStoreError, MemoryRevision, StoredCompartment};
 use sha2::{Digest, Sha256};
 
 use crate::compartment_coverage::{resolve_coverage, CoverageGap};
@@ -20,7 +20,7 @@ use crate::memory_render::{render_m0, render_memory_line, workspace_source_names
 use crate::project_docs::read_project_docs_canonical;
 
 pub(crate) const MEMORY_MURAL_BLOCK: &str =
-    "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>";
+    "<memory-mural>\nThe project memory mural image follows.\nThe memory mural image lists project memories that did not fit `<project-memory>`, as compressed cues under category banners. A red cue is a prohibition (`⊘thing (reason)`), `→` means leads to. Run `ctx_search` with a cue's identifiers to recall the full memory.\n</memory-mural>";
 
 /// Why composing the HARD m0 from the store failed.
 #[derive(Debug)]
@@ -114,8 +114,8 @@ pub struct M0ComposeInputs<'a> {
     /// The expiry cutoff, FROZEN at the HARD (a memory expiring after this still renders;
     /// a later defer uses the same cutoff → identical bytes).
     pub now_ms: i64,
-    /// The history budget in tokens selected for this frozen render decision. The decay
-    /// renderer fits the compartments to it; under a loose budget the render is estimator-independent.
+    /// Local-token history allowance converted from the real budget at the HARD edge.
+    /// The decay curve and exact demotion loop both consume this same local allowance.
     pub history_budget_tokens: f64,
     /// System-role content that is no longer in the live tail because the current fold
     /// covers its ordinal. Passing it explicitly keeps m0 composition deterministic and
@@ -123,8 +123,6 @@ pub struct M0ComposeInputs<'a> {
     pub covered_system_messages: &'a [String],
     /// Disabled memory removes both project memories and the user-profile memory block.
     pub memory_enabled: bool,
-    /// Host-backed profiles expose context.db ids; Claude Code remains module-native.
-    pub host_backed_memory_ids: bool,
     /// Maximum token estimate for the grouped project-memory block.
     pub memory_budget_tokens: f64,
     /// Maximum token estimate for the user-profile block.
@@ -168,11 +166,25 @@ fn memory_selection_order(
     if left_permanent != right_permanent {
         return right_permanent.cmp(&left_permanent);
     }
-    right
+    let left_reinforced_at = left.last_seen_at.into_iter().chain(left.verified_at).max();
+    let right_reinforced_at = right
+        .last_seen_at
+        .into_iter()
+        .chain(right.verified_at)
+        .max();
+    let importance_order = right
         .importance
         .unwrap_or(i32::MIN)
-        .cmp(&left.importance.unwrap_or(i32::MIN))
-        .then_with(|| left.id.cmp(&right.id))
+        .cmp(&left.importance.unwrap_or(i32::MIN));
+    if importance_order != Ordering::Equal {
+        return importance_order;
+    }
+    match (left_reinforced_at, right_reinforced_at) {
+        (None, None) => left.id.cmp(&right.id),
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(left_at), Some(right_at)) => right_at.cmp(&left_at),
+    }
 }
 
 fn memory_candidate_cost(
@@ -217,8 +229,9 @@ fn admit_memory(
 }
 
 /// Select the same grouped-block candidates as TypeScript: permanent memories first,
-/// then importance descending and id (the durable recency tie-break) ascending. Workspace
-/// renders additionally reserve an equal floor for each member before filling leftovers.
+/// then importance and latest re-observation/verification descending, with id only when
+/// both recency timestamps are absent. Workspace renders additionally reserve an equal floor for each
+/// member before filling leftovers.
 pub(crate) fn trim_memories_to_budget(
     memories: Vec<mc_store::StoredMemory>,
     membership: Option<&mc_store::WorkspaceMembership>,
@@ -409,10 +422,53 @@ fn render_m0_retry(
     m0_bytes
 }
 
+/// The four domain reads m0 is composed from.
+///
+/// The module reads them through its store. The single-store migration engine implements
+/// them twice more, over the old `store.db` tables and over `context.db`, so its render
+/// check composes both sides with this same composer.
+pub trait M0Source {
+    fn load_compartments(&self, session_id: &str) -> Result<Vec<StoredCompartment>, McStoreError>;
+    fn resolve_workspace_membership(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<mc_store::WorkspaceMembership>, McStoreError>;
+    fn load_memory_render_snapshot(
+        &self,
+        project_path: &str,
+        membership: Option<&mc_store::WorkspaceMembership>,
+        now_ms: i64,
+    ) -> Result<mc_store::MemoryRenderSnapshot, McStoreError>;
+    fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError>;
+}
+
+impl M0Source for McStore {
+    fn load_compartments(&self, session_id: &str) -> Result<Vec<StoredCompartment>, McStoreError> {
+        McStore::load_compartments(self, session_id)
+    }
+    fn resolve_workspace_membership(
+        &self,
+        project_path: &str,
+    ) -> Result<Option<mc_store::WorkspaceMembership>, McStoreError> {
+        McStore::resolve_workspace_membership(self, project_path)
+    }
+    fn load_memory_render_snapshot(
+        &self,
+        project_path: &str,
+        membership: Option<&mc_store::WorkspaceMembership>,
+        now_ms: i64,
+    ) -> Result<mc_store::MemoryRenderSnapshot, McStoreError> {
+        McStore::load_memory_render_snapshot(self, project_path, membership, now_ms)
+    }
+    fn load_active_user_memories(&self) -> Result<Vec<String>, McStoreError> {
+        McStore::load_active_user_memories(self)
+    }
+}
+
 /// Read the store and compose the HARD m0 bytes + watermarks. `estimate_tokens` is the
 /// token estimator used for every injection budget and the history fit.
-pub fn compose_m0_from_store(
-    store: &McStore,
+pub fn compose_m0_from_store<S: M0Source + ?Sized>(
+    store: &S,
     inputs: &M0ComposeInputs<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
 ) -> Result<M0Composition, M0ComposeError> {
@@ -425,8 +481,8 @@ pub fn compose_m0_from_store(
     )
 }
 
-pub(crate) fn compose_m0_from_store_timed(
-    store: &McStore,
+pub(crate) fn compose_m0_from_store_timed<S: M0Source + ?Sized>(
+    store: &S,
     inputs: &M0ComposeInputs<'_>,
     estimate_tokens: impl Fn(&str) -> usize + Copy,
     incremental: bool,
@@ -477,12 +533,7 @@ pub(crate) fn compose_m0_from_store_timed(
         inputs.memory_budget_tokens,
         estimate_tokens,
     );
-    let mut rendered_memories = selected_memories.clone();
-    if inputs.host_backed_memory_ids {
-        for memory in &mut rendered_memories {
-            memory.id = memory.host_row_id.unwrap_or(0);
-        }
-    }
+    let rendered_memories = selected_memories.clone();
     let source_name_by_id = membership
         .as_ref()
         .map(|value| workspace_source_names(&rendered_memories, value))
@@ -579,8 +630,10 @@ mod tests {
     }
 
     fn seed_user_profile(store: &McStore, profile: &[String]) {
+        store.seed_user_profile_for_test(profile, 1).unwrap();
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
+                resolved_compartment_boundaries: &[],
                 session_id: "ses",
                 project_path: "git:proj",
                 shadow_generation: 0,
@@ -602,16 +655,7 @@ mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: profile,
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: false,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: Some(1),
                 acked_watermarks: serde_json::json!({}),
             })
             .unwrap();
@@ -629,6 +673,50 @@ mod tests {
             importance: 50,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn importance_50_budget_selects_the_verified_memory() {
+        let never_verified = mc_store::StoredMemory {
+            id: 1,
+            category: "CONSTRAINTS".to_string(),
+            content: "memory alpha record".to_string(),
+            importance: Some(50),
+            status: "active".to_string(),
+            last_seen_at: Some(1_000),
+            verified_at: None,
+            ..Default::default()
+        };
+        let verified_yesterday = mc_store::StoredMemory {
+            id: 2,
+            category: "CONSTRAINTS".to_string(),
+            content: "memory bravo record".to_string(),
+            importance: Some(50),
+            status: "active".to_string(),
+            last_seen_at: Some(1_000),
+            verified_at: Some(2_000),
+            ..Default::default()
+        };
+        let estimate = |text: &str| text.len();
+        let categories = HashSet::new();
+        let sources = HashMap::new();
+        let budget = estimate("<project-memory>\n</project-memory>")
+            + memory_candidate_cost(&never_verified, &categories, &sources, estimate).max(
+                memory_candidate_cost(&verified_yesterday, &categories, &sources, estimate),
+            ) as usize;
+
+        let selected = trim_memories_to_budget(
+            vec![never_verified, verified_yesterday],
+            None,
+            &sources,
+            budget as f64,
+            estimate,
+        );
+
+        assert_eq!(
+            selected.iter().map(|memory| memory.id).collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[test]
@@ -690,7 +778,6 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 15_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: false,
@@ -747,7 +834,6 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -781,7 +867,6 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: false,
@@ -810,7 +895,6 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -860,7 +944,6 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: false,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -878,6 +961,31 @@ mod tests {
         assert!(composed.rendered_memory_ids.is_empty());
         assert_eq!(composed.max_memory_id, 0);
         assert_eq!(composed.memory_mutation_cursor, 0);
+
+        for (enabled, supports_vision, data_url, expected) in [
+            (true, true, Some("data:image/png;base64,YQ=="), true),
+            (false, true, Some("data:image/png;base64,YQ=="), false),
+            (true, false, Some("data:image/png;base64,YQ=="), false),
+            (true, true, None, false),
+        ] {
+            let image = M0MuralInput {
+                enabled,
+                supports_vision,
+                data_url: data_url.map(str::to_string),
+                content_hash: Some("legend-test".to_string()),
+            };
+            let active_inputs = M0ComposeInputs {
+                memory_enabled: true,
+                mural: Some(&image),
+                ..inputs
+            };
+            let active = compose_m0_from_store(store, &active_inputs, no_estimate).unwrap();
+            assert_eq!(active.m0_bytes.contains(MEMORY_MURAL_BLOCK), expected);
+            assert_eq!(
+                active.m0_bytes.contains("The memory mural image lists"),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -901,7 +1009,6 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,
@@ -954,7 +1061,6 @@ mod tests {
             history_budget_tokens: 300.0,
             covered_system_messages: &[],
             memory_enabled: false,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 0.0,
             user_profile_budget_tokens: 0.0,
             inject_docs: false,
@@ -1201,136 +1307,6 @@ mod tests {
     }
 
     #[test]
-    fn host_backed_m0_uses_acknowledged_host_ids_and_hides_unacknowledged_module_ids() {
-        let fixture = FixtureBuilder::store();
-        let store = &fixture.store;
-        store
-            .seed_memory(1, "git:proj", "CONSTRAINTS", "stable", 50)
-            .unwrap();
-        let project_directory = fixture.dir.path().to_str().unwrap();
-        let module = compose_m0_from_store(
-            store,
-            &M0ComposeInputs {
-                session_id: "ses",
-                project_path: "git:proj",
-                project_directory,
-                now_ms: 0,
-                history_budget_tokens: 60_000.0,
-                covered_system_messages: &[],
-                memory_enabled: true,
-                host_backed_memory_ids: false,
-                memory_budget_tokens: 8_000.0,
-                user_profile_budget_tokens: 4_000.0,
-                inject_docs: false,
-                temporal_awareness: true,
-                mural: None,
-            },
-            no_estimate,
-        )
-        .unwrap();
-        let pending = compose_m0_from_store(
-            store,
-            &M0ComposeInputs {
-                session_id: "ses",
-                project_path: "git:proj",
-                project_directory,
-                now_ms: 0,
-                history_budget_tokens: 60_000.0,
-                covered_system_messages: &[],
-                memory_enabled: true,
-                host_backed_memory_ids: true,
-                memory_budget_tokens: 8_000.0,
-                user_profile_budget_tokens: 4_000.0,
-                inject_docs: false,
-                temporal_awareness: true,
-                mural: None,
-            },
-            no_estimate,
-        )
-        .unwrap();
-        assert!(!pending.m0_bytes.contains("#1:"));
-        assert!(pending.m0_bytes.contains("waiting for the host mirror"));
-        assert!(pending.rendered_memory_ids.is_empty());
-
-        let feed_head_before_ack = store.changefeed_head("memories").unwrap();
-        store
-            .acknowledge_host_memory_ids(
-                "git:proj",
-                &[mc_store::HostMemoryIdentityAck {
-                    module_row_id: 1,
-                    host_row_id: 101,
-                }],
-            )
-            .unwrap();
-        assert_eq!(
-            store.changefeed_head("memories").unwrap(),
-            feed_head_before_ack,
-            "host identity acknowledgements must not create mirror feedback rows"
-        );
-        let host = compose_m0_from_store(
-            store,
-            &M0ComposeInputs {
-                session_id: "ses",
-                project_path: "git:proj",
-                project_directory,
-                now_ms: 0,
-                history_budget_tokens: 60_000.0,
-                covered_system_messages: &[],
-                memory_enabled: true,
-                host_backed_memory_ids: true,
-                memory_budget_tokens: 8_000.0,
-                user_profile_budget_tokens: 4_000.0,
-                inject_docs: false,
-                temporal_awareness: true,
-                mural: None,
-            },
-            no_estimate,
-        )
-        .unwrap();
-        assert_eq!(host.m0_bytes, module.m0_bytes.replace("#1:", "#101:"));
-        assert_eq!(host.rendered_memory_ids, vec![101]);
-    }
-
-    #[test]
-    fn review_claude_code_m0_identity_pin() {
-        let fixture = FixtureBuilder::store();
-        fixture
-            .store
-            .seed_memory(1, "git:proj", "CONSTRAINTS", "stable", 50)
-            .unwrap();
-        let inputs = M0ComposeInputs {
-            session_id: "ses",
-            project_path: "git:proj",
-            project_directory: fixture.dir.path().to_str().unwrap(),
-            now_ms: 0,
-            history_budget_tokens: 60_000.0,
-            covered_system_messages: &[],
-            memory_enabled: true,
-            host_backed_memory_ids: false,
-            memory_budget_tokens: 8_000.0,
-            user_profile_budget_tokens: 4_000.0,
-            inject_docs: false,
-            temporal_awareness: true,
-            mural: None,
-        };
-        let before = compose_m0_from_store(&fixture.store, &inputs, no_estimate).unwrap();
-        assert!(before.m0_bytes.contains("#1:"));
-        fixture
-            .store
-            .acknowledge_host_memory_ids(
-                "git:proj",
-                &[mc_store::HostMemoryIdentityAck {
-                    module_row_id: 1,
-                    host_row_id: 901,
-                }],
-            )
-            .unwrap();
-        let after = compose_m0_from_store(&fixture.store, &inputs, no_estimate).unwrap();
-        assert_eq!(before.m0_bytes, after.m0_bytes);
-        assert_eq!(after.rendered_memory_ids, vec![1]);
-    }
-
-    #[test]
     fn determinism_same_inputs_same_bytes() {
         let fixture = FixtureBuilder::store();
         let dir = &fixture.dir;
@@ -1349,7 +1325,6 @@ mod tests {
             history_budget_tokens: 60_000.0,
             covered_system_messages: &[],
             memory_enabled: true,
-            host_backed_memory_ids: false,
             memory_budget_tokens: 8_000.0,
             user_profile_budget_tokens: 4_000.0,
             inject_docs: true,

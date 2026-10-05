@@ -54,6 +54,88 @@ describe("renderVerboseRange", () => {
         }
     });
 
+    test("labels tool-result-only user turns without changing real user or assistant turns", () => {
+        const cleanup = provide([
+            {
+                ordinal: 2,
+                id: "prompt",
+                role: "user",
+                parts: [{ type: "text", text: "Read PLAN.md" }],
+            },
+            {
+                ordinal: 3,
+                id: "call",
+                role: "assistant",
+                parts: [ocTool("read", "read:1", { filePath: "PLAN.md" }, undefined)],
+            },
+            {
+                ordinal: 4,
+                id: "results",
+                role: "user",
+                parts: [ocTool("read", "read:1", null, "file contents")],
+            },
+            {
+                ordinal: 5,
+                id: "mixed",
+                role: "user",
+                parts: [
+                    { type: "tool_result", tool_use_id: "read:2", content: "more contents" },
+                    { type: "text", text: "Continue" },
+                ],
+            },
+            {
+                ordinal: 6,
+                id: "anthropic",
+                role: "user",
+                parts: [{ type: "tool_result", tool_use_id: "read:3", content: "output" }],
+            },
+            {
+                ordinal: 7,
+                id: "oc",
+                role: "assistant",
+                parts: [ocTool("read", "read:4", {}, "output")],
+            },
+        ]);
+        try {
+            const out = renderVerboseRange(SESSION, 2, 7, 15_000);
+            expect(out.text).toMatch(/^\[2\] U \(user\)\n {4}• Read PLAN.md/m);
+            expect(out.text).toMatch(/^\[3\] A \(assistant\)\n {4}• tool read\(PLAN.md\)/m);
+            expect(out.text).toMatch(/^\[4\] tool results\n {4}• tool read → output ~\d+ tok/m);
+            expect(out.text).toMatch(
+                /^\[5\] U \(user\)\n {4}• tool tool_result → output ~\d+ tok\n {4}• Continue/m,
+            );
+            expect(out.text).toMatch(/^\[6\] tool results/m);
+            expect(out.text).toMatch(/^\[7\] A \(assistant\)/m);
+            expect(out.lastOrdinal).toBe(7);
+        } finally {
+            cleanup();
+        }
+    });
+
+    test("keeps ranges without tool-result-only messages byte-identical", () => {
+        const cleanup = provide([
+            {
+                ordinal: 2,
+                id: "prompt",
+                role: "user",
+                parts: [{ type: "text", text: "Read PLAN.md" }],
+            },
+            {
+                ordinal: 3,
+                id: "reply",
+                role: "assistant",
+                parts: [{ type: "text", text: "Reading" }],
+            },
+        ]);
+        try {
+            expect(renderVerboseRange(SESSION, 2, 3, 15_000).text).toBe(
+                "[2] U (user)\n    • Read PLAN.md\n\n[3] A (assistant)\n    • Reading",
+            );
+        } finally {
+            cleanup();
+        }
+    });
+
     test("only includes messages within [start,end]", () => {
         const cleanup = provide([
             { ordinal: 5, id: "msg_before", role: "user", parts: [{ type: "text", text: "x" }] },

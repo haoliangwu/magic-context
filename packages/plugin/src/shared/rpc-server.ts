@@ -18,7 +18,13 @@ import {
     type NotificationSink,
     registerNotificationSink,
 } from "./rpc-notifications";
-import { isPidAlive, parseRpcPortFile, rpcPortDir, rpcPortFilePath } from "./rpc-utils";
+import {
+    inspectProcessesAsync,
+    parseRpcPortFile,
+    registerOwnRpcServerInstance,
+    rpcPortDir,
+    rpcPortFilePath,
+} from "./rpc-utils";
 import { shouldEnforcePrivateStoragePermissions } from "./storage-permissions";
 
 type RpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -87,6 +93,7 @@ export class MagicContextRpcServer {
     private portDir: string;
     private startedAt = Date.now();
     private readonly instanceId = randomBytes(8).toString("hex");
+    private unregisterOwnInstance: (() => void) | null = null;
     /** Every authenticated WS socket, so dispose can close them all. */
     private sockets = new Set<ServerWebSocket<WsData>>();
     // Unguessable per-process bearer token, published in the (user-private) port
@@ -104,6 +111,24 @@ export class MagicContextRpcServer {
     /** Register an RPC method handler. */
     handle(method: string, handler: RpcHandler): void {
         this.handlers.set(method, handler);
+    }
+
+    /**
+     * Run a registered handler from inside this process, skipping the HTTP hop.
+     *
+     * A caller that already lives in the server process (a host command callback,
+     * for instance) must reach exactly the handler the TUI reaches over HTTP, so
+     * the two entry points cannot drift apart. The loopback socket, its bearer
+     * token and JSON encoding add nothing here, so they are skipped rather than
+     * paid for; an unknown method is still an error, as it is over HTTP.
+     */
+    async dispatch(
+        method: string,
+        params: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> {
+        const handler = this.handlers.get(method);
+        if (!handler) return { error: `Unknown method: ${method}` };
+        return handler(params);
     }
 
     /** Start the server on a random port, write port to disk. */
@@ -151,7 +176,7 @@ export class MagicContextRpcServer {
         // supported: TUI discovery scans all live files and picks the most
         // recent instead of cross-wiring via one shared project file.
         try {
-            this.warnIfOtherLiveInstance();
+            void this.warnIfOtherLiveInstance();
             const dir = dirname(this.portFilePath);
             // The port file carries the RPC bearer token. The normal policy keeps
             // it owner-only; a trusted-group deployment explicitly delegates every
@@ -168,6 +193,9 @@ export class MagicContextRpcServer {
             } else {
                 mkdirSync(dir, { recursive: true });
             }
+            // Registered before the file appears, so the storage migration guard in
+            // this process never sees its own discovery file as another live host.
+            this.unregisterOwnInstance ??= registerOwnRpcServerInstance(this.instanceId);
             const tmpPath = `${this.portFilePath}.tmp`;
             // A stale tmp from a crashed write could exist with loose perms;
             // writeFileSync's mode only applies on create, so remove it first.
@@ -231,14 +259,18 @@ export class MagicContextRpcServer {
         } catch {
             // Intentional: port file may already be gone
         }
+        this.unregisterOwnInstance?.();
+        this.unregisterOwnInstance = null;
     }
 
-    private warnIfOtherLiveInstance(): void {
+    private async warnIfOtherLiveInstance(): Promise<void> {
         try {
             for (const entry of readdirSync(this.portDir)) {
                 if (!entry.startsWith("port-") || !entry.endsWith(".json")) continue;
                 const record = parseRpcPortFile(readFileSync(`${this.portDir}/${entry}`, "utf-8"));
-                if (!record || record.pid === process.pid || !isPidAlive(record.pid)) continue;
+                if (!record || record.pid === process.pid) continue;
+                const processes = await inspectProcessesAsync();
+                if (processes.liveness(record.pid) !== "alive") continue;
                 log(
                     `[rpc] another Magic Context RPC server is active for this project (pid ${record.pid}, port ${record.port}); starting separate instance on a new port`,
                 );

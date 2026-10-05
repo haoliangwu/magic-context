@@ -202,7 +202,16 @@ export function pruneSynapseBatchLedgerForProject(
         )
         .get();
     if (!ledgerTable) return 0;
+    const shadow = `shadow:${projectIdentity}`;
+    const cutoff = Date.now() - ttlMs;
+    const predicate = "session_id IN (?, ?) AND updated_at < ?";
+    if (
+        !db
+            .prepare(`SELECT 1 FROM synapse_batch_ledger WHERE ${predicate} LIMIT 1`)
+            .get(projectIdentity, shadow, cutoff)
+    )
+        return 0;
     return db
-        .prepare("DELETE FROM synapse_batch_ledger WHERE session_id IN (?, ?) AND updated_at < ?")
-        .run(projectIdentity, `shadow:${projectIdentity}`, Date.now() - ttlMs).changes;
+        .prepare(`DELETE FROM synapse_batch_ledger WHERE ${predicate}`)
+        .run(projectIdentity, shadow, cutoff).changes;
 }

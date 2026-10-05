@@ -1,16 +1,16 @@
-export const CTX_NOTE_DESCRIPTION = `Working notes for this session — reminders, follow-ups, and things to revisit later.
+export const CTX_NOTE_DESCRIPTION = `Session notes are pending intentions: work you intend to return to, with its findings attached.
 
-Use a note when something matters LATER but not in the next few steps: "revisit the retry logic after the release", "user wants the dashboard polish batched", "flaky test to investigate when touching CI". Don't use notes for active work (use todos) or durable project knowledge (use ctx_memory). Notes resurface at work boundaries and when read.
+Use notes for:
+- A finding to revisit when you return to the intended work
+- A decision with its reasoning, when follow-up work remains
+- A backlog item with evidence already found
+- Something the user explicitly asks you to note
 
-Actions:
-- write: save a note (content). Add surface_condition to make it a smart note (below).
-- read: list notes, newest first. Default: latest active session notes + ready smart notes; page older ones with limit/offset, or inspect other states with filter.
-- update: change one note (note_ids=[N]). dismiss: retire 1–50 notes (note_ids=[...]).
+Don't use notes for: the next few steps; a plan you are actively executing; restart/fold insurance; or a record of how things stand (world-state, a design at a point in time) with nothing you intend to do about it — that goes stale silently; a fact worth keeping is memory, the rest is nothing. Use todos for active work. If the detail already lives in a file, record the path and what to inspect — don't copy the file into a note. Durable project facts belong in ctx_memory, not notes.
 
-Smart notes: pass surface_condition and the note stays hidden until a background checker confirms the condition — using ONLY externally verifiable signals (GitHub state via gh, files on disk, git history, web pages). It cannot see this conversation, so the condition must be checkable from outside:
-✓ "When PR #42 in cortexkit/magic-context is merged"
-✓ "When the latest release tag is >= v0.22.0"
-✓ "When packages/plugin/src/foo.ts contains a function named bar"
-✗ "When the user mentions X" / "when we revisit Y" / "after we finish this refactor" — no external signal; write a regular note instead.
-
-Example: ctx_note(action="write", content="Re-run the perf benchmark once the boundary rework ships", surface_condition="When the latest release tag is >= v0.23.0")`;
+First line is the title (under 80 chars), followed by detail. Operations:
+- write: save a new note (content required)
+- read: one row per note — \`#id · age · title\` — ready smart notes first, then newest; rows untouched 30+ days are marked stale. Pass note_ids to read full bodies; limit/offset page; filter selects other statuses.
+- update: change one note (note_ids=[N])
+- dismiss: retire 1–50 notes (note_ids). Dismiss a note when its work lands or is abandoned; a queue you never dismiss from stops being read.
+- surface_condition: make it a smart note — an outside checker periodically tests the condition using only externally verifiable signals (GitHub state, files, git, releases, web), never this conversation or future actions; the note is parked until the condition holds.`;

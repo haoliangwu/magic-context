@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "bun:test";
 import {
     existsSync,
     mkdirSync,
-    mkdtempSync,
     readFileSync,
     renameSync,
     rmSync,
@@ -14,6 +13,8 @@ import { dirname, join } from "node:path";
 import { LATEST_SUPPORTED_VERSION } from "@magic-context/core/features/magic-context/storage-db";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { convertEntriesToRawMessages } from "@magic-context/pi-core/read-session-pi";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
+import { writeFileAtomic } from "../lib/atomic-write";
 import {
     type MigrationPendingRow,
     migrateOpenCodeSessionToPi,
@@ -29,7 +30,7 @@ const databases: Array<{ close(): void }> = [];
 const originalPiDir = process.env.PI_CODING_AGENT_DIR;
 
 function tempDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-migrate-test-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-migrate-test-"));
     tempDirs.push(dir);
     return dir;
 }
@@ -506,6 +507,36 @@ describe("migrateOpenCodeSessionToPi", () => {
         expect(readJournalRows(cortexkitDb)).toEqual([]);
     });
 
+    it("refuses partial-message compartment conversion before staging or claiming a journal", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const cortexkitDb = makeCortexkitDb();
+        cortexkitDb.exec("ALTER TABLE compartments ADD COLUMN end_block_index INTEGER");
+        cortexkitDb
+            .prepare(
+                "INSERT INTO compartments(session_id, sequence, start_message, end_message, start_message_id, end_message_id, end_block_index, title, content, created_at, harness) VALUES (?, 0, 1, 2, 'm1', 'm2', 0, 'partial', 'body', 1, 'opencode')",
+            )
+            .run(sessionId);
+        const writes: string[] = [];
+        expect(() =>
+            migrateOpenCodeSessionToPi({
+                db,
+                cortexkitDb,
+                sessionId,
+                piSessionsRoot: tempDir(),
+                fs: {
+                    writeFileAtomic: (path) => writes.push(path),
+                    unlinkSync: () => {},
+                    existsSync: (path) => existsSync(path),
+                    renameSync: (from, to) => renameSync(from, to),
+                    mkdirSync: (path, options) => mkdirSync(path, options),
+                },
+            }),
+        ).toThrow("partial_message_compartments_require_recompaction");
+        expect(writes).toEqual([]);
+        expect(readJournalRows(cortexkitDb)).toEqual([]);
+    });
+
     it("refuses module-managed source sessions before staging output", () => {
         const db = makeDb();
         const { sessionId, cwd } = insertSyntheticSession(db);
@@ -536,9 +567,7 @@ describe("migrateOpenCodeSessionToPi", () => {
                     mkdirSync: (path, options) => mkdirSync(path, options),
                 },
             }),
-        ).toThrow(
-            `context.db may contain only host mirrors, not the Rust engine truth. Drain authority to TypeScript with \`magic-context doctor drain-authority ${cwd}\``,
-        );
+        ).toThrow("(MC-C14)");
         expect(writes).toEqual([]);
         expect(readJournalRows(cortexkitDb)).toEqual([]);
     });
@@ -995,6 +1024,48 @@ describe("migration journal — crash-safe lifecycle", () => {
         expect(rows[0].content_sha256.length).toBe(64);
         // Ordering proof: the staged row committed BEFORE any shared state.
         expect(countPiCompartments(ck, rows[0].pi_session_id)).toBe(0);
+    });
+
+    it("aborts without shared state when a concurrent sweep rolled back its staged row", () => {
+        const db = makeDb();
+        const { sessionId } = insertSyntheticSession(db);
+        const ck = makeCortexkitDb();
+        insertCompartment(ck, sessionId);
+        const root = tempDir();
+        const sessionsRoot = join(root, "sessions");
+        const realFs = {
+            writeFileAtomic,
+            unlinkSync,
+            existsSync,
+            renameSync,
+            mkdirSync,
+        };
+
+        // A plain `doctor` in another terminal sweeps the journal right after
+        // this migration staged its file: the staged row and file are rolled back.
+        expect(() =>
+            migrateOpenCodeSessionToPi({
+                db,
+                cortexkitDb: ck,
+                sessionId,
+                piSessionsRoot: sessionsRoot,
+                now: new Date("2026-04-30T11:46:47.422Z"),
+                fs: {
+                    ...realFs,
+                    writeFileAtomic: (path: string, data: string) => {
+                        writeFileAtomic(path, data);
+                        expect(sweepPendingMigrations(ck, realFs).rolledBack).toBe(1);
+                    },
+                },
+            }),
+        ).toThrow(/journal/);
+
+        expect(readJournalRows(ck)).toEqual([]);
+        const piCompartments = ck
+            .prepare("SELECT COUNT(*) AS n FROM compartments WHERE harness = 'pi'")
+            .get() as { n: number };
+        expect(piCompartments.n).toBe(0);
+        expect(existsSync(sessionsRoot)).toBe(false);
     });
 
     it("replay after a post-commit crash reuses the journal identity and upserts shared state", () => {

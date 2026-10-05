@@ -30,6 +30,9 @@ describe.skipIf(!rustPrereqs.ok)("rust maintenance command contract", () => {
     beforeAll(async () => {
         h = await RustTestHarness.create({
             modelContextLimit: 30_000,
+            // The historian gets its own 128k mock model: the 30k session window
+            // builds pressure quickly but cannot hold a historian prompt.
+            historianModelContextLimit: 128_000,
             magicContextConfig: {
                 execute_threshold_percentage: 25,
                 protected_tags: 1,

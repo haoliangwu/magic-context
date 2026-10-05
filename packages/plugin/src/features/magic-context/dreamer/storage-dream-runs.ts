@@ -5,6 +5,9 @@ import type { DreamTaskRunBacklog } from "./task-registry";
 export type DreamRunFailureClass =
     | "provider_timeout"
     | "provider_error"
+    | "local_refusal"
+    | "step_limit"
+    | "token_budget"
     | "empty_completion"
     | "no_models"
     | "child_aborted"
@@ -18,12 +21,16 @@ export interface DreamRunFailureDetail {
     provider_error: string | null;
     timeout_ms: number | null;
     child_session_id: string | null;
+    refusal_reason?: string | null;
 }
 
 export interface DreamRunTaskSummary {
     name: string;
     durationMs: number;
     resultChars: number;
+    /** Absent on older records; their error field distinguishes failure from completion. */
+    status?: "completed" | "failed" | "skipped";
+    skipReason?: string;
     /** Failure detail only. Missing means no failure was recorded; an empty
      * string is treated as absent and is not persisted. */
     error?: string;
@@ -33,11 +40,13 @@ export interface DreamRunTaskSummary {
     /** Successful progress/detail. Missing means no progress was reported; an
      * empty string is treated as absent and is not persisted. */
     progress?: string;
+    /** Child prompt-token budget, consumption, finalize turn and accepted units. */
+    tokenBudget?: { budget: number; spent: number; finalizeFired: boolean; banked: number };
     backlog?: DreamTaskRunBacklog;
 }
 
 export function formatDreamRunFailure(failure: DreamRunFailureDetail): string {
-    return renderDreamFailure(failure.failure_class);
+    return renderDreamFailure(failure.failure_class, "markdown", failure.refusal_reason);
 }
 
 export interface DreamRunMemoryChanges {

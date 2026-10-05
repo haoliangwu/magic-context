@@ -1,12 +1,13 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     FORK_MIGRATION_VERSION_FLOOR,
     isSiblingMigrationConflict,
@@ -30,7 +31,7 @@ import { initializeDatabase } from "./storage-db";
 
 describe("migration race tolerance", () => {
     test("two connections safely race a genuinely pending v51 migration", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-migration-race-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-migration-race-"));
         const path = join(dir, "context.db");
         try {
             const setup = new Database(path);
@@ -131,7 +132,7 @@ describe("migration race tolerance", () => {
     });
 
     test("current schema does not take a write lock behind a sibling BEGIN IMMEDIATE", () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-migration-current-lock-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-migration-current-lock-"));
         const path = join(dir, "context.db");
         const setup = new Database(path);
         const holder = new Database(path);
@@ -368,7 +369,7 @@ describe("migration race tolerance", () => {
     });
 
     test("async migration-lock retry succeeds after a sibling releases its write lock", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-migration-retry-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-migration-retry-"));
         const path = join(dir, "context.db");
         let holder: ReturnType<typeof Bun.spawn> | undefined;
         try {
@@ -395,7 +396,11 @@ describe("migration race tolerance", () => {
                 db.exec("COMMIT");
                 db.close();
             `;
-            holder = Bun.spawn(["bun", "-e", holderScript], { stdout: "pipe", stderr: "inherit" });
+            holder = Bun.spawn(["bun", "-e", holderScript], {
+                stdout: "pipe",
+                stderr: "inherit",
+                windowsHide: true,
+            });
             await holder.stdout?.getReader().read();
 
             const db = new Database(path);

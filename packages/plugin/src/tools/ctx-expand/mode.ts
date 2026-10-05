@@ -10,9 +10,12 @@
  * valid ordinal there, and no message field is competing.
  */
 
+import { parseTagInput } from "../../features/magic-context/tag-input";
+
 export type CtxExpandOrdinalDomain = "positive" | "non-negative";
 
 export type CtxExpandMode =
+    | { kind: "tag"; tag: number }
     | { kind: "message"; message: number }
     | { kind: "range"; start: number; end: number; verbose: boolean }
     | { kind: "error"; message: string };
@@ -39,6 +42,7 @@ function rangeError(domain: CtxExpandOrdinalDomain): string {
 
 export function resolveCtxExpandMode(
     args: {
+        tag?: unknown;
         start?: unknown;
         end?: unknown;
         message?: unknown;
@@ -46,6 +50,31 @@ export function resolveCtxExpandMode(
     },
     domain: CtxExpandOrdinalDomain,
 ): CtxExpandMode {
+    if (
+        args.tag !== undefined &&
+        args.tag !== null &&
+        !(
+            (args.tag === 0 || args.tag === "") &&
+            (args.message !== undefined || args.start !== undefined)
+        )
+    ) {
+        try {
+            const tag = parseTagInput(args.tag);
+            if (
+                [args.message, args.start, args.end].some(
+                    (value) => value !== undefined && value !== null && value !== 0,
+                )
+            ) {
+                return {
+                    kind: "error",
+                    message: "Error: use tag alone, without message or start/end.",
+                };
+            }
+            return { kind: "tag", tag };
+        } catch (error) {
+            return { kind: "error", message: (error as Error).message };
+        }
+    }
     const min = minOrdinal(domain);
     const messagePresent = args.message !== undefined && args.message !== null;
     const message = isInt(args.message) ? args.message : undefined;

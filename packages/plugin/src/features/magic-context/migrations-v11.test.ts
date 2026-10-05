@@ -1,10 +1,15 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "../../shared/sqlite";
+import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { runMigrations } from "./migrations";
 import { closeDatabase, openDatabase } from "./storage";
+import { initializeDatabase } from "./storage-db";
 import {
     clearPersistedTodoSyntheticAnchor,
     getPersistedTodoSyntheticAnchor,
@@ -21,7 +26,7 @@ const TODO_COLUMNS = [
 const tempDirs: string[] = [];
 
 function useTempDataHome(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     return dir;
@@ -37,17 +42,24 @@ afterEach(() => {
         }
     }
     tempDirs.length = 0;
-    process.env.XDG_DATA_HOME = undefined;
+    process.env.XDG_DATA_HOME = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 });
 
 describe("migration v11 — todo state synthesis schema", () => {
     test("fresh database has all three todo columns", () => {
-        useTempDataHome("v11-fresh-");
-        const db = openDatabase();
-        const cols = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{ name: string }>;
-        const names = new Set(cols.map((c) => c.name));
-        for (const col of TODO_COLUMNS) {
-            expect(names.has(col)).toBe(true);
+        const db = new Database(":memory:");
+        try {
+            initializeDatabase(db);
+            runMigrations(db);
+            const cols = db.prepare("PRAGMA table_info(session_meta)").all() as Array<{
+                name: string;
+            }>;
+            const names = new Set(cols.map((c) => c.name));
+            for (const col of TODO_COLUMNS) {
+                expect(names.has(col)).toBe(true);
+            }
+        } finally {
+            closeQuietly(db);
         }
     });
 

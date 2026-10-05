@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { StatusDetail } from "./rpc-types";
-import { formatStatusDetailMarkdown, formatStatusDiagnosticsMarkdown } from "./status-detail-text";
+import { formatStatusDetailMarkdown } from "./status-detail-text";
 
 const STATUS_FIXTURE: StatusDetail = {
     sessionId: "ses_status",
@@ -12,6 +12,17 @@ const STATUS_FIXTURE: StatusDetail = {
     compartmentCount: 12,
     memoryCount: 8,
     memoryBlockCount: 3,
+    memoryImportanceHistogram: {
+        total: 7_986,
+        unclassified: 1_181,
+        bands: {
+            "0-19": 101,
+            "20-39": 202,
+            "40-59": 6_303,
+            "60-79": 707,
+            "80-100": 673,
+        },
+    },
     pendingOpsCount: 2,
     historianRunning: true,
     compartmentInProgress: true,
@@ -112,20 +123,29 @@ describe("status detail text", () => {
         expect(rendered).not.toContain("Reclaimable: 0");
     });
 
-    test("renders summary and diagnostics from one snapshot with matching status values", () => {
-        const summary = formatStatusDetailMarkdown(STATUS_FIXTURE);
-        const diagnostics = formatStatusDiagnosticsMarkdown(STATUS_FIXTURE);
-        for (const value of ["75.0%", "65.0%", "1h (config for anthropic/claude-opus-5)"]) {
-            expect(summary).toContain(value);
-            expect(diagnostics).toContain(value);
-        }
+    test("surfaces a failing scheduled dreamer task in the summary", () => {
+        // The whole point: a task failing on every slot must not be visible only as a
+        // backlog count that never falls.
+        const detail: StatusDetail = {
+            ...STATUS_FIXTURE,
+            dreamerFailures: [
+                {
+                    task: "classify-memories",
+                    error: "Rust classify module failed: producer session busy",
+                    lastSucceededAt: Date.now() - 6 * 24 * 3_600_000,
+                    retryCount: 3,
+                },
+            ],
+        };
+        const summary = formatStatusDetailMarkdown(detail);
+        expect(summary).toContain("A background maintenance task keeps failing");
+        expect(summary).toContain("MC-S05");
     });
 
-    test("keeps the previous OpenCode detail behind diagnostics", () => {
-        const diagnostics = formatStatusDiagnosticsMarkdown(STATUS_FIXTURE);
-        expect(diagnostics).toContain("- **Active profile:** work");
-        expect(diagnostics).toContain("- **Tags:** 4 active, 1 dropped; 2 pending drops");
-        expect(diagnostics).toContain("- **Execute threshold:** 65.0%");
+    test("says nothing about the dreamer while every scheduled task is healthy", () => {
+        expect(
+            formatStatusDetailMarkdown({ ...STATUS_FIXTURE, dreamerFailures: [] }),
+        ).not.toContain("MC-S05");
     });
 
     test("keeps internal vocabulary and identifiers out of the summary", () => {
@@ -157,7 +177,7 @@ describe("status detail text", () => {
         expect(summary).toContain("(MC-H01)");
     });
 
-    test("shows stalled mirror and authority mismatch codes in summary and diagnostics", () => {
+    test("shows stalled mirror and authority mismatch codes in the summary", () => {
         const detail = {
             ...STATUS_FIXTURE,
             hostBackendsModuleSide: true,
@@ -174,13 +194,50 @@ describe("status detail text", () => {
             memoryAuthorityMismatch: true,
         };
         const summary = formatStatusDetailMarkdown(detail);
-        const diagnostics = formatStatusDiagnosticsMarkdown(detail);
 
         expect(summary).toContain("(MC-M01)");
         expect(summary).toContain("(MC-M02)");
-        expect(diagnostics).toContain("cursor 3,726 / 4,850");
-        expect(diagnostics).toContain("stalled (MC-M01)");
-        expect(diagnostics).toContain("(MC-M02)");
+    });
+
+    test("renders historian refusal stage and received runner text", () => {
+        const detail =
+            "historian refusal stage=credential provider=google model=google/model-a received=\"open_failed: no apikey credential for provider 'google'\"";
+        const status = formatStatusDetailMarkdown({
+            ...STATUS_FIXTURE,
+            historianRefusal: {
+                stage: "credential",
+                canonicalCause: "credential_unavailable",
+                detail,
+            },
+        });
+
+        expect(status).toContain("Historian refusal:** credential (credential_unavailable)");
+        expect(status).toContain(
+            "received=\"open_failed: no apikey credential for provider 'google'\"",
+        );
+    });
+
+    test("says which runner ran the session's completions and why", () => {
+        const status = formatStatusDetailMarkdown({
+            ...STATUS_FIXTURE,
+            historianRunner: {
+                runner: "host",
+                source: "default_for_harness",
+                harness: "opencode",
+                observed: "last_completion",
+            },
+            dreamerRunner: {
+                runner: "broca",
+                source: "configured",
+                harness: "opencode",
+                observed: "resolved_for_route",
+            },
+        });
+
+        expect(status).toMatch(
+            /^- \*\*Historian runner:\*\* host \(default for harness opencode\)$/m,
+        );
+        expect(status).toContain("- **Dreamer runner:** broca (configured) · no completion yet");
     });
 
     test("does not expose module routing in the summary", () => {

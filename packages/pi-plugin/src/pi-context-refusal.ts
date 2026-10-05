@@ -5,6 +5,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { log } from "@magic-context/core/shared/logger";
+import { withSqliteTransformPass } from "@magic-context/core/shared/sqlite";
 
 const ENTRY_TYPE = "magic-context-turn-refused";
 const RETRY_MESSAGE =
@@ -30,7 +31,10 @@ export function registerPiGuardedContext(
 	);
 	pi.on("context", async (event, ctx) => {
 		try {
-			return await handler(event, ctx);
+			// Share at most 250 ms of synchronous writer waiting across the turn,
+			// including autocommit statements, as in OpenCode.
+			// Do not rerun the handler: it may already have committed earlier writes.
+			return await withSqliteTransformPass(() => handler(event, ctx));
 		} catch (error) {
 			log("[magic-context][pi] turn refused", error);
 			// Direct handler fixtures lack the host abort API; retain their original

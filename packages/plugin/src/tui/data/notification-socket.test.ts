@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
 } from "../../shared/rpc-notifications";
 import { MagicContextRpcServer } from "../../shared/rpc-server";
 import { rpcPortFilePath } from "../../shared/rpc-utils";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { closeRpc, initRpcClient } from "./context-db";
 import {
     _resetNotificationSocketStateForTesting,
@@ -41,7 +42,7 @@ afterEach(() => {
 });
 
 function makeDataHome(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-notification-socket-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-notification-socket-"));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     return dir;
@@ -165,6 +166,52 @@ describe("notification socket", () => {
         );
         expect(received.some((notification) => notification.type === "scoped")).toBe(false);
         expect(drainNotifications(0, "ses_hidden", { sessionOnly: true })).toHaveLength(1);
+    });
+
+    test("subscribes to the server of the shown session's directory, not the startup one", async () => {
+        // A TUI started in the home directory showing a session from a project
+        // directory: the project's server runs that session's commands, so its
+        // "show status dialog" push only reaches a socket subscribed to it.
+        const dataHome = makeDataHome();
+        const home = startLegacyServer(dataHome, "/home-startup", []);
+        const project = startLegacyServer(dataHome, "/home-startup/Pictures/project", [
+            {
+                id: 1,
+                type: "action",
+                payload: { action: "show-status-dialog" },
+                sessionId: "ses_p",
+            },
+        ]);
+        initRpcClient("/home-startup");
+        const received: SocketNotification[] = [];
+        startNotificationSocket({
+            getSessionId: () => "ses_p",
+            getSessionDirectory: () => "/home-startup/Pictures/project",
+            onNotification: (notification) => {
+                received.push(notification);
+                return true;
+            },
+        });
+        await waitFor(() => received.length === 1, "the project server's push");
+        expect(project.sockets.size).toBe(1);
+        expect(home.sockets.size).toBe(0);
+    });
+
+    test("moves the socket when the shown session changes directory", async () => {
+        const dataHome = makeDataHome();
+        const home = startLegacyServer(dataHome, "/home-move", []);
+        const project = startLegacyServer(dataHome, "/home-move/project", []);
+        initRpcClient("/home-move");
+        let sessionDirectory: string | null = null;
+        startNotificationSocket({
+            getSessionId: () => (sessionDirectory ? "ses_moved" : null),
+            getSessionDirectory: () => sessionDirectory,
+            onNotification: () => true,
+        });
+        await waitFor(() => home.sockets.size === 1, "startup subscription");
+        sessionDirectory = "/home-move/project";
+        await waitFor(() => project.sockets.size === 1, "project subscription", 5_000);
+        await waitFor(() => home.sockets.size === 0, "startup socket closed");
     });
 
     test("overlapping starts create one socket and one delivery", async () => {

@@ -89,11 +89,22 @@ pub fn decode_pi_with_sidecar(
         } else {
             role.as_str()
         };
+        let mut selection_extras = ProviderExtras::new();
+        if role == "toolResult"
+            && message
+                .get("details")
+                .is_some_and(crate::user_answer::has_user_answer_metadata)
+        {
+            selection_extras
+                .entry("pi".into())
+                .or_default()
+                .insert("user_answer_block_indices".into(), json!([0]));
+        }
         let ck = CkWireMessage::from_parts(
             ck_role.to_string(),
             content,
             origin,
-            ProviderExtras::new(),
+            selection_extras,
             HarnessMeta {
                 harness_id: Some(mid.clone()),
                 ordinal: Some(ordinal),

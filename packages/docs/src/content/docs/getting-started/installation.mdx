@@ -9,8 +9,8 @@ The setup wizard detects which harnesses you have installed, configures the plug
 
 ## Requirements
 
-- **Node.js >= 24** for the CLI
-- **OpenCode** (current version) — for OpenCode installs
+- **Node.js 22.16 or later on the 22 line, or Node.js >= 24** for the CLI (Node 23 is not supported)
+- **OpenCode** (current version) — for OpenCode installs. On OpenCode 2, or when upgrading an existing install from OpenCode 1 to 2, read [OpenCode 2](/getting-started/opencode-2/) first
 - **Pi >= 0.74.0** — for Pi installs
 - **OMP >= 17.1.7** — for Oh My Pi installs
 
@@ -40,7 +40,7 @@ Target one harness explicitly with `--harness opencode`, `--harness pi`, or `--h
 <Tabs>
 <TabItem label="OpenCode">
 
-Setup adds the plugin to your `opencode.jsonc` and turns off compaction:
+Setup adds the plugin to your `opencode.jsonc` and turns off compaction. This example is OpenCode 1; on OpenCode 2 the key is `plugins` (see [OpenCode 2](/getting-started/opencode-2/#install-on-opencode-2)):
 
 ```jsonc
 {
@@ -89,7 +89,7 @@ If plugin registration or config writing fails, the prior OMP settings are resto
 
 ## Manual setup (OpenCode)
 
-If you cannot run the wizard, add this to `opencode.jsonc`:
+If you cannot run the wizard, add this to `opencode.jsonc` (on OpenCode 2, write `plugins` instead of `plugin`):
 
 ```jsonc
 {

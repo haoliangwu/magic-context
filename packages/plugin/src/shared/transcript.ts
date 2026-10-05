@@ -78,6 +78,9 @@ export interface TranscriptPart {
     /** Discriminator for filter logic. Stable across mutations. */
     readonly kind: TranscriptPartKind;
 
+    /** True when the host marks this tool result as carrying a user's answer. */
+    hasUserAnswer?(): boolean;
+
     /**
      * Best-effort identifier for cross-pass tracking. May be:
      * - OpenCode part ID (e.g. "prt_..."), stable across passes.

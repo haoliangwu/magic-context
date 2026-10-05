@@ -1,16 +1,19 @@
+import { promptAsyncAndWaitForIdle } from "../../shared/prompt-async-transport";
 import { drainNotifications } from "../../shared/rpc-notifications";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { recordMessageFtsRowid } from "../../features/magic-context/message-fts-rowid-map";
 import {
     __resetMessageIndexAsyncForTests,
     isSessionReconciled,
 } from "../../features/magic-context/message-index-async";
+import { createScheduler } from "../../features/magic-context/scheduler";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     applyStrippedPlaceholderDelta,
@@ -51,10 +54,17 @@ import {
 import type { ContextUsage } from "../../features/magic-context/types";
 import { getWindowReportsPath } from "../../features/magic-context/window-report-ledger";
 import { createEventHandler as createPluginEventHandler } from "../../plugin/event";
-import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
+import {
+    clearModelsDevCache,
+    refreshModelLimitsFromApi,
+    resetAuthRewarmLatchForTest,
+} from "../../shared/models-dev-cache";
 import { clearWindowOverlayCacheForTest, setWindowOverlayPath } from "../../shared/window-geometry";
+import { describeContextLimitChange } from "./context-limit-resolution";
 import { createEventHandler } from "./event-handler";
+import { resolveContextLimit as resolveLimitForTest } from "./event-resolvers";
 import { __ignoredNotificationTest } from "./send-session-notification";
+import { loadContextUsage } from "./transform-context-state";
 
 // These alert-content units supply idle authorization independently of the harness event hook.
 beforeEach(() => __ignoredNotificationTest.setHoldDetector(() => false));
@@ -91,7 +101,7 @@ afterEach(() => {
 });
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -192,7 +202,87 @@ function providersClient(limit: number, prompt?: ReturnType<typeof mock>) {
     };
 }
 
+// Captured 400 body for Claude Fable 5.1 and Claude Opus 5.5 (identical on both),
+// from docs/reports/anthropic-thinking-binding.md section 2.
+const LIVE_BINDING_400_BODY = {
+    type: "error",
+    error: {
+        type: "invalid_request_error",
+        message:
+            'messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block". Content before this block differs from when it was created, first at `messages.0.content.0`.',
+    },
+    request_id: "req_011CfSakFxfwQ2vmA7q6iK45",
+};
+
 describe("createEventHandler", () => {
+    for (const [providerID, modelID] of [
+        ["google-vertex-anthropic", "claude-sonnet-5-5@20260930"],
+        ["amazon-bedrock", "anthropic.claude-opus-5-5-v1:0"],
+        ["vertex-eu-anthropic", "claude-fable-5-1"],
+    ]) {
+        it(`arms binding recovery via ${providerID}/${modelID}`, async () => {
+            useTempDataHome("context-event-cloud-binding-");
+            const deps = createDeps(new Map());
+            const handler = createEventHandler(deps);
+            await handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            id: "failed-shell",
+                            role: "assistant",
+                            sessionID: "ses-cloud-binding",
+                            providerID,
+                            modelID,
+                            error: {
+                                status: 400,
+                                data: { message: JSON.stringify(LIVE_BINDING_400_BODY) },
+                            },
+                        },
+                    },
+                },
+            });
+            expect(getThinkingBindingRecoveryTarget(deps.db, "ses-cloud-binding")).toBe(
+                "all_reasoning_bearing_assistants",
+            );
+        });
+    }
+
+    it("observes both user and assistant message events without a transform pass", async () => {
+        useTempDataHome("context-event-activity-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "user-1",
+                        role: "user",
+                        sessionID: "activity-user",
+                    },
+                },
+            },
+        });
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "assistant-1",
+                        role: "assistant",
+                        sessionID: "activity-assistant",
+                    },
+                },
+            },
+        });
+        const read = (id: string) =>
+            deps.db
+                .prepare("SELECT value FROM schema_migrations_meta WHERE key = ?")
+                .get(`retrospective_activity:${id}`) as { value: string } | undefined;
+        expect(Number(read("activity-user")?.value)).toBeGreaterThan(0);
+        expect(Number(read("activity-assistant")?.value)).toBeGreaterThan(0);
+    });
     it("arms documented Fable 5.1 binding mismatch recovery and ignores other models", async () => {
         useTempDataHome("context-event-thinking-binding-");
         const deps = createDeps(new Map());
@@ -222,7 +312,7 @@ describe("createEventHandler", () => {
             },
         });
         expect(getThinkingBindingRecoveryTarget(deps.db, "ses-fable-51")).toBe(
-            "newest_reasoning_bearing_assistant",
+            "all_reasoning_bearing_assistants",
         );
 
         await handler({
@@ -241,6 +331,60 @@ describe("createEventHandler", () => {
             },
         });
         expect(getThinkingBindingRecoveryTarget(deps.db, "ses-other-model")).toBeNull();
+    });
+
+    it("arms binding recovery for Opus 5.5 from the live 400 body", async () => {
+        useTempDataHome("context-event-thinking-binding-opus-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "failed-opus-shell",
+                        role: "assistant",
+                        sessionID: "ses-opus-55",
+                        providerID: "anthropic",
+                        modelID: "claude-opus-5-5",
+                        error: { status: 400, ...LIVE_BINDING_400_BODY },
+                    },
+                },
+            },
+        });
+        expect(getThinkingBindingRecoveryTarget(deps.db, "ses-opus-55")).toBe(
+            "all_reasoning_bearing_assistants",
+        );
+    });
+
+    it("never targets a single message from a message_id field the API does not send", async () => {
+        useTempDataHome("context-event-thinking-binding-id-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id: "failed-shell",
+                        role: "assistant",
+                        sessionID: "ses-fable-id",
+                        providerID: "anthropic",
+                        modelID: "claude-fable-5-1",
+                        error: {
+                            status: 400,
+                            error: {
+                                ...LIVE_BINDING_400_BODY.error,
+                                message_id: "assistant-with-bound-block",
+                            },
+                        },
+                    },
+                },
+            },
+        });
+        expect(getThinkingBindingRecoveryTarget(deps.db, "ses-fable-id")).toBe(
+            "all_reasoning_bearing_assistants",
+        );
     });
 
     it("normalizes transform decision reasons across harnesses", () => {
@@ -503,6 +647,38 @@ describe("createEventHandler", () => {
         expect(getOrCreateSessionMeta(openDatabase(), "ses-root").isSubagent).toBe(false);
     });
 
+    it("binds host-created children without a transform and does not bind directoryless events", async () => {
+        useTempDataHome("context-event-binding-");
+        const handler = createEventHandler(createDeps(new Map()));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "context-child-project-"));
+        tempDirs.push(directory);
+        for (const [id, parentID] of [
+            ["ses-parent", ""],
+            ["ses-child", "ses-parent"],
+        ]) {
+            await handler({
+                event: {
+                    type: "session.created",
+                    properties: { info: { id, parentID, directory } },
+                },
+            });
+        }
+        await handler({
+            event: {
+                type: "session.created",
+                properties: { info: { id: "ses-no-dir", parentID: "ses-parent" } },
+            },
+        });
+        const rows = openDatabase()
+            .prepare("SELECT session_id, project_path FROM session_projects ORDER BY session_id")
+            .all() as Array<{ session_id: string; project_path: string }>;
+        const identity = resolveProjectIdentityForSession(directory);
+        expect(rows).toEqual([
+            { session_id: "ses-child", project_path: identity },
+            { session_id: "ses-parent", project_path: identity },
+        ]);
+    });
+
     it("marks child sessions as subagents", async () => {
         useTempDataHome("context-event-created-");
         const handler = createEventHandler(createDeps(new Map()));
@@ -602,8 +778,8 @@ describe("createEventHandler", () => {
         );
     });
 
-    it("refuses an impossible success reading above an overlay-backed wall", async () => {
-        useTempDataHome("context-event-impossible-usage-");
+    it("treats provider usage above an overlay-backed window as real pressure on every reading", async () => {
+        useTempDataHome("context-event-above-window-usage-");
         const overlayPath = join(makeTempDir("context-event-overlay-"), "window-overlay.json");
         writeFileSync(
             overlayPath,
@@ -651,28 +827,52 @@ describe("createEventHandler", () => {
         const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
         const deps = createDeps(contextUsageMap);
         const handler = createEventHandler(deps);
-
-        await handler({
-            event: {
-                type: "message.updated",
-                properties: {
-                    info: {
-                        role: "assistant",
-                        finish: "stop",
-                        sessionID: "ses-impossible-usage",
-                        providerID: "test-provider",
-                        modelID: "test-model",
-                        tokens: { input: 585_397, cache: { read: 8_320, write: 0 } },
+        const reading = (input: number, read: number) =>
+            handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            role: "assistant",
+                            finish: "stop",
+                            sessionID: "ses-impossible-usage",
+                            providerID: "test-provider",
+                            modelID: "test-model",
+                            tokens: { input, cache: { read, write: 0 } },
+                        },
                     },
                 },
-            },
-        });
+            });
 
-        const meta = getOrCreateSessionMeta(deps.db, "ses-impossible-usage");
-        expect(meta.observedSafeInputTokens).toBe(0);
-        expect(meta.lastInputTokens).toBe(0);
+        await reading(147_839, 0);
+        recordDetectedContextLimit(deps.db, "ses-impossible-usage", 200_000);
+        await reading(291_680, 8_320);
+
+        // The provider accepted a 300K prompt on a model configured at 272K.
+        // It is the real prompt size, measured against the configured usable
+        // limit, so pressure is past the emergency line.
+        let meta = getOrCreateSessionMeta(deps.db, "ses-impossible-usage");
+        expect(meta.lastInputTokens).toBe(300_000);
         expect(meta.lastUsageContextLimit).toBe(240_000);
-        expect(contextUsageMap.get("ses-impossible-usage")?.usage.inputTokens).toBe(0);
+        expect(meta.lastContextPercentage).toBeCloseTo((300_000 / 240_000) * 100, 5);
+        expect(contextUsageMap.get("ses-impossible-usage")?.usage.inputTokens).toBe(300_000);
+        // The limit learned from an earlier overflow error is disproved by the
+        // accepted request and cleared.
+        expect(getOverflowState(deps.db, "ses-impossible-usage").detectedContextLimit).toBe(0);
+        // The configured window stays the user's limit: the reading is pressure,
+        // not a proven capacity that would widen the window. (Recording the
+        // learned limit above reset the proven floor to 0.)
+        expect(meta.observedSafeInputTokens).toBe(0);
+
+        // Staying above the configured window keeps counting on every reading.
+        await reading(310_000, 0);
+        meta = getOrCreateSessionMeta(deps.db, "ses-impossible-usage");
+        expect(meta.lastInputTokens).toBe(310_000);
+        expect(meta.lastContextPercentage).toBeCloseTo((310_000 / 240_000) * 100, 5);
+        expect(contextUsageMap.get("ses-impossible-usage")?.usage.percentage).toBeCloseTo(
+            (310_000 / 240_000) * 100,
+            5,
+        );
     });
 
     it("clears a stale unkeyed detected limit on the first successful event after restart", async () => {
@@ -932,6 +1132,138 @@ describe("createEventHandler", () => {
             usage: { percentage: 61, inputTokens: 122_000 },
             updatedAt: preservedUpdatedAt,
         });
+    });
+
+    // Issue 545. OpenCode creates the assistant message for a new request, with
+    // zero tokens, before it runs that request's transform; a request the
+    // provider refuses (a spent quota) also ends with zero tokens. Neither is a
+    // served response, so neither may move the idle clock: after a long idle the
+    // transform must still see the cache as expired and apply queued drops.
+    it("keeps last_response_time for tokenless assistant updates, including errors", async () => {
+        useTempDataHome("context-event-tokenless-clock-");
+        const contextUsageMap = new Map<string, { usage: ContextUsage; updatedAt: number }>([
+            ["ses-idle", { usage: { percentage: 20, inputTokens: 40_000 }, updatedAt: Date.now() }],
+        ]);
+        const deps = createDeps(contextUsageMap);
+        updateSessionMeta(deps.db, "ses-idle", {
+            lastResponseTime: 5_000,
+            lastContextPercentage: 20,
+            lastInputTokens: 40_000,
+        });
+        const handler = createEventHandler(deps);
+
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        id: "msg_shell",
+                        sessionID: "ses-idle",
+                        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        id: "msg_refused",
+                        sessionID: "ses-idle",
+                        finish: "error",
+                        error: {
+                            name: "APIError",
+                            data: { message: "Your credit balance is too low to access the API." },
+                        },
+                        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+
+        expect(getOrCreateSessionMeta(openDatabase(), "ses-idle").lastResponseTime).toBe(5_000);
+    });
+
+    it("expires once after switching to usage-less completed replies, but not on shells or failures", async () => {
+        useTempDataHome("context-event-no-usage-completion-");
+        const deps = createDeps(new Map());
+        const handler = createEventHandler(deps);
+        const sessionID = "ses-no-usage-switch";
+        const now = Date.now();
+        const previous = now - 2 * 3_600_000;
+        const emit = (info: Record<string, unknown>) =>
+            handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            role: "assistant",
+                            sessionID,
+                            providerID: "test-provider",
+                            modelID: "usage-less",
+                            ...info,
+                        },
+                    },
+                },
+            });
+        await emit({
+            id: "msg_01",
+            modelID: "usage-bearing",
+            finish: "stop",
+            time: { completed: previous },
+            tokens: { input: 1_000 },
+        });
+        // Age the persisted response clock, as a resumed session's idle gap would.
+        updateSessionMeta(deps.db, sessionID, { cacheTtl: "1h", lastResponseTime: previous });
+        deps.contextUsageMap.clear();
+        for (const info of [
+            { id: "msg_02", tokens: { input: 0 }, time: { created: now } },
+            {
+                id: "msg_03",
+                finish: "error",
+                time: { completed: now },
+                error: { name: "APIError" },
+            },
+            {
+                id: "msg_04",
+                finish: "stop",
+                time: { completed: now },
+                error: { name: "MessageAbortedError" },
+            },
+        ])
+            await emit(info);
+        const scheduler = createScheduler({ executeThresholdPercentage: 90 });
+        const usage = { inputTokens: 1_000, percentage: 1 };
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastResponseTime).toBe(previous);
+        expect(
+            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now),
+        ).toBe("execute");
+        await emit({ id: "msg_05", finish: "stop", time: { completed: now } });
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastResponseTime).toBe(now);
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastInputTokens).toBe(1_000);
+        expect(
+            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now + 1_000),
+        ).toBe("defer");
+        await emit({
+            id: "msg_06",
+            finish: "stop",
+            time: { completed: now + 2_000 },
+            tokens: { input: 0 },
+        });
+        expect(
+            scheduler.shouldExecute(getOrCreateSessionMeta(deps.db, sessionID), usage, now + 3_000),
+        ).toBe("defer");
+        await emit({
+            id: "msg_01",
+            modelID: "usage-bearing",
+            finish: "stop",
+            time: { completed: previous },
+            tokens: { input: 1_000 },
+        });
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastResponseTime).toBe(now + 2_000);
     });
 
     it("ignores tokenless assistant updates when no prior usage exists", async () => {
@@ -1816,4 +2148,410 @@ describe("createEventHandler — compaction-off overflow gating (issue #266 S3)"
         expect(state.needsEmergencyRecovery).toBe(0);
         expect(state.detectedContextLimit).toBe(120000);
     });
+});
+
+describe("createEventHandler — context limit stays stable for one session and model", () => {
+    // A 262,144-token model whose catalog output limit equals its window: the
+    // output reserve is capped at a quarter of the window, leaving 196,608 usable.
+    const CATALOG_USABLE = 196_608;
+    const twoModels = {
+        config: {
+            providers: async () => ({
+                data: {
+                    providers: [
+                        {
+                            id: "test-provider",
+                            models: {
+                                "model-a": { limit: { context: 262_144, output: 262_144 } },
+                                "model-b": { limit: { context: 262_144, output: 262_144 } },
+                            },
+                        },
+                    ],
+                },
+            }),
+        },
+    };
+
+    async function accepted(
+        handler: ReturnType<typeof createEventHandler>,
+        sessionID: string,
+        modelID: string,
+        input: number,
+    ): Promise<void> {
+        await handler({
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        role: "assistant",
+                        finish: "stop",
+                        sessionID,
+                        providerID: "test-provider",
+                        modelID,
+                        tokens: { input, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        });
+    }
+
+    function limitFor(db: ReturnType<typeof openDatabase>, sessionID: string, modelID: string) {
+        return resolveLimitForTest("test-provider", modelID, { db, sessionID });
+    }
+
+    it("does not let another model's accepted request raise this model's limit", async () => {
+        useTempDataHome("context-event-limit-drift-");
+        await refreshModelLimitsFromApi(twoModels);
+        const deps = { ...createDeps(new Map()), client: twoModels };
+        const handler = createEventHandler(deps);
+        const sessionID = "ses-limit-drift";
+
+        // Model A proves a prompt above its catalog budget: a learned increase.
+        await accepted(handler, sessionID, "model-a", 250_000);
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastUsageContextLimit).toBe(250_000);
+
+        // The session switches to model B. Before B's first reading, a pass
+        // resolves B at its catalog budget.
+        const beforeFirstReading = limitFor(deps.db, sessionID, "model-b");
+        expect(beforeFirstReading).toBe(CATALOG_USABLE);
+
+        // B's own request is accepted at 100K, below its catalog budget. Nothing
+        // about B changed, so the next pass must resolve B the same way.
+        await accepted(handler, sessionID, "model-b", 100_000);
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastUsageContextLimit).toBe(
+            CATALOG_USABLE,
+        );
+        expect(limitFor(deps.db, sessionID, "model-b")).toBe(beforeFirstReading);
+        await accepted(handler, sessionID, "model-b", 100_000);
+        expect(getOrCreateSessionMeta(deps.db, sessionID).lastUsageContextLimit).toBe(
+            CATALOG_USABLE,
+        );
+    });
+
+    it("keeps one model's learned limit across its consecutive readings", async () => {
+        useTempDataHome("context-event-limit-steady-");
+        await refreshModelLimitsFromApi(twoModels);
+        const deps = { ...createDeps(new Map()), client: twoModels };
+        const handler = createEventHandler(deps);
+        const sessionID = "ses-limit-steady";
+
+        await accepted(handler, sessionID, "model-a", 250_000);
+        const learned = limitFor(deps.db, sessionID, "model-a");
+        expect(learned).toBe(250_000);
+        for (const input of [150_000, 120_000, 180_000]) {
+            await accepted(handler, sessionID, "model-a", input);
+            expect(getOrCreateSessionMeta(deps.db, sessionID).lastUsageContextLimit).toBe(learned);
+            expect(limitFor(deps.db, sessionID, "model-a")).toBe(learned);
+        }
+    });
+});
+
+describe("describeContextLimitChange", () => {
+    const base = {
+        modelKey: "test-provider/model-a",
+        limit: 196_608,
+        catalog: 196_608,
+        detected: 0,
+        provenFloor: 150_000,
+    };
+
+    it("is silent when neither the limit nor the model changed", () => {
+        expect(describeContextLimitChange(base, { ...base, provenFloor: 160_000 })).toBeNull();
+    });
+
+    it("names the input that moved the limit", () => {
+        expect(
+            describeContextLimitChange(base, { ...base, limit: 250_000, provenFloor: 250_000 }),
+        ).toBe("context limit 196608 → 250000 (proven accepted input 150000 → 250000)");
+        expect(
+            describeContextLimitChange(base, { ...base, limit: 262_144, detected: 262_144 }),
+        ).toBe("context limit 196608 → 262144 (overflow-detected limit 0 → 262144)");
+    });
+
+    it("reports a limit change that no input explains", () => {
+        expect(describeContextLimitChange(base, { ...base, limit: 200_000 })).toBe(
+            "context limit 196608 → 200000 (no input changed)",
+        );
+    });
+});
+
+describe("createEventHandler — a turn's final step usage", () => {
+    it("keeps the final step's usage when the previous step's event finishes after it", async () => {
+        useTempDataHome("context-event-final-step-order-");
+        resetAuthRewarmLatchForTest();
+        // The first usage event of a process re-warms the model-limit cache over
+        // the SDK before it records anything. Hold that round trip open so the
+        // turn's next step completes while the previous step's event still waits,
+        // which is how two steps of one tool turn can finish out of order.
+        const providersGate = deferred();
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps = {
+            ...createDeps(contextUsageMap),
+            client: {
+                config: {
+                    providers: async () => {
+                        await providersGate.promise;
+                        return { data: { providers: [] } };
+                    },
+                },
+            },
+        };
+        const handler = createEventHandler(deps);
+        const stepFinish = (id: string, finish: string, input: number, read: number) =>
+            handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            id,
+                            role: "assistant",
+                            finish,
+                            sessionID: "ses-final-step",
+                            providerID: "test-provider",
+                            modelID: "test-model",
+                            tokens: { input, cache: { read, write: 0 } },
+                        },
+                    },
+                },
+            });
+
+        // A real report's numbers: the tool step's prompt was 2,398 + 165,393 and
+        // the final step's, after a large tool output, 89,167 + 169,811.
+        const toolStep = stepFinish("msg_0db8b3b020011tBWUisW3XqpeZ", "tool-calls", 2_398, 165_393);
+        await waitForTimers();
+        await stepFinish("msg_0db8b8a8e001DuI1o7N2LSIrjL", "stop", 89_167, 169_811);
+        providersGate.resolve();
+        await toolStep;
+
+        expect(contextUsageMap.get("ses-final-step")?.usage.inputTokens).toBe(258_978);
+        expect(getOrCreateSessionMeta(deps.db, "ses-final-step").lastInputTokens).toBe(258_978);
+    });
+
+    it("still records a later step whose event arrives after an earlier one", async () => {
+        useTempDataHome("context-event-final-step-inorder-");
+        resetAuthRewarmLatchForTest();
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps = createDeps(contextUsageMap);
+        const handler = createEventHandler(deps);
+        const stepFinish = (id: string, input: number, read: number) =>
+            handler({
+                event: {
+                    type: "message.updated",
+                    properties: {
+                        info: {
+                            id,
+                            role: "assistant",
+                            finish: "stop",
+                            sessionID: "ses-final-step-inorder",
+                            tokens: { input, cache: { read, write: 0 } },
+                        },
+                    },
+                },
+            });
+
+        await stepFinish("msg_0db8b3b020011tBWUisW3XqpeZ", 2_398, 165_393);
+        await stepFinish("msg_0db8b8a8e001DuI1o7N2LSIrjL", 89_167, 169_811);
+        // The same message publishes again when OpenCode stamps its completion
+        // time; an equal id is the same reading, not a stale one.
+        await stepFinish("msg_0db8b8a8e001DuI1o7N2LSIrjL", 89_167, 169_811);
+        expect(contextUsageMap.get("ses-final-step-inorder")?.usage.inputTokens).toBe(258_978);
+    });
+});
+
+describe("createEventHandler — usage is recorded before the model-limit refresh", () => {
+    const SESSION = "ses-record-before-refresh";
+
+    function usageEvent(id: string, input: number) {
+        return {
+            event: {
+                type: "message.updated",
+                properties: {
+                    info: {
+                        id,
+                        role: "assistant",
+                        finish: "tool-calls",
+                        sessionID: SESSION,
+                        providerID: "test-provider",
+                        modelID: "test-model",
+                        tokens: { input, cache: { read: 0, write: 0 } },
+                    },
+                },
+            },
+        };
+    }
+
+    // A providers client whose config.providers() call does not return until the
+    // gate opens, then reports `limit` for test-provider/test-model.
+    function stalledProvidersClient(gate: Promise<void>, limit: number) {
+        const calls = { count: 0 };
+        return {
+            calls,
+            client: {
+                config: {
+                    providers: async () => {
+                        calls.count += 1;
+                        await gate;
+                        return providersClient(limit).config.providers();
+                    },
+                },
+            },
+        };
+    }
+
+    it("makes an over-limit reading visible to the next transform while the refresh is stalled", async () => {
+        useTempDataHome("context-event-record-before-refresh-");
+        resetAuthRewarmLatchForTest();
+        await refreshModelLimitsFromApi(providersClient(30_000));
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps: ReturnType<typeof createDeps> & { client: unknown } = {
+            ...createDeps(contextUsageMap),
+            client: providersClient(30_000),
+        };
+        const handler = createEventHandler(deps);
+        const scheduler = createScheduler({ executeThresholdPercentage: 65 });
+
+        // An in-limit reading first, handled to completion. It also spends the
+        // once-per-process auth re-warm, so the stall below is the over-limit
+        // refresh and nothing else.
+        await handler(usageEvent("msg_0001", 2_000));
+        const before = loadContextUsage(contextUsageMap, deps.db, SESSION);
+        expect(before.inputTokens).toBe(2_000);
+        expect(before.percentage).toBeLessThan(65);
+
+        const gate = deferred();
+        const stalled = stalledProvidersClient(gate.promise, 30_000);
+        deps.client = stalled.client;
+        // A reading three times the catalog limit. The handler is not awaited:
+        // OpenCode runs the next transform without waiting for it.
+        const pending = handler(usageEvent("msg_0002", 90_000));
+
+        // What the next transform reads for its pressure and scheduling, read
+        // before the handler has yielded even once.
+        const usage = loadContextUsage(contextUsageMap, deps.db, SESSION);
+        expect(usage.inputTokens).toBe(90_000);
+        expect(usage.percentage).toBeGreaterThanOrEqual(95);
+        const meta = getOrCreateSessionMeta(deps.db, SESSION);
+        expect(meta.lastInputTokens).toBe(90_000);
+        expect(scheduler.shouldExecute(meta, usage, meta.lastResponseTime, SESSION)).toBe(
+            "execute",
+        );
+
+        // The over-limit refresh did start and is still waiting on the gate.
+        await waitForTimers();
+        expect(stalled.calls.count).toBe(1);
+        expect(loadContextUsage(contextUsageMap, deps.db, SESSION).inputTokens).toBe(90_000);
+
+        gate.resolve();
+        await pending;
+        expect(loadContextUsage(contextUsageMap, deps.db, SESSION).inputTokens).toBe(90_000);
+    });
+
+    it("applies a limit the refresh changed by recording the reading again", async () => {
+        useTempDataHome("context-event-record-before-refresh-rerecord-");
+        resetAuthRewarmLatchForTest();
+        await refreshModelLimitsFromApi(providersClient(30_000));
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const gate = deferred();
+        const stalled = stalledProvidersClient(gate.promise, 100_000);
+        const deps = { ...createDeps(contextUsageMap), client: stalled.client };
+        const handler = createEventHandler(deps);
+
+        const pending = handler(usageEvent("msg_0001", 90_000));
+        // Recorded against the stale 30k catalog: the accepted 90k is the limit.
+        expect(contextUsageMap.get(SESSION)?.usage.percentage).toBe(100);
+
+        gate.resolve();
+        await pending;
+        const expected =
+            (90_000 /
+                resolveLimitForTest("test-provider", "test-model", {
+                    db: deps.db,
+                    sessionID: SESSION,
+                })) *
+            100;
+        expect(expected).toBeLessThan(100);
+        expect(contextUsageMap.get(SESSION)?.usage.percentage).toBeCloseTo(expected, 10);
+        expect(getOrCreateSessionMeta(deps.db, SESSION).lastContextPercentage).toBeCloseTo(
+            expected,
+            10,
+        );
+    });
+
+    it("does not let a refresh re-record a reading that a newer step replaced", async () => {
+        useTempDataHome("context-event-record-before-refresh-newer-");
+        resetAuthRewarmLatchForTest();
+        await refreshModelLimitsFromApi(providersClient(30_000));
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        // Each step's refresh reports a larger catalog, so each handler would
+        // record its reading again when its refresh returns. The final step's
+        // refresh returns first, leaving the older step's refresh last.
+        const toolGate = deferred();
+        const finalGate = deferred();
+        const deps: ReturnType<typeof createDeps> & { client: unknown } = {
+            ...createDeps(contextUsageMap),
+            client: stalledProvidersClient(toolGate.promise, 100_000).client,
+        };
+        const handler = createEventHandler(deps);
+
+        const toolStep = handler(usageEvent("msg_0001", 90_000));
+        deps.client = stalledProvidersClient(finalGate.promise, 100_000).client;
+        const finalStep = handler(usageEvent("msg_0002", 95_000));
+        expect(contextUsageMap.get(SESSION)?.usage.inputTokens).toBe(95_000);
+
+        finalGate.resolve();
+        await finalStep;
+        expect(contextUsageMap.get(SESSION)?.usage.inputTokens).toBe(95_000);
+        toolGate.resolve();
+        await toolStep;
+        expect(contextUsageMap.get(SESSION)?.usage.inputTokens).toBe(95_000);
+        expect(getOrCreateSessionMeta(deps.db, SESSION).lastInputTokens).toBe(95_000);
+    });
+
+    it("keeps the newer reading when an older step's event is delivered after it", async () => {
+        useTempDataHome("context-event-record-before-refresh-out-of-order-");
+        resetAuthRewarmLatchForTest();
+        const contextUsageMap = new Map<string, ContextUsageCacheEntry>();
+        const deps = createDeps(contextUsageMap);
+        const handler = createEventHandler(deps);
+
+        await handler(usageEvent("msg_0002", 95_000));
+        await handler(usageEvent("msg_0001", 90_000));
+        expect(contextUsageMap.get(SESSION)?.usage.inputTokens).toBe(95_000);
+        expect(getOrCreateSessionMeta(deps.db, SESSION).lastInputTokens).toBe(95_000);
+    });
+});
+
+it("forwards an early dreamer model error into its active asynchronous wait", async () => {
+    useTempDataHome("context-dreamer-provider-error-");
+    const handler = createEventHandler(createDeps(new Map()));
+    const message =
+        "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v4-flash";
+    const client = {
+        session: {
+            messages: async () => ({ data: [] }),
+            status: async () => ({ data: {} }),
+            promptAsync: async () => {
+                await handler({
+                    event: {
+                        type: "session.error",
+                        properties: {
+                            sessionID: "ses-dreamer-error",
+                            error: { name: "APIError", data: { statusCode: 400, message } },
+                        },
+                    },
+                });
+                return {};
+            },
+        },
+    } as never;
+    await expect(
+        promptAsyncAndWaitForIdle(
+            client,
+            {
+                path: { id: "ses-dreamer-error" },
+                body: { parts: [{ type: "text", text: "map" }] },
+            },
+            { pollIntervalMs: 1, startGraceMs: 20 },
+        ),
+    ).rejects.toThrow(`${message} (status=400)`);
 });

@@ -1,0 +1,1690 @@
+{
+  "cases": [
+    {
+      "name": "master-sub-85-small",
+      "version": "1.18.30",
+      "pressure": 85,
+      "size": "small",
+      "parentId": "ses_f0d9267f2ffefTkWf02EFi6kgl",
+      "reportChars": 2434,
+      "probes": [
+        {
+          "kind": "task",
+          "tag": 4,
+          "ordinal": 3
+        },
+        {
+          "kind": "read",
+          "tag": 3,
+          "ordinal": 2
+        }
+      ],
+      "records": [
+        {
+          "index": 1,
+          "lane": "parent",
+          "parentStep": 0,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434153
+        },
+        {
+          "index": 2,
+          "lane": "parent",
+          "parentStep": 1,
+          "taskVisible": false,
+          "readVisible": true,
+          "bytes": 461709
+        },
+        {
+          "index": 3,
+          "lane": "child",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 29002
+        },
+        {
+          "index": 4,
+          "lane": "parent",
+          "parentStep": 2,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 464525
+        },
+        {
+          "index": 5,
+          "lane": "parent",
+          "parentStep": 3,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 464849
+        },
+        {
+          "index": 6,
+          "lane": "parent",
+          "parentStep": 4,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 467837
+        },
+        {
+          "index": 7,
+          "lane": "parent",
+          "parentStep": 5,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 470817
+        },
+        {
+          "index": 8,
+          "lane": "parent",
+          "parentStep": 6,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 498584
+        }
+      ],
+      "expands": [
+        {
+          "call": "toolu_expand_task_tag",
+          "input": {
+            "message": 4
+          },
+          "output": "[4] A (assistant) — full recovery:\n\n  [tool: ctx_expand #toolu_expand_task_tag]\n  input: {}",
+          "chars": 91,
+          "hasTask": false,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_task_ordinal",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d9263d1ffeQTkZvDnbSqrcUh\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review ",
+          "chars": 2722,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_tag",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d9263d1ffeQTkZvDnbSqrcUh\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review ",
+          "chars": 2722,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_ordinal",
+          "input": {
+            "message": 2
+          },
+          "output": "[2] A (assistant) — full recovery:\n\n  [text]\nPreparing reference read.\n  [tool: read #toolu_read]\n  description: var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/work/control.txt\n  input: {\"filePath\":\"/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/work/control.txt\"}\n  output:\n<path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/work/control.txt</path>\n<type>file<",
+          "chars": 26509,
+          "hasTask": false,
+          "hasRead": true
+        }
+      ],
+      "arrivalTags": [
+        {
+          "tag": 1,
+          "tool": null,
+          "status": "active",
+          "bytes": 390041
+        },
+        {
+          "tag": 2,
+          "tool": null,
+          "status": "active",
+          "bytes": 25
+        },
+        {
+          "tag": 3,
+          "tool": "read",
+          "status": "active",
+          "bytes": 26143
+        },
+        {
+          "tag": 4,
+          "tool": "task",
+          "status": "active",
+          "bytes": 2532
+        }
+      ],
+      "arrivalToolResults": [
+        {
+          "id": "toolu_read",
+          "content": "\"§3§ <path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/work/control.txt</path>\\n<type>file</type>\\n<content>\\n1: READ_CONTROL_START\\n2: older reference data\\n3: older reference data\\n4: older reference"
+        },
+        {
+          "id": "toolu_task",
+          "content": "\"§4§ <task id=\\\"ses_f0d9263d1ffeQTkZvDnbSqrcUh\\\" state=\\\"completed\\\">\\n<task_result>\\nTASK_REVIEW_START\\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique de"
+        }
+      ],
+      "rawTask": {
+        "status": "completed",
+        "chars": 2532,
+        "start": "<task id=\"ses_f0d9263d1ffeQTkZvDnbSqrcUh\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique deta",
+        "end": " review evidence unique detail review evidence unique detail \nTASK_REVIEW_END\n</task_result>\n</task>",
+        "hasEnd": true,
+        "ordinalRecoveryContainsExactRawOutput": true
+      },
+      "log": [
+        "[2026-09-30T13:07:44.895Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] protected token floor snapshot: floor=16000 provenance=derived usableSoft=230808",
+        "[2026-09-30T13:07:44.898Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26d9823001RHYoV1YcjNVkSk",
+        "[2026-09-30T13:07:44.903Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:07:44.955Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26d9823001RHYoV1YcjNVkSk",
+        "[2026-09-30T13:07:44.958Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:07:45.007Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26d9823001RHYoV1YcjNVkSk",
+        "[2026-09-30T13:07:45.011Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:07:45.052Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26d9823001RHYoV1YcjNVkSk",
+        "[2026-09-30T13:07:45.056Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:07:45.110Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26d9823001RHYoV1YcjNVkSk",
+        "[2026-09-30T13:07:45.114Z] [magic-context][ses_f0d9267f2ffefTkWf02EFi6kgl] emergency tiered drop skipped: no-candidates"
+      ],
+      "lsof": [
+        "opencode 93808 ufukaltinok  txt      REG               1,17     32768          1996040938 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/opencode/issue-repro.db-shm",
+        "opencode 93808 ufukaltinok  txt      REG               1,17     32768          1996057288 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/cortexkit/magic-context/context.db-shm",
+        "opencode 93808 ufukaltinok    7u     REG               1,17   1306624          1996040932 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/opencode/issue-repro.db",
+        "opencode 93808 ufukaltinok    8u     REG               1,17     61832          1996040937 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/opencode/issue-repro.db-wal",
+        "opencode 93808 ufukaltinok    9u     REG               1,17     32768          1996040938 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/opencode/issue-repro.db-shm",
+        "opencode 93808 ufukaltinok   13u     REG               1,17   1306624          1996040932 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/opencode/issue-repro.db",
+        "opencode 93808 ufukaltinok   14u     REG               1,17     61832          1996040937 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/opencode/issue-repro.db-wal",
+        "opencode 93808 ufukaltinok   33u     REG               1,17   1847296          1996057218 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/cortexkit/magic-context/context.db",
+        "opencode 93808 ufukaltinok   35u     REG               1,17   2072392          1996057287 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/cortexkit/magic-context/context.db-wal",
+        "opencode 93808 ufukaltinok   36u     REG               1,17     32768          1996057288 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/cortexkit/magic-context/context.db-shm",
+        "opencode 93808 ufukaltinok   37r     REG               1,17   1306624          1996040932 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/opencode/issue-repro.db",
+        "opencode 93808 ufukaltinok   41r     REG               1,17     61832          1996040937 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-small/data/opencode/issue-repro.db-wal"
+      ]
+    },
+    {
+      "name": "master-sub-85-large-final",
+      "version": "1.18.30",
+      "pressure": 85,
+      "size": "large",
+      "parentId": "ses_f0d90cffeffeH5vuRRZCQ2fXMn",
+      "reportChars": 46433,
+      "probes": [
+        {
+          "kind": "task",
+          "tag": 4,
+          "ordinal": 3
+        },
+        {
+          "kind": "read",
+          "tag": 3,
+          "ordinal": 2
+        }
+      ],
+      "records": [
+        {
+          "index": 1,
+          "lane": "parent",
+          "parentStep": 0,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434165
+        },
+        {
+          "index": 2,
+          "lane": "parent",
+          "parentStep": 1,
+          "taskVisible": false,
+          "readVisible": true,
+          "bytes": 461733
+        },
+        {
+          "index": 3,
+          "lane": "child",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 29014
+        },
+        {
+          "index": 4,
+          "lane": "parent",
+          "parentStep": 2,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 510319
+        },
+        {
+          "index": 5,
+          "lane": "parent",
+          "parentStep": 3,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 510643
+        },
+        {
+          "index": 6,
+          "lane": "parent",
+          "parentStep": 4,
+          "taskVisible": true,
+          "readVisible": false,
+          "bytes": 532253
+        },
+        {
+          "index": 7,
+          "lane": "parent",
+          "parentStep": 5,
+          "taskVisible": true,
+          "readVisible": false,
+          "bytes": 581003
+        },
+        {
+          "index": 8,
+          "lane": "parent",
+          "parentStep": 6,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 608788
+        }
+      ],
+      "expands": [
+        {
+          "call": "toolu_expand_task_tag",
+          "input": {
+            "message": 4
+          },
+          "output": "[4] A (assistant) — full recovery:\n\n  [tool: ctx_expand #toolu_expand_task_tag]\n  input: {}",
+          "chars": 91,
+          "hasTask": false,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_task_ordinal",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d90cc41ffe4bQil0tIjI8LvQ\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n1d795ba0b258280096c1cd959a45\n000a58269d5960a3f33b0bb9d18e\n64dbab382fbef3728e883f1d36da\nb63ec7a6347000046301ee29e595\n1da47ae0369307",
+          "chars": 46889,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_tag",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d90cc41ffe4bQil0tIjI8LvQ\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n1d795ba0b258280096c1cd959a45\n000a58269d5960a3f33b0bb9d18e\n64dbab382fbef3728e883f1d36da\nb63ec7a6347000046301ee29e595\n1da47ae0369307",
+          "chars": 46889,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_ordinal",
+          "input": {
+            "message": 2
+          },
+          "output": "[2] A (assistant) — full recovery:\n\n  [text]\nPreparing reference read.\n  [tool: read #toolu_read]\n  description: var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/work/control.txt\n  input: {\"filePath\":\"/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/work/control.txt\"}\n  output:\n<path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/work/control.txt<",
+          "chars": 26527,
+          "hasTask": false,
+          "hasRead": true
+        }
+      ],
+      "arrivalTags": [
+        {
+          "tag": 1,
+          "tool": null,
+          "status": "active",
+          "bytes": 390041
+        },
+        {
+          "tag": 2,
+          "tool": null,
+          "status": "active",
+          "bytes": 25
+        },
+        {
+          "tag": 3,
+          "tool": "read",
+          "status": "active",
+          "bytes": 26149
+        },
+        {
+          "tag": 4,
+          "tool": "task",
+          "status": "active",
+          "bytes": 46699
+        }
+      ],
+      "arrivalToolResults": [
+        {
+          "id": "toolu_read",
+          "content": "\"§3§ <path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/work/control.txt</path>\\n<type>file</type>\\n<content>\\n1: READ_CONTROL_START\\n2: older reference data\\n3: older reference data\\n4: older ref"
+        },
+        {
+          "id": "toolu_task",
+          "content": "\"§4§ <task id=\\\"ses_f0d90cc41ffe4bQil0tIjI8LvQ\\\" state=\\\"completed\\\">\\n<task_result>\\nTASK_REVIEW_START\\n7c794c9c7015761e6f17802c7cf8\\n19f365a95185035965832eb2ea07\\n72bbeb75306e44a7f5ce5b9d9c2f\\n1d795ba0b258280096c1cd959a45\\n000a58269d5960a3f33b0bb9d"
+        }
+      ],
+      "rawTask": {
+        "status": "completed",
+        "chars": 46699,
+        "start": "<task id=\"ses_f0d90cc41ffe4bQil0tIjI8LvQ\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n",
+        "end": ". Make a ctx_reduce pass now over the outputs you've already used, then continue.\n</system-reminder>",
+        "hasEnd": true,
+        "ordinalRecoveryContainsExactRawOutput": true
+      },
+      "log": [
+        "[2026-09-30T13:09:29.234Z] [magic-context][ses_f0d90cffeffeH5vuRRZCQ2fXMn] protected token floor snapshot: floor=16000 provenance=derived usableSoft=230808",
+        "[2026-09-30T13:09:29.237Z] [magic-context][ses_f0d90cffeffeH5vuRRZCQ2fXMn] heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26f30170017HqDM3fqIIraCZ",
+        "[2026-09-30T13:09:29.244Z] [magic-context][ses_f0d90cffeffeH5vuRRZCQ2fXMn] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:09:29.283Z] [magic-context][ses_f0d90cffeffeH5vuRRZCQ2fXMn] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26f30170017HqDM3fqIIraCZ",
+        "[2026-09-30T13:09:29.289Z] [magic-context][ses_f0d90cffeffeH5vuRRZCQ2fXMn] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:09:29.331Z] [magic-context][ses_f0d90cffeffeH5vuRRZCQ2fXMn] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26f30170017HqDM3fqIIraCZ",
+        "[2026-09-30T13:09:29.340Z] [magic-context][ses_f0d90cffeffeH5vuRRZCQ2fXMn] emergency tiered drop: tiered drop: 1 tags, reclaim≈6110/89093 tokens (floor≈88695, ceiling=150025)"
+      ],
+      "lsof": [
+        "opencode 5416 ufukaltinok  txt      REG               1,17     32768          1996112383 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/opencode/issue-repro.db-shm",
+        "opencode 5416 ufukaltinok  txt      REG               1,17     32768          1996122688 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/cortexkit/magic-context/context.db-shm",
+        "opencode 5416 ufukaltinok    7u     REG               1,17   1671168          1996112380 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/opencode/issue-repro.db",
+        "opencode 5416 ufukaltinok    8u     REG               1,17    407912          1996112382 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/opencode/issue-repro.db-wal",
+        "opencode 5416 ufukaltinok    9u     REG               1,17     32768          1996112383 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/opencode/issue-repro.db-shm",
+        "opencode 5416 ufukaltinok   12u     REG               1,17   1671168          1996112380 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/opencode/issue-repro.db",
+        "opencode 5416 ufukaltinok   13u     REG               1,17    407912          1996112382 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/opencode/issue-repro.db-wal",
+        "opencode 5416 ufukaltinok   28u     REG               1,17   2216592          1996122687 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/cortexkit/magic-context/context.db-wal",
+        "opencode 5416 ufukaltinok   34u     REG               1,17   1847296          1996122670 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/cortexkit/magic-context/context.db",
+        "opencode 5416 ufukaltinok   35u     REG               1,17     32768          1996122688 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/cortexkit/magic-context/context.db-shm",
+        "opencode 5416 ufukaltinok   36r     REG               1,17   1671168          1996112380 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/opencode/issue-repro.db",
+        "opencode 5416 ufukaltinok   41r     REG               1,17    407912          1996112382 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/opencode/issue-repro.db-wal",
+        "opencode 5416 ufukaltinok   60u     REG               1,17   1847296          1996122670 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/cortexkit/magic-context/context.db",
+        "opencode 5416 ufukaltinok   61u     REG               1,17   2216592          1996122687 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-85-large-final/data/cortexkit/magic-context/context.db-wal"
+      ]
+    },
+    {
+      "name": "master-sub-98-small",
+      "version": "1.18.30",
+      "pressure": 98,
+      "size": "small",
+      "parentId": "ses_f0d92038dffeSRuEt3DW4g94LB",
+      "reportChars": 2434,
+      "probes": [
+        {
+          "kind": "task",
+          "tag": 4,
+          "ordinal": 3
+        },
+        {
+          "kind": "read",
+          "tag": 3,
+          "ordinal": 2
+        }
+      ],
+      "records": [
+        {
+          "index": 1,
+          "lane": "parent",
+          "parentStep": 0,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434153
+        },
+        {
+          "index": 2,
+          "lane": "parent",
+          "parentStep": 1,
+          "taskVisible": false,
+          "readVisible": true,
+          "bytes": 461709
+        },
+        {
+          "index": 3,
+          "lane": "child",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 29002
+        },
+        {
+          "index": 4,
+          "lane": "parent",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434528
+        },
+        {
+          "index": 5,
+          "lane": "parent",
+          "parentStep": 3,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434767
+        },
+        {
+          "index": 6,
+          "lane": "parent",
+          "parentStep": 4,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435014
+        },
+        {
+          "index": 7,
+          "lane": "parent",
+          "parentStep": 5,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435253
+        },
+        {
+          "index": 8,
+          "lane": "parent",
+          "parentStep": 6,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435500
+        }
+      ],
+      "expands": [
+        {
+          "call": "toolu_expand_task_tag",
+          "input": {
+            "message": 4
+          },
+          "output": "[4] A (assistant) — full recovery:\n\n  [tool: ctx_expand #toolu_expand_task_tag]\n  input: {}",
+          "chars": 91,
+          "hasTask": false,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_task_ordinal",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d91fdafffeyVFmK7xHUbioye\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review ",
+          "chars": 2722,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_tag",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d91fdafffeyVFmK7xHUbioye\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review ",
+          "chars": 2722,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_ordinal",
+          "input": {
+            "message": 2
+          },
+          "output": "[2] A (assistant) — full recovery:\n\n  [text]\nPreparing reference read.\n  [tool: read #toolu_read]\n  description: var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/work/control.txt\n  input: {\"filePath\":\"/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/work/control.txt\"}\n  output:\n<path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/work/control.txt</path>\n<type>file<",
+          "chars": 26509,
+          "hasTask": false,
+          "hasRead": true
+        }
+      ],
+      "arrivalTags": [
+        {
+          "tag": 1,
+          "tool": null,
+          "status": "active",
+          "bytes": 390041
+        },
+        {
+          "tag": 2,
+          "tool": null,
+          "status": "active",
+          "bytes": 25
+        },
+        {
+          "tag": 3,
+          "tool": "read",
+          "status": "dropped",
+          "bytes": 26143
+        },
+        {
+          "tag": 4,
+          "tool": "task",
+          "status": "dropped",
+          "bytes": 2532
+        }
+      ],
+      "arrivalToolResults": [
+        {
+          "id": "toolu_task",
+          "content": "\"[dropped §4§]\""
+        }
+      ],
+      "rawTask": {
+        "status": "completed",
+        "chars": 2532,
+        "start": "<task id=\"ses_f0d91fdafffeyVFmK7xHUbioye\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique deta",
+        "end": " review evidence unique detail review evidence unique detail \nTASK_REVIEW_END\n</task_result>\n</task>",
+        "hasEnd": true,
+        "ordinalRecoveryContainsExactRawOutput": true
+      },
+      "log": [
+        "[2026-09-30T13:08:11.141Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] protected token floor snapshot: floor=16000 provenance=derived usableSoft=230808",
+        "[2026-09-30T13:08:11.145Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26dfc9c001xN5Bj5killoQ8E",
+        "[2026-09-30T13:08:11.152Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] emergency tiered drop: tiered drop: 2 tags, reclaim≈6565/51586 tokens (floor≈174606, ceiling=150025)",
+        "[2026-09-30T13:08:11.240Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26dfc9c001xN5Bj5killoQ8E",
+        "[2026-09-30T13:08:11.244Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] emergency tiered drop: tiered drop: 1 tags, reclaim≈40/45061 tokens (floor≈181131, ceiling=150025)",
+        "[2026-09-30T13:08:11.379Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26dfc9c001xN5Bj5killoQ8E",
+        "[2026-09-30T13:08:11.382Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] emergency tiered drop: tiered drop: 1 tags, reclaim≈438/45459 tokens (floor≈180733, ceiling=150025)",
+        "[2026-09-30T13:08:11.472Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26dfc9c001xN5Bj5killoQ8E",
+        "[2026-09-30T13:08:11.476Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] emergency tiered drop: tiered drop: 1 tags, reclaim≈438/45459 tokens (floor≈180733, ceiling=150025)",
+        "[2026-09-30T13:08:11.556Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26dfc9c001xN5Bj5killoQ8E",
+        "[2026-09-30T13:08:11.572Z] [magic-context][ses_f0d92038dffeSRuEt3DW4g94LB] emergency tiered drop: tiered drop: 1 tags, reclaim≈6258/51279 tokens (floor≈174913, ceiling=150025)"
+      ],
+      "lsof": [
+        "opencode 99459 ufukaltinok  txt      REG               1,17     32768          1996072039 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/opencode/issue-repro.db-shm",
+        "opencode 99459 ufukaltinok  txt      REG               1,17     32768          1996083268 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db-shm",
+        "opencode 99459 ufukaltinok    7u     REG               1,17   1306624          1996072031 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/opencode/issue-repro.db",
+        "opencode 99459 ufukaltinok    8u     REG               1,17     61832          1996072038 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/opencode/issue-repro.db-wal",
+        "opencode 99459 ufukaltinok    9u     REG               1,17     32768          1996072039 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/opencode/issue-repro.db-shm",
+        "opencode 99459 ufukaltinok   12u     REG               1,17   1306624          1996072031 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/opencode/issue-repro.db",
+        "opencode 99459 ufukaltinok   13u     REG               1,17     61832          1996072038 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/opencode/issue-repro.db-wal",
+        "opencode 99459 ufukaltinok   34u     REG               1,17   1847296          1996083055 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 99459 ufukaltinok   35u     REG               1,17   3324872          1996083267 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db-wal",
+        "opencode 99459 ufukaltinok   36u     REG               1,17     32768          1996083268 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db-shm",
+        "opencode 99459 ufukaltinok   37r     REG               1,17   1306624          1996072031 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/opencode/issue-repro.db",
+        "opencode 99459 ufukaltinok   41r     REG               1,17     61832          1996072038 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/opencode/issue-repro.db-wal",
+        "opencode 99459 ufukaltinok   60u     REG               1,17   1847296          1996083055 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 99459 ufukaltinok   62u     REG               1,17   1847296          1996083055 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 99459 ufukaltinok   64u     REG               1,17   1847296          1996083055 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 99459 ufukaltinok   66u     REG               1,17   1847296          1996083055 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 99459 ufukaltinok   67u     REG               1,17   3324872          1996083267 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-small/data/cortexkit/magic-context/context.db-wal"
+      ]
+    },
+    {
+      "name": "master-sub-98-large-final",
+      "version": "1.18.30",
+      "pressure": 98,
+      "size": "large",
+      "parentId": "ses_f0d90b009ffeGmfGZ5EgDPUNBg",
+      "reportChars": 46433,
+      "probes": [
+        {
+          "kind": "task",
+          "tag": 4,
+          "ordinal": 3
+        },
+        {
+          "kind": "read",
+          "tag": 3,
+          "ordinal": 2
+        }
+      ],
+      "records": [
+        {
+          "index": 1,
+          "lane": "parent",
+          "parentStep": 0,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434165
+        },
+        {
+          "index": 2,
+          "lane": "parent",
+          "parentStep": 1,
+          "taskVisible": false,
+          "readVisible": true,
+          "bytes": 461733
+        },
+        {
+          "index": 3,
+          "lane": "child",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 29014
+        },
+        {
+          "index": 4,
+          "lane": "parent",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434540
+        },
+        {
+          "index": 5,
+          "lane": "parent",
+          "parentStep": 3,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434779
+        },
+        {
+          "index": 6,
+          "lane": "parent",
+          "parentStep": 4,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435026
+        },
+        {
+          "index": 7,
+          "lane": "parent",
+          "parentStep": 5,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435265
+        },
+        {
+          "index": 8,
+          "lane": "parent",
+          "parentStep": 6,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435512
+        }
+      ],
+      "expands": [
+        {
+          "call": "toolu_expand_task_tag",
+          "input": {
+            "message": 4
+          },
+          "output": "[4] A (assistant) — full recovery:\n\n  [tool: ctx_expand #toolu_expand_task_tag]\n  input: {}",
+          "chars": 91,
+          "hasTask": false,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_task_ordinal",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d90ac8effeAI5DImO0JejDOP\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n1d795ba0b258280096c1cd959a45\n000a58269d5960a3f33b0bb9d18e\n64dbab382fbef3728e883f1d36da\nb63ec7a6347000046301ee29e595\n1da47ae0369307",
+          "chars": 46889,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_tag",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d90ac8effeAI5DImO0JejDOP\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n1d795ba0b258280096c1cd959a45\n000a58269d5960a3f33b0bb9d18e\n64dbab382fbef3728e883f1d36da\nb63ec7a6347000046301ee29e595\n1da47ae0369307",
+          "chars": 46889,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_ordinal",
+          "input": {
+            "message": 2
+          },
+          "output": "[2] A (assistant) — full recovery:\n\n  [text]\nPreparing reference read.\n  [tool: read #toolu_read]\n  description: var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/work/control.txt\n  input: {\"filePath\":\"/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/work/control.txt\"}\n  output:\n<path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/work/control.txt<",
+          "chars": 26527,
+          "hasTask": false,
+          "hasRead": true
+        }
+      ],
+      "arrivalTags": [
+        {
+          "tag": 1,
+          "tool": null,
+          "status": "active",
+          "bytes": 390041
+        },
+        {
+          "tag": 2,
+          "tool": null,
+          "status": "active",
+          "bytes": 25
+        },
+        {
+          "tag": 3,
+          "tool": "read",
+          "status": "dropped",
+          "bytes": 26149
+        },
+        {
+          "tag": 4,
+          "tool": "task",
+          "status": "dropped",
+          "bytes": 46699
+        }
+      ],
+      "arrivalToolResults": [
+        {
+          "id": "toolu_task",
+          "content": "\"[dropped §4§]\""
+        }
+      ],
+      "rawTask": {
+        "status": "completed",
+        "chars": 46699,
+        "start": "<task id=\"ses_f0d90ac8effeAI5DImO0JejDOP\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n",
+        "end": ". Make a ctx_reduce pass now over the outputs you've already used, then continue.\n</system-reminder>",
+        "hasEnd": true,
+        "ordinalRecoveryContainsExactRawOutput": true
+      },
+      "log": [
+        "[2026-09-30T13:09:37.357Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] protected token floor snapshot: floor=16000 provenance=derived usableSoft=230808",
+        "[2026-09-30T13:09:37.360Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26f5008001kaBo2dJ4PJQNqw",
+        "[2026-09-30T13:09:37.369Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] emergency tiered drop: tiered drop: 2 tags, reclaim≈34280/78361 tokens (floor≈146891, ceiling=150025)",
+        "[2026-09-30T13:09:37.413Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26f5008001kaBo2dJ4PJQNqw",
+        "[2026-09-30T13:09:37.416Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] emergency tiered drop: tiered drop: 1 tags, reclaim≈40/45061 tokens (floor≈181131, ceiling=150025)",
+        "[2026-09-30T13:09:37.457Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26f5008001kaBo2dJ4PJQNqw",
+        "[2026-09-30T13:09:37.463Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] emergency tiered drop: tiered drop: 1 tags, reclaim≈28149/73170 tokens (floor≈153022, ceiling=150025)",
+        "[2026-09-30T13:09:37.499Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26f5008001kaBo2dJ4PJQNqw",
+        "[2026-09-30T13:09:37.504Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] emergency tiered drop: tiered drop: 1 tags, reclaim≈28149/73170 tokens (floor≈153022, ceiling=150025)",
+        "[2026-09-30T13:09:37.582Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26f5008001kaBo2dJ4PJQNqw",
+        "[2026-09-30T13:09:37.585Z] [magic-context][ses_f0d90b009ffeGmfGZ5EgDPUNBg] emergency tiered drop: tiered drop: 1 tags, reclaim≈6264/51285 tokens (floor≈174907, ceiling=150025)"
+      ],
+      "lsof": [
+        "opencode 6016 ufukaltinok  txt      REG               1,17     32768          1996122942 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/opencode/issue-repro.db-shm",
+        "opencode 6016 ufukaltinok  txt      REG               1,17     32768          1996131872 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db-shm",
+        "opencode 6016 ufukaltinok    7u     REG               1,17   1671168          1996122939 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/opencode/issue-repro.db",
+        "opencode 6016 ufukaltinok    8u     REG               1,17    416152          1996122941 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/opencode/issue-repro.db-wal",
+        "opencode 6016 ufukaltinok    9u     REG               1,17     32768          1996122942 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/opencode/issue-repro.db-shm",
+        "opencode 6016 ufukaltinok   12u     REG               1,17   1671168          1996122939 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/opencode/issue-repro.db",
+        "opencode 6016 ufukaltinok   13u     REG               1,17    416152          1996122941 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/opencode/issue-repro.db-wal",
+        "opencode 6016 ufukaltinok   33u     REG               1,17   1847296          1996131836 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db",
+        "opencode 6016 ufukaltinok   35u     REG               1,17   1833432          1996131871 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db-wal",
+        "opencode 6016 ufukaltinok   36u     REG               1,17     32768          1996131872 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db-shm",
+        "opencode 6016 ufukaltinok   37r     REG               1,17   1671168          1996122939 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/opencode/issue-repro.db",
+        "opencode 6016 ufukaltinok   41r     REG               1,17    416152          1996122941 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/opencode/issue-repro.db-wal",
+        "opencode 6016 ufukaltinok   60u     REG               1,17   1847296          1996131836 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db",
+        "opencode 6016 ufukaltinok   61u     REG               1,17   1833432          1996131871 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db-wal",
+        "opencode 6016 ufukaltinok   62u     REG               1,17   1847296          1996131836 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db",
+        "opencode 6016 ufukaltinok   63u     REG               1,17   1833432          1996131871 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db-wal",
+        "opencode 6016 ufukaltinok   64u     REG               1,17   1847296          1996131836 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db",
+        "opencode 6016 ufukaltinok   65u     REG               1,17   1833432          1996131871 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db-wal",
+        "opencode 6016 ufukaltinok   66u     REG               1,17   1847296          1996131836 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db",
+        "opencode 6016 ufukaltinok   67u     REG               1,17   1833432          1996131871 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db-wal",
+        "opencode 6016 ufukaltinok   68u     REG               1,17   1847296          1996131836 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db",
+        "opencode 6016 ufukaltinok   69u     REG               1,17   1833432          1996131871 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/master-sub-98-large-final/data/cortexkit/magic-context/context.db-wal"
+      ]
+    },
+    {
+      "name": "release-sub-85-small",
+      "version": "1.18.30",
+      "pressure": 85,
+      "size": "small",
+      "parentId": "ses_f0d907bffffeiZ8RBDzPHFqv1X",
+      "reportChars": 2434,
+      "probes": [
+        {
+          "kind": "task",
+          "tag": 4,
+          "ordinal": 3
+        },
+        {
+          "kind": "read",
+          "tag": 3,
+          "ordinal": 2
+        }
+      ],
+      "records": [
+        {
+          "index": 1,
+          "lane": "parent",
+          "parentStep": 0,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434155
+        },
+        {
+          "index": 2,
+          "lane": "parent",
+          "parentStep": 1,
+          "taskVisible": false,
+          "readVisible": true,
+          "bytes": 461713
+        },
+        {
+          "index": 3,
+          "lane": "child",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 29004
+        },
+        {
+          "index": 4,
+          "lane": "parent",
+          "parentStep": 2,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 464529
+        },
+        {
+          "index": 5,
+          "lane": "parent",
+          "parentStep": 3,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 464853
+        },
+        {
+          "index": 6,
+          "lane": "parent",
+          "parentStep": 4,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 467841
+        },
+        {
+          "index": 7,
+          "lane": "parent",
+          "parentStep": 5,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 470821
+        },
+        {
+          "index": 8,
+          "lane": "parent",
+          "parentStep": 6,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 498591
+        }
+      ],
+      "expands": [
+        {
+          "call": "toolu_expand_task_tag",
+          "input": {
+            "message": 4
+          },
+          "output": "[4] A (assistant) — full recovery:\n\n  [tool: ctx_expand #toolu_expand_task_tag]\n  input: {}",
+          "chars": 91,
+          "hasTask": false,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_task_ordinal",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d907638ffeFOhvJN6YkFdls4\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review ",
+          "chars": 2722,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_tag",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d907638ffeFOhvJN6YkFdls4\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review ",
+          "chars": 2722,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_ordinal",
+          "input": {
+            "message": 2
+          },
+          "output": "[2] A (assistant) — full recovery:\n\n  [text]\nPreparing reference read.\n  [tool: read #toolu_read]\n  description: var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/work/control.txt\n  input: {\"filePath\":\"/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/work/control.txt\"}\n  output:\n<path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/work/control.txt</path>\n<type>fi",
+          "chars": 26512,
+          "hasTask": false,
+          "hasRead": true
+        }
+      ],
+      "arrivalTags": [
+        {
+          "tag": 1,
+          "tool": null,
+          "status": "active",
+          "bytes": 390041
+        },
+        {
+          "tag": 2,
+          "tool": null,
+          "status": "active",
+          "bytes": 25
+        },
+        {
+          "tag": 3,
+          "tool": "read",
+          "status": "active",
+          "bytes": 26144
+        },
+        {
+          "tag": 4,
+          "tool": "task",
+          "status": "active",
+          "bytes": 2532
+        }
+      ],
+      "arrivalToolResults": [
+        {
+          "id": "toolu_read",
+          "content": "\"§3§ <path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/work/control.txt</path>\\n<type>file</type>\\n<content>\\n1: READ_CONTROL_START\\n2: older reference data\\n3: older reference data\\n4: older referenc"
+        },
+        {
+          "id": "toolu_task",
+          "content": "\"§4§ <task id=\\\"ses_f0d907638ffeFOhvJN6YkFdls4\\\" state=\\\"completed\\\">\\n<task_result>\\nTASK_REVIEW_START\\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique de"
+        }
+      ],
+      "rawTask": {
+        "status": "completed",
+        "chars": 2532,
+        "start": "<task id=\"ses_f0d907638ffeFOhvJN6YkFdls4\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique deta",
+        "end": " review evidence unique detail review evidence unique detail \nTASK_REVIEW_END\n</task_result>\n</task>",
+        "hasEnd": true,
+        "ordinalRecoveryContainsExactRawOutput": true
+      },
+      "log": [
+        "[2026-09-30T13:09:51.479Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] protected token floor snapshot: floor=16000 provenance=derived usableSoft=230808",
+        "[2026-09-30T13:09:51.482Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26f840f001rdJ7zpn3kr4Vdh",
+        "[2026-09-30T13:09:51.488Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:09:51.553Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26f840f001rdJ7zpn3kr4Vdh",
+        "[2026-09-30T13:09:51.556Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:09:51.678Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26f840f001rdJ7zpn3kr4Vdh",
+        "[2026-09-30T13:09:51.682Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:09:51.739Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26f840f001rdJ7zpn3kr4Vdh",
+        "[2026-09-30T13:09:51.743Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:09:51.807Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26f840f001rdJ7zpn3kr4Vdh",
+        "[2026-09-30T13:09:51.812Z] [magic-context][ses_f0d907bffffeiZ8RBDzPHFqv1X] emergency tiered drop skipped: no-candidates"
+      ],
+      "lsof": [
+        "opencode 6190 ufukaltinok  txt      REG               1,17     32768          1996132086 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/opencode/issue-repro.db-shm",
+        "opencode 6190 ufukaltinok  txt      REG               1,17     32768          1996142836 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/cortexkit/magic-context/context.db-shm",
+        "opencode 6190 ufukaltinok    7u     REG               1,17   1306624          1996132083 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/opencode/issue-repro.db",
+        "opencode 6190 ufukaltinok    8u     REG               1,17     61832          1996132085 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/opencode/issue-repro.db-wal",
+        "opencode 6190 ufukaltinok    9u     REG               1,17     32768          1996132086 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/opencode/issue-repro.db-shm",
+        "opencode 6190 ufukaltinok   12u     REG               1,17   1306624          1996132083 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/opencode/issue-repro.db",
+        "opencode 6190 ufukaltinok   13u     REG               1,17     61832          1996132085 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/opencode/issue-repro.db-wal",
+        "opencode 6190 ufukaltinok   22u     REG               1,17   1847296          1996142654 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/cortexkit/magic-context/context.db",
+        "opencode 6190 ufukaltinok   35u     REG               1,17   2583272          1996142834 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/cortexkit/magic-context/context.db-wal",
+        "opencode 6190 ufukaltinok   36u     REG               1,17     32768          1996142836 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/cortexkit/magic-context/context.db-shm",
+        "opencode 6190 ufukaltinok   37r     REG               1,17   1306624          1996132083 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/opencode/issue-repro.db",
+        "opencode 6190 ufukaltinok   41r     REG               1,17     61832          1996132085 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-small/data/opencode/issue-repro.db-wal"
+      ]
+    },
+    {
+      "name": "release-sub-85-large",
+      "version": "1.18.30",
+      "pressure": 85,
+      "size": "large",
+      "parentId": "ses_f0d904558ffefiq8qRHPzZSveJ",
+      "reportChars": 46433,
+      "probes": [
+        {
+          "kind": "task",
+          "tag": 4,
+          "ordinal": 3
+        },
+        {
+          "kind": "read",
+          "tag": 3,
+          "ordinal": 2
+        }
+      ],
+      "records": [
+        {
+          "index": 1,
+          "lane": "parent",
+          "parentStep": 0,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434155
+        },
+        {
+          "index": 2,
+          "lane": "parent",
+          "parentStep": 1,
+          "taskVisible": false,
+          "readVisible": true,
+          "bytes": 461713
+        },
+        {
+          "index": 3,
+          "lane": "child",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 29004
+        },
+        {
+          "index": 4,
+          "lane": "parent",
+          "parentStep": 2,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 510299
+        },
+        {
+          "index": 5,
+          "lane": "parent",
+          "parentStep": 3,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 510623
+        },
+        {
+          "index": 6,
+          "lane": "parent",
+          "parentStep": 4,
+          "taskVisible": true,
+          "readVisible": false,
+          "bytes": 532238
+        },
+        {
+          "index": 7,
+          "lane": "parent",
+          "parentStep": 5,
+          "taskVisible": true,
+          "readVisible": false,
+          "bytes": 580988
+        },
+        {
+          "index": 8,
+          "lane": "parent",
+          "parentStep": 6,
+          "taskVisible": true,
+          "readVisible": true,
+          "bytes": 608758
+        }
+      ],
+      "expands": [
+        {
+          "call": "toolu_expand_task_tag",
+          "input": {
+            "message": 4
+          },
+          "output": "[4] A (assistant) — full recovery:\n\n  [tool: ctx_expand #toolu_expand_task_tag]\n  input: {}",
+          "chars": 91,
+          "hasTask": false,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_task_ordinal",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d904225ffeiW24CM2E6zhDMv\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n1d795ba0b258280096c1cd959a45\n000a58269d5960a3f33b0bb9d18e\n64dbab382fbef3728e883f1d36da\nb63ec7a6347000046301ee29e595\n1da47ae0369307",
+          "chars": 46889,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_tag",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d904225ffeiW24CM2E6zhDMv\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n1d795ba0b258280096c1cd959a45\n000a58269d5960a3f33b0bb9d18e\n64dbab382fbef3728e883f1d36da\nb63ec7a6347000046301ee29e595\n1da47ae0369307",
+          "chars": 46889,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_ordinal",
+          "input": {
+            "message": 2
+          },
+          "output": "[2] A (assistant) — full recovery:\n\n  [text]\nPreparing reference read.\n  [tool: read #toolu_read]\n  description: var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/work/control.txt\n  input: {\"filePath\":\"/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/work/control.txt\"}\n  output:\n<path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/work/control.txt</path>\n<type>fi",
+          "chars": 26512,
+          "hasTask": false,
+          "hasRead": true
+        }
+      ],
+      "arrivalTags": [
+        {
+          "tag": 1,
+          "tool": null,
+          "status": "active",
+          "bytes": 390041
+        },
+        {
+          "tag": 2,
+          "tool": null,
+          "status": "active",
+          "bytes": 25
+        },
+        {
+          "tag": 3,
+          "tool": "read",
+          "status": "active",
+          "bytes": 26144
+        },
+        {
+          "tag": 4,
+          "tool": "task",
+          "status": "active",
+          "bytes": 46699
+        }
+      ],
+      "arrivalToolResults": [
+        {
+          "id": "toolu_read",
+          "content": "\"§3§ <path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/work/control.txt</path>\\n<type>file</type>\\n<content>\\n1: READ_CONTROL_START\\n2: older reference data\\n3: older reference data\\n4: older referenc"
+        },
+        {
+          "id": "toolu_task",
+          "content": "\"§4§ <task id=\\\"ses_f0d904225ffeiW24CM2E6zhDMv\\\" state=\\\"completed\\\">\\n<task_result>\\nTASK_REVIEW_START\\n7c794c9c7015761e6f17802c7cf8\\n19f365a95185035965832eb2ea07\\n72bbeb75306e44a7f5ce5b9d9c2f\\n1d795ba0b258280096c1cd959a45\\n000a58269d5960a3f33b0bb9d"
+        }
+      ],
+      "rawTask": {
+        "status": "completed",
+        "chars": 46699,
+        "start": "<task id=\"ses_f0d904225ffeiW24CM2E6zhDMv\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n",
+        "end": ". Make a ctx_reduce pass now over the outputs you've already used, then continue.\n</system-reminder>",
+        "hasEnd": true,
+        "ordinalRecoveryContainsExactRawOutput": true
+      },
+      "log": [
+        "[2026-09-30T13:10:04.751Z] [magic-context][ses_f0d904558ffefiq8qRHPzZSveJ] protected token floor snapshot: floor=16000 provenance=derived usableSoft=230808",
+        "[2026-09-30T13:10:04.755Z] [magic-context][ses_f0d904558ffefiq8qRHPzZSveJ] heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26fbac10010vjuq4d1GdKJj3",
+        "[2026-09-30T13:10:04.766Z] [magic-context][ses_f0d904558ffefiq8qRHPzZSveJ] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:10:04.842Z] [magic-context][ses_f0d904558ffefiq8qRHPzZSveJ] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26fbac10010vjuq4d1GdKJj3",
+        "[2026-09-30T13:10:04.850Z] [magic-context][ses_f0d904558ffefiq8qRHPzZSveJ] emergency tiered drop skipped: no-candidates",
+        "[2026-09-30T13:10:04.933Z] [magic-context][ses_f0d904558ffefiq8qRHPzZSveJ] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=85.0%, turn=msg_0f26fbac10010vjuq4d1GdKJj3",
+        "[2026-09-30T13:10:04.948Z] [magic-context][ses_f0d904558ffefiq8qRHPzZSveJ] emergency tiered drop: tiered drop: 1 tags, reclaim≈6108/89087 tokens (floor≈88703, ceiling=150025)"
+      ],
+      "lsof": [
+        "opencode 7215 ufukaltinok  txt      REG               1,17     32768          1996143992 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/opencode/issue-repro.db-shm",
+        "opencode 7215 ufukaltinok  txt      REG               1,17     32768          1996154528 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/cortexkit/magic-context/context.db-shm",
+        "opencode 7215 ufukaltinok    7u     REG               1,17   1671168          1996143986 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/opencode/issue-repro.db",
+        "opencode 7215 ufukaltinok    8u     REG               1,17    416152          1996143990 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/opencode/issue-repro.db-wal",
+        "opencode 7215 ufukaltinok    9u     REG               1,17     32768          1996143992 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/opencode/issue-repro.db-shm",
+        "opencode 7215 ufukaltinok   12u     REG               1,17   1671168          1996143986 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/opencode/issue-repro.db",
+        "opencode 7215 ufukaltinok   13u     REG               1,17    416152          1996143990 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/opencode/issue-repro.db-wal",
+        "opencode 7215 ufukaltinok   34u     REG               1,17   1847296          1996154499 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/cortexkit/magic-context/context.db",
+        "opencode 7215 ufukaltinok   35u     REG               1,17   3914032          1996154527 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/cortexkit/magic-context/context.db-wal",
+        "opencode 7215 ufukaltinok   36u     REG               1,17     32768          1996154528 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/cortexkit/magic-context/context.db-shm",
+        "opencode 7215 ufukaltinok   37r     REG               1,17   1671168          1996143986 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/opencode/issue-repro.db",
+        "opencode 7215 ufukaltinok   41r     REG               1,17    416152          1996143990 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/opencode/issue-repro.db-wal",
+        "opencode 7215 ufukaltinok   60u     REG               1,17   1847296          1996154499 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/cortexkit/magic-context/context.db",
+        "opencode 7215 ufukaltinok   61u     REG               1,17   3914032          1996154527 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-85-large/data/cortexkit/magic-context/context.db-wal"
+      ]
+    },
+    {
+      "name": "release-sub-98-small",
+      "version": "1.18.30",
+      "pressure": 98,
+      "size": "small",
+      "parentId": "ses_f0d901639ffe85raYF16tmYakn",
+      "reportChars": 2434,
+      "probes": [
+        {
+          "kind": "task",
+          "tag": 4,
+          "ordinal": 3
+        },
+        {
+          "kind": "read",
+          "tag": 3,
+          "ordinal": 2
+        }
+      ],
+      "records": [
+        {
+          "index": 1,
+          "lane": "parent",
+          "parentStep": 0,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434155
+        },
+        {
+          "index": 2,
+          "lane": "parent",
+          "parentStep": 1,
+          "taskVisible": false,
+          "readVisible": true,
+          "bytes": 461713
+        },
+        {
+          "index": 3,
+          "lane": "child",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 29004
+        },
+        {
+          "index": 4,
+          "lane": "parent",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434530
+        },
+        {
+          "index": 5,
+          "lane": "parent",
+          "parentStep": 3,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434769
+        },
+        {
+          "index": 6,
+          "lane": "parent",
+          "parentStep": 4,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435016
+        },
+        {
+          "index": 7,
+          "lane": "parent",
+          "parentStep": 5,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435255
+        },
+        {
+          "index": 8,
+          "lane": "parent",
+          "parentStep": 6,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435502
+        }
+      ],
+      "expands": [
+        {
+          "call": "toolu_expand_task_tag",
+          "input": {
+            "message": 4
+          },
+          "output": "[4] A (assistant) — full recovery:\n\n  [tool: ctx_expand #toolu_expand_task_tag]\n  input: {}",
+          "chars": 91,
+          "hasTask": false,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_task_ordinal",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d90120bffe5mRkycfAoERPSD\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review ",
+          "chars": 2722,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_tag",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d90120bffe5mRkycfAoERPSD\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review evidence unique detail review ",
+          "chars": 2722,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_ordinal",
+          "input": {
+            "message": 2
+          },
+          "output": "[2] A (assistant) — full recovery:\n\n  [text]\nPreparing reference read.\n  [tool: read #toolu_read]\n  description: var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/work/control.txt\n  input: {\"filePath\":\"/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/work/control.txt\"}\n  output:\n<path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/work/control.txt</path>\n<type>fi",
+          "chars": 26512,
+          "hasTask": false,
+          "hasRead": true
+        }
+      ],
+      "arrivalTags": [
+        {
+          "tag": 1,
+          "tool": null,
+          "status": "active",
+          "bytes": 390041
+        },
+        {
+          "tag": 2,
+          "tool": null,
+          "status": "active",
+          "bytes": 25
+        },
+        {
+          "tag": 3,
+          "tool": "read",
+          "status": "dropped",
+          "bytes": 26144
+        },
+        {
+          "tag": 4,
+          "tool": "task",
+          "status": "dropped",
+          "bytes": 2532
+        }
+      ],
+      "arrivalToolResults": [
+        {
+          "id": "toolu_task",
+          "content": "\"[dropped §4§]\""
+        }
+      ],
+      "rawTask": {
+        "status": "completed",
+        "chars": 2532,
+        "start": "<task id=\"ses_f0d90120bffe5mRkycfAoERPSD\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\nreview evidence unique detail review evidence unique detail review evidence unique deta",
+        "end": " review evidence unique detail review evidence unique detail \nTASK_REVIEW_END\n</task_result>\n</task>",
+        "hasEnd": true,
+        "ordinalRecoveryContainsExactRawOutput": true
+      },
+      "log": [
+        "[2026-09-30T13:10:16.912Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] protected token floor snapshot: floor=16000 provenance=derived usableSoft=230808",
+        "[2026-09-30T13:10:16.916Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26fe9e4001Lgap7nlrzybrfG",
+        "[2026-09-30T13:10:16.922Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] emergency tiered drop: tiered drop: 2 tags, reclaim≈6565/51586 tokens (floor≈174606, ceiling=150025)",
+        "[2026-09-30T13:10:16.977Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26fe9e4001Lgap7nlrzybrfG",
+        "[2026-09-30T13:10:16.981Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] emergency tiered drop: tiered drop: 1 tags, reclaim≈40/45061 tokens (floor≈181131, ceiling=150025)",
+        "[2026-09-30T13:10:17.069Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26fe9e4001Lgap7nlrzybrfG",
+        "[2026-09-30T13:10:17.072Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] emergency tiered drop: tiered drop: 1 tags, reclaim≈438/45459 tokens (floor≈180733, ceiling=150025)",
+        "[2026-09-30T13:10:17.113Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26fe9e4001Lgap7nlrzybrfG",
+        "[2026-09-30T13:10:17.115Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] emergency tiered drop: tiered drop: 1 tags, reclaim≈438/45459 tokens (floor≈180733, ceiling=150025)",
+        "[2026-09-30T13:10:17.172Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f26fe9e4001Lgap7nlrzybrfG",
+        "[2026-09-30T13:10:17.176Z] [magic-context][ses_f0d901639ffe85raYF16tmYakn] emergency tiered drop: tiered drop: 1 tags, reclaim≈6258/51279 tokens (floor≈174913, ceiling=150025)"
+      ],
+      "lsof": [
+        "opencode 7877 ufukaltinok  txt      REG               1,17     32768          1996155369 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/opencode/issue-repro.db-shm",
+        "opencode 7877 ufukaltinok  txt      REG               1,17     32768          1996166194 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db-shm",
+        "opencode 7877 ufukaltinok    7u     REG               1,17   1306624          1996155366 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/opencode/issue-repro.db",
+        "opencode 7877 ufukaltinok    8u     REG               1,17     61832          1996155368 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/opencode/issue-repro.db-wal",
+        "opencode 7877 ufukaltinok    9u     REG               1,17     32768          1996155369 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/opencode/issue-repro.db-shm",
+        "opencode 7877 ufukaltinok   12u     REG               1,17   1306624          1996155366 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/opencode/issue-repro.db",
+        "opencode 7877 ufukaltinok   13u     REG               1,17     61832          1996155368 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/opencode/issue-repro.db-wal",
+        "opencode 7877 ufukaltinok   31u     REG               1,17   1847296          1996166161 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 7877 ufukaltinok   35u     REG               1,17   2282512          1996166193 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db-wal",
+        "opencode 7877 ufukaltinok   36u     REG               1,17     32768          1996166194 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db-shm",
+        "opencode 7877 ufukaltinok   37r     REG               1,17   1306624          1996155366 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/opencode/issue-repro.db",
+        "opencode 7877 ufukaltinok   41r     REG               1,17     61832          1996155368 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/opencode/issue-repro.db-wal",
+        "opencode 7877 ufukaltinok   60u     REG               1,17   1847296          1996166161 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 7877 ufukaltinok   61u     REG               1,17   2282512          1996166193 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db-wal",
+        "opencode 7877 ufukaltinok   62u     REG               1,17   1847296          1996166161 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 7877 ufukaltinok   63u     REG               1,17   2282512          1996166193 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db-wal",
+        "opencode 7877 ufukaltinok   64u     REG               1,17   1847296          1996166161 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 7877 ufukaltinok   65u     REG               1,17   2282512          1996166193 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db-wal",
+        "opencode 7877 ufukaltinok   66u     REG               1,17   1847296          1996166161 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db",
+        "opencode 7877 ufukaltinok   67u     REG               1,17   2282512          1996166193 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-small/data/cortexkit/magic-context/context.db-wal"
+      ]
+    },
+    {
+      "name": "release-sub-98-large",
+      "version": "1.18.30",
+      "pressure": 98,
+      "size": "large",
+      "parentId": "ses_f0d8fea52ffeKL8L6QDNbubwnp",
+      "reportChars": 46433,
+      "probes": [
+        {
+          "kind": "task",
+          "tag": 4,
+          "ordinal": 3
+        },
+        {
+          "kind": "read",
+          "tag": 3,
+          "ordinal": 2
+        }
+      ],
+      "records": [
+        {
+          "index": 1,
+          "lane": "parent",
+          "parentStep": 0,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434155
+        },
+        {
+          "index": 2,
+          "lane": "parent",
+          "parentStep": 1,
+          "taskVisible": false,
+          "readVisible": true,
+          "bytes": 461713
+        },
+        {
+          "index": 3,
+          "lane": "child",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 29004
+        },
+        {
+          "index": 4,
+          "lane": "parent",
+          "parentStep": 2,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434530
+        },
+        {
+          "index": 5,
+          "lane": "parent",
+          "parentStep": 3,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 434769
+        },
+        {
+          "index": 6,
+          "lane": "parent",
+          "parentStep": 4,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435016
+        },
+        {
+          "index": 7,
+          "lane": "parent",
+          "parentStep": 5,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435255
+        },
+        {
+          "index": 8,
+          "lane": "parent",
+          "parentStep": 6,
+          "taskVisible": false,
+          "readVisible": false,
+          "bytes": 435502
+        }
+      ],
+      "expands": [
+        {
+          "call": "toolu_expand_task_tag",
+          "input": {
+            "message": 4
+          },
+          "output": "[4] A (assistant) — full recovery:\n\n  [tool: ctx_expand #toolu_expand_task_tag]\n  input: {}",
+          "chars": 91,
+          "hasTask": false,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_task_ordinal",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d8fe3a1ffeLk2htptTqGdHOh\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n1d795ba0b258280096c1cd959a45\n000a58269d5960a3f33b0bb9d18e\n64dbab382fbef3728e883f1d36da\nb63ec7a6347000046301ee29e595\n1da47ae0369307",
+          "chars": 46889,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_tag",
+          "input": {
+            "message": 3
+          },
+          "output": "[3] A (assistant) — full recovery:\n\n  [tool: task #toolu_task]\n  description: review\n  input: {\"description\":\"review\",\"prompt\":\"CHILD_585 produce review\",\"subagent_type\":\"worker\"}\n  output:\n<task id=\"ses_f0d8fe3a1ffeLk2htptTqGdHOh\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n1d795ba0b258280096c1cd959a45\n000a58269d5960a3f33b0bb9d18e\n64dbab382fbef3728e883f1d36da\nb63ec7a6347000046301ee29e595\n1da47ae0369307",
+          "chars": 46889,
+          "hasTask": true,
+          "hasRead": false
+        },
+        {
+          "call": "toolu_expand_read_ordinal",
+          "input": {
+            "message": 2
+          },
+          "output": "[2] A (assistant) — full recovery:\n\n  [text]\nPreparing reference read.\n  [tool: read #toolu_read]\n  description: var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/work/control.txt\n  input: {\"filePath\":\"/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/work/control.txt\"}\n  output:\n<path>/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/work/control.txt</path>\n<type>fi",
+          "chars": 26512,
+          "hasTask": false,
+          "hasRead": true
+        }
+      ],
+      "arrivalTags": [
+        {
+          "tag": 1,
+          "tool": null,
+          "status": "active",
+          "bytes": 390041
+        },
+        {
+          "tag": 2,
+          "tool": null,
+          "status": "active",
+          "bytes": 25
+        },
+        {
+          "tag": 3,
+          "tool": "read",
+          "status": "dropped",
+          "bytes": 26144
+        },
+        {
+          "tag": 4,
+          "tool": "task",
+          "status": "dropped",
+          "bytes": 46699
+        }
+      ],
+      "arrivalToolResults": [
+        {
+          "id": "toolu_task",
+          "content": "\"[dropped §4§]\""
+        }
+      ],
+      "rawTask": {
+        "status": "completed",
+        "chars": 46699,
+        "start": "<task id=\"ses_f0d8fe3a1ffeLk2htptTqGdHOh\" state=\"completed\">\n<task_result>\nTASK_REVIEW_START\n7c794c9c7015761e6f17802c7cf8\n19f365a95185035965832eb2ea07\n72bbeb75306e44a7f5ce5b9d9c2f\n",
+        "end": ". Make a ctx_reduce pass now over the outputs you've already used, then continue.\n</system-reminder>",
+        "hasEnd": true,
+        "ordinalRecoveryContainsExactRawOutput": true
+      },
+      "log": [
+        "[2026-09-30T13:10:28.930Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] protected token floor snapshot: floor=16000 provenance=derived usableSoft=230808",
+        "[2026-09-30T13:10:28.934Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] heuristics WILL RUN — reason=ride=force (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f27015bf001TiaZaqI6Fsf9TF",
+        "[2026-09-30T13:10:28.942Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] emergency tiered drop: tiered drop: 2 tags, reclaim≈34278/78359 tokens (floor≈146893, ceiling=150025)",
+        "[2026-09-30T13:10:29.135Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f27015bf001TiaZaqI6Fsf9TF",
+        "[2026-09-30T13:10:29.139Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] emergency tiered drop: tiered drop: 1 tags, reclaim≈40/45061 tokens (floor≈181131, ceiling=150025)",
+        "[2026-09-30T13:10:29.216Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f27015bf001TiaZaqI6Fsf9TF",
+        "[2026-09-30T13:10:29.223Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] emergency tiered drop: tiered drop: 1 tags, reclaim≈28151/73172 tokens (floor≈153020, ceiling=150025)",
+        "[2026-09-30T13:10:29.307Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f27015bf001TiaZaqI6Fsf9TF",
+        "[2026-09-30T13:10:29.316Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] emergency tiered drop: tiered drop: 1 tags, reclaim≈28151/73172 tokens (floor≈153020, ceiling=150025)",
+        "[2026-09-30T13:10:29.426Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] heuristics WILL RUN — reason=ride=force subagent_rerun (pendingOps=0, scheduler=execute), context=98.0%, turn=msg_0f27015bf001TiaZaqI6Fsf9TF",
+        "[2026-09-30T13:10:29.431Z] [magic-context][ses_f0d8fea52ffeKL8L6QDNbubwnp] emergency tiered drop: tiered drop: 1 tags, reclaim≈6258/51279 tokens (floor≈174913, ceiling=150025)"
+      ],
+      "lsof": [
+        "opencode 8851 ufukaltinok  txt      REG               1,17     32768          1996167461 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/opencode/issue-repro.db-shm",
+        "opencode 8851 ufukaltinok  txt      REG               1,17     32768          1996179977 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db-shm",
+        "opencode 8851 ufukaltinok    7u     REG               1,17   1671168          1996167452 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/opencode/issue-repro.db",
+        "opencode 8851 ufukaltinok    8u     REG               1,17    416152          1996167460 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/opencode/issue-repro.db-wal",
+        "opencode 8851 ufukaltinok    9u     REG               1,17     32768          1996167461 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/opencode/issue-repro.db-shm",
+        "opencode 8851 ufukaltinok   12u     REG               1,17   1671168          1996167452 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/opencode/issue-repro.db",
+        "opencode 8851 ufukaltinok   13u     REG               1,17    416152          1996167460 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/opencode/issue-repro.db-wal",
+        "opencode 8851 ufukaltinok   33u     REG               1,17   1847296          1996179959 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db",
+        "opencode 8851 ufukaltinok   34u     REG               1,17   3555592          1996179976 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db-wal",
+        "opencode 8851 ufukaltinok   35u     REG               1,17     32768          1996179977 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db-shm",
+        "opencode 8851 ufukaltinok   36r     REG               1,17   1671168          1996167452 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/opencode/issue-repro.db",
+        "opencode 8851 ufukaltinok   41r     REG               1,17    416152          1996167460 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/opencode/issue-repro.db-wal",
+        "opencode 8851 ufukaltinok   60u     REG               1,17   1847296          1996179959 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db",
+        "opencode 8851 ufukaltinok   61u     REG               1,17   3555592          1996179976 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db-wal",
+        "opencode 8851 ufukaltinok   62u     REG               1,17   1847296          1996179959 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db",
+        "opencode 8851 ufukaltinok   63u     REG               1,17   3555592          1996179976 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db-wal",
+        "opencode 8851 ufukaltinok   64u     REG               1,17   1847296          1996179959 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db",
+        "opencode 8851 ufukaltinok   65u     REG               1,17   3555592          1996179976 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db-wal",
+        "opencode 8851 ufukaltinok   66u     REG               1,17   1847296          1996179959 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db",
+        "opencode 8851 ufukaltinok   67u     REG               1,17   3555592          1996179976 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db-wal",
+        "opencode 8851 ufukaltinok   68u     REG               1,17   1847296          1996179959 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db",
+        "opencode 8851 ufukaltinok   69u     REG               1,17   3555592          1996179976 /private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/issue-585/release-sub-98-large/data/cortexkit/magic-context/context.db-wal"
+      ]
+    }
+  ],
+  "reporter": {
+    "lineCount": 43627,
+    "sha256": "42aa4009b8636778e90fb029f84538b1b987ecf110de0a9590cd7ddb18a8c36a",
+    "mainPublishes": [
+      {
+        "line": 305,
+        "text": "[2026-09-30T08:58:17.604Z] [magic-context][ses_f12b44189ffeeT1z7tK0Fuwxrd] historian publish completed: compartments=1 range=1-32"
+      },
+      {
+        "line": 1953,
+        "text": "[2026-09-30T09:05:34.485Z] [magic-context][ses_f12b44189ffeeT1z7tK0Fuwxrd] historian publish completed: compartments=1 range=33-48"
+      },
+      {
+        "line": 3056,
+        "text": "[2026-09-30T09:11:03.540Z] [magic-context][ses_f12b44189ffeeT1z7tK0Fuwxrd] historian publish completed: compartments=1 range=49-52"
+      },
+      {
+        "line": 12104,
+        "text": "[2026-09-30T10:28:51.404Z] [magic-context][ses_f12b44189ffeeT1z7tK0Fuwxrd] historian publish completed: compartments=1 range=53-63"
+      },
+      {
+        "line": 13591,
+        "text": "[2026-09-30T10:35:04.150Z] [magic-context][ses_f12b44189ffeeT1z7tK0Fuwxrd] historian publish completed: compartments=1 range=64-68"
+      },
+      {
+        "line": 14892,
+        "text": "[2026-09-30T10:41:18.453Z] [magic-context][ses_f12b44189ffeeT1z7tK0Fuwxrd] historian publish completed: compartments=1 range=69-72"
+      },
+      {
+        "line": 26114,
+        "text": "[2026-09-30T11:26:44.618Z] [magic-context][ses_f12b44189ffeeT1z7tK0Fuwxrd] historian publish completed: compartments=1 range=73-79"
+      }
+    ],
+    "subEmergencyDrops": 68,
+    "subNearFullPasses": 30,
+    "subClassification": [
+      {
+        "line": 14376,
+        "text": "[2026-09-30T10:37:29.493Z] [magic-context][ses_f0e1bf95dfferQqKEYxSArHrN0] injected generic guidance into system prompt (ctxReduce=false, subagent=true, subagentReduceMode=true)"
+      }
+    ],
+    "subNoHistorian": [],
+    "tailDrops": [
+      {
+        "line": 37171,
+        "text": "[2026-09-30T12:00:07.686Z] [magic-context][ses_f0e1bf95dfferQqKEYxSArHrN0] emergency tiered drop: tiered drop: 3 tags, reclaim≈505/3940 tokens (floor≈231719, ceiling=153430)"
+      },
+      {
+        "line": 37237,
+        "text": "[2026-09-30T12:00:14.875Z] [magic-context][ses_f0e1bf95dfferQqKEYxSArHrN0] emergency tiered drop: tiered drop: 3 tags, reclaim≈2494/5772 tokens (floor≈233256, ceiling=155368)"
+      },
+      {
+        "line": 37301,
+        "text": "[2026-09-30T12:00:21.723Z] [magic-context][ses_f0e1bf95dfferQqKEYxSArHrN0] emergency tiered drop: tiered drop: 1 tags, reclaim≈5840/9101 tokens (floor≈230271, ceiling=155591)"
+      },
+      {
+        "line": 37366,
+        "text": "[2026-09-30T12:00:28.535Z] [magic-context][ses_f0e1bf95dfferQqKEYxSArHrN0] emergency tiered drop: tiered drop: 2 tags, reclaim≈749/4021 tokens (floor≈235459, ceiling=155662)"
+      },
+      {
+        "line": 37740,
+        "text": "[2026-09-30T12:10:22.746Z] [magic-context][ses_f0e1bf95dfferQqKEYxSArHrN0] emergency tiered drop: tiered drop: 6 tags, reclaim≈1450/2838 tokens (floor≈235879, ceiling=155810)"
+      },
+      {
+        "line": 41471,
+        "text": "[2026-09-30T12:27:01.197Z] [magic-context][ses_f0e1bf95dfferQqKEYxSArHrN0] emergency tiered drop: tiered drop: 1 tags, reclaim≈1449/3290 tokens (floor≈235489, ceiling=155810)"
+      }
+    ],
+    "subNearFullUsageEvents": 60
+  },
+  "diagnosticsProof": {
+    "fixture": "7 synthetic success rows in isolated release-sub-98-small context.db",
+    "node": {
+      "historianRuns": []
+    },
+    "bun": {
+      "total": 7,
+      "success": 7
+    },
+    "note": "Runtime-reader proof, not fabricated reporter rows or live historian calls"
+  }
+}

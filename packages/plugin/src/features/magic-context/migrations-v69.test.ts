@@ -66,11 +66,19 @@ function makePreV65ReplayFixture(db: DatabaseType): void {
     // Start from the complete prior object set, then remove only the v65-v69
     // artifacts. This keeps the fixture compact while making every versioned
     // column and index flow through migrations rather than fresh declarations.
+    //
+    // Columns added AFTER v69 have to come out too, even though they are not
+    // v65-v69 artifacts: SQLite appends a new column at the end of the table, so
+    // leaving them in place would have the replay re-add the v65-v69 columns
+    // behind them and produce a different column ORDER than a fresh database for
+    // the same set of columns.
     db.exec(`
         ALTER TABLE memories DROP COLUMN mural_cue_rejection_count;
         ALTER TABLE memories DROP COLUMN mural_cue_at;
         ALTER TABLE memories DROP COLUMN mural_cue_hash;
         ALTER TABLE memories DROP COLUMN mural_cue;
+        ALTER TABLE session_meta DROP COLUMN coordinate_rebase_notice;
+        ALTER TABLE session_meta DROP COLUMN coordinate_generation;
         ALTER TABLE session_meta DROP COLUMN cached_m0_mural_hash;
         ALTER TABLE session_meta DROP COLUMN cached_m0_mural_data_url;
         ALTER TABLE session_meta DROP COLUMN upgrade_reminder_count;

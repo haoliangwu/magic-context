@@ -1,7 +1,13 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, expect, it } from "bun:test";
 import { TestHarness } from "../src/harness";
+import {
+    createFreshSession,
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 
 /**
  * Lifecycle tests that exercise the plugin's session bookkeeping:
@@ -16,34 +22,35 @@ import { TestHarness } from "../src/harness";
 
 const RUST_MODE = process.env.MC_E2E_MODE === "rust";
 
-let h: TestHarness;
+let h: ScenarioHarness;
 
 async function rustSessionStatus(
     sessionId: string,
 ): Promise<Record<string, unknown>> {
+    if (!(h instanceof TestHarness)) {
+        throw new Error("Rust lifecycle check requires the OpenCode 1 hermetic module stack");
+    }
     const stack = h.rustStack;
-    if (!stack)
-        throw new Error("Rust lifecycle check requires the hermetic module stack");
+    if (!stack) throw new Error("Rust lifecycle check requires the hermetic module stack");
     return stack.moduleStatus(
         sessionId,
-        h.opencode.env.workdir,
+        h.workdir,
         "session.status",
     );
 }
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            execute_threshold_percentage: 80,
-        },
+forEachHost(import.meta.url, "session lifecycle", (host) => {
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: {
+                execute_threshold_percentage: 80,
+            },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("session lifecycle", () => {
+    afterAll(async () => {
+        await h.dispose();
+    });
     it("tags and session_meta are scoped per session", async () => {
         h.mock.reset();
         h.mock.setDefault({
@@ -57,10 +64,10 @@ describe("session lifecycle", () => {
         });
 
         const a = await h.createSession();
-        const b = await h.createSession();
-
         await h.sendPrompt(a, "session A turn 1");
         await h.sendPrompt(a, "session A turn 2");
+
+        const b = await createFreshSession(h);
         await h.sendPrompt(b, "session B turn 1");
 
         // Each session gets its own tags and session_meta row. The plugin
@@ -99,7 +106,7 @@ describe("session lifecycle", () => {
                 },
             });
 
-            const sessionId = await h.createSession();
+            const sessionId = await createFreshSession(h);
             await h.sendPrompt(sessionId, "lifecycle turn 1");
             await h.sendPrompt(sessionId, "lifecycle turn 2");
 
@@ -115,13 +122,11 @@ describe("session lifecycle", () => {
                 .get(sessionId) as { n: number };
             expect(metaBefore.n).toBe(1);
 
-            // Delete the session through the SDK. Go direct via fetch so we
-            // don't need to add a delete signature to our SdkClient type.
-            const del = await fetch(
-                `${h.opencode.url}/session/${encodeURIComponent(sessionId)}`,
-                { method: "DELETE" },
-            );
-            expect(del.ok).toBe(true);
+            if (!h.capabilities.sessionRemove) {
+                expect(h.capabilities.sessionRemove).toBe(false);
+                return;
+            }
+            await h.removeSession(sessionId);
 
             // Plugin's session.deleted handler runs asynchronously; allow a
             // beat for the event to propagate.

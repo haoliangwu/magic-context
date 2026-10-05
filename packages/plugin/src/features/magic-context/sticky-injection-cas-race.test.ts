@@ -1,10 +1,11 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import {
@@ -24,7 +25,7 @@ function createRaceDb(path: string): Database {
 
 describe("sticky-injection CAS helpers", () => {
     it("two WAL handles append distinct note-nudge anchors without losing either", () => {
-        const dir = mkdtempSync(join(tmpdir(), "sticky-anchor-race-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "sticky-anchor-race-"));
         try {
             const path = join(dir, "context.db");
             const a = createRaceDb(path);
@@ -45,7 +46,7 @@ describe("sticky-injection CAS helpers", () => {
     });
 
     it("append plus prune keeps newly appended visible anchor", () => {
-        const dir = mkdtempSync(join(tmpdir(), "sticky-anchor-prune-race-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "sticky-anchor-prune-race-"));
         try {
             const path = join(dir, "context.db");
             const a = createRaceDb(path);
@@ -64,7 +65,7 @@ describe("sticky-injection CAS helpers", () => {
     });
 
     it("conflicting note-nudge delivery refuses second text for same message id", () => {
-        const dir = mkdtempSync(join(tmpdir(), "sticky-anchor-conflict-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "sticky-anchor-conflict-"));
         try {
             const path = join(dir, "context.db");
             const db = createRaceDb(path);
@@ -87,7 +88,7 @@ describe("sticky-injection CAS helpers", () => {
     });
 
     it("auto-search already-present outcome returns stored decision", () => {
-        const dir = mkdtempSync(join(tmpdir(), "sticky-auto-stored-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "sticky-auto-stored-"));
         try {
             const path = join(dir, "context.db");
             const db = createRaceDb(path);

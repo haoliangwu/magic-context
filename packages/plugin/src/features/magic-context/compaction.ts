@@ -14,7 +14,7 @@ export function createCompactionHandler(): CompactionHandler {
                 ).run(sessionId);
                 db.prepare("DELETE FROM pending_ops WHERE session_id = ?").run(sessionId);
                 updateSessionMeta(db, sessionId, { lastNudgeBand: null });
-            })();
+            }).immediate();
         },
     };
 }

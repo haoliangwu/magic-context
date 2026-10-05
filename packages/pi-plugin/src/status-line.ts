@@ -4,7 +4,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { resolvePiWindowGeometry } from "./pi-context-limit";
-import { resolvePiPressureSnapshot } from "./pi-pressure";
+import { resolvePiStatusPressureSnapshot } from "./pi-pressure";
 
 const STATUS_KEY = "magic-context";
 const RECENT_FAILURE_MS = 60_000;
@@ -99,8 +99,7 @@ export function renderStatusText(
 			: undefined;
 	const windowGeometry = resolvePiWindowGeometry({
 		rawContextWindow: usage?.contextWindow ?? ctx.model?.contextWindow,
-		rawContextWindowSource:
-			usage?.contextWindow === undefined ? "catalog" : "observed",
+		rawContextWindowSource: "catalog",
 		model: ctx.model,
 		detectedContextLimit:
 			typeof meta?.detected_context_limit === "number" &&
@@ -115,7 +114,8 @@ export function renderStatusText(
 	});
 	const pressure =
 		liveInputTokens !== undefined || persistedInputTokens !== undefined
-			? resolvePiPressureSnapshot({
+			? resolvePiStatusPressureSnapshot({
+					sessionId,
 					persistedPercentage: meta?.last_context_percentage ?? 0,
 					persistedInputTokens: persistedInputTokens ?? 0,
 					liveInputTokens,

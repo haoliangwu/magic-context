@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { projectPathToPiDirSlug } from "../commands/migrate";
 import { collectDiagnostics, sanitizeValue } from "./diagnostics-pi";
 
@@ -18,7 +19,7 @@ const originalCacheHome = process.env.XDG_CACHE_HOME;
 const originalConfigHome = process.env.XDG_CONFIG_HOME;
 
 function makeTempRoot(prefix = "mc-pi-diagnostics-"): string {
-    const root = mkdtempSync(join(tmpdir(), prefix));
+    const root = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempRoots.push(root);
     return root;
 }

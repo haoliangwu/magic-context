@@ -1,12 +1,14 @@
 import {
     acquireCompartmentLease,
     COMPARTMENT_LEASE_RENEWAL_MS,
+    getCompartmentLeaseBlocker,
     releaseCompartmentLease,
     releaseCompartmentLeaseBestEffort,
     renewCompartmentLease,
 } from "../../features/magic-context/compartment-lease";
 import { isWrapupInProgress, updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { sessionLog } from "../../shared/logger";
+import { withoutSqliteTransformPass } from "../../shared/sqlite";
 import { runCompartmentAgent } from "./compartment-runner-incremental";
 import {
     executePartialRecompInternal,
@@ -112,9 +114,17 @@ function startLeaseRenewal(
     }, COMPARTMENT_LEASE_RENEWAL_MS);
 }
 
+/** Historian work and its lease timers remain background work even when a pass starts them. */
 export function startCompartmentAgent(
     deps: HiddenCompartmentRunnerDeps,
     runAgent: typeof runCompartmentAgent = runCompartmentAgent,
+): void {
+    withoutSqliteTransformPass(() => startBackgroundCompartmentAgent(deps, runAgent));
+}
+
+function startBackgroundCompartmentAgent(
+    deps: HiddenCompartmentRunnerDeps,
+    runAgent: typeof runCompartmentAgent,
 ): void {
     // Intentional: this check-then-set is safe in Bun's single-threaded event loop.
     // The synchronous code between activeRuns.get() and activeRuns.set() cannot interleave,
@@ -136,9 +146,12 @@ export function startCompartmentAgent(
     const holderId = crypto.randomUUID();
     const lease = acquireCompartmentLease(deps.db, deps.sessionId, holderId);
     if (!lease) {
+        const blocker = getCompartmentLeaseBlocker(deps.db, deps.sessionId);
         sessionLog(
             deps.sessionId,
-            "compartment agent skipped: compartment lease held by another process",
+            blocker
+                ? `compartment agent skipped: compartment lease held by another process (holder=${blocker.holderId} pid=${blocker.ownerPid ?? "unknown"} expiresAt=${blocker.expiresAt})`
+                : "compartment agent skipped: compartment lease held by another process (owner unavailable after acquisition race)",
         );
         // The DB lease is the cross-process authority. If this process set the
         // start-intent flag but did not win the lease, no local run will clear it;

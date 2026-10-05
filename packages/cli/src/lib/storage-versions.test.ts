@@ -135,5 +135,12 @@ describe("checkStorageVersionFence", () => {
         expect(result.message).toContain("OpenCode server (PID 5736)");
         expect(result.message).toContain("an older Magic Context build");
         expect(result.message).toContain("shut it down and retry");
+        // Doctor states both versions and the fix for a host that loads an older build.
+        expect(result.message).toContain(
+            "The database is at upstream migration v73; this build needs v74.",
+        );
+        expect(result.message).toContain(
+            "stop it or update its Magic Context build, then start this host once",
+        );
     });
 });

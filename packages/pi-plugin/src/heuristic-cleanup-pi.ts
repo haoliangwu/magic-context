@@ -33,6 +33,7 @@
  */
 
 import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
+import { sessionDecisionCalibration } from "@magic-context/core/features/magic-context/session-decision-calibration";
 import {
 	type ContextDatabase,
 	getActiveTagsBySession,
@@ -43,12 +44,17 @@ import {
 import { getEmergencyInputSample } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import {
+	applyNewToolDrop,
+	hasSmallToolInput,
+} from "@magic-context/core/hooks/magic-context/apply-operations";
+import {
 	applyCavemanCleanup,
 	type CavemanCleanupConfig,
 } from "@magic-context/core/hooks/magic-context/caveman-cleanup";
 import type { DroppedTokenReduction } from "@magic-context/core/hooks/magic-context/dropped-token-estimate";
 import {
 	type EmergencyDropTag,
+	measureEmergencyTag,
 	planEmergencyDrop,
 } from "@magic-context/core/hooks/magic-context/emergency-drop";
 import { stripSystemInjection } from "@magic-context/core/hooks/magic-context/system-injection-stripper";
@@ -62,10 +68,21 @@ import { sessionLog } from "@magic-context/core/shared/logger";
  * are wasted context. Anything mutating (write/edit/bash/etc.) is
  * intentionally excluded because two identical calls may have
  * different semantics in different positions of the conversation.
+ * Pi names its built-in tools bare (`read`, `grep`), so the bare names
+ * are what match; the `mcp_` forms cover MCP servers using that prefix.
  */
 export const PI_CTX_REDUCE_KEEP = 3;
 
 const DEDUP_SAFE_TOOLS = new Set([
+	"grep",
+	"read",
+	"glob",
+	"ast_grep_search",
+	"lsp_diagnostics",
+	"lsp_symbols",
+	"lsp_find_references",
+	"lsp_goto_definition",
+	"lsp_prepare_rename",
 	"mcp_grep",
 	"mcp_read",
 	"mcp_glob",
@@ -88,6 +105,8 @@ export interface PiHeuristicCleanupConfig {
 	 * tags still replay through applyFlushedStatuses on every provider.
 	 */
 	staleReduceStripEnabled: boolean;
+	/** Reports actual new stale-arc edits, not dropped-status replay. */
+	onStaleReduceEdit?: (tag: TagEntry) => void;
 	/**
 	 * Tiered target-headroom emergency drop (Phase 2). Provided only on the
 	 * derived force-band materialize (cache-busting) pass; undefined on routine execute
@@ -98,6 +117,8 @@ export interface PiHeuristicCleanupConfig {
 		currentTotalInputTokens: number;
 		ceilingTokens: number;
 		usagePercentage?: number;
+		/** Another mutation already rewrites the cached prefix on this pass. */
+		passAlreadyPriced?: boolean;
 	};
 	/**
 	 * Age-tier caveman text compression settings. Caller is responsible
@@ -350,7 +371,7 @@ export function applyPiHeuristicCleanup(
 		// Plan ONLY over tags in the live window that would ACTUALLY reclaim
 		// bytes (canDrop, not mere drop() presence) — keeps the floor math equal
 		// to the on-wire tail and avoids phantom under-evict. Mirrors OpenCode.
-		const droppableTags = tags.filter(
+		const candidateTags = tags.filter(
 			(t) =>
 				t.status === "active" &&
 				t.type === "tool" &&
@@ -359,7 +380,34 @@ export function applyPiHeuristicCleanup(
 		// Floor accounting needs the FULL active live-window set (all types) —
 		// narrowing it to the droppable subset folds real conversation/
 		// reasoning tail into the "irreducible prefix" and under-evicts.
-		const activeTags = tags.filter((t) => t.status === "active");
+		const recentTags = new Set(
+			candidateTags
+				.slice()
+				.sort((a, b) => b.tagNumber - a.tagNumber)
+				.slice(0, 20)
+				.map((tag) => tag.tagNumber),
+		);
+		const calibration = sessionDecisionCalibration(db, sessionId);
+		const activeTags = tags
+			.filter((t) => t.status === "active")
+			.map((tag) =>
+				measureEmergencyTag(
+					tag,
+					targets.get(tag.tagNumber),
+					calibration,
+					targets.get(tag.tagNumber)?.requiresToolArcSkeleton === true ||
+						((emergency.usagePercentage ?? 0) < 95 &&
+							recentTags.has(tag.tagNumber) &&
+							hasSmallToolInput(targets.get(tag.tagNumber))),
+				),
+			);
+		const byTag = new Map(activeTags.map((tag) => [tag.tagNumber, tag]));
+		const droppableTags = candidateTags
+			.flatMap((tag) => {
+				const measured = byTag.get(tag.tagNumber);
+				return measured ? [measured] : [];
+			})
+			.filter((tag) => (tag.reclaimableTokens ?? 0) > 0);
 		sessionLog(
 			sessionId,
 			`emergency candidates: loaded=${tags.length} active=${activeTags.length} activeTools=${activeTags.filter((tag) => tag.type === "tool").length} visibleCompleteTools=${droppableTags.length} windowYields=${(emergency.usagePercentage ?? 0) >= 95} cutoff=${protectedCutoff}`,
@@ -374,16 +422,11 @@ export function applyPiHeuristicCleanup(
 			usagePercentage: emergency.usagePercentage,
 			priorInputSample,
 			hasPriorDrop: priorInputSample > 0,
+			passAlreadyPriced: emergency.passAlreadyPriced === true,
 		});
 		if (plan.shouldDrop) {
 			const toDrop = new Set(plan.tagNumbers);
-			const newestEmergencyTags = new Set(
-				droppableTags
-					.slice()
-					.sort((left, right) => right.tagNumber - left.tagNumber)
-					.slice(0, 20)
-					.map((tag) => tag.tagNumber),
-			);
+			const newestEmergencyTags = recentTags;
 			db.transaction(() => {
 				for (const tag of tags) {
 					if (!toDrop.has(tag.tagNumber)) continue;
@@ -393,28 +436,22 @@ export function applyPiHeuristicCleanup(
 						(emergency.usagePercentage ?? 0) < 95 &&
 						newestEmergencyTags.has(tag.tagNumber);
 					// Removing the result separator beside native reasoning lets Anthropic
-					// merge signed assistant turns, so this safety case always keeps the pair.
-					const reasoningSafeSkeleton =
-						target?.requiresToolArcSkeleton === true;
-					const skeleton = recent || reasoningSafeSkeleton;
-					const result = reasoningSafeSkeleton
-						? (target?.truncate?.() ?? "absent")
-						: recent
-							? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
-							: (target?.drop?.() ?? "absent");
+					// merge signed assistant turns, so this safety case always keeps the
+					// pair, with its real arguments.
+					const { result, mode } = applyNewToolDrop(target, {
+						inWindow: recent,
+						keepSkeleton: target?.requiresToolArcSkeleton === true,
+					});
 					if (result === "removed" || result === "truncated") {
+						// Persist the mode applied (including drop() keeping the
+						// call whose result ends the request) so replays match.
 						updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-						updateTagDropMode(
-							db,
-							sessionId,
-							tag.tagNumber,
-							skeleton ? "truncated" : "full",
-						);
+						updateTagDropMode(db, sessionId, tag.tagNumber, mode);
 						droppedTools++;
 						emergencyDroppedTools++;
 						droppedTokenReductions.push({
 							tagNumber: tag.tagNumber,
-							mode: skeleton ? "truncated" : "full",
+							mode: mode === "full" ? "full" : "truncated",
 						});
 					}
 				}
@@ -457,12 +494,14 @@ export function applyPiHeuristicCleanup(
 					: staleReduce.bareCallIds.has(tag.messageId);
 				if (!matched) continue;
 				const target = targets.get(tag.tagNumber);
-				const result = target?.drop?.() ?? "absent";
+				if (target?.canDrop?.() === false) continue;
+				const { result, mode } = applyNewToolDrop(target, { inWindow: false });
 				if (result === "incomplete") continue;
-				updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+				updateTagDropMode(db, sessionId, tag.tagNumber, mode);
 				updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 				if (result === "removed" || result === "truncated") {
 					droppedStaleReduceCalls++;
+					config.onStaleReduceEdit?.(tag);
 				}
 			}
 		}).immediate();
@@ -543,10 +582,13 @@ export function applyPiHeuristicCleanup(
 			}
 		}
 
+		// Protected tags join their group so a protected newest copy still anchors
+		// it; they are never dropped themselves (below). Leaving them out kept one
+		// unprotected copy alive beside the protected one.
 		const fingerprintGroups = new Map<string, TagEntry[]>();
 		for (const [compositeKey, fingerprint] of toolFingerprints) {
 			const tag = tagsByCompositeKey.get(compositeKey);
-			if (!tag || tag.tagNumber > protectedCutoff) continue;
+			if (!tag) continue;
 			const group = fingerprintGroups.get(fingerprint) ?? [];
 			group.push(tag);
 			fingerprintGroups.set(fingerprint, group);
@@ -559,17 +601,22 @@ export function applyPiHeuristicCleanup(
 				// Keep the newest, drop the rest.
 				for (let i = 0; i < group.length - 1; i++) {
 					const tag = group[i];
+					if (tag.tagNumber > protectedCutoff) continue;
 					const target = targets.get(tag.tagNumber);
-					// Deduplication stays full-drop; only emergency recent arcs keep skeletons.
-					const result = target?.drop?.() ?? "absent";
+					if (target?.canDrop?.() === false) continue;
+					// Deduplication stays full-drop; only emergency recent arcs keep
+					// skeletons. A call that cannot be removed keeps real arguments.
+					const { result, mode } = applyNewToolDrop(target, {
+						inWindow: false,
+					});
 					if (result === "incomplete") continue;
-					updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+					updateTagDropMode(db, sessionId, tag.tagNumber, mode);
 					updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
 					if (result === "removed" || result === "truncated") {
 						deduplicatedTools++;
 						droppedTokenReductions.push({
 							tagNumber: tag.tagNumber,
-							mode: "full",
+							mode: mode === "full" ? "full" : "truncated",
 						});
 					}
 				}
@@ -593,11 +640,23 @@ export function applyPiHeuristicCleanup(
 	let compressedTextTags = 0;
 	let mutatedTextTags = 0;
 	if (routine && config.caveman?.enabled) {
-		const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
-			enabled: true,
-			minChars: config.caveman.minChars,
-			protectedCutoff,
-		});
+		// System-injection cleanup above drops tags but keeps their pristine source.
+		// Reload active rows so compression skips tags dropped during this request.
+		// Otherwise compression restores a dropped injection now, and the persisted
+		// drop takes effect only on the next request, causing a second cache rebuild.
+		const cavemanTags = getActiveTagsBySession(db, sessionId);
+		const cavemanResult = applyCavemanCleanup(
+			sessionId,
+			db,
+			targets,
+			cavemanTags,
+			{
+				enabled: true,
+				minChars: config.caveman.minChars,
+				wordRules: config.caveman.wordRules,
+				protectedCutoff,
+			},
+		);
 		compressedTextTags =
 			cavemanResult.compressedToLite +
 			cavemanResult.compressedToFull +

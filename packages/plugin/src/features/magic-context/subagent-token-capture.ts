@@ -86,6 +86,26 @@ function modelFromMessage(message: Record<string, unknown>): LastAssistantModel 
     };
 }
 
+export function failedInvocationStatus(error: unknown): SubagentInvocationStatus {
+    const message = describeError(error).brief;
+    if (/timed out after \d+ms|prompt timed out/i.test(message)) return "timed_out";
+    // A host client's request timer (Bun's fetch rejects with a DOMException named
+    // TimeoutError) ends the prompt the same way our own slice expiry does.
+    if (
+        error !== null &&
+        typeof error === "object" &&
+        (error as { name?: unknown }).name === "TimeoutError"
+    ) {
+        return "timed_out";
+    }
+    if (
+        /length-capped|no (?:assistant )?output|empty (?:assistant )?(?:output|text)/i.test(message)
+    ) {
+        return "empty";
+    }
+    return "failed";
+}
+
 export function emptyTokenTotals(): TokenTotals {
     return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 }

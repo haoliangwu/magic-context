@@ -9,7 +9,7 @@ import type { Memory } from "../memory/types";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { ensureMuralRendered, muralCoverageGate } from "./render-trigger";
-import { resolveMural } from "./resolve-mural";
+import { getMuralCoverage, readMuralPool, resolveMural } from "./resolve-mural";
 import { getMural } from "./storage-mural";
 import { computeCueContentHash, setMuralCue } from "./storage-mural-cues";
 
@@ -46,6 +46,41 @@ function seedCuedMemory(
 }
 
 describe("resolveMural", () => {
+    test("a shared refresh pool preserves coverage and ordered entries including blank and stale cues", () => {
+        const db = freshDb();
+        try {
+            const project = "git:shared-pool";
+            for (let i = 0; i < 25; i++) {
+                const memory = seedCuedMemory(
+                    db,
+                    project,
+                    i % 2 ? "CONSTRAINTS" : "ARCHITECTURE",
+                    `fact ${i}`,
+                    i,
+                );
+                if (i === 1)
+                    setMuralCue(db, project, memory.id, " ", computeCueContentHash(memory.content));
+                if (i === 2)
+                    setMuralCue(
+                        db,
+                        project,
+                        memory.id,
+                        "stale",
+                        computeCueContentHash("old content"),
+                    );
+            }
+            const pool = readMuralPool(db, project);
+            expect(getMuralCoverage(db, project, pool)).toEqual(getMuralCoverage(db, project));
+            expect(resolveMural(db, project, 1, pool)).toEqual(resolveMural(db, project, 1));
+            const before = getMuralCoverage(db, project, pool).cuedMemoryCount;
+            const edited = pool.memories.find((memory) => memory.content === "fact 3");
+            if (!edited) throw new Error("Missing hash-current fixture memory");
+            edited.content = "edited snapshot content";
+            expect(getMuralCoverage(db, project, pool).cuedMemoryCount).toBe(before - 1);
+        } finally {
+            db.close();
+        }
+    });
     test("selects only the overflow complement of the budget trim", () => {
         const db = freshDb();
         try {

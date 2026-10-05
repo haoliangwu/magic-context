@@ -33,22 +33,14 @@ export const DREAMER_MEMORY_MAPPER_ALLOWED_TOOLS = [
 // needs no tools at all. Locked so a user override can't grant any.
 export const DREAMER_CLASSIFIER_AGENT = "dreamer-classifier";
 
-// Docs maintainer for the maintain-docs task: explores the codebase and writes
-// ARCHITECTURE.md / STRUCTURE.md. Needs file read + write/edit + bash (git log,
-// find) + aft navigation, but deliberately NO ctx_memory/ctx_search/ctx_note —
-// it touches docs, never the memory store. Locked so a user override can't add
-// the memory surface back.
+// Docs proposal investigator: read-only source tools; the host validates its final text.
 export const DREAMER_DOCS_AGENT = "dreamer-docs";
 
-/** Codebase-read + doc-write tool profile for the docs maintainer. No memory
- *  tools (it edits docs, not the memory store). */
+/** Read-only source investigation for docs proposals. */
 export const DREAMER_DOCS_ALLOWED_TOOLS = [
     "read",
     "grep",
     "glob",
-    "bash",
-    "write",
-    "edit",
     "aft_outline",
     "aft_zoom",
     "aft_search",
@@ -59,10 +51,7 @@ export const DREAMER_DOCS_ALLOWED_TOOLS = [
 // calls NO tools (zero), so it gets the empty allow-list, locked.
 export const DREAMER_REVIEWER_AGENT = "dreamer-reviewer";
 
-/** Tool profile for the base `dreamer` agent, now CURATE-ONLY (memory-pool
- *  hygiene). Curate edits the memory store through ctx_memory and never reads
- *  code (a separate verify task owns memory-vs-code correctness), so it needs
- *  only ctx_memory — not the former bash/write/edit/read/aft/ctx_search/ctx_note
- *  kitchen sink. Kept on the `dreamer` id so the ctx_memory dreamer-action gate
- *  (toolContext.agent === DREAMER_AGENT) still recognizes it. */
+/** Curate receives its category snapshot from the host and edits memories via
+ *  ctx_memory. It does not read code; the verify task checks memory accuracy.
+ *  Keep the `dreamer` id because memory-tool authorization matches that id. */
 export const DREAMER_CURATE_ALLOWED_TOOLS = ["ctx_memory"] as const;

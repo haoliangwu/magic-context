@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { acquireCompartmentLease } from "./compartment-lease";
@@ -10,6 +10,7 @@ import {
     promoteRecompStaging,
     replaceAllCompartmentState,
     replaceAllCompartmentStateAndBumpDepth,
+    replaceAllCompartments,
     saveRecompStagingPass,
 } from "./compartment-storage";
 import {
@@ -35,6 +36,63 @@ const compartment = (sequence: number, start: number, end: number, title = `c${s
 });
 
 describe("atomic compartment state publish", () => {
+    it("compartment projection preserves rejection of legacy rows missing required coordinates", () => {
+        const db = new Database(":memory:");
+        try {
+            db.exec(
+                "CREATE TABLE compartments(id INTEGER, session_id TEXT, sequence INTEGER, start_message INTEGER, end_message INTEGER, title TEXT, content TEXT, created_at INTEGER)",
+            );
+            db.exec("INSERT INTO compartments VALUES (1, 'old', 0, 1, 2, 'legacy', 'summary', 0)");
+            expect(getCompartments(db, "old")).toEqual([]);
+        } finally {
+            db.close();
+        }
+    });
+    it("compartment projection omits retired blobs without changing rendered fields", () => {
+        const db = makeDb();
+        try {
+            replaceAllCompartments(db, "projection", [
+                {
+                    ...compartment(1, 3, 4),
+                    p1: "full",
+                    p2: "short",
+                    importance: 75,
+                    episodeType: "coding",
+                    endBlockIndex: 2,
+                },
+                compartment(0, 1, 2),
+            ]);
+            const before = getCompartments(db, "projection");
+            db.prepare(
+                "UPDATE compartments SET p1_embedding = ?, p1_embedding_model_id = 'retired' WHERE session_id = 'projection'",
+            ).run(Buffer.alloc(128 * 1024));
+            const prepare = db.prepare.bind(db);
+            let projected: Record<string, unknown>[] = [];
+            const spy = spyOn(db, "prepare").mockImplementation((sql: string) => {
+                const statement = prepare(sql);
+                if (sql.startsWith("SELECT") && sql.includes("FROM compartments")) {
+                    const all = statement.all.bind(statement);
+                    spyOn(statement, "all").mockImplementation((...args: unknown[]) => {
+                        const rows = all(...args) as Record<string, unknown>[];
+                        projected = rows;
+                        return rows;
+                    });
+                }
+                return statement;
+            });
+            try {
+                expect(getCompartments(db, "projection")).toEqual(before);
+                expect(projected).toHaveLength(2);
+                expect(projected.every((row) => !("p1_embedding" in row))).toBe(true);
+                expect(projected.every((row) => !("p1_embedding_model_id" in row))).toBe(true);
+            } finally {
+                spy.mockRestore();
+            }
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     it("replaces compartments/facts and bumps the selected depth range atomically", () => {
         const db = makeDb();
         const sessionId = "ses-atomic";
@@ -134,4 +192,63 @@ describe("atomic compartment state publish", () => {
         expect(getCompartments(db, sessionId).map((c) => c.title)).toEqual(["new"]);
         closeQuietly(db);
     });
+});
+
+it("logs every compartment replacement atomically without marking an initial insert", () => {
+    for (const kind of ["rows", "state", "depth", "staging", "leased-staging"] as const) {
+        const db = makeDb();
+        const sessionId = `mutation-${kind}`;
+        try {
+            const head = () =>
+                (
+                    db
+                        .prepare(
+                            "SELECT COUNT(*) AS count FROM m0_mutation_log WHERE session_id = ?",
+                        )
+                        .get(sessionId) as { count: number }
+                ).count;
+            replaceAllCompartmentState(db, sessionId, [compartment(0, 1, 2, "old")], []);
+            expect(head()).toBe(0);
+            expect(acquireCompartmentLease(db, sessionId, "holder")).not.toBeNull();
+            const replace = () => {
+                const rows = [compartment(0, 1, 3, "new")];
+                if (kind === "rows") replaceAllCompartments(db, sessionId, rows);
+                else if (kind === "state") replaceAllCompartmentState(db, sessionId, rows, []);
+                else if (kind === "depth")
+                    expect(
+                        replaceAllCompartmentStateAndBumpDepth(
+                            db,
+                            "holder",
+                            sessionId,
+                            rows,
+                            [],
+                            1,
+                            3,
+                        ),
+                    ).toBe(true);
+                else {
+                    saveRecompStagingPass(db, sessionId, 1, rows, []);
+                    expect(
+                        promoteRecompStaging(
+                            db,
+                            sessionId,
+                            kind === "leased-staging" ? "holder" : undefined,
+                        ),
+                    ).not.toBeNull();
+                }
+            };
+            db.exec(
+                "CREATE TRIGGER reject_mutation BEFORE INSERT ON m0_mutation_log BEGIN SELECT RAISE(ABORT, 'mutation rejected'); END",
+            );
+            expect(replace).toThrow("mutation rejected");
+            expect(getCompartments(db, sessionId).map((row) => row.title)).toEqual(["old"]);
+            expect(head()).toBe(0);
+            db.exec("DROP TRIGGER reject_mutation");
+            replace();
+            expect(getCompartments(db, sessionId).map((row) => row.title)).toEqual(["new"]);
+            expect(head()).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    }
 });

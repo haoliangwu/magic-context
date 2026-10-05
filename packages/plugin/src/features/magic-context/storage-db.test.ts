@@ -1,12 +1,12 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import {
     type chmodSync,
     existsSync,
     mkdirSync,
-    mkdtempSync,
+    readdirSync,
     readFileSync,
     rmSync,
     statSync,
@@ -15,13 +15,19 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { __resetRpcIdentityTestHooks, __setRpcIdentityTestHooks } from "../../shared/rpc-utils";
+import {
+    __resetRpcIdentityTestHooks,
+    __setRpcIdentityTestHooks,
+    type AsyncProcessInspection,
+    inspectWindowsProcessesSync,
+} from "../../shared/rpc-utils";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import {
     __resetStoragePrivatePermissionEnforcementForTests,
     setStoragePrivatePermissionEnforcement,
 } from "../../shared/storage-permissions";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     __resetRpcDiscoveryFsForTests,
     __resetSchemaFenceStateForTests,
@@ -39,11 +45,14 @@ import {
     getMigrationOnOpenRefusal,
     getPersistedSchemaVersion,
     getSchemaFenceRejection,
+    initializeDatabase,
     inspectRpcServerDiscovery,
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     openDatabase,
     openDatabaseAsync,
+    pruneEmptyRpcDiscoveryDirs,
+    removeRpcDiscoveryRecords,
     resolveDatabasePath,
 } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
@@ -56,7 +65,7 @@ const originalNodeEnv = process.env.NODE_ENV;
 const originalTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -79,6 +88,7 @@ function seedPendingMigration(dataHome: string): string {
     const dbPath = resolveDbPath(dataHome);
     const db = new Database(dbPath);
     db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(LATEST_SUPPORTED_VERSION);
+    db.exec("DROP TABLE single_store_state");
     closeQuietly(db);
     return dbPath;
 }
@@ -265,13 +275,13 @@ describe("explicit shared storage resolution", () => {
         holder.exec("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE");
         const startedAt = performance.now();
         try {
-            const opened = await openDatabaseAsync({ dbPath, busyTimeoutMs: 35 });
+            // A genuinely held exclusive lock prevents the schema read. Bound
+            // the fail-closed rejection, not a successful read through a lost lock.
+            await expect(openDatabaseAsync({ dbPath, busyTimeoutMs: 35 })).rejects.toThrow(
+                "storage unavailable: database is locked",
+            );
             const elapsedMs = performance.now() - startedAt;
             expect(elapsedMs).toBeLessThan(1_000);
-            if (opened) {
-                const timeout = opened.prepare("PRAGMA busy_timeout").get() as { timeout: number };
-                expect(timeout.timeout).toBe(35);
-            }
         } finally {
             holder.exec("ROLLBACK");
             closeQuietly(holder);
@@ -302,15 +312,31 @@ describe("explicit shared storage resolution", () => {
         const override = makeTempDir("storage-db-explicit-");
         process.env.MAGIC_CONTEXT_TEST_DATA_DIR = "";
         process.env.NODE_ENV = "development";
+        process.env.XDG_DATA_HOME = override;
         process.env.MAGIC_CONTEXT_STORAGE_DIR = join(override, "shared");
         __setRpcDiscoveryFsForTests({
             readdirSync: (_path, options) => (options?.withFileTypes ? [] : []),
         });
+        const processListProbeCalls: string[] = [];
         __setRpcIdentityTestHooks({
-            processListExecFileSync: (() => "") as typeof execFileSync,
+            processListExecFileSync: ((file: unknown, args?: readonly unknown[]) => {
+                processListProbeCalls.push([String(file), ...(args ?? []).map(String)].join(" "));
+                return "";
+            }) as typeof execFileSync,
         });
-        const db = openDatabase();
+
+        const db = openDatabase({ busyTimeoutMs: 0 });
+
         expect(db).not.toBeNull();
+        expect(openDatabase({ busyTimeoutMs: 0 })).toBe(db);
+        expect(processListProbeCalls).toHaveLength(3);
+        expect(processListProbeCalls[0]).toBe("ps -axo pid=,command=");
+        expect(processListProbeCalls.slice(1)).toHaveLength(2);
+        expect(
+            processListProbeCalls.slice(1).every((call) => /^ps -o ppid= -p \d+$/.test(call)),
+        ).toBe(true);
+        const timeout = db!.prepare("PRAGMA busy_timeout").get() as { timeout: number };
+        expect(timeout.timeout).toBe(0);
         const dbPath = join(override, "shared", "context.db");
         expect(existsSync(dbPath)).toBe(true);
         expect(statSync(join(override, "shared")).mode & 0o777).toBe(0o700);
@@ -528,8 +554,14 @@ describe("storage-db", () => {
                     return "seed";
                 });
                 const placeholders = insertedColumns.map(() => "?").join(", ");
+                // A seeded tag or compartment may already have created this row through
+                // its version trigger.
+                const insertVerb =
+                    table === "session_meta" || table === "compartment_history_versions"
+                        ? "INSERT OR IGNORE"
+                        : "INSERT";
                 db.prepare(
-                    `INSERT INTO ${table} (${insertedColumns.map((column) => column.name).join(", ")}) VALUES (${placeholders})`,
+                    `${insertVerb} INTO ${table} (${insertedColumns.map((column) => column.name).join(", ")}) VALUES (${placeholders})`,
                 ).run(...values);
                 expect(
                     db
@@ -1195,6 +1227,58 @@ describe("storage-db", () => {
             );
         });
 
+        it("#when an existing session_meta predates tags_version #then the schema bootstrap heals it before any migration runs", () => {
+            const dataHome = useTempDataHome("storage-db-legacy-tags-version-");
+            const dbPath = resolveDbPath(dataHome);
+            mkdirSync(join(dataHome, "cortexkit", "magic-context"), {
+                recursive: true,
+            });
+            const legacyDb = new Database(dbPath);
+            legacyDb.run(`
+        CREATE TABLE session_meta (
+          session_id TEXT PRIMARY KEY,
+          last_response_time INTEGER,
+          cache_ttl TEXT,
+          counter INTEGER DEFAULT 0,
+          last_nudge_tokens INTEGER DEFAULT 0,
+          last_nudge_band TEXT DEFAULT '',
+          last_transform_error TEXT DEFAULT '',
+          is_subagent INTEGER DEFAULT 0,
+          last_context_percentage REAL DEFAULT 0,
+          last_input_tokens INTEGER DEFAULT 0,
+          observed_safe_input_tokens INTEGER NOT NULL DEFAULT 0,
+          cache_alert_sent INTEGER NOT NULL DEFAULT 0,
+          times_execute_threshold_reached INTEGER DEFAULT 0,
+          cleared_reasoning_through_tag INTEGER DEFAULT 0,
+          harness TEXT NOT NULL DEFAULT 'opencode'
+        );
+      `);
+            closeQuietly(legacyDb);
+
+            // Only the schema bootstrap, no migration runner: the tag triggers are
+            // created here and the migration that adds tags_version runs much later,
+            // so this is the window where a legacy database carries a trigger whose
+            // body names a column that does not exist. SQLite resolves a trigger body
+            // when the trigger fires AND whenever it reparses the whole schema, which
+            // every ALTER TABLE ... RENAME does — so an uncompilable trigger here also
+            // broke the embedding-table rebuild in the middle of the migration chain,
+            // leaving memory_embeddings dropped and unrecoverable.
+            const db = new Database(dbPath);
+            try {
+                initializeDatabase(db);
+                db.prepare(
+                    "INSERT INTO tags (session_id, message_id, type, tag_number) VALUES (?, ?, ?, ?)",
+                ).run("legacy-tags-version", "msg-1", "message", 1);
+                expect(
+                    db
+                        .prepare("SELECT tags_version FROM session_meta WHERE session_id = ?")
+                        .get("legacy-tags-version"),
+                ).toEqual({ tags_version: 1 });
+            } finally {
+                closeQuietly(db);
+            }
+        });
+
         it("#when an existing memory_embeddings table lacks model_id #then openDatabase adds the missing column", () => {
             const dataHome = useTempDataHome("storage-db-migrate-embedding-model-");
             const dbPath = resolveDbPath(dataHome);
@@ -1321,5 +1405,247 @@ describe("storage-db", () => {
                 expect(body.includes("test-preload.ts")).toBe(true);
             }
         });
+    });
+});
+
+it("checks 500 dead RPC PIDs with one Windows snapshot and prunes only dead records", () => {
+    const storage = makeTempDir("mc-rpc-snapshot-");
+    const rpc = join(storage, "rpc", "project");
+    mkdirSync(rpc, { recursive: true });
+    for (let pid = 100000; pid < 100500; pid++) {
+        writeFileSync(
+            join(rpc, `port-${pid}.json`),
+            JSON.stringify({ pid, port: 43123, started_at: 0 }),
+        );
+    }
+    const live = 100501;
+    const liveFile = join(rpc, `port-${live}.json`);
+    writeFileSync(liveFile, JSON.stringify({ pid: live, port: 43123, started_at: 0 }));
+    let calls = 0;
+    __setRpcIdentityTestHooks({
+        platform: "win32",
+        processListExecFileSync: (() => {
+            calls++;
+            return JSON.stringify([
+                {
+                    ProcessId: live,
+                    ParentProcessId: 0,
+                    Name: "opencode.exe",
+                    CommandLine: "opencode serve",
+                    CreationDate: null,
+                },
+            ]);
+        }) as typeof execFileSync,
+    });
+    const result = inspectRpcServerDiscovery(storage, inspectWindowsProcessesSync());
+    expect(calls).toBe(1);
+    expect(result.staleFiles).toHaveLength(500);
+    expect(existsSync(join(rpc, "port-100000.json"))).toBe(false);
+    expect(existsSync(liveFile)).toBe(true);
+    expect(result.serverPids).toEqual([live]);
+});
+
+it("RPC holder inspection reports slow progress and refuses after its deadline", () => {
+    const storage = makeTempDir("mc-rpc-deadline-");
+    const rpc = join(storage, "rpc", "project");
+    mkdirSync(rpc, { recursive: true });
+    writeFileSync(
+        join(rpc, "port-100000.json"),
+        JSON.stringify({ pid: 100000, port: 43123, started_at: 0 }),
+    );
+    const processes = {
+        pi: { state: "known" as const, processIds: [] },
+        liveness: () => "inconclusive" as const,
+        evidence: () => ({ startTime: null, commandLine: null }),
+    };
+    const cliOptions = (onProgress: (checked: number, total: number) => void) => ({
+        deadlineMs: 15_000,
+        onProgress,
+    });
+    const progress: string[] = [];
+    let ticks = 0;
+    const clock = spyOn(Date, "now").mockImplementation(() => (++ticks <= 2 ? 0 : 4000));
+    try {
+        expect(
+            inspectRpcServerDiscovery(
+                storage,
+                processes,
+                cliOptions((checked, total) => progress.push(`${checked}/${total}`)),
+            ).state,
+        ).toBe("inconclusive");
+        expect(progress).toEqual(["0/1"]);
+        ticks = 0;
+        clock.mockImplementation(() => (++ticks <= 2 ? 0 : 16000));
+        expect(() =>
+            inspectRpcServerDiscovery(
+                storage,
+                processes,
+                cliOptions(() => {}),
+            ),
+        ).toThrow("timed out after 15 seconds");
+        expect(existsSync(join(rpc, "port-100000.json"))).toBe(true);
+        // Plugin hosts pass no options: a slow scan neither reports nor gives up.
+        ticks = 0;
+        expect(inspectRpcServerDiscovery(storage, processes).state).toBe("inconclusive");
+    } finally {
+        clock.mockRestore();
+    }
+});
+
+describe("RPC discovery records whose PIDs were reused", () => {
+    const RECORDED = Date.parse("2026-07-22T02:50:42Z");
+    const LATER = Date.parse("2026-09-28T16:53:00Z");
+
+    interface FakeProcess {
+        startTime: number | null;
+        imageName: string;
+    }
+
+    /** A Windows CIM snapshot in which every listed PID is alive. */
+    function cimProcesses(byPid: Record<number, FakeProcess>): AsyncProcessInspection {
+        const facts = Object.entries(byPid).map(([pid, fact]) => ({
+            pid: Number(pid),
+            imageName: fact.imageName,
+            commandLine: null,
+        }));
+        return {
+            pi: { state: "known", processIds: [] },
+            processSnapshot: { source: "cim", facts },
+            liveness: (pid) => (byPid[pid] ? "alive" : "dead"),
+            evidence: (pid) => ({
+                startTime: byPid[pid]?.startTime ?? null,
+                commandLine: byPid[pid]?.imageName ?? null,
+                ...(byPid[pid] ? { imageName: byPid[pid].imageName } : {}),
+            }),
+        };
+    }
+
+    function writeRecord(storage: string, project: string, pid: number, startedAt: number): string {
+        const dir = join(storage, "rpc", project);
+        mkdirSync(dir, { recursive: true });
+        const file = join(dir, `port-${pid}.json`);
+        writeFileSync(file, JSON.stringify({ port: 54209, pid, started_at: startedAt }));
+        return file;
+    }
+
+    /** Backdate every project directory by an hour, past the pruning age limit. */
+    function ageDirs(storage: string): void {
+        const hourAgo = new Date(Date.now() - 60 * 60 * 1000);
+        const rpc = join(storage, "rpc");
+        for (const name of readdirSync(rpc)) utimesSync(join(rpc, name), hourAgo, hourAgo);
+    }
+    it("removes a record whose live PID started after the record was written", () => {
+        const storage = makeTempDir("mc-rpc-recycled-");
+        const file = writeRecord(storage, "a", 17856, RECORDED);
+        const result = inspectRpcServerDiscovery(
+            storage,
+            cimProcesses({ 17856: { startTime: LATER, imageName: "Cherry Studio.exe" } }),
+        );
+        expect(result.state).toBe("stale");
+        expect(result.staleFiles).toEqual([file]);
+        expect(existsSync(file)).toBe(false);
+    });
+
+    it("keeps a genuine host whose process started at or before its record", () => {
+        const storage = makeTempDir("mc-rpc-genuine-");
+        const file = writeRecord(storage, "a", 13620, RECORDED);
+        const result = inspectRpcServerDiscovery(
+            storage,
+            cimProcesses({ 13620: { startTime: RECORDED - 13_000, imageName: "opencode.exe" } }),
+        );
+        expect(result.state).toBe("live");
+        expect(result.serverPids).toEqual([13620]);
+        expect(existsSync(file)).toBe(true);
+    });
+
+    it("removes a record whose start time is unreadable when the image cannot be a host", () => {
+        const storage = makeTempDir("mc-rpc-svchost-");
+        const file = writeRecord(storage, "a", 3128, RECORDED);
+        const result = inspectRpcServerDiscovery(
+            storage,
+            cimProcesses({ 3128: { startTime: null, imageName: "svchost.exe" } }),
+        );
+        expect(result.state).toBe("stale");
+        expect(existsSync(file)).toBe(false);
+    });
+
+    it("keeps and reports a record whose start time is unreadable when the image could be a host", () => {
+        const storage = makeTempDir("mc-rpc-hostlike-");
+        const file = writeRecord(storage, "a", 7036, RECORDED);
+        const result = inspectRpcServerDiscovery(
+            storage,
+            cimProcesses({ 7036: { startTime: null, imageName: "node.exe" } }),
+        );
+        expect(result.state).toBe("inconclusive");
+        expect(result.inconclusivePids).toEqual([7036]);
+        expect(result.inconclusiveRecords).toEqual([
+            {
+                file,
+                pid: 7036,
+                recordedStartedAt: RECORDED,
+                processStartTime: null,
+                imageName: "node.exe",
+                commandLine: "node.exe",
+                liveness: "alive",
+            },
+        ]);
+        expect(existsSync(file)).toBe(true);
+    });
+
+    it("removes a record whose PID is dead", () => {
+        const storage = makeTempDir("mc-rpc-dead-");
+        const file = writeRecord(storage, "a", 26532, RECORDED);
+        const result = inspectRpcServerDiscovery(storage, cimProcesses({}));
+        expect(result.state).toBe("stale");
+        expect(existsSync(file)).toBe(false);
+    });
+
+    it("leaves empty project directories in place during inspection", () => {
+        // Inspection runs on every storage open; a host may be between creating
+        // its directory and writing its record, so directories are never removed here.
+        const storage = makeTempDir("mc-rpc-empty-dirs-");
+        mkdirSync(join(storage, "rpc", "empty-before"), { recursive: true });
+        writeRecord(storage, "emptied", 26532, RECORDED);
+        const kept = writeRecord(storage, "kept", 7036, RECORDED);
+        ageDirs(storage);
+        inspectRpcServerDiscovery(
+            storage,
+            cimProcesses({ 7036: { startTime: null, imageName: "node.exe" } }),
+        );
+        expect(existsSync(join(storage, "rpc", "empty-before"))).toBe(true);
+        expect(existsSync(join(storage, "rpc", "emptied"))).toBe(true);
+        expect(existsSync(kept)).toBe(true);
+
+        const bare = makeTempDir("mc-rpc-only-empty-");
+        mkdirSync(join(bare, "rpc", "x"), { recursive: true });
+        ageDirs(bare);
+        expect(inspectRpcServerDiscovery(bare, cimProcesses({})).state).toBe("absent");
+        expect(existsSync(join(bare, "rpc", "x"))).toBe(true);
+    });
+
+    it("prunes only empty project directories untouched for at least a minute", () => {
+        const storage = makeTempDir("mc-rpc-prune-dirs-");
+        mkdirSync(join(storage, "rpc", "old-empty"), { recursive: true });
+        const kept = writeRecord(storage, "old-with-record", 7036, RECORDED);
+        ageDirs(storage);
+        // Created now: a host may be about to write its record into it.
+        mkdirSync(join(storage, "rpc", "fresh-empty"), { recursive: true });
+
+        expect(pruneEmptyRpcDiscoveryDirs(storage)).toEqual([join(storage, "rpc", "old-empty")]);
+        expect(existsSync(join(storage, "rpc", "old-empty"))).toBe(false);
+        expect(existsSync(join(storage, "rpc", "fresh-empty"))).toBe(true);
+        expect(existsSync(kept)).toBe(true);
+    });
+
+    it("removes chosen records and refuses paths outside the discovery tree", () => {
+        const storage = makeTempDir("mc-rpc-remove-");
+        const record = writeRecord(storage, "a", 7036, RECORDED);
+        const outside = join(storage, "context.db");
+        writeFileSync(outside, "");
+        const result = removeRpcDiscoveryRecords(storage, [record, outside]);
+        expect(result.removed).toEqual([record]);
+        expect(result.failed).toEqual([{ file: outside, error: "not an RPC discovery record" }]);
+        expect(existsSync(outside)).toBe(true);
+        expect(existsSync(record)).toBe(false);
     });
 });

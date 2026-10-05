@@ -235,7 +235,6 @@ Gjenkalling fungerer **på tvers av økter** (en ny økt arver alt) og **på tve
 | `/ctx-status` | Debug-visning: tags, pending drops, cache TTL, nudge-tilstand, historian-fremdrift, kompartementdekning, historikkbudsjett |
 | `/ctx-flush` | Tving alle køede operasjoner umiddelbart, forbi cache TTL |
 | `/ctx-recomp` | Bygg kompartementer på nytt fra rå historikk (aksepterer et `start-end`-område). Bruk når lagret tilstand virker feil |
-| `/ctx-session-upgrade` | Oppgrader denne økten til nyeste historikkformat: bygg kompartementer på nytt og migrer prosjektminner |
 | `/ctx-dream` | Kjør dreamer-vedlikehold på forespørsel: vedlikehold minne, docs, smart notes og user-profile review |
 
 ---

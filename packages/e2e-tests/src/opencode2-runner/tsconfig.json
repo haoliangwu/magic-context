@@ -8,7 +8,10 @@
 		"noEmit": true,
 		"esModuleInterop": true,
 		"resolveJsonModule": true,
-		"types": ["bun-types", "../../../plugin/node_modules/@types/node"]
+		"types": ["bun-types", "../../../plugin/node_modules/@types/node"],
+		"paths": {
+			"@magic-context/core/*": ["../../../plugin/src/*"]
+		}
 	},
 	"include": [
 		"*.ts",

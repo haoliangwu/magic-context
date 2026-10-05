@@ -1,6 +1,6 @@
 {
 	"name": "@cortexkit/pi-magic-context",
-	"version": "0.42.6",
+	"version": "0.45.0",
 	"type": "module",
 	"description": "Pi and OMP coding agent extension for Magic Context — cross-session memory and context management",
 	"main": "dist/index.js",
@@ -27,9 +27,10 @@
 		"dist",
 		"README.md"
 	],
+	"//": "The build intentionally bundles typebox (no --external typebox) and keeps it a regular dependency. OMP's extension loader rewrites every bare `typebox` import to its own omptype-based shim, whose schemas are callable objects rather than JSON Schema; they fail structuredClone during tool registration, so an external typebox import stops Magic Context loading on OMP. src/typebox-bundling.test.ts guards this.",
 	"scripts": {
-		"build": "bun ../../scripts/check-bun.mjs && tsc -p ../retina-local-fs/tsconfig.build.json && rm -f dist/index.js dist/subagent-entry.js dist/historian-calibration-extension.js dist/transformers-web.js dist/transformers-node-wasm.js dist/*-*.js && bun build ../plugin/src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun ../plugin/scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts src/subagent-entry.ts src/historian-calibration-extension.ts --outdir dist --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external onnxruntime-node --external onnxruntime-web --external sharp --external node:sqlite",
-		"build:e2e-argv": "bun build src/subagent-runner.ts --outfile ../../tests/docker/.generated/subagent-runner-e2e.mjs --target node --format esm --external node:sqlite",
+		"build": "bun ../../scripts/check-bun.mjs && tsc -p ../retina-local-fs/tsconfig.build.json && bun ../../scripts/clean-dist-chunks.mjs dist index.js subagent-entry.js historian-calibration-extension.js transformers-web.js transformers-node-wasm.js && bun build ../plugin/src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun ../plugin/scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts src/subagent-entry.ts src/historian-calibration-extension.ts ../plugin/src/features/magic-context/memory/embedding-worker.ts ../plugin/src/features/magic-context/migration-worker.ts --outdir dist --entry-naming '[name].[ext]' --target node --format esm --splitting --external @earendil-works/pi-coding-agent --external @earendil-works/pi-tui --external onnxruntime-node --external onnxruntime-web --external sharp --external node:sqlite",
+		"build:e2e-argv": "bun ../../scripts/clean-dist-chunks.mjs ../../tests/docker/.generated subagent-runner-e2e.mjs && bun build src/subagent-runner.ts --outdir ../../tests/docker/.generated --entry-naming 'subagent-runner-e2e.mjs' --splitting --target node --format esm --external node:sqlite && node --input-type=module -e 'const { __test } = await import(\"../../tests/docker/.generated/subagent-runner-e2e.mjs\"); if (typeof __test.buildArgs !== \"function\" || typeof __test.resolvePiInvocation !== \"function\") throw new Error(\"argv renderer exports missing\"); console.log(\"Node argv renderer: 2 exports loaded\")'",
 		"typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit",
 		"test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && bun test --parallel --timeout 30000",
 		"test:serial": "bun install --frozen-lockfile && bun test --timeout 30000",
@@ -37,43 +38,51 @@
 		"lint:fix": "biome check --write src",
 		"format": "biome format --write src",
 		"format:check": "biome format src",
-		"clean": "rm -rf dist",
+		"clean": "bun ../../scripts/clean-dist-chunks.mjs dist index.js subagent-entry.js historian-calibration-extension.js embedding-worker.js migration-worker.js transformers-web.js transformers-node-wasm.js",
 		"prepublishOnly": "bun run build"
 	},
 	"dependencies": {
-		"@cortexkit/subc-client": "0.4.1",
+		"@cortexkit/subc-client": "0.11.1",
 		"@jitl/quickjs-singlefile-cjs-release-asyncify": "0.32.0",
 		"ai-tokenizer": "^1.0.6",
 		"comment-json": "^5.0.0",
 		"onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
 		"quickjs-emscripten": "^0.32.0",
-		"typebox": "^1.3.1",
 		"zod": "^4.1.8"
 	},
 	"optionalDependencies": {
-		"onnxruntime-node": "1.24.3",
+		"onnxruntime-node": "1.30.0",
 		"sharp": "^0.35.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.1",
-		"@huggingface/transformers": "^4.1.0",
 		"@earendil-works/pi-ai": "0.83.0",
 		"@earendil-works/pi-coding-agent": "0.83.0",
 		"@earendil-works/pi-tui": "0.83.0",
+		"@huggingface/transformers": "^4.3.0",
 		"@types/better-sqlite3": "^7.6.13",
 		"@types/bun": "^1.3.10",
 		"@types/node": "^22.20.0",
+		"pi-agent-core-087": "npm:@earendil-works/pi-agent-core@0.87.1",
+		"pi-ai-086": "npm:@earendil-works/pi-ai@0.86.0",
+		"pi-coding-agent-086": "npm:@earendil-works/pi-coding-agent@0.86.0",
+		"pi-coding-agent-087": "npm:@earendil-works/pi-coding-agent@0.87.1",
+		"typebox": "^1.3.1",
 		"typescript": "^5.8.0"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": ">=0.80.2",
-		"@earendil-works/pi-tui": ">=0.80.2"
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
 	},
 	"peerDependenciesMeta": {
 		"@earendil-works/pi-coding-agent": {
 			"optional": true
 		},
 		"@earendil-works/pi-tui": {
+			"optional": true
+		},
+		"typebox": {
 			"optional": true
 		}
 	},

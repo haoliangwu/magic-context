@@ -350,7 +350,7 @@ export function insertPrimerCandidates(db: Database, candidates: PrimerCandidate
             ) as { id?: number } | undefined;
             if (typeof row?.id === "number") ids.push(row.id);
         }
-    })();
+    }).immediate();
     return ids;
 }
 
@@ -447,33 +447,35 @@ export function createPrimer(
         now?: number;
     },
 ): number {
-    return db.transaction(() => {
-        const now = input.now ?? Date.now();
-        const sourceCandidateIds = normalizedCandidateIds(input.sourceCandidateIds);
-        const sourceProvenance = loadPrimerSourceProvenance(db, sourceCandidateIds);
-        const info = db
-            .prepare(
-                `INSERT INTO primers (
+    return db
+        .transaction(() => {
+            const now = input.now ?? Date.now();
+            const sourceCandidateIds = normalizedCandidateIds(input.sourceCandidateIds);
+            const sourceProvenance = loadPrimerSourceProvenance(db, sourceCandidateIds);
+            const info = db
+                .prepare(
+                    `INSERT INTO primers (
                     project_path, question, question_embedding, question_embedding_model_id, answer,
                     status, total_support, last_observed_at, answer_refreshed_at,
                     source_candidate_ids, source_candidate_provenance, created_at, updated_at
                  ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL, ?, ?, ?, ?)`,
-            )
-            .run(
-                input.projectPath,
-                input.question,
-                vectorBlob(input.questionEmbedding),
-                input.questionEmbeddingModelId ?? null,
-                input.answer ?? "",
-                input.totalSupport,
-                input.lastObservedAt,
-                JSON.stringify(sourceCandidateIds),
-                serializePrimerSourceProvenance(sourceProvenance, sourceCandidateIds),
-                now,
-                now,
-            );
-        return Number(info.lastInsertRowid);
-    })();
+                )
+                .run(
+                    input.projectPath,
+                    input.question,
+                    vectorBlob(input.questionEmbedding),
+                    input.questionEmbeddingModelId ?? null,
+                    input.answer ?? "",
+                    input.totalSupport,
+                    input.lastObservedAt,
+                    JSON.stringify(sourceCandidateIds),
+                    serializePrimerSourceProvenance(sourceProvenance, sourceCandidateIds),
+                    now,
+                    now,
+                );
+            return Number(info.lastInsertRowid);
+        })
+        .immediate();
 }
 
 export function updatePrimerSupport(
@@ -529,7 +531,7 @@ export function updatePrimerSupport(
             input.now ?? Date.now(),
             input.primerId,
         );
-    })();
+    }).immediate();
 }
 
 export function updatePrimerAnswer(
@@ -566,6 +568,6 @@ export function pruneExpiredPrimerCandidates(
     const stmt = db.prepare("DELETE FROM primer_candidates WHERE id = ?");
     db.transaction(() => {
         for (const id of toDelete) stmt.run(id);
-    })();
+    }).immediate();
     return toDelete.length;
 }

@@ -6,7 +6,10 @@ import {
 	getSessionFacts,
 } from "@magic-context/core/features/magic-context/compartment-storage";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
-import { getMemoriesByProject } from "@magic-context/core/features/magic-context/memory/storage-memory";
+import {
+	getMemoriesByProject,
+	insertMemory,
+} from "@magic-context/core/features/magic-context/memory/storage-memory";
 import {
 	getHistorianFailureState,
 	getOverflowState,
@@ -17,7 +20,9 @@ import {
 	reserveProtectedTailDrainTokens,
 } from "@magic-context/core/features/magic-context/storage";
 import { getUserMemoryCandidates } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
+import { producerPromptFailureReason } from "@magic-context/core/hooks/magic-context/producer-window-guard";
 import type { ProtectedTailBoundarySnapshot } from "@magic-context/core/hooks/magic-context/protected-tail-boundary";
+import { estimateTokens } from "@magic-context/core/hooks/magic-context/read-session-formatting";
 import type { RawMessage } from "@magic-context/core/hooks/magic-context/read-session-raw";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
@@ -243,6 +248,9 @@ async function runHistorianWith(args: {
 	forceKeepLastCompartment?: boolean;
 	historianChunkTokens?: number;
 	historianContextLimit?: number;
+	producerContextLimits?: ReadonlyMap<string, number>;
+	resolveHostContextLimit?: (model: string) => number | undefined;
+	resolveHostOutputLimit?: (model: string) => number | undefined;
 	maxOutputTokens?: number;
 	beforeRun?: (db: ReturnType<typeof createTestDb>) => void;
 	ensureProjectRegistered?: Parameters<
@@ -264,7 +272,26 @@ async function runHistorianWith(args: {
 		fallbackModels: args.fallbackModels,
 		fallbackModelId: args.fallbackModelId,
 		historianChunkTokens: args.historianChunkTokens ?? 20_000,
-		historianContextLimit: args.historianContextLimit,
+		historianContextLimit:
+			args.historianContextLimit ??
+			(args.resolveHostContextLimit ? undefined : 200_000),
+		producerContextLimits:
+			args.producerContextLimits ??
+			new Map([
+				[args.historianModel ?? "test/model", 200_000],
+				...(args.fallbackModels ?? []).map(
+					(entry) =>
+						[typeof entry === "string" ? entry : entry.model, 200_000] as [
+							string,
+							number,
+						],
+				),
+				...(args.fallbackModelId
+					? [[args.fallbackModelId, 200_000] as [string, number]]
+					: []),
+			]),
+		resolveHostContextLimit: args.resolveHostContextLimit,
+		resolveHostOutputLimit: args.resolveHostOutputLimit,
 		maxOutputTokens: args.maxOutputTokens,
 		signal: args.signal,
 		retryBackoffMs: args.retryBackoffMs,
@@ -287,6 +314,72 @@ async function runHistorianWith(args: {
 }
 
 describe("runPiHistorian", () => {
+	it("uses the Pi registry with an empty cache and sends without a window when registry misses", async () => {
+		for (const known of [true, false]) {
+			const runner = runnerReturning([successXml()]);
+			const logSpy = spyOn(loggerModule, "sessionLog").mockImplementation(
+				() => {},
+			);
+			const { db } = await runHistorianWith({
+				runner,
+				historianModel: `test/uncached-${known}`,
+				producerContextLimits: new Map(),
+				resolveHostContextLimit: () => (known ? 200_000 : undefined),
+			});
+			try {
+				expect(runner.run).toHaveBeenCalledTimes(1);
+				expect(logSpy).toHaveBeenCalledWith(
+					"ses-historian",
+					known
+						? `historian producer window for test/uncached-${known}: 200000 (host registry)`
+						: `producer window unknown for test/uncached-${known}: sending unguarded`,
+				);
+			} finally {
+				logSpy.mockRestore();
+				closeQuietly(db);
+			}
+		}
+	});
+
+	it("uses the host catalog output ceiling when no cap is configured", async () => {
+		const { db, runner } = await runHistorianWith({
+			historianContextLimit: 200_000,
+			resolveHostContextLimit: () => 64_000,
+			resolveHostOutputLimit: () => 1_024,
+			outputs: [successXml()],
+		});
+		try {
+			expect(
+				getHistorianFailureState(db, "ses-historian").lastError,
+			).toBeNull();
+			expect(runner.run).toHaveBeenCalledTimes(1);
+			expect(runner.run.mock.calls[0]?.[0].maxOutputTokens).toBe(1_024);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("releases reserved drain tokens when the producer refuses before dispatch", async () => {
+		const { db, runner } = await runHistorianWith({
+			outputs: [successXml()],
+			historianContextLimit: 32_001,
+			maxOutputTokens: 30_000,
+		});
+		try {
+			expect(runner.run).not.toHaveBeenCalled();
+			// A window that cannot hold even the fixed prompt parts is a failure
+			// the next run cannot fix, so it is recorded (and backed off on), but
+			// the prompt is sized before any drain budget is reserved.
+			expect(getHistorianFailureState(db, "ses-historian").lastError).toContain(
+				"producer_prompt_unfit",
+			);
+			expect(
+				loadProtectedTailMeta(db, "ses-historian").protectedTailDrainTokens,
+			).toBe(0);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 	it("does not spawn beyond the producer window and still spawns within the margin", async () => {
 		const messages = rawMessages();
 		const firstMessage = messages[0];
@@ -294,7 +387,7 @@ describe("runPiHistorian", () => {
 			throw new Error("producer-window fixture requires a source message");
 		messages[0] = {
 			...firstMessage,
-			parts: [{ type: "text", text: "producer source token ".repeat(2_000) }],
+			parts: [{ type: "text", text: "producer source token ".repeat(20_000) }],
 		};
 		const refusedRunner = runnerReturning([successXml()]);
 		const refused = await runHistorianWith({
@@ -302,13 +395,15 @@ describe("runPiHistorian", () => {
 			providerMessages: messages,
 			historianChunkTokens: 100_000,
 			historianContextLimit: 32_001,
-			maxOutputTokens: 32_000,
+			maxOutputTokens: 8_000,
 		});
 		try {
 			expect(refusedRunner.run).toHaveBeenCalledTimes(0);
+			// An uncalibrated model counts the historian system prompt double, so
+			// this window cannot hold it: one recorded failure, no spawn.
 			expect(
 				getHistorianFailureState(refused.db, "ses-historian").lastError,
-			).toContain("producer_source_exceeds_window");
+			).toContain("producer_prompt_unfit");
 		} finally {
 			closeQuietly(refused.db);
 		}
@@ -719,6 +814,42 @@ describe("runPiHistorian", () => {
 		try {
 			expect(attemptedModels(runner)).toEqual(["test/model", "fallback/model"]);
 			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("does not retry a request error just because a token count contains 500", async () => {
+		const runner = runnerWithSteps([
+			new Error(
+				"invalid_request_error: prompt is too long: 250000 tokens > 200000 maximum",
+			),
+			successXml("Fallback model recovered Pi history."),
+		]);
+		const { db } = await runHistorianWith({
+			runner,
+			fallbackModels: ["fallback/model"],
+			retryBackoffMs: () => 0,
+		});
+		try {
+			expect(attemptedModels(runner)).toEqual(["test/model", "fallback/model"]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("retries a provider outage whose text merely contains the letters auth", async () => {
+		const runner = runnerWithSteps([
+			new Error("503 upstream author-profile service unavailable"),
+			successXml("Transient retry recovered Pi history."),
+		]);
+		const { db } = await runHistorianWith({
+			runner,
+			fallbackModels: ["fallback/model"],
+			retryBackoffMs: () => 0,
+		});
+		try {
+			expect(attemptedModels(runner)).toEqual(["test/model", "test/model"]);
 		} finally {
 			closeQuietly(db);
 		}
@@ -1152,4 +1283,119 @@ it("persists a boundary-only marker for a fully filtered Pi head without spawnin
 	} finally {
 		closeQuietly(db);
 	}
+});
+
+describe("Pi historian prompt sized to the producer window", () => {
+	it("counts a window too small for the fixed prompt as one failure and backs off until the window changes", async () => {
+		const db = createTestDb();
+		const holderId = "unfit-holder";
+		expect(
+			acquireCompartmentLease(db, "ses-historian", holderId),
+		).not.toBeNull();
+		const notices: string[] = [];
+		const runner = runnerReturning([successXml()]);
+		const run = (historianContextLimit: number) =>
+			runPiHistorian({
+				db,
+				sessionId: "ses-historian",
+				directory: process.cwd(),
+				provider: { readMessages: () => rawMessages() },
+				runner,
+				historianModel: "test/model",
+				historianChunkTokens: 20_000,
+				historianContextLimit,
+				producerContextLimits: new Map([["test/model", historianContextLimit]]),
+				maxOutputTokens: 30_000,
+				notifyIssue: async (message) => {
+					notices.push(message);
+				},
+				compartmentLeaseHolderId: holderId,
+			});
+		try {
+			clearPiHistorianAlertState("ses-historian");
+			// 32k window with a 30k output reserve: not even the system prompt fits.
+			await run(32_001);
+			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+				1,
+			);
+			expect(getHistorianFailureState(db, "ses-historian").lastError).toContain(
+				"producer_prompt_unfit",
+			);
+			expect(notices.filter((text) => text.includes("(MC-H05)"))).toHaveLength(
+				1,
+			);
+
+			// Nothing changed: no second failure, no spawn.
+			clearPiHistorianAlertState("ses-historian");
+			await run(32_001);
+			await run(32_001);
+			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+				1,
+			);
+			expect(notices).toHaveLength(1);
+			expect(runner.run).not.toHaveBeenCalled();
+
+			// A larger window changes the outcome, so the historian runs again.
+			await run(1_000_000);
+			expect(runner.run).toHaveBeenCalledTimes(1);
+			expect(
+				getCompartments(db, "ses-historian").map((row) => [
+					row.startMessage,
+					row.endMessage,
+				]),
+			).toEqual([[1, 2]]);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("trims the memory block so the chunk fits a window the full prompt would overflow", async () => {
+		const memoryCount = 600;
+		const runner = runnerReturning([successXml()]);
+		const { db } = await runHistorianWith({
+			runner,
+			historianContextLimit: 100_000,
+			maxOutputTokens: 8_000,
+			beforeRun: (database) => {
+				const projectPath = resolveProjectIdentity(process.cwd());
+				for (let index = 0; index < memoryCount; index += 1) {
+					insertMemory(database, {
+						projectPath,
+						category: "ARCHITECTURE",
+						content: `Remembered architecture fact number ${index}: ${"the module keeps a durable ledger of every decision it made ".repeat(4)}`,
+					});
+				}
+			},
+		});
+		try {
+			expect(runner.run).toHaveBeenCalledTimes(1);
+			const options = (
+				runner.run as unknown as {
+					mock: { calls: Array<[Parameters<SubagentRunner["run"]>[0]]> };
+				}
+			).mock.calls[0]?.[0];
+			const user = options?.userMessage ?? "";
+			const keptLines = user
+				.split("\n")
+				.filter((line) => line.startsWith("- Remembered"));
+			expect(keptLines.length).toBeGreaterThan(0);
+			expect(keptLines.length).toBeLessThan(memoryCount);
+			expect(user).toContain("User request 1");
+			expect(
+				producerPromptFailureReason({
+					sourceLocal: estimateTokens(user),
+					systemLocal: estimateTokens(options?.systemPrompt ?? ""),
+					toolsLocal: 0,
+					modelKey: "test/model",
+					contextLimitTokens: 100_000,
+					maxOutputTokens: 8_000,
+				}),
+			).toBeNull();
+			expect(getHistorianFailureState(db, "ses-historian").failureCount).toBe(
+				0,
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 });

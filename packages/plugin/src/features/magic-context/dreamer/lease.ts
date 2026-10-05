@@ -1,4 +1,4 @@
-import type { Database } from "../../../shared/sqlite";
+import { type Database, withSqliteBackgroundWriter } from "../../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../../shared/write-transaction-timing";
 import { deleteDreamState, getDreamState, setDreamState } from "./storage-dream-state";
 
@@ -107,8 +107,8 @@ function runImmediate<T>(
     site?: string,
     slowWriteThresholdMs?: number,
 ): T {
-    const transactionStartedAt = site === undefined ? undefined : performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = site === undefined ? undefined : performance.now();
     let committed = false;
     try {
         const result = body();
@@ -213,22 +213,44 @@ export function runLeaseGuardedWrite<T>(
     );
 }
 
-/** Renew halfway through the 120-second lease, leaving about 60 seconds for a
- * delayed or contended renewal before the lease expires. */
-const LEASE_HEARTBEAT_INTERVAL_MS = 60 * 1000;
+/** Three beats per lease leave room for one contended or delayed renewal. */
+const LEASE_HEARTBEAT_INTERVAL_MS = 40 * 1000;
+
+/** Atomically refresh an expired lease only if its original holder and generation remain. */
+export function reacquireOwnedLease(
+    db: Database,
+    holderId: string,
+    leaseKey: string,
+    generation: number,
+): boolean {
+    const keys = rowKeys(leaseKey);
+    return runImmediate(db, () => {
+        if (
+            getLeaseHolder(db, leaseKey) !== holderId ||
+            getLeaseGeneration(db, leaseKey) !== generation
+        ) {
+            return false;
+        }
+        const now = Date.now();
+        setDreamState(db, keys.heartbeat, String(now));
+        setDreamState(db, keys.expiry, String(now + LEASE_DURATION_MS));
+        return true;
+    });
+}
 
 export interface LeaseHeartbeat {
     /** Stop the heartbeat timer. Safe to call more than once. */
     stop(): void;
     /** True after this process no longer owns the lease and onLost was called. */
     readonly lost: boolean;
+    /** Number of transient renewal/reacquisition errors observed by this heartbeat. */
+    readonly renewalFailures: number;
 }
 
 /**
  * Keep a held lease alive on a background interval. Transient renewal errors are
  * retried, an expired lease is reacquired when no other holder claimed it, and
- * lease loss is reported once after another holder is confirmed or a full
- * two-minute lease period passes without a confirmed renewal.
+ * lease loss is reported once when ownership or generation no longer matches.
  */
 export function startLeaseHeartbeat(
     db: Database,
@@ -244,8 +266,8 @@ export function startLeaseHeartbeat(
     const acquisition =
         typeof intervalOrAcquisition === "number" ? undefined : intervalOrAcquisition;
     let lost = false;
-    let expectedGeneration = acquisition?.generation ?? getLeaseGeneration(db, leaseKey);
-    let lastConfirmedAt = acquisition?.acquiredAt ?? Date.now();
+    const expectedGeneration = acquisition?.generation ?? getLeaseGeneration(db, leaseKey);
+    let renewalFailures = 0;
     const declareLost = (reason: string): void => {
         if (lost) return;
         lost = true;
@@ -254,8 +276,7 @@ export function startLeaseHeartbeat(
     const beat = () => {
         if (lost) return;
         try {
-            // A successful renewal confirms that this process still owns the lease
-            // and refreshes the confirmation time.
+            // A successful renewal confirms that this process still owns the lease.
             if (
                 renewLease(
                     db,
@@ -264,42 +285,27 @@ export function startLeaseHeartbeat(
                     expectedGeneration === null ? undefined : expectedGeneration,
                 )
             ) {
-                lastConfirmedAt = Date.now();
                 return;
             }
+            // The write lock protects this check and refresh from a concurrent
+            // acquirer; an expired timestamp alone is not evidence of takeover.
             if (
                 expectedGeneration !== null &&
-                getLeaseGeneration(db, leaseKey) !== expectedGeneration
-            ) {
-                declareLost("lease generation changed — another holder acquired it");
+                reacquireOwnedLease(db, holderId, leaseKey, expectedGeneration)
+            )
                 return;
+            const holder = getLeaseHolder(db, leaseKey);
+            if (holder !== null && holder !== holderId) {
+                declareLost(`lease_lost: taken by ${holder}`);
+            } else if (getLeaseGeneration(db, leaseKey) !== expectedGeneration) {
+                declareLost("lease_lost: generation changed");
+            } else {
+                declareLost("lease_expired: reacquire failed (holder missing)");
             }
-            // If renewal fails and the gap since the last confirmation exceeds a
-            // two-minute lease period, another process may have acquired and used
-            // the lease while this worker was unable to confirm ownership. Do not
-            // let this worker reclaim the lease without current ownership. If the
-            // gap is shorter, the next beat can reacquire an unowned lease below.
-            if (Date.now() - lastConfirmedAt > LEASE_DURATION_MS) {
-                declareLost("lease lapsed past TTL — another holder may have run");
-                return;
-            }
-            // On this beat, reacquire an expired lease if no other holder has
-            // claimed it. This returns false when another holder owns it.
-            const reacquired = acquireLeaseWithAcquisition(db, holderId, leaseKey);
-            if (reacquired) {
-                if (expectedGeneration !== null && reacquired.generation !== expectedGeneration) {
-                    declareLost("lease generation changed during reacquisition");
-                    return;
-                }
-                expectedGeneration = reacquired.generation;
-                lastConfirmedAt = Date.now();
-                return;
-            }
-            declareLost("lease acquired by another holder");
         } catch {
-            if (Date.now() - lastConfirmedAt > LEASE_DURATION_MS) {
-                declareLost("lease renewal unconfirmed past TTL");
-            }
+            // SQLITE_BUSY and other transient database errors do not establish
+            // takeover. Retry at the next beat and retain the failure count.
+            renewalFailures += 1;
         }
     };
 
@@ -308,13 +314,18 @@ export function startLeaseHeartbeat(
     // same lease key.
     beat();
 
-    const timer = lost ? undefined : setInterval(beat, intervalMs);
+    const timer = lost
+        ? undefined
+        : setInterval(() => withSqliteBackgroundWriter(beat), intervalMs);
     return {
         stop: () => {
             if (timer) clearInterval(timer);
         },
         get lost() {
             return lost;
+        },
+        get renewalFailures() {
+            return renewalFailures;
         },
     };
 }

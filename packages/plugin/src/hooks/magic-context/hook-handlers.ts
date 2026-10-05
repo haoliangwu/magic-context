@@ -1,4 +1,5 @@
 import type { MagicContextConfig } from "../../config/schema/magic-context";
+import { capDreamerReadOutput } from "../../features/magic-context/dreamer/verify-read-cap";
 import {
     clearSessionTracking,
     scheduleIncrementalIndex,
@@ -195,9 +196,6 @@ export function createChatMessageHook(args: {
     systemPromptRefreshSessions: SystemPromptRefreshSessions;
     pendingMaterializationSessions: PendingMaterializationSessions;
     lastHeuristicsTurnId: LastHeuristicsTurnId;
-    /** E5 — one-time session upgrade reminder. Optional: only wired when the
-     *  historian can run (so an upgrade is actually possible). Self-gates. */
-    upgradeReminder?: (sessionId: string) => Promise<void>;
     /** The native slash-command handler, reused when Desktop removes the slash. */
     commandHandler?: MagicContextCommandHandler;
     cacheTtlConfig?: MagicContextConfig["cache_ttl"];
@@ -242,12 +240,6 @@ export function createChatMessageHook(args: {
             );
         }
 
-        // E5: fire-and-forget one-time upgrade reminder for legacy sessions.
-        // Self-gating + model-invisible, so it never affects the prompt prefix.
-        if (args.upgradeReminder) {
-            void args.upgradeReminder(sessionId);
-        }
-
         if (input.model?.providerID && input.model.modelID) {
             args.liveModelBySession.set(sessionId, {
                 providerID: input.model.providerID,
@@ -278,7 +270,7 @@ export function createChatMessageHook(args: {
             previousVariant !== input.variant
         ) {
             // Variant changes alter cached thinking blocks on some models. Fable
-            // 5.1 and GPT-6 Astra carry effort outside the cached prefix, leaving
+            // 5.1, GPT-6 Astra and Opus 5.5 carry effort outside the cached prefix, leaving
             // existing prompt bytes unchanged. Use both live IDs to decide; if either
             // is unknown, leave the cache unchanged rather than flushing speculatively.
             const liveModel = args.liveModelBySession.get(sessionId);
@@ -551,7 +543,7 @@ function maybeInjectChannel1Nudge(
 
     // The just-completed output is prospective input for the next pass and is
     // inside the recency reserve, so it grows T but not U.
-    state.turnDeltaT += toolOutputTokens(out.output);
+    state.turnDeltaT += toolOutputTokens(out.output) * (state.toolsRatio ?? 1);
 
     const nudgeState = getChannel1NudgeState(args.db, sessionId);
     const decision = decideChannel1({
@@ -631,6 +623,8 @@ export function createToolExecuteAfterHook(args: {
         if (!typedInput.sessionID || !typedInput.tool) {
             return;
         }
+
+        capDreamerReadOutput(typedInput, output);
 
         // `tool.execute.after` is the next existing host event after a tool
         // boundary. The queue helper re-checks the read-only mid-turn signal,

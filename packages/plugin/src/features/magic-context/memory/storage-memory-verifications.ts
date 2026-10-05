@@ -27,10 +27,6 @@ interface MemoryVerificationRow {
     mapping_origin: string;
 }
 
-function placeholders(values: readonly unknown[]): string {
-    return values.map(() => "?").join(", ");
-}
-
 function uniqueSortedFiles(files: readonly string[]): string[] {
     return Array.from(
         new Set(files.filter((file) => file !== MEMORY_VERIFICATION_SENTINEL)),
@@ -91,9 +87,9 @@ export function getUnmappedMemoryIds(db: Database, memoryIds: readonly number[])
     if (ids.length === 0) return [];
     const rows = db
         .prepare<unknown[], { memory_id: number }>(
-            `SELECT DISTINCT memory_id FROM memory_verifications WHERE memory_id IN (${placeholders(ids)})`,
+            "SELECT DISTINCT memory_id FROM memory_verifications WHERE memory_id IN (SELECT value FROM json_each(?))",
         )
-        .all(...ids);
+        .all(JSON.stringify(ids));
     const mapped = new Set(rows.map((r) => r.memory_id));
     return ids.filter((id) => !mapped.has(id));
 }
@@ -114,10 +110,10 @@ export function getMemoryVerifications(
         .prepare<unknown[], MemoryVerificationRow>(
             `SELECT memory_id, file_path, verified_at, mapped_at, mapping_origin
                FROM memory_verifications
-              WHERE memory_id IN (${placeholders(ids)})
+              WHERE memory_id IN (SELECT value FROM json_each(?))
               ORDER BY memory_id, file_path`,
         )
-        .all(...ids);
+        .all(JSON.stringify(ids));
 
     for (const row of rows) {
         const existing = result.get(row.memory_id) ?? {

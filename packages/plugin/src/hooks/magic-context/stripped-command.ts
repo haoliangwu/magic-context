@@ -1,7 +1,7 @@
 import {
     getMagicContextBuiltinCommands,
     type MagicContextBuiltinCommandName,
-} from "../../features/builtin-commands/commands";
+} from "../../shared/builtin-commands";
 import { acceptsMagicContextCommandArguments } from "./command-handler";
 
 export interface StrippedMagicContextCommand {

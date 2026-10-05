@@ -64,10 +64,10 @@ describe("user-facing failure codes", () => {
             "Finish the provider setup, or set a fallback provider in the embedding settings, then run /ctx-embed start again. (MC-E06)",
         );
         expect(renderUserFacingFailure("configuration_warning")).toContain(
-            "Fix the configuration warning shown in /ctx-status diagnostics, then restart. (MC-S03)",
+            "Fix the configuration warning shown in /ctx-status, then restart. (MC-S03)",
         );
-        expect(renderUserFacingFailure("session_upgrade_unavailable")).toContain(
-            "Run /ctx-recomp instead. (MC-C07)",
+        expect(renderUserFacingFailure("partial_history_unavailable")).toContain(
+            "Run /ctx-recomp without a range. (MC-C06)",
         );
     });
 
@@ -92,7 +92,6 @@ describe("user-facing failure codes", () => {
             "note_access",
             "context_cleanup",
             "partial_history",
-            "session_upgrade",
             "smart_note_condition",
             "history_compression",
             "context_service",

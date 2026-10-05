@@ -21,9 +21,16 @@
  * its `RawMessageProvider` for the call exactly like the range view does.
  */
 
-import { readRawSessionMessages } from "../../hooks/magic-context/read-session-chunk";
+import { createHash } from "node:crypto";
+import { type ContextDatabase, getTagById } from "../../features/magic-context/storage";
+import {
+    readRawSessionMessageById,
+    visitRawSessionMessages,
+} from "../../hooks/magic-context/read-session-chunk";
 import { estimateTokens } from "../../hooks/magic-context/read-session-formatting";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
+import { expandToolPart } from "../../shared/historian-tool-expansions";
+import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -33,6 +40,20 @@ function roleLabel(role: string): string {
     if (role === "assistant") return "A (assistant)";
     if (role === "user") return "U (user)";
     return role;
+}
+
+function verboseRoleLabel(msg: RawMessage): string {
+    if (
+        msg.role === "user" &&
+        msg.parts.length > 0 &&
+        msg.parts.every((part) => {
+            if (!isRecord(part)) return false;
+            if (part.type === "tool_result") return true;
+            return part.type === "tool" && asToolPart(part)?.output != null;
+        })
+    )
+        return "tool results";
+    return roleLabel(msg.role);
 }
 
 function truncate(value: string, max: number): string {
@@ -134,8 +155,10 @@ function reasoningOf(part: Record<string, unknown>): string | null {
 }
 
 /** One per-part PREVIEW line for the verbose range view (bounded). */
-function renderPartPreview(part: unknown): string | null {
+function renderPartPreview(part: unknown, expandTools?: ToolExpansionMap): string | null {
     if (!isRecord(part)) return null;
+    const expansion = expandToolPart(part, expandTools);
+    if (expansion !== null) return `    • tool ${part.tool}: ${expansion}`;
     const text = textOf(part);
     if (text !== null) {
         const t = truncate(text, 200);
@@ -206,7 +229,13 @@ function renderPartFull(part: unknown): string | null {
  * at that ordinal (pruned/reverted or wrong ordinal).
  */
 export function renderMessageByOrdinal(sessionId: string, ordinal: number): string {
-    const msg = readRawSessionMessages(sessionId).find((m: RawMessage) => m.ordinal === ordinal);
+    // Read only the one message, never the whole session.
+    const found: RawMessage[] = [];
+    visitRawSessionMessages(sessionId, ordinal, ordinal, (m) => {
+        if (m.ordinal === ordinal) found.push(m);
+        return false;
+    });
+    const msg = found[0];
     if (!msg) {
         return (
             `No message at ordinal ${ordinal} in this session's stored history — it was deleted ` +
@@ -243,30 +272,101 @@ export function renderVerboseRange(
     start: number,
     end: number,
     tokenBudget: number,
+    expandTools?: ToolExpansionMap,
 ): VerboseRangeResult {
-    const messages = readRawSessionMessages(sessionId).filter(
-        (m: RawMessage) => m.ordinal >= start && m.ordinal <= end,
-    );
-
     const out: string[] = [];
     let usedTokens = 0;
     let lastOrdinal = start - 1;
     let truncated = false;
 
-    for (const msg of messages) {
-        const header = `[${msg.ordinal}] ${roleLabel(msg.role)}`;
-        const partLines = msg.parts.map(renderPartPreview).filter((l): l is string => l !== null);
+    // Stream the range a page at a time and stop at the budget, so a wide range
+    // over a long session never loads every message and tool output at once.
+    visitRawSessionMessages(sessionId, start, end, (msg: RawMessage) => {
+        const header = `[${msg.ordinal}] ${verboseRoleLabel(msg)}`;
+        const partLines = msg.parts
+            .map((part) => renderPartPreview(part, expandTools))
+            .filter((l): l is string => l !== null);
         const block = partLines.length > 0 ? `${header}\n${partLines.join("\n")}` : header;
 
         const blockTokens = estimateTokens(block);
         if (usedTokens + blockTokens > tokenBudget && out.length > 0) {
             truncated = true;
-            break;
+            return false;
         }
         out.push(block);
         usedTokens += blockTokens;
         lastOrdinal = msg.ordinal;
-    }
+        return true;
+    });
 
     return { text: out.join("\n\n"), lastOrdinal, truncated };
+}
+
+/** Resolve a transcript handle by persisted ownership, never by message ordinal. */
+export function renderItemByTag(
+    db: ContextDatabase,
+    sessionId: string,
+    number: number,
+    textIndexDomain: "part" | "text" = "part",
+): string {
+    const tag = getTagById(db, sessionId, number);
+    if (!tag)
+        return `no tag ${number} in this session; if ${number} came from a <session-history> heading or a ctx_search hit, it is an ordinal: use message=${number}`;
+    if (tag.type === "tool") {
+        const owner = tag.toolOwnerMessageId;
+        if (!owner)
+            return `Tag ${number}'s tool owner is unknown; its original call cannot be resolved safely.`;
+        const message = readRawSessionMessageById(sessionId, owner);
+        if (!message) return `Tag ${number}'s original tool owner is no longer in stored history.`;
+        const parts =
+            message?.parts.filter(
+                (part) => isRecord(part) && asToolPart(part)?.callId === tag.messageId,
+            ) ?? [];
+        // Pi stores a tool's invocation and result as separate messages.
+        if (!parts.some((part) => isRecord(part) && asToolPart(part)?.output !== null)) {
+            visitRawSessionMessages(
+                sessionId,
+                message.ordinal + 1,
+                Number.MAX_SAFE_INTEGER,
+                (candidate) => {
+                    const matching = candidate.parts.filter(
+                        (part) => isRecord(part) && asToolPart(part)?.callId === tag.messageId,
+                    );
+                    if (matching.some((part) => isRecord(part) && part.type === "tool_use"))
+                        return false;
+                    parts.push(...matching);
+                    return matching.length === 0;
+                },
+            );
+        }
+        const rendered = parts.map(renderPartFull).filter((part): part is string => part !== null);
+        return rendered.length
+            ? rendered.join("\n")
+            : `Tag ${number}'s original tool call is no longer in stored history.`;
+    }
+    const scoped = /^(.*):p(\d+)$/.exec(tag.messageId);
+    const derived = /^(.*):mc-text-v1:([a-f0-9]+):([a-f0-9]+):o(\d+)$/.exec(tag.messageId);
+    const owner = scoped?.[1] ?? derived?.[1] ?? tag.messageId;
+    const message = readRawSessionMessageById(sessionId, owner);
+    if (!message) return `Tag ${number}'s original text is no longer in stored history.`;
+    const index = scoped ? Number(scoped[2]) : 0;
+    // Text tag locators count all message parts in OpenCode, but only text parts in Pi.
+    const piText = message.parts.filter((part) => isRecord(part) && part.type === "text");
+    const part = message.parts[index];
+    const matching = derived
+        ? piText.filter(
+              (part) =>
+                  isRecord(part) &&
+                  typeof part.text === "string" &&
+                  createHash("sha256").update(part.text).digest("hex") === derived[3],
+          )
+        : [];
+    const selected = derived
+        ? matching[Number(derived[4])]
+        : textIndexDomain === "text"
+          ? piText[index]
+          : part;
+    return selected
+        ? (renderPartFull(selected) ?? "")
+        : `Tag ${number}'s original text part is no longer in stored history.`;
 }

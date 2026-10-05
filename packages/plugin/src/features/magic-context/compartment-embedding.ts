@@ -6,6 +6,7 @@ import {
     canonicalizeInMemoryChunkTextForEmbedding,
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
+    chunkWindowSourceKey,
     replaceCompartmentChunkEmbeddings,
     type SaveCompartmentChunkEmbeddingInput,
 } from "./compartment-chunk-embedding";
@@ -34,8 +35,9 @@ import {
  * to repopulate or drop it.
  *
  * Fire-and-forget + best-effort: a missing/slow embedding provider must never
- * block or fail a historian publish. Gated by `memory.enabled` so a memory-off
- * user never hits the embedding endpoint.
+ * block or fail a historian publish. Gated only by the embedding provider: when
+ * it is `off` (or the project is not registered) nothing is embedded. History
+ * embedding does not depend on `memory.enabled`.
  */
 
 export interface CompartmentChunkToEmbed {
@@ -53,6 +55,9 @@ export async function embedAndStoreCompartmentChunks(
     compartments: readonly CompartmentChunkToEmbed[],
 ): Promise<void> {
     if (compartments.length === 0) return;
+    // Provider off or project not registered: skip before building any chunk
+    // text, so a disabled provider costs no work at all.
+    if (getProjectChunkEmbeddingModelId(projectPath) === "off") return;
     const maxInputTokens = getProjectEmbeddingMaxInputTokens(projectPath);
 
     for (const compartment of compartments) {
@@ -84,6 +89,12 @@ export async function embedAndStoreCompartmentChunks(
                 maxInputTokens,
             );
             if (windows.length === 0) continue;
+            const windowSourceKey = chunkWindowSourceKey(
+                canonicalText,
+                compartment.startMessage,
+                compartment.endMessage,
+                maxInputTokens,
+            );
 
             const currentModelId = getProjectChunkEmbeddingModelId(projectPath);
             if (
@@ -137,7 +148,7 @@ export async function embedAndStoreCompartmentChunks(
                 });
             }
             if (rows.length === windows.length) {
-                replaceCompartmentChunkEmbeddings(db, rows);
+                replaceCompartmentChunkEmbeddings(db, rows, windowSourceKey);
                 enqueueShadowEmbeddingItems(projectPath, "chunk", [String(compartment.id)]);
             }
         } catch (error) {

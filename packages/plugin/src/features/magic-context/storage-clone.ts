@@ -1,12 +1,22 @@
+import { isReservedLedgerControlEntry } from "../../hooks/magic-context/tool-sweep-policy";
 import { getHarness } from "../../shared/harness";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import {
+    decodeMergedReasoningParts,
+    MERGED_REASONING_PARTS_PREFIX,
+} from "./merged-reasoning-decisions";
 import { decodePiContentDecision, encodePiContentDecision } from "./pi-content-decisions";
+import {
+    parseStrippedPlaceholderState,
+    serializeStrippedPlaceholderState,
+    THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+} from "./storage-meta-persisted";
 import { getNativeReplayState } from "./storage-native-replay";
 import {
     type ReplayDocument,
     readReplayDocument,
-    serializeReplayDocument,
+    writeReplayDocument,
 } from "./storage-replay-document";
 
 export interface CloneCompartmentRow {
@@ -58,6 +68,8 @@ type RawCompartmentRow = {
     end_message: number;
     start_message_id: string;
     end_message_id: string;
+    start_block_index: number | null;
+    end_block_index: number | null;
     title: string;
     content: string;
     p1: string | null;
@@ -106,31 +118,99 @@ type RawSessionMetaRow = {
     todo_synthetic_state_json: string | null;
 };
 
+/**
+ * Copy the reasoning replay ledger into the clone. The column holds several
+ * kinds of entry side by side, and each must survive the clone:
+ *
+ * - session-wide control flags, which are not ids at all. Dropping them would
+ *   silently reset the fork's served-bytes policy back to a pre-adoption
+ *   default on its first pass, so they are copied through verbatim;
+ * - Pi content decisions (`pi-content-replay-v1:` records);
+ * - exact merged-reasoning part records (`__merged_reasoning_parts_v1__:`),
+ *   whose assistant id and string part ids are remapped;
+ * - thinking-binding recovery decisions (`binding_mismatch:<message id>`);
+ * - bare assistant message ids, the legacy merged-reasoning form.
+ *
+ * Entries naming a message are filtered and remapped with the rest of the
+ * session. A blob that does not parse yields an empty ledger rather than
+ * aborting the whole clone transaction (and with it every other piece of
+ * inherited state); the merged-reasoning reader treats such a blob as empty
+ * too.
+ */
 function clonePiContentDecisions(
     raw: string | null,
     filter: CloneSessionStateFilter,
 ): string | null {
     if (!raw) return null;
-    const entries: unknown = JSON.parse(raw);
+    let entries: unknown;
+    try {
+        entries = JSON.parse(raw);
+    } catch {
+        return null;
+    }
     if (!Array.isArray(entries)) return null;
     const copied: string[] = [];
     for (const entry of entries) {
         if (typeof entry !== "string") continue;
+        if (isReservedLedgerControlEntry(entry)) {
+            copied.push(entry);
+            continue;
+        }
         const decision = decodePiContentDecision(entry);
-        if (!decision) continue;
-        const [kind, id] = decision;
-        const root = kind === "reminder-strip" ? id.replace(/:p\d+$/, "") : id;
-        if (!filter.includeMessageId(root)) continue;
-        copied.push(
-            encodePiContentDecision(kind, `${mapMessageId(filter, root)}${id.slice(root.length)}`),
-        );
+        if (decision) {
+            const [kind, id] = decision;
+            const root = kind === "reminder-strip" ? id.replace(/:p\d+$/, "") : id;
+            if (!filter.includeMessageId(root)) continue;
+            copied.push(
+                encodePiContentDecision(
+                    kind,
+                    `${mapMessageId(filter, root)}${id.slice(root.length)}`,
+                ),
+            );
+            continue;
+        }
+        const mergedParts = decodeMergedReasoningParts(entry);
+        if (mergedParts) {
+            const [messageId, parts] = mergedParts;
+            if (!filter.includeMessageId(messageId)) continue;
+            const mappedParts = parts.map((part) =>
+                typeof part === "string" ? (mapMessageId(filter, part) ?? part) : part,
+            );
+            copied.push(
+                `${MERGED_REASONING_PARTS_PREFIX}${JSON.stringify([
+                    mapMessageId(filter, messageId) ?? messageId,
+                    mappedParts,
+                ])}`,
+            );
+            continue;
+        }
+        // Thinking-binding recovery decisions name the message whose reasoning
+        // was stripped after a provider rejected the thinking prefix.
+        if (entry.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) {
+            const messageId = entry.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+            if (messageId.length === 0 || !filter.includeMessageId(messageId)) continue;
+            copied.push(
+                `${THINKING_BINDING_RECOVERY_FROZEN_PREFIX}${mapMessageId(filter, messageId) ?? messageId}`,
+            );
+            continue;
+        }
+        // Anything else that is not a recognised record prefix is a bare
+        // assistant message id. Unknown versioned records are dropped rather
+        // than guessed at.
+        if (
+            entry.startsWith(MERGED_REASONING_PARTS_PREFIX) ||
+            entry.startsWith("pi-content-replay-")
+        )
+            continue;
+        if (entry.length === 0 || !filter.includeMessageId(entry)) continue;
+        copied.push(mapMessageId(filter, entry) ?? entry);
     }
     return copied.length ? JSON.stringify(copied) : null;
 }
 
 function runImmediate<T>(db: Database, body: () => T): T {
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let committed = false;
     try {
         const result = body();
@@ -253,6 +333,27 @@ function filterIdBlob(raw: string | null, filter: CloneSessionStateFilter): stri
     }
 }
 
+/**
+ * The stripped-placeholder column has two shapes: a plain id array, and an
+ * `{ ids, hiddenSeamIds }` object once a fold has hidden seam placeholders.
+ * Both are read with the column's own parser so the clone replays exactly the
+ * placeholders the source session strips.
+ */
+function filterStrippedPlaceholderBlob(
+    raw: string | null,
+    filter: CloneSessionStateFilter,
+): string {
+    const state = parseStrippedPlaceholderState(raw);
+    const keep = (ids: readonly string[]): string[] =>
+        ids.filter((id) => filter.includeMessageId(id)).map((id) => mapMessageId(filter, id) ?? id);
+    const ids = keep(state.ids);
+    const copied = new Set(ids);
+    return serializeStrippedPlaceholderState({
+        ids,
+        hiddenSeamIds: keep(state.hiddenSeamIds).filter((id) => copied.has(id)),
+    });
+}
+
 function filterNativeToolInputs(
     inputs: ReadonlyMap<string, string>,
     copiedToolCallIds: ReadonlySet<string>,
@@ -317,6 +418,31 @@ function cloneReplayDocument(
     };
 }
 
+/**
+ * SQLite builds used by node:sqlite (Pi, OpenCode Desktop) accept at most
+ * 32,766 bound variables per statement, so a long session's tag list is read
+ * in slices well under that limit, matching `getTagsByNumbers`.
+ */
+const TAG_ID_QUERY_CHUNK_SIZE = 900;
+
+/** Run `<sqlPrefix> (?, ?, …)` once per slice of `tagIds` and return every row. */
+function selectRowsByTagIds<T>(
+    db: Database,
+    sqlPrefix: string,
+    sessionId: string,
+    tagIds: readonly number[],
+): T[] {
+    const rows: T[] = [];
+    for (let start = 0; start < tagIds.length; start += TAG_ID_QUERY_CHUNK_SIZE) {
+        const chunk = tagIds.slice(start, start + TAG_ID_QUERY_CHUNK_SIZE);
+        const placeholders = chunk.map(() => "?").join(", ");
+        rows.push(
+            ...(db.prepare(`${sqlPrefix} (${placeholders})`).all(sessionId, ...chunk) as T[]),
+        );
+    }
+    return rows;
+}
+
 function clampWatermark(value: number | null, maxCopiedTag: number): number {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
     return Math.min(Math.floor(value), maxCopiedTag);
@@ -353,11 +479,20 @@ export function copySessionStateForClone(
             };
         }
 
+        const compartmentColumns = db.prepare("PRAGMA table_info(compartments)").all() as {
+            name: string;
+        }[];
+        const hasBlockIndices = ["start_block_index", "end_block_index"].every((name) =>
+            compartmentColumns.some((column) => column.name === name),
+        );
+        const blockProjection = hasBlockIndices
+            ? "start_block_index, end_block_index"
+            : "NULL AS start_block_index, NULL AS end_block_index";
         const sourceCompartments = db
             .prepare(
                 `SELECT sequence, start_message, end_message, start_message_id, end_message_id,
                         title, content, p1, p2, p3, p4, importance, episode_type, legacy,
-                        created_at, harness
+                        created_at, harness, ${blockProjection}
                    FROM compartments WHERE session_id = ? ORDER BY sequence ASC`,
             )
             .all(sourceSessionId) as RawCompartmentRow[];
@@ -365,8 +500,8 @@ export function copySessionStateForClone(
             `INSERT INTO compartments
                 (session_id, sequence, start_message, end_message, start_message_id,
                  end_message_id, title, content, p1, p2, p3, p4, importance,
-                 episode_type, legacy, created_at, harness)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 episode_type, legacy, created_at, harness${hasBlockIndices ? ", start_block_index, end_block_index" : ""})
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${hasBlockIndices ? ", ?, ?" : ""})`,
         );
         const copiedCompartments: CloneCompartmentRow[] = [];
         for (const row of sourceCompartments) {
@@ -391,6 +526,7 @@ export function copySessionStateForClone(
                 row.legacy,
                 row.created_at,
                 row.harness,
+                ...(hasBlockIndices ? [row.start_block_index, row.end_block_index] : []),
             );
             copiedCompartments.push({
                 sequence: row.sequence,
@@ -465,20 +601,19 @@ export function copySessionStateForClone(
         }
 
         if (copiedTagNumbers.length > 0) {
-            const sourceTagIds = [...copiedTagIds.keys()];
-            const placeholders = sourceTagIds.map(() => "?").join(", ");
-            const sourceContents = db
-                .prepare(
-                    `SELECT tag_id, content, created_at, harness
-                       FROM source_contents
-                      WHERE session_id = ? AND tag_id IN (${placeholders})`,
-                )
-                .all(sourceSessionId, ...sourceTagIds) as Array<{
+            const sourceContents = selectRowsByTagIds<{
                 tag_id: number;
                 content: string | null;
                 created_at: number | null;
                 harness: string;
-            }>;
+            }>(
+                db,
+                `SELECT tag_id, content, created_at, harness
+                   FROM source_contents
+                  WHERE session_id = ? AND tag_id IN`,
+                sourceSessionId,
+                [...copiedTagIds.keys()],
+            );
             const insertSourceContent = db.prepare(
                 "INSERT INTO source_contents (tag_id, session_id, content, created_at, harness) VALUES (?, ?, ?, ?, ?)",
             );
@@ -494,27 +629,32 @@ export function copySessionStateForClone(
                 );
             }
 
-            const pendingOps = db
-                .prepare(
-                    `SELECT tag_id, operation, queued_at, harness
-                       FROM pending_ops
-                      WHERE session_id = ? AND tag_id IN (${placeholders})`,
-                )
-                .all(sourceSessionId, ...sourceTagIds) as Array<{
+            // Queued operations always name the tag by its per-session tag
+            // number (that is what ctx_reduce and the historian queue, and what
+            // the drain resolves), and the clone keeps every tag number. They
+            // therefore never go through the row-id remap that source contents
+            // may need.
+            const pendingOps = selectRowsByTagIds<{
+                id: number;
                 tag_id: number;
                 operation: string | null;
                 queued_at: number | null;
                 harness: string;
-            }>;
+            }>(
+                db,
+                `SELECT id, tag_id, operation, queued_at, harness
+                   FROM pending_ops
+                  WHERE session_id = ? AND tag_id IN`,
+                sourceSessionId,
+                copiedTagNumbers,
+            ).sort((a, b) => a.id - b.id);
             const insertPendingOp = db.prepare(
                 "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness) VALUES (?, ?, ?, ?, ?)",
             );
             for (const row of pendingOps) {
-                const destinationTagId = copiedTagIds.get(row.tag_id);
-                if (destinationTagId === undefined) continue;
                 insertPendingOp.run(
                     destinationSessionId,
-                    destinationTagId,
+                    row.tag_id,
                     row.operation,
                     row.queued_at,
                     row.harness,
@@ -582,7 +722,7 @@ export function copySessionStateForClone(
                 Number.isFinite(meta.pi_stable_id_scheme)
                 ? meta.pi_stable_id_scheme
                 : null,
-            filterIdBlob(meta?.stripped_placeholder_ids ?? null, filter),
+            filterStrippedPlaceholderBlob(meta?.stripped_placeholder_ids ?? null, filter),
             filterIdBlob(meta?.stale_reduce_stripped_ids ?? null, filter),
             filterIdBlob(meta?.processed_image_stripped_ids ?? null, filter),
             clonePiContentDecisions(meta?.merged_reasoning_stripped_ids ?? null, filter),
@@ -605,9 +745,7 @@ export function copySessionStateForClone(
                 copiedToolCallIds,
                 filter,
             );
-            db.prepare(
-                "UPDATE session_meta SET trailing_blank_decisions = ? WHERE session_id = ?",
-            ).run(serializeReplayDocument(replayDocument), destinationSessionId);
+            writeReplayDocument(db, destinationSessionId, replayDocument);
         }
 
         const pendingOpsRow = db

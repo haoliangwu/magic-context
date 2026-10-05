@@ -137,12 +137,12 @@ export class PiAdapter implements HarnessAdapter {
         return "Install Pi: https://pi.coding/install (npm: @earendil-works/pi-coding-agent)";
     }
 
-    getPluginCacheInfo(): PluginCacheInfo {
+    getPluginCacheInfo(): PluginCacheInfo[] {
         // Pi doesn't have a separate user-level plugin cache the way OpenCode
         // does — it shells out to npm at install time. Reporting as "no cache"
         // means doctor --clear will skip Pi cleanup, which is the correct
         // behavior since there's nothing for us to safely clear.
-        return { path: null, exists: false, sizeBytes: 0 };
+        return [{ path: null, exists: false, sizeBytes: 0 }];
     }
 
     getLogPath(): string {

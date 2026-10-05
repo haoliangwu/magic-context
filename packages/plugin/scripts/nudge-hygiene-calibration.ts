@@ -212,7 +212,9 @@ function readHygieneTags(contextDb: Database, sessionId: string): TagEntry[] {
         tagNumber: Number(row.tag_number),
         reasoningByteSize: Number(row.reasoning_byte_size ?? 0),
         dropMode:
-            row.drop_mode === "truncated" || row.drop_mode === "edit_marker"
+            row.drop_mode === "truncated" ||
+            row.drop_mode === "skeleton_real" ||
+            row.drop_mode === "edit_marker"
                 ? row.drop_mode
                 : "full",
         toolName: row.tool_name === null ? null : String(row.tool_name),

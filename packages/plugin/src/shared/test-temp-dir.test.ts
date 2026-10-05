@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
     cleanupTestTempDir,
     createTestTempDir,
+    createTestTempDirFromPath,
     sweepStaleTestTempDirs,
     withTestTempDir,
 } from "./test-temp-dir";
@@ -21,6 +22,32 @@ function createFixtureRoot(): string {
 }
 
 describe("test temp directories", () => {
+    it("rejects labels that could escape the system temp directory", () => {
+        for (const label of [
+            "",
+            ".",
+            "..",
+            "../outside-",
+            "nested/path-",
+            "nested\\path-",
+            "nul\0-",
+        ]) {
+            expect(() => createTestTempDir(label)).toThrow("single path segments");
+        }
+    });
+    it("cleans and sweeps previously unknown labels", () => {
+        const root = createFixtureRoot();
+        const dir = createTestTempDirFromPath(join(root, "previously-unlisted-"));
+        expect(existsSync(dir)).toBe(true);
+        const old = new Date(Date.now() - 7_200_000);
+        utimesSync(dir, old, old);
+        expect(sweepStaleTestTempDirs({ tempDir: root })).toContain(dir);
+        expect(existsSync(dir)).toBe(false);
+        cleanupTestTempDir(dir);
+        const fixture = createTestTempDir("another-unlisted-");
+        fixture.cleanup();
+        expect(existsSync(fixture.dir)).toBe(false);
+    });
     it("removes a root when its fixture callback throws", () => {
         let directory = "";
 

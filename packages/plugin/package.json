@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/opencode-magic-context",
-  "version": "0.42.6",
+  "version": "0.45.0",
   "type": "module",
   "description": "OpenCode plugin for Magic Context — cross-session memory and context management",
   "main": "dist/index.js",
@@ -25,6 +25,7 @@
   "files": [
     "dist",
     "index.js",
+    "tui.js",
     "src/tui",
     "src/tui-compiled",
     "src/v2/tui",
@@ -36,20 +37,20 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun ../../scripts/check-bun.mjs && tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && rm -f dist/index.js dist/transformers-web.js dist/transformers-node-wasm.js dist/*-*.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts --outdir dist --target node --format esm --splitting --external @opencode-ai/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:sqlite --external node:sqlite && bun run build:v2 && tsc --emitDeclarationOnly",
-    "build:v2": "bun build src/v2/server.ts --outfile dist/v2/server.js --target node --format esm --external @opencode/plugin && bun test src/v2/server.test.ts",
+    "build": "bun ../../scripts/check-bun.mjs && tsc -p ../retina-local-fs/tsconfig.build.json && bun run build:tui && bun ../../scripts/clean-dist-chunks.mjs dist index.js transformers-web.js transformers-node-wasm.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/transformers-web.js --target browser --format esm --external onnxruntime-web && bun scripts/build-transformers-node-wasm.ts dist && bun build src/index.ts src/features/magic-context/memory/embedding-worker.ts src/features/magic-context/migration-worker.ts --outdir dist --entry-naming '[name].[ext]' --target node --format esm --splitting --external @opencode-ai/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:sqlite --external node:sqlite && bun run build:v2 && tsc --emitDeclarationOnly",
+    "build:v2": "bun ../../scripts/clean-dist-chunks.mjs dist/v2 server.js embedding-worker.js migration-worker.js && bun build src/features/magic-context/memory/transformers-web-entry.ts --outfile dist/v2/transformers-web.js --target browser --format esm --external onnxruntime-web && bun scripts/build-transformers-node-wasm.ts dist/v2 && bun build src/v2/server.ts src/features/magic-context/memory/embedding-worker.ts src/features/magic-context/migration-worker.ts --outdir dist/v2 --entry-naming '[name].[ext]' --target node --format esm --splitting --external @opencode/plugin --external onnxruntime-node --external onnxruntime-web --external sharp --external bun:sqlite --external node:sqlite && bun test src/v2/server.test.ts",
     "build:tui": "bun scripts/build-tui.ts",
     "check:tui-compiled": "bun run build:tui && git diff --exit-code -- src/tui-compiled && test -z \"$(git status --porcelain -- src/tui-compiled)\"",
     "check:transformers-node-wasm": "bun scripts/verify-transformers-node-wasm.ts",
     "typecheck": "tsc -p ../retina-local-fs/tsconfig.build.json && tsc --noEmit && tsc -p tsconfig.scripts.json",
-    "test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && bun test --parallel --timeout 30000",
+    "test": "bun ../../scripts/check-bun.mjs && bun install --frozen-lockfile && bun test --parallel=4 --timeout 30000",
     "test:serial": "bun install --frozen-lockfile && bun test --timeout 30000",
     "test:parallel:probe": "bun scripts/verify-parallel-db-isolation.ts",
     "lint": "bun ../../scripts/check-bun.mjs && biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "clean": "rm -rf dist",
+    "clean": "bun ../../scripts/clean-dist-chunks.mjs dist index.js embedding-worker.js migration-worker.js transformers-web.js transformers-node-wasm.js && bun ../../scripts/clean-dist-chunks.mjs dist/v2 server.js embedding-worker.js migration-worker.js transformers-web.js transformers-node-wasm.js",
     "prepublishOnly": "bun run build && bun run build:tui"
   },
   "dependencies": {
@@ -68,16 +69,17 @@
     "zod": "^4.1.8"
   },
   "optionalDependencies": {
-    "onnxruntime-node": "1.24.3",
+    "onnxruntime-node": "1.30.0",
     "sharp": "^0.35.0"
   },
   "devDependencies": {
-    "@opencode/plugin": "2.0.5",
-    "@opencode/cli": "2.0.5",
-    "@opencode/client": "2.0.5",
+    "@opencode/plugin": "2.0.22",
+    "@opencode/ai": "2.0.22",
+    "@opencode/cli": "2.0.22",
+    "@opencode/client": "2.0.22",
     "effect": "4.0.0-rc.112",
     "@ai-sdk/anthropic": "3.0.82",
-    "@huggingface/transformers": "^4.1.0",
+    "@huggingface/transformers": "^4.3.0",
     "@ai-sdk/openai-compatible": "2.0.41",
     "@biomejs/biome": "^2.5.1",
     "@types/better-sqlite3": "^7.6.13",

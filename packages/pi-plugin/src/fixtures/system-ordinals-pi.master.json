@@ -1,0 +1,83 @@
+{
+	"sourceRef": "59d2ef9c3b293b491adb39971cfd598439b98022",
+	"sourcePath": "packages/pi-plugin/src/read-session-pi.ts",
+	"sourceBlob": "06e2f4cd18fefd7ba93ddabbb7f20dde26bca237",
+	"rawMessages": [
+		{
+			"ordinal": 1,
+			"id": "s0",
+			"role": "system",
+			"parts": [],
+			"version": "s0"
+		},
+		{
+			"ordinal": 2,
+			"id": "u0",
+			"role": "user",
+			"parts": [
+				{
+					"type": "text",
+					"text": "Inspect the source file"
+				}
+			],
+			"version": "u0"
+		},
+		{
+			"ordinal": 3,
+			"id": "a0",
+			"role": "assistant",
+			"parts": [
+				{
+					"type": "tool",
+					"tool": "read",
+					"callID": "call0",
+					"state": {
+						"input": {
+							"path": "source.ts"
+						}
+					}
+				}
+			],
+			"version": "a0"
+		},
+		{
+			"ordinal": 4,
+			"id": "s1",
+			"role": "system",
+			"parts": [],
+			"version": "s1"
+		},
+		{
+			"ordinal": 5,
+			"id": "u1",
+			"role": "user",
+			"parts": [
+				{
+					"type": "tool",
+					"tool": "read",
+					"callID": "call0",
+					"state": {
+						"output": "Source contents"
+					}
+				},
+				{
+					"type": "text",
+					"text": "Explain the result"
+				}
+			],
+			"version": "u1"
+		},
+		{
+			"ordinal": 6,
+			"id": "a1",
+			"role": "assistant",
+			"parts": [
+				{
+					"type": "text",
+					"text": "The source implements a reader."
+				}
+			],
+			"version": "a1"
+		}
+	]
+}

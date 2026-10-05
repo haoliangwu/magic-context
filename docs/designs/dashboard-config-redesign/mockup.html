@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Magic Context · Config design proposal</title>
+  <style>
+    /* Keep the dashboard's palette, font stacks, radii, and 176px sidebar. */
+    :root {
+      --bg-base: #0a0a0f; --bg-panel: #13131a; --bg-card: #1c1c27;
+      --bg-hover: #252535; --bg-active: #1e1e30; --border: #2a2a3a;
+      --border-light: #333348; --text-primary: #e4e4ef; --text-secondary: #8888a0;
+      --text-muted: #555566; --accent: #3b82f6; --accent-dim: #2563eb;
+      --green: #22c55e; --amber: #f59e0b; --red: #ef4444;
+      --mono-font: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
+      --sans-font: "Inter", "Geist Sans", system-ui, -apple-system, sans-serif;
+      --radius-sm: 4px; --radius-md: 6px; --radius-lg: 8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font: 13px/1.5 var(--sans-font); color: var(--text-primary); background: var(--bg-base); -webkit-font-smoothing: antialiased; }
+    button, input, select, textarea { font: inherit; }
+    button, summary, select, input[type="checkbox"] { cursor: pointer; }
+    button { color: inherit; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    a { color: inherit; text-decoration: none; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    [hidden] { display: none !important; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    .app-shell { display: grid; grid-template-columns: 176px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) 28px; height: 100vh; }
+    .nav { background: var(--bg-panel); border: 1px solid var(--border); border-left: 0; display: flex; flex-direction: column; padding: 12px 8px; gap: 2px; }
+    .nav-item { height: 40px; display: flex; align-items: center; gap: 10px; padding: 0 12px; border: 0; background: transparent; color: var(--text-secondary); border-radius: var(--radius-md); position: relative; text-align: left; }
+    .nav-item.active { background: var(--bg-active); color: var(--accent); }
+    .nav-item.active::before { content: ""; position: absolute; left: -8px; top: 8px; bottom: 8px; width: 3px; background: var(--accent); border-radius: 0 2px 2px 0; }
+    .nav-icon { width: 20px; text-align: center; font-size: 16px; }
+    .nav-label { font-size: 12px; font-weight: 500; }
+    .nav-item:disabled { opacity: 1; cursor: default; }
+    .nav-foot { margin-top: auto; padding: 12px; font-size: 11px; color: var(--text-secondary); }
+    .content { display: flex; flex-direction: column; min-width: 0; overflow: hidden; border-top: 1px solid var(--border); }
+    .page-header { padding: 16px 24px 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); gap: 16px; }
+    h1 { font-size: 16px; font-weight: 600; }
+    .subtitle { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+    .header-actions, .scope-bar, .inline, .tabs { display: flex; align-items: center; gap: 12px; }
+    .header-actions { flex-wrap: wrap; justify-content: flex-end; }
+    .btn { padding: 6px 12px; border: 1px solid var(--border-light); border-radius: var(--radius-md); background: var(--bg-card); font-size: 12px; }
+    .btn:hover:not(:disabled) { background: var(--bg-hover); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+    .btn.quiet { background: transparent; color: var(--text-secondary); }
+    .scope-bar { padding: 12px 24px; border-bottom: 1px solid var(--border); gap: 20px; }
+    .tabs { gap: 4px; }
+    .tab { padding: 4px 12px; border: 0; border-radius: 12px; background: transparent; color: var(--text-secondary); font-size: 12px; font-weight: 500; }
+    .tab:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
+    .tab.active { background: var(--accent); color: white; }
+    .path, code, .mono { font-family: var(--mono-font); }
+    .path { font-size: 11px; color: var(--text-secondary); overflow-wrap: anywhere; }
+    .scope-note { color: var(--text-secondary); font-size: 11px; margin-left: auto; }
+    .workspace { display: grid; grid-template-columns: 188px minmax(0, 1fr); min-height: 0; flex: 1; }
+    .section-index { padding: 24px 12px 16px 20px; border-right: 1px solid var(--border); overflow: auto; }
+    .eyebrow { color: var(--text-secondary); text-transform: uppercase; font-size: 10px; font-weight: 600; letter-spacing: .08em; margin: 0 12px 12px; }
+    .section-index a { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: var(--radius-md); color: var(--text-secondary); font-size: 12px; margin-bottom: 2px; }
+    .section-index a.active { background: var(--bg-active); color: var(--accent); }
+    .section-index a:hover { background: var(--bg-hover); color: var(--text-primary); }
+    .section-index .num { font: 10px var(--mono-font); opacity: .7; }
+    .index-note { margin: 24px 12px; color: var(--text-secondary); font-size: 11px; line-height: 1.6; }
+    .scroll-area { overflow: auto; scroll-behavior: smooth; padding: 24px; }
+    .settings { max-width: 1160px; margin: 0 auto; }
+    .section { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px 20px; margin-bottom: 16px; scroll-margin-top: 24px; }
+    .section-heading { display: flex; gap: 12px; align-items: baseline; border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 4px; }
+    h2 { color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
+    .section-heading .num { color: var(--text-secondary); font: 10px var(--mono-font); }
+    .section-heading p { font-size: 11px; color: var(--text-secondary); margin-left: auto; }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 32px; }
+    .field { display: grid; grid-template-columns: minmax(0, 1fr) 156px; align-items: start; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+    .field:last-child, .fields > .field:nth-last-child(2) { border-bottom: 0; }
+    .label { font-size: 13px; font-weight: 600; display: block; }
+    .desc { font-size: 11px; line-height: 1.4; color: var(--text-secondary); display: block; margin-top: 4px; }
+    .field-copy { min-width: 0; }
+    .key { display: none; color: var(--text-secondary); font: 10px/1.5 var(--mono-font); overflow-wrap: anywhere; margin-top: 3px; font-weight: 400; }
+    .show-keys .key { display: block; }
+    .input { width: 100%; padding: 6px 10px; font: 12px/1.5 var(--mono-font); color: var(--text-primary); background: var(--bg-base); border: 1px solid var(--border); border-radius: var(--radius-sm); min-width: 0; }
+    .input:focus { border-color: var(--accent); outline: none; }
+    .input::placeholder { color: var(--text-secondary); opacity: .8; font-size: 11px; }
+    textarea.input { resize: vertical; min-height: 74px; }
+    .switch { display: inline-flex; align-items: center; gap: 8px; position: relative; min-height: 31px; font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+    .switch input { position: absolute; width: 32px; height: 20px; opacity: 0; }
+    .switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 3px; }
+    .slider { display: block; width: 32px; height: 18px; background: var(--border-light); border-radius: 10px; position: relative; flex-shrink: 0; transition: background 150ms ease; }
+    .slider::before { content: ""; width: 12px; height: 12px; position: absolute; top: 3px; left: 3px; border-radius: 50%; background: var(--text-primary); transition: transform 150ms ease; }
+    .switch input:checked + .slider { background: var(--accent); }
+    .switch input:checked + .slider::before { transform: translateX(14px); }
+    .inherited { font-size: 10px; color: var(--text-secondary); display: block; margin-top: 4px; }
+    .restart { color: var(--amber); border: 1px solid #59401f; border-radius: var(--radius-sm); padding: 1px 5px; font-size: 9px; font-weight: 500; display: inline-block; vertical-align: middle; margin-left: 6px; white-space: nowrap; }
+    .help { color: var(--text-secondary); font-size: 11px; margin-top: 4px; }
+    .help summary { width: fit-content; }
+    .help p { margin-top: 6px; line-height: 1.5; }
+    .defaults { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 20px; padding: 14px 0 4px; }
+    .default-field .input { margin-top: 8px; }
+    .default-field .desc { min-height: 32px; }
+    .overrides { border-top: 1px solid var(--border); margin-top: 8px; }
+    .overrides > summary { padding: 14px 0 4px; font-size: 12px; }
+    .count { margin-left: 8px; color: var(--text-secondary); font-size: 11px; font-weight: 400; }
+    .table-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; }
+    .table-toolbar p, .table-note { font-size: 11px; color: var(--text-secondary); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; }
+    caption { text-align: left; font-size: 12px; font-weight: 600; padding: 4px 0 12px; }
+    th { color: var(--text-secondary); font-size: 10px; font-weight: 500; padding: 8px; border-bottom: 1px solid var(--border-light); vertical-align: top; }
+    td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; font-size: 12px; }
+    tbody tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: var(--bg-active); }
+    .model-table { table-layout: fixed; min-width: 880px; }
+    .model-table th:first-child { width: 42%; }
+    .model-table th:last-child { width: 40px; }
+    .model-table .input { padding: 4px 8px; font-size: 11px; }
+    .model-name { font: 11px var(--mono-font); overflow-wrap: anywhere; }
+    .review-tag { font: 9px var(--sans-font); color: var(--text-secondary); border: 1px solid var(--border-light); border-radius: var(--radius-sm); padding: 1px 4px; margin-left: 8px; white-space: nowrap; }
+    .icon-btn { border: 0; background: transparent; color: var(--text-secondary); border-radius: var(--radius-sm); padding: 4px 6px; font-size: 13px; }
+    .icon-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+    .subheading { color: var(--text-secondary); font-size: 11px; font-weight: 600; margin: 18px 0 4px; }
+    .wide { grid-column: 1 / -1; }
+    .wide.field { grid-template-columns: minmax(0, 1fr) minmax(260px, 48%); }
+    .subsection { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 4px; }
+    .embedding-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 24px; padding: 12px 0; }
+    .embedding-grid .input { margin-top: 6px; }
+    .model-scope { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; }
+    .scope-label { font-size: 11px; color: var(--text-secondary); }
+    .agent-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .agent-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 16px; min-width: 0; }
+    h3 { font-size: 12px; font-weight: 600; margin-bottom: 12px; }
+    .agent-card .input { margin-top: 6px; font-size: 11px; }
+    .qualifiers { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+    .qualifiers .label { font-size: 11px; }
+    .fallback { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+    .fallback-row { display: grid; grid-template-columns: minmax(0, 1fr) 26px; gap: 8px; align-items: center; }
+    .fallback-row .input { grid-column: 1; }
+    .fallback-row .icon-btn { grid-column: 2; grid-row: 1; margin-top: 6px; }
+    .table-note { padding: 10px 0 2px; }
+    .task-table { table-layout: fixed; min-width: 900px; }
+    .task-table th:nth-child(1) { width: 36%; }
+    .task-table th:nth-child(2) { width: 21%; }
+    .task-table th:nth-child(3) { width: 37%; }
+    .task-table th:nth-child(4) { width: 6%; }
+    .task-table td { padding: 9px 8px; }
+    .task-table .label { font-size: 12px; }
+    .task-table .desc { font-size: 10px; }
+    .task-table .input { font-size: 10px; padding: 6px 8px; }
+    .schedule-btn { border: 0; border-bottom: 1px dotted var(--border-light); background: transparent; color: var(--text-primary); text-align: left; font-size: 11px; padding: 3px 0; }
+    .schedule-btn:hover { color: var(--accent); }
+    .schedule-btn::after { content: " ⌄"; color: var(--text-secondary); }
+    .task-detail td { background: var(--bg-panel); padding: 12px 16px; }
+    .task-edit-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px; }
+    .task-edit-grid .input { font-size: 12px; margin-top: 6px; }
+    .task-edit-grid .label { font-size: 11px; }
+    .status-bar { grid-column: 1 / -1; border-top: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 0 12px; background: var(--bg-panel); font: 10px var(--mono-font); color: var(--text-secondary); }
+    dialog { width: min(560px, calc(100vw - 32px)); max-height: 80vh; margin: auto; padding: 24px; color: var(--text-primary); background: var(--bg-panel); border: 1px solid var(--border-light); border-radius: var(--radius-lg); }
+    dialog::backdrop { background: #0009; }
+    dialog h2 { font-size: 13px; text-transform: none; letter-spacing: 0; margin-bottom: 12px; }
+    dialog p { color: var(--text-secondary); font-size: 12px; margin-bottom: 12px; }
+    dialog ul { list-style: none; max-height: 35vh; overflow: auto; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 16px; }
+    dialog li { padding: 4px 0; font: 11px var(--mono-font); }
+    dialog .inline { justify-content: flex-end; }
+    .notice { padding: 8px 0; font-size: 11px; color: var(--text-secondary); }
+    @media (prefers-reduced-motion: reduce) { .scroll-area { scroll-behavior: auto; } .slider, .slider::before { transition: none; } }
+    @media (max-width: 1150px) { .fields, .agent-grid { grid-template-columns: 1fr; } .defaults { grid-template-columns: 1fr 1fr; } .field { grid-template-columns: minmax(0, 1fr) 180px; } .section-heading p { max-width: 50%; text-align: right; } }
+    @media (max-width: 800px) {
+      .app-shell { grid-template-columns: 56px minmax(0, 1fr); }
+      .nav { padding: 12px 4px; } .nav-item { padding: 0 8px; } .nav-label, .nav-foot { display: none; }
+      .workspace { grid-template-columns: 1fr; } .section-index { display: flex; padding: 8px; gap: 4px; border-bottom: 1px solid var(--border); overflow-x: auto; }
+      .section-index a { flex-shrink: 0; margin: 0; padding: 6px 8px; } .section-index .eyebrow, .index-note, .section-index .num { display: none; }
+      .scroll-area { padding: 12px; } .page-header { padding: 12px; } .scope-bar { padding: 10px 12px; flex-wrap: wrap; gap: 8px; }
+      .scope-note { display: none; } .section { padding: 12px; } .section-heading p { display: none; }
+      .embedding-grid { grid-template-columns: 1fr; } .wide.field { grid-template-columns: minmax(0, 1fr) 180px; }
+      .status-bar span:last-child { display: none; } .model-scope { align-items: flex-start; flex-wrap: wrap; }
+    }
+    @media (max-width: 540px) { .field, .wide.field { grid-template-columns: 1fr; } .defaults { grid-template-columns: 1fr; } .header-actions .btn { display: none; } .path { width: 100%; } }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <nav class="nav" aria-label="Dashboard">
+      <button class="nav-item" disabled title="Projects is outside this Config-only proposal"><span class="nav-icon" aria-hidden="true">📁</span><span class="nav-label">Projects</span></button>
+      <button class="nav-item" disabled title="Workspaces is outside this Config-only proposal"><span class="nav-icon" aria-hidden="true">🗂️</span><span class="nav-label">Workspaces</span></button>
+      <button class="nav-item" disabled title="Cache is outside this Config-only proposal"><span class="nav-icon" aria-hidden="true">📊</span><span class="nav-label">Cache</span></button>
+      <button class="nav-item" disabled title="User Directives is outside this Config-only proposal"><span class="nav-icon" aria-hidden="true">👤</span><span class="nav-label">User Directives</span></button>
+      <button class="nav-item active" aria-current="page"><span class="nav-icon" aria-hidden="true">⚙️</span><span class="nav-label">Config</span></button>
+      <button class="nav-item" disabled title="Logs is outside this Config-only proposal"><span class="nav-icon" aria-hidden="true">📋</span><span class="nav-label">Logs</span></button>
+      <div class="nav-foot">Magic Context<br>Design proposal</div>
+    </nav>
+    <main class="content">
+      <header class="page-header">
+        <div><h1>Config</h1><p class="subtitle">Your defaults, grouped by what they control.</p></div>
+        <div class="header-actions">
+          <label class="inline subtitle"><input id="show-keys" type="checkbox"> Show config keys</label>
+          <button class="btn primary" disabled title="Design proposal only. Nothing is saved to your config.">Save Changes</button>
+        </div>
+      </header>
+      <div class="scope-bar">
+        <div class="tabs" aria-label="Configuration scope"><button class="tab active" aria-current="true">User Config</button><button class="tab" disabled title="Project configuration is outside this proposal">Project Configs</button></div>
+        <span class="path">~/.config/cortexkit/magic-context.jsonc</span>
+        <span class="scope-note">Local preview · edits are not saved</span>
+      </div>
+      <div class="workspace">
+        <nav class="section-index" aria-label="Config sections">
+          <p class="eyebrow">On this page</p>
+          <a href="#general" class="active"><span class="num">01</span>General</a>
+          <a href="#context"><span class="num">02</span>Context window</a>
+          <a href="#history"><span class="num">03</span>History</a>
+          <a href="#memory"><span class="num">04</span>Memory &amp; search</a>
+          <a href="#models"><span class="num">05</span>Background models</a>
+          <a href="#schedule"><span class="num">06</span>Dreamer schedule</a>
+          <a href="#prompt"><span class="num">07</span>Prompt surface</a>
+          <a href="#advanced"><span class="num">08</span>Advanced</a>
+          <p class="index-note">Blank inputs inherit a default.<br><br>Only restart-sensitive settings are badged. No wall of “Live” labels.</p>
+        </nav>
+        <div class="scroll-area" id="scroller">
+          <div class="settings">
+            <noscript><p class="notice">Enable JavaScript for model tables, harness tabs, and schedule editors. This page never saves or sends your changes.</p></noscript>
+            <section class="section" id="general" aria-labelledby="general-title">
+              <div class="section-heading"><span class="num">01</span><h2 id="general-title">General</h2><p>Plugin behavior · user-level configuration</p></div>
+              <div class="fields">
+                <div class="field"><div class="field-copy"><label class="label" for="enabled">Enabled</label><code class="key">enabled</code><p class="desc">Enable the magic-context plugin</p></div><label class="switch"><input id="enabled" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+                <div class="field"><div class="field-copy"><label class="label" for="home-project">Allow Home Directory Sessions</label><code class="key">allow_home_project</code><p class="desc">Allow sessions started exactly from your home directory to use a durable Magic Context project identity. User-level only.</p></div><div><label class="switch"><input id="home-project" type="checkbox"><span class="slider"></span><span>Disabled</span></label><span class="inherited">Default: off</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="language">Output Language</label><code class="key">language</code><p class="desc">Optional user-level output language for Magic Context generated prose and guidance, as a 2-letter ISO 639-1 code (e.g. tr, es, de, ja). Leave blank to keep today's behavior.</p></div><input class="input" id="language" placeholder="No language override"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="toasts">Toast Duration (ms)</label><code class="key">toast_duration_ms</code><p class="desc">How long Magic Context TUI toasts stay visible.</p></div><input class="input" type="number" id="toasts" placeholder="Default: 5000" min="0" max="60000"></div>
+              </div>
+            </section>
+            <section class="section" id="context" aria-labelledby="context-title">
+              <div class="section-heading"><span class="num">02</span><h2 id="context-title">Context window</h2><p>Defaults first · model exceptions tucked away</p></div>
+              <div class="defaults">
+                <div class="default-field"><label class="label" for="ttl">Cache TTL</label><code class="key">cache_ttl.default</code><p class="desc">Provider prompt-cache lifetime that Magic Context assumes.</p><input class="input" id="ttl" value="5m" placeholder="Default: 5m"><details class="help"><summary>How it works</summary><p>This is Magic Context's deferral gate; it does not change the provider's actual cache lifetime. Use a duration or “never” to keep the prefix warm.</p></details></div>
+                <div class="default-field"><label class="label" for="execute-percent">Execute Threshold %</label><code class="key">execute_threshold_percentage.default</code><p class="desc">Context usage percentage (20–90) at which queued drops execute. The safe-window cap is 90%.</p><input class="input" type="number" id="execute-percent" value="75" placeholder="Default: 65" min="20" max="90"></div>
+                <div class="default-field"><label class="label" for="execute-tokens">Execute Threshold (tokens)</label><code class="key">execute_threshold_tokens.default</code><p class="desc">Optional absolute-tokens threshold. When set for a model, overrides the percentage above.</p><input class="input" type="number" id="execute-tokens" placeholder="Unset: use percentage" min="5000" max="2000000"><details class="help"><summary>Threshold details</summary><p>Per-model map only (use 'default' key for a fallback across all unlisted models). Clamped to 90% × context_limit at runtime.</p></details></div>
+                <div class="default-field"><label class="label" for="output-reserve">Output Reserve</label><code class="key">output_reserve</code><p class="desc">Reserve output tokens from the shared context window. Set 0 to disable the reservation. User-level only.</p><input class="input" type="number" id="output-reserve" placeholder="Derived from model window" min="0"></div>
+              </div>
+              <div class="fields">
+                <div class="field"><div class="field-copy"><label class="label" for="protected">Protected tokens</label><code class="key">protected_tokens</code><p class="desc">Absolute token floor protected from automatic reclaim (4,000–1,000,000). Leave blank to derive it from the model's usable context window. User-level only.</p></div><input class="input" type="number" id="protected" value="30000" placeholder="Derived from model window" min="4000" max="1000000"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="reasoning">Clear Reasoning Age</label><code class="key">clear_reasoning_age</code><p class="desc">Reasoning blocks older than N tags are removed whole, only on passes that already rebuild the cache.</p></div><input class="input" type="number" id="reasoning" value="30" placeholder="Default: 50" min="10"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="compaction">Compaction Management <span class="restart">Restart</span></label><code class="key">compaction.enabled</code><p class="desc">Let Magic Context manage the context window. Turn this off to keep memory and search features while native compaction (or nothing) owns the window.</p><details class="help"><summary>Scope</summary><p>Requires a restart and applies only to user configuration.</p></details></div><div><label class="switch"><input id="compaction" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="smart-drops">Smart Drops</label><code class="key">smart_drops</code><p class="desc">Experimental: content-aware reclaim of provably-superseded tool output, on top of the existing auto-drop.</p><details class="help"><summary>What gets reclaimed</summary><p>Drops superseded todowrite, spent ctx_reduce, and zero-value status outputs, and compresses older edits to a file while keeping the newest. Only acts on passes already busting the cache, so it never causes a cache bust on its own. Off by default while cache stability is being proven.</p></details></div><label class="switch"><input id="smart-drops" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+              </div>
+              <details class="overrides" id="overrides">
+                <summary>Per-model overrides <span class="count">19 models · 13 older-model review candidates</span></summary>
+                <div class="table-toolbar"><p>Blank cells use the defaults above. “Review” is a manual design annotation, not a usage check.</p><button class="btn quiet" id="review-overrides">Remove unused overrides…</button></div>
+                <div class="table-wrap"><table class="model-table"><caption>All model exceptions, in one place</caption><thead><tr><th scope="col">Model</th><th scope="col">Cache TTL<code class="key">cache_ttl</code></th><th scope="col">Execute Threshold %<code class="key">execute_threshold_percentage</code></th><th scope="col">Execute Threshold (tokens)<code class="key">execute_threshold_tokens</code></th><th scope="col">Output Reserve<code class="key">output_reserve</code></th><th scope="col"><span aria-label="Remove row">×</span></th></tr></thead><tbody id="override-rows"></tbody></table></div>
+                <div class="inline table-note"><span id="override-status" role="status">19 models with explicit overrides. No usage history is available in this mockup.</span><button class="btn quiet" id="reset-overrides" hidden>Undo preview removal</button></div>
+              </details>
+            </section>
+            <section class="section" id="history" aria-labelledby="history-title">
+              <div class="section-heading"><span class="num">03</span><h2 id="history-title">History</h2><p>Shared across harnesses · model selection lives below</p></div>
+              <div class="fields">
+                <div class="field"><div class="field-copy"><label class="label" for="history-budget">History Budget %</label><code class="key">history_budget_percentage</code><p class="desc">Fraction of context limit reserved for rendered history (0.0–1.0).</p></div><input class="input" type="number" id="history-budget" placeholder="Default: 0.15" min="0.05" max="0.5" step="0.01"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="historian-timeout">Historian Timeout (ms)</label><code class="key">historian_timeout_ms</code><p class="desc">Max wait time for a historian run before timeout.</p></div><input class="input" type="number" id="historian-timeout" value="600000" placeholder="Default: 600000" min="60000"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="cluster-trigger">Commit Cluster Trigger</label><code class="key">commit_cluster_trigger.enabled</code><p class="desc">Fire historian when enough git commit clusters accumulate in the unsummarized conversation tail.</p><details class="help"><summary>What is a cluster?</summary><p>A commit cluster is a distinct work phase where the agent made git commits, separated by meaningful user turns.</p></details></div><div><label class="switch"><input id="cluster-trigger" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="min-clusters">Min Clusters</label><code class="key">commit_cluster_trigger.min_clusters</code><p class="desc">Minimum number of commit clusters required to trigger historian</p></div><input class="input" type="number" id="min-clusters" placeholder="Default: 3" min="1"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="temporal">Temporal Awareness</label><code class="key">temporal_awareness</code><p class="desc">Inject elapsed-time markers (e.g. +12m, +3d 4h) between user messages with &gt;5 min gaps.</p><details class="help"><summary>History rendering details</summary><p>Add start-date/end-date attributes on rendered compartments. Helps the agent reason about session pacing across long-running and multi-day sessions. On by default.</p></details></div><label class="switch"><input id="temporal" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+                <div class="field"><div class="field-copy"><label class="label" for="compression">Caveman Text Compression</label><code class="key">caveman_text_compression.enabled</code><p class="desc">Age-tiered compression for long user/assistant text parts.</p><details class="help"><summary>Compression policy</summary><p>Active for primary sessions when enabled; subagents are excluded because their context is curated by the parent. Outside the protected tail, oldest 20% of eligible tags get ultra compression, next 20% full, next 20% lite, newest 40% untouched. Always compresses from the original source, so depth shifts are equivalent to compressing the original text directly. Off by default.</p></details></div><label class="switch"><input id="compression" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+                <div class="field"><div class="field-copy"><label class="label" for="min-chars">Min Chars</label><code class="key">caveman_text_compression.min_chars</code><p class="desc">Text parts shorter than this are left untouched. Range 100–10000, default 500.</p></div><input class="input" type="number" id="min-chars" value="250" placeholder="Default: 500" min="100" max="10000"></div>
+              </div>
+            </section>
+            <section class="section" id="memory" aria-labelledby="memory-title">
+              <div class="section-heading"><span class="num">04</span><h2 id="memory-title">Memory &amp; search</h2><p>Recall, retrieval, embeddings, and the mural</p></div>
+              <div class="fields">
+                <div class="field"><div class="field-copy"><label class="label" for="memory-enabled">Memory Enabled</label><code class="key">memory.enabled</code><p class="desc">Enable cross-session project memory.</p></div><div><label class="switch"><input id="memory-enabled" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="injection-budget">Injection Budget (tokens)</label><code class="key">memory.injection_budget_tokens</code><p class="desc">Max tokens for memory injection into session history.</p></div><input class="input" type="number" id="injection-budget" value="15000" placeholder="Default: 4000" min="500"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="auto-promote">Auto Promote</label><code class="key">memory.auto_promote</code><p class="desc">Automatically promote session facts to project memory.</p></div><div><label class="switch"><input id="auto-promote" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="retrieval-threshold">Retrieval Count Promotion Threshold</label><code class="key">memory.retrieval_count_promotion_threshold</code><p class="desc">Minimum ctx_search retrieval count before a session fact is auto-promoted to project memory.</p></div><input class="input" type="number" id="retrieval-threshold" placeholder="Default: 3" min="1"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="auto-search">Auto Search Hint</label><code class="key">memory.auto_search.enabled</code><p class="desc">On each new user message, run ctx_search in the background and append a compact &lt;ctx-search-hint&gt; block of vague fragments when the top hit clears the score threshold.</p><details class="help"><summary>Hint behavior</summary><p>Does NOT inject full content — just nudges the agent to run ctx_search for the real result if relevant. Adds one embedding round-trip per new user turn. On by default.</p></details></div><label class="switch"><input id="auto-search" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+                <div class="field"><div class="field-copy"><label class="label" for="search-score">Score Threshold</label><code class="key">memory.auto_search.score_threshold</code><p class="desc">Minimum top-hit score for the hint to fire. Higher = fewer but more relevant hints. Range 0.30–0.95.</p></div><input class="input" type="number" id="search-score" placeholder="Default: 0.6" min="0.3" max="0.95" step="0.05"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="prompt-chars">Min Prompt Chars</label><code class="key">memory.auto_search.min_prompt_chars</code><p class="desc">Skip the hint when a user message is shorter than this. Avoids embedding cost on trivial replies. Range 5–500, default 20.</p></div><input class="input" type="number" id="prompt-chars" value="20" placeholder="Default: 20" min="5" max="500"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="git-indexing">Git Commit Indexing</label><code class="key">memory.git_commit_indexing.enabled</code><p class="desc">Index HEAD non-merge commits into ctx_search as a 4th source alongside memories, facts, and message history.</p><details class="help"><summary>Why index commits?</summary><p>Useful for agents recalling regressions, prior fixes, and decisions without running git log manually. Off by default.</p></details></div><label class="switch"><input id="git-indexing" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+                <div class="field"><div class="field-copy"><label class="label" for="history-window">History Window (days)</label><code class="key">memory.git_commit_indexing.since_days</code><p class="desc">Days of HEAD history to index. Older commits are excluded from search. Range 7–3650, default 365.</p></div><input class="input" type="number" id="history-window" value="365" placeholder="Default: 365" min="7" max="3650"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="max-commits">Max Commits</label><code class="key">memory.git_commit_indexing.max_commits</code><p class="desc">Maximum commits kept per project. Oldest evicted when the cap is reached. Range 100–20000, default 2000.</p></div><input class="input" type="number" id="max-commits" placeholder="Default: 2000" min="100" max="20000"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="mural-enabled">Mural Enabled</label><code class="key">mural.enabled</code><p class="desc">Render a deterministic image of project memories that did not fit the context budget.</p></div><label class="switch"><input id="mural-enabled" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+              </div>
+              <div class="subsection">
+                <h3 class="subheading">Embedding · user-level only</h3>
+                <div class="embedding-grid">
+                  <div><label class="label" for="embedding-provider">Embedding Provider</label><code class="key">embedding.provider</code><p class="desc">Provider for memory semantic search</p><select class="input" id="embedding-provider"><option value="local">Local</option><option value="openai-compatible" selected>OpenAI Compatible</option><option value="off">Off</option></select></div>
+                  <div class="remote-embedding"><label class="label" for="embedding-model">Model</label><code class="key">embedding.model</code><p class="desc">Embedding model name (e.g., text-embedding-3-small)</p><input class="input" id="embedding-model" value="qwen/qwen3-embedding-8b" placeholder="text-embedding-3-small"></div>
+                  <div class="remote-embedding"><label class="label" for="embedding-endpoint">Endpoint</label><code class="key">embedding.endpoint</code><p class="desc">API endpoint URL</p><input class="input" id="embedding-endpoint" value="https://openrouter.ai/api/v1" placeholder="https://api.openai.com/v1"></div>
+                  <div class="remote-embedding"><label class="label" for="embedding-key">API Key</label><code class="key">embedding.api_key</code><p class="desc">Authentication key for the embedding API</p><input class="input" id="embedding-key" value="••••••••••••••••" readonly aria-label="API Key, masked placeholder; actual credential is not included"></div>
+                  <div id="local-embedding" hidden><label class="label" for="embedding-dtype">Model dtype</label><code class="key">embedding.local_dtype</code><p class="desc">ONNX dtype for the local embedding model. The default fp32 keeps today's behavior; quantized choices use less memory.</p><select class="input" id="embedding-dtype"><option>fp32</option><option>auto</option><option>fp16</option><option>q8</option><option>int8</option><option>uint8</option><option>q4</option><option>bnb4</option><option>q4f16</option><option>q2</option><option>q2f16</option><option>q1</option><option>q1f16</option></select><p class="desc">Uses Xenova/all-MiniLM-L6-v2 locally — no configuration needed</p></div>
+                </div>
+                <button class="btn quiet remote-embedding" disabled title="No network requests are made by this mockup">Test Connection · unavailable in preview</button>
+              </div>
+            </section>
+            <section class="section" id="models" aria-labelledby="models-title">
+              <div class="section-heading"><span class="num">05</span><h2 id="models-title">Background models</h2><p>Model choices only · no global settings inside tabs</p></div>
+              <div class="model-scope"><div class="tabs harness-tabs" role="tablist" aria-label="Background model harness" data-target="model-panels"><button class="tab active" id="model-tab-opencode" role="tab" aria-selected="true" aria-controls="models-opencode" data-harness="opencode">OpenCode</button><button class="tab" id="model-tab-pi" role="tab" aria-selected="false" aria-controls="models-pi" data-harness="pi" tabindex="-1">Pi</button><button class="tab" id="model-tab-omp" role="tab" aria-selected="false" aria-controls="models-omp" data-harness="omp" tabindex="-1">OMP</button></div><span class="scope-label">Each harness has its own primary model, qualifier, and fallback chain.</span></div>
+              <div id="model-panels"></div>
+              <div class="subsection"><h3 class="subheading">Shared across harnesses · mural</h3><div class="field wide"><div class="field-copy"><label class="label" for="cue-model">Cue Compressor Model</label><code class="key">mural.model</code><p class="desc">Model used to compress each memory into a mural cue. The mural image itself is rendered deterministically.</p></div><input class="input" id="cue-model" value="google/antigravity-gemini-3.8-flash" placeholder="Use built-in cue model"></div></div>
+            </section>
+            <section class="section" id="schedule" aria-labelledby="schedule-title">
+              <div class="section-heading"><span class="num">06</span><h2 id="schedule-title">Dreamer schedule</h2><p>Schedules are global · task model overrides are per-harness</p></div>
+              <div class="fields">
+                <div class="field"><div class="field-copy"><label class="label" for="dreamer-enabled">Dreamer agent enabled</label><code class="key">dreamer.disable (inverted)</code><p class="desc">Controls whether the Dreamer hidden agent is registered. To keep manual /ctx-dream but disable automatic runs, leave enabled and set Schedule to empty.</p></div><div><label class="switch"><input id="dreamer-enabled" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="inject-docs">Inject Docs</label><code class="key">dreamer.inject_docs</code><p class="desc">Inject ARCHITECTURE.md and STRUCTURE.md into agent context</p></div><label class="switch"><input id="inject-docs" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+              </div>
+              <div class="model-scope"><div class="tabs harness-tabs" role="tablist" aria-label="Dreamer task model harness" data-target="task-panels"><button class="tab active" id="task-tab-opencode" role="tab" aria-selected="true" aria-controls="tasks-opencode" data-harness="opencode">OpenCode</button><button class="tab" id="task-tab-pi" role="tab" aria-selected="false" aria-controls="tasks-pi" data-harness="pi" tabindex="-1">Pi</button><button class="tab" id="task-tab-omp" role="tab" aria-selected="false" aria-controls="tasks-omp" data-harness="omp" tabindex="-1">OMP</button></div><span class="scope-label">Tabs change model overrides only. Blank model = this harness's Dreamer model.</span></div>
+              <p class="table-note">Click a schedule to edit cron, task qualifiers, and promotion thresholds. Off means an empty schedule, not a separate enable flag.</p>
+              <code class="key">dreamer.tasks / dreamer.&lt;harness&gt;.tasks</code>
+              <div id="task-panels"></div>
+            </section>
+            <section class="section" id="prompt" aria-labelledby="prompt-title">
+              <div class="section-heading"><span class="num">07</span><h2 id="prompt-title">Prompt surface</h2><p>Guidance, routing, and tool descriptions</p></div>
+              <div class="fields">
+                <div class="field"><div class="field-copy"><label class="label" for="system-injection">System Prompt Injection</label><code class="key">system_prompt_injection.enabled</code><p class="desc">Inject the magic-context guidance text into the system prompt. On by default. Disabling it stops the guidance block entirely.</p><details class="help"><summary>Custom agent exclusions</summary><p>To exclude only specific custom agents, set system_prompt_injection.skip_signatures (a substring list) in the raw editor.</p></details></div><div><label class="switch"><input id="system-injection" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="default-preset">Default preset</label><code class="key">prompt_surface.default</code><p class="desc">Choose the built-in full or light preset.</p></div><select class="input" id="default-preset"><option selected>full</option><option>light</option></select></div>
+                <div class="field wide"><div class="field-copy"><label class="label" for="model-routes">Model routes</label><code class="key">prompt_surface.models</code><p class="desc">JSON object of provider/model or provider/* keys to full or light. Leave empty for default routing.</p><p class="desc">Model routes use the literal provider/model or provider/* form and are case-sensitive; additional slashes in model IDs are preserved.</p></div><textarea class="input" id="model-routes" placeholder="No model routes · {}" spellcheck="false"></textarea></div>
+                <div class="field wide"><div class="field-copy"><label class="label" for="guidance-path">Guidance override path</label><code class="key">prompt_surface.guidance_override_path</code><p class="desc">User-only path to a complete primary guidance section. Relative paths resolve from the user config file.</p></div><input class="input" id="guidance-path" placeholder="No override · path/to/guidance.md"></div>
+                <div class="field wide"><div class="field-copy"><label class="label" for="tool-descriptions">Tool-description overrides</label><code class="key">prompt_surface.tool_descriptions</code><p class="desc">User-only JSON object keyed by tool ID. Only top-level descriptions change; IDs, parameter schemas, and parameter descriptions remain fixed.</p></div><textarea class="input" id="tool-descriptions" placeholder="No tool-description overrides · {}" spellcheck="false"></textarea></div>
+              </div>
+            </section>
+            <section class="section" id="advanced" aria-labelledby="advanced-title">
+              <div class="section-heading"><span class="num">08</span><h2 id="advanced-title">Advanced</h2><p>Storage, harness plumbing, and debugging</p></div>
+              <div class="fields">
+                <div class="field"><div class="field-copy"><label class="label" for="sqlite-cache">SQLite Cache (MB)</label><code class="key">sqlite.cache_size_mb</code><p class="desc">Per-connection page-cache size in MB. Higher reduces disk reads on large databases at the cost of memory. Range 8–1024, default 64.</p></div><input class="input" type="number" id="sqlite-cache" value="1024" placeholder="Default: 64" min="8" max="1024"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="sqlite-mmap">SQLite mmap (MB)</label><code class="key">sqlite.mmap_size_mb</code><p class="desc">Memory-mapped I/O size in MB. 0 disables mmap. Can speed up large reads on some filesystems. Range 0–4096, default 0.</p></div><input class="input" type="number" id="sqlite-mmap" value="4096" placeholder="Default: 0" min="0" max="4096"></div>
+                <div class="field"><div class="field-copy"><label class="label" for="private-permissions">Private Storage Permissions</label><code class="key">storage.enforce_private_permissions</code><p class="desc">Keep Magic Context directories owner-only (0700) and files owner-only (0600). Disable only when a trusted group manages permissions externally.</p></div><div><label class="switch"><input id="private-permissions" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="auto-update">Auto Update</label><code class="key">auto_update</code><p class="desc">Automatically self-update the OpenCode plugin to the latest published version on startup. On by default. (User-config only — project configs cannot change it.)</p></div><div><label class="switch"><input id="auto-update" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field"><div class="field-copy"><label class="label" for="keep-subagents">Keep Subagent Sessions</label><code class="key">keep_subagents</code><p class="desc">Retain the child sessions magic-context spawns for its own agents (historian, dreamer, memory migration, key-files, user-memory).</p><details class="help"><summary>Retention behavior</summary><p>By default these are deleted on success; enable this to keep their full transcript and token usage for debugging. Kept sessions accumulate until cleared. Off by default.</p></details></div><label class="switch"><input id="keep-subagents" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label></div>
+                <div class="field"><div class="field-copy"><label class="label" for="pi-todowrite">Pi Todowrite Tool <span class="restart">Reload / restart</span></label><code class="key">todowrite.enabled</code><p class="desc">Register Magic Context's Pi todowrite task-list tool. Disable this if you use another Pi todo extension.</p><details class="help"><summary>Harness scope</summary><p>OpenCode has its own built-in todowrite, so this setting only affects Pi. Requires /reload or restart after changing.</p></details></div><label class="switch"><input id="pi-todowrite" type="checkbox"><span class="slider"></span><span>Disabled</span></label></div>
+                <div class="field" id="todo-overlay-field" hidden><div class="field-copy"><label class="label" for="todo-overlay">Pi Todo Overlay <span class="restart">Reload / restart</span></label><code class="key">todowrite.overlay</code><p class="desc">Show the persistent todo overlay above the editor while tasks are active. The /todos command and tool remain available when only the overlay is off.</p></div><div><label class="switch"><input id="todo-overlay" type="checkbox" checked><span class="slider"></span><span>Enabled</span></label><span class="inherited">Default: on</span></div></div>
+                <div class="field wide"><div class="field-copy"><label class="label" for="pi-extensions">Pi Subagent Extensions</label><code class="key">pi.subagent_extensions</code><p class="desc">Optional user-level allowlist for extensions loaded by Pi subagent children. Enter one extension path or package per line.</p></div><textarea class="input" id="pi-extensions" rows="5" spellcheck="false">../../Work/Projects/CortexKit/anthropic-auth/packages/pi
+../../Work/Projects/CortexKit/antigravity-auth/packages/pi/dist
+npm:pi-ollama-cloud</textarea></div>
+              </div>
+            </section>
+            <p class="notice">Design proposal only. Inputs are editable to explore the layout; reload this file to reset. No config writes, model lookups, or network requests.</p>
+          </div>
+        </div>
+      </div>
+    </main>
+    <footer class="status-bar"><span id="preview-status" role="status">Magic Context · Config design proposal</span><span>Local preview only · credentials omitted · no persistence</span></footer>
+  </div>
+  <dialog id="review-dialog" aria-labelledby="review-title">
+    <h2 id="review-title">Review older-model overrides</h2>
+    <p>These 13 entries look retired based on the supplied model list. The mockup has no catalog or usage data, so it cannot know that they are unused. Removing them below is a browser-only preview, not a recommendation to delete them from your config.</p>
+    <ul id="review-list"></ul>
+    <div class="inline"><button class="btn quiet" id="cancel-review">Keep overrides</button><button class="btn" id="preview-removal">Preview removal</button></div>
+  </dialog>
+  <script>
+    // The snapshot contains only the fields being demonstrated, never the user credential.
+    const $ = (selector, root = document) => root.querySelector(selector);
+    const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+    const escape = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const key = path => `<code class="key">${escape(path)}</code>`;
+    const control = (id, label, value = '', placeholder = 'Use harness default') => `<input class="input" id="${escape(id)}" aria-label="${escape(label)}" value="${escape(value)}" placeholder="${escape(placeholder)}">`;
+    const switchControl = (id, label, checked) => `<label class="switch"><input id="${id}" type="checkbox" aria-label="${escape(label)}" ${checked ? 'checked' : ''}><span class="slider"></span></label>`;
+    const overrides = [
+      ['anthropic/claude-opus-4-8','never','',true], ['anthropic/claude-opus-4-7','never','',true],
+      ['anthropic/claude-sonnet-4-6','never','',true], ['anthropic/claude-opus-4-6','never','',true],
+      ['anthropic/claude-fable-5','never','',true], ['openai/gpt-5.5','60m',90,true],
+      ['openai/gpt-5.5-fast','60m',90,true], ['openai/gpt-5.6-sol','90m',90,true],
+      ['openai/gpt-5.6-sol-fast','90m',90,true], ['openai/gpt-5.6-luna-fast','90m',90,true],
+      ['openai/gpt-5.6-terra-fast','90m',90,true], ['openai/gpt-5.6-terra','90m',90,true],
+      ['openai/gpt-5.6-luna','90m',90,true], ['anthropic/claude-opus-5','never','',false],
+      ['anthropic/claude-sonnet-5','never','',false], ['anthropic/claude-fable-5-1','never','',false],
+      ['openai/gpt-6-astra','60m',60,false], ['openai/gpt-6-sol','30m','',false], ['openai/gpt-6-luna','30m','',false]
+    ];
+    $('#override-rows').innerHTML = overrides.map(([model, ttl, percent, review], i) => `<tr data-review="${review}"><td><span class="model-name">${escape(model)}</span>${review ? '<span class="review-tag" title="Manually flagged older-model candidate; actual retirement and usage are unknown">Review</span>' : ''}</td><td>${control(`ttl-${i}`, `${model} Cache TTL`, ttl, '')}</td><td>${control(`percent-${i}`, `${model} Execute Threshold %`, percent, '')}</td><td>${control(`tokens-${i}`, `${model} Execute Threshold (tokens)`, '', '')}</td><td>${control(`reserve-${i}`, `${model} Output Reserve`, '', '')}</td><td><button class="icon-btn remove-override" aria-label="Preview removing overrides for ${escape(model)}">×</button></td></tr>`).join('');
+    const harnesses = ['opencode', 'pi', 'omp'];
+    const models = {
+      opencode: {model: 'google/antigravity-gemini-3.8-flash', fallback: 'openrouter/deepseek/deepseek-v4.1-flash'},
+      pi: {model: 'google-antigravity/antigravity-gemini-3.8-flash', fallback: 'ollama-cloud/deepseek-v4.1-flash'},
+      omp: {model: '', fallback: ''}
+    };
+    const qualifierField = (id, label, path, value, description) => `<div><label class="label" for="${id}">${label}</label>${key(path)}<p class="desc">${description}</p>${control(id, label, value)}</div>`;
+    $('#model-panels').innerHTML = harnesses.map(h => `<div id="models-${h}" role="tabpanel" aria-labelledby="model-tab-${h}" ${h !== 'opencode' ? 'hidden' : ''}><div class="agent-grid">${['historian','dreamer'].map(agent => {
+      const path = `${agent}.${h}`, q = h === 'opencode' ? 'variant' : 'thinking_level', qLabel = h === 'opencode' ? 'variant' : 'thinking level', m = models[h];
+      return `<article class="agent-card"><h3>${agent === 'historian' ? 'Historian' : 'Dreamer'} · ${h === 'opencode' ? 'OpenCode' : h === 'pi' ? 'Pi' : 'OMP'} only</h3><label class="label" for="${path}-model">Model</label>${key(`${path}.model`)}<p class="desc">Primary model for the ${agent} ${h} harness</p>${control(`${path}-model`, `${agent} ${h} Model`, m.model, 'Use fallback chain')}<div class="qualifiers">${qualifierField(`${path}-primary`, `Primary ${qLabel}`, `${path}.model.${q}`, agent === 'historian' && h === 'opencode' ? 'high' : '', 'Stored on this model entry and used only by this harness.')}${qualifierField(`${path}-default`, `Default ${qLabel}`, `${path}.${q}`, '', 'Used when the primary entry does not specify its own qualifier.')}</div><div class="fallback"><span class="label">Fallback Models</span>${key(`${path}.fallback_models`)}<p class="desc">Fallback entries keep their own ${qLabel} and never inherit the primary entry's value.</p>${m.fallback ? `<div class="fallback-entry"><div class="fallback-row">${control(`${path}-fallback-model`, `${agent} ${h} fallback Model`, m.fallback)}<button class="icon-btn remove-fallback" aria-label="Preview removing ${agent} ${h} fallback">×</button></div><div class="qualifiers">${qualifierField(`${path}-fallback-qualifier`, `Fallback ${qLabel}`, `${path}.fallback_models[0].${q}`, agent === 'historian' && h === 'opencode' ? 'medium' : '', 'Optional qualifier for this fallback entry.')}</div></div>` : '<p class="desc">Using built-in fallback chain · no explicit OMP configuration</p>'}</div></article>`;
+    }).join('')}</div></div>`).join('');
+    // Each tuple uses the existing task label, description, stored schedule, and enable fallback.
+    const tasks = [
+      ['map-memories','Map memories','Maps each memory to its backing files so verify knows what to re-check','','0 2 * * *'],
+      ['verify','Verify changed memories','Checks changed-file memories against code and fixes/removes stale ones','','0 3 * * *'],
+      ['verify-broad','Verify all memories','Periodic full re-check of the whole memory pool (catches drift)','0 4 * * 0','0 4 * * 0'],
+      ['curate','Curate memories','Deduplicates, tightens, and prunes the memory pool','0 4 * * 0','0 4 * * 0'],
+      ['compress-cues','Compress mural cues','Compresses each overflow memory into a mural cue (the mural image renders deterministically)','0 4 * * *','0 4 * * *'],
+      ['classify-memories','Classify memories','Scores memory importance, scope, and shareability','15 3 * * *','0 6 * * *'],
+      ['retrospective','Retrospective','Learns from moments you had to correct or re-explain, and records the lesson','26 3 * * *','0 5 * * *'],
+      ['maintain-docs','Maintain docs','Keep ARCHITECTURE.md / STRUCTURE.md in sync','41 3 * * *','0 3 * * *'],
+      ['evaluate-smart-notes','Evaluate smart notes','Surface smart notes whose conditions are now met','48 3 * * *','0 3 * * *'],
+      ['review-user-memories','Review user memories','Promote recurring behaviors into your user profile','12 3 * * *','0 3 * * *'],
+      ['promote-primers','Promote primers','Promote recurring project questions into Primers','10 4 * * *','0 3 * * *'],
+      ['refresh-primers','Refresh primers','Refresh answers for active project Primers','0 4 * * *','0 3 * * *']
+    ];
+    const describeCron = cron => {
+      if (!cron.trim()) return 'Disabled';
+      const match = /^(\d{1,2}) (\d{1,2}) \* \* (\*|0)$/.exec(cron.trim());
+      return match && +match[1] < 60 && +match[2] < 24 ? `${match[3] === '0' ? 'Sun' : 'Daily'} · ${match[2].padStart(2,'0')}:${match[1].padStart(2,'0')}` : 'Custom cron · edit';
+    };
+    $('#task-panels').innerHTML = harnesses.map(h => `<div id="tasks-${h}" role="tabpanel" aria-labelledby="task-tab-${h}" ${h !== 'opencode' ? 'hidden' : ''}><div class="table-wrap"><table class="task-table"><caption>Task schedules and model overrides · ${h === 'opencode' ? 'OpenCode' : h === 'pi' ? 'Pi' : 'OMP'} models</caption><thead><tr><th scope="col">Task</th><th scope="col">Schedule · all harnesses</th><th scope="col">Model override · ${h}</th><th scope="col">On / off</th></tr></thead><tbody>${tasks.map(([name,label,desc,cron]) => {
+      const id = `${h}-${name}`, model = ['curate','verify-broad'].includes(name) ? models[h].model : '';
+      const threshold = name === 'review-user-memories' ? 3 : name === 'promote-primers' ? 2 : null;
+      return `<tr data-task="${name}"><td><span class="label">${label}</span>${key(`dreamer.tasks.${name}`)}<p class="desc">${desc}</p></td><td><button class="schedule-btn" aria-expanded="false" aria-controls="edit-${id}" data-expand="edit-${id}">${describeCron(cron)}</button></td><td>${key(`dreamer.${h}.tasks.${name}.model`)}${control(`task-model-${id}`, `${label} ${h} model override`, model, '')}</td><td>${switchControl(`on-${id}`, `${label} automatic schedule, all harnesses`, !!cron)}</td></tr><tr class="task-detail" id="edit-${id}" hidden><td colspan="4"><div class="task-edit-grid"><div><label class="label" for="cron-${id}">Schedule</label>${key(`dreamer.tasks.${name}.schedule`)}<input class="input cron" id="cron-${id}" data-task="${name}" value="${cron}" placeholder="Empty = disabled"><p class="desc">5 fields: minute · hour · day · month · weekday</p></div><div><label class="label" for="qualifier-${id}">${h === 'opencode' ? 'Variant' : 'Thinking level'}</label>${key(`dreamer.${h}.tasks.${name}.${h === 'opencode' ? 'variant' : 'thinking_level'}`)}${control(`qualifier-${id}`, `${label} ${h} qualifier`)}<p class="desc">Only this task on ${h}; blank uses harness default.</p></div>${threshold ? `<div><label class="label" for="promotion-${id}">Promotion threshold</label>${key(`dreamer.tasks.${name}.promotion_threshold`)}<input class="input promotion" id="promotion-${id}" data-task="${name}" type="number" min="2" max="20" ${name === 'review-user-memories' ? 'value="3"' : ''} placeholder="Default: ${threshold}"><p class="desc">${name === 'promote-primers' ? 'Promotion threshold (2–20 recurring source days, default 2)' : 'Promotion threshold (2–20 observations, default 3)'}</p></div>` : ''}</div></td></tr>`;
+    }).join('')}</tbody></table></div></div>`).join('');
+    $('#show-keys').addEventListener('change', e => document.body.classList.toggle('show-keys', e.target.checked));
+    $$('.harness-tabs').forEach(group => {
+      const buttons = $$('.tab', group);
+      group.addEventListener('click', e => { const button = e.target.closest('[data-harness]'); if (!button) return;
+        buttons.forEach(b => { const active = b === button; b.classList.toggle('active',active); b.setAttribute('aria-selected',active); b.tabIndex = active ? 0 : -1; });
+        $$('[role="tabpanel"]', document.getElementById(group.dataset.target)).forEach(panel => panel.hidden = !panel.id.endsWith(`-${button.dataset.harness}`));
+      });
+      group.addEventListener('keydown', e => { const i = buttons.indexOf(document.activeElement); if (i < 0 || !['ArrowLeft','ArrowRight','Home','End'].includes(e.key)) return; e.preventDefault(); const next = e.key === 'Home' ? 0 : e.key === 'End' ? 2 : (i + (e.key === 'ArrowRight' ? 1 : 2)) % 3; buttons[next].click(); buttons[next].focus(); });
+    });
+    $('#task-panels').addEventListener('click', e => { const button = e.target.closest('[data-expand]'); if (!button) return; const row = document.getElementById(button.dataset.expand); row.hidden = !row.hidden; button.setAttribute('aria-expanded', !row.hidden); });
+    const previousSchedules = new Map(tasks.map(t => [t[0], t[3] || t[4]]));
+    function updateSchedule(name, cron) {
+      tasks.find(t => t[0] === name)[3] = cron;
+      if (cron.trim()) previousSchedules.set(name, cron);
+      $$(`.cron[data-task="${name}"]`).forEach(input => input.value = cron);
+      $$(`tr[data-task="${name}"]`).forEach(row => { $('.schedule-btn',row).textContent = describeCron(cron); $('input[type="checkbox"]',row).checked = !!cron.trim(); });
+    }
+    $('#task-panels').addEventListener('input', e => { if (e.target.matches('.cron')) updateSchedule(e.target.dataset.task, e.target.value); if (e.target.matches('.promotion')) $$(`.promotion[data-task="${e.target.dataset.task}"]`).forEach(input => input.value = e.target.value); });
+    $('#task-panels').addEventListener('change', e => { if (e.target.matches('input[type="checkbox"]')) { const name = e.target.closest('[data-task]').dataset.task; updateSchedule(name, e.target.checked ? previousSchedules.get(name) : ''); } });
+    document.addEventListener('change', e => { if (!e.target.matches('.switch input')) return; const label = e.target.closest('.switch').querySelector('span:last-child'); if (label && !label.classList.contains('slider')) label.textContent = e.target.checked ? 'Enabled' : 'Disabled'; const inherited = e.target.closest('.field')?.querySelector('.inherited'); if (inherited) inherited.hidden = true; });
+    $('#pi-todowrite').addEventListener('change', e => $('#todo-overlay-field').hidden = !e.target.checked);
+    $('#embedding-provider').addEventListener('change', e => { $$('.remote-embedding').forEach(el => el.hidden = e.target.value !== 'openai-compatible'); $('#local-embedding').hidden = e.target.value !== 'local'; });
+    const announce = text => $('#preview-status').textContent = text;
+    const indexLinks = $$('.section-index a');
+    indexLinks.forEach(link => link.addEventListener('click', e => { e.preventDefault(); const target = $(link.getAttribute('href')); $('#scroller').scrollTo({top: target.offsetTop - $('.settings').offsetTop, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'}); }));
+    $('#scroller').addEventListener('scroll', () => { const current = $$('.section').filter(section => section.getBoundingClientRect().top <= $('#scroller').getBoundingClientRect().top + 64).at(-1) || $('#general'); indexLinks.forEach(link => { const active = link.hash === `#${current.id}`; link.classList.toggle('active',active); active ? link.setAttribute('aria-current','location') : link.removeAttribute('aria-current'); }); }, {passive:true});
+    const showRemoval = () => { const count = $$('#override-rows tr:not([hidden])').length; $('#override-status').textContent = `${count} model rows remain in preview only.`; $('#reset-overrides').hidden = false; announce('Override removal preview · no config file changed'); };
+    $('#override-rows').addEventListener('click', e => { const button = e.target.closest('.remove-override'); if (button) { button.closest('tr').hidden = true; showRemoval(); } });
+    $('#review-list').innerHTML = overrides.filter(o => o[3]).map(o => `<li>${escape(o[0])}</li>`).join('');
+    $('#review-overrides').addEventListener('click', () => $('#review-dialog').showModal());
+    $('#cancel-review').addEventListener('click', () => $('#review-dialog').close());
+    $('#preview-removal').addEventListener('click', () => { $$('#override-rows tr[data-review="true"]').forEach(row => row.hidden = true); $('#review-dialog').close(); showRemoval(); });
+    $('#reset-overrides').addEventListener('click', () => { $$('#override-rows tr').forEach(row => row.hidden = false); $('#override-status').textContent = '19 models with explicit overrides. No usage history is available in this mockup.'; $('#reset-overrides').hidden = true; announce('Override rows restored · no config file changed'); });
+    $('#model-panels').addEventListener('click', e => { const button = e.target.closest('.remove-fallback'); if (button) { const entry = button.closest('.fallback-entry'); entry.hidden = true; const message = document.createElement('p'); message.className = 'desc'; message.textContent = 'Preview: using built-in fallback chain. Reload to restore.'; entry.after(message); announce('Fallback removal preview · no config file changed'); } });
+  </script>
+</body>
+</html>

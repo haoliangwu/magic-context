@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { advanceSessionActivity } from "../session-activity";
 import { OpenCodeRetrospectiveRawProvider } from "./retrospective-raw-provider";
 
 const dbs: Database[] = [];
@@ -30,6 +31,7 @@ function setupContextDb(): Database {
             session_id TEXT PRIMARY KEY,
             is_subagent INTEGER DEFAULT 0
         );
+        CREATE TABLE schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
     return db;
 }
@@ -114,6 +116,7 @@ describe("OpenCodeRetrospectiveRawProvider", () => {
             )
             .run("s3", "opencode", "project-b", 40);
 
+        advanceSessionActivity(contextDb, "s1", 20);
         const provider = new OpenCodeRetrospectiveRawProvider({
             contextDb,
             openOpenCodeDb: () => null,
@@ -133,6 +136,9 @@ describe("OpenCodeRetrospectiveRawProvider", () => {
         insert.run("sub1", "opencode", "project-a", 60); // newer, but a subagent child
         insert.run("root2", "opencode", "project-a", 40);
         markSubagent(contextDb, "sub1");
+        advanceSessionActivity(contextDb, "root1", 50);
+        advanceSessionActivity(contextDb, "root2", 40);
+        advanceSessionActivity(contextDb, "sub1", 60);
 
         const provider = new OpenCodeRetrospectiveRawProvider({
             contextDb,
@@ -241,5 +247,6 @@ describe("OpenCodeRetrospectiveRawProvider", () => {
             messages: [],
             truncated: false,
         });
+        expect(provider.readOldestMessageTimesSince(["missing"], 0)).toBeNull();
     });
 });

@@ -1,12 +1,13 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { recordMessageFtsRowid } from "./message-fts-rowid-map";
 import {
     getDirtyIndexFloor,
@@ -101,7 +102,7 @@ describe("message-index", () => {
     });
 
     it("preserves a dirty floor beyond a stale snapshot and fills it on the next pass", () => {
-        const directory = mkdtempSync(join(tmpdir(), "message-index-gap-"));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "message-index-gap-"));
         const dbPath = join(directory, "context.db");
         const first = new Database(dbPath);
         const second = new Database(dbPath);

@@ -52,8 +52,9 @@ export function insertUserMemoryCandidates(
     const stmt = db.prepare(
         "INSERT INTO user_memory_candidates (content, session_id, source_compartment_start, source_compartment_end, created_at) VALUES (?, ?, ?, ?, ?)",
     );
-    const transactionStartedAt = performance.now();
+    let transactionStartedAt = 0;
     db.transaction(() => {
+        transactionStartedAt = performance.now();
         for (const c of candidates) {
             stmt.run(
                 c.content,
@@ -63,7 +64,7 @@ export function insertUserMemoryCandidates(
                 now,
             );
         }
-    })();
+    }).immediate();
     logSlowWriteTransaction("user_memory_candidate_insert", transactionStartedAt);
 }
 
@@ -168,25 +169,27 @@ export function insertUserMemory(
     content: string,
     sourceCandidateIds: number[],
 ): number {
-    return db.transaction(() => {
-        const now = Date.now();
-        const sourceProvenance = loadUserMemorySourceProvenance(db, sourceCandidateIds);
-        const result = db
-            .prepare(
-                `INSERT INTO user_memories
+    return db
+        .transaction(() => {
+            const now = Date.now();
+            const sourceProvenance = loadUserMemorySourceProvenance(db, sourceCandidateIds);
+            const result = db
+                .prepare(
+                    `INSERT INTO user_memories
                     (content, status, promoted_at, source_candidate_ids, source_candidate_provenance, created_at, updated_at)
                  VALUES (?, 'active', ?, ?, ?, ?, ?)`,
-            )
-            .run(
-                content,
-                now,
-                JSON.stringify(sourceCandidateIds),
-                serializeUserMemorySourceProvenance(sourceProvenance, sourceCandidateIds),
-                now,
-                now,
-            );
-        return Number(result.lastInsertRowid);
-    })();
+                )
+                .run(
+                    content,
+                    now,
+                    JSON.stringify(sourceCandidateIds),
+                    serializeUserMemorySourceProvenance(sourceProvenance, sourceCandidateIds),
+                    now,
+                    now,
+                );
+            return Number(result.lastInsertRowid);
+        })
+        .immediate();
 }
 
 export function getActiveUserMemories(db: Database): UserMemory[] {

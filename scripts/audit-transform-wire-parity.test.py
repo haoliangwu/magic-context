@@ -1172,6 +1172,42 @@ class AuditTransformWireParityTest(unittest.TestCase):
                 ("ses_ts", "decision", 1, now),
             )
 
+    def test_scheduler_histories_read_from_ring_rows_and_legacy_columns(self) -> None:
+        module = runpy.run_path(str(SCRIPT))
+        read = module["scheduler_history_rows"]
+        history = [
+            {"timestamp_ms": 1, "scheduler_decision": "Defer"},
+            {"timestamp_ms": 2, "scheduler_decision": "Execute"},
+        ]
+        interesting = [{"timestamp_ms": 2, "scheduler_decision": "Execute"}]
+        migration = (
+            ROOT / "crates/mc-store/src/migrations/store_063_pass_trace_ring.sql"
+        ).read_text()
+        results = {}
+        for shape in ("legacy", "ring"):
+            db = sqlite3.connect(":memory:")
+            db.execute(
+                "CREATE TABLE mc_pass_trace (session_id TEXT PRIMARY KEY, "
+                "scheduler_history TEXT NOT NULL DEFAULT '[]', "
+                "scheduler_interesting_history TEXT NOT NULL DEFAULT '[]')"
+            )
+            db.execute(
+                "INSERT INTO mc_pass_trace VALUES ('ses', ?, ?)",
+                (json.dumps(history), json.dumps(interesting)),
+            )
+            if shape == "ring":
+                # The exact statements store migration 63 runs on the trace table.
+                db.executescript(migration)
+                columns = {row[1] for row in db.execute("PRAGMA table_info(mc_pass_trace)")}
+                self.assertNotIn("scheduler_history", columns)
+            rows = read(db, {"ses"})
+            self.assertEqual(len(rows), 1, shape)
+            session, scheduler_json, interesting_json = rows[0]
+            results[shape] = (session, json.loads(scheduler_json), json.loads(interesting_json))
+        self.assertEqual(results["ring"], results["legacy"])
+        self.assertEqual(results["ring"][1], history)
+        self.assertEqual(read(sqlite3.connect(":memory:"), set()), [])
+
     def _write_store_db(self, path: Path) -> None:
         with sqlite3.connect(path) as db:
             db.executescript(

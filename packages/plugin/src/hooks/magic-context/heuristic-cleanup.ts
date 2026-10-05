@@ -1,3 +1,4 @@
+import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getActiveTagsBySession,
@@ -12,18 +13,34 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import type { TagEntry } from "../../features/magic-context/types";
 import { sessionLog } from "../../shared";
+import { applyNewToolDrop, hasSmallToolInput } from "./apply-operations";
 import { applyCavemanCleanup, type CavemanCleanupConfig } from "./caveman-cleanup";
 import type { DroppedTokenReduction } from "./dropped-token-estimate";
 import {
     type EmergencyDropTag,
     estimateEmergencyDropReclaimTokens,
+    measureEmergencyTag,
     planEmergencyDrop,
 } from "./emergency-drop";
 import { stripSystemInjection } from "./system-injection-stripper";
 import type { MessageLike, TagTarget } from "./tag-messages";
 import { stripTagPrefix } from "./tag-part-guards";
 
+// Read-only tools whose parallel calls with identical arguments return identical output.
+// Hosts hand the transform bare tool names (OpenCode 1.18.30 stores `read`, `grep`,
+// `glob`; Pi stores `read`, `grep`), so the bare names are what actually match. The
+// `mcp_`-prefixed forms are kept for MCP servers that expose the same tools under that
+// prefix.
 const DEDUP_SAFE_TOOLS = new Set([
+    "grep",
+    "read",
+    "glob",
+    "ast_grep_search",
+    "lsp_diagnostics",
+    "lsp_symbols",
+    "lsp_find_references",
+    "lsp_goto_definition",
+    "lsp_prepare_rename",
     "mcp_grep",
     "mcp_read",
     "mcp_glob",
@@ -58,6 +75,8 @@ export function applyHeuristicCleanup(
             currentTotalInputTokens: number;
             ceilingTokens: number;
             usagePercentage?: number;
+            /** Another mutation already rewrites the cached prefix on this pass. */
+            passAlreadyPriced?: boolean;
         };
         /**
          * Whether ordinary deduplication, injection stripping, and caveman
@@ -112,14 +131,41 @@ export function applyHeuristicCleanup(
         // would no-op on). This keeps the floor math equal to the on-wire tail
         // and guarantees every selected tag reclaims — no phantom tag counted as
         // reclaimed (which makes the plan stop early and under-evict).
-        const droppableTags = tags.filter(
+        const candidateTags = tags.filter(
             (t) =>
                 t.status === "active" && t.type === "tool" && targets.get(t.tagNumber)?.canDrop?.(),
         );
         // Floor accounting needs the FULL active live-window set (all types) —
         // narrowing it to the droppable subset folds real conversation/
         // reasoning tail into the "irreducible prefix" and under-evicts.
-        const activeTags = tags.filter((t) => t.status === "active");
+        const recentTags = new Set(
+            candidateTags
+                .slice()
+                .sort((a, b) => b.tagNumber - a.tagNumber)
+                .slice(0, 20)
+                .map((tag) => tag.tagNumber),
+        );
+        const calibration = sessionDecisionCalibration(db, sessionId);
+        const activeTags = tags
+            .filter((t) => t.status === "active")
+            .map((tag) =>
+                measureEmergencyTag(
+                    tag,
+                    targets.get(tag.tagNumber),
+                    calibration,
+                    targets.get(tag.tagNumber)?.requiresToolArcSkeleton === true ||
+                        ((emergency.usagePercentage ?? 0) < 95 &&
+                            recentTags.has(tag.tagNumber) &&
+                            hasSmallToolInput(targets.get(tag.tagNumber))),
+                ),
+            );
+        const measuredByTag = new Map(activeTags.map((tag) => [tag.tagNumber, tag]));
+        const droppableTags = candidateTags
+            .flatMap((tag) => {
+                const measured = measuredByTag.get(tag.tagNumber);
+                return measured ? [measured] : [];
+            })
+            .filter((tag) => (tag.reclaimableTokens ?? 0) > 0);
         const plan = planEmergencyDrop({
             tags: droppableTags as readonly EmergencyDropTag[],
             floorTags: activeTags as readonly EmergencyDropTag[],
@@ -130,16 +176,11 @@ export function applyHeuristicCleanup(
             usagePercentage: emergency.usagePercentage,
             priorInputSample,
             hasPriorDrop: priorInputSample > 0,
+            passAlreadyPriced: emergency.passAlreadyPriced === true,
         });
         if (plan.shouldDrop) {
             const toDrop = new Set(plan.tagNumbers);
-            const newestEmergencyTags = new Set(
-                droppableTags
-                    .slice()
-                    .sort((left, right) => right.tagNumber - left.tagNumber)
-                    .slice(0, 20)
-                    .map((tag) => tag.tagNumber),
-            );
+            const newestEmergencyTags = recentTags;
             db.transaction(() => {
                 for (const tag of tags) {
                     if (!toDrop.has(tag.tagNumber)) continue;
@@ -149,29 +190,26 @@ export function applyHeuristicCleanup(
                         (emergency.usagePercentage ?? 0) < 95 &&
                         newestEmergencyTags.has(tag.tagNumber);
                     // Removing the result separator beside native reasoning lets Anthropic
-                    // merge signed assistant turns, so this safety case always keeps the pair.
-                    const reasoningSafeSkeleton = target?.requiresToolArcSkeleton === true;
-                    const skeleton = recent || reasoningSafeSkeleton;
-                    const result = reasoningSafeSkeleton
-                        ? (target?.truncate?.() ?? "absent")
-                        : recent
-                          ? (target?.truncate?.() ?? target?.drop?.() ?? "absent")
-                          : (target?.drop?.() ?? "absent");
+                    // merge signed assistant turns, so this safety case always keeps the
+                    // pair, with its real arguments.
+                    const { result, mode } = applyNewToolDrop(target, {
+                        inWindow: recent,
+                        keepSkeleton: target?.requiresToolArcSkeleton === true,
+                    });
                     if (result === "removed" || result === "truncated") {
                         updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
-                        updateTagDropMode(
-                            db,
-                            sessionId,
-                            tag.tagNumber,
-                            skeleton ? "truncated" : "full",
-                        );
+                        // Persist the mode applied (including drop() keeping the
+                        // call whose result ends the request) so replays match.
+                        updateTagDropMode(db, sessionId, tag.tagNumber, mode);
                         droppedTools++;
                         emergencyDroppedTools++;
                         droppedTokenReductions.push({
                             tagNumber: tag.tagNumber,
                             mode: result === "removed" ? "full" : "truncated",
                         });
-                        emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(tag);
+                        emergencyReclaimedTokens += estimateEmergencyDropReclaimTokens(
+                            measuredByTag.get(tag.tagNumber) ?? tag,
+                        );
                     }
                 }
             }).immediate();
@@ -230,7 +268,9 @@ export function applyHeuristicCleanup(
                         }
                     }
                 } else {
-                    const didSet = target.setContent(stripped);
+                    // Only the injected reminder leaves; the message's own text
+                    // and the reasoning that produced it stay.
+                    const didSet = target.setContent(stripped, { keepReasoning: true });
                     if (didSet) {
                         replaceSourceContent(db, sessionId, tag.tagNumber, strippedSource);
                         droppedInjections++;
@@ -270,11 +310,13 @@ export function applyHeuristicCleanup(
             }
         }
 
-        // Group tags by fingerprint
+        // Group tags by fingerprint. Protected tags join their group so a protected
+        // newest copy still anchors it; they are never dropped themselves (below).
+        // Leaving them out kept one unprotected copy alive beside the protected one.
         const fingerprintGroups = new Map<string, TagEntry[]>();
         for (const [compositeKey, fingerprint] of toolFingerprints) {
             const tag = tagsByCompositeKey.get(compositeKey);
-            if (!tag || config.protectedTagNumbers.has(tag.tagNumber)) continue;
+            if (!tag) continue;
             const group = fingerprintGroups.get(fingerprint) ?? [];
             group.push(tag);
             fingerprintGroups.set(fingerprint, group);
@@ -288,12 +330,15 @@ export function applyHeuristicCleanup(
                 // Keep the newest (last), drop the rest
                 for (let i = 0; i < group.length - 1; i++) {
                     const tag = group[i];
+                    if (config.protectedTagNumbers.has(tag.tagNumber)) continue;
                     const target = targets.get(tag.tagNumber);
+                    if (target?.canDrop?.() === false) continue;
                     // Deduplication remains a full drop; only the emergency newest-window
-                    // arm preserves skeleton bytes.
-                    const result = target?.drop?.() ?? "absent";
+                    // arm preserves skeleton bytes. A call that cannot be removed keeps
+                    // its real arguments.
+                    const { result, mode } = applyNewToolDrop(target, { inWindow: false });
                     if (result === "incomplete") continue;
-                    updateTagDropMode(db, sessionId, tag.tagNumber, "full");
+                    updateTagDropMode(db, sessionId, tag.tagNumber, mode);
                     updateTagStatus(db, sessionId, tag.tagNumber, "dropped");
                     if (result === "removed" || result === "truncated") {
                         deduplicatedTools++;
@@ -325,6 +370,7 @@ export function applyHeuristicCleanup(
         const cavemanResult = applyCavemanCleanup(sessionId, db, targets, tags, {
             enabled: true,
             minChars: config.caveman.minChars,
+            wordRules: config.caveman.wordRules,
             protectedCutoff: config.protectedCutoff,
         });
         compressedTextTags =

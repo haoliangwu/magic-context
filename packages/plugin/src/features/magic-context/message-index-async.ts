@@ -1,7 +1,10 @@
-import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
+import type {
+    RawMessage,
+    RawMessageOrdinalAnchor,
+} from "../../hooks/magic-context/read-session-raw";
 import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { log, sessionLog } from "../../shared/logger";
-import type { Database } from "../../shared/sqlite";
+import { type Database, withSqliteBackgroundWriter } from "../../shared/sqlite";
 import {
     clearIndexedMessages,
     getLastIndexedOrdinal,
@@ -75,6 +78,10 @@ const RECONCILIATION_BATCH_SIZE = 100;
 class MagicContextMessageIndexHeapHolder {
     readonly reconciledSessions = new Set<string>();
     readonly reconciliationScheduledSessions = new Set<string>();
+    readonly clearAndReindexScheduledSessions = new Map<
+        string,
+        { source: MessageReconciliationSource }
+    >();
     readonly sessionLocks = new Map<string, Promise<void>>();
     readonly incrementalTimers = new Map<string, ReturnType<typeof setTimeout>>();
     readonly pendingIncrementalKeys = new Set<string>();
@@ -91,15 +98,29 @@ function clearCompletedIncrementalKeys(sessionId: string): void {
     }
 }
 
-type ReadMessages = ((sessionId: string) => RawMessage[]) & {
+type FullReadMessages = ((sessionId: string) => RawMessage[]) & {
     readPage?: (
         sessionId: string,
         afterOrdinal: number,
         limit: number,
         finalWatermark: number,
+        after?: RawMessageOrdinalAnchor,
     ) => RawMessage[];
     getCount?: (sessionId: string) => number;
 };
+
+export interface BoundedMessageReconciliationSource {
+    readPage(
+        sessionId: string,
+        afterOrdinal: number,
+        limit: number,
+        finalWatermark: number,
+        after?: RawMessageOrdinalAnchor,
+    ): RawMessage[];
+    getCount(sessionId: string): number;
+}
+
+export type MessageReconciliationSource = FullReadMessages | BoundedMessageReconciliationSource;
 type ReadSingleMessage = (sessionId: string, messageId: string) => RawMessage | null;
 type IncrementalMessageSource = ReadSingleMessage | RawMessage;
 
@@ -165,17 +186,19 @@ function serializedMessageBytes(messages: readonly RawMessage[]): number {
 async function reconcileSessionIndex(
     db: Database,
     sessionId: string,
-    readMessages: ReadMessages,
+    readMessages: MessageReconciliationSource,
 ): Promise<void> {
     await runWithSessionLock(sessionId, async () => {
         if (heapHolder.reconciledSessions.has(sessionId)) return;
 
         let fallbackSnapshot: RawMessage[] | null = null;
         try {
+            const fullReader = typeof readMessages === "function" ? readMessages : null;
             const finalWatermark = readMessages.getCount
                 ? readMessages.getCount(sessionId)
-                : (fallbackSnapshot = readMessages(sessionId)).length;
+                : (fallbackSnapshot = fullReader?.(sessionId) ?? []).length;
             let cursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
+            let after: RawMessageOrdinalAnchor | undefined;
 
             while (cursor < finalWatermark) {
                 const pageEnd = Math.min(finalWatermark, cursor + RECONCILIATION_BATCH_SIZE);
@@ -185,6 +208,7 @@ async function reconcileSessionIndex(
                           cursor,
                           RECONCILIATION_BATCH_SIZE,
                           finalWatermark,
+                          after,
                       )
                     : (fallbackSnapshot ?? []).filter(
                           (message) => message.ordinal > cursor && message.ordinal <= pageEnd,
@@ -192,10 +216,19 @@ async function reconcileSessionIndex(
                 const retainedMessages = fallbackSnapshot ?? messages;
                 heapHolder.activeReconcilerBuffers.set(sessionId, retainedMessages);
 
-                indexMessagesAfterOrdinal(db, sessionId, messages, cursor, pageEnd);
+                withSqliteBackgroundWriter(() =>
+                    indexMessagesAfterOrdinal(db, sessionId, messages, cursor, pageEnd),
+                );
                 const nextCursor = getMessageIndexReconciliationStartOrdinal(db, sessionId);
                 if (nextCursor <= cursor) break;
                 cursor = nextCursor;
+                const last = messages.at(-1);
+                // Only seek from a row whose ordinal matches the durable progress.
+                // Empty/filtered pages may advance farther than the last hydrated row.
+                after =
+                    last?.ordinal === cursor && typeof last.createdAt === "number"
+                        ? { timeCreated: last.createdAt, id: last.id }
+                        : undefined;
 
                 if (cursor < finalWatermark) {
                     // One bounded page is the maximum synchronous work per event-loop
@@ -217,7 +250,7 @@ async function reconcileSessionIndex(
 export function scheduleReconciliation(
     db: Database,
     sessionId: string,
-    readMessages: ReadMessages,
+    readMessages: MessageReconciliationSource,
 ): void {
     if (
         heapHolder.reconciledSessions.has(sessionId) ||
@@ -232,6 +265,11 @@ export function scheduleReconciliation(
             void reconcileSessionIndex(db, sessionId, readMessages)
                 .catch((error) => {
                     logIndexingError(sessionId, "reconciliation", error);
+                    if (isDatabaseLockedError(error))
+                        setTimeout(
+                            () => scheduleReconciliation(db, sessionId, readMessages),
+                            1000,
+                        ).unref();
                 })
                 .finally(() => {
                     heapHolder.reconciliationScheduledSessions.delete(sessionId);
@@ -278,7 +316,7 @@ export function scheduleIncrementalIndex(
             }
 
             const wasReconciled = heapHolder.reconciledSessions.delete(sessionId);
-            indexSingleMessage(db, sessionId, message);
+            withSqliteBackgroundWriter(() => indexSingleMessage(db, sessionId, message));
             const finalWatermark = getLastIndexedOrdinal(db, sessionId);
             if (wasReconciled && isMessageIndexReconciledThrough(db, sessionId, finalWatermark)) {
                 heapHolder.reconciledSessions.add(sessionId);
@@ -288,6 +326,11 @@ export function scheduleIncrementalIndex(
             .catch((error) => {
                 heapHolder.reconciledSessions.delete(sessionId);
                 logIndexingError(sessionId, `incremental index for ${messageId}`, error);
+                if (isDatabaseLockedError(error))
+                    setTimeout(
+                        () => scheduleIncrementalIndex(db, sessionId, messageId, messageSource),
+                        1000,
+                    ).unref();
             })
             .finally(() => {
                 heapHolder.pendingIncrementalKeys.delete(schedulingKey);
@@ -300,25 +343,43 @@ export function scheduleIncrementalIndex(
 export function scheduleClearAndReindex(
     db: Database,
     sessionId: string,
-    readMessages: ReadMessages,
+    readMessages: MessageReconciliationSource,
 ): void {
     heapHolder.reconciledSessions.delete(sessionId);
     heapHolder.reconciliationScheduledSessions.delete(sessionId);
     clearCompletedIncrementalKeys(sessionId);
 
+    const existing = heapHolder.clearAndReindexScheduledSessions.get(sessionId);
+    if (existing) {
+        existing.source = readMessages;
+        return;
+    }
+    const pending = { source: readMessages };
+    heapHolder.clearAndReindexScheduledSessions.set(sessionId, pending);
+
     scheduleAfterBootQuiet(() => {
         defer(() => {
+            let cleared = false;
             void runWithSessionLock(sessionId, () => {
+                if (heapHolder.clearAndReindexScheduledSessions.get(sessionId) !== pending) return;
+                // Coalesce removals only until the clear starts. A removal during
+                // paged reconciliation must schedule another authoritative rebuild.
+                heapHolder.clearAndReindexScheduledSessions.delete(sessionId);
                 // An older boot-quiet reconciliation can finish after this clear was
                 // scheduled, so invalidate process state under the same session lock
                 // that clears the durable index.
                 heapHolder.reconciledSessions.delete(sessionId);
                 clearCompletedIncrementalKeys(sessionId);
                 clearIndexedMessages(db, sessionId);
+                cleared = true;
             })
-                .then(() => reconcileSessionIndex(db, sessionId, readMessages))
+                .then(() =>
+                    cleared ? reconcileSessionIndex(db, sessionId, pending.source) : undefined,
+                )
                 .catch((error) => {
                     heapHolder.reconciledSessions.delete(sessionId);
+                    if (heapHolder.clearAndReindexScheduledSessions.get(sessionId) === pending)
+                        heapHolder.clearAndReindexScheduledSessions.delete(sessionId);
                     logIndexingError(sessionId, "clear and reindex", error);
                 });
         });
@@ -364,6 +425,7 @@ export function isSessionReconciled(sessionId: string): boolean {
 }
 
 export function clearSessionTracking(sessionId: string): void {
+    heapHolder.clearAndReindexScheduledSessions.delete(sessionId);
     heapHolder.reconciledSessions.delete(sessionId);
     heapHolder.reconciliationScheduledSessions.delete(sessionId);
     heapHolder.sessionLocks.delete(sessionId);
@@ -388,6 +450,7 @@ export function clearSessionTracking(sessionId: string): void {
 }
 
 export function __resetMessageIndexAsyncForTests(): void {
+    heapHolder.clearAndReindexScheduledSessions.clear();
     for (const timer of heapHolder.incrementalTimers.values()) {
         clearTimeout(timer);
     }

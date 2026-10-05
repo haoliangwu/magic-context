@@ -23,8 +23,10 @@
  */
 
 import { withReadOnlySessionDb } from "../../hooks/magic-context/read-session-db";
+import { getDataDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { gaDatabasePath, V2StoreReader } from "../../v2/store-reader";
 
 interface SessionParentRow {
     parent_id: string | null;
@@ -59,5 +61,21 @@ export function resolveIsSubagentFromOpenCodeDb(sessionId: string): boolean | nu
         // Never throw — fallback is best-effort. Log once and return null.
         log(`[magic-context] resolveIsSubagentFromOpenCodeDb failed for ${sessionId}:`, error);
         return null;
+    }
+}
+
+/** The same creation-time fallback using OC2's authoritative projection, never the retained v1 table. */
+export function resolveIsSubagentFromOpenCode2Db(sessionId: string): boolean | null {
+    let reader: V2StoreReader | undefined;
+    try {
+        reader = new V2StoreReader(
+            gaDatabasePath(getDataDir(), process.env.OPENCODE_CHANNEL ?? "latest"),
+        );
+        return reader.isSubagent(sessionId);
+    } catch (error) {
+        log(`[magic-context] resolveIsSubagentFromOpenCode2Db failed for ${sessionId}:`, error);
+        return null;
+    } finally {
+        reader?.close();
     }
 }

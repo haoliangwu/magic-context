@@ -131,3 +131,49 @@ describe("tagTranscript source_contents persistence", () => {
 		}
 	});
 });
+
+it("Pi tool reclaim preview retains skeleton mass and leaves served content unchanged", () => {
+	const db = createTestDb();
+	try {
+		const sessionId = "pi-reclaim-preview";
+		const messages = [
+			{
+				...assistantMessage("", 1),
+				content: [
+					{
+						type: "toolCall",
+						id: "c",
+						name: "read",
+						arguments: { path: "sample.txt" },
+					},
+				],
+			},
+			{
+				role: "toolResult",
+				toolCallId: "c",
+				toolName: "read",
+				content: [{ type: "text", text: "word ".repeat(999) }],
+				isError: false,
+				timestamp: 2,
+			},
+		] as Parameters<typeof createPiTranscript>[0];
+		const tagger = createTagger();
+		tagger.initFromDb(sessionId, db);
+		const { targets } = tagTranscript(
+			sessionId,
+			createPiTranscript(messages, sessionId),
+			tagger,
+			db,
+		);
+		const target = [...targets.values()].find((t) => t.canDrop?.());
+		const before = JSON.stringify(messages);
+		const observed = target?.measureReclaim?.(true);
+		if (!observed) throw new Error("Expected reclaim measurement");
+		expect(observed.beforeTools).toBeGreaterThan(1000);
+		expect(observed.afterTools).toBeGreaterThan(0);
+		expect(observed.afterTools).toBeLessThan(observed.beforeTools);
+		expect(JSON.stringify(messages)).toBe(before);
+	} finally {
+		closeQuietly(db);
+	}
+});

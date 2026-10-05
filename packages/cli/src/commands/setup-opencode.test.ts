@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { parse as parseJsonc } from "comment-json";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import {
     addPluginToOpenCodeConfig,
     addPluginToTuiConfig,
+    applyOpenCodeSetupConfigs,
+    findDcpPluginEntries,
     findDcpPluginIndexes,
     writeMagicContextConfig,
 } from "./setup-opencode";
@@ -13,7 +16,7 @@ import {
 const tempDirs: string[] = [];
 
 function tempDir(): string {
-    const path = mkdtempSync(join(tmpdir(), "mc-opencode-setup-"));
+    const path = createTestTempDirFromPath(join(tmpdir(), "mc-opencode-setup-"));
     tempDirs.push(path);
     return path;
 }
@@ -152,6 +155,69 @@ describe("setup-opencode per-harness config", () => {
     });
 });
 
+/** The retired agent's config key, spelled the way the source fence test requires. */
+const RETIRED_AGENT_KEY = ["side", "kick"].join("");
+
+describe("setup-opencode keeps magic-context.jsonc comments", () => {
+    it("retains top-level, nested and trailing comments when rewriting choices", () => {
+        const path = join(tempDir(), "magic-context.jsonc");
+        writeFileSync(
+            path,
+            `{
+  // why this historian
+  "historian": {
+    // pinned for cost
+    "opencode": { "model": "old/historian" } // trailing note
+  },
+  /* keep the dreamer */
+  "dreamer": { "opencode": { "model": "old/dreamer" } },
+  "${RETIRED_AGENT_KEY}": { "enabled": true }
+}
+`,
+        );
+
+        writeMagicContextConfig(path, {
+            historianModel: "new/historian",
+            dreamerEnabled: true,
+            dreamerModel: "new/dreamer",
+            claudeMax: false,
+        });
+
+        const text = readFileSync(path, "utf-8");
+        for (const comment of [
+            "// why this historian",
+            "// pinned for cost",
+            "// trailing note",
+            "/* keep the dreamer */",
+        ]) {
+            expect(text).toContain(comment);
+        }
+        const config = parseJsonc(text) as Record<string, unknown> & {
+            historian?: { opencode?: { model?: string } };
+            dreamer?: { opencode?: { model?: string } };
+        };
+        expect(config.historian?.opencode?.model).toBe("new/historian");
+        expect(config.dreamer?.opencode?.model).toBe("new/dreamer");
+        // The retired agent block is still removed.
+        expect(config).not.toHaveProperty(RETIRED_AGENT_KEY);
+    });
+
+    it("still refuses a prototype-pollution key", () => {
+        const path = join(tempDir(), "magic-context.jsonc");
+        const original = `{ "__proto__": { "polluted": true } }\n`;
+        writeFileSync(path, original);
+        expect(() =>
+            writeMagicContextConfig(path, {
+                historianModel: "new/historian",
+                dreamerEnabled: false,
+                dreamerModel: null,
+                claudeMax: false,
+            }),
+        ).toThrow(/prototype-pollution/);
+        expect(readFileSync(path, "utf-8")).toBe(original);
+    });
+});
+
 describe("setup-opencode DCP preflight", () => {
     it("is tuple-safe and only matches canonical opencode-dcp entries", () => {
         const plugins: unknown[] = [
@@ -274,5 +340,220 @@ describe("setup-opencode JSONC byte preservation", () => {
 
         expect(readFileSync(configPath, "utf-8")).toBe(expected);
         expect(readFileSync(configPath, "utf-8")).not.toContain("removed DCP plugin");
+    });
+});
+
+// OpenCode 2 loads both the legacy `plugin` and the native `plugins` array, so
+// setup must recognise a registration under either and write new entries under
+// the running generation's own key; otherwise the plugin loads twice.
+describe("setup-opencode plugin key across host generations", () => {
+    it("writes a fresh v2 registration under `plugins`, never `plugin`", () => {
+        const path = join(tempDir(), "opencode.json");
+        writeFileSync(path, `{"model":"openai/x"}`);
+        addPluginToOpenCodeConfig(path, "json", false, true, "v2");
+        const config = parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>;
+        expect(config.plugin).toBeUndefined();
+        expect(config.plugins).toEqual(["@cortexkit/opencode-magic-context@latest"]);
+    });
+
+    it("leaves a checkout registered under `plugins` alone on a v2 host", () => {
+        const path = join(tempDir(), "opencode.json");
+        const checkout = resolve(import.meta.dir, "../../../plugin");
+        writeFileSync(path, JSON.stringify({ plugins: [checkout] }));
+        addPluginToOpenCodeConfig(path, "json", false, true, "v2");
+        const config = parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>;
+        expect(config.plugins).toEqual([checkout]);
+        expect(config.plugin).toBeUndefined();
+    });
+
+    it("creates a v2 config with the `plugins` key", () => {
+        const path = join(tempDir(), "opencode.json");
+        addPluginToOpenCodeConfig(path, "none", false, true, "v2");
+        const config = parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>;
+        expect(config.plugins).toEqual(["@cortexkit/opencode-magic-context@latest"]);
+        expect(config.plugin).toBeUndefined();
+    });
+
+    it("keeps the singular `plugin` key on a v1 host", () => {
+        const path = join(tempDir(), "opencode.json");
+        writeFileSync(path, `{"model":"openai/x"}`);
+        addPluginToOpenCodeConfig(path, "json", false, true, "v1");
+        const config = parseJsonc(readFileSync(path, "utf-8")) as Record<string, unknown>;
+        expect(config.plugin).toEqual(["@cortexkit/opencode-magic-context@latest"]);
+        expect(config.plugins).toBeUndefined();
+    });
+});
+
+describe("setup-opencode Claude Max cache TTL", () => {
+    it("keeps a string cache_ttl as the default when adding the Claude Max overrides", () => {
+        const path = join(tempDir(), "magic-context.jsonc");
+        writeFileSync(path, `{ "cache_ttl": "1h" }\n`);
+
+        writeMagicContextConfig(path, {
+            historianModel: null,
+            dreamerEnabled: false,
+            dreamerModel: null,
+            claudeMax: true,
+        });
+
+        const config = parseJsonc(readFileSync(path, "utf-8")) as { cache_ttl?: unknown };
+        expect(config.cache_ttl).toEqual({
+            default: "1h",
+            "anthropic/claude-sonnet-4-6": "59m",
+            "anthropic/claude-opus-4-6": "59m",
+        });
+    });
+});
+
+describe("setup-opencode byte-order mark", () => {
+    const BOM = "\uFEFF";
+
+    it("adds the plugin to an opencode.jsonc that starts with a BOM", () => {
+        const path = join(tempDir(), "opencode.jsonc");
+        writeFileSync(path, `${BOM}{\n  // mine\n  "plugin": ["other"]\n}\n`);
+
+        addPluginToOpenCodeConfig(path, "jsonc", false, false, "v1");
+
+        const text = readFileSync(path, "utf-8");
+        expect(text.startsWith(BOM)).toBe(true);
+        expect(text).toContain("// mine");
+        expect((parseJsonc(text) as { plugin?: unknown[] }).plugin).toEqual([
+            "other",
+            "@cortexkit/opencode-magic-context@latest",
+        ]);
+    });
+
+    it("adds the plugin to a tui.jsonc that starts with a BOM", () => {
+        const path = join(tempDir(), "tui.jsonc");
+        writeFileSync(path, `${BOM}{\n  "theme": "dark"\n}\n`);
+
+        addPluginToTuiConfig(path, "jsonc");
+
+        const text = readFileSync(path, "utf-8");
+        expect(text.startsWith(BOM)).toBe(true);
+        expect((parseJsonc(text) as { plugin?: unknown[] }).plugin).toEqual([
+            "@cortexkit/opencode-magic-context@latest",
+        ]);
+    });
+});
+
+describe("applyOpenCodeSetupConfigs", () => {
+    function targets() {
+        const dir = tempDir();
+        const paths = {
+            opencodeConfig: join(dir, "opencode.jsonc"),
+            magicContextConfig: join(dir, "magic-context.jsonc"),
+            tuiConfig: join(dir, "tui.jsonc"),
+        };
+        writeFileSync(paths.opencodeConfig, `{\n  "plugin": []\n}\n`);
+        writeFileSync(paths.tuiConfig, `\uFEFF{\n  "theme": "dark"\n}\n`);
+        return paths;
+    }
+    const choices = {
+        removeDcp: false,
+        compactionEnabled: true,
+        hostGeneration: "v1" as const,
+        magicContext: {
+            historianModel: "a/historian",
+            dreamerEnabled: false,
+            dreamerModel: null,
+            claudeMax: true,
+        },
+    };
+
+    it("writes all three configs, including a BOM-prefixed tui.jsonc", () => {
+        const paths = targets();
+        applyOpenCodeSetupConfigs(paths, choices);
+
+        expect(readFileSync(paths.opencodeConfig, "utf-8")).toContain(
+            "@cortexkit/opencode-magic-context@latest",
+        );
+        expect(readFileSync(paths.tuiConfig, "utf-8")).toContain(
+            "@cortexkit/opencode-magic-context@latest",
+        );
+        expect(
+            (
+                parseJsonc(readFileSync(paths.magicContextConfig, "utf-8")) as {
+                    historian?: { opencode?: { model?: string } };
+                }
+            ).historian?.opencode?.model,
+        ).toBe("a/historian");
+    });
+
+    it("writes nothing when one config cannot be updated", () => {
+        const paths = targets();
+        // An array cache_ttl cannot take per-model overrides; setup must stop
+        // before opencode.jsonc is changed, not after.
+        const magicContext = `{ "cache_ttl": ["5m"] }\n`;
+        writeFileSync(paths.magicContextConfig, magicContext);
+        const before = [paths.opencodeConfig, paths.tuiConfig].map((path) =>
+            readFileSync(path, "utf-8"),
+        );
+
+        expect(() => applyOpenCodeSetupConfigs(paths, choices)).toThrow(/cache_ttl/);
+
+        expect(
+            [paths.opencodeConfig, paths.tuiConfig].map((path) => readFileSync(path, "utf-8")),
+        ).toEqual(before);
+        expect(readFileSync(paths.magicContextConfig, "utf-8")).toBe(magicContext);
+    });
+});
+
+describe("setup-opencode relative development checkout", () => {
+    it("does not add the npm entry next to a checkout registered relative to the config", () => {
+        const configDir = tempDir();
+        const elsewhere = tempDir();
+        mkdirSync(join(configDir, "mc", "plugin"), { recursive: true });
+        writeFileSync(
+            join(configDir, "mc", "plugin", "package.json"),
+            JSON.stringify({ name: "@cortexkit/opencode-magic-context" }),
+        );
+        const path = join(configDir, "opencode.jsonc");
+        const original = `{\n  "plugin": ["./mc/plugin"],\n  "compaction": { "auto": false, "prune": false }\n}\n`;
+        writeFileSync(path, original);
+        const originalCwd = process.cwd();
+        process.chdir(elsewhere);
+        try {
+            addPluginToOpenCodeConfig(path, "jsonc", false, true, "v1");
+        } finally {
+            process.chdir(originalCwd);
+        }
+        expect(readFileSync(path, "utf-8")).toBe(original);
+    });
+});
+
+describe("setup-opencode DCP detection across plugin keys", () => {
+    it("finds opencode-dcp registered under the OpenCode 2 `plugins` key", () => {
+        expect(
+            findDcpPluginEntries({
+                plugin: ["@cortexkit/opencode-magic-context@latest"],
+                plugins: [{ package: "@tarquinen/opencode-dcp@latest" }],
+            }),
+        ).toEqual([{ package: "@tarquinen/opencode-dcp@latest" }]);
+        expect(findDcpPluginEntries({ plugin: ["@tarquinen/opencode-dcp"] })).toEqual([
+            "@tarquinen/opencode-dcp",
+        ]);
+        expect(findDcpPluginEntries({ plugins: ["other"] })).toEqual([]);
+    });
+});
+
+describe("setup-opencode inserts follow the file's layout", () => {
+    it("writes new keys on their own indented lines with the file's CRLF endings", () => {
+        const path = join(tempDir(), "opencode.jsonc");
+        writeFileSync(path, '{\r\n    "model": "a/b"\r\n}\r\n');
+
+        addPluginToOpenCodeConfig(path, "jsonc", false, true, "v1");
+
+        const text = readFileSync(path, "utf-8");
+        // Every line break stays CRLF and nothing is crammed onto the model line.
+        expect(text.replace(/\r\n/g, "")).not.toContain("\n");
+        expect(text.split("\r\n")[1]).toBe('    "model": "a/b",');
+        expect(text).toContain('\r\n    "plugin": [');
+        expect(text).toContain('\r\n    "compaction": {');
+        expect(parseJsonc(text)).toEqual({
+            model: "a/b",
+            plugin: ["@cortexkit/opencode-magic-context@latest"],
+            compaction: { auto: false, prune: false },
+        });
     });
 });

@@ -33,6 +33,7 @@ if (isolatedTestFiles.length !== SPAWN_SYNC_TESTS.size) {
 function runTestFiles(files: string[]): Promise<number> {
     return new Promise((resolveExitCode) => {
         const child = spawn(process.execPath, ["test", ...process.argv.slice(2), ...files], {
+            windowsHide: true,
             cwd: packageRoot,
             env: process.env,
             stdio: "inherit",

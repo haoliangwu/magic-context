@@ -235,7 +235,6 @@ Genkaldelse virker **på tværs af sessioner** (en ny session arver alt) og **p�
 | `/ctx-status` | Debugvisning: tags, pending drops, cache TTL, nudge-tilstand, historian-fremskridt, kompartementdækning, historikbudget |
 | `/ctx-flush` | Tving alle køede operationer straks, uden om cache TTL |
 | `/ctx-recomp` | Genopbyg kompartementer fra rå historik (accepterer et `start-end`-interval). Brug når gemt tilstand virker forkert |
-| `/ctx-session-upgrade` | Opgrader denne session til det nyeste historikformat: genopbyg kompartementer og migrer projekthukommelser |
 | `/ctx-dream` | Kør dreamer-vedligeholdelse efter behov: vedligehold hukommelse, docs, smart notes og user-profile review |
 
 ---

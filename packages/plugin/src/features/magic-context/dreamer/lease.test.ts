@@ -1,13 +1,14 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it, spyOn } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { $ } from "bun";
 import * as logger from "../../../shared/logger";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import {
@@ -217,7 +218,7 @@ describe("dreamer lease (serialized acquisition)", () => {
     });
 
     it("allows exactly one winner across separate DB handles", () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-dream-lease-handles-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-dream-lease-handles-"));
         const path = join(dir, "context.db");
         const dbA = makeDb(path);
         const dbB = makeDb(path);
@@ -233,7 +234,7 @@ describe("dreamer lease (serialized acquisition)", () => {
     });
 
     it("allows exactly one winner across subprocesses sharing a DB", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-dream-lease-process-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-dream-lease-process-"));
         const path = join(dir, "context.db");
         const setup = makeDb(path);
         closeQuietly(setup);
@@ -322,11 +323,9 @@ describe("startLeaseHeartbeat", () => {
         closeQuietly(db);
     });
 
-    it("declares lost (not reclaim) when the lease lapsed past a full TTL — split-brain guard", async () => {
-        // If more than two minutes pass without confirming ownership, another process
-        // may have used the lease. Continuing with stale work is unsafe even if the
-        // lease is now free; a shorter gap remains safe to recover (see the
-        // transient-tolerant test above).
+    it("reacquires its own expired generation even after a full TTL", async () => {
+        // A long gap alone does not prove takeover. The generation tracks whether
+        // another holder acquired and released the lease during the gap.
         const db = makeDb();
         const realNow = Date.now();
         const clock = { value: realNow };
@@ -347,14 +346,13 @@ describe("startLeaseHeartbeat", () => {
             );
             expect(hb.lost).toBe(false);
 
-            // Advance the fake clock by 3 minutes, past the two-minute confirmation
-            // cutoff. The lease has lapsed, so the next beat cannot renew it and the
-            // gap exceeds the allowed ownership-confirmation period.
+            // Advance past expiry while leaving holder and generation untouched.
             clock.value = realNow + 3 * 60 * 1000;
             await sleep(60);
 
-            expect(hb.lost).toBe(true);
-            expect(lostReason).toContain("past TTL");
+            expect(hb.lost).toBe(false);
+            expect(lostReason).toBeNull();
+            expect(isLeaseActive(db)).toBe(true);
             hb.stop();
         } finally {
             nowSpy.mockRestore();
@@ -398,13 +396,13 @@ describe("startLeaseHeartbeat", () => {
     it("declares lost exactly once when a different holder actively owns the lease", async () => {
         const db = makeDb();
         expect(acquireLease(db, "holder-a")).toBe(true);
-        let lostCalls = 0;
+        const reasons: string[] = [];
         const hb = startLeaseHeartbeat(
             db,
             "holder-a",
             DREAMING_LEASE_KEY,
-            () => {
-                lostCalls += 1;
+            (reason) => {
+                reasons.push(reason);
             },
             20,
         );
@@ -413,10 +411,100 @@ describe("startLeaseHeartbeat", () => {
         expect(acquireLease(db, "holder-b")).toBe(true);
         await sleep(80);
         expect(hb.lost).toBe(true);
-        expect(lostCalls).toBe(1); // onLost fires once, not on every subsequent beat
+        expect(reasons).toEqual(["lease_lost: taken by holder-b"]);
         expect(getLeaseHolder(db)).toBe("holder-b");
         hb.stop();
         closeQuietly(db);
+    });
+
+    it("counts a busy renewal and retries on the next beat", async () => {
+        const db = makeDb();
+        expect(acquireLease(db, "holder-a")).toBe(true);
+        const realExec = db.exec.bind(db);
+        let busy = true;
+        const execSpy = spyOn(db, "exec").mockImplementation((sql: string) => {
+            if (sql === "BEGIN IMMEDIATE" && busy) {
+                busy = false;
+                throw new Error("SQLITE_BUSY");
+            }
+            return realExec(sql);
+        });
+        try {
+            const reasons: string[] = [];
+            const hb = startLeaseHeartbeat(
+                db,
+                "holder-a",
+                DREAMING_LEASE_KEY,
+                (reason) => reasons.push(reason),
+                20,
+            );
+            expect(hb.lost).toBe(false);
+            expect(hb.renewalFailures).toBe(1);
+            await sleep(65);
+            expect(hb.lost).toBe(false);
+            expect(hb.renewalFailures).toBe(1);
+            expect(reasons).toEqual([]);
+            expect(isLeaseActive(db)).toBe(true);
+            hb.stop();
+        } finally {
+            execSpy.mockRestore();
+            closeQuietly(db);
+        }
+    });
+
+    it("detects takeover by a second process without reclaiming its lease", async () => {
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-dream-lease-heartbeat-"));
+        const path = join(dir, "context.db");
+        const db = makeDb(path);
+        const acquisition = acquireLeaseWithAcquisition(db, "holder-a");
+        expect(acquisition).not.toBeNull();
+        const reasons: string[] = [];
+        const controller = new AbortController();
+        let hb: ReturnType<typeof startLeaseHeartbeat> | undefined;
+        try {
+            // The second process takes the expired lease before the heartbeat starts.
+            // A running heartbeat is allowed to re-acquire its own expired lease while
+            // nobody else holds it, so starting it first would race the subprocess.
+            expireLease(db);
+            const pluginRoot = process.cwd().endsWith("/packages/plugin")
+                ? process.cwd()
+                : join(process.cwd(), "packages", "plugin");
+            const script = `
+                const { Database } = await import(${JSON.stringify(`file://${pluginRoot}/src/shared/sqlite.ts`)});
+                const { acquireLease, getLeaseHolder } = await import(${JSON.stringify(`file://${pluginRoot}/src/features/magic-context/dreamer/lease.ts`)});
+                const db = new Database(${JSON.stringify(path)});
+                const acquired = acquireLease(db, "holder-b");
+                console.log(JSON.stringify({ acquired, holder: getLeaseHolder(db) }));
+                db.close();
+            `;
+            const other = (await $`bun -e ${script}`.json()) as {
+                acquired: boolean;
+                holder: string;
+            };
+            expect(other).toEqual({ acquired: true, holder: "holder-b" });
+            hb = startLeaseHeartbeat(
+                db,
+                "holder-a",
+                DREAMING_LEASE_KEY,
+                (reason) => {
+                    reasons.push(reason);
+                    controller.abort(new Error(reason));
+                },
+                20,
+            );
+            await sleep(80);
+            expect(hb.lost).toBe(true);
+            expect(controller.signal.aborted).toBe(true);
+            expect((controller.signal.reason as Error).message).toBe(
+                "lease_lost: taken by holder-b",
+            );
+            expect(reasons).toEqual(["lease_lost: taken by holder-b"]);
+            expect(getLeaseHolder(db)).toBe("holder-b");
+        } finally {
+            hb?.stop();
+            closeQuietly(db);
+            rmSync(dir, { recursive: true, force: true });
+        }
     });
 
     it("stops firing after stop()", async () => {

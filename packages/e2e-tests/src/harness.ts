@@ -24,16 +24,26 @@ import { MockProvider, type MockResponse } from "./mock-provider/server";
 import { spawnOpencode, type SpawnedOpencode, type SpawnOptions } from "./opencode-runner/spawn";
 
 export interface TestHarnessOptions {
+    /** Use a canonical provider id when testing provider-specific replay lanes. */
+    mockProviderID?: string;
     /** magic-context config overrides. Merged onto test defaults. */
     magicContextConfig?: Record<string, unknown>;
     /** Extra opencode.json config. Merged onto test defaults. */
     openCodeConfigExtra?: Record<string, unknown>;
+    /** Extra config for OpenCode's GLOBAL config dir, the layer $OPENCODE_CONFIG_DIR sits on top of. */
+    openCodeGlobalConfigExtra?: Record<string, unknown>;
+    /** Leave the default `compaction` block out of the $OPENCODE_CONFIG_DIR layer. */
+    omitConfigDirCompaction?: boolean;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /** Register a separate mock historian model with this window and pin the historian to it. */
+    historianMockModel?: { id: string; contextLimit: number };
     /** Set false only when the test intentionally verifies conflict-based self-disable behavior. */
     expectMagicContext?: boolean;
     /** Debug harnesses may boot the plugin with hooks configured off while retaining diagnostics. */
     expectedMagicContextState?: "enabled" | "configured-disabled" | "conflict-disabled";
+    /** Leave schema initialization to an older released plugin during compatibility probes. */
+    prepareContextDatabase?: boolean;
     /**
      * Default response used when the mock queue is empty. Lets tests send extra
      * prompts without worrying about scripting every one.
@@ -107,6 +117,18 @@ export class TestHarness implements HostHarness {
         return this.clientInstance;
     }
 
+    get serverUrl(): string {
+        return this.opencode.url;
+    }
+
+    get workdir(): string {
+        return this.opencode.env.workdir;
+    }
+
+    get dataDir(): string {
+        return this.opencode.env.dataDir;
+    }
+
     /** Provides Rust-mode-only access to the historian and status interfaces running in the module's Rust stack. */
     get rustStack(): SpawnedOpencode["rustStack"] {
         return this.opencodeInstance.rustStack;
@@ -125,10 +147,14 @@ export class TestHarness implements HostHarness {
         const expectMagicContext = expectedMagicContextState === "enabled";
         const spawnOpts: SpawnOptions = {
             mockProviderURL: baseURL,
+            mockProviderID: options.mockProviderID,
             magicContextConfig: options.magicContextConfig,
             openCodeConfigExtra: options.openCodeConfigExtra,
+            openCodeGlobalConfigExtra: options.openCodeGlobalConfigExtra,
+            omitConfigDirCompaction: options.omitConfigDirCompaction,
             modelContextLimit: options.modelContextLimit,
-            prepareContextDatabase: expectMagicContext,
+            historianMockModel: options.historianMockModel,
+            prepareContextDatabase: options.prepareContextDatabase ?? expectMagicContext,
             expectedMagicContextState,
         };
         let opencode: SpawnedOpencode | undefined;
@@ -154,7 +180,7 @@ export class TestHarness implements HostHarness {
             this.contextDbCached = null;
         }
         const env = this.opencodeInstance.env;
-        await this.opencodeInstance.kill();
+        await this.opencodeInstance.kill({ root: "keep" });
         this.opencodeInstance = await spawnOpencode({
             ...this.spawnOptions,
             existingEnv: env,
@@ -165,12 +191,50 @@ export class TestHarness implements HostHarness {
         }) as unknown as SdkClient;
     }
 
+    async reloadPlugin(): Promise<void> {
+        await this.restart();
+    }
+
     /** Create a session bound to the isolated workdir. Throws on failure. */
     async createSession(): Promise<string> {
         return this.createSessionWithRetry(
             () => this.client.session.create({ query: { directory: this.opencode.env.workdir } }),
             "session.create",
         );
+    }
+
+    /**
+     * Run OpenCode's own compaction on a session, the request `/compact` sends.
+     * Resolves once the host has written its summary.
+     */
+    async compactSession(
+        sessionId: string,
+        model: { providerID: string; modelID: string } = {
+            providerID: "mock-anthropic",
+            modelID: "mock-sonnet",
+        },
+    ): Promise<void> {
+        const response = await fetch(
+            `${this.opencode.url}/session/${encodeURIComponent(sessionId)}/summarize`,
+            {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ ...model, auto: false }),
+            },
+        );
+        if (!response.ok) {
+            throw new Error(
+                `session compaction failed with HTTP ${response.status}: ${await response.text()}`,
+            );
+        }
+    }
+
+    async removeSession(sessionId: string): Promise<void> {
+        const response = await fetch(
+            `${this.opencode.url}/session/${encodeURIComponent(sessionId)}`,
+            { method: "DELETE" },
+        );
+        if (!response.ok) throw new Error(`session removal failed with HTTP ${response.status}`);
     }
 
     /**
@@ -318,7 +382,7 @@ export class TestHarness implements HostHarness {
             path: { id: sessionId },
             body: {
                 model: {
-                    providerID: options.providerID ?? "mock-anthropic",
+                    providerID: options.providerID ?? this.spawnOptions.mockProviderID ?? "mock-anthropic",
                     modelID: options.modelID ?? "mock-sonnet",
                 },
                 parts: [{ type: "text", text }],
@@ -404,16 +468,15 @@ export class TestHarness implements HostHarness {
      * Open the magic-context SQLite database in read-only mode.
      * Cached per harness so repeated calls share the handle.
      */
+    contextDbPath(): string {
+        return join(this.dataDir, "cortexkit", "magic-context", "context.db");
+    }
+
     contextDb(): Database {
         if (this.contextDbCached) return this.contextDbCached;
         // Plugin v0.16+ uses the shared cortexkit/magic-context path so OpenCode
         // and Pi can share state. See packages/plugin/src/shared/data-path.ts.
-        const dbPath = join(
-            this.opencode.env.dataDir,
-            "cortexkit",
-            "magic-context",
-            "context.db",
-        );
+        const dbPath = this.contextDbPath();
         if (!existsSync(dbPath)) {
             throw new Error(`context.db not found at ${dbPath} — plugin may not have initialized yet.`);
         }
@@ -423,13 +486,7 @@ export class TestHarness implements HostHarness {
 
     /** Whether the plugin has created its database yet. */
     hasContextDb(): boolean {
-        const dbPath = join(
-            this.opencode.env.dataDir,
-            "cortexkit",
-            "magic-context",
-            "context.db",
-        );
-        return existsSync(dbPath);
+        return existsSync(this.contextDbPath());
     }
 
     /** Poll until `predicate` returns true or `timeoutMs` elapses. */
@@ -488,9 +545,19 @@ export class TestHarness implements HostHarness {
         return this.mock.requests();
     }
 
+    diagnostics(): string {
+        return `stdout:\n${this.opencode.stdout()}\nstderr:\n${this.opencode.stderr()}`;
+    }
+
     assertHistorianRequestsUseMock(): void {
         if (this.expectMagicContext && this.hasContextDb()) {
-            assertHistorianMockRouting(this.contextDb(), "opencode", "mock-anthropic/mock-sonnet");
+            // A test that pins the historian to its own mock model routes there.
+            const historianModel = this.spawnOptions.historianMockModel;
+            assertHistorianMockRouting(
+                this.contextDb(),
+                "opencode",
+                `mock-anthropic/${historianModel?.id ?? "mock-sonnet"}`,
+            );
         }
     }
 
@@ -506,7 +573,7 @@ export class TestHarness implements HostHarness {
                 }
                 this.contextDbCached = null;
             }
-            await this.opencode.kill();
+            await this.opencode.kill({ root: "remove" });
             await this.mock.stop();
         }
     }

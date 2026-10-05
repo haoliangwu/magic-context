@@ -25,7 +25,7 @@ const { buildCompartmentAgentPrompt } = promptMod as {
         extractionFree?: boolean;
     }) => string;
 };
-const { buildReferenceBlocks, selectSeeds, renderSeedExamplesBlock } = referenceMod as {
+const { buildReferenceBlocks, selectSeeds, renderSeedExamplesBlock, selectSessionReferences, renderSessionReferencesBlock } = referenceMod as {
     buildReferenceBlocks: (args: {
         sessionId: string;
         chunkStart: number;
@@ -37,9 +37,11 @@ const { buildReferenceBlocks, selectSeeds, renderSeedExamplesBlock } = reference
         count?: number,
     ) => Array<{ importance: number; block: string }>;
     renderSeedExamplesBlock: (seeds: Array<{ importance: number; block: string }>) => string;
+    selectSessionReferences: (compartments: TsReferenceCompartment[], seeds: Array<{ importance: number; block: string }>, sessionId: string, chunkStart: number) => TsReferenceCompartment[];
+    renderSessionReferencesBlock: (selected: TsReferenceCompartment[], window?: number) => string;
 };
-const { renderMemoryBlock } = injectMod as {
-    renderMemoryBlock: (memories: TsMemory[]) => string | null;
+const { renderHistorianMemoryBlock } = injectMod as {
+    renderHistorianMemoryBlock: (memories: TsMemory[]) => string | null;
 };
 const { REFERENCE_SEEDS } = seedsMod as {
     REFERENCE_SEEDS: ReadonlyArray<{ importance: number; block: string }>;
@@ -190,14 +192,14 @@ const matureCompartments: ReferenceCompartmentJson[] = [
     {
         start_message: 1,
         end_message: 5,
-        title: "old omitted one",
+        title: "older low-mid one",
         content: "old content one",
         importance: 10,
     },
     {
         start_message: 6,
         end_message: 12,
-        title: "old omitted two",
+        title: "older low-mid two",
         content: "old content two",
         importance: 20,
     },
@@ -334,9 +336,9 @@ const promptCaseSpecs: PromptCaseSpec[] = [
 ];
 
 const seedCaseSpecs: SeedCaseSpec[] = [
-    { label: "default rotation a", session_id: "rot-a", chunk_start: 0, count: 4 },
-    { label: "default rotation b", session_id: "rot-b", chunk_start: 1, count: 4 },
-    { label: "unicode utf16 rotation", session_id: "emoji-🚀-session", chunk_start: 7, count: 4 },
+    { label: "default rotation a", session_id: "rot-a", chunk_start: 0, count: 3 },
+    { label: "default rotation b", session_id: "rot-b", chunk_start: 1, count: 3 },
+    { label: "unicode utf16 rotation", session_id: "emoji-🚀-session", chunk_start: 7, count: 3 },
     { label: "flat fallback count above band guard", session_id: "fallback", chunk_start: 12345, count: 25 },
 ];
 
@@ -356,7 +358,7 @@ const promptCases: PromptCase[] = promptCaseSpecs.map((spec) => {
         chunkStart: spec.chunk_start,
         sessionCompartments,
     });
-    const projectMemory = renderMemoryBlock(spec.memories.map(toTsMemory)) ?? "";
+    const projectMemory = renderHistorianMemoryBlock(spec.memories.map(toTsMemory)) ?? "";
     const prompt = buildCompartmentAgentPrompt({
         seedExamples: refs.seedExamples,
         sessionReferences: refs.sessionReferences,
@@ -367,7 +369,7 @@ const promptCases: PromptCase[] = promptCaseSpecs.map((spec) => {
     });
     return {
         ...spec,
-        selected_seed_indices: selectedSeedIndices(spec.session_id, spec.chunk_start, 4),
+        selected_seed_indices: selectedSeedIndices(spec.session_id, spec.chunk_start, 3),
         seed_examples: refs.seedExamples,
         session_references: refs.sessionReferences,
         project_memory: projectMemory,
@@ -376,7 +378,7 @@ const promptCases: PromptCase[] = promptCaseSpecs.map((spec) => {
 });
 
 const distinctDefaultSelections = new Set(
-    seedCases.filter((c) => c.count === 4).map((c) => JSON.stringify(c.selected_indices)),
+    seedCases.filter((c) => c.count === 3).map((c) => JSON.stringify(c.selected_indices)),
 );
 if (distinctDefaultSelections.size <= 1) {
     throw new Error("seed rotation cases are vacuous; distinct inputs produced the same selection");
@@ -394,7 +396,38 @@ if (!promptCases.some((c) => c.project_memory.length > 0)) {
     throw new Error("prompt cases never emitted project memory");
 }
 
-const golden = { seed_cases: seedCases, prompt_cases: promptCases };
+// Boundary scores, clustered histories and Unicode ids pin band choice, tie
+// rotation, no-content exclusion and every fitting suffix in both languages.
+const referenceSpecs = [
+    { label: "mixed recent bands", scores: [1, 9, 10, 29, 30, 59, 60, 84, 85, 100, 70, 90, 70, 90] },
+    { label: "all bands covered", scores: [5, 20, 40, 70, 90, 5, 20, 40, 70, 90, 5, 20, 40, 70] },
+    { label: "history lacks low bands", scores: [40, 70, 90, 40, 70, 90, 70, 70, 70, 70] },
+    { label: "one older band", scores: [...Array(20).fill(40), 70, 70, 70, 70] },
+    { label: "no-content gaps", scores: [5, 20, 40, 70, 90, 50, 70, 90], markers: true },
+    ...Array.from({ length: 6 }, (_, count) => ({ label: `young ${count}`, scores: Array(count).fill(50) })),
+];
+const referenceCases = referenceSpecs.map((spec, caseIndex) => {
+    const session_id = "calibration-🚀";
+    const chunk_start = 42 + caseIndex;
+    const session_compartments: ReferenceCompartmentJson[] = spec.scores.map((importance, i) => ({
+        start_message: i * 10 + 1, end_message: i * 10 + 10,
+        title: `Compartment ${i}`, content: `Body & <${i}>`, importance, episode_type: "feature",
+    }));
+    if ("markers" in spec && spec.markers) {
+        for (const at of [session_compartments.length, 4, 0]) session_compartments.splice(at, 0, {
+            start_message: 999, end_message: 999, title: "", content: "", importance: 1,
+        });
+    }
+    const seeds = selectSeeds(session_id, chunk_start);
+    const selected = selectSessionReferences(session_compartments.map(toTsCompartment), seeds, session_id, chunk_start);
+    return {
+        label: spec.label, session_id, chunk_start, session_compartments,
+        seed_examples: renderSeedExamplesBlock(seeds),
+        selected_starts: selected.map((c) => c.startMessage),
+        windows: Array.from({ length: 8 }, (_, window) => ({ window, block: renderSessionReferencesBlock(selected, window) })),
+    };
+});
+const golden = { seed_cases: seedCases, prompt_cases: promptCases, reference_cases: referenceCases };
 const rendered = `${JSON.stringify(golden, null, 2)}\n`;
 const outPath = join(import.meta.dir, "..", "testdata", "historian-prompt-golden.json");
 
@@ -408,8 +441,8 @@ if (process.argv.includes("--check")) {
         console.error(`historian prompt golden drifted; regenerate ${outPath}`);
         process.exit(1);
     }
-    console.log(`historian prompt golden up to date: ${outPath}`);
+    console.log(`historian prompt golden up to date: ${promptCases.length} prompts, ${seedCases.length} seeds, ${referenceCases.length} reference selections: ${outPath}`);
 } else {
     writeFileSync(outPath, rendered);
-    console.log(`wrote ${promptCases.length} historian prompt cases + ${seedCases.length} seed cases → ${outPath}`);
+    console.log(`wrote ${promptCases.length} prompts + ${seedCases.length} seed cases + ${referenceCases.length} reference selections → ${outPath}`);
 }

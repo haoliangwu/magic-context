@@ -170,6 +170,7 @@ export function reconcileCompactionMode(args: {
     historianRunnable: boolean;
     /** Pass-local session meta (drives the stale compartmentInProgress clear). */
     compartmentInProgress: boolean;
+    cleanupMarkers?: (sessionId: string) => McOwnedMarkerCleanupResult;
 }): CompactionModeTransitionResult {
     const { db, sessionId } = args;
     const stored = getCompactionModeRecord(db, sessionId);
@@ -235,7 +236,7 @@ export function reconcileCompactionMode(args: {
         // This separate durable state means a successful notice delivery never
         // suppresses a retry after marker verification failed. It resolves as
         // off for all normal gates while retrying only the unverified cleanup.
-        const markerCleanup = cleanupOffMarkers(sessionId);
+        const markerCleanup = (args.cleanupMarkers ?? cleanupOffMarkers)(sessionId);
         return {
             ...NO_TRANSITION,
             recordToWrite: markerCleanup.verified ? "off" : null,
@@ -253,7 +254,7 @@ export function reconcileCompactionMode(args: {
 
     // 1. Delete MC-owned marker lineages from opencode.db (canonical +
     //    supported legacy). No opencode.db means no markers — not an error.
-    const markerCleanup = cleanupOffMarkers(sessionId);
+    const markerCleanup = (args.cleanupMarkers ?? cleanupOffMarkers)(sessionId);
     if (markerCleanup.removedRows > 0) clearedSomething = true;
 
     // 2. Clear the context.db marker bookkeeping that references the deleted

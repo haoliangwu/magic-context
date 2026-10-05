@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
-import { cavemanCompress } from "./caveman";
+import { cavemanCompress, cavemanWordRulesForLanguage, findFilePathMatches } from "./caveman";
 
 describe("cavemanCompress", () => {
     describe("empty and passthrough", () => {
@@ -251,6 +251,74 @@ describe("cavemanCompress", () => {
     });
 });
 
+describe("linear-time compression", () => {
+    // Each bound is far above the linear cost and far below the old quadratic one
+    // (a 40k run of one token took seconds, and the transform replays compression
+    // on every pass).
+    test("a long token without slashes compresses in linear time", () => {
+        const input = "x".repeat(200_000);
+        const started = performance.now();
+        expect(cavemanCompress(input, "ultra")).toBe(input);
+        expect(performance.now() - started).toBeLessThan(2_000);
+    });
+
+    test("a long dash-joined id compresses in linear time", () => {
+        const input = Array.from({ length: 20_000 }, (_, index) => `id${index}`).join("-");
+        const started = performance.now();
+        expect(cavemanCompress(input, "lite")).toBe(input);
+        expect(performance.now() - started).toBeLessThan(2_000);
+    });
+
+    test("a long whitespace run compresses in linear time", () => {
+        const input = `x${" ".repeat(200_000)}y`;
+        const started = performance.now();
+        expect(cavemanCompress(input, "full")).toBe("x y");
+        expect(performance.now() - started).toBeLessThan(2_000);
+    });
+
+    test("many paths restore in linear time", () => {
+        const input = Array.from({ length: 60_000 }, (_, index) => `see src/f${index}.ts`).join(
+            " ",
+        );
+        const started = performance.now();
+        expect(cavemanCompress(input, "lite")).toBe(input);
+        expect(performance.now() - started).toBeLessThan(2_000);
+    });
+
+    test("the path scanner finds exactly the matches of the path regex", () => {
+        const pathRegex = /(?:\.{1,2}\/)?(?:[\w.-]+\/)+[\w.-]+\.\w{1,6}/g;
+        const alphabet = ["a", "b", "1", "_", ".", "-", "/", " ", "\u0000", "é", "..", "./"];
+        let seed = 7;
+        const random = () => {
+            seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+            return seed / 0x7fffffff;
+        };
+        for (let round = 0; round < 20_000; round += 1) {
+            let text = "";
+            const length = Math.floor(random() * 30);
+            for (let index = 0; index < length; index += 1) {
+                text += alphabet[Math.floor(random() * alphabet.length)];
+            }
+            const expected = [...text.matchAll(pathRegex)].map((match) => [
+                match.index,
+                match.index + match[0].length,
+            ]);
+            expect({ text, matches: findFilePathMatches(text) }).toEqual({
+                text,
+                matches: expected,
+            });
+        }
+    });
+
+    test("nested and literal placeholders restore like a region-at-a-time replace", () => {
+        const nested = "open https://x.io/a`b c` now";
+        expect(cavemanCompress(nested, "lite")).toBe(nested);
+        expect(cavemanCompress("keep \u0000MC_PRES_0\u0000 and `code`", "lite")).toBe(
+            "keep `code` and `code`",
+        );
+    });
+});
+
 type CavemanGoldenCase = {
     text: string;
     lite: string;
@@ -271,6 +339,127 @@ describe("TypeScript/Rust caveman differential golden", () => {
             expect(cavemanCompress(fixture.text, "lite")).toBe(fixture.lite);
             expect(cavemanCompress(fixture.text, "full")).toBe(fixture.full);
             expect(cavemanCompress(fixture.text, "ultra")).toBe(fixture.ultra);
+        }
+    });
+});
+
+describe("original ASCII rules", () => {
+    // Sessions compressed before the Unicode rules replay these bytes until a
+    // cache-rebuilding pass switches them, so they must never drift. The fixture
+    // was rendered by the module as it was before the Unicode rules existed.
+    test("render every fixture row exactly as the original module did", async () => {
+        const path = resolve(import.meta.dir, "__fixtures__/caveman-ascii-v1-golden.json");
+        const cases = (await Bun.file(path).json()) as CavemanGoldenCase[];
+
+        expect(cases.length).toBeGreaterThan(60);
+        for (const fixture of cases) {
+            expect(cavemanCompress(fixture.text, "lite", "ascii-v1")).toBe(fixture.lite);
+            expect(cavemanCompress(fixture.text, "full", "ascii-v1")).toBe(fixture.full);
+            expect(cavemanCompress(fixture.text, "ultra", "ascii-v1")).toBe(fixture.ultra);
+        }
+    });
+});
+
+describe("Unicode rules", () => {
+    test("keep words next to accented letters whole", () => {
+        expect(
+            cavemanCompress(
+                "Hoy es un d\u00eda para probar la energ\u00eda de la bater\u00eda.",
+                "full",
+            ),
+        ).toBe("Hoy es un d\u00eda para probar la energ\u00eda de la bater\u00eda.");
+        expect(cavemanCompress("Ask Mar\u00eda about the caf\u00e9 menu.", "ultra")).toBe(
+            "Ask Mar\u00eda about caf\u00e9 menu.",
+        );
+        // A combining accent is part of the word too.
+        expect(cavemanCompress("un di\u0301a para", "full")).toBe("un di\u0301a para");
+    });
+
+    test("keep fenced code indentation", () => {
+        expect(
+            cavemanCompress("Text\n```ts\nfunction f() {\n    return 1;\n}\n```\n", "lite"),
+        ).toBe("Text\n```ts\nfunction f() {\n    return 1;\n}\n```");
+    });
+
+    test("never merge lines when a word at the start of a line is dropped", () => {
+        expect(
+            cavemanCompress(
+                "Steps:\n1. Build it\nProbably the tests fail.\n\nActually, ship it.",
+                "lite",
+            ),
+        ).toBe("Steps:\n1. Build it\nthe tests fail.\n\n, ship it.");
+        expect(
+            cavemanCompress("The historian was\ncompressed and the\nresult was fixed.", "full"),
+        ).toBe("historian was\ncompressed and the\nresult fixed.");
+    });
+});
+
+type CavemanLanguageGolden = {
+    englishLanguages: Array<string | null>;
+    nonEnglishLanguages: string[];
+    cases: Array<{ text: string; neutral: string }>;
+};
+
+describe("language gate (shared with the Rust module)", () => {
+    const load = async () =>
+        (await Bun.file(
+            resolve(
+                import.meta.dir,
+                "../../../../../crates/mc-module/testdata/caveman-language-golden.json",
+            ),
+        ).json()) as CavemanLanguageGolden;
+
+    test("treats unset, en, en-* and invalid codes as English and other languages as not", async () => {
+        const golden = await load();
+        for (const language of golden.englishLanguages) {
+            expect({ language, rules: cavemanWordRulesForLanguage(language ?? undefined) }).toEqual(
+                {
+                    language,
+                    rules: "english",
+                },
+            );
+        }
+        for (const language of golden.nonEnglishLanguages) {
+            expect({ language, rules: cavemanWordRulesForLanguage(language) }).toEqual({
+                language,
+                rules: "none",
+            });
+        }
+    });
+
+    test("another language keeps only the language-neutral passes, at every level", async () => {
+        const golden = await load();
+        expect(golden.cases.length).toBeGreaterThan(60);
+        for (const fixture of golden.cases) {
+            for (const level of ["lite", "full", "ultra"] as const) {
+                expect(cavemanCompress(fixture.text, level, undefined, "none")).toBe(
+                    fixture.neutral,
+                );
+            }
+        }
+        expect(
+            cavemanCompress("Voy a revisar la configuraci\u00f3n.", "full", undefined, "none"),
+        ).toBe("Voy a revisar la configuraci\u00f3n.");
+        expect(
+            cavemanCompress("Es mejor que quite la l\u00ednea.", "ultra", undefined, "none"),
+        ).toBe("Es mejor que quite la l\u00ednea.");
+    });
+
+    test("English output is unchanged for unset and English settings", async () => {
+        const path = resolve(
+            import.meta.dir,
+            "../../../../../crates/mc-module/testdata/caveman-golden.json",
+        );
+        const cases = (await Bun.file(path).json()) as CavemanGoldenCase[];
+        for (const language of [undefined, "en", "en-US"]) {
+            const rules = cavemanWordRulesForLanguage(language);
+            for (const fixture of cases) {
+                expect(cavemanCompress(fixture.text, "lite", undefined, rules)).toBe(fixture.lite);
+                expect(cavemanCompress(fixture.text, "full", undefined, rules)).toBe(fixture.full);
+                expect(cavemanCompress(fixture.text, "ultra", undefined, rules)).toBe(
+                    fixture.ultra,
+                );
+            }
         }
     });
 });

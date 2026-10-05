@@ -1,4 +1,4 @@
-# Magic Context — pinned OpenCode 2.0.5 end-to-end image.
+# Magic Context — pinned OpenCode 2.0.22 end-to-end image.
 #
 # Local/CI command (the wrapper builds the exact plugin artifact first):
 #   tests/docker/opencode2/run.sh
@@ -22,9 +22,9 @@ ENV PATH="/root/.bun/bin:/test/host/node_modules/.bin:$PATH"
 # The wrapper and native Linux binary are both explicit exact pins. Installing
 # @opencode/client only equips the lane driver; product code never imports it.
 RUN mkdir -p /test/host && npm install --prefix /test/host --no-audit --no-fund \
-    @opencode/cli@2.0.5 \
-    @opencode/cli-linux-x64@2.0.5 \
-    @opencode/client@2.0.5
+    @opencode/cli@2.0.22 \
+    @opencode/cli-linux-x64@2.0.22 \
+    @opencode/client@2.0.22
 
 # Reconstruct the files npm publishes. The Docker build consumes the locally
 # built dist plus the raw TUI sources rather than the registry release.

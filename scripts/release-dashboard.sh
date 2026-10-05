@@ -310,9 +310,9 @@ fi
 echo ""
 echo "→ Publishing release..."
 if [[ -n "$NOTES" ]]; then
-  gh release edit "$TAG" --repo cortexkit/magic-context --draft=false --notes "$NOTES"
+  GH_SHIM_BYPASS=operator gh release edit "$TAG" --repo cortexkit/magic-context --draft=false --notes "$NOTES"
 else
-  gh release edit "$TAG" --repo cortexkit/magic-context --draft=false
+  GH_SHIM_BYPASS=operator gh release edit "$TAG" --repo cortexkit/magic-context --draft=false
 fi
 
 echo ""

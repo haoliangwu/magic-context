@@ -39,13 +39,100 @@ export function modelAcceptsEmptyContent(providerID?: string): boolean {
 }
 
 /**
+ * True when the route serializes reasoning as Anthropic signed thinking, where
+ * removing the tool-result separator between two reasoning-bearing assistant
+ * steps lets the adapter merge them into one signed turn (issue 423). Covers
+ * canonical Anthropic, Vertex and other custom Anthropic ids, and Claude
+ * models behind any other provider (Bedrock, Copilot, OpenRouter
+ * `anthropic/*`). Non-Claude Bedrock models (Nova, Llama, DeepSeek) do not
+ * produce signed Anthropic thinking and are excluded. The forced call
+ * skeleton beside reasoning exists only for these routes.
+ */
+export function isAnthropicFamilyRoute(providerID?: string, modelID?: string): boolean {
+    const provider = (providerID ?? "").toLowerCase();
+    const model = (modelID ?? "").toLowerCase();
+    return (
+        provider.includes("anthropic") || model.includes("claude") || model.includes("anthropic")
+    );
+}
+
+const REMOVED_REASONING_MARK = Symbol.for("magic-context.removed-reasoning");
+/** The fields a neutralized part had, so a route that keeps it can restore it. */
+const NEUTRALIZED_ORIGINALS = new WeakMap<object, Record<string, unknown>>();
+
+/**
+ * Take a reasoning part that a tool or text drop invalidated off the wire,
+ * without ever writing placeholder text into it.
+ *
+ * The part object is rewritten in place to the exact `makeSentinel(part)`
+ * shape (an empty text part keeping any cache marker), so indices stay stable
+ * for every lane that runs later in the pass. Canonical Anthropic's adapter
+ * drops that empty part, which is the output the older `[cleared]` plus
+ * sentinel conversion produced. On every other route the part also carries a
+ * hidden mark, and final representation splices it out together with all of
+ * its provider metadata (signatures, OpenAI encrypted content).
+ *
+ * Parts without `thinking` or `text` (redacted blocks) are left alone, as
+ * before.
+ */
+export function neutralizeDroppedReasoningPart(part: unknown): void {
+    if (!isRecord(part)) return;
+    if (part.thinking === undefined && part.text === undefined) return;
+    if (part.type === "text") return;
+    NEUTRALIZED_ORIGINALS.set(part, { ...part });
+    const cacheControl = part.cache_control;
+    const cacheControlCamel = part.cacheControl;
+    for (const key of Object.keys(part)) delete part[key];
+    part.type = "text";
+    part.text = "";
+    if (cacheControl !== undefined) part.cache_control = cacheControl;
+    if (cacheControlCamel !== undefined) part.cacheControl = cacheControlCamel;
+    Object.defineProperty(part, REMOVED_REASONING_MARK, {
+        value: true,
+        enumerable: false,
+        configurable: true,
+    });
+}
+
+/**
+ * Put a neutralized part back exactly as it was (same object, same key order).
+ * With `legacyCleared`, write `[cleared]` into its `thinking`/`text` the way
+ * drops did before parts were neutralized, reproducing those bytes.
+ */
+export function restoreNeutralizedReasoningPart(part: unknown, legacyCleared: boolean): boolean {
+    if (!isRecord(part)) return false;
+    const original = NEUTRALIZED_ORIGINALS.get(part);
+    if (!original) return false;
+    for (const key of Object.keys(part)) delete part[key];
+    Object.assign(part, original);
+    if (legacyCleared) {
+        if (part.thinking !== undefined) part.thinking = "[cleared]";
+        if (part.text !== undefined) part.text = "[cleared]";
+    }
+    NEUTRALIZED_ORIGINALS.delete(part);
+    delete (part as Record<PropertyKey, unknown>)[REMOVED_REASONING_MARK];
+    return true;
+}
+
+/** True for a part rewritten by `neutralizeDroppedReasoningPart`. */
+export function isNeutralizedReasoningPart(part: unknown): boolean {
+    return (
+        isRecord(part) && (part as Record<PropertyKey, unknown>)[REMOVED_REASONING_MARK] === true
+    );
+}
+
+/**
  * Provider-cache facts for model identities whose effort can change without
  * invalidating cached prompt bytes: Anthropic Fable 5.1 was observed on
- * 2026-09-02 and OpenAI GPT-6 Astra on 2026-09-05.
+ * 2026-09-02, OpenAI GPT-6 Astra on 2026-09-05, and Anthropic Opus 5.5 on
+ * 2026-09-23 (an effort high -> default -> high round trip kept reading the
+ * same cached message prefix). Keep this list in sync with
+ * `VARIANT_CACHE_PRESERVING_MODELS` in crates/mc-module/src/transform.rs.
  */
 const VARIANT_CACHE_PRESERVING_MODELS: Readonly<Record<string, string>> = {
     "anthropic/claude-fable-5-1": "2026-09-02",
     "openai/gpt-6-astra": "2026-09-05",
+    "anthropic/claude-opus-5-5": "2026-09-23",
 };
 
 function canonicalVariantModelIdentity(providerID: string, modelID: string): string {

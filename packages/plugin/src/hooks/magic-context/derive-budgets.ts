@@ -17,7 +17,13 @@
  *     by its own context, not the main session's pressure math.
  */
 
-import { getSdkContextLimit } from "../../shared/models-dev-cache";
+import { log } from "../../shared/logger";
+import {
+    getSdkContextLimit,
+    getSdkInputLimit,
+    getSdkWindowGeometry,
+} from "../../shared/models-dev-cache";
+import { calibrationForModelKey, localBudget } from "./decision-calibration";
 
 // 5% of (main_context × execute_threshold) is the "working usable × 5%" basis.
 // This preserves the legacy static behavior for 1M × 40% (60K tail_size ≈ 15%
@@ -102,6 +108,26 @@ export function resolveKnownHistorianContextLimit(
     return typeof limit === "number" && limit > 0 ? limit : undefined;
 }
 
+export function resolveHistorianProducerLimits(modelKey?: string): {
+    context?: number;
+    input?: number;
+} {
+    if (!modelKey?.includes("/")) return {};
+    const [provider, ...parts] = modelKey.split("/");
+    const model = parts.join("/");
+    if (!provider || !model) return {};
+    const input = getSdkInputLimit(provider, model);
+    const window = getSdkWindowGeometry(provider, model)?.derivation.window;
+    // The legacy resolver can return an input cap; only use it as a context
+    // fallback when no separate input cap was declared.
+    const context =
+        window ?? (input === undefined ? resolveKnownHistorianContextLimit(modelKey) : undefined);
+    return {
+        ...(context !== undefined ? { context } : {}),
+        ...(input !== undefined ? { input } : {}),
+    };
+}
+
 export function resolveHistorianContextLimit(historianModelOverride?: string): number {
     // Explicit override with full provider/model form — user intent wins.
     if (typeof historianModelOverride === "string" && historianModelOverride.includes("/")) {
@@ -115,10 +141,20 @@ export function resolveHistorianContextLimit(historianModelOverride?: string): n
     // and use the conservative default for chunk-budget derivation.
     if (typeof historianModelOverride === "string" && historianModelOverride.trim() !== "") {
         // eslint-disable-next-line no-console
-        console.warn(
+        log(
             `[magic-context] historian.model "${historianModelOverride}" lacks provider prefix ("provider/model-id"); using the default context limit for chunk-budget derivation.`,
         );
     }
 
     return DEFAULT_HISTORIAN_CONTEXT_FALLBACK;
+}
+
+/** Formatted historian source mixes prose and compact tool records, so use the larger class seed. */
+export function producerSourceLocalBudget(
+    providerTokens: number,
+    modelKey: string | undefined,
+): number {
+    const seed = calibrationForModelKey(modelKey);
+    const ratio = Math.max(seed.proseRatio, seed.toolsRatio);
+    return ratio === 1 ? providerTokens : localBudget(providerTokens, ratio);
 }

@@ -9,9 +9,8 @@ import type { SubagentRunner } from "@magic-context/core/shared/subagent-runner"
  *
  * `executeContextRecompWithResult` is harness-agnostic but expects an
  * OpenCode-shaped `client.session.{create,prompt,messages,delete}`. This wraps
- * the Pi subagent runner into that shape so recomp (and session-upgrade) can
- * reuse the exact shared runner. Extracted from ctx-recomp.ts so both
- * /ctx-recomp and /ctx-session-upgrade share one implementation.
+ * the Pi subagent runner into that shape so recomp can reuse the exact shared
+ * runner.
  */
 export function createPiHistorianClient(args: {
 	runner: SubagentRunner;

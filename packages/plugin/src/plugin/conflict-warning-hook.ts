@@ -14,6 +14,7 @@ import { sendStatusNotification } from "../hooks/magic-context/send-session-noti
 import type { ConflictResult } from "../shared/conflict-detector";
 import { formatConflictShort } from "../shared/conflict-detector";
 import { log } from "../shared/logger";
+import { importPluginModule } from "../shared/stale-plugin-build";
 
 const CONFLICT_WARNING_MARKER = "⚠️ Magic Context is disabled due to conflicting configuration:";
 const SCHEMA_FENCE_MARKER = "⚠️ Magic Context is disabled — database is newer than this version";
@@ -403,7 +404,9 @@ export async function sendStartupAnnouncement(
 
     // TUI owns the announcement dialog and shared dismissal stamp. Do not race
     // it with an RPC toast when any TUI is connected, even for another session.
-    const { isTuiConnected } = await import("../shared/rpc-notifications");
+    const { isTuiConnected } = await importPluginModule(
+        () => import("../shared/rpc-notifications"),
+    );
     if (isTuiConnected(sessionId) || isTuiConnected()) return;
 
     // Toast payloads are plain text, so retain copyable URLs instead of Markdown links.

@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import type { EmbeddingConfig } from "../../../config/schema/magic-context";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     _resetProjectEmbeddingRegistryForTests,
     _setTestProviderFactoryForProject,
@@ -64,7 +64,7 @@ describe("ensureMemoryEmbeddings (read-path backfill)", () => {
     const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
     function useTempDb() {
-        const dir = mkdtempSync(join(tmpdir(), "embedding-backfill-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "embedding-backfill-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
         return openDatabase();

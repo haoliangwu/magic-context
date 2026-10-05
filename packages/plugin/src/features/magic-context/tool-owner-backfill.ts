@@ -45,10 +45,7 @@
 
 import { existsSync } from "node:fs";
 import { log } from "../../shared/logger";
-import {
-    assertOpenCodeStoreGeneration,
-    resolveOpenCodeDbPath,
-} from "../../shared/opencode-db-path";
+import { hasV1MessageTables, resolveOpenCodeDbPath } from "../../shared/opencode-db-path";
 import type { Database } from "../../shared/sqlite";
 
 /**
@@ -155,7 +152,11 @@ export function runToolOwnerBackfill(db: Database): BackfillResult {
     const escapedDbPath = opencodeDbPath.replaceAll("'", "''");
     db.exec(`ATTACH '${escapedDbPath}' AS oc_backfill`);
     try {
-        assertOpenCodeStoreGeneration(db, "v1", opencodeDbPath, "oc_backfill");
+        if (!hasV1MessageTables(db, "oc_backfill")) {
+            throw new Error(
+                `OpenCode store at ${opencodeDbPath} has no v1 message tables; nothing to backfill`,
+            );
+        }
         backfillToolOwnersInChunks(db, result);
     } finally {
         // DETACH is safe even if ATTACH partially failed; SQLite
@@ -451,6 +452,7 @@ function applyOwnersForSession(
            AND tool_owner_message_id = ?
          LIMIT 1`,
     );
+    const ownerForRowStmt = db.prepare("SELECT tool_owner_message_id FROM tags WHERE id = ?");
 
     let rowsUpdated = 0;
     db.transaction(() => {
@@ -462,8 +464,12 @@ function applyOwnersForSession(
             // violate the partial UNIQUE index; leave the ghost NULL so runtime
             // lazy adoption can attach it to the real observed owner later.
             if (existingOwnerStmt.get(sessionId, callId, ownerId)) continue;
-            const result = updateRowStmt.run(ownerId, orphan.id);
-            rowsUpdated += result.changes ?? 0;
+            updateRowStmt.run(ownerId, orphan.id);
+            // Verify the claimed row under the same write lock; tag triggers inflate changes.
+            const updated = ownerForRowStmt.get(orphan.id) as
+                | { tool_owner_message_id: string | null }
+                | undefined;
+            if (updated?.tool_owner_message_id === ownerId) rowsUpdated += 1;
         }
     }).immediate();
 

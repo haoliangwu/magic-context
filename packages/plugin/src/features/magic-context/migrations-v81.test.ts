@@ -36,9 +36,14 @@ describe("migration v81: durable last-known-good transform snapshots", () => {
             initializeDatabase(db);
             runMigrations(db);
 
+            // A fresh database gets the current shape: migration 94 replaced the
+            // single json_prefix column with chunk metadata (the prefix itself
+            // lives in lkg_slot_chunks).
             expect(columnNames(db, "lkg_slots")).toEqual([
                 "session_id",
-                "json_prefix",
+                "json_prefix_chars",
+                "json_prefix_chunks",
+                "json_prefix_hash",
                 "input_id_seq",
                 "input_content_digests",
                 "input_content_signatures",
@@ -49,7 +54,6 @@ describe("migration v81: durable last-known-good transform snapshots", () => {
                 "row_version",
                 "capture_sequence",
             ]);
-            expect(LATEST_SUPPORTED_VERSION).toBe(85);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);

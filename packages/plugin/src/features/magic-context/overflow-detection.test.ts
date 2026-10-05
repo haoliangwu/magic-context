@@ -4,6 +4,8 @@ import {
     detectOverflow,
     detectThinkingBindingMismatch,
     extractErrorMessage,
+    isPrefixBoundThinkingModel,
+    parseReportedInputTokens,
     parseReportedLimit,
 } from "./overflow-detection";
 
@@ -54,6 +56,12 @@ describe("overflow-detection / detectOverflow", () => {
             undefined,
         ],
         [
+            "gemini-parenthesized",
+            "The input token count (123456) exceeds the maximum number of tokens allowed (100000).",
+            100000,
+            "prompt_only",
+        ],
+        [
             "xai",
             "the maximum prompt length is 256000 tokens but the prompt was 300000",
             256000,
@@ -80,6 +88,12 @@ describe("overflow-detection / detectOverflow", () => {
         ],
         ["zai", "model_context_window_exceeded", undefined, undefined],
         ["lemonade", "Context size has been exceeded", undefined, undefined],
+        [
+            "ninfer",
+            "AI_APICallError: prepared prompt exceeds Engine max_context 262144",
+            262144,
+            "unknown",
+        ],
     ])("%s pattern matches overflow", (_provider, message, expectedLimit, expectedProvenance) => {
         const detection = detectOverflow(message);
         expect(detection.isOverflow).toBe(true);
@@ -106,6 +120,22 @@ describe("overflow-detection / detectOverflow", () => {
         expect(detection.reportedLimitProvenance).toBe("combined");
     });
 
+    test("extracts provider-reported input mass separately from the accepted limit", () => {
+        expect(detectOverflow("prompt is too long: 1091002").reportedInputTokens).toBe(1_091_002);
+        expect(
+            detectOverflow("prompt is too long: 1091002 tokens > 1048576 maximum"),
+        ).toMatchObject({
+            reportedInputTokens: 1_091_002,
+            reportedLimit: 1_048_576,
+        });
+        expect(
+            detectOverflow("input length 1091002 exceeds the context length of 1048576"),
+        ).toMatchObject({
+            reportedInputTokens: 1_091_002,
+            reportedLimit: 1_048_576,
+        });
+    });
+
     test("returns matchedPattern for diagnostics", () => {
         const detection = detectOverflow("prompt is too long: 210000 > 200000");
         expect(detection.isOverflow).toBe(true);
@@ -114,7 +144,7 @@ describe("overflow-detection / detectOverflow", () => {
 });
 
 describe("overflow-detection / detectThinkingBindingMismatch", () => {
-    test("matches the documented Fable 5.1 400 shape", () => {
+    test("matches the documented 400 shape", () => {
         const detection = detectThinkingBindingMismatch({
             status: 400,
             error: {
@@ -127,19 +157,50 @@ describe("overflow-detection / detectThinkingBindingMismatch", () => {
         expect(detection).toEqual({
             isBindingMismatch: true,
             matchedPattern: "bound to a different conversation",
+            failingBlockPath: "messages.4.content.0",
         });
     });
 
-    test("extracts a provider-supplied offending message id when present", () => {
+    // Captured on 2026-09-26; the body was byte-identical for Claude Fable 5.1
+    // and Claude Opus 5.5 (docs/reports/anthropic-thinking-binding.md section 2).
+    // It carries no message id of any kind, only lowered wire-array paths.
+    const LIVE_BINDING_400_BODY = {
+        type: "error",
+        error: {
+            type: "invalid_request_error",
+            message:
+                'messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to "drop_block". Content before this block differs from when it was created, first at `messages.0.content.0`.',
+        },
+        request_id: "req_011CfSakFxfwQ2vmA7q6iK45",
+    };
+
+    test("reads only the wire paths from the live 400 body, never a host message id", () => {
+        expect(detectThinkingBindingMismatch({ status: 400, ...LIVE_BINDING_400_BODY })).toEqual({
+            isBindingMismatch: true,
+            matchedPattern: "bound to a different conversation",
+            failingBlockPath: "messages.1.content.0",
+            firstChangedPath: "messages.0.content.0",
+        });
+        // A message_id field is not part of the API contract; it must not leak
+        // into the detection as a recovery target.
+        const withForeignId = detectThinkingBindingMismatch({
+            ...LIVE_BINDING_400_BODY,
+            error: { ...LIVE_BINDING_400_BODY.error, message_id: "assistant-x" },
+        }) as Record<string, unknown>;
+        expect(withForeignId.messageId).toBeUndefined();
+        expect(withForeignId.isBindingMismatch).toBe(true);
+    });
+
+    test("does not treat the missing-beta block_binding 400 as a binding mismatch", () => {
         expect(
             detectThinkingBindingMismatch({
                 status: 400,
                 error: {
-                    message: "The block is bound to a different conversation",
-                    message_id: "assistant-with-bound-block",
+                    type: "invalid_request_error",
+                    message: "thinking.adaptive.block_binding: Extra inputs are not permitted",
                 },
-            }).messageId,
-        ).toBe("assistant-with-bound-block");
+            }).isBindingMismatch,
+        ).toBe(false);
     });
 
     test("tolerates provider prefix and suffix drift but rejects unrelated 400s", () => {
@@ -163,8 +224,73 @@ describe("overflow-detection / detectThinkingBindingMismatch", () => {
     });
 });
 
+describe("overflow-detection / isPrefixBoundThinkingModel", () => {
+    test("matches prefix-bound families and route variants independently of provider", () => {
+        for (const providerID of [
+            "anthropic",
+            "ANTHROPIC",
+            "amazon-bedrock",
+            "google-vertex-anthropic",
+            "vertex-eu-anthropic",
+            "custom-route",
+            "openrouter",
+            undefined,
+            null,
+            "",
+        ]) {
+            for (const modelID of [
+                "claude-fable-5-1",
+                "fable-5-1-20260831",
+                "claude-fable-5.1-latest",
+                "claude-opus-5-5",
+                "claude-opus-5.5",
+                "claude-opus-5-5-20260901",
+                "claude-sonnet-5-5",
+                "SONNET_5_5_latest",
+                "claude-sonnet-5.5-20260930",
+                "anthropic.claude-opus-5-5-v1:0",
+                "us.anthropic.claude-sonnet-5-5-v1:0",
+                "anthropic.claude-fable-5-1-v1:0",
+                "claude-sonnet-5-5@20260930",
+            ]) {
+                expect(isPrefixBoundThinkingModel(providerID, modelID)).toBe(true);
+            }
+            for (const modelID of [
+                "fable-5-0",
+                "claude-fable-5-5",
+                "claude-opus-5",
+                "claude-opus-5-4",
+                "claude-opus-4-5",
+                "claude-sonnet-5-4",
+                "claude-sonnet-5-50",
+                "claude-sonnet-15-5",
+                "notsonnet-5-5",
+                "gpt-6-astra",
+                "",
+                null,
+                undefined,
+            ]) {
+                expect(isPrefixBoundThinkingModel(providerID, modelID)).toBe(false);
+            }
+        }
+    });
+});
+
 describe("overflow-detection / parseReportedLimit", () => {
     test("extracts from 'maximum prompt length' (xAI)", () => {
+        expect(
+            parseReportedLimit(
+                "The input token count (123456) exceeds the maximum number of tokens allowed (100000).",
+            ),
+        ).toEqual({ value: 100000, provenance: "prompt_only" });
+        expect(
+            parseReportedInputTokens(
+                "The input token count (123456) exceeds the maximum number of tokens allowed (100000).",
+            ),
+        ).toBe(123456);
+        expect(parseReportedInputTokens("Input token count 1234567 exceeds the maximum")).toBe(
+            1234567,
+        );
         expect(parseReportedLimit("the maximum prompt length is 256000 tokens")).toEqual({
             value: 256000,
             provenance: "prompt_only",

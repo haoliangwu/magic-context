@@ -1,0 +1,34 @@
+{
+  "positive": [
+    "§672§ [dropped §672§]",
+    "[dropped §645§]",
+    "§647§ [dropped §647§]",
+    "§655§ [cleared]",
+    "[dropped]",
+    "[cleared]",
+    "§7§",
+    "§1§ §2§ [dropped §3§] [cleared]",
+    "[dropped] §9§ [cleared]",
+    "  \n §3§\t[dropped]  [dropped §4§] \n"
+  ],
+  "positivePartCombinations": [
+    [" \t", "§672§ [dropped §672§]"],
+    ["[cleared]", " \n"],
+    [" ", "\t"]
+  ],
+  "negative": [
+    "see [dropped §3§] above",
+    "[dropped §3§] hello",
+    "text §3§ more text",
+    "",
+    " \n\t ",
+    "```\n[dropped §3§]\n```",
+    "[truncated §3§]",
+    "[image stripped]",
+    "[dropped §x§]",
+    "§3§ [dropped §3§",
+    "[cleared] prose",
+    "\u00a7\u0663\u00a7",
+    "[dropped \u00a7\u0663\u00a7]"
+  ]
+}

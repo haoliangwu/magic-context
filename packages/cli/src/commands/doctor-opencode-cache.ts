@@ -3,10 +3,26 @@ import {
     getOpenCodePluginCacheRoots,
     getOpenCodePluginPackageJsonPath,
 } from "../lib/opencode-plugin-cache";
+import {
+    type HostUseProbe,
+    type HostUseProbeTargets,
+    probeHostProcessesUsing,
+} from "./doctor-opencode2-cache";
 
 export interface PluginCacheResult {
-    action: "cleared" | "up_to_date" | "not_found" | "check_unavailable" | "error";
+    action:
+        | "cleared"
+        | "up_to_date"
+        | "not_found"
+        | "check_unavailable"
+        | "in_use"
+        | "in_use_unknown"
+        | "error";
     path: string;
+    /** Processes holding the OpenCode database or a cache file (`in_use`). */
+    pids?: number[];
+    /** Why use could not be ruled out (`in_use_unknown`). */
+    reason?: string;
     paths?: string[];
     clearedPaths?: string[];
     failedPaths?: string[];
@@ -15,7 +31,8 @@ export interface PluginCacheResult {
     error?: string;
 }
 
-function readCachedPluginVersion(pluginCacheDir: string): string | undefined {
+/** Version of the Magic Context package installed under an OpenCode 1 cache root, if readable. */
+export function readCachedPluginVersion(pluginCacheDir: string): string | undefined {
     try {
         const installedPkgPath = getOpenCodePluginPackageJsonPath(pluginCacheDir);
         if (!existsSync(installedPkgPath)) return undefined;
@@ -27,8 +44,16 @@ function readCachedPluginVersion(pluginCacheDir: string): string | undefined {
 }
 
 export async function clearPluginCache(
-    options: { force?: boolean; latestVersion?: string | null } = {},
-    deps: { remove?: (path: string) => void } = {},
+    options: {
+        force?: boolean;
+        latestVersion?: string | null;
+        /** Files a running OpenCode keeps open, normally its session database. */
+        hostFiles?: string[];
+    } = {},
+    deps: {
+        remove?: (path: string) => void;
+        probe?: (targets: HostUseProbeTargets) => HostUseProbe;
+    } = {},
 ): Promise<PluginCacheResult> {
     // Injected remover keeps the per-root deletion failure path deterministically
     // testable; defaults to a real recursive remove.
@@ -70,6 +95,28 @@ export async function clearPluginCache(
             paths: cacheEntries.map((entry) => entry.path),
             cached: firstEntry?.cached,
             latest: latestVersion,
+        };
+    }
+
+    // A running OpenCode 1 loads some plugin files (workers) lazily from the
+    // cache, so deleting it under a live host breaks that host later. Apply the
+    // same guard as the OpenCode 2 slot: any process holding the host database
+    // or a file in a root keeps every root in place, and so does a probe that
+    // cannot tell.
+    const probe = deps.probe ?? probeHostProcessesUsing;
+    const use = probe({
+        files: options.hostFiles ?? [],
+        directories: clearTargets.map((entry) => entry.path),
+    });
+    if (use.status !== "free") {
+        const firstTarget = clearTargets[0];
+        return {
+            action: use.status === "in_use" ? "in_use" : "in_use_unknown",
+            path: firstTarget?.path ?? pluginCacheRoots[0] ?? "",
+            paths: clearTargets.map((entry) => entry.path),
+            cached: firstTarget?.cached,
+            latest: latestVersion,
+            ...(use.status === "in_use" ? { pids: use.pids } : { reason: use.reason }),
         };
     }
 

@@ -77,11 +77,13 @@ pub fn decode_opencode_with_sidecar_and_base(
             .or_else(|| integer_field(info, "time_completed"))
             .or_else(|| integer_field(info, "timeCompleted"));
         let origin = opencode_origin(info).or_else(|| opencode_origin(raw_message));
+        profile_start!(perf_parts_copy, "rt07_parts_copy");
         let parts = raw_message
             .get("parts")
             .and_then(Value::as_array)
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
+        profile_end!(perf_parts_copy);
 
         let mut content = Vec::new();
         let mut block_metas = Vec::new();
@@ -204,12 +206,30 @@ pub fn decode_opencode_with_sidecar_and_base(
             }
         }
 
-        let synthetic = is_synthetic_message(&parts);
+        let synthetic = is_synthetic_message(parts);
+        let answer_blocks: Vec<usize> = block_metas
+            .iter()
+            .filter(|meta| {
+                meta.kind == "tool_result"
+                    && meta
+                        .raw
+                        .pointer("/state/metadata")
+                        .is_some_and(crate::user_answer::has_user_answer_metadata)
+            })
+            .map(|meta| meta.block_index)
+            .collect();
+        let mut selection_extras = ProviderExtras::new();
+        if !answer_blocks.is_empty() {
+            selection_extras
+                .entry("opencode".into())
+                .or_default()
+                .insert("user_answer_block_indices".into(), json!(answer_blocks));
+        }
         let ck = CkWireMessage::from_parts(
             role.clone(),
             content,
             origin,
-            ProviderExtras::new(),
+            selection_extras,
             HarnessMeta {
                 harness_id: Some(mid.clone()),
                 ordinal: Some(ordinal),

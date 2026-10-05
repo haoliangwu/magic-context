@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getHarness, type HarnessId } from "./harness";
+import { createTestTempDir } from "./test-temp-dir";
 
 export function getDataDir(): string {
     return process.env.XDG_DATA_HOME ?? path.join(os.homedir(), ".local", "share");
@@ -262,11 +263,10 @@ let testBackstopWarned = false;
  */
 function getTestBackstopStorageDir(): string {
     if (!testBackstopStorageDir) {
-        testBackstopStorageDir = path.join(
-            mkdtempSync(path.join(os.tmpdir(), "mc-test-db-backstop-")),
-            "cortexkit",
-            "magic-context",
-        );
+        // Registered so the test preload's exit cleanup removes it; the preload's
+        // stale sweep also recognizes the prefix.
+        const { dir } = createTestTempDir("mc-test-db-backstop-");
+        testBackstopStorageDir = path.join(dir, "cortexkit", "magic-context");
     }
     if (!testBackstopWarned) {
         testBackstopWarned = true;

@@ -1,19 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
-import { __test, TRANSFORM_DECISIONS_RETENTION } from "./transform-decision-log";
+import {
+    __test,
+    TRANSFORM_DECISIONS_RETENTION,
+    writeRustTransformDecision,
+} from "./transform-decision-log";
 
 let dir: string;
 let dbPath: string;
 let db: Database;
 
 beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "mc-txn-decision-"));
+    dir = createTestTempDirFromPath(join(tmpdir(), "mc-txn-decision-"));
     dbPath = join(dir, "context.db");
     db = new Database(dbPath);
     initializeDatabase(db);
@@ -59,6 +64,33 @@ function rowCount(): number {
 }
 
 describe("transform_decisions retention cap", () => {
+    it("attributes a byte-identical expired Rust resend to its own execute ttl_idle decision", () => {
+        writeRustTransformDecision({
+            sessionId: "ses-1",
+            decision: "SOFT+",
+            materializeReason: "ttl_idle",
+            inputTokens: 100,
+            tsMs: 123,
+        });
+        expect(__test.getPending("ses-1")).toMatchObject({
+            tsMs: 123,
+            decision: "execute",
+            materialized: false,
+            materializeReason: "ttl_idle",
+            bustedThisPass: true,
+        });
+        writeRustTransformDecision({
+            sessionId: "ses-1",
+            decision: "SOFT+",
+            materializeReason: null,
+            inputTokens: 100,
+        });
+        expect(__test.getPending("ses-1")).toMatchObject({
+            decision: "defer",
+            materialized: false,
+            bustedThisPass: false,
+        });
+    });
     // The prune SQL is cap-agnostic (`LIMIT ?`), so we inject a tiny cap to
     // exercise it with a handful of rows. Writing the real 2000+ cap opened
     // that many fresh DB connections in a loop and timed out under CI load.

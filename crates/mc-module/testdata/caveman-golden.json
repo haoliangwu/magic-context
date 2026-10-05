@@ -79,9 +79,9 @@
   },
   {
     "text": "Keep `a  b` and https://example.com/a  b exactly through the final whitespace pass.",
-    "lite": "Keep `a b` and https://example.com/a b exactly through the final whitespace pass.",
-    "full": "Keep `a b` and https://example.com/a b exactly through final whitespace pass.",
-    "ultra": "Keep `a b` + https://example.com/a b exactly through final whitespace pass."
+    "lite": "Keep `a  b` and https://example.com/a b exactly through the final whitespace pass.",
+    "full": "Keep `a  b` and https://example.com/a b exactly through final whitespace pass.",
+    "ultra": "Keep `a  b` + https://example.com/a b exactly through final whitespace pass."
   },
   {
     "text": "Look at `const x = 1` for reference.",
@@ -250,5 +250,131 @@
     "lite": "Fixed the annoying cache bug in the transform. The fix preserved message order.\nU: We need to make sure the protected tail is not touched.\nCommitted and pushed.",
     "full": "Fixed annoying cache bug in transform. fix preserved message order.\nU: We need to make sure the protected tail is not touched.\nCommitted and pushed.",
     "ultra": "Fixed annoying cache bug in transform. fix preserved message order.\nU: We need to make sure the protected tail is not touched.\nCommitted + pushed."
+  },
+  {
+    "text": "Hoy es un día para probar la energía de la batería.",
+    "lite": "Hoy es un día para probar la energía de la batería.",
+    "full": "Hoy es un día para probar la energía de la batería.",
+    "ultra": "Hoy es un día para probar la energía de la batería."
+  },
+  {
+    "text": "Hablé con María y con Sofía sobre la policía.",
+    "lite": "Hablé con María y con Sofía sobre la policía.",
+    "full": "Hablé con María y con Sofía sobre la policía.",
+    "ultra": "Hablé con María y con Sofía sobre la policía."
+  },
+  {
+    "text": "Ask María about the café menu.",
+    "lite": "Ask María about the café menu.",
+    "full": "Ask María about café menu.",
+    "ultra": "Ask María about café menu."
+  },
+  {
+    "text": "Text\n```ts\nfunction f() {\n    return 1;\n}\n```\n",
+    "lite": "Text\n```ts\nfunction f() {\n    return 1;\n}\n```",
+    "full": "Text\n```ts\nfunction f() {\n    return 1;\n}\n```",
+    "ultra": "Text\n```ts\nfunction f() {\n    return 1;\n}\n```"
+  },
+  {
+    "text": "Steps:\n1. Build it\nProbably the tests fail.\n\nActually, ship it.",
+    "lite": "Steps:\n1. Build it\nthe tests fail.\n\n, ship it.",
+    "full": "Steps:\n1. Build it\ntests fail.\n\n, ship it.",
+    "ultra": "Steps:\n1. Build it\ntests fail.\n\n, ship it."
+  },
+  {
+    "text": "x\n  maybe just do it\ny",
+    "lite": "x\n do it\ny",
+    "full": "x\n do it\ny",
+    "ultra": "x\n do it\ny"
+  },
+  {
+    "text": "The historian was\ncompressed and the\nresult was fixed.",
+    "lite": "The historian was\ncompressed and the\nresult was fixed.",
+    "full": "historian was\ncompressed and the\nresult fixed.",
+    "ultra": "historian was\ncompressed + the\nresult fixed."
+  },
+  {
+    "text": "Es un día para la energía de la red, and the a team.",
+    "lite": "Es un día para la energía de la red, and the a team.",
+    "full": "Es un día para la energía de la red, and team.",
+    "ultra": "Es un día para la energía de la red, + team."
+  },
+  {
+    "text": "see https://x.io/a﻿then it was fixed and  maybe it is fixed",
+    "lite": "see https://x.io/a﻿then it was fixed and  it is fixed",
+    "full": "see https://x.io/a﻿then it fixed and  it fixed",
+    "ultra": "see https://x.io/a﻿then it fixed +  it fixed"
+  },
+  {
+    "text": "it is ing and was ed but it is red and was en",
+    "lite": "it is ing and was ed but it is red and was en",
+    "full": "it is ing and was ed but it red and was en",
+    "ultra": "it is ing + was ed but it red + was en"
+  },
+  {
+    "text": "msg_abc_def was compressed in ses_x_y and the toolu_Q",
+    "lite": "msg_abc_def was compressed in ses_x_y and the toolu_Q",
+    "full": "msg_abc_def compressed in ses_x_y and toolu_Q",
+    "ultra": "msg_abc_def compressed in ses_x_y + toolu_Q"
+  },
+  {
+    "text": "This is is fixed AND that OR this And then the end",
+    "lite": "This is is fixed AND that OR this And then the end",
+    "full": "This is fixed AND that OR this And then end",
+    "ultra": "This is fixed + that | this → end"
+  },
+  {
+    "text": "it has  been\tfixed and has\nbeen moved, it will  be shipped",
+    "lite": "it has been fixed and has\nbeen moved, it will  be shipped",
+    "full": "it fixed and has\nbeen moved, it shipped",
+    "ultra": "it fixed + has\nbeen moved, it shipped"
+  },
+  {
+    "text": "𝐀a test of 𝐀 a test and Привет a мир",
+    "lite": "𝐀a test of 𝐀 a test and Привет a мир",
+    "full": "𝐀a test of 𝐀 test and Привет мир",
+    "ultra": "𝐀a test of 𝐀 test + Привет мир"
+  },
+  {
+    "text": "committed é1a2b3c4d and the ffa0997b",
+    "lite": "committed é1a2b3c4d and the ffa0997b",
+    "full": "committed é1a2b3c4d and ffa0997b",
+    "ultra": "committed é1a2b3c4d + ffa0997b"
+  },
+  {
+    "text": "U: keep this one\nPerhaps the fix was applied.\nU: and this one",
+    "lite": "U: keep this one\nthe fix was applied.\nU: and this one",
+    "full": "U: keep this one\nfix applied.\nU: and this one",
+    "ultra": "U: keep this one\nfix applied.\nU: and this one"
+  },
+  {
+    "text": "Build it\r\nProbably the tests fail\r\nthanks\r\n",
+    "lite": "Build it\r\nthe tests fail",
+    "full": "Build it\r\ntests fail",
+    "ultra": "Build it\r\ntests fail"
+  },
+  {
+    "text": "contexto context context context Context",
+    "lite": "contexto context context context Context",
+    "full": "contexto context context context Context",
+    "ultra": "contexto ctx ctx ctx Ctx"
+  },
+  {
+    "text": "the cache and a result were updated",
+    "lite": "the cache and a result were updated",
+    "full": "cache and result updated",
+    "ultra": "cache + result updated"
+  },
+  {
+    "text": "٣a test and _a test",
+    "lite": "٣a test and _a test",
+    "full": "٣a test and _a test",
+    "ultra": "٣a test + _a test"
+  },
+  {
+    "text": "Just\nreally\n\n\nmaybe\nPlease",
+    "lite": "",
+    "full": "",
+    "ultra": ""
   }
 ]

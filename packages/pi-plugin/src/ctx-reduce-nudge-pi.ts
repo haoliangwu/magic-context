@@ -144,7 +144,7 @@ export function maybeChannel1ReminderForToolResult(args: {
 	// tail tokens (T), while reclaimable tokens (U) remain unchanged.
 	const deltaTokens = measurePiToolResultDelta(args.content);
 	if (deltaTokens === 0) return null;
-	state.turnDeltaT += deltaTokens;
+	state.turnDeltaT += deltaTokens * (state.toolsRatio ?? 1);
 
 	if (state.agentDropsAppliedThisPass) return null;
 

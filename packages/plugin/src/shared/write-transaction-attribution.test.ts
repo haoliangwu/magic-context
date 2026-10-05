@@ -1,12 +1,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 const repoRoot = resolve(import.meta.dir, "../../../../");
 const beginImmediate = /\b(?:[A-Za-z_$][\w$]*\.)?exec\("BEGIN IMMEDIATE"\)/g;
 
-const fencedSources: Array<{ path: string; sites: string[] }> = [
+const fencedSources: Array<{ path: string; sites: string[]; reporterCalls?: string[] }> = [
     {
         path: "packages/plugin/src/features/magic-context/smart-notes/storage.ts",
         sites: ["smart_note_commit"],
@@ -32,10 +33,7 @@ const fencedSources: Array<{ path: string; sites: string[] }> = [
             "storage_meta_wrapup_release",
         ],
     },
-    {
-        path: "packages/plugin/src/features/magic-context/context-authority.ts",
-        sites: ["authority_marker_capture", "authority_capture_check"],
-    },
+
     {
         path: "packages/plugin/src/features/magic-context/compartment-storage.ts",
         sites: ["compartment_state_replace", "recomp_staging_promote"],
@@ -52,8 +50,8 @@ const fencedSources: Array<{ path: string; sites: string[] }> = [
         // The chokepoint cannot import the logging chain (Node executes it
         // directly), so it reports through the injected reporter instead.
         path: "packages/plugin/src/shared/sqlite.ts",
-        sites: ["privileged_writer"],
-        reporterCall: "reportSlowPrivilegedWrite?.(",
+        sites: ["async_acquisition_dynamic_site", "privileged_writer"],
+        reporterCalls: ["reportSqliteDiagnostic(", "reportSlowPrivilegedWrite?.("],
     },
     {
         path: "packages/plugin/src/features/magic-context/git-commits/sweep-coordinator.ts",
@@ -76,10 +74,6 @@ const fencedSources: Array<{ path: string; sites: string[] }> = [
         sites: ["historian-publish:recomp"],
     },
     {
-        path: "packages/plugin/src/hooks/magic-context/compartment-runner-incremental.ts",
-        sites: ["historian-publish"],
-    },
-    {
         path: "packages/plugin/src/features/magic-context/dreamer/lease.ts",
         sites: ["lease_dynamic_site"],
     },
@@ -98,6 +92,14 @@ const fencedSources: Array<{ path: string; sites: string[] }> = [
 ];
 
 const nonBeginCoveredSites: Array<{ path: string; site: string }> = [
+    {
+        path: "packages/plugin/src/hooks/magic-context/lkg-persist.ts",
+        site: "lkg_stale_gc",
+    },
+    {
+        path: "packages/plugin/src/hooks/magic-context/compartment-runner-incremental.ts",
+        site: "historian-publish",
+    },
     {
         path: "packages/plugin/src/features/magic-context/message-index.ts",
         site: "message_index_clear",
@@ -159,7 +161,7 @@ function sourceFor(relativePath: string): string {
 function assertCoveredBeginImmediate(
     source: string,
     sites: string[],
-    reporterCall = "logSlowWriteTransaction(",
+    reporterCalls: string[] = [],
 ): void {
     const matches = [...source.matchAll(beginImmediate)];
     expect(matches).toHaveLength(sites.length);
@@ -167,8 +169,10 @@ function assertCoveredBeginImmediate(
         const match = matches[index];
         const nextBegin = matches[index + 1]?.index ?? source.length;
         const transactionRegion = source.slice(match.index, nextBegin);
-        expect(transactionRegion).toContain(reporterCall);
-        if (sites[index] === "lease_dynamic_site") {
+        expect(transactionRegion).toContain(reporterCalls[index] ?? "logSlowWriteTransaction(");
+        if (sites[index] === "async_acquisition_dynamic_site") {
+            expect(transactionRegion).toContain("site=${site}");
+        } else if (sites[index] === "lease_dynamic_site") {
             expect(transactionRegion).toContain("logSlowWriteTransaction(site");
         } else {
             expect(transactionRegion).toContain(`"${sites[index]}"`);
@@ -178,7 +182,9 @@ function assertCoveredBeginImmediate(
 
 describe("write transaction attribution fences", () => {
     beforeAll(async () => {
-        scenarioRoot = mkdtempSync(join(tmpdir(), "magic-context-write-attribution-"));
+        scenarioRoot = createTestTempDirFromPath(
+            join(tmpdir(), "magic-context-write-attribution-"),
+        );
         scenarioLogPath = join(scenarioRoot, "transactions.log");
         const scenario = `
             const timing = await import(${JSON.stringify(new URL("./write-transaction-timing.ts", import.meta.url).href)});
@@ -190,6 +196,7 @@ describe("write transaction attribution fences", () => {
             logger.flushLogger();
         `;
         const child = Bun.spawn({
+            windowsHide: true,
             cmd: ["bun", "--eval", scenario],
             cwd: import.meta.dir,
             env: {
@@ -218,7 +225,7 @@ describe("write transaction attribution fences", () => {
             assertCoveredBeginImmediate(
                 sourceFor(fencedSource.path),
                 fencedSource.sites,
-                "reporterCall" in fencedSource ? fencedSource.reporterCall : undefined,
+                fencedSource.reporterCalls,
             );
         }
         for (const coveredSite of nonBeginCoveredSites) {

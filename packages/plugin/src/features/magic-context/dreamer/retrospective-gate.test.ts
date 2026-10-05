@@ -1,12 +1,18 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-
+import {
+    producerInputTokenLimit,
+    producerWindowFailureReason,
+} from "../../../hooks/magic-context/producer-window-guard";
+import { estimateTokens } from "../../../hooks/magic-context/read-session-formatting";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import {
+    RETROSPECTIVE_MAX_USER_MESSAGE_CHARS,
+    RETROSPECTIVE_MESSAGE_TRUNCATION_MARKER,
     type RetrospectiveProjectSession,
     type RetrospectiveRawMessage,
     type RetrospectiveRawProvider,
@@ -18,6 +24,7 @@ import {
     recordRetrospectiveWindowProcessed,
 } from "./storage-task-schedule";
 import { parseFrictionGateVerdict } from "./task-executor";
+import { buildFrictionGatePrompt, FRICTION_GATE_SYSTEM_PROMPT } from "./task-prompts";
 
 describe("parseFrictionGateVerdict", () => {
     test("clean verdicts: n / y:ords", () => {
@@ -154,6 +161,146 @@ class ScriptedProvider implements RetrospectiveRawProvider {
 }
 
 describe("readRetrospectiveScanWindow", () => {
+    const gatePromptFor = (messages: RetrospectiveRawMessage[]): string => {
+        const userLines = messages
+            .map((message, index) => ({ ...message, ordinal: index + 1 }))
+            .filter((message) => message.role === "user")
+            .map((message) => `${message.ordinal}: ${message.text}`);
+        return `${FRICTION_GATE_SYSTEM_PROMPT}\n${buildFrictionGatePrompt({ userLines })}`;
+    };
+
+    test("clamps an oversized genuine user line head+tail before prompt assembly", async () => {
+        const head = "HEAD-FRICTION ";
+        const tail = " TAIL-CONTEXT";
+        const pastedLog = `${head}${"chromium gpu error\n".repeat(40_000)}${tail}`;
+        const provider = new ScriptedProvider(["s1"], new Map([["s1", [u("s1", 100, pastedLog)]]]));
+
+        const win = await readRetrospectiveScanWindow(provider, "proj", 0, 0);
+
+        expect(win.messages).toHaveLength(1);
+        expect(win.messages[0]?.text.length).toBeLessThanOrEqual(
+            RETROSPECTIVE_MAX_USER_MESSAGE_CHARS,
+        );
+        expect(win.messages[0]?.text).toStartWith(head);
+        expect(win.messages[0]?.text).toEndWith(tail);
+        expect(win.messages[0]?.text).toContain(RETROSPECTIVE_MESSAGE_TRUNCATION_MARKER);
+    });
+
+    test("reproduces the 1.8MB rejection shape, then admits only the oldest lines inside the child window", async () => {
+        const logDump = (label: string) =>
+            `${label}\n${"[ERROR:gpu_process_host.cc] GPU process crashed\n".repeat(6_500)}`;
+        const rows = new Map([
+            [
+                "s1",
+                Array.from({ length: 7 }, (_, index) =>
+                    u("s1", 100 + index * 10, logDump(`paste-${index + 1}`)),
+                ),
+            ],
+        ]);
+        const rawMessages = rows.get("s1") ?? [];
+        const beforePrompt = gatePromptFor(rawMessages);
+        const beforeBytes = Buffer.byteLength(beforePrompt);
+        const usableInputTokens = 8_000;
+        const contextLimitTokens = 12_000;
+        const maxOutputTokens = contextLimitTokens - usableInputTokens;
+
+        expect(beforeBytes).toBeGreaterThan(1_790_000);
+        expect(
+            producerWindowFailureReason({
+                producerSourceTokens: estimateTokens(beforePrompt),
+                contextLimitTokens,
+                maxOutputTokens,
+            }),
+        ).toContain("producer_source_exceeds_window");
+
+        const win = await readRetrospectiveScanWindow(
+            new ScriptedProvider(["s1"], rows),
+            "proj",
+            0,
+            0,
+            { usableInputTokens },
+        );
+        const afterPrompt = gatePromptFor(win.messages);
+        const admittedLimit = producerInputTokenLimit(usableInputTokens, 0);
+
+        expect(win.budgetTruncated).toBe(true);
+        expect(win.messages.length).toBeGreaterThan(0);
+        expect(win.messages.length).toBeLessThan(rawMessages.length);
+        expect(win.messages.map((message) => message.text)).toEqual(
+            rawMessages
+                .slice(0, win.messages.length)
+                .map((message) => expect.stringContaining(message.text.slice(0, 100))),
+        );
+        expect(Buffer.byteLength(afterPrompt)).toBeLessThan(beforeBytes);
+        expect(estimateTokens(afterPrompt)).toBeLessThanOrEqual(admittedLimit ?? 0);
+        expect(win.promptTokens).toBe(estimateTokens(afterPrompt));
+        expect(win.promptInputLimitTokens).toBe(admittedLimit);
+        expect(win.maxScannedTs).toBe(win.messages.at(-1)?.ts);
+    });
+
+    test("prompt-budget frontier drains oldest-first without skipping omitted lines", async () => {
+        const rows = new Map([
+            [
+                "s1",
+                Array.from({ length: 12 }, (_, index) =>
+                    u("s1", 100 + index * 10, `${index + 1}:${"payload ".repeat(300)}`),
+                ),
+            ],
+        ]);
+        const options = { usableInputTokens: 2_000 };
+        const first = await readRetrospectiveScanWindow(
+            new ScriptedProvider(["s1"], rows),
+            "proj",
+            0,
+            0,
+            options,
+        );
+        const second = await readRetrospectiveScanWindow(
+            new ScriptedProvider(["s1"], rows),
+            "proj",
+            first.maxScannedTs,
+            0,
+            options,
+        );
+
+        expect(first.budgetTruncated).toBe(true);
+        expect(first.messages.map((message) => message.ts)).toEqual(
+            [...first.messages.map((message) => message.ts)].sort((a, b) => a - b),
+        );
+        expect(second.messages[0]?.ts).toBeGreaterThan(first.messages.at(-1)?.ts ?? 0);
+        expect(
+            new Set([...first.messages, ...second.messages].map((message) => message.ts)).size,
+        ).toBe(first.messages.length + second.messages.length);
+    });
+
+    test("recency cutoff skips ancient lines and advances the persisted frontier past them", async () => {
+        const cutoff = 30 * 24 * 60 * 60 * 1000;
+        const rows = new Map([
+            ["s1", [u("s1", cutoff - 20, "ancient"), u("s1", cutoff, "boundary")]],
+        ]);
+
+        const win = await readRetrospectiveScanWindow(
+            new ScriptedProvider(["s1"], rows),
+            "proj",
+            0,
+            0,
+            { recencyCutoffMs: cutoff },
+        );
+
+        expect(win.messages.map((message) => message.text)).toEqual(["boundary"]);
+        expect(win.maxScannedTs).toBe(cutoff);
+
+        const onlyAncient = await readRetrospectiveScanWindow(
+            new ScriptedProvider(["s1"], new Map([["s1", [u("s1", cutoff - 20, "ancient")]]])),
+            "proj",
+            0,
+            0,
+            { recencyCutoffMs: cutoff },
+        );
+        expect(onlyAncient.messages).toEqual([]);
+        expect(onlyAncient.maxScannedTs).toBe(cutoff - 1);
+    });
+
     test("merges since + overlap; maxScannedTs comes ONLY from the since portion", async () => {
         const rows = new Map([
             [
@@ -287,6 +434,18 @@ describe("readRetrospectiveScanWindow", () => {
         });
         // frontier = lastKept(130) − 1 = 129 even though only 1 row < cap 5.
         expect(win.maxScannedTs).toBe(129);
+    });
+
+    test("advances past observed assistant-only activity when no user message remains", async () => {
+        const provider: RetrospectiveRawProvider = {
+            listProjectSessions: () => [{ sessionId: "s", updatedAt: 300 }],
+            readOldestMessageTimesSince: () => new Map(),
+            readUserMessagesSince: () => ({ messages: [], truncated: false }),
+            readUserMessagesBefore: () => [],
+        };
+        const win = await readRetrospectiveScanWindow(provider, "proj", 200, 0);
+        expect(win.maxScannedTs).toBe(300);
+        expect(win.messages).toEqual([]);
     });
 
     test("session cap drains oldest eligible sessions without skipping older backlog", async () => {

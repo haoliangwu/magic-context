@@ -73,6 +73,12 @@ export function applyNativeToolInputReplayPi(
 				continue;
 			}
 			if (serialized === undefined || saved.get(id) === serialized) continue;
+			// A removal marker is a decision, not an input: the arc was removed on a
+			// priced pass. A pass that has to keep the pair (a model that needs tool
+			// pairs beside its reasoning) rewrites the call's arguments to a sentinel;
+			// freezing those here would erase the marker, and later Responses passes
+			// could no longer remove the arc on a defer pass.
+			if (saved.get(id) === NATIVE_TOOL_REMOVAL_MARKER) continue;
 			const normalized: unknown = JSON.parse(serialized);
 			if (!isRecord(normalized)) continue;
 			const candidate = { ...next };

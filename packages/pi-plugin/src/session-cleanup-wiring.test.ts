@@ -7,11 +7,12 @@ import { join } from "node:path";
  *
  * Pi has no `session_deleted` event. The closest analogs are:
  *   - `session_shutdown` — graceful process exit (Ctrl+C, SIGTERM)
- *   - `session_before_switch` — user switches to a different session
- *     within the same Pi process
+ *   - a completed switch to a different session within the same Pi
+ *     process (`session_shutdown` on stock Pi, `session_switch` on OMP)
  *
  * Both are valid moments to drain caches keyed by the outgoing session
- * id. Without this, a long-running Pi process that switches sessions
+ * id; `session_before_switch` is not, because the switch can still be
+ * cancelled. Without this, a long-running Pi process that switches sessions
  * many times leaks one entry per per-session map per switch.
  *
  * Counterpart to OpenCode `session.deleted` cleanup in
@@ -57,29 +58,28 @@ describe("clearContextHandlerSession internals", () => {
 	});
 });
 
-describe("session_before_switch handler wiring", () => {
-	const handler = INDEX_SRC.match(
+describe("session switch handler wiring", () => {
+	// session_before_switch can be cancelled (or the switch can fail after
+	// it), so it must not drain the still-current session. The drain runs
+	// once the switch has happened: session_shutdown on stock Pi, and
+	// session_switch on OMP. The behaviour is exercised in
+	// index-in-process-latch.test.ts; this pins the wiring.
+	const beforeSwitch = INDEX_SRC.match(
 		/pi\.on\("session_before_switch"[\s\S]*?\}\);/,
 	);
+	const afterSwitch = INDEX_SRC.match(/\)\("session_switch"[\s\S]*?\n\t\}\);/);
 
-	test("session_before_switch handler is registered", () => {
-		expect(handler).not.toBeNull();
+	test("session_before_switch only records the OUTGOING session id", () => {
+		const body = beforeSwitch?.[0] ?? "";
+		expect(body).toContain("switchOutgoingSessionId = readSessionId(ctx)");
+		expect(body).not.toContain("clearContextHandlerSession(");
+		expect(body).not.toContain("clearPiSystemPromptSession(");
 	});
 
-	const body = handler?.[0] ?? "";
-
-	test("handler resolves the OUTGOING session id (not the new target)", () => {
-		// Pi fires this BEFORE the switch, so getSessionId() returns
-		// the still-current session — that's exactly what we want.
-		expect(body).toContain("getSessionId()");
-	});
-
-	test("handler calls clearContextHandlerSession", () => {
-		expect(body).toContain("clearContextHandlerSession(");
-	});
-
-	test("handler calls clearPiSystemPromptSession", () => {
-		expect(body).toContain("clearPiSystemPromptSession(");
+	test("session_switch drains the recorded outgoing session", () => {
+		const body = afterSwitch?.[0] ?? "";
+		expect(body).toContain("clearContextHandlerSession(outgoingSessionId)");
+		expect(body).toContain("clearPiSystemPromptSession(outgoingSessionId)");
 	});
 });
 

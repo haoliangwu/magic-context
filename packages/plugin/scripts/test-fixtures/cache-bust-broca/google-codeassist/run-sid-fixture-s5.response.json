@@ -1,0 +1,9 @@
+{
+  "response": {
+    "usageMetadata": {
+      "promptTokenCount": 24000,
+      "cachedContentTokenCount": 20000,
+      "candidatesTokenCount": 5
+    }
+  }
+}

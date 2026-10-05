@@ -6,7 +6,10 @@
 # No --platform flag is used: Docker builds and runs this image for its native
 # architecture (including linux/arm64 on Apple silicon).
 
-FROM oven/bun:1.3.14-debian
+# Keep in step with package.json's packageManager (and engines.bun >= 1.4.0): Pi
+# 0.87's bundled undici needs Bun 1.4's webidl, and on 1.3.14 every Pi process
+# exited at startup (markAsUncloneable is not a function).
+FROM oven/bun:1.4.2-debian
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -16,7 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     python3 \
     build-essential \
+    procps \
+    lsof \
     && rm -rf /var/lib/apt/lists/*
+
+# procps and lsof: the OpenCode 2 harness proves isolation by inspecting the
+# child process group's open files (pgrep/ps/lsof), the same tools the GitHub
+# runner has; without them every OpenCode 2 scenario fails before setup.
 
 # The host behavior suite launches the real OpenCode server and Pi process. Keep
 # both runtimes in the image instead of relying on anything installed on the

@@ -5,6 +5,8 @@ body:
   - type: markdown
     attributes:
       value: |
+        Discuss the design here before implementing it. A maintainer's `design-approved` label is what unblocks a linked PR; keep the PR in draft until approval.
+
         Thanks for the suggestion! Please check the [README](https://github.com/cortexkit/magic-context#readme) and [open issues](https://github.com/cortexkit/magic-context/issues) first — your idea may already be documented or under discussion.
 
   - type: input

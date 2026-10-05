@@ -5,11 +5,16 @@
 
 import type {
     DreamTaskBacklogMap,
+    DreamTaskFailureState,
+    DreamTaskName,
     DreamTaskProgress,
 } from "../features/magic-context/dreamer/task-registry";
+import type { DreamerTickFailure } from "../features/magic-context/dreamer/tick-failure";
 import type { SynapseLaneDescriptor } from "../features/magic-context/memory/embedding-synapse";
+import type { RunnerRefusalCanonicalCause } from "../hooks/magic-context/historian-no-fire-cause";
 import type { ConfigParseFailure } from "./config-diagnostics";
 import type { LoggerDiagnostics } from "./logger";
+import type { UserFacingFailureKey } from "./user-facing-codes";
 
 export interface TailHygieneStatus {
     /** Tokens in active, non-protected tail content that the agent can reclaim. */
@@ -98,6 +103,14 @@ export interface SidebarSnapshot {
      * shows this as "Tool Definitions".
      */
     toolDefinitionTokens: number;
+    /**
+     * Named capabilities the host this plugin runs in does not have, such as an
+     * experimental mode the host cannot carry. These persist for the life of
+     * the process rather than describing one failed operation, so the status
+     * surfaces keep showing them. Absent on hosts with nothing to report and on
+     * older RPC servers.
+     */
+    hostLimitations?: UserFacingFailureKey[];
     /** Persisted reclaimable (U) and eligible (T) token counts used by both nudge mechanisms. */
     tailHygiene?: TailHygieneStatus;
     /**
@@ -124,15 +137,19 @@ export interface SidebarSnapshot {
     newWorkTokens?: number | null;
     totalInputTokens?: number | null;
     /**
-     * Live recomp / session-upgrade progress for this session, or null when no
-     * recomp is running (and no recent terminal state is being shown). Drives the
-     * sidebar "Recomp"/"Upgrade" progress bar and the /ctx-status dialog. Mirrors
-     * the runtime `RecompProgress` shape from compartment-runner-types.ts.
+     * Live recomp progress for this session, or null when no recomp is running
+     * (and no recent terminal state is being shown). Drives the sidebar progress
+     * bar and the /ctx-status dialog. Mirrors the runtime `RecompProgress` shape
+     * from compartment-runner-types.ts.
      */
     /** Read-only per-task candidate counts; populated by the server RPC. */
     dreamerBacklog?: DreamTaskBacklogMap;
     /** Process-local task progress; absent when no Dreamer task is running. */
     dreamerProgress?: DreamTaskProgress | null;
+    /** Dreamer tasks whose last scheduled run failed. Empty when all of them are
+     *  healthy; absent on a database with no scheduler table yet. */
+    dreamerFailures?: DreamTaskFailureState[];
+    dreamerSkipped?: string[];
     recompProgress?: {
         /** "recomp" → "Recomp" labels; "upgrade" → "Upgrade" labels. */
         kind?: "recomp" | "upgrade" | "embed" | "wrapup";
@@ -146,7 +163,71 @@ export interface SidebarSnapshot {
     } | null;
 }
 
+export interface MemoryImportanceHistogram {
+    total: number;
+    unclassified: number;
+    bands: {
+        "0-19": number;
+        "20-39": number;
+        "40-59": number;
+        "60-79": number;
+        "80-100": number;
+    };
+}
+
+/**
+ * Which side ran (or would run) a Rust-mode completion, and why: `configured`
+ * when the user set the runner, `default_for_harness` when the harness chose it.
+ * `observed` is `last_completion` for a completion that actually ran in the
+ * module's current process, `resolved_for_route` when none has yet.
+ */
+export interface RunnerStatus {
+    runner: "host" | "broca";
+    source: "configured" | "default_for_harness";
+    harness: string;
+    observed: "last_completion" | "resolved_for_route";
+}
+
 export interface StatusDetail extends SidebarSnapshot {
+    /**
+     * Version of the Magic Context package the answering server runs. The TUI
+     * compares it with its own so the status dialog can say when the two differ
+     * (OpenCode keeps the server it started with until it restarts). Absent from
+     * servers older than this field, which the dialog reports as "older than
+     * this UI". Also sent on the `{ disabled: true }` replies.
+     */
+    pluginVersion?: string;
+    /**
+     * Set when this server migrated the shared store at startup while another
+     * OpenCode server's RPC record named a PID it could not check. If that PID
+     * was an older build still running, it now runs against a newer store.
+     */
+    unconfirmedMigrationHolders?: { pids: number[]; fromVersion: number; toVersion: number };
+    /** OpenCode 2 hidden-run model variants dropped because the host catalog did not declare them. */
+    hiddenVariantWarnings?: string[];
+    /** Runner refusal provenance reported by the Rust historian, including received text. */
+    historianRefusal?: {
+        stage: "credential" | "provider" | "model" | "resolution";
+        canonicalCause: RunnerRefusalCanonicalCause;
+        detail: string;
+    };
+    /** Which runner the Rust historian used for this session, and why. Rust mode only. */
+    historianRunner?: RunnerStatus;
+    /** Which runner the Rust module's dreamer completions resolve to, and why. Rust mode only. */
+    dreamerRunner?: RunnerStatus;
+    /** ACTIVE-memory importance distribution; unclassified is a subset of total. */
+    memoryImportanceHistogram: MemoryImportanceHistogram;
+    /**
+     * Dreamer tasks this host cannot run because it has no tool loop, named so a
+     * user can see which maintenance is unavailable instead of inferring it from
+     * a backlog that never falls. Absent on a host that runs every task.
+     */
+    dreamerUnsupportedTasks?: DreamTaskName[];
+    /**
+     * The stage that stopped the last background maintenance pass, when one did.
+     * Absent while the maintenance timer is completing its passes.
+     */
+    dreamerTickFailure?: DreamerTickFailure | null;
     /** True when Rust authority has rerouted host tool and historian paths to the module. */
     hostBackendsModuleSide?: boolean;
     /** Host cursor compared with the module changefeed frontier. */
@@ -160,10 +241,20 @@ export interface StatusDetail extends SidebarSnapshot {
         stalled: boolean;
         code: "MC-M01" | null;
     };
+    /** Health of the pending OpenCode history-boundary marker repair. */
+    compactionMarker?: {
+        code: "MC-C11" | null;
+        attempts: number;
+        lastError: string | null;
+        pendingSinceMs: number | null;
+    };
     /** A durable host marker whose live module status no longer reports module ownership. */
     memoryAuthorityMismatch?: boolean;
     /** User-owned model profile selected for this project, or null for the base config. */
     activeProfile: string | null;
+    configGeneration?: number;
+    configAdoptedAt?: number;
+    configReloadFailure?: { path: string; message: string };
     tagCounter: number;
     activeTags: number;
     droppedTags: number;
@@ -204,7 +295,7 @@ export interface StatusDetail extends SidebarSnapshot {
     cacheExpired: boolean;
     /** Reports whether the displayed TTL came from config, persisted session metadata,
      *  or the default; cache scheduling still uses the TTL stored in session metadata. */
-    cacheTtlSource?: "config" | "session" | "default";
+    cacheTtlSource?: import("./cache-ttl-display").CacheTtlDisplaySource;
     cacheTtlModelKey?: string;
     configParseFailures?: ConfigParseFailure[];
     /** True when cacheTtl is "never" — the idle-TTL heuristic is disabled on

@@ -11,6 +11,7 @@ interface VerificationPathsExecOptions {
     timeout: number;
     maxBuffer: number;
     encoding: BufferEncoding;
+    windowsHide: true;
 }
 
 type VerificationPathsExecResult = {
@@ -28,7 +29,11 @@ const defaultExecFileForVerificationPaths: VerificationPathsExecFile = async (
     file,
     args,
     options,
-) => (await execFileAsync(file, [...args], options)) as VerificationPathsExecResult;
+) =>
+    (await execFileAsync(file, [...args], {
+        ...options,
+        windowsHide: true,
+    })) as VerificationPathsExecResult;
 
 let execFileForVerificationPaths = defaultExecFileForVerificationPaths;
 
@@ -45,9 +50,21 @@ async function runGit(cwd: string, args: readonly string[]): Promise<string | nu
             timeout: GIT_TIMEOUT_MS,
             maxBuffer: 16 * 1024 * 1024,
             encoding: "utf8",
+            windowsHide: true,
         });
         return String(result.stdout);
-    } catch {
+    } catch (error) {
+        if (
+            (error as { killed?: boolean }).killed ||
+            (error as NodeJS.ErrnoException).code === "ETIMEDOUT"
+        ) {
+            throw new Error(
+                `Git verification command git ${args.join(" ")} timed out after ${GIT_TIMEOUT_MS}ms`,
+                {
+                    cause: error,
+                },
+            );
+        }
         return null;
     }
 }
@@ -84,9 +101,10 @@ export async function readGitHead(cwd: string): Promise<string | null> {
 export async function readGitChangedFilesSince(
     cwd: string,
     revision: string,
+    knownGitRoot?: string,
 ): Promise<Set<string> | null> {
     if (!/^[0-9a-f]{7,40}$/i.test(revision)) return null;
-    const gitRoot = await resolveGitTopLevel(cwd);
+    const gitRoot = knownGitRoot ?? (await resolveGitTopLevel(cwd));
     if (!gitRoot) return null;
     const stdout = await runGit(gitRoot, ["diff", "--name-only", "-z", revision]);
     if (stdout === null) return null;
@@ -108,8 +126,9 @@ export async function readGitChangedFilesSince(
 export async function readGitFileChangeTimesSince(
     cwd: string,
     sinceMs: number,
+    knownGitRoot?: string,
 ): Promise<Map<string, number> | null> {
-    const gitRoot = await resolveGitTopLevel(cwd);
+    const gitRoot = knownGitRoot ?? (await resolveGitTopLevel(cwd));
     if (!gitRoot) return null;
     const sinceSec = Math.max(0, Math.floor(sinceMs / 1000));
     // Block format: "<unix-seconds>\n<file>\n<file>\n...\n\n". %ct = committer
@@ -181,6 +200,9 @@ export async function normalizeVerificationFiles(args: {
     const rootReal = safeRealpath(root) ?? root;
     const warnings: string[] = [];
     const normalized: string[] = [];
+    // An exact tracked-path hit needs no per-file pathspec query. Unusual
+    // pathspecs and missing paths retain Git's existing matching/fallback rules.
+    let trackedPaths: Set<string> | undefined;
 
     for (const raw of args.files) {
         const value = typeof raw === "string" ? raw.trim() : "";
@@ -235,7 +257,19 @@ export async function normalizeVerificationFiles(args: {
                 );
                 continue;
             }
-            const tracked = await gitTrackedPath(gitRoot, repoRelative);
+            if (!trackedPaths) {
+                let trackedOutput: string | null = null;
+                try {
+                    trackedOutput = await runGit(gitRoot, ["ls-files", "-z", "--full-name"]);
+                } catch {
+                    // The bulk inventory is optional. A slow or oversized inventory
+                    // must not prevent the original per-path lookup from succeeding.
+                }
+                trackedPaths = new Set(trackedOutput?.split("\0").filter(Boolean) ?? []);
+            }
+            const tracked = trackedPaths.has(repoRelative)
+                ? repoRelative
+                : await gitTrackedPath(gitRoot, repoRelative);
             if (!tracked) {
                 warnings.push(
                     `Skipped verification path "${value}" because it is not a tracked git file.`,

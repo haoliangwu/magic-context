@@ -533,7 +533,11 @@ export function getSdkWindowGeometry(
         },
     );
     if (!result || promptOnlyDetected === undefined) return result;
-    const usableSoft = promptOnlyDetected;
+    // A declared input cap bounds the prompt wall; without one the wall is
+    // already pre-carved and may exceed the catalog-derived window.
+    const usableSoft = isFinitePositive(metadata.inputLimit)
+        ? Math.min(promptOnlyDetected, result.usableSoft)
+        : promptOnlyDetected;
     return {
         ...result,
         usableSoft,
@@ -599,6 +603,11 @@ export function modelSupportsVision(providerID: string, modelID: string): boolea
     return colon > 0
         ? apiCache.get(`${providerID}/${modelID.slice(0, colon)}`)?.vision === true
         : false;
+}
+
+export function getSdkOutputLimit(providerID: string, modelID: string): number | undefined {
+    loadPersistedApiCacheOnce();
+    return lookupMetadataWithTagFallback(apiCache, providerID, modelID)?.outputLimit;
 }
 
 export function getSdkInputLimit(providerID: string, modelID: string): number | undefined {

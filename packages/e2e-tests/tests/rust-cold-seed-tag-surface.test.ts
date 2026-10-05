@@ -2,6 +2,8 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import { Database } from "bun:sqlite";
+import { join } from "node:path";
 import { RustTestHarness } from "../src/rust-harness";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
@@ -87,18 +89,15 @@ async function seedCoveredPrefix(
 	h: RustTestHarness,
 	sessionId: string,
 ): Promise<void> {
-	const response = await h.subc.moduleRequest(sessionId, h.env.workdir, {
-		method: "state_sync",
-		shadow_generation: 0,
-		expected_shadow_seq: 0,
-		seed_boundary_id: "m1#0",
-		compartments: [
+	const compartments = [
 			{
 				sequence: 0,
 				start_message: 1,
 				end_message: 1,
-				start_message_id: "m1#0",
-				end_message_id: "m1#0",
+				start_message_id: "m1",
+				end_message_id: "m1",
+                start_block_index: 0,
+                end_block_index: 0,
 				title: "Seeded prefix",
 				content: "covered seed",
 				p1: "covered seed",
@@ -106,9 +105,24 @@ async function seedCoveredPrefix(
 				episode_type: "feature",
 				created_at: 1,
 			},
-		],
-	});
-	expect(response.ok).toBe(true);
+        ];
+    const db = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
+    try {
+        for (const row of compartments) {
+            const columns = Object.keys(row);
+            db.prepare(`INSERT INTO compartments (session_id, ${columns.join(", ")}) VALUES (?, ${columns.map(() => "?").join(", ")})`)
+                .run(sessionId, ...Object.values(row));
+        }
+    } finally {
+        db.close();
+    }
+    const response = await h.subc.moduleRequest(sessionId, h.env.workdir, {
+        method: "state_sync",
+        shadow_generation: 0,
+        expected_shadow_seq: 0,
+        seed_boundary_id: "m1#0",
+    });
+    expect(response.ok).toBe(true);
 }
 
 describe.skipIf(!rustPrereqs.ok)(

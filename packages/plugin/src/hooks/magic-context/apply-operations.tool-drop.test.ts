@@ -1,11 +1,12 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
     closeDatabase,
+    getMaxTagNumberBySession,
     getPendingOps,
     getTagById,
     insertTag,
@@ -15,6 +16,7 @@ import {
     updateTagStatus,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     applyFlushedStatuses,
     applyPendingOperations,
@@ -40,7 +42,7 @@ afterEach(() => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -53,8 +55,10 @@ function padSkeletonWindow(
     db: ReturnType<typeof openDatabase> & object,
     realTagNumber: number,
 ): void {
+    // Start above every existing tag: fixtures may tag messages after the tool.
+    const base = Math.max(realTagNumber, getMaxTagNumberBySession(db, "ses-1"));
     for (let i = 1; i <= 20; i += 1) {
-        insertTag(db, "ses-1", `call-pad-${i}`, "tool", 10, realTagNumber + i);
+        insertTag(db, "ses-1", `call-pad-${i}`, "tool", 10, base + i);
     }
 }
 
@@ -95,6 +99,12 @@ describe("apply operations for tool drops", () => {
                 info: { id: "m-tool", role: "tool", sessionID: "ses-1" },
                 parts: [{ type: "tool", callID: "call-1", state: { output: "result" } }],
             },
+            // A later prompt, so this call does not end the conversation (drop()
+            // keeps that one as a skeleton instead of removing it).
+            {
+                info: { id: "m-next", role: "user", sessionID: "ses-1" },
+                parts: [{ type: "text", text: "next prompt" }],
+            },
         ];
 
         const { targets, batch } = tagMessages("ses-1", messages, tagger, db);
@@ -134,8 +144,9 @@ describe("apply operations for tool drops", () => {
         const toolTagId = tagger.getToolTag("ses-1", "call-1", "m-assistant");
         expect(toolTagId).toBeDefined();
 
-        // No padding: the tool is within the newest-20 window, so the agent
-        // drop keeps the structural skeleton (anti-hallucination anchor).
+        // No padding: the tool is within the newest-20 window and its input is
+        // small, so the agent drop keeps the structural skeleton with its real
+        // arguments (anti-hallucination anchor).
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
         const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
         batch.finalize();
@@ -148,7 +159,7 @@ describe("apply operations for tool drops", () => {
         expect(toolPart.state.output).toBe(`[dropped \u00a7${toolTagId}\u00a7]`);
         expect(getPendingOps(db, "ses-1")).toHaveLength(0);
         expect(getTagById(db, "ses-1", toolTagId!)?.status).toBe("dropped");
-        expect(getTagById(db, "ses-1", toolTagId!)?.dropMode).toBe("truncated");
+        expect(getTagById(db, "ses-1", toolTagId!)?.dropMode).toBe("skeleton_real");
     });
 
     it("defers a pending/running task part and keeps its long prompt byte-identical (#250 open arc)", () => {
@@ -224,22 +235,23 @@ describe("apply operations for tool drops", () => {
         // further — this is the byte-identity we assert.
         const pristine = JSON.stringify(taskPart);
 
-        // Within the skeleton window → truncate (skeleton) path, as before.
+        // Within the skeleton window with a small input → real-argument skeleton.
         queuePendingOp(db, "ses-1", toolTagId!, "drop");
         const didMutate = applyPendingOperations("ses-1", db, targets, new Set());
         batch.finalize();
 
-        // No reclaim regression: the completed arc still clamps.
+        // No reclaim regression: the completed arc's output is still reclaimed.
         expect(didMutate).toBe(true);
-        expect(getTagById(db, "ses-1", toolTagId!)?.dropMode).toBe("truncated");
+        expect(getTagById(db, "ses-1", toolTagId!)?.dropMode).toBe("skeleton_real");
 
-        // The wire copy now in the array is clamped + sentinelled...
+        // The wire copy now in the array keeps the real arguments and carries
+        // the sentinel output...
         const wire = messages[0]?.parts[0] as {
             state: { input: Record<string, unknown>; output: string };
         };
         expect(wire).not.toBe(taskPart);
         expect(wire.state.output).toBe(`[dropped \u00a7${toolTagId}\u00a7]`);
-        expect(wire.state.input).toEqual({ dropped: `[dropped §${toolTagId}§]` });
+        expect(wire.state.input).toEqual({ prompt: longPrompt, subagent_type: "mason" });
 
         // ...but the LIVE object OpenCode still holds is byte-identical (the long
         // prompt is intact), so a background child spawning from it is unharmed.
@@ -529,6 +541,12 @@ describe("apply operations for tool drops", () => {
                     },
                 ],
             },
+            // A later prompt, so this call does not end the conversation (drop()
+            // keeps that one as a skeleton instead of removing it).
+            {
+                info: { id: "m-next", role: "user", sessionID: "ses-1" },
+                parts: [{ type: "text", text: "next prompt" }],
+            },
         ];
 
         const { targets, batch } = tagMessages("ses-1", messages, tagger, db);
@@ -562,6 +580,12 @@ describe("apply operations for tool drops", () => {
                     { type: "step-finish", reason: "tool-calls" },
                 ],
             },
+            // A later prompt, so this call does not end the conversation (drop()
+            // keeps that one as a skeleton instead of removing it).
+            {
+                info: { id: "m-next", role: "user", sessionID: "ses-1" },
+                parts: [{ type: "text", text: "next prompt" }],
+            },
         ];
 
         const { targets, batch } = tagMessages("ses-1", messages, tagger, db);
@@ -575,7 +599,7 @@ describe("apply operations for tool drops", () => {
 
         expect(didMutate).toBe(true);
         expect(hasCall(messages, "call-3")).toBe(false);
-        expect(messages).toHaveLength(2);
+        expect(messages).toHaveLength(3);
         expect(messages[1]?.parts.map((part) => (part as { type?: string }).type)).toEqual([
             "step-start",
             "text",
@@ -600,6 +624,12 @@ describe("apply operations for tool drops", () => {
                     { type: "step-finish", reason: "tool-calls" },
                 ],
             },
+            // A later prompt, so this call does not end the conversation (drop()
+            // keeps that one as a skeleton instead of removing it).
+            {
+                info: { id: "m-next", role: "user", sessionID: "ses-1" },
+                parts: [{ type: "text", text: "next prompt" }],
+            },
         ];
 
         const { targets, batch } = tagMessages("ses-1", messages, tagger, db);
@@ -613,8 +643,7 @@ describe("apply operations for tool drops", () => {
 
         expect(didMutate).toBe(true);
         expect(hasCall(messages, "call-4")).toBe(false);
-        expect(messages).toHaveLength(1);
-        expect(messages[0]?.info.id).toBe("m-user");
+        expect(messages.map((message) => message.info.id)).toEqual(["m-user", "m-next"]);
     });
 
     it("clears stale drop ops for compacted tags", () => {

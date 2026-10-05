@@ -40,9 +40,14 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-5: transport han
             h.subc.continueModule();
             await h.sendPrompt(sessionId, `FM-OC-5 continued module: ${h.ballast(400)}`);
             const recovered = await h.waitForRustPasses(beforeCount + 2);
-            expect(recovered.slice(beforeCount + 1).some((pass) => pass.servedFrom === "transform")).toBe(
-                true,
-            );
+            // A healthy deferred response may reuse the last-known-good cached
+            // prefix until the cache is deliberately cleared, rather than
+            // rewriting the provider cache when the module resumes.
+            expect(
+                recovered.slice(beforeCount + 1).some(
+                    (pass) => pass.applied && (pass.servedFrom === "transform" || pass.servedFrom === "lkg_frozen"),
+                ),
+            ).toBe(true);
 
             const lines = assertLoudModuleFailure(h, sessionId);
             expect(lines.some((line) => line.includes("served_from=lkg") || line.includes("served_from=raw"))).toBe(

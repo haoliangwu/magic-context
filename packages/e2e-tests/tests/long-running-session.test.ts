@@ -1,14 +1,21 @@
 /// <reference types="bun-types" />
 
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, expect, it } from 'bun:test';
 import { realpathSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import { computeSyntheticCallId } from "../../plugin/src/hooks/magic-context/todo-view";
 import { TestHarness } from "../src/harness";
-import { buildMockHistorianPayload } from "../src/mock-historian";
+import { OpenCode2TestHarness } from "../src/opencode2-harness";
+import { PiTestHarness } from "../src/pi-harness";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
+import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
 import type { MockUsage } from "../src/mock-provider/server";
 import { openTestDb } from "../src/test-db";
 
@@ -58,30 +65,7 @@ type HistorianRange = { start: number; end: number };
 type HistorianCapture = { requestIndex: number; range: HistorianRange };
 type PublishedCompartment = { start_message: number; end_message: number; title: string };
 
-let h: TestHarness;
-
-beforeAll(async () => {
-    h = await TestHarness.create({
-        modelContextLimit: 100_000,
-        magicContextConfig: {
-            execute_threshold_percentage: 20,
-            protected_tags: 1,
-            memory: {
-                enabled: true,
-                auto_promote: false,
-                injection_budget_tokens: 500,
-                auto_search: { enabled: true, score_threshold: 0.1, min_prompt_chars: 12 },
-                git_commit_indexing: { enabled: false },
-            },
-            dreamer: { disable: true },
-            compressor: { enabled: false },
-        },
-    });
-});
-
-afterAll(async () => {
-    await h.dispose();
-});
+let h: ScenarioHarness;
 
 function stripCacheControl(value: unknown): unknown {
     if (Array.isArray(value)) return value.map(stripCacheControl);
@@ -220,17 +204,11 @@ function emitToolOnce(pattern: RegExp, input: Record<string, unknown>, usage: Mo
     });
 }
 
-function findOrdinalRange(body: Record<string, unknown>): HistorianRange | null {
-    for (const message of requestMessages(body)) {
-        const content = Array.isArray(message.content) ? message.content : [];
-        for (const block of content) {
-            const text = (block as { text?: unknown } | null)?.text;
-            if (typeof text !== "string" || !text.includes("<new_messages>")) continue;
-            const ordinals = [...text.matchAll(/\[(\d+)\]/g)].map((match) => Number(match[1]));
-            if (ordinals.length > 0) return { start: Math.min(...ordinals), end: Math.max(...ordinals) };
-        }
-    }
-    return null;
+function pendingMarkerColumns(): string {
+    const pending = h.host === "pi" || h.host === "omp"
+        ? "pending_pi_compaction_marker_state"
+        : "pending_compaction_marker_state";
+    return `${pending} AS pending_compaction_marker_state, compaction_marker_state`;
 }
 
 function readMeta<T>(sessionId: string, columns: string): T | null {
@@ -241,7 +219,7 @@ function readMeta<T>(sessionId: string, columns: string): T | null {
 }
 
 function contextDbPath(): string {
-    return join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
+    return h.contextDbPath();
 }
 
 function writeDb(fn: (db: Database) => void): void {
@@ -254,7 +232,7 @@ function writeDb(fn: (db: Database) => void): void {
 }
 
 function seedMemory(content: string): void {
-    const projectIdentity = resolveProjectIdentity(realpathSync(pathResolve(h.opencode.env.workdir)));
+    const projectIdentity = resolveProjectIdentity(realpathSync(pathResolve(h.workdir)));
     writeDb((db) => {
         const now = Date.now();
         db.prepare(
@@ -318,6 +296,7 @@ async function send(
     // then fail the test fast — much better than waiting for 600s timeout.
     let runawayAborted = false;
     const dumpTimer = setInterval(() => {
+        if (h.host !== "opencode") return;
         const now = Date.now();
         const reqs = h.mock.requests().length;
         // Fire diagnostic as soon as we see >=25 unexpected requests, then
@@ -327,7 +306,7 @@ async function send(
             lastDumpAt = now;
             // Open opencode's session DB directly (Database is imported at top of file)
             try {
-                const ocDbPath = join(h.opencode.env.dataDir, "opencode", "opencode.db");
+                const ocDbPath = join(h.dataDir, "opencode", "opencode.db");
                 const ocDb = openTestDb(ocDbPath, { readonly: true });
                 // Get latest messages in the session
                 const rows = ocDb.prepare(
@@ -425,7 +404,30 @@ async function send(
     }
 }
 
-describe("long-running OpenCode Magic Context session", () => {
+forEachHost(import.meta.url, "long-running OpenCode Magic Context session", (host) => {
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            modelContextLimit: 100_000,
+            magicContextConfig: {
+                execute_threshold_percentage: 20,
+                embedding: { provider: "off" },
+                protected_tags: 1,
+                memory: {
+                    enabled: true,
+                    auto_promote: false,
+                    injection_budget_tokens: 500,
+                    auto_search: { enabled: true, score_threshold: 0.3, min_prompt_chars: 12 },
+                    git_commit_indexing: { enabled: false },
+                },
+                dreamer: { disable: true },
+                compressor: { enabled: false },
+            },
+        });
+    });
+
+    afterAll(async () => {
+        await h.dispose();
+    });
     it("matches an out-of-order historian completion to its own captured range", () => {
         const earlyCapture: HistorianCapture = { requestIndex: 1, range: { start: 3, end: 4 } };
         const laterCapture: HistorianCapture = { requestIndex: 2, range: { start: 7, end: 8 } };
@@ -457,13 +459,13 @@ describe("long-running OpenCode Magic Context session", () => {
     // (95% emergency notification re-firing) is fixed and locked in
     // by transform-compartment-phase.test.ts ("95% emergency
     // notification idempotency" describe block).
-    it.skipIf(Boolean(process.env.CI))("exercises execute, notes, reduce, historian, todo synthesis, and auto-search over one realistic session", async () => {
+    it.skipIf(Boolean(process.env.CI))(host === "opencode2" ? "exercises execute, notes, reduce, historian, native folds, and auto-search without native todos" : "exercises execute, notes, reduce, historian, todo synthesis, and auto-search over one realistic session", async () => {
         await resetMock("start long-running session");
 
         const historianCaptures: HistorianCapture[] = [];
         h.mock.addMatcher((body) => {
             if (!isHistorianRequest(body)) return null;
-            const range = findOrdinalRange(body) ?? { start: 1, end: 2 };
+            const range = findHistorianOrdinalRange(body) ?? { start: 1, end: 2 };
             historianCaptures.push({ requestIndex: historianCaptures.length + 1, range });
             return {
                 text: buildMockHistorianPayload({
@@ -537,20 +539,27 @@ describe("long-running OpenCode Magic Context session", () => {
         expect(
             h.contextDb().prepare("SELECT COUNT(*) AS n FROM notes WHERE session_id = ?").get(sessionId) as { n: number },
         ).toMatchObject({ n: 1 });
+        let replayNudgeMarker: string;
+        if (h.host === "opencode2") {
+            replayNudgeMarker = await send(sessionId, "continue after the persisted note", "phase 3 native host without todo trigger");
+            const nativeTools = (await mainRequestForMarker(replayNudgeMarker)).body.tools as Array<{ name: string }>;
+            expect(nativeTools.some((tool) => /todo.*write|write.*todo/i.test(tool.name))).toBe(false);
+        } else {
         emitToolOnce(/todo.*write|write.*todo|todowrite/i, { todos: TERMINAL_TODOS });
         await send(sessionId, "turn 8: mark terminal todos to create a work-boundary note trigger", "phase 3 after terminal todos");
         await send(sessionId, "turn 9: first post-trigger turn records the nudge anchor", "phase 3 nudge anchor");
         let nudgeMarker = await send(sessionId, "turn 10: second post-trigger turn should receive the note nudge", "phase 3 nudge delivery");
         let nudgeBody = (await mainRequestForMarker(nudgeMarker)).body;
-        for (let retry = 0; retry < 4 && !JSON.stringify(nudgeBody).includes("deferred note"); retry += 1) {
+        for (let retry = 0; retry < 4 && !JSON.stringify(nudgeBody).includes("notes ready"); retry += 1) {
             nudgeMarker = await send(sessionId, `turn ${11 + retry}: extra post-trigger turn for persisted nudge delivery`, "phase 3 nudge delivery retry");
             nudgeBody = (await mainRequestForMarker(nudgeMarker)).body;
         }
-        expect(JSON.stringify(nudgeBody)).toContain("deferred note");
-        const replayNudgeMarker = await send(sessionId, "turn 15: note nudge sticky replay should be byte-identical", "phase 3 nudge replay");
+        expect(JSON.stringify(nudgeBody)).toContain("notes ready");
+        replayNudgeMarker = await send(sessionId, "turn 15: note nudge sticky replay should be byte-identical", "phase 3 nudge replay");
         const replayNudgeBody = (await mainRequestForMarker(replayNudgeMarker)).body;
-        expect(JSON.stringify(replayNudgeBody)).toContain("deferred note");
-        expect(readMeta<{ note_nudge_anchors: string }>(sessionId, "note_nudge_anchors")?.note_nudge_anchors ?? "").toContain("deferred note");
+        expect(JSON.stringify(replayNudgeBody)).toContain("notes ready");
+        expect(readMeta<{ note_nudge_anchors: string }>(sessionId, "note_nudge_anchors")?.note_nudge_anchors ?? "").toContain("notes ready");
+        }
         // The 15-minute cooldown uses process-local wall-clock time; this long test cannot advance it without sleeping.
 
         // Phase 4: ctx_reduce queues a real drop; the next force pass materializes a dropped shell and suppresses cleanup nudges.
@@ -598,12 +607,15 @@ describe("long-running OpenCode Magic Context session", () => {
             // a5b7d61d publishes through the out-of-band module stack; context.db
             // is not the Rust compartment authority. Observe the committed count
             // directly rather than waiting on a legacy TypeScript mirror row.
+            if (!(h instanceof TestHarness)) {
+                throw new Error("Rust historian check requires the OpenCode 1 hermetic module stack");
+            }
             const stack = h.rustStack;
             if (!stack) throw new Error("Rust historian check requires the hermetic module stack");
             const deadline = Date.now() + 120_000;
             let compartmentCount = 0;
             while (Date.now() < deadline) {
-                const status = await stack.moduleStatus(sessionId, h.opencode.env.workdir, "session.status");
+                const status = await stack.moduleStatus(sessionId, h.workdir, "session.status");
                 compartmentCount = Number(status.compartment_count ?? 0);
                 if (compartmentCount > 0) break;
                 await Bun.sleep(100);
@@ -631,19 +643,31 @@ describe("long-running OpenCode Magic Context session", () => {
             const markerAfterPublish = readMeta<{
                 pending_compaction_marker_state: string | null;
                 compaction_marker_state: string | null;
-            }>(sessionId, "pending_compaction_marker_state, compaction_marker_state");
-            expect(
+            }>(sessionId, pendingMarkerColumns());
+            if (h.host === "opencode2") {
+                expect(markerAfterPublish?.pending_compaction_marker_state).toBeNull();
+            } else expect(
                 Boolean(markerAfterPublish?.pending_compaction_marker_state) ||
-                    Boolean(markerAfterPublish?.compaction_marker_state),
+                    Boolean(markerAfterPublish?.compaction_marker_state) ||
+                    (h instanceof PiTestHarness && await h.hasNativeCompactionMarker(matchedPublication.compartment.end_message)),
             ).toBe(true);
             pendingBeforeDefer = markerAfterPublish?.pending_compaction_marker_state ?? null;
         }
 
         // Phase 6: Synthetic todowrite rides the next cache-busting pass, while the marker drains with that pass.
+        if (h instanceof OpenCode2TestHarness) {
+            const beforeFold = h.mock.requests().length;
+            await h.compactSession(sessionId);
+            expect(h.mock.requests().length).toBe(beforeFold);
+            const foldedMarker = await send(sessionId, "surface the native checkpoint", "phase 6 native fold");
+            const body = JSON.stringify((await mainRequestForMarker(foldedMarker)).body);
+            expect(body).toContain("<conversation-checkpoint>");
+            expect(body).toContain("Long OpenCode e2e chunk");
+        } else {
         emitToolOnce(/todo.*write|write.*todo|todowrite/i, { todos: ACTIVE_TODOS });
         await send(sessionId, "turn 19: active todowrite snapshot while marker must remain pending", "phase 6 active todos");
         if (pendingBeforeDefer !== null) {
-            expect(readMeta<{ pending_compaction_marker_state: string | null }>(sessionId, "pending_compaction_marker_state")?.pending_compaction_marker_state).toBe(pendingBeforeDefer);
+            expect(readMeta<{ pending_compaction_marker_state: string | null }>(sessionId, pendingMarkerColumns())?.pending_compaction_marker_state).toBe(pendingBeforeDefer);
         }
         const stateJson = normalizedTodos(ACTIVE_TODOS);
         expect(readMeta<{ last_todo_state: string }>(sessionId, "last_todo_state")?.last_todo_state).toBe(stateJson);
@@ -656,9 +680,15 @@ describe("long-running OpenCode Magic Context session", () => {
         expect(syntheticPair !== null || syntheticBody.includes("Ship long-running OpenCode fixture")).toBe(true);
         const markerAfterExecute = readMeta<{ pending_compaction_marker_state: string | null; compaction_marker_state: string | null }>(
             sessionId,
-            "pending_compaction_marker_state, compaction_marker_state",
+            pendingMarkerColumns(),
         );
-        expect(Boolean(markerAfterExecute?.compaction_marker_state) || markerAfterExecute?.pending_compaction_marker_state === pendingBeforeDefer).toBe(true);
+        if (h.host === "pi" || h.host === "omp") {
+            // Pi drains the staged marker into host-owned JSONL rather than
+            // mirroring OpenCode's compaction_marker_state field.
+            expect(markerAfterExecute?.pending_compaction_marker_state).toBeNull();
+        } else {
+            expect(Boolean(markerAfterExecute?.compaction_marker_state) || markerAfterExecute?.pending_compaction_marker_state === pendingBeforeDefer).toBe(true);
+        }
         expect(JSON.stringify(syntheticExecuteRequest.body)).toContain("<session-history>");
         expect(JSON.stringify(syntheticExecuteRequest.body)).toContain("Long OpenCode e2e chunk");
         const syntheticReplayMarker = await send(sessionId, "turn 22: defer pass replays synthetic todowrite bytes", "phase 6 synthetic replay");
@@ -669,6 +699,7 @@ describe("long-running OpenCode Magic Context session", () => {
             expect(JSON.stringify(syntheticReplayRequest.body)).toContain("Ship long-running OpenCode fixture");
         }
 
+        }
         // Phase 7: Auto-search hint from a seeded memory is appended and persisted for same-turn replay.
         const autoSearchMemory =
             "zebra cache ritual: when debugging long sessions, inspect prefix bytes before changing runtime code";
@@ -685,6 +716,12 @@ describe("long-running OpenCode Magic Context session", () => {
                 .contextDb()
                 .prepare("SELECT COUNT(*) AS n FROM memories WHERE content = ?")
                 .get(autoSearchMemory) as { n: number } | null;
+            if ((mirroredMemory?.n ?? 0) !== 1) {
+                const body = h.mock.requests().at(-1)?.body;
+                console.error("memory write tool result", JSON.stringify(Array.isArray(body?.messages) ? body.messages.slice(-2) : body).slice(-3000));
+                const diagnostic = await Bun.file(join(h.dataDir, "cortexkit", "magic-context-e2e.log")).text();
+                console.error(diagnostic.split("\n").filter(line => /config|embedding|observation|disabled|registered project/.test(line)).join("\n"));
+            }
             expect(mirroredMemory?.n ?? 0).toBe(1);
         } else {
             seedMemory(autoSearchMemory);

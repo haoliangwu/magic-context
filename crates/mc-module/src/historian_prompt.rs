@@ -11,9 +11,14 @@ use mc_store::{StoredCompartment, StoredMemory};
 use serde::Deserialize;
 
 /// Permanent seed floor — every historian run receives this many calibration examples.
-pub const SEED_FLOOR: usize = 4;
+pub const SEED_FLOOR: usize = 3;
 /// Number of this-session compartments shown for continuity and local calibration.
-pub const SESSION_REF_WINDOW: usize = 6;
+pub const SESSION_REF_WINDOW: usize = 4;
+pub const SESSION_REF_DIVERSE: usize = 3;
+/// Ten calibration examples: 3 seeds + 3 diverse older + 4 recent. One-compartment
+/// runs anchor on recent scores, so recent examples hide importance; diverse
+/// older examples keep scores and fill bands the seeds leave uncovered.
+pub const SESSION_REF_LIMIT: usize = SESSION_REF_WINDOW + SESSION_REF_DIVERSE;
 
 const SEED_BANDS: [(i32, i32); 5] = [(85, 100), (60, 84), (30, 59), (10, 29), (1, 9)];
 
@@ -82,7 +87,7 @@ impl From<&StoredCompartment> for ReferenceCompartment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceBlocks {
-    /// `<compartment_examples_from_other_projects>` — present for the normal 4-seed floor.
+    /// `<compartment_examples_from_other_projects>` — present for the normal 3-seed floor.
     pub seed_examples: String,
     /// `<session_references>` — empty for a young session with no prior compartments.
     pub session_references: String,
@@ -318,7 +323,9 @@ pub fn render_seed_examples_block(seeds: &[ReferenceSeed]) -> String {
     format!("<compartment_examples_from_other_projects>\n{body}\n</compartment_examples_from_other_projects>")
 }
 
-pub fn render_session_ref_compartment(c: &ReferenceCompartment) -> String {
+/// Keep episode_type everywhere, but show importance only on diverse examples:
+/// the newest reference scores cause anchoring in one-compartment runs.
+pub fn render_session_ref_compartment(c: &ReferenceCompartment, show_importance: bool) -> String {
     let importance = c.importance.unwrap_or(50);
     let episode_type = c
         .episode_type
@@ -327,12 +334,16 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment) -> String {
         .map(|value| format!(" episode_type=\"{}\"", escape_xml_attr(value)))
         .unwrap_or_default();
     let attrs = format!(
-        "start=\"{}\" end=\"{}\" title=\"{}\"{} importance=\"{}\"",
+        "start=\"{}\" end=\"{}\" title=\"{}\"{}{}",
         c.start_message,
         c.end_message,
         escape_xml_attr(&c.title),
         episode_type,
-        importance
+        if show_importance {
+            format!(" importance=\"{importance}\"")
+        } else {
+            String::new()
+        }
     );
 
     if c.p1.as_deref().is_some_and(|p1| !p1.is_empty()) {
@@ -367,24 +378,93 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment) -> String {
     )
 }
 
-pub fn render_session_references_block(all_compartments: &[ReferenceCompartment]) -> String {
-    let all_compartments: Vec<_> = all_compartments
+fn is_no_content_compartment(c: &ReferenceCompartment) -> bool {
+    c.title.is_empty()
+        && c.content.is_empty()
+        && [&c.p1, &c.p2, &c.p3, &c.p4]
+            .iter()
+            .all(|p| p.as_deref().unwrap_or("").is_empty())
+}
+
+/// Pick the least-represented available bands against the seeds alone. Recent
+/// reference scores are hidden, so their bands do not count as anchors.
+/// Ties follow the seed's rotating band order; picks within each band use the
+/// same UTF-16 hash. Remove each pick, then render diverse chronological first,
+/// recent chronological last. The input must be chronological.
+pub fn select_session_references(
+    all_compartments: &[ReferenceCompartment],
+    seeds: &[ReferenceSeed],
+    session_id: &str,
+    chunk_start: i64,
+) -> Vec<ReferenceCompartment> {
+    let eligible: Vec<_> = all_compartments
         .iter()
-        .filter(|c| {
-            !(c.title.is_empty()
-                && c.content.is_empty()
-                && [&c.p1, &c.p2, &c.p3, &c.p4]
-                    .iter()
-                    .all(|p| p.as_deref().unwrap_or("").is_empty()))
-        })
+        .filter(|c| !is_no_content_compartment(c))
+        .collect();
+    let older_count = eligible.len().saturating_sub(SESSION_REF_WINDOW);
+    let recent = &eligible[older_count..];
+    let mut bands = vec![Vec::new(); SEED_BANDS.len()];
+    let mut counts = [0usize; SEED_BANDS.len()];
+    for seed in seeds {
+        counts[seed_band_index(seed.importance)] += 1;
+    }
+    for (i, c) in eligible[..older_count].iter().enumerate() {
+        bands[seed_band_index(c.importance.unwrap_or(50))].push(i);
+    }
+    let hash = fnv1a(&format!("{session_id}:{chunk_start}")) as usize;
+    let band_order: Vec<_> = (0..SEED_BANDS.len())
+        .map(|i| (i + (hash % SEED_BANDS.len())) % SEED_BANDS.len())
+        .collect();
+    let mut picks = Vec::new();
+    while picks.len() < SESSION_REF_DIVERSE {
+        let best = band_order
+            .iter()
+            .copied()
+            .filter(|&bi| !bands[bi].is_empty())
+            .min_by_key(|&bi| counts[bi]);
+        let Some(best) = best else { break };
+        let band = &mut bands[best];
+        picks.push(band.remove((hash + picks.len()) % band.len()));
+        counts[best] += 1;
+    }
+    picks.sort_unstable();
+    picks
+        .into_iter()
+        .map(|i| eligible[i].clone())
+        .chain(recent.iter().map(|c| (*c).clone()))
+        .collect()
+}
+
+pub fn render_session_references_block(selected: &[ReferenceCompartment]) -> String {
+    render_session_references_block_window(selected, SESSION_REF_LIMIT)
+}
+
+/// Render a suffix of already-selected references. Drop diverse examples before
+/// recent examples, then the oldest recent first. Select once before fitting so
+/// trimming never reshuffles the calibration examples.
+pub fn render_session_references_block_window(
+    selected: &[ReferenceCompartment],
+    window: usize,
+) -> String {
+    let window = window.min(SESSION_REF_LIMIT);
+    if window == 0 {
+        return String::new();
+    }
+    let all_compartments: Vec<_> = selected
+        .iter()
+        .filter(|c| !is_no_content_compartment(c))
         .collect();
     if all_compartments.is_empty() {
         return String::new();
     }
-    let start = all_compartments.len().saturating_sub(SESSION_REF_WINDOW);
+    let start = all_compartments.len().saturating_sub(window);
+    // Determine the scored boundary before trimming: diverse rows keep their
+    // scores, while retained recent rows must never acquire an importance attribute.
+    let recent_start = all_compartments.len().saturating_sub(SESSION_REF_WINDOW);
     let body = all_compartments[start..]
         .iter()
-        .map(|c| render_session_ref_compartment(c))
+        .enumerate()
+        .map(|(i, c)| render_session_ref_compartment(c, i + start < recent_start))
         .collect::<Vec<_>>()
         .join("\n\n");
     format!("<session_references>\n{body}\n</session_references>")
@@ -398,7 +478,12 @@ pub fn build_reference_blocks(
     let seeds = select_seeds(session_id, chunk_start, SEED_FLOOR);
     ReferenceBlocks {
         seed_examples: render_seed_examples_block(&seeds),
-        session_references: render_session_references_block(session_compartments),
+        session_references: render_session_references_block(&select_session_references(
+            session_compartments,
+            &seeds,
+            session_id,
+            chunk_start,
+        )),
     }
 }
 
@@ -414,10 +499,33 @@ pub fn build_reference_blocks_from_stored(
     build_reference_blocks(session_id, chunk_start, &refs)
 }
 
+/// Return the memories that [`render_historian_memory_block`] renders, in the order
+/// it renders them (by category priority, then input order). Rendering any prefix
+/// of this list reproduces the first lines of the full block, so a caller that must
+/// shrink the block to fit a model window drops the lowest-priority lines by taking
+/// a shorter prefix.
+pub fn order_historian_memories(memories: &[StoredMemory]) -> Vec<StoredMemory> {
+    let mut ordered = Vec::new();
+    for category in HISTORIAN_MEMORY_CATEGORY_PRIORITY {
+        ordered.extend(
+            memories
+                .iter()
+                .filter(|memory| memory.category == *category)
+                .cloned(),
+        );
+    }
+    ordered
+}
+
 /// Render the historian's category-grouped project-memory block from already-loaded rows.
 ///
-/// This differs from the m0/m1 memory render: the historian needs compact category groups
-/// for fact deduplication, not per-memory ids or update metadata.
+/// Canonical form: category-grouped `- <fact>` lines WITHOUT memory ids. This differs
+/// from the m0/m1 memory render (`#id: fact`) by design: the historian system prompt
+/// uses this block only for content-based fact deduplication and contradiction
+/// reporting — it never addresses a memory by id, while the agent-facing wire needs
+/// ids so `<memory-updates>` corrections can point at baseline lines. The TypeScript
+/// renderer (`renderHistorianMemoryBlock` in inject-compartments.ts) emits the same
+/// bytes; the historian prompt golden pins both lanes to this form.
 pub fn render_historian_memory_block(memories: &[StoredMemory]) -> String {
     let mut by_category: HashMap<&str, Vec<&StoredMemory>> = HashMap::new();
     for memory in memories {
@@ -556,6 +664,24 @@ mod tests {
     struct GoldenFile {
         seed_cases: Vec<SeedCase>,
         prompt_cases: Vec<PromptCase>,
+        reference_cases: Vec<ReferenceCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct ReferenceCase {
+        label: String,
+        session_id: String,
+        chunk_start: i64,
+        session_compartments: Vec<GoldenCompartment>,
+        seed_examples: String,
+        selected_starts: Vec<i64>,
+        windows: Vec<ReferenceWindow>,
+    }
+
+    #[derive(Deserialize)]
+    struct ReferenceWindow {
+        window: usize,
+        block: String,
     }
 
     #[derive(Deserialize)]
@@ -603,6 +729,146 @@ mod tests {
     fn xml_escaping_matches_prompt_reference_order() {
         assert_eq!(escape_xml_attr("&\"'<>"), "&amp;&quot;&apos;&lt;&gt;");
         assert_eq!(escape_xml_content("&<>\"'"), "&amp;&lt;&gt;\"'");
+    }
+
+    fn scored_history(scores: &[i32]) -> Vec<ReferenceCompartment> {
+        scores
+            .iter()
+            .enumerate()
+            .map(|(i, &importance)| ReferenceCompartment {
+                start_message: i as i64 * 10 + 1,
+                end_message: i as i64 * 10 + 10,
+                title: format!("Compartment {i}"),
+                content: format!("Body {i}"),
+                importance: Some(importance),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn calibration_seeds() -> Vec<ReferenceSeed> {
+        [90, 70, 40]
+            .into_iter()
+            .map(|importance| ReferenceSeed {
+                importance,
+                block: String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn diverse_selection_fills_uncovered_and_then_least_represented_bands() {
+        let seeds = calibration_seeds();
+        let mixed = scored_history(&[5, 20, 40, 70, 90, 5, 20, 40, 70, 90, 70, 90, 70, 90]);
+        let refs = select_session_references(&mixed, &seeds, "ses-diverse", 42);
+        assert_eq!(refs.len(), 7);
+        assert_eq!(&refs[3..], &mixed[10..]);
+        let bands: Vec<_> = refs[..3]
+            .iter()
+            .map(|c| seed_band_index(c.importance.unwrap()))
+            .collect();
+        assert!(bands.contains(&3) && bands.contains(&4));
+        let changed_recent = scored_history(&[5, 20, 40, 70, 90, 5, 20, 40, 70, 90, 5, 20, 5, 20]);
+        assert_eq!(
+            &select_session_references(&changed_recent, &seeds, "ses-diverse", 42)[..3],
+            &refs[..3]
+        );
+
+        let covered = scored_history(&[20, 40, 70, 90, 20, 40, 70, 90, 5, 20, 40, 70]);
+        let refs = select_session_references(&covered, &seeds, "ses-diverse", 42);
+        assert_eq!(refs.len(), 7);
+        let mut bands: Vec<_> = refs[..3]
+            .iter()
+            .map(|c| seed_band_index(c.importance.unwrap()))
+            .collect();
+        bands.sort_unstable();
+        assert!(bands.contains(&3));
+        for band in [0, 1, 2, 3] {
+            assert!(bands.iter().filter(|&&b| b == band).count() <= if band == 3 { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn diverse_selection_handles_missing_low_bands_and_is_repeatable() {
+        let seeds = calibration_seeds();
+        let history = scored_history(&[40, 70, 90, 40, 70, 90, 70, 70, 70, 70]);
+        let refs = select_session_references(&history, &seeds, "🚀", 42);
+        assert_eq!(refs.len(), 7);
+        let mut scores: Vec<_> = refs[..3].iter().map(|c| c.importance.unwrap()).collect();
+        scores.sort_unstable();
+        assert!(scores.contains(&40) && scores.contains(&90));
+        assert!(scores.contains(&70));
+        assert_eq!(refs, select_session_references(&history, &seeds, "🚀", 42));
+        let history = scored_history(&[40; 24]);
+        let variants: HashSet<_> = (0..20)
+            .map(|start| {
+                select_session_references(&history, &seeds, "🚀", start)
+                    .iter()
+                    .map(|c| c.start_message)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(variants.len() > 1);
+    }
+
+    #[test]
+    fn diverse_selection_excludes_no_content_and_keeps_young_sessions_whole() {
+        assert_eq!(SESSION_REF_WINDOW, 4);
+        let seeds = calibration_seeds();
+        for count in 0..=7 {
+            let history = scored_history(&vec![50; count]);
+            let mut marked = vec![ReferenceCompartment::default()];
+            for c in &history {
+                marked.extend([c.clone(), ReferenceCompartment::default()]);
+            }
+            assert_eq!(
+                select_session_references(&marked, &seeds, "young", 42),
+                history
+            );
+        }
+        let history = scored_history(&[5, 20, 40, 70, 90, 50, 70, 90]);
+        let mut marked = history.clone();
+        marked.insert(0, ReferenceCompartment::default());
+        marked.push(ReferenceCompartment::default());
+        let expected = select_session_references(&history, &seeds, "marked", 42);
+        assert_eq!(expected.len(), 7);
+        assert_eq!(
+            select_session_references(&marked, &seeds, "marked", 42),
+            expected
+        );
+    }
+
+    #[test]
+    fn diverse_scores_are_visible_but_recent_scores_are_hidden_even_after_trimming() {
+        let mut history = scored_history(&[5, 20, 40, 70, 90, 5, 20, 40, 70, 90]);
+        for c in &mut history {
+            c.episode_type = Some("feature".into());
+        }
+        let refs = select_session_references(&history, &calibration_seeds(), "visibility", 42);
+        assert_eq!(refs.len(), 7);
+        let block = render_session_references_block(&refs);
+        let headers: Vec<_> = block
+            .lines()
+            .filter(|line| line.starts_with("<compartment "))
+            .collect();
+        assert_eq!(headers.len(), 7);
+        for (i, header) in headers.iter().enumerate() {
+            assert!(header.contains("episode_type=\"feature\""));
+            assert_eq!(header.contains(" importance=\""), i < 3);
+            if i < 3 {
+                assert!(header.contains(&format!("importance=\"{}\"", refs[i].importance.unwrap())));
+            }
+        }
+        for window in 0..=7 {
+            let block = render_session_references_block_window(&refs, window);
+            assert_eq!(
+                block.matches(" importance=\"").count(),
+                window.saturating_sub(4)
+            );
+            assert_eq!(block.matches("episode_type=\"feature\"").count(), window);
+        }
+        let young = render_session_references_block(&refs[3..]);
+        assert!(!young.contains(" importance=\""));
     }
 
     #[test]
@@ -672,6 +938,43 @@ mod tests {
             serde_json::from_str(raw).expect("parse historian-prompt-golden.json");
         assert!(!golden.seed_cases.is_empty(), "empty seed golden");
         assert!(!golden.prompt_cases.is_empty(), "empty prompt golden");
+        assert_eq!(golden.reference_cases.len(), 11, "missing reference cases");
+
+        for case in &golden.reference_cases {
+            let seeds = select_seeds(&case.session_id, case.chunk_start, SEED_FLOOR);
+            let compartments: Vec<_> = case
+                .session_compartments
+                .iter()
+                .map(ReferenceCompartment::from)
+                .collect();
+            let selected = select_session_references(
+                &compartments,
+                &seeds,
+                &case.session_id,
+                case.chunk_start,
+            );
+            assert_eq!(
+                selected.iter().map(|c| c.start_message).collect::<Vec<_>>(),
+                case.selected_starts,
+                "selection mismatch in {}",
+                case.label
+            );
+            assert_eq!(
+                render_seed_examples_block(&seeds),
+                case.seed_examples,
+                "seed mismatch in {}",
+                case.label
+            );
+            for window in &case.windows {
+                assert_eq!(
+                    render_session_references_block_window(&selected, window.window),
+                    window.block,
+                    "window {} mismatch in {}",
+                    window.window,
+                    case.label
+                );
+            }
+        }
 
         let corpus = reference_seeds();
         let mut distinct_seed_selections = HashSet::new();

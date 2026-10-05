@@ -21,6 +21,7 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { getLastCompartmentEndMessage } from "@magic-context/core/features/magic-context/compartment-storage";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
+	hasRawMessageProvider,
 	readSessionChunk,
 	setRawMessageProvider,
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
@@ -30,6 +31,7 @@ import {
 } from "@magic-context/core/tools/ctx-expand/constants";
 import { resolveCtxExpandMode } from "@magic-context/core/tools/ctx-expand/mode";
 import {
+	renderItemByTag,
 	renderMessageByOrdinal,
 	renderVerboseRange,
 } from "@magic-context/core/tools/ctx-expand/render";
@@ -39,28 +41,34 @@ import { readPiSessionMessages } from "../read-session-pi";
 
 const ParamsSchema = Type.Object(
 	{
+		tag: Type.Optional(
+			Type.Union([Type.Number(), Type.String()], {
+				description:
+					"Tag number from a §N§ tag or a [dropped §N§] placeholder, not a message ordinal. Returns that one item in full. Use alone.",
+			}),
+		),
 		start: Type.Optional(
 			Type.Number({
 				description:
-					'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
+					"First message ordinal of the range (a <session-history> heading's start, or a ctx_search hit), not a tag number.",
 			}),
 		),
 		end: Type.Optional(
 			Type.Number({
 				description:
-					'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
+					"Last message ordinal of the range, inclusive, not a tag number.",
 			}),
 		),
 		verbose: Type.Optional(
 			Type.Boolean({
 				description:
-					"With start/end: list each message separately with its ordinal [N] and per-part preview, so you can recover one in full by ordinal.",
+					"With start/end: one entry per message with ordinal and per-part preview instead of the transcript.",
 			}),
 		),
 		message: Type.Optional(
 			Type.Number({
 				description:
-					"Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
+					"Message ordinal from a <session-history> heading or a ctx_search hit, not a tag number. Returns that one message in full. Use alone.",
 			}),
 		),
 	},
@@ -83,6 +91,7 @@ function err(text: string) {
 
 export interface CtxExpandToolDeps {
 	db: ContextDatabase;
+	expandTools?: Record<string, string | false>;
 }
 
 export function createCtxExpandTool(
@@ -100,7 +109,7 @@ export function createCtxExpandTool(
 			_onUpdate,
 			ctx,
 		) {
-			params = unwrapImitatedReducedArgs(params, ["message", "start"], {
+			params = unwrapImitatedReducedArgs(params, ["tag", "message", "start"], {
 				start: "number",
 				end: "number",
 				verbose: "boolean",
@@ -112,17 +121,26 @@ export function createCtxExpandTool(
 			}
 
 			// All raw reads go through the shared provider-aware helpers, so
-			// register Pi's source for the duration of this single call.
-			// setRawMessageProvider returns an unregister fn so we don't leak the
-			// binding into concurrent transform passes.
-			const unregister = setRawMessageProvider(sessionId, {
-				readMessages: () => readPiSessionMessages(ctx),
-			});
+			// they need a Pi source for this session. One is usually registered
+			// already: each transform pass registers its branch snapshot, and a
+			// background historian or recomp holds one for its whole run. Use it
+			// rather than replacing it: a session has one provider slot, and
+			// releasing a replacement empties the slot, which would leave that
+			// background run reading the wrong store. Only when nothing is
+			// registered does this call install a live source of its own.
+			const unregister = hasRawMessageProvider(sessionId)
+				? () => {}
+				: setRawMessageProvider(sessionId, {
+						readMessages: () => readPiSessionMessages(ctx),
+					});
 
 			try {
 				const mode = resolveCtxExpandMode(params, "positive");
 				if (mode.kind === "error") {
 					return err(mode.message);
+				}
+				if (mode.kind === "tag") {
+					return ok(renderItemByTag(deps.db, sessionId, mode.tag, "text"));
 				}
 				if (mode.kind === "message") {
 					return ok(renderMessageByOrdinal(sessionId, mode.message));
@@ -152,6 +170,7 @@ export function createCtxExpandTool(
 						start,
 						effectiveEnd,
 						CTX_EXPAND_TOKEN_BUDGET,
+						deps.expandTools,
 					);
 					if (!v.text) {
 						return ok(
@@ -177,6 +196,7 @@ export function createCtxExpandTool(
 					CTX_EXPAND_TOKEN_BUDGET,
 					start,
 					effectiveEnd + 1, // readSessionChunk uses exclusive end
+					{ expand: false },
 				);
 
 				if (!chunk.text || chunk.messageCount === 0) {

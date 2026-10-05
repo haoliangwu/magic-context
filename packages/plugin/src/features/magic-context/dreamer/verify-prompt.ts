@@ -22,9 +22,9 @@ import {
 
 export const VERIFY_SYSTEM_PROMPT = `You are a memory verifier for the magic-context system. You verify project memories against the CURRENT code.
 
-Each memory below comes with its backing file(s) — the code it makes a claim about. For EACH memory: read its backing files (you may read more if needed) and decide whether the memory is still accurate.
+Each memory below comes with its backing file(s) — the code it makes a claim about. For EACH memory: use the provided git diff as evidence when present. If no diff is supplied, read its backing files (you may read more if needed) and decide whether the memory is still accurate.
 
-Tools (read-only): read, grep, glob, aft_search, aft_outline, aft_zoom. You read code to check claims; you change nothing.
+Tools (read-only): read, grep, glob. Request line ranges and keep reads short. You read code only when the evidence requires it; you change nothing.
 
 Decide ONE of four outcomes per memory:
 - VERIFIED — still accurate. Keep it as-is.
@@ -55,9 +55,17 @@ export interface VerifyPromptMemory {
     category: string;
     content: string;
     mappedFiles: string[];
+    verifiedAt?: number;
+    verifiedCommit?: string | null;
 }
 
-export function buildVerifyPrompt(projectPath: string, memories: VerifyPromptMemory[]): string {
+import type { VerifyDiffEvidence } from "./verify-diff";
+
+export function buildVerifyPrompt(
+    projectPath: string,
+    memories: VerifyPromptMemory[],
+    evidence?: VerifyDiffEvidence | null,
+): string {
     const list = memories
         .map(
             (m) =>
@@ -68,11 +76,11 @@ export function buildVerifyPrompt(projectPath: string, memories: VerifyPromptMem
 
 Project: ${projectPath}
 
-Read each memory's backing files, decide verified / update / archive / skip (default verified; behavioral directives only permit verified or skip), then output ONE <verify> manifest covering every id.
+${evidence ? "The git diff below is the evidence. If changed hunks do not touch a claim, mark it verified without opening files. Open files only when a diff suggests the claim may have changed. A rename or deletion requires an update or archive when positively supported; do not archive on uncertainty." : "Read each memory's backing files to check its claims."} Decide verified / update / archive / skip (default verified; behavioral directives only permit verified or skip), then output ONE <verify> manifest covering every id.
 
 <memories>
 ${list}
-</memories>`;
+</memories>${evidence ? `\n\n<changed-files mode="${evidence.mode}">\n${evidence.files.map((file) => `File: ${file.path} (memories: ${file.memoryIds.join(", ")})\n${file.text}`).join("\n\n")}\n</changed-files>` : ""}`;
 }
 
 export interface ParsedVerifyManifest {

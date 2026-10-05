@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import {
     type ProviderConfig,
     ProviderError,
@@ -17,7 +18,7 @@ const temporaryDirectories: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 async function temporaryDirectory(prefix = "retina-local-fs-"): Promise<string> {
-    const directory = await mkdtemp(join(tmpdir(), prefix));
+    const directory = await createTestTempDirFromPath(join(tmpdir(), prefix));
     temporaryDirectories.push(directory);
     return directory;
 }
@@ -150,6 +151,48 @@ describe("filesystem predicates", () => {
 });
 
 describe("git predicates", () => {
+    test.skipIf(process.platform === "win32")(
+        "unchanged git_commit_after validates refs but skips the ancestry process",
+        async () => {
+            const { repo, firstSha } = await createRepository();
+            await commit(repo, "two\n");
+            await git(repo, "tag", "audit-base", firstSha);
+            const config = {
+                kind: "git_commit_after",
+                repo_path: repo,
+                sha: "audit-base",
+            } as const;
+            const first = await poll(config);
+            const bin = await temporaryDirectory("retina-local-fs-git-trace-");
+            const trace = join(bin, "trace");
+            const { stdout } = await execFileAsync("which", ["git"], { encoding: "utf8" });
+            const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+            await writeFile(
+                join(bin, "git"),
+                `#!/bin/sh\nprintf '%s\\n' "$*" >> ${shellQuote(trace)}\nexec ${shellQuote(stdout.trim())} "$@"\n`,
+                { mode: 0o755 },
+            );
+            const originalPath = process.env.PATH;
+            try {
+                process.env.PATH = `${bin}:${originalPath}`;
+                expect(await poll(config, first.scalar)).toEqual({
+                    events: [],
+                    scalar: first.scalar,
+                });
+                const calls = (await readFile(trace, "utf8")).trim().split("\n");
+                expect(calls).toHaveLength(2);
+                expect(calls.every((call) => call.includes("rev-parse --verify"))).toBe(true);
+                // Quiet polling must still fail on a base that no longer resolves.
+                await git(repo, "tag", "--delete", "audit-base");
+                await expect(poll(config, first.scalar)).rejects.toMatchObject({
+                    code: "git_error",
+                });
+            } finally {
+                process.env.PATH = originalPath;
+            }
+        },
+    );
+
     test("git_commit_after fires for strict descendants and each new commit", async () => {
         const { repo, firstSha } = await createRepository();
         const equal = await poll({
@@ -196,6 +239,25 @@ describe("git predicates", () => {
         await git(repo, "tag", "v2.0.0");
         const next = await poll(config, matching.scalar);
         expect(next.events[0]?.id).not.toBe(matching.events[0]?.id);
+    });
+
+    // No shell is involved, but git still parses an argument that starts with
+    // "-" as an option, so a pattern like --format=... changed what the provider
+    // reported as tags. Such values are refused before git runs.
+    test("refuses ref, sha and pattern values git would parse as options", async () => {
+        const { repo, firstSha } = await createRepository();
+        await git(repo, "tag", "v1.0.0");
+        const optionLike = [
+            { kind: "git_tag_matching", repo_path: repo, pattern: "--format=injected" },
+            { kind: "git_tag_matching", repo_path: repo, pattern: "-n99" },
+            { kind: "git_commit_after", repo_path: repo, sha: "--all" },
+            { kind: "git_commit_after", repo_path: repo, sha: firstSha, ref: "--branches" },
+            { kind: "git_tag_matching", repo_path: repo, pattern: "v*\n--format=x" },
+        ] as const;
+        for (const config of optionLike) {
+            expect(validateProviderConfig(config)).toMatchObject({ success: false });
+            await expect(poll(config)).rejects.toMatchObject({ code: "invalid_config" });
+        }
     });
 });
 
@@ -425,6 +487,56 @@ describe("path fence", () => {
         await expect(poll({ kind: "path_exists", path }, null, home)).rejects.toMatchObject({
             code: "fenced_path",
         });
+    });
+
+    // Users who move CortexKit data to another disk replace the data directory
+    // with a symlink. The watched path is fully resolved, so the fence must
+    // compare it against the resolved CortexKit locations too.
+    test("refuses fenced roots when the cortexkit data directory is a symlink", async () => {
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const elsewhere = await temporaryDirectory("retina-local-fs-moved-");
+        const realCortexkit = join(elsewhere, "real", "cortexkit");
+        await mkdir(join(home, ".local", "share"), { recursive: true });
+        await mkdir(realCortexkit, { recursive: true });
+        await symlink(realCortexkit, join(home, ".local", "share", "cortexkit"));
+        for (const relativePath of [
+            ["plexus", "store.db"],
+            ["claustrum", "secret.txt"],
+            ["run", "subc-connection.json"],
+            ["magic-context", "context.db"],
+        ]) {
+            await mkdir(join(realCortexkit, relativePath[0] ?? ""), { recursive: true });
+            await writeFile(join(realCortexkit, ...relativePath), "secret");
+            for (const path of [
+                join(home, ".local", "share", "cortexkit", ...relativePath),
+                join(realCortexkit, ...relativePath),
+            ]) {
+                await expect(poll({ kind: "path_exists", path }, null, home)).rejects.toMatchObject(
+                    { code: "fenced_path" },
+                );
+            }
+        }
+
+        // The carve-ins still apply through the symlink.
+        const carveIn = join(realCortexkit, "plexus", "catalog", "provider.json");
+        await mkdir(join(carveIn, ".."), { recursive: true });
+        await writeFile(carveIn, "allowed");
+        const result = await poll({ kind: "path_exists", path: carveIn }, null, home);
+        expect(result.events).toHaveLength(1);
+    });
+
+    test("refuses a fenced root that is itself a symlink to another disk", async () => {
+        const home = await temporaryDirectory("retina-local-fs-home-");
+        const elsewhere = await temporaryDirectory("retina-local-fs-moved-");
+        const realPlexus = join(elsewhere, "plexus-data");
+        await mkdir(realPlexus, { recursive: true });
+        await writeFile(join(realPlexus, "store.db"), "events");
+        await mkdir(join(home, ".local", "share", "cortexkit"), { recursive: true });
+        await symlink(realPlexus, join(home, ".local", "share", "cortexkit", "plexus"));
+
+        await expect(
+            poll({ kind: "path_exists", path: join(realPlexus, "store.db") }, null, home),
+        ).rejects.toMatchObject({ code: "fenced_path" });
     });
 });
 

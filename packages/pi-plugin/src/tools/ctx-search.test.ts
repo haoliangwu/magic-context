@@ -8,6 +8,27 @@ import { createTestDb, fakeContext } from "../test-utils.test";
 import { createCtxSearchTool } from "./ctx-search";
 
 describe("createCtxSearchTool", () => {
+	it("returns a typed tool error for an invalid date", async () => {
+		const db = createTestDb();
+		try {
+			const tool = createCtxSearchTool({ db });
+			const result = await tool.execute(
+				"call-date",
+				{ query: "needle", to: "not-a-date" },
+				new AbortController().signal,
+				undefined,
+				fakeContext("ses-search") as never,
+			);
+
+			expect(result.isError).toBe(true);
+			expect(result.content[0]?.text).toBe(
+				"Error: Invalid 'to' date; use YYYY-MM-DD or a full ISO datetime.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("prints ctx_expand ranges and footer for message search hits", async () => {
 		const db = createTestDb();
 		const spy = spyOn(searchModule, "unifiedSearch").mockImplementation(

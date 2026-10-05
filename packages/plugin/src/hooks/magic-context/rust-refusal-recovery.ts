@@ -26,6 +26,24 @@ export interface RustRefusalRecoveryOptions {
     maxDurationMs?: number;
     probeTimeoutMs?: number;
     readLatestMessage?: typeof latestPersistedMessageForRecovery;
+    /**
+     * How the synthetic continue reaches the conversation. OpenCode 1 sends it as a
+     * prompt carrying a synthetic part; hosts with their own synthetic carrier pass
+     * that carrier here instead, so the continue is delivered the same way every
+     * other Magic Context synthetic message on that host is.
+     */
+    deliverSynthetic?: (args: {
+        sessionId: string;
+        text: string;
+        beforeSend: () => boolean;
+    }) => Promise<boolean>;
+    /**
+     * Whether the refused turn is still the conversation's current step, read from
+     * whichever store this host persists its history in. False means the user has
+     * already moved on and the synthetic continue would be a stale interruption;
+     * throwing means "cannot tell yet", which keeps the watcher armed.
+     */
+    isRefusedStepStillCurrent?: (sessionId: string, refusedUserMessageId: string) => boolean;
 }
 
 function errorContainsReconnectRefusal(error: unknown): boolean {
@@ -43,6 +61,34 @@ export function createRustRefusalRecovery(options: RustRefusalRecoveryOptions) {
     const maxDurationMs = options.maxDurationMs ?? RUST_REFUSAL_RECOVERY_MAX_MS;
     const probeTimeoutMs = options.probeTimeoutMs ?? RUST_REFUSAL_RECOVERY_PROBE_TIMEOUT_MS;
     const readLatestMessage = options.readLatestMessage ?? latestPersistedMessageForRecovery;
+    const isRefusedStepStillCurrent =
+        options.isRefusedStepStillCurrent ??
+        ((sessionId: string, refusedUserMessageId: string): boolean => {
+            const latest = readLatestMessage(sessionId);
+            // OpenCode persists the assistant shell before it records a transform error. The
+            // arm already proves this exact user turn was refused, so its unfinished assistant
+            // child is still the refused step; a completed child without the refusal error is not.
+            const matchingAssistant =
+                latest?.role === "assistant" &&
+                (latest.parentID === undefined || latest.parentID === refusedUserMessageId)
+                    ? latest
+                    : null;
+            return (
+                matchingAssistant !== null &&
+                (errorContainsReconnectRefusal(matchingAssistant.error) ||
+                    (matchingAssistant.parentID === refusedUserMessageId &&
+                        matchingAssistant.error === undefined &&
+                        matchingAssistant.completedAt === undefined))
+            );
+        });
+    const deliverSynthetic =
+        options.deliverSynthetic ??
+        ((args) =>
+            deliverSyntheticUserMessage(args.sessionId, {
+                client: options.client,
+                text: args.text,
+                beforeSend: args.beforeSend,
+            }));
 
     const cancel = (sessionId: string): void => {
         const watcher = watchers.get(sessionId);
@@ -98,28 +144,14 @@ export function createRustRefusalRecovery(options: RustRefusalRecoveryOptions) {
             return;
         }
 
-        let latest: ReturnType<typeof latestPersistedMessageForRecovery>;
+        let stillRefusedStep: boolean;
         try {
-            latest = readLatestMessage(sessionId);
+            stillRefusedStep = isRefusedStepStillCurrent(sessionId, watcher.refusedUserMessageId);
         } catch (error) {
             sessionLog(sessionId, "rust refusal recovery could not read persisted history:", error);
             schedule(sessionId, watcher);
             return;
         }
-        // OpenCode persists the assistant shell before it records a transform error. The arm
-        // already proves this exact user turn was refused, so its unfinished assistant child is
-        // still the refused step; a completed child without the refusal error is not.
-        const matchingAssistant =
-            latest?.role === "assistant" &&
-            (latest.parentID === undefined || latest.parentID === watcher.refusedUserMessageId)
-                ? latest
-                : null;
-        const stillRefusedStep =
-            matchingAssistant !== null &&
-            (errorContainsReconnectRefusal(matchingAssistant.error) ||
-                (matchingAssistant.parentID === watcher.refusedUserMessageId &&
-                    matchingAssistant.error === undefined &&
-                    matchingAssistant.completedAt === undefined));
         if (!stillRefusedStep) {
             cancel(sessionId);
             sessionLog(
@@ -131,8 +163,8 @@ export function createRustRefusalRecovery(options: RustRefusalRecoveryOptions) {
 
         if (watcher.state !== "pending" || watchers.get(sessionId) !== watcher) return;
         watcher.state = "claimed";
-        const delivered = await deliverSyntheticUserMessage(sessionId, {
-            client: options.client,
+        const delivered = await deliverSynthetic({
+            sessionId,
             text: RUST_REFUSAL_RECOVERY_PROMPT,
             beforeSend: () => watchers.get(sessionId) === watcher && watcher.state === "claimed",
         }).catch((error) => {

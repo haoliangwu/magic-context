@@ -101,7 +101,11 @@ if ! command -v opencode >/dev/null 2>&1; then
 fi
 echo "  [e2e:rust:prerequisites:end] status=pass"
 
-RUST_E2E_FILES=$(bun "$MANIFEST_VALIDATOR" --mode rust --harness all | tr '\n' ' ')
+if [[ -n "${MC_E2E_SHARD:-}" ]]; then
+    RUST_E2E_FILES=$(bun "$E2E_DIR/scripts/select-rust-shard.ts" "$MC_E2E_SHARD" | tr '\n' ' ')
+else
+    RUST_E2E_FILES=$(bun "$MANIFEST_VALIDATOR" --mode rust --harness all | tr '\n' ' ')
+fi
 if [[ -z "$RUST_E2E_FILES" ]]; then
     echo "Error: Rust e2e manifest selected zero test files" >&2
     exit 1

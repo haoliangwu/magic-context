@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { parse } from "comment-json";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 import {
     __resetTuiPreferencesWatchTestHooks,
     __setTuiPreferencesWatchTestHooks,
@@ -25,7 +26,7 @@ const ENV_KEYS = [TUI_PREFS_FILE_ENV, "OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"];
 
 beforeEach(async () => {
     for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
-    dir = await mkdtemp(join(tmpdir(), "mc-tui-prefs-test-"));
+    dir = await createTestTempDirFromPath(join(tmpdir(), "mc-tui-prefs-test-"));
     file = join(dir, "tui-preferences.jsonc");
     process.env[TUI_PREFS_FILE_ENV] = file;
 });

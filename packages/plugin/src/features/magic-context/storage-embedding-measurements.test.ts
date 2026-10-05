@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { closeDatabase, openDatabase } from "./storage";
 import {
     listEmbeddingMeasurements,
@@ -21,7 +22,7 @@ describe("embedding measurement corpus", () => {
     });
 
     it("stores hashed, bounded rank lists once per query cohort", () => {
-        const dir = mkdtempSync(join(tmpdir(), "embedding-measurements-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "embedding-measurements-"));
         dirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
         const db = openDatabase();
@@ -56,7 +57,7 @@ describe("embedding measurement corpus", () => {
     });
 
     it("bounds a session's corpus rows, keeping the newest when the cap is exceeded", () => {
-        const dir = mkdtempSync(join(tmpdir(), "embedding-measurements-cap-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "embedding-measurements-cap-"));
         dirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
         const db = openDatabase();

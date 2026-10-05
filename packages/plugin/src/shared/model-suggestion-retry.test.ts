@@ -1,6 +1,8 @@
 import { describe, expect, mock, test } from "bun:test";
 
+import { HiddenAgentStepLimit } from "../v2/hooks/hidden-child";
 import {
+    getPromptFailureDetail,
     promptSyncWithModelSuggestionRetry,
     promptSyncWithValidatedOutputRetry,
 } from "./model-suggestion-retry";
@@ -158,6 +160,18 @@ describe("promptSyncWithModelSuggestionRetry", () => {
         expect(prompt).toHaveBeenCalledTimes(0);
     });
 
+    test("pre-aborted lease signal carries its loss reason into the prompt error", async () => {
+        const controller = new AbortController();
+        controller.abort(new Error("lease_lost: taken by holder-b"));
+        const prompt = mock(async () => {});
+        await expect(
+            promptSyncWithModelSuggestionRetry(createClient(prompt), createArgs(), {
+                signal: controller.signal,
+            }),
+        ).rejects.toThrow("prompt aborted by external signal: lease_lost: taken by holder-b");
+        expect(prompt).not.toHaveBeenCalled();
+    });
+
     test("AbortError name short-circuits", async () => {
         const abortError = new Error("aborted by provider");
         abortError.name = "AbortError";
@@ -225,6 +239,49 @@ describe("promptSyncWithModelSuggestionRetry", () => {
         expect((abort.mock.calls[0]?.[0] as { path: { id: string } }).path.id).toBe("ses-test");
     });
 
+    test("timeout with a resolving transport still aborts the child", async () => {
+        const abort = mock(async () => ({}));
+        const client = createClient(
+            mock(async () => ({})),
+            abort,
+        );
+        const transport = Object.assign(
+            ({ signal }: { signal?: AbortSignal }) =>
+                new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve())),
+            { childSessionId: "child-test" },
+        );
+        await expect(
+            promptSyncWithModelSuggestionRetry(client, createArgs(), {
+                timeoutMs: 10,
+                transport,
+            }),
+        ).rejects.toThrow("prompt timed out after 10ms");
+        expect(abort).toHaveBeenCalledTimes(1);
+        expect((abort.mock.calls[0]?.[0] as { path: { id: string } }).path.id).toBe("child-test");
+    });
+
+    test("external abort with a resolving transport still aborts the child", async () => {
+        const controller = new AbortController();
+        const abort = mock(async () => ({}));
+        const client = createClient(
+            mock(async () => ({})),
+            abort,
+        );
+        const transport = Object.assign(
+            ({ signal }: { signal?: AbortSignal }) =>
+                new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve())),
+            { childSessionId: "child-test" },
+        );
+        setTimeout(() => controller.abort(), 10);
+        await expect(
+            promptSyncWithModelSuggestionRetry(client, createArgs(), {
+                signal: controller.signal,
+                transport,
+            }),
+        ).rejects.toThrow("prompt aborted by external signal");
+        expect(abort).toHaveBeenCalledTimes(1);
+    });
+
     // External abort (e.g. dreamer lease loss) mid-flight must also stop the
     // server-side loop, not just our fetch.
     test("external abort fires session.abort on the child session", async () => {
@@ -237,10 +294,10 @@ describe("promptSyncWithModelSuggestionRetry", () => {
         const abort = mock(async () => ({}));
         const client = createClient(prompt as never, abort);
 
-        setTimeout(() => controller.abort(), 10);
+        setTimeout(() => controller.abort(new Error("lease_lost: taken by holder-b")), 10);
         await expect(
             promptSyncWithModelSuggestionRetry(client, createArgs(), { signal: controller.signal }),
-        ).rejects.toThrow(/aborted by external signal/);
+        ).rejects.toThrow("prompt aborted by external signal: lease_lost: taken by holder-b");
         expect(abort).toHaveBeenCalledTimes(1);
         expect((abort.mock.calls[0]?.[0] as { path: { id: string } }).path.id).toBe("ses-test");
     });
@@ -350,6 +407,71 @@ describe("promptSyncWithModelSuggestionRetry", () => {
 });
 
 describe("promptSyncWithValidatedOutputRetry", () => {
+    test("records a step cap as step_limit without a provider error", async () => {
+        const prompt = mock(async () => {
+            throw new HiddenAgentStepLimit("dreamer-retrospective", 40);
+        });
+        const client = createClient(prompt);
+        let caught: unknown;
+        try {
+            await promptSyncWithValidatedOutputRetry(client, createArgs(), {
+                fetchOutput: async () => "unused",
+                validateOutput: (output) => output,
+            });
+        } catch (error) {
+            caught = error;
+        }
+        expect(caught).toBeInstanceOf(HiddenAgentStepLimit);
+        expect(getPromptFailureDetail(caught)).toMatchObject({
+            failureClass: "step_limit",
+            providerError: null,
+        });
+        expect(prompt).toHaveBeenCalledTimes(1);
+    });
+
+    test("surfaces a host-recorded assistant refusal even when the row has no text", async () => {
+        const client = createClient(mock(async () => ({})));
+        const refusal =
+            "UnknownError: custody accounts exhausted: provider=synthetic accounts=main:cooldown";
+
+        await expect(
+            promptSyncWithValidatedOutputRetry(client, createArgs(), {
+                fetchOutput: async () => [
+                    {
+                        info: {
+                            role: "assistant",
+                            time: { created: 1 },
+                            finish: "stop",
+                            tokens: { output: 0 },
+                        },
+                        parts: [],
+                    },
+                    {
+                        info: { role: "assistant", time: { created: 2 }, error: refusal },
+                        parts: [],
+                    },
+                ],
+                validateOutput: () => {
+                    throw new Error("empty_completion");
+                },
+            }),
+        ).rejects.toMatchObject({
+            message: `Host recorded assistant error: ${refusal}`,
+            transient: true,
+        });
+    });
+
+    test("keeps a real empty completion without an assistant error on the normal validation path", async () => {
+        const client = createClient(mock(async () => ({})));
+        await expect(
+            promptSyncWithValidatedOutputRetry(client, createArgs(), {
+                fetchOutput: async () => [{ info: { role: "assistant" }, parts: [] }],
+                validateOutput: () => {
+                    throw new Error("empty_completion");
+                },
+            }),
+        ).rejects.toThrow("empty_completion");
+    });
     test("valid first model returns without trying fallbacks", async () => {
         const prompt = mock(async () => ({}));
         const messages = mock(async () => "primary-output");
@@ -431,7 +553,7 @@ describe("promptSyncWithValidatedOutputRetry", () => {
         });
     });
 
-    test("all empty outputs surface the original validation failure", async () => {
+    test("all empty outputs surface the last validation failure and every attempted model", async () => {
         const prompt = mock(async () => ({}));
         const messages = mock(async () => "");
         const client = createClient(prompt, undefined, messages);
@@ -447,9 +569,130 @@ describe("promptSyncWithValidatedOutputRetry", () => {
                     return output.trim();
                 },
             }),
-        ).rejects.toThrow("empty output from primary");
+        ).rejects.toThrow(
+            /All models exhausted \(primary, anthropic\/claude-sonnet-4-6\): empty output from anthropic\/claude-sonnet-4-6/,
+        );
 
         expect(prompt).toHaveBeenCalledTimes(2);
         expect(messages).toHaveBeenCalledTimes(2);
     });
+});
+
+/**
+ * Bun's fetch rejects with this exact object when its default request timer
+ * fires on a plugin SDK request (the name is "TimeoutError", legacy code 23).
+ * The dreamer ledger shows it as `TimeoutError message="The operation timed out." code=23`.
+ */
+function hostFetchTimeout(): Error {
+    return new DOMException("The operation timed out.", "TimeoutError") as unknown as Error;
+}
+
+describe("host fetch TimeoutError is a timeout", () => {
+    test("validated retry stops the chain, aborts the child, and reports provider_timeout", async () => {
+        const prompt = mock(async () => {
+            throw hostFetchTimeout();
+        });
+        const abort = mock(async () => ({}));
+        const client = createClient(prompt, abort);
+
+        let caught: unknown;
+        try {
+            await promptSyncWithValidatedOutputRetry(client, createArgs(), {
+                fallbackModels: ["anthropic/claude-sonnet-4-6", "google/gemini-3-flash"],
+                fetchOutput: async () => "unused",
+                validateOutput: (output: string) => output,
+            });
+        } catch (error) {
+            caught = error;
+        }
+
+        expect((caught as Error | undefined)?.name).toBe("TimeoutError");
+        // Another model would be sent into the same still-running child session and
+        // hit the same host timer, so the chain must stop at the first attempt.
+        expect(prompt).toHaveBeenCalledTimes(1);
+        expect(getPromptFailureDetail(caught)?.failureClass).toBe("provider_timeout");
+        // The host loop keeps running after the client-side timer fires unless the
+        // child is aborted explicitly.
+        expect(abort).toHaveBeenCalledTimes(1);
+        expect(abort.mock.calls[0]?.[0]).toEqual({ path: { id: "ses-test" } });
+    });
+
+    test("unvalidated retry stops the chain and aborts the child", async () => {
+        const prompt = mock(async () => {
+            throw hostFetchTimeout();
+        });
+        const abort = mock(async () => ({}));
+        const client = createClient(prompt, abort);
+
+        await expect(
+            promptSyncWithModelSuggestionRetry(client, createArgs(), {
+                fallbackModels: ["anthropic/claude-sonnet-4-6"],
+            }),
+        ).rejects.toThrow("The operation timed out.");
+
+        expect(prompt).toHaveBeenCalledTimes(1);
+        expect(abort).toHaveBeenCalledTimes(1);
+    });
+
+    test("an ordinary provider error still falls back and does not abort the child", async () => {
+        const prompt = mock(async () => {
+            if (prompt.mock.calls.length === 1) throw new Error("upstream 502");
+            return {};
+        });
+        const abort = mock(async () => ({}));
+        const client = createClient(prompt, abort);
+
+        await promptSyncWithModelSuggestionRetry(client, createArgs(), {
+            fallbackModels: ["anthropic/claude-sonnet-4-6"],
+        });
+
+        expect(prompt).toHaveBeenCalledTimes(2);
+        expect(abort).not.toHaveBeenCalled();
+    });
+});
+
+test("empty v1 and v2 replies report the provider finish reason", async () => {
+    for (const output of [
+        [{ info: { role: "assistant", finish: "stop" }, parts: [] }],
+        { text: null, tokenLog: { finish_reason: "stop" } },
+    ]) {
+        const client = createClient(mock(async () => ({})));
+        await expect(
+            promptSyncWithValidatedOutputRetry(client, createArgs(), {
+                fetchOutput: async () => output,
+                validateOutput: () => {
+                    throw new Error("map-memories returned no output");
+                },
+            }),
+        ).rejects.toThrow("no output (finish=stop");
+    }
+});
+
+test("DeepSeek unsupported-model 400 preserves provider status and message rather than no output", async () => {
+    const message =
+        "The supported API model names are deepseek-flash, deepseek-v4-pro, but you passed deepseek-v4-flash";
+    const client = createClient(mock(async () => ({})));
+    let caught: unknown;
+    try {
+        await promptSyncWithValidatedOutputRetry(client, createArgs(), {
+            fetchOutput: async () => [
+                {
+                    info: {
+                        role: "assistant",
+                        error: { name: "APIError", data: { statusCode: 400, message } },
+                    },
+                    parts: [],
+                },
+            ],
+            validateOutput: () => {
+                throw new Error("map-memories returned no output");
+            },
+        });
+    } catch (error) {
+        caught = error;
+    }
+    expect((caught as Error).message).toContain(message);
+    expect((caught as Error).message).toContain("status=400");
+    expect((caught as Error).message).not.toContain("no output");
+    expect(getPromptFailureDetail(caught)).toMatchObject({ failureClass: "provider_error" });
 });

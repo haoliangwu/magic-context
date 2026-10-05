@@ -1,4 +1,4 @@
-import { detectOpenCodeStoreGeneration } from "@magic-context/core/shared/opencode-db-path";
+import type { OpenCodeHostGeneration } from "@magic-context/core/shared/opencode-db-path";
 import type { Database } from "@magic-context/core/shared/sqlite";
 
 interface BoundaryRow {
@@ -15,15 +15,65 @@ export interface DanglingCompartmentBoundary {
     missingEndMessageId: string | null;
 }
 
+type BoundaryMessageTable = "message" | "session_message";
+
+interface BoundaryMessageTableSelection {
+    table: BoundaryMessageTable;
+    diagnostic: string | null;
+}
+
+function selectBoundaryMessageTable(
+    openCodeDb: Pick<Database, "prepare">,
+    hostGeneration?: OpenCodeHostGeneration,
+): BoundaryMessageTableSelection {
+    const rows = openCodeDb
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('message', 'part', 'session_message', 'session_v2')",
+        )
+        .all() as Array<{ name?: unknown }>;
+    const tables = new Set(rows.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])));
+    const hasV1Messages = tables.has("message") && tables.has("part");
+    const hasV2Messages = tables.has("session_message") && tables.has("session_v2");
+
+    if (hostGeneration === "v1") {
+        if (!hasV1Messages) {
+            throw new Error("OpenCode session database has no v1 message tables");
+        }
+        return { table: "message", diagnostic: null };
+    }
+
+    if (hostGeneration === "v2") {
+        if (hasV2Messages) return { table: "session_message", diagnostic: null };
+        if (hasV1Messages) {
+            return {
+                table: "message",
+                diagnostic:
+                    "Compartment boundary check: OpenCode 2 pre-migration window; using message table",
+            };
+        }
+        throw new Error("OpenCode session database has an unrecognized schema");
+    }
+
+    // When Desktop provides no host version, the same tables can mean migrated v2 or downgraded
+    // v1. Choosing populated v2 history fixes migrated Desktop stores but may read frozen v2
+    // history after a downgrade, so this branch is deliberately only a heuristic.
+    const hasV2Rows =
+        hasV2Messages && openCodeDb.prepare("SELECT 1 FROM session_message LIMIT 1").get() != null;
+    if (hasV2Rows) return { table: "session_message", diagnostic: null };
+    if (hasV1Messages) return { table: "message", diagnostic: null };
+    throw new Error("OpenCode session database has an unrecognized schema");
+}
+
 /** Read-only comparison of durable compartment ids with the active OpenCode store. */
 export function listDanglingCompartmentBoundaries(
     contextDb: Pick<Database, "prepare">,
     openCodeDb: Pick<Database, "prepare">,
+    hostGeneration?: OpenCodeHostGeneration,
+    onDiagnostic?: (line: string) => void,
 ): DanglingCompartmentBoundary[] {
-    const generation = detectOpenCodeStoreGeneration(openCodeDb);
-    if (generation === "unknown") {
-        throw new Error("OpenCode session database has an unrecognized schema");
-    }
+    const selection = selectBoundaryMessageTable(openCodeDb, hostGeneration);
+    if (selection.diagnostic) onDiagnostic?.(selection.diagnostic);
+
     const rows = contextDb
         .prepare(
             `SELECT c.session_id, c.sequence, c.start_message_id, c.end_message_id
@@ -34,9 +84,7 @@ export function listDanglingCompartmentBoundaries(
         )
         .all() as BoundaryRow[];
     const statement = openCodeDb.prepare(
-        generation === "v2"
-            ? "SELECT 1 AS found FROM session_message WHERE session_id = ? AND id = ? LIMIT 1"
-            : "SELECT 1 AS found FROM message WHERE session_id = ? AND id = ? LIMIT 1",
+        `SELECT 1 AS found FROM ${selection.table} WHERE session_id = ? AND id = ? LIMIT 1`,
     );
     const exists = (sessionId: string, messageId: string): boolean =>
         statement.get(sessionId, messageId) != null;

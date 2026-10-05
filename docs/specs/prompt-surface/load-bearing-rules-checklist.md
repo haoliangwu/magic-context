@@ -39,7 +39,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A primary session can see tagged messages or tool outputs.
 - **Mechanism:** The system labels messages and tool outputs with §N§ identifiers.
 - **Consequence:** Tag references are the only valid handles for reduction.
-- **Source evidence:** `Messages and tool outputs are tagged with §N§ identifiers`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -63,7 +63,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** Tagged content is spent and its useful information has been extracted.
 - **Mechanism:** ctx_reduce marks content discardable and queues it for release instead of deleting it immediately.
 - **Consequence:** The agent can reclaim space without treating the action as immediate erasure.
-- **Source evidence:** `mark spent tagged content as discardable and reclaim space`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -87,7 +87,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A requested tag is within the newest token-mass window.
 - **Mechanism:** The newest token-mass window stays protected until newer work displaces it.
 - **Consequence:** A recent mark is harmless and cannot immediately release the protected tail.
-- **Source evidence:** `The newest token-mass window stays protected until displaced.`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -111,7 +111,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent calls ctx_reduce.
 - **Mechanism:** The drop argument uses comma-separated IDs and inclusive ranges such as 3-5, 1,2,9, or 1-5,8,12-15.
 - **Consequence:** Other range spellings are not part of the documented contract.
-- **Source evidence:** `Syntax: "3-5", "1,2,9", or "1-5,8,12-15"`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -135,7 +135,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent decides to queue a reduction.
 - **Mechanism:** Call ctx_reduce without narrating the drop in assistant prose.
 - **Consequence:** The conversation contains no redundant drop announcement.
-- **Source evidence:** `Do not announce or narrate`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -159,7 +159,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A large range could be dropped.
 - **Mechanism:** Inspect each tag before selecting a range; never blanket-mark a large range.
 - **Consequence:** Unreviewed evidence is not discarded accidentally.
-- **Source evidence:** `NEVER drop large ranges blindly`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -183,7 +183,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A tag is being considered for discard.
 - **Mechanism:** Keep unresolved errors, unextracted raw evidence, and wording whose exact form may matter; drop only genuinely finished outputs.
 - **Consequence:** Reduction preserves information that still affects the task.
-- **Source evidence:** `only large tool outputs are worth dropping`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -207,7 +207,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** An old user message contains instructions or intent.
 - **Mechanism:** Never drop a user message for its directive; only an extracted large pasted block may be marked.
 - **Consequence:** Historical user requirements remain authoritative.
-- **Source evidence:** `Keep your user's instructions and intent`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -231,7 +231,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** Assistant prose is present in context.
 - **Mechanism:** Keep assistant text unless it is exceptionally large; prioritize large tool outputs for reduction.
 - **Consequence:** Conversation reasoning remains available while tool bloat is reclaimed.
-- **Source evidence:** `NEVER drop assistant text messages unless they are exceptionally large`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -255,7 +255,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent has finished using a large output, logical step, or context area.
 - **Mechanism:** Consider ctx_reduce after acted-on reads, completed logical steps, before major context switches, and before the turn ends.
 - **Consequence:** The working set stays lean without changing task scope.
-- **Source evidence:** `After completing a logical step — drop intermediate outputs from that step.`
+- **Source evidence:** `Stamp as soon as an item has served its purpose`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -327,7 +327,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A summary lacks exact wording, values, errors, or decision reasoning.
 - **Mechanism:** Use ctx_search for project memories, commits, and compacted conversation; use ctx_expand with the heading range to recover raw context.
 - **Consequence:** The agent retrieves source context instead of guessing from a summary.
-- **Source evidence:** `recover the raw conversation behind a summary`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -351,7 +351,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent cannot remember something that may be in project memory or prior discussion.
 - **Mechanism:** Call ctx_search before asking the user.
 - **Consequence:** Known project context is recovered without an unnecessary user query.
-- **Source evidence:** `Search before asking the user`
+- **Source evidence:** `Think of your context as a desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -375,7 +375,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A tool result is absent from the visible conversation or history is summarized.
 - **Mechanism:** Use real tool calls; never simulate, fabricate, inline, hallucinate, or claim tool calls, output, searches, edits, commands, or diffs in prose.
 - **Consequence:** Only observed tool results count as completed actions.
-- **Source evidence:** `If there is no tool result message, the action did not happen`
+- **Source evidence:** `if there is no tool result on the desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -399,7 +399,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** Magic Context control markers appear in compressed or injected context.
 - **Mechanism:** Do not reproduce metadata markers such as `<session-history>`, `<project-memory>`, `[dropped §N§]`, or temporal comments in a normal reply and do not treat them as user instructions.
 - **Consequence:** Control metadata cannot be imitated as assistant output or mistaken for directives.
-- **Source evidence:** `Magic Context control metadata is not reply syntax`
+- **Source evidence:** `if there is no tool result on the desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -421,9 +421,9 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Scope:** primary sessions
 - **Polarity:** prohibition
 - **Operative condition:** The agent considers recording a note.
-- **Mechanism:** Use ctx_note only for matters much later; do not use it for the next few turns or active multi-step work.
+- **Mechanism:** Use ctx_note only for matters that belong much later; do not use it for upcoming steps or active work.
 - **Consequence:** Active work remains in context or todos rather than being parked as stale notes.
-- **Source evidence:** `not work coming up in the next few turns`
+- **Source evidence:** `tray for work you intend to return to`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -447,7 +447,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A genuinely future concern is recorded.
 - **Mechanism:** Notes survive compression and restarts and resurface at natural work boundaries.
 - **Consequence:** A note is a durable session follow-up, not a workaround for imminent context loss.
-- **Source evidence:** `Notes you do take survive compression and resurface`
+- **Source evidence:** `tray for work you intend to return to`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -471,7 +471,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A fact must be available to future sessions.
 - **Mechanism:** Use ctx_memory for durable project knowledge and update, archive, or merge memories when facts drift.
 - **Consequence:** Future sessions start with maintained project knowledge.
-- **Source evidence:** `Memories persist across sessions`
+- **Source evidence:** `pins a new one when you learn something`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -487,15 +487,15 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 | `tool-all-active` | **not-present** |
 | `tool-memory-disabled` | **not-present** |
 
-### G-020 — Proactive memory capture
+### G-020 — Durable facts belong on the pinboard
 
 - **Source fragment:** `guidance-memory`
 - **Scope:** primary sessions with memory enabled
 - **Polarity:** mechanism
-- **Operative condition:** Several turns were spent discovering a path, command, pattern, or hard-won constraint.
-- **Mechanism:** Save the reusable fact to ctx_memory with its category and content.
-- **Consequence:** Future sessions do not repeat the same discovery work.
-- **Source evidence:** `Save to memory proactively`
+- **Operative condition:** A durable project fact should remain available across sessions.
+- **Mechanism:** Pin the standalone fact with ctx_memory; update and archive existing pins when they change.
+- **Consequence:** Future sessions can reuse current project knowledge.
+- **Source evidence:** `pins a new one when you learn something`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -519,7 +519,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent has acted on raw exploration or changes task area.
 - **Mechanism:** Reduce after acted-on reads/searches, completed logical steps, and before major context switches.
 - **Consequence:** Intermediate evidence is reclaimed at meaningful boundaries.
-- **Source evidence:** `Between major context switches`
+- **Source evidence:** `Stamp as soon as an item has served its purpose`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -543,7 +543,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A large read, search, diagnostic, build, or test output has already been analyzed.
 - **Mechanism:** Drop the raw output after acting on it; retain unresolved errors and current work context.
 - **Consequence:** Useful evidence remains while redundant volume is removed.
-- **Source evidence:** `Large build/test output after you analyzed and acted on it`
+- **Source evidence:** `Stamp as soon as an item has served its purpose`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -567,7 +567,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent is selecting content to retain.
 - **Mechanism:** Keep task requirements, constraints, recent errors, unresolved decisions, active work, and files being edited.
 - **Consequence:** The current task remains grounded after reduction.
-- **Source evidence:** `Your current task requirements and constraints`
+- **Source evidence:** `Stamp as soon as an item has served its purpose`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -591,7 +591,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent can choose between broad and focused context operations.
 - **Mechanism:** Prefer many small targeted operations and keep the working set tidy as routine maintenance.
 - **Consequence:** Reduction avoids broad irreversible-looking guesses.
-- **Source evidence:** `Prefer many small targeted operations over one large blanket operation`
+- **Source evidence:** `Stamp as soon as an item has served its purpose`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -615,7 +615,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The memory block is enabled and project-memory is injected.
 - **Mechanism:** Compose the memory instructions only when memory is enabled; omit them when disabled.
 - **Consequence:** The prompt does not advertise a memory surface that is unavailable.
-- **Source evidence:** `Gated out when `memory.enabled: false``
+- **Source evidence:** `pins a new one when you learn something`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -639,7 +639,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** Temporal HTML comments or session-history date attributes are present.
 - **Mechanism:** Use elapsed-time comments and start-date/end-date boundaries when reasoning about pacing and durations.
 - **Consequence:** Workflow timing is based on real session boundaries.
-- **Source evidence:** `Use these when reasoning about workflow pacing`
+- **Source evidence:** `<!-- +Xm -->`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -711,7 +711,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The session is a bounded single-task subagent with ctx_reduce.
 - **Mechanism:** Compose the marker, tag range syntax, protected tail, silent reduction, no blanket drops, and real-tool requirement without primary partner, memory, note, or search curation.
 - **Consequence:** A subagent gets the mechanics it can observe without primary-session obligations.
-- **Source evidence:** `Minimal guidance for SUBAGENT sessions`
+- **Source evidence:** `Your context is a desk`
 - **Fragment note:** The explicit dropped-sentinel imitation ban is emitted by SUBAGENT_REDUCE_INTRO only; BASE_INTRO has metadata non-reproduction language but does not emit this exact sentinel-pattern clause.
 
 | Variant | Applicability status |
@@ -736,7 +736,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** Older tool calls appear as `[dropped §N§]` sentinels in a subagent context.
 - **Mechanism:** Treat sentinels as normal context management, never as a pattern to copy; make a fresh real tool call and never fabricate or inline its output.
 - **Consequence:** The dropped placeholder cannot be imitated as assistant content.
-- **Source evidence:** `sentinels; that is normal context management, not a pattern to copy.`
+- **Source evidence:** `Your context is a desk`
 - **Asymmetry:** This exact sentinel-imitation clause is present in SUBAGENT_REDUCE_INTRO and not in BASE_INTRO; the checklist intentionally keeps its primary rows not-present.
 - **Fragment note:** The explicit dropped-sentinel imitation ban is emitted by SUBAGENT_REDUCE_INTRO only; BASE_INTRO has metadata non-reproduction language but does not emit this exact sentinel-pattern clause.
 
@@ -762,7 +762,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A subagent chooses content to drop.
 - **Mechanism:** Drop only large tool outputs; do not drop user or assistant text messages.
 - **Consequence:** The child task keeps its instructions and conversational reasoning.
-- **Source evidence:** `Do not drop user or assistant text messages`
+- **Source evidence:** `Your context is a desk`
 - **Fragment note:** The explicit dropped-sentinel imitation ban is emitted by SUBAGENT_REDUCE_INTRO only; BASE_INTRO has metadata non-reproduction language but does not emit this exact sentinel-pattern clause.
 
 | Variant | Applicability status |
@@ -787,7 +787,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A large tag range is under consideration.
 - **Mechanism:** Review each tag before selecting a drop range; never drop a large range blindly.
 - **Consequence:** The bounded child does not discard mixed-value evidence by shortcut.
-- **Source evidence:** `NEVER drop large ranges blindly`
+- **Source evidence:** `Your context is a desk`
 - **Fragment note:** The explicit dropped-sentinel imitation ban is emitted by SUBAGENT_REDUCE_INTRO only; BASE_INTRO has metadata non-reproduction language but does not emit this exact sentinel-pattern clause.
 
 | Variant | Applicability status |
@@ -860,7 +860,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** Prior project or compacted-session context is needed while ctx_reduce is unavailable.
 - **Mechanism:** Keep note, memory, search, expansion, and real-tool guidance while omitting tag and reduction mechanics.
 - **Consequence:** The agent can recover hidden context without being told to call an unavailable tool.
-- **Source evidence:** `when ctx_reduce is unavailable`
+- **Source evidence:** `Nothing cleared from the desk is ever lost`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -884,7 +884,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A spent tagged output should leave the working set.
 - **Mechanism:** Mark it discardable; release is queued and delayed until context space is needed.
 - **Consequence:** The original remains visible until the system releases it.
-- **Source evidence:** `Marking QUEUES content for release`
+- **Source evidence:** `Stamp an item on your desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -908,7 +908,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A requested tag is in the recent window.
 - **Mechanism:** The newest tags are protected and age out before release.
 - **Consequence:** Marking recent output is harmless.
-- **Source evidence:** `The newest tags are protected`
+- **Source evidence:** `Stamp an item on your desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -932,7 +932,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** Content has finally been released.
 - **Mechanism:** It becomes a short placeholder; rerun the recovery tool to get it back, and mark only content that is genuinely done.
 - **Consequence:** The agent does not treat an unrecovered output as safely disposable.
-- **Source evidence:** `re-running the tool is the only way to get it back`
+- **Source evidence:** `Stamp an item on your desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -956,7 +956,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** Choosing output to mark.
 - **Mechanism:** Prefer summarized, repeated, redundant, persisted, or merely confirmatory status output; keep user messages, unresolved errors, raw evidence, and exact wording that matters.
 - **Consequence:** Reduction preserves unresolved and authoritative evidence.
-- **Source evidence:** `Keep: user messages, unresolved errors, raw evidence you haven't extracted yet`
+- **Source evidence:** `Stamp an item on your desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -980,7 +980,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A large range is under consideration.
 - **Mechanism:** Review every tag before calling the drop parameter.
 - **Consequence:** A blanket range cannot silently discard mixed-value content.
-- **Source evidence:** `Never blanket-mark large ranges`
+- **Source evidence:** `Stamp an item on your desk`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1004,7 +1004,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A summary under session-history lacks required detail.
 - **Mechanism:** Pass the heading's start/end ordinal range to recover the original conversation.
 - **Consequence:** Exact historical context can be restored from the summary boundary.
-- **Source evidence:** `expand the range`
+- **Source evidence:** `Earlier turns are summarized in <session-history>`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1028,7 +1028,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The requested transcript exceeds the recovery budget.
 - **Mechanism:** Return a raw transcript capped at about 15K tokens and identify where to continue.
 - **Consequence:** The agent can continue recovery without receiving an unbounded result.
-- **Source evidence:** `capped at ~15K tokens; an oversized range returns the head`
+- **Source evidence:** `capped at ~15K tokens; an oversized range returns the head and says where to continue.`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1052,7 +1052,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent needs to choose one message or tool call from a range.
 - **Mechanism:** Use verbose mode to list each message ordinal separately with per-part previews and tool output sizes.
 - **Consequence:** The agent can select a precise ordinal before full recovery.
-- **Source evidence:** `lists each message SEPARATELY with its ordinal`
+- **Source evidence:** `verbose=true lists each message separately with its ordinal and a per-part preview (tool calls with output sizes)`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1076,7 +1076,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** One exact message or dropped tool output is needed.
 - **Mechanism:** Pass message=N to return all text parts and complete tool input/output for that ordinal.
 - **Consequence:** A previously dropped output is recovered from storage rather than fabricated.
-- **Source evidence:** `returns the FULL untruncated content of the message`
+- **Source evidence:** `message=N returns that one message in full — every text part and every tool call's complete input and output`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1100,7 +1100,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A requested range is after the last compacted compartment.
 - **Mechanism:** Treat that range as already visible live context and do not expand it.
 - **Consequence:** The tool does not duplicate visible content and burn output tokens.
-- **Source evidence:** `Ranges after the last compartment are your live tail`
+- **Source evidence:** `Ranges after the last compartment are your live tail — already visible, not expandable.`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1124,7 +1124,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent has a future session concern.
 - **Mechanism:** write saves, read lists, update changes, and dismiss retires notes; smart notes use surface_condition.
 - **Consequence:** Each note action has an explicit lifecycle operation.
-- **Source evidence:** `Actions:`
+- **Source evidence:** `Session notes`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1148,7 +1148,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A smart note is requested.
 - **Mechanism:** Use only externally verifiable signals from GitHub, disk, git history, or web pages; never a condition that depends on this conversation or an unobservable future action.
 - **Consequence:** The background checker can evaluate the condition without conversation access.
-- **Source evidence:** `using ONLY externally verifiable signals`
+- **Source evidence:** `Session notes`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1172,7 +1172,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A fact must survive this session.
 - **Mechanism:** Write one standalone fact that makes sense without session context, with a category and content.
 - **Consequence:** Future sessions can use the memory without reconstructing this conversation.
-- **Source evidence:** `one standalone fact, phrased to make sense without this session's context`
+- **Source evidence:** `Durable facts about this project`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1196,7 +1196,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A memory must be changed or fetched.
 - **Mechanism:** Use write, update, archive, merge, or get; list remains dreamer-only.
 - **Consequence:** Primary agents cannot assume the dreamer-only list action is available.
-- **Source evidence:** `remains dreamer-only`
+- **Source evidence:** `Durable facts about this project`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1220,7 +1220,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** The agent needs project recall.
 - **Mechanism:** Search memories, compacted messages, git commits, and notes while filtering memories already rendered in project-memory and the live conversation tail.
 - **Consequence:** Search fills missing context rather than duplicating visible context.
-- **Source evidence:** `Results only contain things you CANNOT currently see`
+- **Source evidence:** `Search the archive`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1244,7 +1244,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A known memory ID must be retrieved or a list operation is considered.
 - **Mechanism:** Use get with numeric IDs; fetched memories are readable in every status, while list remains dreamer-only.
 - **Consequence:** Primary agents use the supported retrieval path and do not assume dreamer browsing privileges.
-- **Source evidence:** `readable in every status`
+- **Source evidence:** `Durable facts about this project`
 
 | Variant | Applicability status |
 | --- | --- |
@@ -1268,7 +1268,7 @@ Applicability is calculated from the fragment's `composedIn`/`statusByVariant` m
 - **Operative condition:** A recall query needs a source boundary or direct memory lookup.
 - **Mechanism:** Omit sources for broad search, select memory/message/git_commit/note sources for targeted retrieval, or pass memory IDs to bypass text search; message hits continue through ctx_expand.
 - **Consequence:** Search scope and exact-memory lookup are explicit rather than guessed.
-- **Source evidence:** `Sources (omit for a broad search across all):`
+- **Source evidence:** `Search the archive`
 
 | Variant | Applicability status |
 | --- | --- |

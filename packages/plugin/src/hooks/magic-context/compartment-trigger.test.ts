@@ -1,20 +1,24 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-
 import {
     closeDatabase,
+    getPendingOps,
+    getTagsBySession,
     insertTag,
     markProtectedTailPolicyV3Seeded,
     openDatabase,
     queuePendingOp,
 } from "../../features/magic-context/storage";
 import type { SessionMeta } from "../../features/magic-context/types";
+import * as logger from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { applyPendingOperations } from "./apply-operations";
 import {
     checkCompartmentTrigger,
     formatProjectedPostDropPercentage,
@@ -57,7 +61,7 @@ afterEach(() => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -268,6 +272,40 @@ describe("checkCompartmentTrigger", () => {
         expect(second.partReads()).toBe(0);
     });
 
+    it("treats a message as tag-covered when its text tags carry content-derived ids", () => {
+        // Pi re-keys a drifted message's text tags by content instead of by part
+        // position; the cheap gate must still see that message as covered.
+        useTempDataHome("compartment-trigger-memory-text-tag-ids-");
+        const db = openDatabase();
+        const sessionId = "ses-memory-text-tag-ids";
+        seedTriggerPolicy(db, sessionId);
+        const first = observedRawTextMessage(1, "m-text-1", "user", "small tail");
+        const second = observedRawTextMessage(2, "m-text-2", "assistant", "small response");
+        const digests = `${"a".repeat(64)}:${"b".repeat(64)}`;
+        insertCoveredMessageTag(db, sessionId, `m-text-1:mc-text-v1:${digests}:o0`, 1, 100);
+        insertCoveredMessageTag(db, sessionId, `m-text-2:mc-text-v1:${digests}:o0`, 2, 50);
+
+        const result = checkCompartmentTrigger(
+            db,
+            sessionId,
+            makeSessionMeta(sessionId, 25),
+            { percentage: 25, inputTokens: 50_000 },
+            25,
+            65,
+            1_000,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            inMemoryTail([first.message, second.message], 50_000),
+        );
+
+        expect(result).toEqual({ shouldFire: false });
+        // A covered message is never re-estimated from its parts.
+        expect(first.partReads()).toBe(0);
+        expect(second.partReads()).toBe(0);
+    });
+
     it("falls through when a large untagged in-memory message pushes the upper bound over budget", () => {
         useTempDataHome("compartment-trigger-memory-large-untagged-");
         const db = openDatabase();
@@ -466,30 +504,75 @@ describe("checkCompartmentTrigger", () => {
         expect(result).toMatchObject({ shouldFire: true, reason: "projected_headroom" });
     });
 
-    it("does not fire proactively when pending drops already project usage below the post-drop target", () => {
+    it("fires on the first eligible pass without a ride, then drops ride its publication", () => {
         useTempDataHome("compartment-trigger-projected-");
         createOpenCodeDb("ses-projected", [
-            { id: "m-1", role: "user", text: "setup" },
+            { id: "m-1", role: "user", text: "a ".repeat(3500) },
             { id: "m-2", role: "assistant", text: "done" },
-            { id: "m-3", role: "user", text: "a ".repeat(5000) },
-            { id: "m-4", role: "assistant", text: "b ".repeat(5000) },
+            { id: "m-3", role: "user", text: "b ".repeat(3500) },
+            { id: "m-4", role: "assistant", text: "done" },
+            { id: "m-5", role: "user", text: "c ".repeat(3500) },
+            { id: "m-6", role: "assistant", text: "done" },
+            ...Array.from({ length: 5 }, (_, i) => ({
+                id: `m-${i + 7}`,
+                role: "user",
+                text: `protected ${i}`,
+            })),
         ]);
         const db = openDatabase();
         insertTag(db, "ses-projected", "m-1", "message", 800, 1);
         insertTag(db, "ses-projected", "m-2", "message", 200, 2);
         queuePendingOp(db, "ses-projected", 1, "drop", 1);
 
-        const result = checkCompartmentTrigger(
-            db,
-            "ses-projected",
-            makeSessionMeta("ses-projected", 62),
-            { percentage: 63, inputTokens: 126_000 },
-            62,
-            65,
-            6500,
-        );
-
-        expect(result).toEqual({ shouldFire: false });
+        const evaluate = (ride: "none" | "publishedHistory" | "explicitFlush") =>
+            checkCompartmentTrigger(
+                db,
+                "ses-projected",
+                makeSessionMeta("ses-projected", 60),
+                { percentage: 61, inputTokens: 122_000 },
+                60,
+                63,
+                6500,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                {
+                    hardFold: false,
+                    force: false,
+                    explicitFlush: ride === "explicitFlush",
+                    publishedHistory: ride === "publishedHistory",
+                },
+            );
+        const log = spyOn(logger, "sessionLog").mockImplementation(() => {});
+        try {
+            // The first evaluation requests a history publication without applying queued drops.
+            expect(evaluate("none")).toMatchObject({
+                shouldFire: true,
+                reason: "projected_headroom",
+            });
+            expect(getPendingOps(db, "ses-projected")).toHaveLength(1);
+            // Published history permits the pending drop to apply on the publication pass.
+            expect(evaluate("explicitFlush")).toEqual({ shouldFire: false });
+            expect(evaluate("publishedHistory")).toEqual({ shouldFire: false });
+            applyPendingOperations("ses-projected", db, new Map(), new Set());
+            expect(getPendingOps(db, "ses-projected")).toHaveLength(0);
+            expect(
+                getTagsBySession(db, "ses-projected").find((tag) => tag.tagNumber === 1)?.status,
+            ).toBe("dropped");
+            expect(
+                log.mock.calls.some(
+                    ([, message]) =>
+                        String(message).includes("historian redundancy skip") &&
+                        String(message).includes("ride=publishedHistory"),
+                ),
+            ).toBe(true);
+        } finally {
+            log.mockRestore();
+        }
     });
 
     it("projects aged reasoning only when the provider can clear it from the wire", () => {
@@ -536,6 +619,7 @@ describe("checkCompartmentTrigger", () => {
                 undefined,
                 undefined,
                 reasoningProjection,
+                { hardFold: false, force: false, explicitFlush: true, publishedHistory: false },
             );
 
         // Mutation direction: removing the provider gate would count the 700
@@ -566,6 +650,7 @@ describe("checkCompartmentTrigger", () => {
         insertTag(db, "ses-force-skip", "m-2", "message", 200, 2);
         queuePendingOp(db, "ses-force-skip", 1, "drop", 1);
 
+        const log = spyOn(logger, "sessionLog").mockImplementation(() => {});
         const result = checkCompartmentTrigger(
             db,
             "ses-force-skip",
@@ -574,9 +659,25 @@ describe("checkCompartmentTrigger", () => {
             79,
             65,
             6500,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            { hardFold: false, force: true, explicitFlush: false, publishedHistory: false },
         );
 
         expect(result).toEqual({ shouldFire: false });
+        expect(
+            log.mock.calls.some(
+                ([, message]) =>
+                    String(message).includes("historian redundancy skip") &&
+                    String(message).includes("ride=force"),
+            ),
+        ).toBe(true);
+        log.mockRestore();
     });
 
     it("keeps raised-threshold usage below the force band on the proactive ladder", () => {

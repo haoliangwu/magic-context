@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 /**
  * Regression suite for `createSystemPromptHashHandler`'s drain semantics.
@@ -17,7 +18,7 @@
 
 import { afterEach, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAnthropic } from "@ai-sdk/anthropic";
@@ -33,7 +34,6 @@ import {
     REVIEW_USER_MEMORIES_SYSTEM_PROMPT,
 } from "../../features/magic-context/dreamer/task-prompts";
 import { VERIFY_SYSTEM_PROMPT } from "../../features/magic-context/dreamer/verify-prompt";
-import { MIGRATION_SYSTEM_PROMPT } from "../../features/magic-context/memory/memory-migration";
 import { SMART_NOTE_COMPILER_SYSTEM_PROMPT } from "../../features/magic-context/smart-notes/compiler-prompt";
 import {
     closeDatabase,
@@ -59,7 +59,7 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -143,6 +143,74 @@ function buildHandler(opts?: {
 }
 
 describe("system-prompt-hash drain semantics (Oracle review 2026-04-26 Finding A1)", () => {
+    it("a cold handler adopts a midnight date change on the idle-expired request", async () => {
+        useTempDataHome("sph-cold-midnight-");
+        const sessionId = "ses-cold-midnight";
+        resolveCtxReduceAvailabilityFromMessages(sessionId, [
+            { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+        ] as never);
+        const first = buildHandler();
+        await first.handler(
+            { sessionID: sessionId },
+            { system: ["Base\nToday's date: Fri Oct 02 2026"] },
+        );
+        const oldHash = getOrCreateSessionMeta(openDatabase(), sessionId).systemPromptHash;
+        updateSessionMeta(openDatabase(), sessionId, {
+            cacheTtl: "1h",
+            lastResponseTime: Date.now() - 16.5 * 3_600_000,
+        });
+        // Desktop can dispose and recreate a plugin instance without restarting
+        // the host. The hash survives that lifecycle; the sticky-date map does not.
+        first.clearSession(sessionId);
+        const pendingMaterializationSessions = new Set<string>();
+        const cold = buildHandler({ pendingMaterializationSessions });
+        const output = { system: ["Base\nToday's date: Sat Oct 03 2026"] };
+        await cold.handler({ sessionID: sessionId }, output);
+        const meta = getOrCreateSessionMeta(openDatabase(), sessionId);
+        expect(output.system.join("\n")).toContain("Today's date: Sat Oct 03 2026");
+        expect(meta.systemPromptHash).not.toBe(oldHash);
+        expect(meta.cachedM0SystemHash).toBe(meta.systemPromptHash);
+        expect(pendingMaterializationSessions.has(sessionId)).toBe(false);
+        clearCtxReduceAvailability(sessionId);
+    });
+    for (const expired of [true, false]) {
+        it(`${expired ? "adopts" : "flushes"} a late system change on an ${expired ? "expired" : "warm"} request`, async () => {
+            useTempDataHome("sph-idle-adopt-");
+            const sessionId = `ses-idle-adopt-${expired}`;
+            resolveCtxReduceAvailabilityFromMessages(sessionId, [
+                { info: { id: "u", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+            ] as never);
+            const historyRefreshSessions = new Set<string>();
+            const systemPromptRefreshSessions = new Set<string>();
+            const pendingMaterializationSessions = new Set<string>();
+            const { handler } = buildHandler({
+                historyRefreshSessions,
+                systemPromptRefreshSessions,
+                pendingMaterializationSessions,
+            });
+            const db = openDatabase();
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, {
+                systemPromptHash: "old-system-hash",
+                cachedM0SystemHash: "old-system-hash",
+                cacheTtl: "1h",
+                lastResponseTime: Date.now() - (expired ? 16.5 * 3_600_000 : 1_000),
+            });
+            await handler(
+                { sessionID: sessionId },
+                { system: ["New stable system content\nToday's date: Sat Oct 03 2026"] },
+            );
+            const meta = getOrCreateSessionMeta(db, sessionId);
+            expect(meta.systemPromptHash).not.toBe("old-system-hash");
+            expect(meta.cachedM0SystemHash).toBe(
+                expired ? meta.systemPromptHash : "old-system-hash",
+            );
+            expect(historyRefreshSessions.has(sessionId)).toBe(!expired);
+            expect(systemPromptRefreshSessions.has(sessionId)).toBe(!expired);
+            expect(pendingMaterializationSessions.has(sessionId)).toBe(!expired);
+            clearCtxReduceAvailability(sessionId);
+        });
+    }
     it("drains pre-existing systemPromptRefresh flag set by /ctx-flush", async () => {
         useTempDataHome("sph-drain-existing-");
         const sessionId = "ses-existing-flag";
@@ -314,7 +382,7 @@ describe("system-prompt-hash fail-open (per-turn handler must never throw)", () 
 describe("system-prompt-hash v2 system prompt contents", () => {
     it("keeps project docs, user profile, and key files out of the system prompt", async () => {
         useTempDataHome("sph-v2-adjuncts-out-");
-        const directory = mkdtempSync(join(tmpdir(), "sph-docs-project-"));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "sph-docs-project-"));
         tempDirs.push(directory);
         writeFileSync(join(directory, "ARCHITECTURE.md"), "Alpha <closing-tag> & beta", "utf-8");
         const sessionId = "ses-v2-adjuncts-out";
@@ -557,6 +625,30 @@ describe("system-prompt-hash skips OpenCode internal hidden agents (issue #52)",
         expect(system[0]).toBe(COMPACTION_PROMPT_HEAD);
     });
 
+    it("skips injection and keeps the stored hash for OpenCode 1.18's compaction prompt", async () => {
+        // OpenCode 1.18 rewrote compaction.txt. Without this signature the
+        // compaction request's prompt became the session's stored hash, and the
+        // next real turn folded again when its own prompt flipped the hash back.
+        useTempDataHome("sph-skip-compaction-118-");
+        const sessionId = "ses-compaction-118";
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, sessionId);
+        updateSessionMeta(db, sessionId, { systemPromptHash: "main-agent-hash-abc123" });
+        const historyRefreshSessions = new Set<string>();
+        const { handler } = buildHandler({ historyRefreshSessions });
+
+        const prompt =
+            "You are a context summarization agent. You are given a conversation between a user and an agent. Your goal is to produce a structured summary.";
+        const system = [prompt];
+        await handler({ sessionID: sessionId }, { system });
+
+        expect(system).toEqual([prompt]);
+        expect(getOrCreateSessionMeta(db, sessionId).systemPromptHash).toBe(
+            "main-agent-hash-abc123",
+        );
+        expect(historyRefreshSessions.has(sessionId)).toBe(false);
+    });
+
     it("does NOT update systemPromptHash for internal-agent calls", async () => {
         // Title-gen runs once on the first user turn with a totally
         // different system prompt than the main agent. If we updated the
@@ -661,7 +753,6 @@ describe("system-prompt-hash skips Magic Context internal child agents", () => {
             ["historian", COMPARTMENT_AGENT_SYSTEM_PROMPT],
             ["historian-recomp", COMPARTMENT_STRUCTURAL_SYSTEM_PROMPT],
             ["historian-editor", HISTORIAN_EDITOR_SYSTEM_PROMPT],
-            ["memory-migration", MIGRATION_SYSTEM_PROMPT],
         ] as const;
 
         for (const [label, prompt] of prompts) {
@@ -718,7 +809,7 @@ describe("system-prompt-hash subagent self-management (Unit B)", () => {
         const joined = system.join("\n");
         // Minimal block: marker + §N§ + ctx_reduce mechanics …
         expect(joined).toContain("## Magic Context");
-        expect(joined).toContain("§N§ identifiers");
+        expect(joined).toContain("§N§ tag");
         expect(joined).toContain("ctx_reduce");
         // … but NONE of the primary's role/guidance.
         expect(joined).not.toContain("long-term partner");
@@ -934,7 +1025,7 @@ describe("provisional ctx_reduce availability (pre-first-user race)", () => {
         // provisional fail-open true; persisting a hash computed from the
         // reduce-enabled guidance variant would flip (hash change → flush →
         // HARD fold) as soon as the real first user message denies the tool.
-        const dir = mkdtempSync(join(tmpdir(), "sph-provisional-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "sph-provisional-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
         const { mkdirSync } = require("node:fs");
@@ -964,7 +1055,7 @@ describe("provisional ctx_reduce availability (pre-first-user race)", () => {
     });
 
     it("persists the hash from the frozen deny-verdict variant once the first user row exists", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "sph-frozen-deny-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "sph-frozen-deny-"));
         tempDirs.push(dir);
         process.env.XDG_DATA_HOME = dir;
 

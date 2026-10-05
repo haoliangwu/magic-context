@@ -6,10 +6,35 @@ export interface RawMessageParts {
     parts: unknown[];
     createdAt?: number | null;
     version?: string | number | null;
+    /** Native store row type when the host exposes one; intentionally absent on v1. */
+    storeType?: string;
 }
 
 export interface RawMessage extends RawMessageParts {
     ordinal: number;
+}
+
+/** Strictly classify rows that carry no user/assistant narrative and may fill a range gap. */
+export function isStrictGapHealingMessage(message: RawMessage): boolean {
+    if (message.storeType === "synthetic") return true;
+    let sawTool = false;
+    for (const part of message.parts) {
+        if (!part || typeof part !== "object" || Array.isArray(part)) return false;
+        const record = part as Record<string, unknown>;
+        const type = typeof record.type === "string" ? record.type : "";
+        if (type === "tool" || type === "tool_use" || type === "tool_result") {
+            sawTool = true;
+            continue;
+        }
+        const text =
+            typeof record.text === "string"
+                ? record.text
+                : typeof record.content === "string"
+                  ? record.content
+                  : "";
+        if (text.trim().length > 0 || type.length > 0) return false;
+    }
+    return sawTool;
 }
 
 export interface RawMessageOrdinalAnchor {
@@ -172,36 +197,16 @@ export function readRawSessionMessagePageFromDb(
     afterOrdinal: number,
     limit: number,
     finalWatermark = Number.MAX_SAFE_INTEGER,
+    after?: RawMessageOrdinalAnchor,
 ): RawMessage[] {
-    const remaining = Math.max(0, Math.floor(finalWatermark) - Math.floor(afterOrdinal));
-    const pageSize = Math.min(Math.max(1, Math.floor(limit)), remaining);
-    if (pageSize === 0) return [];
-
-    const messageRows = db
-        .prepare(
-            `SELECT id, data, time_created, time_updated
-             FROM message
-             WHERE session_id = ?
-               AND NOT (
-                   CASE WHEN json_valid(data) = 1
-                        THEN COALESCE(json_extract(data, '$.summary'), 0)
-                        ELSE 0 END = 1
-                   AND CASE WHEN json_valid(data) = 1
-                            THEN COALESCE(json_extract(data, '$.finish'), '')
-                            ELSE '' END = 'stop'
-               )
-             ORDER BY time_created ASC, id ASC
-             LIMIT ? OFFSET ?`,
-        )
-        .all(sessionId, pageSize, Math.max(0, Math.floor(afterOrdinal)))
-        .filter(isRawMessageRow)
-        .map(
-            (row, index): PagedRawMessageRow => ({
-                ...row,
-                ordinal: Math.floor(afterOrdinal) + index + 1,
-            }),
-        );
-
+    const messageRows = readRawMessagePageRows(
+        db,
+        sessionId,
+        afterOrdinal,
+        limit,
+        finalWatermark,
+        after,
+    );
     if (messageRows.length === 0) return [];
 
     const placeholders = messageRows.map(() => "?").join(", ");
@@ -215,6 +220,60 @@ export function readRawSessionMessagePageFromDb(
         )
         .all(sessionId, ...messageRows.map((row) => row.id))
         .filter(isRawPartRow);
+    return assembleRawMessagePage(messageRows, partRows);
+}
+
+function readRawMessagePageRows(
+    db: Database,
+    sessionId: string,
+    afterOrdinal: number,
+    limit: number,
+    finalWatermark: number,
+    after?: RawMessageOrdinalAnchor,
+): PagedRawMessageRow[] {
+    const remaining = Math.max(0, Math.floor(finalWatermark) - Math.floor(afterOrdinal));
+    const pageSize = Math.min(Math.max(1, Math.floor(limit)), remaining);
+    if (pageSize === 0) return [];
+
+    // The ordinal seek is needed only for the first page of a range. Later
+    // pages resume after the last filtered row, including timestamp ties. The
+    // redundant lower bound lets SQLite seek the session/time index before
+    // evaluating the tie-break and JSON filter.
+    const parameters: Array<string | number> = [sessionId];
+    if (after) parameters.push(after.timeCreated, after.timeCreated, after.timeCreated, after.id);
+    parameters.push(pageSize);
+    if (!after) parameters.push(Math.max(0, Math.floor(afterOrdinal)));
+    return db
+        .prepare(
+            `SELECT id, data, time_created, time_updated
+             FROM message
+             WHERE session_id = ?
+                ${after ? "AND time_created >= ? AND (time_created > ? OR (time_created = ? AND id > ?))" : ""}
+                AND NOT (
+                   CASE WHEN json_valid(data) = 1
+                        THEN COALESCE(json_extract(data, '$.summary'), 0)
+                        ELSE 0 END = 1
+                   AND CASE WHEN json_valid(data) = 1
+                            THEN COALESCE(json_extract(data, '$.finish'), '')
+                            ELSE '' END = 'stop'
+               )
+             ORDER BY time_created ASC, id ASC
+             LIMIT ? ${after ? "" : "OFFSET ?"}`,
+        )
+        .all(...parameters)
+        .filter(isRawMessageRow)
+        .map(
+            (row, index): PagedRawMessageRow => ({
+                ...row,
+                ordinal: Math.floor(afterOrdinal) + index + 1,
+            }),
+        );
+}
+
+function assembleRawMessagePage(
+    messageRows: readonly PagedRawMessageRow[],
+    partRows: readonly RawPartRow[],
+): RawMessage[] {
     const partsByMessageId = new Map<string, unknown[]>();
     for (const part of partRows) {
         const list = partsByMessageId.get(part.message_id) ?? [];
@@ -233,6 +292,92 @@ export function readRawSessionMessagePageFromDb(
             version: row.time_updated ?? null,
         };
     });
+}
+
+/** Longest text a summary page keeps from one text part or one tool key argument. */
+export const RAW_SUMMARY_TEXT_MAX_CHARS = 8192;
+const RAW_SUMMARY_ARG_MAX_CHARS = 512;
+
+/** Tool input keys the `TC:` summary line reads (see extractToolCallSummaries). */
+const RAW_SUMMARY_TOOL_INPUT_KEYS = [
+    "description",
+    "filePath",
+    "path",
+    "pattern",
+    "query",
+    "symbol",
+    "module",
+    "action",
+] as const;
+
+function summaryStringField(jsonPath: string): string {
+    return `CASE WHEN json_type(data, '${jsonPath}') = 'text' THEN substr(json_extract(data, '${jsonPath}'), 1, ${RAW_SUMMARY_ARG_MAX_CHARS}) END`;
+}
+
+/**
+ * Part projection for summary pages, computed inside SQLite so the JavaScript
+ * heap never holds a whole tool output. A text part keeps its fields with the
+ * text cut to RAW_SUMMARY_TEXT_MAX_CHARS. A tool part is rebuilt from its name,
+ * call id, status, the input keys a `TC:` line uses, and the metadata
+ * description; its output, full metadata (LSP diagnostics and the like), and
+ * bulky inputs such as written file contents are never read into JavaScript.
+ */
+const RAW_SUMMARY_PART_DATA_SQL = `CASE
+    WHEN json_extract(data, '$.type') = 'text'
+        THEN json_set(data, '$.text', substr(json_extract(data, '$.text'), 1, ${RAW_SUMMARY_TEXT_MAX_CHARS}))
+    ELSE json_object(
+        'type', 'tool',
+        'tool', ${summaryStringField("$.tool")},
+        'callID', ${summaryStringField("$.callID")},
+        'state', json_object(
+            'status', ${summaryStringField("$.state.status")},
+            'input', json_object(${RAW_SUMMARY_TOOL_INPUT_KEYS.map(
+                (key) => `'${key}', ${summaryStringField(`$.state.input.${key}`)}`,
+            ).join(", ")}),
+            'metadata', json_object('description', ${summaryStringField("$.state.metadata.description")})
+        )
+    )
+END`;
+
+/**
+ * Read one bounded page in the same ordinal space as
+ * {@link readRawSessionMessagePageFromDb}, keeping only text and tool parts in
+ * their summary projection. For callers that render `U:` / `TC:` lines and
+ * never need tool outputs, reasoning, or file payloads: peak memory is one page
+ * of small projected parts, whatever the session or tool-output size.
+ */
+export function readRawSessionMessageSummaryPageFromDb(
+    db: Database,
+    sessionId: string,
+    afterOrdinal: number,
+    limit: number,
+    finalWatermark = Number.MAX_SAFE_INTEGER,
+    after?: RawMessageOrdinalAnchor,
+): RawMessage[] {
+    const messageRows = readRawMessagePageRows(
+        db,
+        sessionId,
+        afterOrdinal,
+        limit,
+        finalWatermark,
+        after,
+    );
+    if (messageRows.length === 0) return [];
+
+    const placeholders = messageRows.map(() => "?").join(", ");
+    const partRows = db
+        .prepare(
+            `SELECT message_id, ${RAW_SUMMARY_PART_DATA_SQL} AS data, time_updated
+             FROM part
+             WHERE +session_id = ?
+               AND likelihood(message_id IN (${placeholders}), 0.000001)
+               AND json_valid(data) = 1
+               AND json_extract(data, '$.type') IN ('text', 'tool')
+             ORDER BY message_id ASC, time_created ASC, id ASC`,
+        )
+        .all(sessionId, ...messageRows.map((row) => row.id))
+        .filter(isRawPartRow);
+    return assembleRawMessagePage(messageRows, partRows);
 }
 
 export function countRawSessionMessageOrdinalsFromDb(db: Database, sessionId: string): number {
@@ -278,6 +423,34 @@ export function readRawSessionMessageIdOrdinalsFromDb(
         if (info) ordinalById.set(row.id, ordinal);
     }
     return ordinalById;
+}
+
+/** Hydrate only the requested range; malformed rows consume ordinals but have no id entry. */
+export function readRawSessionMessageIdOrdinalsForRangeFromDb(
+    db: Database,
+    sessionId: string,
+    fromOrdinal: number,
+    toOrdinal: number,
+): Map<string, number> {
+    const from = Math.max(1, Math.floor(fromOrdinal));
+    const to = Math.floor(toOrdinal);
+    if (to < from) return new Map();
+    const rows = db
+        .prepare(`
+        SELECT id, data FROM message WHERE session_id = ?
+          AND CASE WHEN json_valid(data) THEN NOT (
+            COALESCE(json_type(data, '$.summary'), '') = 'true'
+            AND COALESCE(json_extract(data, '$.finish'), '') = 'stop'
+          ) ELSE 1 END
+        ORDER BY time_created, id LIMIT ? OFFSET ?
+    `)
+        .all(sessionId, to - from + 1, from - 1)
+        .filter(isRawMessageRow);
+    const result = new Map<string, number>();
+    for (const [index, row] of rows.entries()) {
+        if (parseJsonRecord(row.data)) result.set(row.id, from + index);
+    }
+    return result;
 }
 
 /** Read a keyset page used to incrementally maintain shadow message ordinals. */
@@ -700,6 +873,25 @@ export function readRawSessionMessageByIdFromDb(
         createdAt: row.time_created,
         version: row.time_updated ?? null,
     };
+}
+
+/** Existence does not require a canonical ordinal or any part payloads. */
+export function hasRawSessionMessageByIdFromDb(
+    db: Database,
+    sessionId: string,
+    messageId: string,
+): boolean {
+    const row = db
+        .prepare("SELECT id, data, time_created FROM message WHERE session_id = ? AND id = ?")
+        .get(sessionId, messageId) as RawMessageRow | null;
+    if (!row || !isRawMessageRow(row) || typeof row.time_created !== "number") return false;
+    const info = parseJsonRecord(row.data);
+    if (!info || isRawCompactionSummaryInfo(info)) return false;
+    // The legacy ordinal SQL also excludes numeric summary=1. Preserve its
+    // unusual point-lookup behavior for those rows without taxing ordinary ids.
+    if (info.summary === 1 && info.finish === "stop")
+        return readRawSessionMessageByIdFromDb(db, sessionId, messageId) !== null;
+    return true;
 }
 
 /** Read the canonical servable tail and its parts in one query, including its boundary row. */

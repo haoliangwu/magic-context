@@ -16,8 +16,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use subc_control::{ClientControlRequest, ClientControlResponse, ConsumerIdentity};
 use subc_protocol::{
-    BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority, RouteTarget,
-    SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, Priority, SUBC_MODULE_ID_ENV,
 };
 use subc_transport::{
     authenticate_client, connection_file, read_frame, write_frame, AuthError, ConnectionFileError,
@@ -25,11 +24,7 @@ use subc_transport::{
 };
 use tokio::net::TcpStream;
 
-/// The owned-leg runner module the historian producer opens routes to. Renamed
-/// llm-runner -> broca in the fleet cut; this binary ships in the same deploy
-/// beat as the daemon's module-key rename, so the default flips with it
-/// atomically (a full daemon kickstart bounces every module in that window).
-const DEFAULT_RUNNER_MODULE_ID: &str = "broca";
+use crate::route_targets::{RegisteredRoute, RouteTargetConfig};
 
 /// Output budget for a historian summarization pass. llm-runner's default (4k) truncated
 /// a real 50k-input chunk mid-XML on the rig: a tiered compartment doc for a full chunk
@@ -66,15 +61,80 @@ pub const ERROR_CLASS_WIRE_SET: [&str; 4] = [
     "context_overflow",
 ];
 
-/// Broca route-open contract used to distinguish a model/provider resolution refusal from
-/// transport failures that happen to share the same outer `open_failed` code.
-pub const MODEL_UNRESOLVABLE_OPEN_CODES: [&str; 1] = ["open_failed"];
-pub const MODEL_UNRESOLVABLE_OPEN_MESSAGE_LITERALS: [&str; 4] = [
+/// Runner route-open contract. The received text remains authoritative; these literals only
+/// identify the stage that produced it.
+pub const RUNNER_REFUSAL_OPEN_CODES: [&str; 1] = ["open_failed"];
+pub const RUNNER_REFUSAL_OPEN_MESSAGE_LITERALS: [&str; 4] = [
     "run resolution failed",
     "no apikey credential for provider",
     "unknown provider",
     "unknown model",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerRefusalStage {
+    Credential,
+    Provider,
+    Model,
+    /// The runner refused route resolution without a more specific credential/catalog literal.
+    Resolution,
+}
+
+impl RunnerRefusalStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::Provider => "provider",
+            Self::Model => "model",
+            Self::Resolution => "resolution",
+        }
+    }
+
+    pub const fn canonical_cause(self) -> &'static str {
+        match self {
+            Self::Credential => "credential_unavailable",
+            Self::Provider => "provider_unknown",
+            Self::Model => "model_unknown",
+            Self::Resolution => "runner_resolution_failed",
+        }
+    }
+
+    pub const fn is_durable(self) -> bool {
+        matches!(self, Self::Provider | Self::Model)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerRefusal {
+    pub stage: RunnerRefusalStage,
+    pub received_code: String,
+    pub received_message: String,
+}
+
+impl RunnerRefusal {
+    fn from_open_body(body: &ProducerErrorBody) -> Option<Self> {
+        if !RUNNER_REFUSAL_OPEN_CODES.contains(&body.code.as_str()) {
+            return None;
+        }
+        let message = body.message.to_ascii_lowercase();
+        // Specific stages take precedence because the credential/provider/model messages are
+        // commonly nested below the generic "run resolution failed" text.
+        let stage = if message.contains(RUNNER_REFUSAL_OPEN_MESSAGE_LITERALS[1]) {
+            RunnerRefusalStage::Credential
+        } else if message.contains(RUNNER_REFUSAL_OPEN_MESSAGE_LITERALS[2]) {
+            RunnerRefusalStage::Provider
+        } else if message.contains(RUNNER_REFUSAL_OPEN_MESSAGE_LITERALS[3]) {
+            RunnerRefusalStage::Model
+        } else {
+            RunnerRefusalStage::Resolution
+        };
+        Some(Self {
+            stage,
+            received_code: body.code.clone(),
+            received_message: body.message.clone(),
+        })
+    }
+}
 
 static DEPRECATED_HEURISTIC_USES: AtomicU64 = AtomicU64::new(0);
 
@@ -214,6 +274,60 @@ pub struct ProducerOutput {
     /// terminal can still say completed while a model step hit its output ceiling and
     /// cut the text mid-document, so validation failures need this to self-diagnose.
     pub length_capped: bool,
+    /// Provider token spend for the run, when the runner reported any. `None` means
+    /// nothing was reported, not a zero-cost run.
+    pub usage: Option<ProducerUsage>,
+}
+
+/// Token spend for one producer run, summed over its model steps. Field meanings follow
+/// the runner's usage record: `input` is fresh (non-cached) input, `cache_read` and
+/// `cache_write` are the cached-input hit and cache-creation counts, and `output`
+/// already includes any reasoning tokens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProducerUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+pub(crate) fn producer_token_log(
+    usage: Option<ProducerUsage>,
+    max_tokens: Option<u32>,
+    length_capped: bool,
+) -> Value {
+    serde_json::json!({
+        "input": usage.map(|value| value.input),
+        "output": usage.map(|value| value.output),
+        "reasoning": None::<u64>,
+        "cache_read": usage.map(|value| value.cache_read),
+        "cache_write": usage.map(|value| value.cache_write),
+        "max_tokens": max_tokens,
+        "finish_reason": if length_capped { Some("length") } else { None },
+    })
+}
+
+impl ProducerUsage {
+    /// Reads a runner usage object (`input_tokens`, `output_tokens`,
+    /// `cached_input_tokens`, `cache_write_tokens`; each optional). Returns `None` when
+    /// the value is not an object.
+    fn from_runner_usage(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let field = |name: &str| object.get(name).and_then(Value::as_u64).unwrap_or(0);
+        Some(Self {
+            input: field("input_tokens"),
+            output: field("output_tokens"),
+            cache_read: field("cached_input_tokens"),
+            cache_write: field("cache_write_tokens"),
+        })
+    }
+
+    fn add(&mut self, other: Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.output = self.output.saturating_add(other.output);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +342,7 @@ pub struct HistorianProducerConfig {
     pub connection_file: PathBuf,
     pub project_root: PathBuf,
     pub harness: String,
-    pub module_id: String,
+    pub route_targets: RouteTargetConfig,
     pub handshake_timeout: Duration,
     pub request_timeout: Duration,
     pub await_timeout: Duration,
@@ -244,7 +358,7 @@ impl HistorianProducerConfig {
             connection_file: connection_file.into(),
             project_root: project_root.into(),
             harness: harness.into(),
-            module_id: DEFAULT_RUNNER_MODULE_ID.to_string(),
+            route_targets: RouteTargetConfig::default(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             await_timeout: DEFAULT_AWAIT_TIMEOUT,
@@ -272,7 +386,16 @@ pub enum HistorianProducerError {
     Subc(ProducerErrorBody),
     UnexpectedControlResponse,
     MissingRunId,
+    /// The send was accepted but did not start a run: the lineage already had an active
+    /// run, so the prompt was durably queued behind it under `submission_id`.
+    SendQueued {
+        submission_id: String,
+        /// Whether the queued submission was withdrawn again. A submission left standing
+        /// eventually runs a model call whose output no one is waiting for.
+        retracted: bool,
+    },
     MissingSession,
+    HostRunnerRequiresHostTransport,
     UnexpectedStreamEnd,
     TimedOut,
     RunFailed {
@@ -350,6 +473,12 @@ impl HistorianProducerError {
             HistorianProducerError::Subc(body) => body.classification(),
             HistorianProducerError::RunFailed { classification, .. }
             | HistorianProducerError::RunPaused { classification, .. } => *classification,
+            // A busy lineage clears once its active run ends, so a queued send is always
+            // worth retrying. This is a fact about the response, not a parsed hint.
+            HistorianProducerError::SendQueued { .. } => Some(ErrorClassification {
+                class: ErrorClass::Transient,
+                retry_after_secs: None,
+            }),
             _ => None,
         }
     }
@@ -401,20 +530,12 @@ impl HistorianProducerError {
         )
     }
 
-    /// Return the structured route-open body only when Broca says the selected model or
-    /// provider cannot be resolved. Other `open_failed` bodies remain transport failures.
-    pub fn model_unresolvable_open_body(&self) -> Option<&ProducerErrorBody> {
+    /// Parse a route-open refusal while preserving the runner's code and message verbatim.
+    pub fn runner_refusal(&self) -> Option<RunnerRefusal> {
         let HistorianProducerError::Subc(body) = self else {
             return None;
         };
-        if !MODEL_UNRESOLVABLE_OPEN_CODES.contains(&body.code.as_str()) {
-            return None;
-        }
-        let message = body.message.to_ascii_lowercase();
-        MODEL_UNRESOLVABLE_OPEN_MESSAGE_LITERALS
-            .iter()
-            .any(|literal| message.contains(literal))
-            .then_some(body)
+        RunnerRefusal::from_open_body(body)
     }
 
     fn heuristic_decision(&self) -> DeprecatedHeuristicDecision {
@@ -441,6 +562,7 @@ impl HistorianProducerError {
             HistorianProducerError::Subc(body) => &body.code,
             HistorianProducerError::RunFailed { .. } => "run_failed",
             HistorianProducerError::RunPaused { .. } => "run_paused",
+            HistorianProducerError::SendQueued { .. } => "send_queued",
             HistorianProducerError::TimedOut => "timed_out",
             _ => "producer_error",
         }
@@ -449,7 +571,7 @@ impl HistorianProducerError {
 
 fn record_deprecated_heuristic_use(code: &str) {
     DEPRECATED_HEURISTIC_USES.fetch_add(1, Ordering::Relaxed);
-    eprintln!("[mc-module] untagged producer error (deprecated heuristic used): code={code}");
+    tracing::error!("[mc-module] untagged producer error (deprecated heuristic used): code={code}");
 }
 
 fn retryable_code(s: &str) -> bool {
@@ -496,8 +618,19 @@ impl fmt::Display for HistorianProducerError {
             HistorianProducerError::MissingRunId => {
                 write!(f, "session.send did not return an active run_id")
             }
+            HistorianProducerError::SendQueued {
+                submission_id,
+                retracted,
+            } => write!(
+                f,
+                "session.send queued this prompt behind the run already active on the session (submission {submission_id}, retracted: {})",
+                if *retracted { "yes" } else { "no" }
+            ),
             HistorianProducerError::MissingSession => {
                 write!(f, "historian producer has no bound session")
+            }
+            HistorianProducerError::HostRunnerRequiresHostTransport => {
+                write!(f, "host historian runner does not use a subc module route")
             }
             HistorianProducerError::UnexpectedStreamEnd => write!(
                 f,
@@ -538,7 +671,9 @@ impl Error for HistorianProducerError {
             | HistorianProducerError::Subc(_)
             | HistorianProducerError::UnexpectedControlResponse
             | HistorianProducerError::MissingRunId
+            | HistorianProducerError::SendQueued { .. }
             | HistorianProducerError::MissingSession
+            | HistorianProducerError::HostRunnerRequiresHostTransport
             | HistorianProducerError::UnexpectedStreamEnd
             | HistorianProducerError::TimedOut
             | HistorianProducerError::RunFailed { .. }
@@ -717,19 +852,40 @@ impl HistorianProducer {
             "params": params
         });
         let response = self.unary_json(route, body).await?;
-        let run_id = response
-            .get("run_id")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                response
-                    .get("result")
-                    .and_then(|r| r.get("run_id"))
-                    .and_then(Value::as_str)
-            })
-            .ok_or(HistorianProducerError::MissingRunId)?;
-        Ok(RunHandle {
-            run_id: run_id.to_string(),
-        })
+        match send_outcome(&response) {
+            SendOutcome::Active(run_id) => Ok(RunHandle { run_id }),
+            SendOutcome::Queued(submission_id) => {
+                // The prompt was ACCEPTED, not rejected: the run this producer wanted is
+                // sitting in the lineage's queue. Nothing here will ever drain it — this
+                // producer only subscribes to a run it started — so withdraw it rather
+                // than leave a model call to fire for output no one is waiting for.
+                let retracted = self.retract(route, &submission_id).await.is_ok();
+                Err(HistorianProducerError::SendQueued {
+                    submission_id,
+                    retracted,
+                })
+            }
+            SendOutcome::Unrecognized => Err(HistorianProducerError::MissingRunId),
+        }
+    }
+
+    /// Withdraw a queued submission. Best effort: a submission the server has already
+    /// consumed, or a server without the operation, is reported by the caller as such.
+    async fn retract(
+        &mut self,
+        route: OpenedRoute,
+        submission_id: &str,
+    ) -> Result<(), HistorianProducerError> {
+        let _ = self
+            .unary_json(
+                route,
+                json!({
+                    "method": "session.retract",
+                    "params": { "submission_id": submission_id }
+                }),
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn await_output(
@@ -848,18 +1004,25 @@ impl HistorianProducer {
             .session_id
             .clone()
             .ok_or(HistorianProducerError::MissingSession)?;
+        let target = self
+            .config
+            .route_targets
+            .target(RegisteredRoute::HistorianRunner)
+            .ok_or(HistorianProducerError::HostRunnerRequiresHostTransport)?;
         let request = ClientControlRequest::RouteOpen {
-            target: RouteTarget::ManagementSurface {
-                module_id: self.config.module_id.clone(),
-            },
+            target,
             identity: BindIdentity::new(
                 self.config.project_root.clone(),
                 self.config.harness.clone(),
                 session,
             ),
-            consumer_identity: consumer_identity_from_env(),
+            consumer_identity: consumer_identity_from_launch(),
             consumer_capabilities: None,
             admission_facts: None,
+            // Historian routes carry no session scope; they run under the module's own identity.
+            scope: None,
+            // The historian runner is not a versioned role route.
+            role_versions: None,
         };
         let corr = self.next_corr();
         let body = serde_json::to_vec(&request)?;
@@ -934,6 +1097,10 @@ impl HistorianProducer {
         let mut text = String::new();
         let mut last_run_started: Option<String> = None;
         let mut length_capped = false;
+        // The runner reports each model step's usage on its `step_finished` unit, never
+        // a running total, so the run's spend is their sum. The terminal's own `usage`
+        // is only used when no step unit carried any (for example an older runner).
+        let mut step_usage: Option<ProducerUsage> = None;
         loop {
             let Some(frame) = read_frame(&mut self.stream).await? else {
                 return Err(HistorianProducerError::UnexpectedStreamEnd);
@@ -975,6 +1142,15 @@ impl HistorianProducer {
                     if unit_is_length_capped(unit) {
                         length_capped = true;
                     }
+                    if is_step_finished_unit(unit) {
+                        if let Some(usage) =
+                            unit.get("usage").and_then(ProducerUsage::from_runner_usage)
+                        {
+                            step_usage
+                                .get_or_insert_with(ProducerUsage::default)
+                                .add(usage);
+                        }
+                    }
                     if terminal {
                         if last_run_started.as_deref() != Some(run_id) {
                             return Err(HistorianProducerError::TerminalRunMismatch {
@@ -993,9 +1169,13 @@ impl HistorianProducer {
                         }
                         // The run terminal control unit is authoritative. StreamEnd is only
                         // route mechanics and can appear on detach/resubscribe without ending a run.
+                        let usage = step_usage.or_else(|| {
+                            unit.get("usage").and_then(ProducerUsage::from_runner_usage)
+                        });
                         return Ok(ProducerOutput {
                             text,
                             length_capped,
+                            usage,
                         });
                     }
                 }
@@ -1077,6 +1257,42 @@ impl HistorianProducer {
 impl Drop for HistorianProducer {
     fn drop(&mut self) {
         // Async close is preferred by callers; drop only releases the TCP socket.
+    }
+}
+
+/// What a `session.send` reply actually said.
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    /// The session was idle and this run started.
+    Active(String),
+    /// The session was busy; the prompt is durably queued under this submission id.
+    Queued(String),
+    /// Neither shape — the reply carries no run and names no submission.
+    Unrecognized,
+}
+
+/// Decode a `session.send` reply.
+///
+/// The runner answers with a `state`-tagged result inside a `result` envelope: `active`
+/// carries the run that started, `pending` means the session already had an active run and
+/// this prompt was durably QUEUED behind it under a submission id. Reading only `run_id`
+/// collapses those two into "no run id", which reports a queued (accepted) prompt as a
+/// malformed reply and hides the one fact that explains it — the session was busy.
+fn send_outcome(response: &Value) -> SendOutcome {
+    let body = match response.get("result") {
+        Some(result) if result.is_object() => result,
+        _ => response,
+    };
+    if let Some(run_id) = body.get("run_id").and_then(Value::as_str) {
+        return SendOutcome::Active(run_id.to_string());
+    }
+    let pending = body
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| state.eq_ignore_ascii_case("pending"));
+    match body.get("submission_id").and_then(Value::as_str) {
+        Some(submission_id) if pending => SendOutcome::Queued(submission_id.to_string()),
+        _ => SendOutcome::Unrecognized,
     }
 }
 
@@ -1191,6 +1407,12 @@ fn is_run_started_unit(unit: &Value) -> bool {
         .is_some_and(|ty| ty == "run_started" || ty == "runstarted")
 }
 
+fn is_step_finished_unit(unit: &Value) -> bool {
+    unit_type(unit)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|ty| ty == "step_finished" || ty == "stepfinished")
+}
+
 /// A length-class finish reason on ANY unit (step or terminal): providers spell it
 /// "length", "max_tokens", or "max_output_tokens" depending on the wire family.
 fn unit_is_length_capped(unit: &Value) -> bool {
@@ -1268,9 +1490,10 @@ fn unit_error_info(unit: &Value) -> UnitErrorInfo {
     }
 }
 
-fn consumer_identity_from_env() -> Option<ConsumerIdentity> {
+fn consumer_identity_from_launch() -> Option<ConsumerIdentity> {
     let module_id = std::env::var(SUBC_MODULE_ID_ENV).ok()?;
-    let launch_nonce = std::env::var(SUBC_LAUNCH_NONCE_ENV).ok()?;
+    // Share the SDK's cached HELLO read: the first read consumes and closes the pipe.
+    let launch_nonce = subc_client_rs::launch_nonce().ok()??.value().to_owned();
     (!module_id.is_empty() && !launch_nonce.is_empty()).then_some(ConsumerIdentity {
         module_id,
         launch_nonce,
@@ -1409,6 +1632,64 @@ mod tests {
     use tempfile::TempDir;
     use tokio::{net::TcpListener, sync::Mutex};
 
+    #[cfg(unix)]
+    #[test]
+    fn pipe_only_launch_identity_reuses_sdk_nonce() {
+        const CHILD: &str = "MC_TEST_PIPE_IDENTITY_CHILD";
+        const NONCE: &str = "pipe-only-mc-launch-nonce";
+        const TEST: &str = "historian_producer::tests::pipe_only_launch_identity_reuses_sdk_nonce";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os(subc_protocol::SUBC_LAUNCH_NONCE_ENV).is_none());
+            // HELLO uses this same accessor before the historian opens a route.
+            let hello_nonce = subc_client_rs::launch_nonce().unwrap().unwrap();
+            assert_eq!(hello_nonce.value(), NONCE);
+            assert_eq!(hello_nonce.source().as_str(), "fd");
+            let provenance = crate::manifest("magic-context").provenance.unwrap();
+            assert_eq!(
+                serde_json::to_value(provenance).unwrap()["launch_nonce_source"],
+                "fd"
+            );
+            for _ in 0..2 {
+                let identity = consumer_identity_from_launch().expect("pipe-only route identity");
+                assert_eq!(identity.module_id, "magic-context");
+                assert_eq!(identity.launch_nonce, NONCE);
+            }
+            return;
+        }
+
+        // A fresh process isolates the process-wide nonce cache from other tests.
+        let handoff = subc_os::LaunchNonceHandoff::new(NONCE).unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env(SUBC_MODULE_ID_ENV, "magic-context")
+            .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+            .env(subc_os::LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
+        handoff.install_last(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "pipe-only child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn producer_token_log_distinguishes_missing_usage_from_zero_and_reports_cap() {
+        assert_eq!(
+            producer_token_log(None, None, false),
+            json!({"input":null,"output":null,"reasoning":null,"cache_read":null,"cache_write":null,"max_tokens":null,"finish_reason":null})
+        );
+        let usage = ProducerUsage::from_runner_usage(&json!({"input_tokens":4,"output_tokens":32,"cached_input_tokens":0,"cache_write_tokens":2})).unwrap();
+        assert_eq!(
+            producer_token_log(Some(usage), Some(32), true),
+            json!({"input":4,"output":32,"reasoning":null,"cache_read":0,"cache_write":2,"max_tokens":32,"finish_reason":"length"})
+        );
+    }
+
     #[test]
     fn provider_reset_metadata_survives_open_and_terminal_errors() {
         let reset = chrono::DateTime::parse_from_rfc3339("2026-09-11T20:34:51Z")
@@ -1438,10 +1719,10 @@ mod tests {
     }
 
     #[test]
-    fn model_unresolvable_open_literals_match_pinned_broca_contract() {
-        assert_eq!(MODEL_UNRESOLVABLE_OPEN_CODES, ["open_failed"]);
+    fn runner_refusal_literals_map_to_the_reporting_stage() {
+        assert_eq!(RUNNER_REFUSAL_OPEN_CODES, ["open_failed"]);
         assert_eq!(
-            MODEL_UNRESOLVABLE_OPEN_MESSAGE_LITERALS,
+            RUNNER_REFUSAL_OPEN_MESSAGE_LITERALS,
             [
                 "run resolution failed",
                 "no apikey credential for provider",
@@ -1450,21 +1731,49 @@ mod tests {
             ]
         );
 
-        let live = HistorianProducerError::Subc(ProducerErrorBody::untagged(
+        let cases = [
+            (
+                "open failed: run resolution failed: no apikey credential for provider 'google'",
+                RunnerRefusalStage::Credential,
+            ),
+            (
+                "open failed: run resolution failed: unknown provider 'missing'",
+                RunnerRefusalStage::Provider,
+            ),
+            (
+                "open failed: run resolution failed: unknown model 'missing'",
+                RunnerRefusalStage::Model,
+            ),
+            (
+                "open failed: run resolution failed: malformed runner selection",
+                RunnerRefusalStage::Resolution,
+            ),
+        ];
+        for (message, expected_stage) in cases {
+            let error =
+                HistorianProducerError::Subc(ProducerErrorBody::untagged("open_failed", message));
+            let refusal = error.runner_refusal().expect("runner refusal");
+            assert_eq!(refusal.stage, expected_stage);
+            assert_eq!(refusal.received_code, "open_failed");
+            assert_eq!(refusal.received_message, message);
+        }
+
+        let unmatched = HistorianProducerError::Subc(ProducerErrorBody::untagged(
             "open_failed",
-            "open failed: run resolution failed: no apikey credential for provider 'opencode' (credential id 'apikey:opencode')",
+            "open failed: route closed before bind completed",
         ));
-        assert!(live.model_unresolvable_open_body().is_some());
+        assert_eq!(
+            unmatched
+                .runner_refusal()
+                .expect("unmatched open refusal")
+                .stage,
+            RunnerRefusalStage::Resolution
+        );
         let wrong_outer_code = HistorianProducerError::Subc(ProducerErrorBody::untagged(
             "route_rejected",
             "run resolution failed: unknown provider 'opencode'",
         ));
-        assert!(wrong_outer_code.model_unresolvable_open_body().is_none());
-        let transport_open = HistorianProducerError::Subc(ProducerErrorBody::untagged(
-            "open_failed",
-            "open failed: route closed before bind completed",
-        ));
-        assert!(transport_open.model_unresolvable_open_body().is_none());
+        assert!(wrong_outer_code.runner_refusal().is_none());
     }
 
     #[test]
@@ -1536,11 +1845,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn send_outcome_reads_the_runner_send_contract() {
+        // Both shapes ride a `result` envelope and are tagged by `state`.
+        assert_eq!(
+            send_outcome(&json!({"result":{"state":"active","run_id":"run-9"}})),
+            SendOutcome::Active("run-9".to_string())
+        );
+        assert_eq!(
+            send_outcome(&json!({"result":{"state":"pending","submission_id":"sub-3"}})),
+            SendOutcome::Queued("sub-3".to_string()),
+            "a queued prompt was ACCEPTED behind a busy session, not malformed"
+        );
+        // An un-enveloped reply carrying the run directly stays readable.
+        assert_eq!(
+            send_outcome(&json!({"state":"active","run_id":"run-flat"})),
+            SendOutcome::Active("run-flat".to_string())
+        );
+        // A submission id without the pending state is not a queue acknowledgement.
+        assert_eq!(
+            send_outcome(&json!({"result":{"submission_id":"sub-4"}})),
+            SendOutcome::Unrecognized
+        );
+        assert_eq!(send_outcome(&json!({})), SendOutcome::Unrecognized);
+        assert_eq!(send_outcome(&Value::Null), SendOutcome::Unrecognized);
+    }
+
     #[derive(Debug, Default)]
     struct ServerLog {
         route_sessions: Vec<String>,
         sends: Vec<Value>,
         subscribes: Vec<Value>,
+        retracts: Vec<Value>,
         goodbyes: Vec<u16>,
     }
 
@@ -1676,6 +2012,17 @@ mod tests {
                                 )
                                 .await;
                             }
+                            Some("session.retract") => {
+                                log_task.lock().await.retracts.push(req["params"].clone());
+                                send_response_frame(
+                                    &mut stream,
+                                    frame.header.channel,
+                                    frame.header.epoch,
+                                    frame.header.corr,
+                                    serde_json::to_vec(&json!({"result":"retracted"})).unwrap(),
+                                )
+                                .await;
+                            }
                             other => panic!(
                                 "unexpected request {other:?} on route {:?}",
                                 route_sessions.get(&frame.header.channel)
@@ -1749,7 +2096,7 @@ mod tests {
             connection_file: server.connection_file.clone(),
             project_root: std::env::current_dir().unwrap(),
             harness: "mc-test".to_string(),
-            module_id: "llm-runner".to_string(),
+            route_targets: RouteTargetConfig::runner_module("llm-runner"),
             handshake_timeout: Duration::from_secs(2),
             request_timeout: Duration::from_secs(2),
             await_timeout: Duration::from_secs(2),
@@ -1803,6 +2150,45 @@ mod tests {
             "system rides the role-scoped SendParams field, byte-exact"
         );
         assert_eq!(log.goodbyes, vec![10]);
+    }
+
+    #[tokio::test]
+    async fn a_queued_send_is_named_as_such_and_its_submission_is_withdrawn() {
+        let server = fake_server(
+            json!({"result":{"state":"pending","submission_id":"sub-77"}}),
+            Vec::new(),
+        )
+        .await;
+        let mut client = client(&server).await;
+        let error = client
+            .start("mc-dreamer:classify:abc", "role", "prompt", "prov/model-a")
+            .await
+            .expect_err("a queued send starts no run");
+
+        match &error {
+            HistorianProducerError::SendQueued {
+                submission_id,
+                retracted,
+            } => {
+                assert_eq!(submission_id, "sub-77");
+                assert!(retracted, "the queued submission must be withdrawn");
+            }
+            other => panic!("expected a queued send, got {other:?}"),
+        }
+        assert!(
+            error.to_string().contains("already active on the session"),
+            "the message must name the busy session, not a missing field: {error}"
+        );
+        assert!(
+            error.is_retryable_model_failure(),
+            "a busy session clears; the caller should try again"
+        );
+        client.close().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let log = server.log.lock().await;
+        assert_eq!(log.retracts.len(), 1);
+        assert_eq!(log.retracts[0]["submission_id"], json!("sub-77"));
     }
 
     #[tokio::test]
@@ -1916,6 +2302,61 @@ mod tests {
             log.goodbyes,
             vec![11, 10],
             "close releases subscribe and command routes"
+        );
+    }
+
+    /// Run spend is the sum of every step's usage (each step is billed separately); the
+    /// terminal's own usage is used only when no step reported any.
+    #[tokio::test]
+    async fn await_output_sums_step_usage_and_falls_back_to_terminal_usage() {
+        let with_steps = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"step_finished","step_id":"s1","finish_reason":"tool_calls",
+                "usage":{"input_tokens":10_000,"output_tokens":2_000,"cached_input_tokens":7,"cache_write_tokens":1}}}),
+            json!({"kind":"control","unit":{"type":"step_finished","step_id":"s2","finish_reason":"stop",
+                "usage":{"input_tokens":4_039,"output_tokens":4_125,"cached_input_tokens":5}}}),
+            json!({"kind":"control","unit":{"type":"run_finished","reason":"completed",
+                "usage":{"input_tokens":1,"output_tokens":1}}}),
+        ];
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), with_steps).await;
+        let mut first = client(&server).await;
+        first
+            .start("mc-historian:proj:4", "", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        let output = first.await_output("run-1").await.unwrap();
+        first.close().await;
+        assert_eq!(
+            output.usage,
+            Some(ProducerUsage {
+                input: 14_039,
+                output: 6_125,
+                cache_read: 12,
+                cache_write: 1,
+            })
+        );
+
+        let terminal_only = vec![
+            json!({"kind":"control","unit":{"type":"run_started","run_id":"run-1"}}),
+            json!({"kind":"control","unit":{"type":"run_finished","reason":"completed",
+                "usage":{"input_tokens":30,"output_tokens":40}}}),
+        ];
+        let server = fake_server(json!({"state":"active","run_id":"run-1"}), terminal_only).await;
+        let mut second = client(&server).await;
+        second
+            .start("mc-historian:proj:5", "", "prompt", "prov/model-a")
+            .await
+            .unwrap();
+        let output = second.await_output("run-1").await.unwrap();
+        second.close().await;
+        assert_eq!(
+            output.usage,
+            Some(ProducerUsage {
+                input: 30,
+                output: 40,
+                cache_read: 0,
+                cache_write: 0,
+            })
         );
     }
 

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { prependTag } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
 
 describe("stripTagPrefixFromAssistantMessage", () => {
@@ -194,4 +195,13 @@ describe("stripTagPrefixFromAssistantMessage", () => {
 			expect(msg.content).toBe("§4§ legacy string");
 		});
 	});
+});
+
+it("correct leading self-tag round-trips byte-identically through Pi storage and replay", () => {
+	const reply =
+		"§12§ Reading both files in parallel.\n\nThe next step follows.";
+	const part = { type: "text", text: reply };
+	const message = { role: "assistant", content: [part] };
+	expect(stripTagPrefixFromAssistantMessage(message)).toBe(true);
+	expect(prependTag(12, part.text)).toBe(reply);
 });

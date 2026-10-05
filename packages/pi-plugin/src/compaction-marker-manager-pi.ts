@@ -5,8 +5,8 @@ import type { Database } from "@magic-context/core/shared/sqlite";
 import { findFirstKeptEntryId } from "./pi-historian-runner";
 
 export type PiMarkerUpdateOutcome =
-	| { kind: "applied"; firstKeptEntryId: string }
-	| { kind: "already-current" }
+	| { kind: "applied"; firstKeptEntryId: string; compactionId: string }
+	| { kind: "already-current"; firstKeptEntryId: string; compactionId: string }
 	| {
 			kind: "stale-skip";
 			reason: "compartment-removed" | "target-superseded" | "entry-removed";
@@ -69,14 +69,24 @@ export function applyDeferredPiCompactionMarker(
 			return { kind: "stale-skip", reason: "entry-removed" };
 		}
 
-		const latestFirstKept = findLatestCompactionFirstKept(branchEntries);
-		if (latestFirstKept !== null) {
+		const latestCompaction = findLatestCompaction(branchEntries);
+		if (latestCompaction !== null) {
 			const latestFirstKeptIndex = findEntryIndex(
 				branchEntries,
-				latestFirstKept,
+				latestCompaction.firstKeptEntryId,
 			);
 			if (latestFirstKeptIndex >= pendingFirstKeptIndex) {
-				return { kind: "already-current" };
+				if (latestCompaction.id === null) {
+					return {
+						kind: "retryable-failure",
+						error: new Error("Pi compaction entry has no id"),
+					};
+				}
+				return {
+					kind: "already-current",
+					firstKeptEntryId: latestCompaction.firstKeptEntryId,
+					compactionId: latestCompaction.id,
+				};
 			}
 		}
 
@@ -98,9 +108,9 @@ export function applyDeferredPiCompactionMarker(
 		}
 		sessionLog(
 			sessionId,
-			`Pi compaction-marker drain: applied compactionId=${compactionId} firstKept=${firstKeptEntryId} endMessageId=${pending.endMessageId} ordinal=${pending.ordinal} tokensBefore=${pending.tokensBefore}`,
+			`Pi compaction-marker drain: persisted compactionId=${compactionId} firstKept=${firstKeptEntryId} endMessageId=${pending.endMessageId} ordinal=${pending.ordinal} tokensBefore=${pending.tokensBefore}`,
 		);
-		return { kind: "applied", firstKeptEntryId };
+		return { kind: "applied", firstKeptEntryId, compactionId };
 	} catch (err) {
 		const error = err instanceof Error ? err : new Error(String(err));
 		sessionLog(
@@ -112,21 +122,34 @@ export function applyDeferredPiCompactionMarker(
 	}
 }
 
-export function findLatestCompactionFirstKept(
+function findLatestCompaction(
 	branchEntries: unknown[],
-): string | null {
+): { id: string | null; firstKeptEntryId: string } | null {
 	for (let i = branchEntries.length - 1; i >= 0; i--) {
 		const entry = branchEntries[i];
 		if (entry === null || typeof entry !== "object") continue;
-		const record = entry as { type?: unknown; firstKeptEntryId?: unknown };
+		const record = entry as {
+			type?: unknown;
+			id?: unknown;
+			firstKeptEntryId?: unknown;
+		};
 		if (
 			record.type === "compaction" &&
 			typeof record.firstKeptEntryId === "string"
 		) {
-			return record.firstKeptEntryId;
+			return {
+				id: typeof record.id === "string" ? record.id : null,
+				firstKeptEntryId: record.firstKeptEntryId,
+			};
 		}
 	}
 	return null;
+}
+
+export function findLatestCompactionFirstKept(
+	branchEntries: unknown[],
+): string | null {
+	return findLatestCompaction(branchEntries)?.firstKeptEntryId ?? null;
 }
 
 function getEntryId(entry: unknown): string | null {

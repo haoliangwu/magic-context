@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { log } from "@magic-context/core/shared/logger";
+import type { PiLkgSerializedOutput } from "./pi-lkg";
 
 export const PI_SERVED_ARRAY_TAIL_MESSAGES = 40;
 export const PI_SERVED_ARRAY_BODY_CAPTURE_ENV =
@@ -28,13 +29,15 @@ export interface PiServedArrayDigestRecord {
 
 interface PreviousPass {
 	digest: string;
-	serializedMessages: string[];
+	serializedMessages: readonly string[];
 }
 
 interface CaptureOptions {
 	storageDir?: string;
 	now?: Date;
 	fullBodyCapture?: boolean;
+	/** Only the detached serialization captured from these messages in this pass. */
+	serializedOutput?: PiLkgSerializedOutput;
 }
 
 const previousBySession = new Map<string, PreviousPass>();
@@ -43,6 +46,12 @@ const pendingLinesByPath = new Map<string, string[]>();
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 let swallowedWriteCount = 0;
 let lastWriteError: string | null = null;
+
+/** Release transcript-sized state without discarding already queued ledger rows. */
+export function clearPiServedArraySession(sessionId: string): void {
+	previousBySession.delete(sessionId);
+	sequenceBySession.delete(sessionId);
+}
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
@@ -185,8 +194,10 @@ export function capturePiServedArray(
 	options: CaptureOptions = {},
 ): PiServedArrayDigestRecord | undefined {
 	try {
-		const serializedMessages = messages.map(serializeMessage);
-		const serializedArray = `[${serializedMessages.join(",")}]`;
+		const serializedMessages =
+			options.serializedOutput?.jsonMessages ?? messages.map(serializeMessage);
+		const serializedArray =
+			options.serializedOutput?.json ?? `[${serializedMessages.join(",")}]`;
 		const digest = sha256(serializedArray);
 		const previous = previousBySession.get(sessionId);
 		const divergence = previous

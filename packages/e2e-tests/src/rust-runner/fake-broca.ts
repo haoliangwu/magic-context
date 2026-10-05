@@ -27,12 +27,30 @@ interface RunRecord {
     runId: string;
     sessionId: string;
     output: string;
+    /** A run holds its lineage until a terminal unit is delivered. Broca queues any
+     *  further send on a busy lineage instead of starting a second run. */
+    live: boolean;
+    /** Paused runs stay live: the lineage is still occupied by them. */
+    pauses: boolean;
 }
 
 const routeSessions = new Map<number, string>();
 const runs = new Map<string, RunRecord>();
 const latestRunBySession = new Map<string, string>();
+const queuedSubmissions = new Map<string, string>();
 let nextRun = 1;
+let nextSubmission = 1;
+
+/** A prompt carrying this marker parks its run instead of finishing it, the way the
+ *  real Broca parks a run whose provider credential needs attention. The run stays
+ *  the lineage's live run, so anything sent to the same lineage afterwards queues. */
+const PAUSE_MARKER = "hermetic-broca-pause-this-run";
+
+function liveRunForSession(sessionId: string): RunRecord | undefined {
+    const runId = latestRunBySession.get(sessionId);
+    const run = runId ? runs.get(runId) : undefined;
+    return run?.live ? run : undefined;
+}
 
 function log(message: string): void {
     process.stdout.write(`[broca] ${message}\n`);
@@ -90,7 +108,31 @@ function deterministicTitle(prompt: string, start: number, end: number): string 
     return `Hermetic Broca chunk ${start}-${end}`;
 }
 
+const CLASSIFY_POOL_HEADER = "### Memory pool to classify";
+
+function isClassifyPrompt(prompt: string): boolean {
+    return prompt.includes(CLASSIFY_POOL_HEADER);
+}
+
+/** Ids the classify prompt lists in its pool. Anything before the pool header is the
+ *  anchor block, whose ids must NOT appear in the manifest. */
+function classifyPoolIds(prompt: string): number[] {
+    const pool = prompt.slice(prompt.indexOf(CLASSIFY_POOL_HEADER));
+    return [...pool.matchAll(/^\[(\d+)\]\s/gm)].map((match) => Number(match[1]));
+}
+
+/** A well-formed classify manifest covering exactly the prompt's pool, with a spread of
+ *  importances so a caller can tell a real classification from a constant. */
+function deterministicClassifyManifest(prompt: string): string {
+    const entries = [...new Set(classifyPoolIds(prompt))].map(
+        (id, index) =>
+            `<memory id="${id}" importance="${20 + ((index * 7) % 70)}" scope="project" shareable="true"/>`,
+    );
+    return `<classify>\n${entries.join("\n")}\n</classify>`;
+}
+
 function deterministicOutput(prompt: string): string {
+    if (isClassifyPrompt(prompt)) return deterministicClassifyManifest(prompt);
     const { start, end } = ordinalRange(prompt);
     const title = deterministicTitle(prompt, start, end);
     const tierOne = `<p1>${title}</p1>`;
@@ -111,14 +153,16 @@ function event(run: RunRecord, unit: Record<string, unknown>): Uint8Array {
     return jsonBytes({ kind: "control", unit: { run_id: run.runId, ...unit } });
 }
 
+// The operation set Broca actually publishes. `session.delete` is deliberately absent:
+// the real module answers unknown_method for it, so a producer cannot purge a lineage.
 const manifest = managementSurfaceManifest({
     moduleId: MODULE_ID,
     operations: [
         { name: "session.send", kind: "mutate" },
         { name: "session.subscribe", kind: "query" },
+        { name: "session.retract", kind: "mutate" },
         { name: "run.status", kind: "query" },
         { name: "run.cancel", kind: "mutate" },
-        { name: "session.delete", kind: "mutate" },
     ],
 });
 
@@ -152,8 +196,26 @@ const provider = await SubcProvider.connect({
             const system = typeof params.system === "string" ? params.system : "";
             const prompt = typeof params.prompt === "string" ? params.prompt : "";
             if (!system || !prompt) throw new Error("session.send requires calibrated system and prompt fields");
+            // A lineage runs one episode at a time. A send that arrives while the lineage
+            // still holds a live run is durably QUEUED and answered with a submission id
+            // instead of a run id — the caller's prompt was accepted, not rejected.
+            const busy = liveRunForSession(sessionId);
+            if (busy) {
+                const submissionId = `broca-submission-${nextSubmission++}`;
+                queuedSubmissions.set(submissionId, sessionId);
+                log(
+                    `session.send queued submission_id=${submissionId} session=${sessionId} behind run_id=${busy.runId}`,
+                );
+                return jsonBytes({ result: { state: "pending", submission_id: submissionId } });
+            }
             const runId = `broca-run-${nextRun++}`;
-            const run: RunRecord = { runId, sessionId, output: deterministicOutput(prompt) };
+            const run: RunRecord = {
+                runId,
+                sessionId,
+                output: deterministicOutput(prompt),
+                live: true,
+                pauses: prompt.includes(PAUSE_MARKER),
+            };
             runs.set(runId, run);
             latestRunBySession.set(sessionId, runId);
             const truncationMarkers = (
@@ -162,7 +224,14 @@ const provider = await SubcProvider.connect({
             log(
                 `session.send run_id=${runId} session=${sessionId} system_bytes=${system.length} prompt_bytes=${prompt.length} truncation_markers=${truncationMarkers}`,
             );
-            return jsonBytes({ run_id: runId });
+            return jsonBytes({ result: { state: "active", run_id: runId } });
+        }
+        if (method === "session.retract") {
+            const submissionId =
+                typeof params.submission_id === "string" ? params.submission_id : "";
+            const known = queuedSubmissions.delete(submissionId);
+            log(`session.retract submission_id=${submissionId} known=${known}`);
+            return jsonBytes({ result: known ? "retracted" : "not_pending" });
         }
         if (method === "session.subscribe") {
             const sessionId = requestSession(handle);
@@ -171,27 +240,31 @@ const provider = await SubcProvider.connect({
             if (!run) throw new Error(`no historian run for session ${sessionId}`);
             log(`session.subscribe run_id=${run.runId} session=${sessionId}`);
             await ctx.emit(event(run, { type: "run_started" }));
+            if (run.pauses) {
+                // A paused run has not ended: it remains the lineage's live run, exactly
+                // as it does when the real Broca parks a run awaiting attention.
+                await ctx.emit(event(run, { type: "paused", reason: "hermetic pause" }));
+                return;
+            }
             await ctx.emit(event(run, {
                 type: "assistant_message",
                 message: { role: "assistant", content: [{ type: "text", text: run.output }] },
             }));
             await ctx.emit(event(run, { type: "run_finished" }));
+            run.live = false;
             return;
         }
         if (method === "run.status") {
             const runId = typeof params.run_id === "string" ? params.run_id : "";
-            if (!runs.has(runId)) return jsonBytes({ run_id: runId, state: "error", last_error: "unknown run" });
-            return jsonBytes({ run_id: runId, state: "completed" });
+            const run = runs.get(runId);
+            if (!run) return jsonBytes({ run_id: runId, state: "error", last_error: "unknown run" });
+            return jsonBytes({ run_id: runId, state: run.live ? "active" : "completed" });
         }
         if (method === "run.cancel") {
             const runId = typeof params.run_id === "string" ? params.run_id : "";
+            const run = runs.get(runId);
+            if (run) run.live = false;
             log(`run.cancel run_id=${runId}`);
-            return jsonBytes({ ok: true });
-        }
-        if (method === "session.delete") {
-            const sessionId = typeof params.session_id === "string" ? params.session_id : requestSession(handle);
-            for (const [runId, run] of runs) if (run.sessionId === sessionId) runs.delete(runId);
-            latestRunBySession.delete(sessionId);
             return jsonBytes({ ok: true });
         }
         throw new Error(`unsupported Broca method ${method ?? "<missing>"}`);

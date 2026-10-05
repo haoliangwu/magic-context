@@ -9,7 +9,8 @@
  * dotted path, type, default, and the `.describe()` text.
  *
  * Run: bun packages/plugin/scripts/build-config-docs.ts
- * Output: packages/docs/src/content/docs/reference/configuration.md
+ * Output: packages/docs/src/content/docs/reference/configuration.md and the
+ * live-key block in CONFIGURATION.md
  */
 
 import * as path from "node:path";
@@ -18,6 +19,7 @@ import { buildSchema } from "./build-schema";
 type JsonSchema = {
     type?: string | string[];
     description?: string;
+    "x-mc-live-reload"?: boolean;
     default?: unknown;
     enum?: unknown[];
     properties?: Record<string, JsonSchema>;
@@ -34,6 +36,7 @@ interface LeafRow {
     type: string;
     def: string;
     description: string;
+    live?: boolean;
 }
 
 // Type labels use a bare " | " between union members; the table renderer
@@ -83,6 +86,7 @@ function collectLeaves(schema: JsonSchema, prefix: string, rows: LeafRow[]): voi
             type: typeLabel(schema),
             def: defaultLabel(schema),
             description: schema.description ?? "",
+            live: schema["x-mc-live-reload"] === true,
         });
         return;
     }
@@ -106,6 +110,7 @@ function collectLeaves(schema: JsonSchema, prefix: string, rows: LeafRow[]): voi
                 type: typeLabel(child),
                 def: defaultLabel(child),
                 description: child.description ?? "",
+                live: child["x-mc-live-reload"] === true,
             });
         }
     }
@@ -182,7 +187,7 @@ function renderTable(rows: LeafRow[]): string {
     const body = rows
         .map(
             (r) =>
-                `| \`${r.path}\` | ${escapeCell(r.type)} | ${escapeCell(r.def)} | ${escapeCell(r.description)} |`,
+                 `| \`${r.path}\`${r.live ? " **Live**" : ""} | ${escapeCell(r.type)} | ${escapeCell(r.def)} | ${escapeCell(r.description)} |`,
         )
         .join("\n");
     return `${header}\n${body}`;
@@ -229,6 +234,7 @@ export function buildConfigDocs(): string {
                     type: typeLabel(child),
                     def: defaultLabel(child),
                     description: child.description ?? "",
+                    live: child["x-mc-live-reload"] === true,
                 });
             }
         }
@@ -265,6 +271,10 @@ Magic Context reads \`magic-context.jsonc\` (or \`.json\`) from one shared Corte
 
 Upgrading from an earlier version moves your existing config here automatically on first run (a \`.MOVED_READPLEASE\` breadcrumb is left at the old per-harness path).
 
+## Changing config without a restart
+
+Keys marked **Live** apply from the next historian or dreamer run (or dream-timer tick); a run already in progress keeps its original settings. Everything else requires a host restart. If a changed file is malformed, the last good configuration stays active and /ctx-status reports the error.
+
 Add the schema line for editor validation and autocomplete:
 
 \`\`\`jsonc
@@ -281,6 +291,30 @@ ${sections.join("\n\n")}
 `;
 }
 
+export function buildGitHubLiveKeys(current: string): string {
+    const schema = buildSchema() as JsonSchema;
+    const rows: LeafRow[] = [];
+    collectLeaves(schema, "", rows);
+    const lines = rows
+        .filter((row) => row.live)
+        .map((row) => `- \`${row.path}\``);
+    const start = "<!-- LIVE-CONFIG-KEYS-START -->";
+    const end = "<!-- LIVE-CONFIG-KEYS-END -->";
+    const before = current.indexOf(start);
+    const after = current.indexOf(end, before + start.length);
+    if (before < 0 || after < 0) throw new Error("GitHub live-key block is missing");
+    const existing = current.slice(before + start.length, after);
+    // Keep explanatory rows that are not bare live-key bullets alongside generated keys.
+    const annotated = existing.split("\n").filter((line) => /^- `[^`]+` \S/.test(line));
+    return (
+        current.slice(0, before + start.length) +
+        "\n" +
+        [...lines, ...annotated].sort().join("\n") +
+        "\n" +
+        current.slice(after)
+    );
+}
+
 async function main() {
     const rootDir = path.resolve(import.meta.dir, "..", "..", "..");
     const outputPath = path.join(
@@ -295,6 +329,9 @@ async function main() {
     );
     await Bun.write(outputPath, buildConfigDocs());
     console.log(`✓ Config reference generated: ${outputPath}`);
+    const githubPath = path.join(rootDir, "CONFIGURATION.md");
+    await Bun.write(githubPath, buildGitHubLiveKeys(await Bun.file(githubPath).text()));
+    console.log(`✓ GitHub live keys generated: ${githubPath}`);
 }
 
 if (import.meta.main) {

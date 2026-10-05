@@ -1,0 +1,166 @@
+{
+  "pooled": [
+    {
+      "variant": "C",
+      "replies": 160,
+      "textParts": 155,
+      "closed": 155,
+      "canonical": 155,
+      "correct": 155,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 155,
+      "proseReferences": 9,
+      "midTextNotation": 0
+    }
+  ],
+  "buckets": [
+    {
+      "variant": "C",
+      "bucket": "1",
+      "textParts": 7,
+      "closed": 7,
+      "canonical": 7,
+      "correct": 7,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 7,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "C",
+      "bucket": "2–5",
+      "textParts": 28,
+      "closed": 28,
+      "canonical": 28,
+      "correct": 28,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 28,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "C",
+      "bucket": "6–20",
+      "textParts": 101,
+      "closed": 101,
+      "canonical": 101,
+      "correct": 101,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 101,
+      "proseReferences": 7,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "C",
+      "bucket": ">20",
+      "textParts": 19,
+      "closed": 19,
+      "canonical": 19,
+      "correct": 19,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 19,
+      "proseReferences": 2,
+      "midTextNotation": 0
+    }
+  ],
+  "firstMixed": [
+    {
+      "variant": "C",
+      "scenario": "fresh",
+      "replicate": 1,
+      "session": "ses_f0c697af9ffesBxM5SUS7mUfRN",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Reading the fixture and listing the directory in parallel first.",
+      "identical": true
+    },
+    {
+      "variant": "C",
+      "scenario": "reduced",
+      "replicate": 1,
+      "session": "ses_f0c691d65ffe1tpRRbiiruHgIb",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Reading the fixture and listing the directory in parallel first.",
+      "identical": true
+    },
+    {
+      "variant": "C",
+      "scenario": "literal-head",
+      "replicate": 1,
+      "session": "ses_f0c68bf26ffe49CmalvP6tLOxd",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Starting with a parallel read and list, per your request.",
+      "identical": true
+    },
+    {
+      "variant": "C",
+      "scenario": "fresh",
+      "replicate": 2,
+      "session": "ses_f0c68653fffewLiYUKv8MscCZ0",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Starting with a parallel read and list.",
+      "identical": true
+    },
+    {
+      "variant": "C",
+      "scenario": "reduced",
+      "replicate": 2,
+      "session": "ses_f0c67f555ffeLQeksL8sEkEaJV",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Reading the fixture and listing the directory in parallel to start.",
+      "identical": true
+    },
+    {
+      "variant": "C",
+      "scenario": "literal-head",
+      "replicate": 2,
+      "session": "ses_f0c6796d2ffeWYgcM2p0GTBa5P",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Reading fixture.txt while listing the fixture directory in parallel first.",
+      "identical": true
+    },
+    {
+      "variant": "C",
+      "scenario": "reduced",
+      "replicate": 1,
+      "session": "ses_f0c60a4d0ffe5JyxT1v7RJJwpO",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Reading the fixture and listing the directory in parallel first.",
+      "identical": true
+    }
+  ],
+  "usage": {
+    "input": 979691,
+    "output": 5456,
+    "cacheHit": 898944,
+    "cacheMiss": 80747,
+    "reasoning": 0,
+    "reasoningUnknown": 160
+  },
+  "calls": 160,
+  "reasoning": {
+    "callsWithReasoning": 0,
+    "callsWithNotation": 0,
+    "exactReplayParts": 0,
+    "emptyReplays": 0,
+    "lengthLimits": []
+  },
+  "estimatedOffPeakUSD": 0.018082482,
+  "estimatedPeakUSD": 0.036164964
+}

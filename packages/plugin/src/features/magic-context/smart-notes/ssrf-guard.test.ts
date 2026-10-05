@@ -1,4 +1,5 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import * as https from "node:https";
 
 import {
@@ -186,6 +187,212 @@ describe("smart-note SSRF guard", () => {
     });
 });
 
+describe("smart-note redirects", () => {
+    const publicResolver = resolver([{ address: "93.184.216.34", family: 4 }]);
+
+    test("follows all supported redirects to a freshly resolved public address", async () => {
+        for (const status of [301, 302, 303, 307, 308]) {
+            const lookup = mock(async (hostname: string) => [
+                {
+                    address: hostname === "cdn.test" ? "1.1.1.1" : "93.184.216.34",
+                    family: 4 as const,
+                },
+            ]);
+            const contacted: string[] = [];
+            const result = await guardedSmartNoteHttpGet("https://registry.test/pkg", {
+                signal,
+                resolver: { lookup },
+                requestAddress: async (validation, candidate) => {
+                    contacted.push(`${validation.url.href} @ ${candidate.address}`);
+                    return validation.hostname === "registry.test"
+                        ? { status, body: "", location: "https://cdn.test/pkg.tgz" }
+                        : { status: 200, body: "tarball" };
+                },
+            });
+            expect(result).toEqual({ status: 200, body: "tarball" });
+            expect(contacted).toEqual([
+                "https://registry.test/pkg @ 93.184.216.34",
+                "https://cdn.test/pkg.tgz @ 1.1.1.1",
+            ]);
+            expect(lookup.mock.calls.map(([host]) => host)).toEqual(["registry.test", "cdn.test"]);
+        }
+    });
+
+    test("refuses redirect destinations with loopback, private, or link-local addresses", async () => {
+        for (const address of ["127.0.0.1", "10.0.0.1", "169.254.169.254"]) {
+            for (const destination of [address, "internal.test"]) {
+                const requestAddress = mock(async () => ({
+                    status: 302,
+                    body: "",
+                    location: `https://${destination}/secret`,
+                }));
+                await expect(
+                    guardedSmartNoteHttpGet("https://public.test/", {
+                        signal,
+                        resolver: {
+                            lookup: async (host) => [
+                                {
+                                    address: host === "internal.test" ? address : "93.184.216.34",
+                                    family: 4,
+                                },
+                            ],
+                        },
+                        requestAddress,
+                    }),
+                ).rejects.toThrow(/SMART_NOTE_SECURITY.*non-global|non-global\/internal/);
+                expect(requestAddress).toHaveBeenCalledTimes(1);
+            }
+        }
+    });
+
+    test("keeps HTTPS and credential restrictions on redirects", async () => {
+        for (const location of ["http://public.test/", "https://user:pass@public.test/"]) {
+            const requestAddress = mock(async () => ({ status: 301, body: "", location }));
+            await expect(
+                guardedSmartNoteHttpGet("https://public.test/", {
+                    signal,
+                    resolver: publicResolver,
+                    requestAddress,
+                }),
+            ).rejects.toThrow(/https|credentials/);
+            expect(requestAddress).toHaveBeenCalledTimes(1);
+        }
+    });
+
+    test("resolves relative Location against the current URL", async () => {
+        const urls: string[] = [];
+        const result = await guardedSmartNoteHttpGet("https://public.test/a/start", {
+            signal,
+            resolver: publicResolver,
+            requestAddress: async (validation) => {
+                urls.push(validation.url.href);
+                return urls.length === 1
+                    ? { status: 302, body: "", location: "../b/next?version=1" }
+                    : urls.length === 2
+                      ? { status: 307, body: "", location: "final" }
+                      : { status: 200, body: "ok" };
+            },
+        });
+        expect(result.body).toBe("ok");
+        expect(urls).toEqual([
+            "https://public.test/a/start",
+            "https://public.test/b/next?version=1",
+            "https://public.test/b/final",
+        ]);
+    });
+
+    test("allows five redirect hops but rejects six with SMART_NOTE_NETWORK", async () => {
+        for (const hops of [5, 6]) {
+            let calls = 0;
+            const result = await guardedSmartNoteHttpGet("https://public.test/", {
+                signal,
+                resolver: publicResolver,
+                requestAddress: async () =>
+                    ++calls <= hops
+                        ? { status: 308, body: "", location: `/hop-${calls}` }
+                        : { status: 200, body: "ok" },
+            }).catch((error) => error);
+            expect(calls).toBe(6);
+            if (hops === 5) expect(result).toEqual({ status: 200, body: "ok" });
+            else {
+                expect(result).toBeInstanceOf(SmartNoteNetworkError);
+                expect(result.message).toBe("SMART_NOTE_NETWORK: too many redirects");
+            }
+        }
+    });
+
+    test("names missing and invalid redirect Location errors", async () => {
+        for (const location of [undefined, "", "   ", "https://["]) {
+            await expect(
+                guardedSmartNoteHttpGet("https://public.test/", {
+                    signal,
+                    resolver: publicResolver,
+                    requestAddress: async () => ({ status: 302, body: "", location }),
+                }),
+            ).rejects.toThrow(/SMART_NOTE_NETWORK: (missing|invalid) redirect Location/);
+        }
+    });
+
+    test("shares the raw body byte ceiling across redirect responses", async () => {
+        const limits: number[] = [];
+        const error = await guardedSmartNoteHttpGet("https://public.test/", {
+            signal,
+            resolver: publicResolver,
+            bodyLimitBytes: 5,
+            requestAddress: async (_validation, _candidate, options) => {
+                limits.push(options.bodyLimitBytes);
+                return limits.length === 1
+                    ? { status: 302, body: "�", bytesRead: 2, location: "/final" }
+                    : { status: 200, body: "four" };
+            },
+        }).catch((error) => error);
+        expect(limits).toEqual([5, 3]);
+        expect(error).toBeInstanceOf(SmartNoteNetworkError);
+        expect(error.message).toMatch(/SMART_NOTE_NETWORK: response body too large/);
+    });
+
+    // These tests hang the slow step until the deadline aborts it, rather than
+    // racing fixed sleeps against a tight budget: on a loaded CI runner the
+    // sleeps alone overran a 40 ms budget before the redirect was requested.
+    test("the wall-clock deadline also covers DNS on a redirect hop", async () => {
+        let calls = 0;
+        let lookups = 0;
+        const error = await guardedSmartNoteHttpGet("https://public.test/", {
+            signal,
+            timeoutMs: 50,
+            resolver: {
+                lookup: async () => {
+                    lookups++;
+                    // The redirect target's DNS never answers.
+                    if (lookups > 1) await new Promise(() => {});
+                    return [{ address: "93.184.216.34", family: 4 }];
+                },
+            },
+            requestAddress: async () => {
+                calls++;
+                return { status: 302, body: "", location: "/final" };
+            },
+        }).catch((error) => error);
+        expect(calls).toBe(1);
+        expect(lookups).toBe(2);
+        expect(error).toBeInstanceOf(SmartNoteNetworkError);
+        expect(error.message).toBe("SMART_NOTE_NETWORK: request timed out");
+    });
+
+    test("one wall-clock budget spans DNS and every redirect request", async () => {
+        const budgets: number[] = [];
+        let chainSignal: AbortSignal | undefined;
+        const error = await guardedSmartNoteHttpGet("https://public.test/", {
+            signal,
+            timeoutMs: 500,
+            resolver: {
+                lookup: async () => {
+                    await Bun.sleep(20);
+                    return [{ address: "93.184.216.34", family: 4 }];
+                },
+            },
+            requestAddress: async (_validation, _candidate, options) => {
+                budgets.push(options.timeoutMs);
+                chainSignal = options.signal;
+                if (budgets.length === 1) return { status: 302, body: "", location: "/final" };
+                // The redirected request hangs until the shared deadline aborts it.
+                await new Promise((resolve) =>
+                    options.signal.addEventListener("abort", resolve, { once: true }),
+                );
+                return { status: 200, body: "late" };
+            },
+        }).catch((error) => error);
+        expect(budgets).toHaveLength(2);
+        // Two 20 ms lookups have already been spent, so the redirect gets what is
+        // left of the original budget, never a fresh one.
+        expect(budgets[1]).toBeLessThanOrEqual(500 - 40 + 1);
+        expect(budgets[1]).toBeLessThan(budgets[0] ?? 0);
+        expect(error).toBeInstanceOf(SmartNoteNetworkError);
+        expect(error.message).toBe("SMART_NOTE_NETWORK: request timed out");
+        expect(chainSignal?.aborted).toBe(true);
+    });
+});
+
 describe("createPinnedLookup", () => {
     // Regression: Node 20+ https.request defaults to autoSelectFamily
     // (Happy-Eyeballs), which calls the lookup hook with { all: true } and
@@ -227,6 +434,94 @@ describe("createPinnedLookup", () => {
 });
 
 describe("guarded HTTPS request agent", () => {
+    test("passes redirect Location and raw bytes from the pinned transport", async () => {
+        const response = Object.assign(new EventEmitter(), {
+            statusCode: 302,
+            headers: { location: "/cdn" },
+            destroy: () => {},
+        });
+        const request = Object.assign(new EventEmitter(), {
+            destroy: () => {},
+            end: () =>
+                queueMicrotask(() => {
+                    response.emit("data", Buffer.from([0xff]));
+                    response.emit("end");
+                }),
+        });
+        const spy = spyOn(https, "request").mockImplementation(((
+            options: https.RequestOptions,
+            callback: (response: typeof response) => void,
+        ) => {
+            expect(options.method).toBe("GET");
+            let pinned: unknown;
+            options.lookup!("public.test", {}, (_error, address) => {
+                pinned = address;
+            });
+            expect(pinned).toBe("1.1.1.1");
+            callback(response);
+            return request;
+        }) as typeof https.request);
+        try {
+            expect(
+                await requestValidatedAddress(
+                    {
+                        url: new URL("https://public.test/"),
+                        hostname: "public.test",
+                        addresses: [],
+                    },
+                    { address: "1.1.1.1", family: 4, classification: "global" },
+                    {
+                        signal,
+                        timeoutMs: 100,
+                        bodyLimitBytes: 10,
+                    },
+                ),
+            ).toEqual({ status: 302, body: "�", location: "/cdn", bytesRead: 1 });
+        } finally {
+            spy.mockRestore();
+        }
+    });
+    test("reports the URL and observed bytes at the hard body ceiling", async () => {
+        const response = new EventEmitter() as EventEmitter & {
+            statusCode: number;
+            destroy: () => void;
+        };
+        response.statusCode = 200;
+        response.destroy = () => {};
+        const request = new EventEmitter() as EventEmitter & {
+            end: () => void;
+            destroy: () => void;
+        };
+        request.destroy = () => {};
+        request.end = () => {
+            queueMicrotask(() => response.emit("data", Buffer.alloc(65_537)));
+        };
+        const spy = spyOn(https, "request").mockImplementation(((
+            _options: unknown,
+            callback: (response: typeof response) => void,
+        ) => {
+            callback(response);
+            return request;
+        }) as typeof https.request);
+        try {
+            const error = await requestValidatedAddress(
+                {
+                    url: new URL("https://example.test/CHANGELOG.md"),
+                    hostname: "example.test",
+                    addresses: [],
+                },
+                { address: "93.184.216.34", family: 4, classification: "global" },
+                { signal, timeoutMs: 100, bodyLimitBytes: 65_536 },
+            ).catch((caught: unknown) => caught);
+            expect(error).toBeInstanceOf(SmartNoteNetworkError);
+            expect(error.message).toMatch(
+                /example\.test\/CHANGELOG\.md \(received at least 65537 bytes; limit 65536\)/,
+            );
+            expect(error.persistent).toBe(true);
+        } finally {
+            spy.mockRestore();
+        }
+    });
     test("does not use a pre-seeded keep-alive global agent", async () => {
         // Intercept at addRequest: every request routed through an Agent must
         // enter addRequest, and it exists on every supported runtime — bun's

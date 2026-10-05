@@ -2,11 +2,13 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { computeProtectionWindow } from "../../features/magic-context/protection-window";
 import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import type { TagEntry } from "../../features/magic-context/types";
+import * as stableJson from "../../shared/stable-json";
 import { buildChannel1Reminder, decideChannel1 } from "./ctx-reduce-nudge";
 import * as formattingModule from "./read-session-formatting";
 import type { MessageLike } from "./tag-messages";
 import {
     assertTailHygieneContentUnchanged,
+    assertTailHygieneContentUnchangedIfEnabled,
     effectiveTailHygiene,
     measureTailHygiene,
     refreshTailHygieneBaseline,
@@ -604,9 +606,12 @@ describe("tail hygiene baseline and defer-window deltas", () => {
 
     it("ignores a Channel-1 reminder appended after the measured pass", () => {
         const original = nativeTool("owner", "call-reminder", { path: "x" }, "tool output");
+        // The newest message is never frozen, so the tool arc being tested needs a
+        // message after it to land inside the frozen prefix, where its delta is zero.
+        const newest = textMessage("newest", "newest turn");
         const tags = [tag(1, "call-reminder", "tool", { toolOwnerMessageId: "owner" })];
         const baseline = refreshTailHygieneBaseline({
-            messages: [original],
+            messages: [original, newest],
             tags,
             protectedTagNumbers: new Set(),
             cacheBusting: true,
@@ -615,7 +620,7 @@ describe("tail hygiene baseline and defer-window deltas", () => {
         const toolPart = mutated.parts[0] as { state: { output: string } };
         toolPart.state.output += buildChannel1Reminder("gentle", 25_000, 16);
         const defer = refreshTailHygieneBaseline({
-            messages: [mutated],
+            messages: [mutated, newest],
             tags,
             protectedTagNumbers: new Set(),
             cacheBusting: false,
@@ -624,12 +629,13 @@ describe("tail hygiene baseline and defer-window deltas", () => {
 
         expect(defer.evaluable).toBe(true);
         expect(defer.turnDeltaU).toBe(0);
-        expect(defer.turnDeltaT).toBe(0);
+        expect(defer.turnDeltaT).toBe(baseline.turnDeltaT);
         expect(effectiveTailHygiene(defer)).toEqual(effectiveTailHygiene(baseline));
     });
 
-    it("marks non-append mutation as generation-invalidated until a bust rewalk", () => {
-        const original = [textMessage("m", "original content")];
+    it("re-measures a non-append mutation on the defer pass that finds it", () => {
+        const newest = textMessage("newest", "newest turn");
+        const original = [textMessage("m", "original content"), newest];
         const tags = [tag(1, "m:p0", "message")];
         const baseline = refreshTailHygieneBaseline({
             messages: original,
@@ -637,7 +643,7 @@ describe("tail hygiene baseline and defer-window deltas", () => {
             protectedTagNumbers: new Set(),
             cacheBusting: true,
         });
-        const changed = [textMessage("m", "changed content")];
+        const changed = [textMessage("m", "changed content and then some"), newest];
         const defer = refreshTailHygieneBaseline({
             messages: changed,
             tags,
@@ -645,20 +651,33 @@ describe("tail hygiene baseline and defer-window deltas", () => {
             cacheBusting: false,
             previous: baseline,
         });
-        const rewalk = refreshTailHygieneBaseline({
+        const measured = measureTailHygiene({
             messages: changed,
             tags,
             protectedTagNumbers: new Set(),
-            cacheBusting: true,
+        });
+        const steady = refreshTailHygieneBaseline({
+            messages: changed,
+            tags,
+            protectedTagNumbers: new Set(),
+            cacheBusting: false,
             previous: defer,
         });
 
-        expect(defer.evaluable).toBe(false);
-        expect(defer.generationInvalidated).toBe(true);
-        expect(defer.baselineGeneration).toBe(baseline.baselineGeneration);
-        expect(rewalk.evaluable).toBe(true);
-        expect(rewalk.generationInvalidated).toBe(false);
-        expect(rewalk.baselineGeneration).toBe(baseline.baselineGeneration + 1);
+        // The mutation is detected and reported, then measured on this same pass
+        // instead of being held until the next cache-busting pass.
+        expect(defer.lastPrefixMismatch).toMatchObject({
+            partIndex: 0,
+            messageId: "m",
+            field: "contentHash",
+        });
+        expect(defer.evaluable).toBe(true);
+        expect(defer.generationInvalidated).toBe(false);
+        expect(defer.baselineGeneration).toBe(baseline.baselineGeneration + 1);
+        expect(effectiveTailHygiene(defer)).toEqual({ u: measured.u, t: measured.t });
+        // One invalidation event, one diagnostic: the next quiet pass reports none.
+        expect(steady.lastPrefixMismatch).toBeUndefined();
+        expect(steady.baselineGeneration).toBe(defer.baselineGeneration);
     });
 
     it("detects a byte mutation after the walk with a content-hash assertion", () => {
@@ -760,6 +779,50 @@ describe("tail hygiene image content memoization", () => {
         }
     });
 
+    it("calibrates the Fable tool-only hygiene floors and reminder figures", () => {
+        const tokenizer = spyOn(formattingModule, "estimateTokens").mockImplementation((content) =>
+            content.startsWith("fable-output-") ? 10_000 : 0,
+        );
+        try {
+            const messages = [1, 2, 3, 4].map((number) =>
+                nativeTool(
+                    `fable-owner-${number}`,
+                    `fable-call-${number}`,
+                    {},
+                    `fable-output-${number}`,
+                ),
+            );
+            const tags = [1, 2, 3, 4].map((number) =>
+                tag(number, `fable-call-${number}`, "tool", {
+                    toolOwnerMessageId: `fable-owner-${number}`,
+                }),
+            );
+            const baseline = refreshTailHygieneBaseline({
+                messages,
+                tags,
+                protectedTagNumbers: new Set([3, 4]),
+                cacheBusting: true,
+                calibration: { toolsRatio: 1.551639, proseRatio: 1.571778 },
+                hygieneUnitsVersion: 2,
+            });
+            const effective = effectiveTailHygiene(baseline);
+            const decision = decideChannel1({
+                ...baseline,
+                lastNudgeUndropped: 0,
+                lastNudgeLevel: "",
+                hasRecentReduce: false,
+            });
+
+            expect(effective).toEqual({ u: 31_033, t: 62_066 });
+            expect(decision).toMatchObject({ fire: true, band: "firm", level: "firm" });
+            expect(buildChannel1Reminder("firm", effective.u, 4)).toContain(
+                "4 spent tool outputs (~31k tokens)",
+            );
+        } finally {
+            tokenizer.mockRestore();
+        }
+    });
+
     it("caches a genuine zero and keeps excluded content out of the tokenizer", () => {
         const zeroContent = "opencode-zero-token-fixture";
         const excludedContent = "opencode-excluded-fixture";
@@ -793,12 +856,60 @@ describe("tail hygiene image content memoization", () => {
 });
 
 describe("tail hygiene walk performance", () => {
+    it("tokenizes each rendered character exactly once, whatever the rendered size", () => {
+        // This is the load-invariant half of the linear-cost claim, and it is the one
+        // that always runs. "One pass over the rendered text" is a statement about
+        // WORK, not about elapsed time: the walk must hand every rendered character to
+        // the tokenizer exactly once and must not re-scan the text as it grows. Both
+        // of those are exact counts, so a busy machine cannot change the answer — a
+        // wall-clock ratio can be moved by a single scheduler stall, which is how the
+        // ratio form of this test kept reading red on shared runners (10.66ms against
+        // a 10.31ms bound derived from a 1.29ms small sample).
+        //
+        // A regression that re-read the text per tag, per part, or per pass would show
+        // up here as more calls or more characters, at any load.
+        const tags = [tag(1, "perf:p0", "message")];
+        const workAt = (tokens: number, marker: string) => {
+            // The walk memoizes token counts by content, so each size needs content no
+            // earlier measurement can have cached.
+            const text = `${marker} ${"token ".repeat(tokens)}`;
+            const messages = [textMessage("perf", text)];
+            let calls = 0;
+            let charactersTokenized = 0;
+            const tokenizer = spyOn(formattingModule, "estimateTokens").mockImplementation(
+                (content: string) => {
+                    calls += 1;
+                    charactersTokenized += content.length;
+                    return content.length;
+                },
+            );
+            try {
+                measureTailHygiene({ messages, tags, protectedTagNumbers: new Set() });
+            } finally {
+                tokenizer.mockRestore();
+            }
+            return { calls, charactersTokenized, rendered: text.length };
+        };
+        const small = workAt(50_000, "tail-hygiene-walk-cost-50k");
+        const large = workAt(250_000, "tail-hygiene-walk-cost-250k");
+
+        expect(small.calls).toBe(1);
+        expect(large.calls).toBe(1);
+        expect(small.charactersTokenized).toBe(small.rendered);
+        expect(large.charactersTokenized).toBe(large.rendered);
+        // Five times the text, five times the work, to the character.
+        expect(large.charactersTokenized * small.rendered).toBe(
+            small.charactersTokenized * large.rendered,
+        );
+    });
+
     it("scales linearly with rendered size (250k tokens cost at most ~5x 50k)", () => {
-        // The walk is one pass over the rendered text, so its cost must grow with the
-        // text and nothing else. A flat wall-clock cap read red under parallel test
-        // load (155ms once on a release gate at load 30 versus 1–3ms quiet), so the
-        // primary assertion is the size ratio measured in the same process; the
-        // absolute cap stays as a belt only when the environment asks for it.
+        // The wall-clock form of the same claim. Even measured as same-process medians
+        // the ratio starves on a loaded shared runner: the 50k sample is small enough
+        // (1–3ms) that one scheduler stall in the 250k sample moves the ratio past any
+        // honest bound. So the bound is asserted only where wall-clock budgets mean
+        // something and recorded otherwise; the count-based test above carries the
+        // invariant everywhere else.
         const tags = [tag(1, "perf:p0", "message")];
         const timeAt = (tokens: number): number => {
             const messages = [textMessage("perf", "token ".repeat(tokens))];
@@ -814,8 +925,10 @@ describe("tail hygiene walk performance", () => {
         const small = timeAt(50_000);
         const large = timeAt(250_000);
         console.log(`tail-hygiene-walk p50: 50k=${small.toFixed(3)}ms 250k=${large.toFixed(3)}ms`);
-        expect(large).toBeLessThan(Math.max(small, 0.2) * 8);
-        if (process.env.MC_PERF_GATE) expect(large).toBeLessThan(30);
+        if (process.env.MC_PERF_GATE) {
+            expect(large).toBeLessThan(Math.max(small, 0.2) * 8);
+            expect(large).toBeLessThan(30);
+        }
     });
 });
 
@@ -933,5 +1046,172 @@ describe("tail hygiene protectedTagNumbers set form (token window)", () => {
         // Non-tool message tag 5 has its eligibility decided solely by independent protections (prose text)
         const msgPart = measured.parts.find((p) => p.tagNumber === 5);
         expect(msgPart?.kind).toBe("text");
+    });
+});
+
+describe("tail baseline replay memo", () => {
+    it("reuses unchanged message content on append while detecting historical in-place edits", () => {
+        const messages = [
+            nativeTool(
+                "incremental-owner",
+                "incremental-call",
+                { path: "original-path" },
+                "original output",
+            ),
+            textMessage("incremental-newest", "old newest"),
+        ];
+        const tags = [
+            tag(101, "incremental-call", "tool", { toolOwnerMessageId: "incremental-owner" }),
+        ];
+        const input = { messages, tags, protectedTagNumbers: new Set<number>() };
+        let previous = refreshTailHygieneBaseline({ ...input, cacheBusting: true });
+        const serialize = spyOn(stableJson, "stableStringify");
+        try {
+            messages.push(textMessage("incremental-appended", "appended tail"));
+            previous = refreshTailHygieneBaseline({ ...input, previous, cacheBusting: false });
+            expect(serialize).not.toHaveBeenCalled();
+            expect(previous.contentSignature).toBe(measureTailHygiene(input).contentSignature);
+            (messages[0].parts[0] as { state: { input: { path: string } } }).state.input.path =
+                "ORIGINAL-path";
+            const edited = refreshTailHygieneBaseline({ ...input, previous, cacheBusting: false });
+            expect(edited.lastPrefixMismatch?.messageId).toBe("incremental-owner");
+            expect(edited.contentSignature).toBe(measureTailHygiene(input).contentSignature);
+            expect(effectiveTailHygiene(edited)).toEqual({
+                u: measureTailHygiene(input).u,
+                t: measureTailHygiene(input).t,
+            });
+        } finally {
+            serialize.mockRestore();
+        }
+    });
+
+    it("rechecks cross-message ownership and paired drop sentinels on replay", () => {
+        const messages = [
+            message("arc-owner", "assistant", [
+                { type: "tool_use", id: "arc", input: { command: "read" } },
+            ]),
+            textMessage("arc-middle", "middle"),
+        ];
+        const tags = [tag(102, "arc", "tool", { toolOwnerMessageId: "arc-owner" })];
+        const input = { messages, tags, protectedTagNumbers: new Set<number>() };
+        const previous = refreshTailHygieneBaseline({ ...input, cacheBusting: true });
+        messages.push(
+            message("arc-result", "user", [
+                { type: "tool_result", tool_use_id: "arc", content: "[dropped §102§]" },
+            ]),
+        );
+        const changed = refreshTailHygieneBaseline({ ...input, previous, cacheBusting: false });
+        const fresh = measureTailHygiene(input);
+        expect(changed.contentSignature).toBe(fresh.contentSignature);
+        expect(effectiveTailHygiene(changed)).toEqual({ u: fresh.u, t: fresh.t });
+        expect(changed.lastPrefixMismatch?.messageId).toBe("arc-owner");
+    });
+
+    it("requires the explicit debug flag for content assertions regardless of NODE_ENV", () => {
+        const previousDebug = process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
+        const previousNodeEnv = process.env.NODE_ENV;
+        const input = {
+            messages: [textMessage("debug-guard", "content")],
+            tags: [],
+            protectedTagNumbers: new Set<number>(),
+            expectedSignature: "wrong",
+        };
+        try {
+            process.env.NODE_ENV = "test";
+            delete process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
+            expect(() => assertTailHygieneContentUnchangedIfEnabled(input)).not.toThrow();
+            process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS = "0";
+            expect(() => assertTailHygieneContentUnchangedIfEnabled(input)).not.toThrow();
+            process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS = "1";
+            process.env.NODE_ENV = "production";
+            expect(() => assertTailHygieneContentUnchangedIfEnabled(input)).toThrow(
+                "tail hygiene walk was not the last byte-affecting operation",
+            );
+        } finally {
+            if (previousDebug === undefined) delete process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS;
+            else process.env.MAGIC_CONTEXT_DEBUG_ASSERTIONS = previousDebug;
+            if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+            else process.env.NODE_ENV = previousNodeEnv;
+        }
+    });
+
+    it("reuses exact replay measurements without serializing tool input again", () => {
+        const input = {
+            messages: [
+                nativeTool("memo-owner", "memo-call", { path: "unique-memo-path" }, "memo output"),
+                textMessage("memo-newest", "newest turn"),
+            ],
+            tags: [tag(1, "memo-call", "tool", { toolOwnerMessageId: "memo-owner" })],
+            protectedTagNumbers: new Set<number>(),
+            cacheBusting: false,
+        };
+        const first = refreshTailHygieneBaseline(input);
+        const serialize = spyOn(stableJson, "stableStringify");
+        try {
+            const replay = refreshTailHygieneBaseline({
+                ...structuredClone(input),
+                previous: first,
+            });
+            expect(replay).toEqual(first);
+            expect(serialize).not.toHaveBeenCalled();
+            const changed = structuredClone(input);
+            (
+                changed.messages[0].parts[0] as { state: { input: { path: string } } }
+            ).state.input.path = "unique-memo-PATh";
+            const invalidated = refreshTailHygieneBaseline({ ...changed, previous: replay });
+            expect(invalidated.lastPrefixMismatch?.messageId).toBe("memo-owner");
+            expect(invalidated.baselineGeneration).toBe(first.baselineGeneration + 1);
+            expect(invalidated.contentSignature).not.toBe(first.contentSignature);
+            expect(serialize).toHaveBeenCalled();
+        } finally {
+            serialize.mockRestore();
+        }
+    });
+
+    it("invalidates memo attribution on pending-drop, protection and tag changes", () => {
+        const input = {
+            messages: [
+                nativeTool(
+                    "memo-owner-2",
+                    "memo-call-2",
+                    { path: "file" },
+                    "large output ".repeat(200),
+                ),
+                textMessage("memo-newest-2", "newest turn"),
+            ],
+            tags: [tag(2, "memo-call-2", "tool", { toolOwnerMessageId: "memo-owner-2" })],
+            protectedTagNumbers: new Set<number>(),
+            cacheBusting: false,
+        };
+        const first = refreshTailHygieneBaseline(input);
+        expect(effectiveTailHygiene(first).u).toBeGreaterThan(0);
+        const queued = refreshTailHygieneBaseline({
+            ...input,
+            previous: first,
+            pendingDropTagNumbers: new Set([2]),
+        });
+        expect(effectiveTailHygiene(queued).u).toBe(0);
+        const unqueued = refreshTailHygieneBaseline({ ...input, previous: queued });
+        expect(effectiveTailHygiene(unqueued).u).toBe(effectiveTailHygiene(first).u);
+        // Protection entering a frozen part and a tag leaving active are both
+        // unattributable on a defer pass: each is named, then re-measured.
+        const protectedReplay = refreshTailHygieneBaseline({
+            ...input,
+            previous: unqueued,
+            protectedTagNumbers: new Set([2]),
+        });
+        expect(protectedReplay.lastPrefixMismatch?.field).toBe("protection-entered");
+        expect(effectiveTailHygiene(protectedReplay).u).toBe(0);
+        input.tags[0].status = "dropped";
+        const dropped = refreshTailHygieneBaseline({ ...input, previous: first });
+        expect(dropped.lastPrefixMismatch?.field).toBe("tagStatus");
+        expect(dropped.baselineGeneration).toBe(first.baselineGeneration + 1);
+        const rebuilt = refreshTailHygieneBaseline({
+            ...input,
+            previous: dropped,
+            cacheBusting: true,
+        });
+        expect(rebuilt.generationInvalidated).toBe(false);
+        expect(effectiveTailHygiene(rebuilt).u).toBe(0);
     });
 });

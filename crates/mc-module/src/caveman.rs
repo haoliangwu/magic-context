@@ -1,9 +1,12 @@
 //! Deterministic caveman-style text compression.
 //!
-//! This is a byte-for-byte Rust port of
+//! This is a byte-for-byte Rust port of the current ("unicode-v2") rules of
 //! `packages/plugin/src/hooks/magic-context/caveman.ts`. Keep the transformation
-//! order and ASCII word-boundary rules aligned with that source: the committed
-//! differential fixture is the compatibility contract.
+//! order, the Unicode word characters and JavaScript's whitespace set aligned with
+//! that source: the committed differential fixture is the compatibility contract.
+//! The TypeScript side also keeps the original ASCII rules for replay of sessions
+//! compressed before; the module never re-derives a frozen payload, so it needs
+//! only the current rules.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -123,8 +126,40 @@ const ULTRA_ABBREVIATIONS: &[(&str, &str)] = &[
     ("directory", "dir"),
 ];
 
-fn is_ascii_word(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
+/// JavaScript's `\s`: Unicode `White_Space` without U+0085, plus U+FEFF. The TypeScript oracle
+/// matches whitespace with `\s`, so Rust's `char::is_whitespace` (which differs on exactly those
+/// two characters) is never used here.
+fn is_js_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
+}
+
+/// JavaScript `\s` without the line feed: whitespace a rule may consume without merging lines.
+fn is_horizontal_space(ch: char) -> bool {
+    ch != '\n' && is_js_whitespace(ch)
+}
+
+/// A word character: a letter, combining mark or number of any script, or `_`. This matches the
+/// TypeScript class `[\p{L}\p{M}\p{N}_]`; an ASCII-only definition reads the final "a" of
+/// "día" as a separate word.
+fn is_word(ch: char) -> bool {
+    if ch.is_ascii() {
+        return ch.is_ascii_alphanumeric() || ch == '_';
+    }
+    static NON_ASCII_WORD: OnceLock<Regex> = OnceLock::new();
+    let mut buffer = [0; 4];
+    NON_ASCII_WORD
+        .get_or_init(|| Regex::new(r"^[\p{L}\p{M}\p{N}]$").unwrap())
+        .is_match(ch.encode_utf8(&mut buffer))
 }
 
 fn previous_char(text: &str, offset: usize) -> Option<char> {
@@ -136,11 +171,18 @@ fn next_char(text: &str, offset: usize) -> Option<char> {
 }
 
 fn has_word_boundary_before(text: &str, offset: usize) -> bool {
-    !previous_char(text, offset).is_some_and(is_ascii_word)
+    !previous_char(text, offset).is_some_and(is_word)
 }
 
 fn has_word_boundary_after(text: &str, offset: usize) -> bool {
-    !next_char(text, offset).is_some_and(is_ascii_word)
+    !next_char(text, offset).is_some_and(is_word)
+}
+
+fn skip_horizontal_space(text: &str, mut offset: usize) -> usize {
+    while let Some(ch) = next_char(text, offset).filter(|ch| is_horizontal_space(*ch)) {
+        offset += ch.len_utf8();
+    }
+    offset
 }
 
 fn ascii_eq_at(text: &str, offset: usize, needle: &str) -> bool {
@@ -181,9 +223,9 @@ fn protect_identifier_regions(text: &str, preserved: &mut Vec<PreservedRegion>) 
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     for matched in regex.find_iter(text) {
-        if !has_word_boundary_before(text, matched.start())
-            || !has_word_boundary_after(text, matched.end())
-        {
+        // Only the start needs a boundary: `msg_abc_def` protects `msg_abc`, as the TypeScript
+        // pattern does.
+        if !has_word_boundary_before(text, matched.start()) {
             continue;
         }
         output.push_str(&text[cursor..matched.start()]);
@@ -244,7 +286,13 @@ fn protect_regions(text: &str) -> (String, Vec<PreservedRegion>) {
     );
     working = protect_regex(
         &working,
-        URL.get_or_init(|| Regex::new(r"https?://\S+").unwrap()),
+        // JavaScript `\S`: a URL ends at U+FEFF but runs through U+0085.
+        URL.get_or_init(|| {
+            Regex::new(
+                r"https?://[^\t\n\x0B\x0C\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]+",
+            )
+            .unwrap()
+        }),
         &mut preserved,
     );
     working = protect_regex(
@@ -265,38 +313,115 @@ fn protect_regions(text: &str) -> (String, Vec<PreservedRegion>) {
     (working, preserved)
 }
 
-fn restore_regions(text: &str, preserved: &[PreservedRegion]) -> String {
-    let mut working = text.to_string();
-    for region in preserved.iter().rev() {
-        working = working.replace(&region.placeholder, &region.original);
+/// Restore placeholders to their original content.
+///
+/// A preserved region can contain placeholders of regions protected before it (a URL that
+/// swallowed inline code), never of later ones, so expanding each placeholder recursively in one
+/// pass gives the same text as replacing them one region at a time from the last to the first,
+/// without rescanning the whole text once per region. That holds only while every NUL in the
+/// text belongs to a placeholder; a source that already contains NUL characters takes the
+/// region-at-a-time path so its output stays byte-identical to the TypeScript oracle.
+fn restore_regions(text: &str, preserved: &[PreservedRegion], source_has_nul: bool) -> String {
+    if preserved.is_empty() {
+        return text.to_string();
     }
-    working
+    if source_has_nul {
+        let mut working = text.to_string();
+        for region in preserved.iter().rev() {
+            working = working.replace(&region.placeholder, &region.original);
+        }
+        return working;
+    }
+    let mut expanded: Vec<Option<String>> = vec![None; preserved.len()];
+    let mut output = String::with_capacity(text.len());
+    expand_placeholders(text, preserved, &mut expanded, &mut output);
+    output
 }
 
+/// Parse a placeholder `\0MC_PRES_<index>\0` at the start of `text`, returning the region index
+/// and the placeholder's byte length.
+fn placeholder_at(text: &str) -> Option<(usize, usize)> {
+    const OPEN: &str = "\u{0}MC_PRES_";
+    let rest = text.strip_prefix(OPEN)?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || rest.as_bytes().get(digits) != Some(&0) {
+        return None;
+    }
+    let index = rest[..digits].parse::<usize>().ok()?;
+    Some((index, OPEN.len() + digits + 1))
+}
+
+fn expand_placeholders(
+    text: &str,
+    preserved: &[PreservedRegion],
+    expanded: &mut Vec<Option<String>>,
+    output: &mut String,
+) {
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find('\0') {
+        let start = cursor + offset;
+        output.push_str(&text[cursor..start]);
+        match placeholder_at(&text[start..]).filter(|(index, _)| *index < preserved.len()) {
+            Some((index, length)) => {
+                if expanded[index].is_none() {
+                    let mut restored = String::with_capacity(preserved[index].original.len());
+                    expand_placeholders(
+                        &preserved[index].original,
+                        preserved,
+                        expanded,
+                        &mut restored,
+                    );
+                    expanded[index] = Some(restored);
+                }
+                output.push_str(expanded[index].as_deref().unwrap_or_default());
+                cursor = start + length;
+            }
+            None => {
+                output.push('\0');
+                cursor = start + 1;
+            }
+        }
+    }
+    output.push_str(&text[cursor..]);
+}
+
+/// Drop every phrase of a list without merging lines. In order of preference at each position:
+/// at the start of a line, keep the indentation and drop the phrases there together with the
+/// spaces after each; after spaces, drop the spaces and the phrase; anywhere else, drop just the
+/// phrase. Mirrors `buildUnicodePhraseDropRegex` in caveman.ts.
 fn drop_phrases(text: &str, phrases: &[&str]) -> String {
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     while cursor < text.len() {
-        if text[cursor..]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace)
-        {
-            let mut phrase_start = cursor;
-            while phrase_start < text.len()
-                && next_char(text, phrase_start).is_some_and(char::is_whitespace)
-            {
-                phrase_start += next_char(text, phrase_start).unwrap().len_utf8();
+        if cursor == 0 || text.as_bytes()[cursor - 1] == b'\n' {
+            let indentation_end = skip_horizontal_space(text, cursor);
+            let mut end = indentation_end;
+            while let Some(phrase) = find_phrase_at(text, end, phrases) {
+                end = skip_horizontal_space(text, end + phrase.len());
             }
-            if let Some(phrase) = find_phrase_at(text, phrase_start, phrases) {
-                cursor = phrase_start + phrase.len();
+            if end > indentation_end {
+                output.push_str(&text[cursor..indentation_end]);
+                cursor = end;
                 continue;
             }
-        } else if let Some(phrase) = find_phrase_at(text, cursor, phrases) {
+        }
+        let ch = next_char(text, cursor).expect("cursor is on a character boundary");
+        if is_horizontal_space(ch) {
+            let run_end = skip_horizontal_space(text, cursor);
+            if let Some(phrase) = find_phrase_at(text, run_end, phrases) {
+                cursor = run_end + phrase.len();
+            } else {
+                // Every later start inside this run reaches the same miss, so keep the whole run
+                // instead of rescanning its rest from each character (quadratic on long runs).
+                output.push_str(&text[cursor..run_end]);
+                cursor = run_end;
+            }
+            continue;
+        }
+        if let Some(phrase) = find_phrase_at(text, cursor, phrases) {
             cursor += phrase.len();
             continue;
         }
-        let ch = next_char(text, cursor).expect("cursor is on a character boundary");
         output.push(ch);
         cursor += ch.len_utf8();
     }
@@ -323,13 +448,10 @@ fn drop_articles(text: &str) -> String {
                 ""
             };
             if !word.is_empty() && has_word_boundary_after(text, cursor + word.len()) {
-                let mut end = cursor + word.len();
-                if end < text.len() && next_char(text, end).is_some_and(char::is_whitespace) {
-                    while end < text.len() && next_char(text, end).is_some_and(char::is_whitespace)
-                    {
-                        end += next_char(text, end).unwrap().len_utf8();
-                    }
-                    cursor = end;
+                let end = cursor + word.len();
+                let space_end = skip_horizontal_space(text, end);
+                if space_end > end {
+                    cursor = space_end;
                     continue;
                 }
             }
@@ -361,18 +483,36 @@ fn matches_participle(text: &str, offset: usize) -> bool {
     let mut end = offset;
     while end < text.len() {
         let ch = next_char(text, end).unwrap();
-        if !is_ascii_word(ch) {
+        if !is_word(ch) {
             break;
         }
         end += ch.len_utf8();
     }
-    if end == offset || !has_word_boundary_after(text, end) {
-        return false;
-    }
     let token = &text[offset..end].to_ascii_lowercase();
+    // The suffix must follow at least one character: a bare "ed" or "ing" is not a participle.
     ["ed", "en", "ing", "ized", "ised"]
         .iter()
-        .any(|suffix| token.ends_with(suffix))
+        .any(|suffix| token.len() > suffix.len() && token.ends_with(suffix))
+}
+
+/// Match an auxiliary at `offset`, its words separated by any horizontal space as in the
+/// TypeScript `has[^\S\n]+been`, and return its end.
+fn match_auxiliary_at(text: &str, offset: usize, auxiliary: &str) -> Option<usize> {
+    let mut cursor = offset;
+    for (index, word) in auxiliary.split(' ').enumerate() {
+        if index > 0 {
+            let space_end = skip_horizontal_space(text, cursor);
+            if space_end == cursor {
+                return None;
+            }
+            cursor = space_end;
+        }
+        if !ascii_eq_at(text, cursor, word) {
+            return None;
+        }
+        cursor += word.len();
+    }
+    has_word_boundary_after(text, cursor).then_some(cursor)
 }
 
 fn drop_auxiliaries(text: &str) -> String {
@@ -385,37 +525,24 @@ fn drop_auxiliaries(text: &str) -> String {
         let Some(ch) = next_char(text, cursor) else {
             break;
         };
-        if ch.is_whitespace() {
-            let mut whitespace_end = cursor;
-            while whitespace_end < text.len()
-                && next_char(text, whitespace_end).is_some_and(char::is_whitespace)
-            {
-                whitespace_end += next_char(text, whitespace_end).unwrap().len_utf8();
-            }
-            let Some(aux) = auxiliaries.iter().find(|aux| {
-                ascii_eq_at(text, whitespace_end, aux)
-                    && has_word_boundary_before(text, whitespace_end)
-                    && has_word_boundary_after(text, whitespace_end + aux.len())
-            }) else {
-                output.push_str(&text[cursor..whitespace_end]);
-                cursor = whitespace_end;
+        if is_horizontal_space(ch) {
+            let space_end = skip_horizontal_space(text, cursor);
+            let Some(aux_end) = auxiliaries
+                .iter()
+                .find_map(|aux| match_auxiliary_at(text, space_end, aux))
+            else {
+                output.push_str(&text[cursor..space_end]);
+                cursor = space_end;
                 continue;
             };
-            let mut aux_end = whitespace_end + aux.len();
-            if aux_end >= text.len() || !next_char(text, aux_end).is_some_and(char::is_whitespace) {
-                output.push_str(&text[cursor..aux_end]);
-                cursor = aux_end;
-                continue;
-            }
-            while aux_end < text.len() && next_char(text, aux_end).is_some_and(char::is_whitespace)
-            {
-                aux_end += next_char(text, aux_end).unwrap().len_utf8();
-            }
-            if matches_participle(text, aux_end) {
+            let verb_start = skip_horizontal_space(text, aux_end);
+            if verb_start > aux_end && matches_participle(text, verb_start) {
                 output.push(' ');
-                cursor = aux_end;
+                cursor = verb_start;
                 continue;
             }
+            // Keep the auxiliary but not the space after it: that space can start the next match
+            // ("is is fixed" drops the second "is").
             output.push_str(&text[cursor..aux_end]);
             cursor = aux_end;
             continue;
@@ -449,7 +576,7 @@ fn replace_literal_phrase(text: &str, phrase: &str, replacement: &str) -> String
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     while cursor < text.len() {
-        if text[cursor..].starts_with(phrase) {
+        if ascii_eq_at(text, cursor, phrase) {
             output.push_str(replacement);
             cursor += phrase.len();
         } else {
@@ -583,13 +710,25 @@ fn normalize_whitespace(text: &str) -> String {
     output
 }
 
-/// Compress `text` using the same deterministic rules as the TypeScript oracle.
+/// Compress `text` using the same deterministic rules as the TypeScript oracle, with the English
+/// word rules.
 pub fn compress(text: &str, level: CavemanLevel) -> String {
+    compress_with(text, level, true)
+}
+
+/// Compress `text`; without `english_word_rules` only the language-neutral passes run (region
+/// protection, whitespace normalization and trimming), the same at every level. The English
+/// word lists rewrite real words of other languages ("quite" is Spanish for "remove", "a" is a
+/// Spanish preposition). Mirrors `cavemanCompress(..., wordRules)` in caveman.ts.
+pub fn compress_with(text: &str, level: CavemanLevel, english_word_rules: bool) -> String {
     if text.is_empty() {
         return text.to_string();
     }
     let (protected_text, preserved) = protect_regions(text);
     let transformed = transform_preserving_user_lines(&protected_text, |chunk| {
+        if !english_word_rules {
+            return chunk.to_string();
+        }
         let mut working = drop_phrases(chunk, FILLER_WORDS);
         working = drop_phrases(&working, HEDGING_PHRASES);
         working = drop_phrases(&working, PLEASANTRIES);
@@ -604,9 +743,15 @@ pub fn compress(text: &str, level: CavemanLevel) -> String {
         }
         working
     });
-    normalize_whitespace(&restore_regions(&transformed, &preserved))
-        .trim()
-        .to_string()
+    // Normalize while the protected regions are still placeholders, so fenced code keeps its
+    // indentation. No region starts or ends with whitespace, so trimming here equals trimming the
+    // restored text.
+    let normalized = normalize_whitespace(&transformed);
+    restore_regions(
+        normalized.trim_matches(is_js_whitespace),
+        &preserved,
+        text.contains('\0'),
+    )
 }
 
 #[cfg(test)]
@@ -647,5 +792,101 @@ mod tests {
                 case.text
             );
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LanguageGolden {
+        cases: Vec<LanguageCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LanguageCase {
+        text: String,
+        neutral: String,
+    }
+
+    #[test]
+    fn language_neutral_golden_matches_typescript_oracle() {
+        let golden: LanguageGolden =
+            serde_json::from_str(include_str!("../testdata/caveman-language-golden.json"))
+                .expect("valid caveman language golden");
+        assert!(golden.cases.len() > 60);
+        for case in golden.cases {
+            for level in [CavemanLevel::Lite, CavemanLevel::Full, CavemanLevel::Ultra] {
+                assert_eq!(
+                    compress_with(&case.text, level, false),
+                    case.neutral,
+                    "{level:?}: {:?}",
+                    case.text
+                );
+            }
+        }
+        assert_eq!(
+            compress_with("Voy a revisar la configuración.", CavemanLevel::Full, false),
+            "Voy a revisar la configuración."
+        );
+    }
+
+    #[test]
+    fn english_word_rules_keep_the_english_golden_output() {
+        let cases: Vec<GoldenCase> =
+            serde_json::from_str(include_str!("../testdata/caveman-golden.json"))
+                .expect("valid caveman golden");
+        for case in cases {
+            assert_eq!(
+                compress_with(&case.text, CavemanLevel::Lite, true),
+                case.lite
+            );
+            assert_eq!(
+                compress_with(&case.text, CavemanLevel::Full, true),
+                case.full
+            );
+            assert_eq!(
+                compress_with(&case.text, CavemanLevel::Ultra, true),
+                case.ultra
+            );
+        }
+    }
+
+    /// A long whitespace run used to rescan its rest from every character, and restoring
+    /// placeholders rescanned the whole text once per preserved region. Both are linear now; the
+    /// bounds are far above the linear cost and far below the old quadratic one.
+    #[test]
+    fn long_whitespace_runs_and_many_paths_compress_in_linear_time() {
+        let spaces = format!("x{}y", " ".repeat(200_000));
+        let started = std::time::Instant::now();
+        for level in [CavemanLevel::Lite, CavemanLevel::Full, CavemanLevel::Ultra] {
+            assert_eq!(compress(&spaces, level), "x y");
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "whitespace run took {:?}",
+            started.elapsed()
+        );
+
+        let paths = (0..20_000)
+            .map(|index| format!("see src/f{index}.ts"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let started = std::time::Instant::now();
+        assert_eq!(compress(&paths, CavemanLevel::Lite), paths);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "20k paths took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn nested_placeholders_and_source_nul_restore_like_the_region_at_a_time_replace() {
+        // A URL swallows the inline-code placeholder protected before it.
+        let nested = "open https://x.io/a`b c` now";
+        assert_eq!(compress(nested, CavemanLevel::Lite), nested);
+        // A literal placeholder in the source is restored region by region, as TS does.
+        let literal = "keep \u{0}MC_PRES_0\u{0} and `code`";
+        assert_eq!(
+            compress(literal, CavemanLevel::Lite),
+            "keep `code` and `code`"
+        );
     }
 }

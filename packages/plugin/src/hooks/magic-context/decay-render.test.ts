@@ -298,3 +298,28 @@ describe("decay-render", () => {
         }
     });
 });
+
+// This is a provider budget: Fable's measured prose ratio makes 60K real tokens
+// admit 38173 local tokens, not the old 60000-local-token history.
+it("Fable HARD history rendering uses 38173 local tokens for a 60000 real-token budget", async () => {
+    const { renderM0 } = await import("./inject-compartments");
+    const compartments = productionShapeCompartments().map((c) => ({
+        ...c,
+        p1: c.p1!.repeat(8),
+        p2: c.p2!.repeat(8),
+        p3: c.p3!.repeat(8),
+        p4: c.p4!.repeat(8),
+    }));
+    const args = {
+        projectDocs: "",
+        userProfileBaseline: [],
+        compartments,
+        memories: [],
+        facts: [],
+        historyBudgetTokens: 60000,
+    };
+    const calibrated = renderM0({ ...args, modelKey: "anthropic/claude-fable-5-1" });
+    const expected = renderDecayedCompartments({ compartments, historyBudgetTokens: 38173 });
+    expect(calibrated).toBe(`<session-history>\n${expected}\n</session-history>`);
+    expect(calibrated).not.toBe(renderM0(args));
+});

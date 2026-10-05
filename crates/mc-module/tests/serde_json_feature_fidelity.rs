@@ -31,8 +31,8 @@ fn serde_json_feature_tree(edges: &str) -> String {
 
 #[test]
 fn resolved_serde_json_features_keep_release_and_tests_number_faithful() {
-    // The D5 fixture once enabled serde_json/arbitrary_precision through a dev-dependency.
-    // Cargo then gave tests a number serializer absent from release builds, so guard both graphs.
+    // A dev-dependency can enable serde_json features absent from release builds.
+    // Guard both graphs so tests exercise the same number serialization as production.
     for (label, edges) in [
         ("release", "normal,features"),
         ("test", "normal,dev,features"),

@@ -9,8 +9,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { RustTestHarness } from "../src/rust-harness";
 import { rustPrereqs } from "../src/rust-scenario-support";
 
@@ -33,9 +32,9 @@ describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () =
 
     beforeAll(async () => {
         h = await RustTestHarness.create({
-            modelContextLimit: 30_000,
+            modelContextLimit: 128_000,
             magicContextConfig: {
-                execute_threshold_percentage: 25,
+                execute_threshold_percentage: 15,
                 protected_tags: 1,
                 compressor: { enabled: false },
             },
@@ -85,7 +84,7 @@ describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () =
         h.mock.setDefault({
             text: "historian trigger",
             usage: {
-                input_tokens: 27_000,
+                input_tokens: 100_000,
                 output_tokens: 20,
                 cache_creation_input_tokens: 2_000,
             },
@@ -138,21 +137,18 @@ describe.skipIf(!rustPrereqs.ok)("rust historian: hermetic Broca producer", () =
         "fits an oversize completed tool arc, publishes it once, and advances past it",
         async () => {
             const oversize = await RustTestHarness.create({
-                modelContextLimit: 30_000,
+                modelContextLimit: 128_000,
                 magicContextConfig: {
-                    execute_threshold_percentage: 25,
+                    execute_threshold_percentage: 15,
                     protected_tags: 1,
                     compressor: { enabled: false },
                     historian: { context_limit_tokens: 120_000 },
                 },
             });
             try {
-                const moduleConfigDir = join(oversize.env.dataDir, "module-config", "cortexkit");
-                mkdirSync(moduleConfigDir, { recursive: true });
-                writeFileSync(
-                    join(moduleConfigDir, "magic-context.jsonc"),
-                    JSON.stringify({ historian: { context_limit_tokens: 120_000 } }),
-                );
+                // The stack keeps its Broca runner in the rewritten file, so this
+                // scenario stays on the producer lane it measures.
+                oversize.subc.writeModuleConfig({ historian: { context_limit_tokens: 120_000 } });
                 const sessionId = await oversize.createSession();
                 const description = `oversize historian arc ${oversize.ballast(180_000)}`;
                 let toolEmitted = false;

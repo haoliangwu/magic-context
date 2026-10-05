@@ -265,11 +265,17 @@ fn render_one_compartment(c: &DecayRenderCompartment, tier: u8) -> String {
 /// curve indexes from newest (1 = newest). Legacy rows are governed by deterministic
 /// truncation, not the curve, and are EXCLUDED from the pressure inputs so unrelated
 /// legacy cost can't demote v2 paraphrases (budget honesty for mixed sessions).
-fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -> Vec<u8> {
+///
+/// Accepts owned or borrowed compartments so callers holding references (the
+/// prepared renderer) need not copy summary bodies just to pick tiers.
+fn compute_tiers<C: std::borrow::Borrow<DecayRenderCompartment>>(
+    compartments: &[C],
+    history_budget: f64,
+) -> Vec<u8> {
     let v2_indices: Vec<usize> = compartments
         .iter()
         .enumerate()
-        .filter(|(_, c)| c.legacy != Some(1))
+        .filter(|(_, c)| c.borrow().legacy != Some(1))
         .map(|(i, _)| i)
         .collect();
     let v2_total = v2_indices.len();
@@ -281,6 +287,7 @@ fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -
         let curve_index = (v2_total - v2_ordinal) as u32;
         curve_index_by_original.insert(original_index, curve_index);
         let importance = compartments[original_index]
+            .borrow()
             .importance
             .unwrap_or(50)
             .clamp(1, 100);
@@ -299,6 +306,7 @@ fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -
         .iter()
         .enumerate()
         .map(|(i, c)| {
+            let c = c.borrow();
             if c.legacy == Some(1) {
                 legacy_tier(c)
             } else {
@@ -421,8 +429,7 @@ impl<'a> PreparedDecay<'a> {
     }
 
     pub fn render(&mut self, budget: f64) -> String {
-        let mapped: Vec<_> = self.compartments.iter().map(|c| (*c).clone()).collect();
-        let mut tiers = compute_tiers(&mapped, budget);
+        let mut tiers = compute_tiers(&self.compartments, budget);
         let mut active: std::collections::VecDeque<_> = tiers
             .iter()
             .enumerate()
@@ -448,11 +455,16 @@ impl<'a> PreparedDecay<'a> {
                 continued_total += self.tier(first, tiers[first]).continued_count;
             }
         }
-        active
-            .iter()
-            .map(|&i| self.tier(i, tiers[i]).text.clone())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        // Same bytes as joining the selected tier texts with blank lines, written
+        // straight into one buffer instead of cloning each prepared text first.
+        let mut out = String::new();
+        for (position, &i) in active.iter().enumerate() {
+            if position > 0 {
+                out.push_str("\n\n");
+            }
+            out.push_str(&self.tier(i, tiers[i]).text);
+        }
+        out
     }
 }
 
@@ -502,6 +514,106 @@ mod tests {
         }
     }
 
+    /// The prepared renderer as it was before tier selection borrowed rows: it
+    /// cloned every compartment for `compute_tiers` and cloned every selected
+    /// tier text before joining. Kept only as the differential reference.
+    fn cloning_prepared_render(prepared: &mut PreparedDecay<'_>, budget: f64) -> String {
+        let mapped: Vec<_> = prepared.compartments.iter().map(|c| (*c).clone()).collect();
+        let mut tiers = compute_tiers(&mapped, budget);
+        let mut active: std::collections::VecDeque<_> = tiers
+            .iter()
+            .enumerate()
+            .filter(|(_, tier)| **tier < 5)
+            .map(|(i, _)| i)
+            .collect();
+        let mut continued_total: usize = active
+            .iter()
+            .map(|&i| prepared.tier(i, tiers[i]).continued_count)
+            .sum();
+        while let Some(&last) = active.back() {
+            let last_tier = prepared.tier(last, tiers[last]);
+            let exact = continued_total - last_tier.continued_count + last_tier.final_count;
+            if budget.is_nan() || budget <= 0.0 || exact as f64 <= budget {
+                break;
+            }
+            let first = *active.front().unwrap();
+            continued_total -= prepared.tier(first, tiers[first]).continued_count;
+            tiers[first] += 1;
+            if tiers[first] == 5 {
+                active.pop_front();
+            } else {
+                continued_total += prepared.tier(first, tiers[first]).continued_count;
+            }
+        }
+        active
+            .iter()
+            .map(|&i| prepared.tier(i, tiers[i]).text.clone())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Borrowed tier selection and direct output assembly must produce the same
+    /// bytes and the same tier choices as the cloning renderer, across legacy,
+    /// malformed pseudo-v2, no-content, tiered and mixed-importance rows, over
+    /// budgets from unbounded to tight enough to archive everything.
+    #[test]
+    fn borrowed_prepared_render_matches_cloning_render() {
+        let mut rows = Vec::new();
+        for i in 0..60i64 {
+            let row = match i % 6 {
+                0 => DecayRenderCompartment {
+                    content: format!("U: legacy {i}\nA: reply\n").repeat(40),
+                    legacy: Some(1),
+                    ..Default::default()
+                },
+                1 => DecayRenderCompartment {
+                    content: format!("flat body {i}"),
+                    legacy: Some(0),
+                    p1: Some(String::new()),
+                    ..Default::default()
+                },
+                2 => DecayRenderCompartment::default(),
+                _ => DecayRenderCompartment {
+                    p1: Some(format!("full {i} ").repeat(30)),
+                    p2: Some(format!("dense {i}\n## fake heading")),
+                    p3: (i % 2 == 0).then(|| "x".to_string()),
+                    p4: Some(String::new()),
+                    importance: Some((i * 17 % 100) as i32),
+                    ..Default::default()
+                },
+            };
+            rows.push(DecayRenderCompartment {
+                start_message: i * 3,
+                end_message: i * 3 + 2,
+                title: if i % 6 == 2 {
+                    String::new()
+                } else {
+                    format!("title {i}")
+                },
+                start_date: Some("2026-01-01".into()),
+                end_date: Some(format!("2026-01-{:02}", i % 28 + 1)),
+                ..row
+            });
+        }
+        let borrowed: Vec<&DecayRenderCompartment> =
+            rows.iter().filter(|c| !c.is_no_content()).collect();
+        let owned: Vec<DecayRenderCompartment> = borrowed.iter().map(|c| (*c).clone()).collect();
+        let mut current = PreparedDecay::new(&rows);
+        let mut reference = PreparedDecay::new(&rows);
+        for budget in [f64::NAN, 0.0, 1.0, 50.0, 400.0, 2_000.0, 8_000.0, 1e9] {
+            assert_eq!(
+                compute_tiers(&borrowed, budget),
+                compute_tiers(&owned, budget),
+                "tiers at budget={budget}"
+            );
+            assert_eq!(
+                current.render(budget),
+                cloning_prepared_render(&mut reference, budget),
+                "bytes at budget={budget}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires a read-only live-store fixture"]
     fn aft_live_compose_profile() {
@@ -523,7 +635,7 @@ mod tests {
         let mut prepared = PreparedDecay::new(&rows);
         let incremental = prepared.render(60_000.0);
         assert_eq!(body, incremental);
-        eprintln!(
+        tracing::debug!(
             "aft-incremental total_ms={:.1} tier_tokenize_ms={:.1}",
             incremental_start.elapsed().as_secs_f64() * 1000.0,
             prepared.tokenize_ms
@@ -544,7 +656,7 @@ mod tests {
             }
         }
         use sha2::{Digest, Sha256};
-        eprintln!(
+        tracing::debug!(
             "aft-compose rows={} total_ms={:.1} tokenize_ms={:.1} calls={} sha256={:x}",
             rows.len(),
             elapsed.as_secs_f64() * 1000.0,
@@ -1063,5 +1175,35 @@ mod tests {
         let rendered = render_decayed_compartments(&fixture.compartments, 10_000.0, no_guard);
         assert!(rendered.contains("## 1-1 · Boundary"));
         assert!(fixture.handle_transform()["messages"].is_array());
+    }
+}
+
+/// Convert the real history allowance only at a materialization edge. Both the
+/// curve pressure and exact demotion loop consume the resulting local allowance.
+pub fn history_local_budget(provider_tokens: f64, model_key: Option<&str>) -> f64 {
+    let ratio = crate::decision_calibration::DecisionCalibration::for_model(model_key).prose_ratio;
+    if ratio == 1.0 {
+        provider_tokens
+    } else {
+        crate::decision_calibration::local_budget(provider_tokens, ratio)
+    }
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    #[test]
+    fn fable_history_budget_is_provider_tokens() {
+        assert_eq!(
+            super::history_local_budget(60_000.0, Some("anthropic/claude-fable-5-1")),
+            38173.0
+        );
+        assert_eq!(
+            super::history_local_budget(60_000.0, Some("anthropic/claude-fable-5-2")),
+            38173.0
+        );
+        assert_eq!(
+            super::history_local_budget(60_000.0, Some("unknown/model")),
+            60000.0
+        );
     }
 }

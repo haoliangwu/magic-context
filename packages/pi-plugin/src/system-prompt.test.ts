@@ -3,6 +3,10 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { convertMessages } from "@earendil-works/pi-ai/api/openai-completions";
+import {
+	getOrCreateSessionMeta,
+	updateSessionMeta,
+} from "@magic-context/core/features/magic-context/storage";
 import { insertUserMemory } from "@magic-context/core/features/magic-context/user-memory/storage-user-memory";
 import {
 	createPromptSurfaceGuidanceEpochCache,
@@ -27,6 +31,42 @@ import { createTestDb } from "./test-utils.test";
 function tempDir(prefix: TestTempDirPrefix): string {
 	return createTestTempDir(prefix).dir;
 }
+
+describe("Pi idle date release", () => {
+	for (const expired of [false, true]) {
+		it(`${expired ? "releases" : "freezes"} the midnight date on an ${expired ? "expired" : "warm"} provider cache`, () => {
+			const db = createTestDb();
+			const sessionId = `ses-pi-idle-date-${expired}`;
+			try {
+				getOrCreateSessionMeta(db, sessionId);
+				const first = processSystemPromptForCache({
+					db,
+					sessionId,
+					systemPrompt: "Base\nToday's date: Fri Oct 02 2026",
+					isCacheBusting: false,
+				});
+				updateSessionMeta(db, sessionId, {
+					cacheTtl: "1h",
+					lastResponseTime: Date.now() - (expired ? 16.5 * 3_600_000 : 1_000),
+				});
+				const next = processSystemPromptForCache({
+					db,
+					sessionId,
+					systemPrompt: "Base\nToday's date: Sat Oct 03 2026",
+					isCacheBusting: false,
+				});
+				expect(next.systemPrompt).toContain(
+					expired ? "Sat Oct 03 2026" : "Fri Oct 02 2026",
+				);
+				expect(next.hashChanged).toBe(expired);
+				if (!expired) expect(next.currentHash).toBe(first.currentHash);
+			} finally {
+				clearPiSystemPromptSession(sessionId);
+				closeQuietly(db);
+			}
+		});
+	}
+});
 
 describe("Pi single system-prompt serialization parity", () => {
 	it("keeps host identity and Magic Context guidance in one OpenAI-compatible wire message", () => {

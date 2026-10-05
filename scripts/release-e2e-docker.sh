@@ -10,6 +10,28 @@ REPO_ROOT=${MC_E2E_REPO_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd -P)}
 IMAGE=${MC_E2E_DOCKER_IMAGE:-mc-e2e-host}
 INNER=${MC_E2E_DOCKER_INNER:-0}
 
+# One host group per container; see the outer branch below for why.
+run_group_container() {
+    docker run --rm --init --read-only \
+        --mount "type=bind,src=$REPO_ROOT,dst=/repo,readonly" \
+        --tmpfs /workspace:rw,exec,size=8g \
+        --tmpfs /tmp:rw,exec,size=8g \
+        --tmpfs /run:rw,exec,size=64m \
+        --env MC_E2E_DOCKER_INNER=1 \
+        --env MC_E2E_REPO_ROOT=/workspace \
+        --env E2E_OC_FILES="${E2E_OC_FILES:-}" \
+        --env E2E_PI_FILES="${E2E_PI_FILES:-}" \
+        --env E2E_OC2_FILES="${E2E_OC2_FILES:-}" \
+        --env E2E_OMP_FILES="${E2E_OMP_FILES:-}" \
+        --env MC_E2E_GROUPS="$1" \
+        --env HOME=/tmp/mc-home \
+        --env XDG_CONFIG_HOME=/tmp/mc-config \
+        --env XDG_DATA_HOME=/tmp/mc-data \
+        --env XDG_CACHE_HOME=/tmp/mc-cache \
+        --env NODE_ENV= \
+        "$IMAGE" \
+        bash /repo/scripts/release-e2e-docker.sh --inside
+}
 if [[ "$INNER" != 1 ]]; then
     if ! command -v docker >/dev/null 2>&1; then
         echo "Error: docker is required for the containerized host e2e gate" >&2
@@ -25,23 +47,24 @@ if [[ "$INNER" != 1 ]]; then
     # The checkout stays read-only. /workspace is a tmpfs copy used for Bun's
     # workspace linker and for optional local dist builds; /tmp holds every
     # runtime cache and test sandbox. No host HOME or ~/.local/share is mounted.
-    exec docker run --rm --init --read-only \
-        --mount "type=bind,src=$REPO_ROOT,dst=/repo,readonly" \
-        --tmpfs /workspace:rw,exec,size=8g \
-        --tmpfs /tmp:rw,exec,size=8g \
-        --tmpfs /run:rw,exec,size=64m \
-        --env MC_E2E_DOCKER_INNER=1 \
-        --env MC_E2E_REPO_ROOT=/workspace \
-        --env E2E_OC_FILES="${E2E_OC_FILES:-}" \
-        --env E2E_PI_FILES="${E2E_PI_FILES:-}" \
-        --env HOME=/tmp/mc-home \
-        --env XDG_CONFIG_HOME=/tmp/mc-config \
-        --env XDG_DATA_HOME=/tmp/mc-data \
-        --env XDG_CACHE_HOME=/tmp/mc-cache \
-        --env NODE_ENV= \
-        "$IMAGE" \
-        bash /repo/scripts/release-e2e-docker.sh --inside
+    #
+    # Each host group runs in its own container so one group's test sandboxes
+    # cannot fill /tmp for the next (the OpenCode 2 group failed with "database
+    # or disk is full" after the OpenCode 1 and Pi groups had run in the same
+    # 8 GB tmpfs). This matches CI, which runs each lane as its own job.
+    outer_exit=0
+    for outer_group in ${MC_E2E_GROUPS:-opencode pi opencode2 omp}; do
+        echo "  [e2e:docker] group $outer_group in a fresh container..."
+        run_group_container "$outer_group" || outer_exit=1
+    done
+    if [[ "$outer_exit" -eq 0 ]]; then
+        echo "  ✓ Containerized host e2e checks passed"
+    else
+        echo "Error: one or more containerized host e2e groups failed"
+    fi
+    exit "$outer_exit"
 fi
+
 
 if [[ "${1:-}" != "--inside" ]]; then
     echo "Error: internal e2e runner invocation is missing --inside" >&2
@@ -112,11 +135,22 @@ if [[ ! -f packages/pi-plugin/dist/index.js ]]; then
     bun run --cwd packages/pi-plugin build
 fi
 
+# The hoisted install resolves @earendil-works/pi-coding-agent to the Pi plugin's
+# older devDependency, while CI's isolated install falls through to the newest Pi
+# in the store. Point the Pi lane at the newest supported Pi explicitly, the
+# alias the Pi plugin installs for its host lane, so both gates test the same host.
+if [[ -z "${MC_E2E_PI_PACKAGE_JSON:-}" && -f "$REPO_ROOT/node_modules/pi-coding-agent-087/package.json" ]]; then
+    export MC_E2E_PI_PACKAGE_JSON="$REPO_ROOT/node_modules/pi-coding-agent-087/package.json"
+    echo "  [e2e:docker] Pi host: $(bun -e "console.log(require('$MC_E2E_PI_PACKAGE_JSON').version)")"
+fi
+
 run_e2e_group() {
     local mode="$1" label="$2" files="$3" output status
     echo "  [e2e:$mode:$label:start] bun test..."
     status=0
-    output=$(cd "$REPO_ROOT/packages/e2e-tests" && MC_E2E_MODE="$mode" NODE_ENV="" bun test --timeout 600000 $files 2>&1) || status=$?
+    # Scenarios are written once and select their host from MC_E2E_HOST; without it a
+    # Pi-selected file that also declares OpenCode would silently run as OpenCode.
+    output=$(cd "$REPO_ROOT/packages/e2e-tests" && MC_E2E_MODE="$mode" MC_E2E_HOST="$label" NODE_ENV="" bun test --timeout 600000 $files 2>&1) || status=$?
     echo "$output"
 
     # Keep this gate identical to release.sh: a positive pass summary is
@@ -143,6 +177,8 @@ run_e2e_group() {
 # also making the standalone Docker runner deterministic.
 MANIFEST_OC_FILES=$(bun "$E2E_MANIFEST_VALIDATOR" --mode ts --harness opencode | tr '\n' ' ')
 MANIFEST_PI_FILES=$(bun "$E2E_MANIFEST_VALIDATOR" --mode ts --harness pi | tr '\n' ' ')
+MANIFEST_OC2_FILES=$(bun "$E2E_MANIFEST_VALIDATOR" --mode ts --harness opencode2 | tr '\n' ' ')
+MANIFEST_OMP_FILES=$(bun "$E2E_MANIFEST_VALIDATOR" --mode ts --harness omp | tr '\n' ' ')
 if [[ -n "${E2E_OC_FILES:-}" && "$E2E_OC_FILES" != "$MANIFEST_OC_FILES" ]]; then
     echo "Error: manifest-derived OpenCode list changed across the Docker boundary" >&2
     exit 1
@@ -151,12 +187,32 @@ if [[ -n "${E2E_PI_FILES:-}" && "$E2E_PI_FILES" != "$MANIFEST_PI_FILES" ]]; then
     echo "Error: manifest-derived Pi list changed across the Docker boundary" >&2
     exit 1
 fi
+if [[ -n "${E2E_OC2_FILES:-}" && "$E2E_OC2_FILES" != "$MANIFEST_OC2_FILES" ]]; then
+    echo "Error: manifest-derived OpenCode 2 list changed across the Docker boundary" >&2
+    exit 1
+fi
+if [[ -n "${E2E_OMP_FILES:-}" && "$E2E_OMP_FILES" != "$MANIFEST_OMP_FILES" ]]; then
+    echo "Error: manifest-derived OMP list changed across the Docker boundary" >&2
+    exit 1
+fi
 E2E_OC_FILES="$MANIFEST_OC_FILES"
 E2E_PI_FILES="$MANIFEST_PI_FILES"
+E2E_OC2_FILES="$MANIFEST_OC2_FILES"
+E2E_OMP_FILES="$MANIFEST_OMP_FILES"
 
+# MC_E2E_GROUPS narrows the gate to named groups (space-separated) for local
+# reproduction of one host lane; the release gate runs all four.
+GROUPS_TO_RUN="${MC_E2E_GROUPS:-opencode pi opencode2 omp}"
 EXIT=0
-run_e2e_group "ts" "opencode" "$E2E_OC_FILES" || EXIT=1
-run_e2e_group "ts" "pi" "$E2E_PI_FILES" || EXIT=1
+for group in $GROUPS_TO_RUN; do
+    case "$group" in
+        opencode) run_e2e_group "ts" "opencode" "$E2E_OC_FILES" || EXIT=1 ;;
+        pi) run_e2e_group "ts" "pi" "$E2E_PI_FILES" || EXIT=1 ;;
+        opencode2) run_e2e_group "ts" "opencode2" "$E2E_OC2_FILES" || EXIT=1 ;;
+        omp) run_e2e_group "ts" "omp" "$E2E_OMP_FILES" || EXIT=1 ;;
+        *) echo "Error: unknown e2e group '$group'" >&2; exit 2 ;;
+    esac
+done
 
 if [[ "$EXIT" -eq 0 ]]; then
     echo "  ✓ Containerized host e2e checks passed"

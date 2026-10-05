@@ -5,13 +5,23 @@ import {
     hasMeaningfulUserText,
 } from "../../hooks/magic-context/read-session-chunk";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
-import { getHarness } from "../../shared/harness";
-import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
+import { getHarness, type HarnessId } from "../../shared/harness";
+import {
+    type Database,
+    type Statement as PreparedStatement,
+    withoutSqliteTransformPass,
+    withSqliteBackgroundWriter,
+} from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { removeSystemReminders } from "../../shared/system-directive";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { clearCompressionDepth } from "./compression-depth-storage";
-import { messageFtsOrdinalRangeIsMapped, recordMessageFtsRowid } from "./message-fts-rowid-map";
+import {
+    deleteUnmappedMessageFtsRows,
+    messageFtsOrdinalRangeIsMapped,
+    recordIndexedMessageTime,
+    recordMessageFtsRowid,
+} from "./message-fts-rowid-map";
 import { deleteSessionScopedRows, SESSION_SCOPED_TABLES } from "./storage-session-tables";
 
 interface MessageHistoryIndexRow {
@@ -32,7 +42,7 @@ interface MessageHistoryOrphanSweepRow {
 }
 
 export interface MessageHistoryOrphanSweepResult {
-    status: "swept" | "cooldown" | "source_unavailable";
+    status: "swept" | "cooldown" | "source_unavailable" | "unavailable";
     scanned: number;
     deleted: number;
     cursor: string;
@@ -286,6 +296,7 @@ function insertMessageFtsRow(
     messageId: string,
     role: string,
     content: string,
+    messageTimeMs: number | null | undefined,
 ): void {
     const result = getInsertMessageStatement(db).run(
         sessionId,
@@ -294,7 +305,13 @@ function insertMessageFtsRow(
         role,
         content,
     ) as { lastInsertRowid: number | bigint };
-    recordMessageFtsRowid(db, sessionId, messageOrdinal, result.lastInsertRowid);
+    recordMessageFtsRowid(
+        db,
+        sessionId,
+        messageOrdinal,
+        result.lastInsertRowid,
+        messageTimeMs ?? null,
+    );
 }
 
 interface CountRow {
@@ -307,26 +324,47 @@ function normalizeSourceVersion(version: RawMessage["version"]): string {
     return "null";
 }
 
-function getMessageSourceSnapshot(message: RawMessage): {
+/**
+ * Everything the search index keeps from one message. A caller that has to hold
+ * a whole session's worth of index input keeps these instead of the messages:
+ * the indexable text is a small fraction of a message's parts.
+ */
+export interface MessageIndexSource {
+    id: string;
     ordinal: number;
+    role: string;
+    createdAt: number | null | undefined;
     sourceVersion: string;
     contentHash: string;
-    role: string;
     content: string;
-} {
+}
+
+export function toMessageIndexSource(message: RawMessage): MessageIndexSource {
     const content = getIndexableContent(message.role, message.parts);
     return {
+        id: message.id,
         ordinal: message.ordinal,
+        role: message.role,
+        createdAt: message.createdAt,
         sourceVersion: normalizeSourceVersion(message.version),
         contentHash: createHash("sha256").update(content).digest("hex"),
-        role: message.role,
         content,
     };
 }
 
+function getMessageSourceSnapshot(message: RawMessage): MessageIndexSource {
+    return toMessageIndexSource(message);
+}
+
 export function getMessageIndexSourceIdentity(message: RawMessage): string {
     const source = getMessageSourceSnapshot(message);
-    return JSON.stringify([source.ordinal, source.sourceVersion, source.contentHash, source.role]);
+    return JSON.stringify([
+        source.ordinal,
+        source.sourceVersion,
+        source.contentHash,
+        source.role,
+        message.createdAt ?? null,
+    ]);
 }
 
 export function isMessageIndexSourceCurrent(
@@ -353,10 +391,18 @@ function setMessageSource(
     message: RawMessage,
     now: number,
 ): string {
-    const source = getMessageSourceSnapshot(message);
+    return writeMessageSource(db, sessionId, getMessageSourceSnapshot(message), now);
+}
+
+function writeMessageSource(
+    db: Database,
+    sessionId: string,
+    source: MessageIndexSource,
+    now: number,
+): string {
     getUpsertMessageSourceStatement(db).run(
         sessionId,
-        message.id,
+        source.id,
         source.ordinal,
         source.sourceVersion,
         source.contentHash,
@@ -458,15 +504,26 @@ export function deleteIndexedMessage(db: Database, sessionId: string, messageId:
     return count;
 }
 
+/**
+ * Drop every indexed document, its rowid mapping, the progress watermark and the
+ * derived compression depth for one session. The caller must already hold a
+ * transaction; use `clearIndexedMessages` when it does not.
+ */
+export function clearIndexedMessagesInTransaction(db: Database, sessionId: string): void {
+    getDeleteFtsStatement(db).run(sessionId);
+    deleteUnmappedMessageFtsRows(db, [sessionId]);
+    getDeleteFtsMapStatement(db).run(sessionId);
+    getDeleteMessageSourceStatement(db).run(sessionId);
+    getDeleteIndexStatement(db).run(sessionId);
+    clearCompressionDepth(db, sessionId);
+}
+
 export function clearIndexedMessages(db: Database, sessionId: string): void {
-    const transactionStartedAt = performance.now();
+    let transactionStartedAt = 0;
     db.transaction(() => {
-        getDeleteFtsStatement(db).run(sessionId);
-        getDeleteFtsMapStatement(db).run(sessionId);
-        getDeleteMessageSourceStatement(db).run(sessionId);
-        getDeleteIndexStatement(db).run(sessionId);
-        clearCompressionDepth(db, sessionId);
-    })();
+        transactionStartedAt = performance.now();
+        clearIndexedMessagesInTransaction(db, sessionId);
+    }).immediate();
     logSlowWriteTransaction("message_index_clear", transactionStartedAt);
 }
 
@@ -506,6 +563,7 @@ function indexSingleMessageInTransaction(
 
     if (message.ordinal <= currentWatermark) {
         if (isMessageIndexSourceCurrent(db, sessionId, message)) {
+            recordIndexedMessageTime(db, sessionId, message.ordinal, message.createdAt);
             return false;
         }
         // Replacing before the legacy row is mapped would insert the revision while
@@ -521,7 +579,15 @@ function indexSingleMessageInTransaction(
         getDeleteMessageFtsMapStatement(db).run(sessionId, sessionId, message.id);
         const content = setMessageSource(db, sessionId, message, now);
         if (content.length > 0 && (message.role === "user" || message.role === "assistant")) {
-            insertMessageFtsRow(db, sessionId, message.ordinal, message.id, message.role, content);
+            insertMessageFtsRow(
+                db,
+                sessionId,
+                message.ordinal,
+                message.id,
+                message.role,
+                content,
+                message.createdAt,
+            );
         }
         setIndexProgress(
             db,
@@ -550,7 +616,15 @@ function indexSingleMessageInTransaction(
         (message.role === "user" || message.role === "assistant") &&
         !isMessageAlreadyIndexed(db, sessionId, message.id)
     ) {
-        insertMessageFtsRow(db, sessionId, message.ordinal, message.id, message.role, content);
+        insertMessageFtsRow(
+            db,
+            sessionId,
+            message.ordinal,
+            message.id,
+            message.role,
+            content,
+            message.createdAt,
+        );
         inserted = true;
     }
 
@@ -570,6 +644,7 @@ export function indexSingleMessage(db: Database, sessionId: string, message: Raw
         message.ordinal <= currentWatermark &&
         isMessageIndexSourceCurrent(db, sessionId, message)
     ) {
+        recordIndexedMessageTime(db, sessionId, message.ordinal, message.createdAt);
         return false;
     }
     const dirtyFloorBeforeAttempt = getDirtyIndexFloor(db, sessionId);
@@ -583,8 +658,8 @@ export function indexSingleMessage(db: Database, sessionId: string, message: Raw
     // plain FTS5 table with NO UNIQUE constraint, and the dedup is checked inside
     // the body. Taking the writer lock up front serializes concurrent terminal
     // updates so the second transaction sees the first transaction's source state.
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let committed = false;
     try {
         const result = indexSingleMessageInTransaction(
@@ -616,14 +691,40 @@ export function indexMessagesAfterOrdinal(
     _lastIndexedOrdinal: number,
     finalWatermark: number = messages.length,
 ): number {
+    return indexItemsAfterOrdinal(db, sessionId, messages, finalWatermark, toMessageIndexSource);
+}
+
+/**
+ * `indexMessagesAfterOrdinal` for input already reduced to index sources. The
+ * slice may be any contiguous part of the session: the watermark advances over
+ * the ordinals it covers and the first one it does not is left as the dirty
+ * floor, so consecutive slices, each in its own transaction, rebuild a session
+ * exactly as one call with every source would.
+ */
+export function indexSourcesAfterOrdinal(
+    db: Database,
+    sessionId: string,
+    sources: readonly MessageIndexSource[],
+    finalWatermark: number,
+): number {
+    return indexItemsAfterOrdinal(db, sessionId, sources, finalWatermark, (source) => source);
+}
+
+function indexItemsAfterOrdinal<T extends { ordinal: number }>(
+    db: Database,
+    sessionId: string,
+    items: readonly T[],
+    finalWatermark: number,
+    toSource: (item: T) => MessageIndexSource,
+): number {
     const now = Date.now();
     let inserted = 0;
 
     // The writer lock protects both duplicate checks and the progress row. Each
     // caller supplies only one bounded source page, so lock hold time is bounded
     // by that page rather than the full session history.
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let committed = false;
     try {
         const currentWatermark = getLastIndexedOrdinal(db, sessionId);
@@ -659,23 +760,24 @@ export function indexMessagesAfterOrdinal(
             getDeleteMessageSourceRangeStatement(db).run(sessionId, dirtyFloor, finalWatermark);
         }
 
-        const messagesByOrdinal = new Map<number, RawMessage>();
-        for (const message of messages) {
-            if (message.ordinal > effectiveWatermark && message.ordinal <= finalWatermark) {
-                messagesByOrdinal.set(message.ordinal, message);
+        const itemsByOrdinal = new Map<number, T>();
+        for (const item of items) {
+            if (item.ordinal > effectiveWatermark && item.ordinal <= finalWatermark) {
+                itemsByOrdinal.set(item.ordinal, item);
             }
         }
 
         let coveredWatermark = effectiveWatermark;
-        while (coveredWatermark < finalWatermark && messagesByOrdinal.has(coveredWatermark + 1)) {
+        while (coveredWatermark < finalWatermark && itemsByOrdinal.has(coveredWatermark + 1)) {
             coveredWatermark += 1;
         }
 
         for (let ordinal = effectiveWatermark + 1; ordinal <= coveredWatermark; ordinal++) {
-            const message = messagesByOrdinal.get(ordinal);
-            if (!message) continue;
+            const item = itemsByOrdinal.get(ordinal);
+            if (!item) continue;
 
-            const content = setMessageSource(db, sessionId, message, now);
+            const message = toSource(item);
+            const content = writeMessageSource(db, sessionId, message, now);
             if (
                 content.length === 0 ||
                 (message.role !== "user" && message.role !== "assistant") ||
@@ -683,7 +785,15 @@ export function indexMessagesAfterOrdinal(
             ) {
                 continue;
             }
-            insertMessageFtsRow(db, sessionId, message.ordinal, message.id, message.role, content);
+            insertMessageFtsRow(
+                db,
+                sessionId,
+                message.ordinal,
+                message.id,
+                message.role,
+                content,
+                message.createdAt,
+            );
             inserted += 1;
         }
 
@@ -740,15 +850,21 @@ export function ensureMessagesIndexed(
     indexMessagesAfterOrdinal(db, sessionId, messages, lastIndexedOrdinal, messages.length);
 }
 
-function openCodeSweepHarness(): "opencode" | "opencode2" {
-    const harness = getHarness();
-    if (harness === "opencode" || harness === "opencode2") return harness;
-    throw new Error(`OpenCode orphan sweep cannot read a ${harness} host store`);
+/**
+ * True when the running host keeps its sessions in the OpenCode store this
+ * sweep reads. Pi and OMP keep theirs elsewhere, so there is nothing here for
+ * the sweep to compare against — that is an absent source, not an error, and
+ * the caller parks the sweep instead of failing the maintenance pass.
+ */
+function harnessSupportsOpenCodeOrphanSweep(
+    harness: HarnessId,
+): harness is "opencode" | "opencode2" {
+    return harness === "opencode" || harness === "opencode2";
 }
 
 function getMessageHistoryOrphanSweepState(
     db: Database,
-    harness: "opencode" | "opencode2",
+    harness: HarnessId,
 ): MessageHistoryOrphanSweepRow {
     return (
         (db
@@ -763,7 +879,7 @@ function persistMessageHistoryOrphanSweepState(
     db: Database,
     cursor: string,
     lastSweptAt: number | null,
-    harness: "opencode" | "opencode2",
+    harness: HarnessId,
 ): void {
     db.prepare(
         `INSERT INTO message_history_orphan_sweep (harness, cursor_session_id, last_swept_at)
@@ -794,7 +910,7 @@ function getOpenCodeSessionScopedCandidateSourceSql(harness: "opencode" | "openc
  * the cursor survives restarts and only resets after a complete pass. Pi rows
  * need a separate sweep against Pi's session files and are excluded here.
  */
-export function sweepOrphanedOpenCodeMessageIndexes(
+function sweepOrphanedOpenCodeMessageIndexesInBackground(
     db: Database,
     openReadableOpenCodeDb: () => Database | null,
     options: MessageHistoryOrphanSweepOptions = {},
@@ -810,11 +926,27 @@ export function sweepOrphanedOpenCodeMessageIndexes(
         cooldownMs,
         options.unavailableReprobeMs ?? MESSAGE_HISTORY_ORPHAN_UNAVAILABLE_REPROBE_MS,
     );
-    const harness = openCodeSweepHarness();
+    const harness = getHarness();
     const state = getMessageHistoryOrphanSweepState(db, harness);
     const cursor = typeof state.cursor_session_id === "string" ? state.cursor_session_id : "";
     if (typeof state.last_swept_at === "number" && state.last_swept_at + cooldownMs > now) {
         return { status: "cooldown", scanned: 0, deleted: 0, cursor };
+    }
+
+    if (!harnessSupportsOpenCodeOrphanSweep(harness)) {
+        // Same class of problem as the unreadable store below: the source this
+        // sweep needs is not here. Park it future-dated so the normal cooldown
+        // arithmetic re-probes after one day, and report it to the caller
+        // instead of throwing — a throw here aborted the whole maintenance tick
+        // on Pi and OMP, which stopped every scheduled task from running
+        // (issue 496).
+        persistMessageHistoryOrphanSweepState(
+            db,
+            cursor,
+            now + unavailableReprobeMs - cooldownMs,
+            harness,
+        );
+        return { status: "unavailable", scanned: 0, deleted: 0, cursor };
     }
 
     let openCodeDb: Database | null = null;
@@ -864,8 +996,8 @@ export function sweepOrphanedOpenCodeMessageIndexes(
                 : (candidates[candidates.length - 1]?.session_id ?? cursor);
         const completedAt = candidates.length < batchSize ? now : null;
 
-        const transactionStartedAt = performance.now();
         db.exec("BEGIN IMMEDIATE");
+        const transactionStartedAt = performance.now();
         let committed = false;
         let deleted = 0;
         try {
@@ -909,4 +1041,16 @@ export function sweepOrphanedOpenCodeMessageIndexes(
     } finally {
         closeQuietly(openCodeDb);
     }
+}
+
+export function sweepOrphanedOpenCodeMessageIndexes(
+    db: Database,
+    openReadableOpenCodeDb: () => Database | null,
+    options: MessageHistoryOrphanSweepOptions = {},
+): MessageHistoryOrphanSweepResult {
+    return withoutSqliteTransformPass(() =>
+        withSqliteBackgroundWriter(() =>
+            sweepOrphanedOpenCodeMessageIndexesInBackground(db, openReadableOpenCodeDb, options),
+        ),
+    );
 }

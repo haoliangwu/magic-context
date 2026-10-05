@@ -1,0 +1,498 @@
+/* biome-ignore-all lint/style/noDescendingSpecificity: Each component's scoped selectors are grouped together; table, default, and field chrome rules style separate elements. */
+.config-editor [hidden] {
+  /* biome-ignore lint/complexity/noImportantStyles: Hidden sections must override grid/flex display rules and stay out of keyboard navigation. */
+  display: none !important;
+}
+
+.config-editor .config-field-key {
+  display: none;
+}
+
+.config-editor.show-config-keys .config-field-key {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.config-keys-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.config-workspace {
+  display: grid;
+  grid-template-columns: 188px minmax(0, 1fr);
+  align-items: start;
+  gap: 24px;
+}
+
+.config-section-index {
+  position: sticky;
+  top: 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 12px 12px 0;
+  border-right: 1px solid var(--border);
+}
+
+.config-index-eyebrow {
+  padding: 0 12px 12px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+
+.config-section-index button {
+  display: flex;
+  gap: 10px;
+  padding: 8px 12px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-md);
+  text-align: left;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.config-section-index button span {
+  font: 10px var(--mono-font);
+  opacity: 0.7;
+}
+
+.config-section-index button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.config-section-index button.active {
+  background: var(--bg-active);
+  color: var(--accent);
+}
+
+.config-section-index p {
+  margin: 24px 12px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.config-section-panel {
+  min-width: 0;
+  padding: 16px 20px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.config-section-panel h2 {
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--accent);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.config-section-panel .config-grid {
+  display: block;
+  padding: 0;
+}
+
+.config-section-panel .config-card {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
+
+.config-section-panel .config-card-header {
+  display: none;
+}
+
+.config-section-panel .config-card-two-col {
+  display: contents;
+}
+
+.config-section-panel .config-card-content {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 32px;
+}
+
+.config-section-panel .config-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 156px;
+  gap: 4px 12px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+  align-content: start;
+}
+
+.config-section-panel .config-field > * {
+  grid-column: 2;
+  grid-row: 1 / span 3;
+  align-self: start;
+  min-width: 0;
+}
+
+.config-section-panel .config-field > .config-field-header {
+  grid-column: 1;
+  grid-row: 1;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
+.config-section-panel .config-field > .config-field-desc {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.config-section-panel .config-field > .config-help {
+  grid-column: 1;
+  grid-row: 3;
+}
+
+.config-section-panel .config-field > .config-field,
+.config-section-panel .config-card-content > .config-field-desc {
+  grid-column: 1 / -1;
+  grid-row: auto;
+}
+
+.config-section-panel .config-input {
+  max-width: none;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.config-editor .config-input::placeholder {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.config-editor .toggle-switch {
+  position: relative;
+  gap: 8px;
+  min-height: 31px;
+  font-size: 11px;
+}
+
+.config-editor .toggle-switch input {
+  display: block;
+  position: absolute;
+  width: 32px;
+  height: 20px;
+  opacity: 0;
+}
+
+.config-editor .toggle-switch input:focus-visible + .toggle-slider {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.config-editor .toggle-slider {
+  width: 32px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.config-editor .toggle-slider::before {
+  width: 12px;
+  height: 12px;
+  top: 3px;
+  left: 3px;
+}
+
+.config-editor .toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(14px);
+}
+
+.config-inherited {
+  display: block;
+  font-size: 10px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.config-restart-badge {
+  border: 1px solid #59401f;
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  color: var(--amber);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.config-defaults {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 20px;
+  padding: 14px 0;
+}
+
+.config-defaults .config-field-desc {
+  display: block;
+  min-height: 32px;
+  margin: 4px 0 8px;
+}
+
+.config-help {
+  color: var(--text-secondary);
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.config-help summary,
+.config-overrides summary {
+  cursor: pointer;
+}
+
+.config-help p {
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.config-overrides {
+  border-top: 1px solid var(--border);
+  padding: 14px 0;
+}
+
+.config-overrides > summary {
+  font-size: 12px;
+}
+
+.config-overrides > summary .config-field-desc {
+  display: inline;
+  margin-left: 8px;
+}
+
+.config-table-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+}
+
+.config-table-toolbar p,
+.config-table-note {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.config-table-note {
+  padding: 10px 0;
+}
+
+.config-table-wrap {
+  overflow-x: auto;
+}
+
+.config-model-table,
+.config-task-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  table-layout: fixed;
+}
+
+.config-model-table {
+  min-width: 800px;
+}
+
+.config-task-table {
+  min-width: 760px;
+  margin-top: 12px;
+}
+
+.config-model-table th,
+.config-task-table th {
+  padding: 8px;
+  border-bottom: 1px solid var(--border-light);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.config-model-table td,
+.config-task-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.config-model-table th:first-child {
+  width: 36%;
+}
+
+.config-model-table th:last-child {
+  width: 48px;
+}
+
+.config-model-table .config-input {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+.config-task-table th:first-child {
+  width: 34%;
+}
+
+.config-task-table th:nth-child(2) {
+  width: 22%;
+}
+
+.config-task-table th:last-child {
+  width: 60px;
+}
+
+.config-task-table .config-field-desc {
+  display: block;
+  margin-top: 4px;
+  font-size: 10px;
+}
+
+.config-icon-btn,
+.config-schedule-btn {
+  background: transparent;
+  border: 0;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+}
+
+.config-schedule-btn {
+  text-align: left;
+  color: var(--text-primary);
+  padding: 3px 0;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.config-schedule-btn::after {
+  content: " ⌄";
+  color: var(--text-secondary);
+}
+
+.config-icon-btn:hover,
+.config-schedule-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.config-task-detail td {
+  background: var(--bg-panel);
+  padding: 12px 16px;
+}
+
+.config-task-edit-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 24px;
+}
+
+.config-task-edit-grid > div,
+.config-task-edit-grid .dreamer-task-param {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.config-task-edit-grid .config-input {
+  max-width: none;
+}
+
+.config-agent-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding: 14px 0;
+}
+
+.config-agent-card {
+  padding: 16px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+
+.config-agent-card h3 {
+  font-size: 12px;
+}
+
+.config-agent-card .config-field {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 0;
+  padding: 8px 0;
+}
+
+.config-task-harness {
+  margin-top: 14px;
+}
+
+.config-section-panel :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+@media (max-width: 1200px) {
+  .config-section-panel .config-card-content,
+  .config-agent-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .config-defaults {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 800px) {
+  .config-workspace {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .config-section-index {
+    position: static;
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: 0;
+    padding: 0;
+  }
+
+  .config-section-index button {
+    flex-shrink: 0;
+  }
+
+  .config-index-eyebrow,
+  .config-section-index p {
+    display: none;
+  }
+
+  .config-section-panel {
+    padding: 12px;
+  }
+}
+
+@media (max-width: 540px) {
+  .config-defaults {
+    grid-template-columns: 1fr;
+  }
+
+  .config-section-panel .config-field {
+    display: flex;
+    flex-direction: column;
+  }
+}

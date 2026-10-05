@@ -1,0 +1,160 @@
+{
+  "source": "captured off a running @opencode/cli GA host (AFT load-matrix recording, ga-host-theme.json); subset of ResolvedThemeTokens the sidebar and status dialog read",
+  "recorded": {
+    "host": "@opencode/cli",
+    "version": "2.0.11",
+    "channel": "latest",
+    "date": "2026-09-21",
+    "theme": "the host default, resolved with no terminal palette available",
+    "how": "read off context.theme inside a plugin running in the host; the light record was taken after dispatching the host command theme.switch_mode",
+    "leaves": "a colour is {\"rgba\": \"#rrggbbaa\"} \u2014 an @opentui/core RGBA read back through toInts(); \"<function>\" is a token group the host exposes as a callable"
+  },
+  "modes": {
+    "dark": {
+      "text": {
+        "base": {
+          "rgba": "#eeeeeeff"
+        },
+        "muted": {
+          "rgba": "#808080ff"
+        },
+        "feedback": {
+          "error": {
+            "base": {
+              "rgba": "#e06c75ff"
+            }
+          },
+          "warning": {
+            "base": {
+              "rgba": "#f5a742ff"
+            }
+          },
+          "success": {
+            "base": {
+              "rgba": "#7fd88fff"
+            }
+          },
+          "info": {
+            "base": {
+              "rgba": "#56b6c2ff"
+            }
+          }
+        }
+      },
+      "background": {
+        "base": {
+          "rgba": "#0a0a0aff"
+        }
+      },
+      "border": {
+        "base": {
+          "rgba": "#484848ff"
+        }
+      },
+      "hue": {
+        "accent": {
+          "100": {
+            "rgba": "#b38ff4ff"
+          },
+          "200": {
+            "rgba": "#9d7cd8ff"
+          },
+          "300": {
+            "rgba": "#8869bdff"
+          },
+          "400": {
+            "rgba": "#7357a2ff"
+          },
+          "500": {
+            "rgba": "#5f4688ff"
+          },
+          "600": {
+            "rgba": "#4b356fff"
+          },
+          "700": {
+            "rgba": "#392557ff"
+          },
+          "800": {
+            "rgba": "#271640ff"
+          },
+          "900": {
+            "rgba": "#17072bff"
+          }
+        }
+      }
+    },
+    "light": {
+      "text": {
+        "base": {
+          "rgba": "#1a1a1aff"
+        },
+        "muted": {
+          "rgba": "#8a8a8aff"
+        },
+        "feedback": {
+          "error": {
+            "base": {
+              "rgba": "#d1383dff"
+            }
+          },
+          "warning": {
+            "base": {
+              "rgba": "#d68c27ff"
+            }
+          },
+          "success": {
+            "base": {
+              "rgba": "#3d9a57ff"
+            }
+          },
+          "info": {
+            "base": {
+              "rgba": "#318795ff"
+            }
+          }
+        }
+      },
+      "background": {
+        "base": {
+          "rgba": "#ffffffff"
+        }
+      },
+      "border": {
+        "base": {
+          "rgba": "#b8b8b8ff"
+        }
+      },
+      "hue": {
+        "accent": {
+          "100": {
+            "rgba": "#c7811eff"
+          },
+          "200": {
+            "rgba": "#d68c27ff"
+          },
+          "300": {
+            "rgba": "#df9a44ff"
+          },
+          "400": {
+            "rgba": "#e8a85cff"
+          },
+          "500": {
+            "rgba": "#f1b671ff"
+          },
+          "600": {
+            "rgba": "#fac386ff"
+          },
+          "700": {
+            "rgba": "#fcd4a8ff"
+          },
+          "800": {
+            "rgba": "#fee3c7ff"
+          },
+          "900": {
+            "rgba": "#fef3e7ff"
+          }
+        }
+      }
+    }
+  }
+}

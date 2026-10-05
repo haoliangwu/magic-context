@@ -89,7 +89,13 @@ function classifyBackfillError(error: unknown): {
 } {
     if (error instanceof ProjectIdentityError) {
         return {
-            errorClass: error.errorClass === "dubious_ownership" ? "unknown" : error.errorClass,
+            errorClass:
+                error.errorClass === "dubious_ownership" ||
+                error.errorClass === "home_project_disabled" ||
+                error.errorClass === "git_identity_unavailable" ||
+                error.errorClass === "no_commits"
+                    ? "unknown"
+                    : error.errorClass,
             errorMessage: error.message,
         };
     }
@@ -460,7 +466,7 @@ export async function doctorRetryV22Backfill(db: Database): Promise<{
                     bumpProjectMemoryEpochInTransaction(db, identity, now);
                     succeeded += 1;
                 }
-            })();
+            }).immediate();
         } catch (error) {
             const classified = classifyBackfillError(error);
             db.prepare(
@@ -516,7 +522,7 @@ export async function doctorRekeyV22DirIdentity(
         if (changedRows > 0) {
             bumpProjectMemoryEpochInTransaction(db, newIdentity, now);
         }
-    })();
+    }).immediate();
 
     return { oldIdentity, newIdentity, changedRows };
 }

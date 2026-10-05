@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { COMMIT_VERB_PATTERN, createCommitHashExtractPattern } from "../../shared/commit-detection";
 import { OMO_INTERNAL_INITIATOR_MARKER } from "../../shared/internal-initiator-marker";
+import { log } from "../../shared/logger";
 import { isSystemDirective, removeSystemReminders } from "../../shared/system-directive";
 
 export interface SessionChunkLine {
@@ -309,7 +310,7 @@ function warnTokenizerFallback(error: unknown): void {
     if (tokenizerWarningSent) return;
     tokenizerWarningSent = true;
     const reason = error instanceof Error ? error.message : String(error);
-    console.warn(
+    log(
         "[magic-context] ai-tokenizer is unavailable; using approximate character-based token counts for this process. Token budgets, persisted per-message counts, and protected-tail/compartment boundaries may be less accurate until restart:",
         reason,
     );
@@ -355,6 +356,44 @@ function estimateTokensHeuristically(text: string): number {
     return Math.ceil(text.length / 3.5);
 }
 
+// Mixed prose, code, numbers, non-ASCII text and a special-token literal, so a
+// tokenizer whose vocabulary counts differently is likely to give another count.
+const TOKEN_ESTIMATOR_SAMPLE =
+    'Coverage check: const windows = chunk(text, 0x1f, 512); // ok? "naïve" café 日本語 <EOT> 3.14159 ->  done.';
+let estimatorFingerprintTokenizer: TokenizerLike | undefined;
+let estimatorFingerprint = "";
+
+/**
+ * Short identity of the estimator `estimateTokens` currently uses. Results that
+ * depend on token counts and outlive the process (such as where embedding
+ * windows were split) record it, so a process running a different estimator
+ * (the character heuristic after a failed tokenizer load, or a tokenizer that
+ * counts differently) recomputes them instead of trusting them. Reads the
+ * tokenizer directly so callers counting `estimateTokens` calls are unaffected.
+ */
+export function getTokenEstimatorFingerprint(): string {
+    const activeTokenizer = getTokenizer();
+    if (!activeTokenizer) {
+        return `heuristic:${estimateTokensHeuristically(TOKEN_ESTIMATOR_SAMPLE)}`;
+    }
+    if (estimatorFingerprintTokenizer === activeTokenizer) return estimatorFingerprint;
+    let fingerprint: string;
+    try {
+        fingerprint = `tokenizer:${activeTokenizer.encode(TOKEN_ESTIMATOR_SAMPLE, "all").length}`;
+    } catch {
+        // Still an exact identity: the same tokenizer fails on the sample the same way.
+        fingerprint = "tokenizer:sample-unencodable";
+    }
+    estimatorFingerprintTokenizer = activeTokenizer;
+    estimatorFingerprint = fingerprint;
+    return fingerprint;
+}
+
+/** Admission must refuse rather than treating a heuristic fallback as an exact count. */
+export function hasTokenizerForFit(): boolean {
+    return getTokenizer() !== undefined;
+}
+
 export function estimateTokens(text: string): number {
     if (!text) return 0;
     const activeTokenizer = getTokenizer();
@@ -372,6 +411,75 @@ export function estimateTokens(text: string): number {
         warnTokenizerFallback(error);
         return estimateTokensHeuristically(text);
     }
+}
+
+/** Exact-content, bounded counts; fallback invalidates counts from the previous tokenizer. */
+export function createTokenCountMemo(
+    maxEntries: number,
+    maxBytes: number,
+): (text: string) => number {
+    const counts = new Map<
+        string,
+        { tokenizer: ReturnType<typeof getTokenizer>; tokens: number }
+    >();
+    let bytes = 0;
+    return (text) => {
+        const cached = counts.get(text);
+        if (cached && cached.tokenizer === getTokenizer()) return cached.tokens;
+        const tokens = estimateTokens(text);
+        if (cached) {
+            bytes -= text.length * 2;
+            counts.delete(text);
+        }
+        if (text.length * 2 <= maxBytes) {
+            while (counts.size >= maxEntries || bytes + text.length * 2 > maxBytes) {
+                const oldest = counts.keys().next().value;
+                if (oldest === undefined) break;
+                bytes -= oldest.length * 2;
+                counts.delete(oldest);
+            }
+            counts.set(text, { tokenizer: getTokenizer(), tokens });
+            bytes += text.length * 2;
+        }
+        return tokens;
+    };
+}
+
+const promptTokenCounts = new Map<
+    string,
+    { tokenizer: ReturnType<typeof getTokenizer>; tokens: number }
+>();
+let promptTokenCountBytes = 0;
+const PROMPT_TOKEN_COUNT_BYTES = 8 * 1024 * 1024;
+
+/** Count identical fixed historian prompts once, without borrowing counts after tokenizer fallback. */
+export function estimateFixedPromptTokens(text: string): number {
+    const activeTokenizer = getTokenizer();
+    const cached = promptTokenCounts.get(text);
+    if (cached && cached.tokenizer === activeTokenizer) {
+        promptTokenCounts.delete(text);
+        promptTokenCounts.set(text, cached);
+        return cached.tokens;
+    }
+    const tokens = estimateTokens(text);
+    if (cached) {
+        promptTokenCountBytes -= text.length * 2;
+        promptTokenCounts.delete(text);
+    }
+    if (text.length * 2 <= PROMPT_TOKEN_COUNT_BYTES) {
+        while (
+            promptTokenCounts.size >= 64 ||
+            promptTokenCountBytes + text.length * 2 > PROMPT_TOKEN_COUNT_BYTES
+        ) {
+            const oldest = promptTokenCounts.keys().next().value;
+            if (oldest === undefined) break;
+            promptTokenCountBytes -= oldest.length * 2;
+            promptTokenCounts.delete(oldest);
+        }
+        promptTokenCounts.set(text, { tokenizer: getTokenizer(), tokens });
+        promptTokenCountBytes += text.length * 2;
+    }
+    return tokens;
 }
 
 export function normalizeText(text: string): string {

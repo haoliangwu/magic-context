@@ -27,6 +27,7 @@ const existingShasStatements = new WeakMap<Database, PreparedStatement>();
 const projectCountStatements = new WeakMap<Database, PreparedStatement>();
 const evictOverflowStatements = new WeakMap<Database, PreparedStatement>();
 const latestCommitTimeStatements = new WeakMap<Database, PreparedStatement>();
+const latestCommitShaStatements = new WeakMap<Database, PreparedStatement>();
 
 function getInsertStatement(db: Database): PreparedStatement {
     let stmt = insertStatements.get(db);
@@ -73,6 +74,17 @@ function getLatestCommitTimeStatement(db: Database): PreparedStatement {
             "SELECT MAX(committed_at) AS latest FROM git_commits WHERE project_path = ?",
         );
         latestCommitTimeStatements.set(db, stmt);
+    }
+    return stmt;
+}
+
+function getLatestCommitShaStatement(db: Database): PreparedStatement {
+    let stmt = latestCommitShaStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(
+            "SELECT sha FROM git_commits WHERE project_path = ? ORDER BY committed_at DESC, sha DESC LIMIT 1",
+        );
+        latestCommitShaStatements.set(db, stmt);
     }
     return stmt;
 }
@@ -134,7 +146,7 @@ export function upsertCommits(
                 }
             }
         }
-    })();
+    }).immediate();
 
     return { inserted, updated };
 }
@@ -151,6 +163,12 @@ export function getLatestIndexedCommitTimeMs(db: Database, projectPath: string):
         | { latest: number | null }
         | undefined;
     return row?.latest ?? null;
+}
+
+/** SHA of this project's most recently committed indexed commit, or null. */
+export function getLatestIndexedCommitSha(db: Database, projectPath: string): string | null {
+    const row = getLatestCommitShaStatement(db).get(projectPath) as { sha: string } | undefined;
+    return row?.sha ?? null;
 }
 
 /** Keep at most `maxCommits` rows for this project, evicting oldest overflow.

@@ -10,19 +10,32 @@ import {
     rmSync,
     statSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-authority";
+import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-store-uuid";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import {
     getPersistedSchemaVersion,
     initializeDatabase,
     inspectRpcServerDiscovery,
+    LATEST_SUPPORTED_VERSION,
 } from "@magic-context/core/features/magic-context/storage-db";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
-import { inspectLivePiProcesses } from "@magic-context/core/shared/rpc-utils";
+import {
+    inspectLivePiProcesses,
+    inspectWindowsProcessesSync,
+} from "@magic-context/core/shared/rpc-utils";
 import { Database, type Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 
+import { CLI_SCHEMA_FLOOR_VERSION } from "../lib/database-access";
 import { type PromptIO, promptIO } from "../lib/prompts";
+import {
+    type CachedPluginFence,
+    listCachedOpenCodePluginFences,
+} from "./doctor-cached-plugin-fence";
+import { OPENCODE_V2_PLUGIN_UPDATE_HINT, probeHostProcessesUsing } from "./doctor-opencode2-cache";
+import { PRUNE_DISCOVERY_COMMAND } from "./doctor-prune-discovery";
+import { canonicalStoragePath, processReferencesStorage } from "./doctor-storage-holders";
 
 const ROW_COUNT_TABLES = ["tags", "compartments", "memories", "notes", "dream_runs"] as const;
 const DATABASE_SUFFIXES = ["", "-wal", "-shm"] as const;
@@ -48,6 +61,8 @@ interface RepairDbDeps {
     now: () => Date;
     sqliteExecutable: string;
     inspectHolders: (storageDir: string) => DatabaseHolderInspection;
+    /** Cached Magic Context plugin copies and the schema each one accepts. */
+    listPluginFences: () => CachedPluginFence[];
 }
 
 export interface RunRepairDbOptions {
@@ -70,8 +85,34 @@ interface SalvageResult {
     schemaVersionAfter?: number;
 }
 
-function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
-    const rpc = inspectRpcServerDiscovery(storageDir);
+interface HolderInspectionDeps {
+    defaultStorageDir: string;
+    inspectRpc: typeof inspectRpcServerDiscovery;
+    inspectPi: typeof inspectLivePiProcesses;
+    probeFiles: typeof probeHostProcessesUsing;
+    processReferences: typeof processReferencesStorage;
+}
+
+export function defaultInspectHolders(
+    storageDir: string,
+    overrides: Partial<HolderInspectionDeps> = {},
+): DatabaseHolderInspection {
+    const deps: HolderInspectionDeps = {
+        defaultStorageDir: join(homedir(), ".local", "share", "cortexkit", "magic-context"),
+        inspectRpc: inspectRpcServerDiscovery,
+        inspectPi: inspectLivePiProcesses,
+        probeFiles: probeHostProcessesUsing,
+        processReferences: processReferencesStorage,
+        ...overrides,
+    };
+    // On Windows one process snapshot serves both the RPC and the Pi checks, so
+    // the slow process listing runs once per doctor call.
+    const processes = process.platform === "win32" ? inspectWindowsProcessesSync() : undefined;
+    const rpc = deps.inspectRpc(storageDir, processes, {
+        deadlineMs: 15_000,
+        onProgress: (checked, total) =>
+            console.error(`Inspecting RPC database holders: ${checked}/${total} records checked`),
+    });
     if (rpc.state === "unreadable") {
         const arm = rpc.unreadableArm === "parse" ? "could not be parsed" : "could not be read";
         return {
@@ -83,7 +124,35 @@ function defaultInspectHolders(storageDir: string): DatabaseHolderInspection {
 
     const blockers =
         rpc.state === "live" ? rpc.serverPids.map((pid) => `OpenCode server (PID ${pid})`) : [];
-    const pi = inspectLivePiProcesses();
+    if (rpc.state === "inconclusive")
+        return {
+            safe: false,
+            blockers: [],
+            uncertainty: `RPC process liveness could not be determined (PID ${(rpc.inconclusivePids ?? []).join(", ")}). If none of these is a running host, review and remove their discovery records with \`${PRUNE_DISCOVERY_COMMAND}\`.`,
+        };
+    const pi = overrides.inspectPi ? deps.inspectPi() : (processes?.pi ?? deps.inspectPi());
+    if (canonicalStoragePath(storageDir) !== canonicalStoragePath(deps.defaultStorageDir)) {
+        // Non-default stores require an explicit host path. A process named Pi
+        // is not enough: open target files or a configured storage path identify holders.
+        const holders = deps.probeFiles({
+            files: ["context.db", "store.db"].flatMap((name) =>
+                DATABASE_SUFFIXES.map((suffix) => join(storageDir, `${name}${suffix}`)),
+            ),
+            directories: [],
+        });
+        if (holders.status === "unknown") {
+            return { safe: false, blockers, uncertainty: holders.reason };
+        }
+        if (holders.status === "in_use") {
+            blockers.push(...holders.pids.map((pid) => `database holder (PID ${pid})`));
+        }
+        const candidates = new Set([...pi.processIds, ...(pi.inconclusivePids ?? [])]);
+        for (const pid of candidates) {
+            if (deps.processReferences(pid, storageDir))
+                blockers.push(`Pi/OMP harness (PID ${pid})`);
+        }
+        return { safe: blockers.length === 0, blockers };
+    }
     if (pi.state === "unreadable" || pi.state === "inconclusive") {
         return {
             safe: false,
@@ -106,6 +175,7 @@ const DEFAULT_DEPS: RepairDbDeps = {
     now: () => new Date(),
     sqliteExecutable: defaultSqliteExecutable(),
     inspectHolders: defaultInspectHolders,
+    listPluginFences: () => listCachedOpenCodePluginFences(),
 };
 
 function timestamp(date: Date): string {
@@ -128,7 +198,7 @@ function copyBackupBundle(dbPath: string, stamp: string): BackupBundle {
     return { basePath, copiedPaths };
 }
 
-function copyDatabaseBundle(sourceBase: string, destinationBase: string): string[] {
+export function copyDatabaseBundle(sourceBase: string, destinationBase: string): string[] {
     const copiedPaths: string[] = [];
     for (const suffix of DATABASE_SUFFIXES) {
         const source = `${sourceBase}${suffix}`;
@@ -292,7 +362,46 @@ function runRecoverShell(
     }
 }
 
-function migrateAndCheckRecoveredDatabase(path: string): SalvageResult {
+/**
+ * Warning printed before repair-db migrates a salvaged database that is older
+ * than this CLI. Salvage must finish (the database is otherwise unusable), so
+ * it still migrates to this CLI's schema, but every other CLI write refuses to
+ * outrun the plugin: a plugin built for an older schema refuses the repaired
+ * database until it is updated. Empty when the database is already current.
+ */
+export function schemaMigrationWarning(
+    schemaVersionBefore: number,
+    fences: CachedPluginFence[],
+): string[] {
+    if (schemaVersionBefore >= CLI_SCHEMA_FLOOR_VERSION) return [];
+    const lines = [
+        `Schema migration ahead: the salvaged database is at schema v${schemaVersionBefore}; this CLI migrates it from v${schemaVersionBefore} to v${LATEST_SUPPORTED_VERSION}. An older Magic Context plugin refuses a database newer than it supports, so update the plugin before restarting OpenCode, Pi or OMP.`,
+    ];
+    for (const fence of fences) {
+        if (fence.supportedVersion === null || fence.supportedVersion >= LATEST_SUPPORTED_VERSION) {
+            continue;
+        }
+        const label =
+            fence.host === "opencode1"
+                ? "OpenCode 1"
+                : fence.spec && fence.spec !== "latest"
+                  ? `OpenCode 2 (@${fence.spec})`
+                  : "OpenCode 2";
+        lines.push(
+            `${label} has Magic Context ${fence.version ?? "(unknown version)"} cached, which supports only schema v${fence.supportedVersion}; it will refuse the repaired database until updated (${fence.directory}).`,
+            fence.host === "opencode1"
+                ? "  To update: quit OpenCode 1, then run `npx @cortexkit/magic-context@latest doctor --force` (or delete that directory); OpenCode 1 installs the current release on its next start."
+                : `  To update, ${OPENCODE_V2_PLUGIN_UPDATE_HINT}.`,
+        );
+    }
+    return lines;
+}
+
+export function migrateAndCheckRecoveredDatabase(
+    path: string,
+    /** Called with the salvaged schema version before any migration runs. */
+    beforeMigrate?: (schemaVersionBefore: number) => void,
+): SalvageResult {
     let db: DatabaseType | null = null;
     try {
         db = new Database(path);
@@ -309,6 +418,7 @@ function migrateAndCheckRecoveredDatabase(path: string): SalvageResult {
         }
 
         const schemaVersionBefore = getPersistedSchemaVersion(db);
+        beforeMigrate?.(schemaVersionBefore);
         initializeDatabase(db);
         runMigrations(db);
         ensureContextStoreUuid(db);
@@ -322,6 +432,7 @@ function migrateAndCheckRecoveredDatabase(path: string): SalvageResult {
         }
         const afterCounts = readCountsFromOpenDatabase(db);
         db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        db.exec("PRAGMA synchronous=FULL");
         db.exec("PRAGMA journal_mode=DELETE");
         return { ok: true, afterCounts, schemaVersionBefore, schemaVersionAfter };
     } catch (error) {
@@ -367,6 +478,7 @@ function prepareFreshDatabase(path: string): SalvageResult {
         }
         const afterCounts = readCountsFromOpenDatabase(db);
         db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+        db.exec("PRAGMA synchronous=FULL");
         db.exec("PRAGMA journal_mode=DELETE");
         return { ok: true, afterCounts, schemaVersionBefore, schemaVersionAfter };
     } catch (error) {
@@ -547,7 +659,16 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
     }
     let salvageResult: SalvageResult;
     if (salvage.ok) {
-        salvageResult = migrateAndCheckRecoveredDatabase(recoveredPath);
+        salvageResult = migrateAndCheckRecoveredDatabase(recoveredPath, (before) => {
+            if (before >= CLI_SCHEMA_FLOOR_VERSION) return;
+            let fences: CachedPluginFence[] = [];
+            try {
+                fences = deps.listPluginFences();
+            } catch {
+                // An unreadable plugin cache only loses the per-copy detail.
+            }
+            for (const line of schemaMigrationWarning(before, fences)) prompts.log.warn(line);
+        });
     } else {
         salvageResult = salvage;
     }

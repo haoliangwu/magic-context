@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { LATEST_MIGRATION_VERSION, runMigrations } from "./migrations";
+import { LATEST_MIGRATION_VERSION, MIGRATIONS, runMigrations } from "./migrations";
 import { initializeDatabase, LATEST_SUPPORTED_VERSION } from "./storage-db";
 
 function columnNames(db: Database, table: string): Set<string> {
@@ -15,22 +15,20 @@ function columnNames(db: Database, table: string): Set<string> {
     );
 }
 
-/** Mark migrations up to `version` as already applied so only the newer ones
- *  run — lets an upgrade test start from a hand-built pre-v65 schema without
- *  replaying every prior migration (which needs tables the stub omits). */
-function seedAppliedVersion(db: Database, version: number): void {
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            description TEXT NOT NULL,
-            applied_at INTEGER NOT NULL
-        );
-    `);
-    for (let v = 1; v <= version; v++) {
-        db.prepare(
-            "INSERT OR IGNORE INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
-        ).run(v, `seed v${v}`, Date.now());
-    }
+/**
+ * Run exactly one migration's `up()` against a hand-built stub schema.
+ *
+ * These upgrade tests start from a few hand-made tables, not a real database at
+ * version N-1. Running every later migration over such a stub tests the stub, not
+ * the migration: on Linux, SQLite's `ALTER TABLE ... RENAME` (v94's table rebuild)
+ * re-checks every trigger in the schema and fails on triggers the stub has but
+ * whose tables it skipped. macOS's SQLite defaults `legacy_alter_table` on and
+ * skips that check, so the full run passed there and failed only on CI.
+ */
+function runOnly(db: Database, version: number): void {
+    const migration = MIGRATIONS.find((candidate) => candidate.version === version);
+    if (!migration) throw new Error(`no migration v${version}`);
+    migration.up(db);
 }
 
 describe("migration v65: per-memory mural cue columns", () => {
@@ -53,8 +51,7 @@ describe("migration v65: per-memory mural cue columns", () => {
         const db = new Database(":memory:");
         try {
             // A minimal pre-v65 memories table WITHOUT the cue columns, as an
-            // upgraded install would have before the migration runs. Seed the
-            // applied version to 64 so only v65's up() runs against this stub.
+            // upgraded install would have before the migration runs.
             db.exec(`
                 CREATE TABLE memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,10 +66,9 @@ describe("migration v65: per-memory mural cue columns", () => {
                     last_seen_at INTEGER NOT NULL
                 );
             `);
-            seedAppliedVersion(db, 64);
             expect(columnNames(db, "memories").has("mural_cue")).toBe(false);
 
-            runMigrations(db);
+            runOnly(db, 65);
 
             const after = columnNames(db, "memories");
             expect(after.has("mural_cue")).toBe(true);
@@ -86,10 +82,9 @@ describe("migration v65: per-memory mural cue columns", () => {
     test("v65 is a no-op when the memories table is absent", () => {
         const db = new Database(":memory:");
         try {
-            // Seed to 64 so ONLY v65 is pending; a sparse DB may lack the memories
-            // table, and v65 must skip rather than throw.
-            seedAppliedVersion(db, 64);
-            expect(() => runMigrations(db)).not.toThrow();
+            // A sparse DB may lack the memories table, and v65 must skip rather
+            // than throw.
+            expect(() => runOnly(db, 65)).not.toThrow();
         } finally {
             closeQuietly(db);
         }
@@ -102,9 +97,7 @@ describe("migration v66: bounded upgrade reminders", () => {
         try {
             db.exec("CREATE TABLE session_meta (session_id TEXT PRIMARY KEY)");
             db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run("ses-legacy");
-            seedAppliedVersion(db, 65);
-
-            runMigrations(db);
+            runOnly(db, 66);
 
             const names = columnNames(db, "session_meta");
             expect(names.has("upgrade_reminder_last_sent_at")).toBe(true);
@@ -145,9 +138,7 @@ describe("migration v75: mural cue rejection latches", () => {
                 INSERT INTO memories (mural_cue, mural_cue_hash, mural_cue_at)
                 VALUES ('existing cue', 'existing hash', 123);
             `);
-            seedAppliedVersion(db, 74);
-
-            runMigrations(db);
+            runOnly(db, 75);
 
             expect(columnNames(db, "memories")).toContain("mural_cue_rejection_count");
             expect(

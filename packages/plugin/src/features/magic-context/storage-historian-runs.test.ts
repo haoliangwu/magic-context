@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { closeDatabase, openDatabase } from "./storage-db";
 import {
     recordHistorianRun,
@@ -15,7 +16,7 @@ let prevDataHome: string | undefined;
 
 beforeEach(() => {
     prevDataHome = process.env.XDG_DATA_HOME;
-    tempHome = mkdtempSync(join(tmpdir(), "mc-hr-"));
+    tempHome = createTestTempDirFromPath(join(tmpdir(), "mc-hr-"));
     process.env.XDG_DATA_HOME = tempHome;
     closeDatabase();
 });

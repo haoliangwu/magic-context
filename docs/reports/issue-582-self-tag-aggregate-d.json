@@ -1,0 +1,166 @@
+{
+  "pooled": [
+    {
+      "variant": "D",
+      "replies": 176,
+      "textParts": 171,
+      "closed": 170,
+      "canonical": 170,
+      "correct": 169,
+      "wrong": 1,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 169,
+      "proseReferences": 3,
+      "midTextNotation": 0
+    }
+  ],
+  "buckets": [
+    {
+      "variant": "D",
+      "bucket": "1",
+      "textParts": 7,
+      "closed": 7,
+      "canonical": 7,
+      "correct": 7,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 7,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "D",
+      "bucket": "2–5",
+      "textParts": 28,
+      "closed": 28,
+      "canonical": 28,
+      "correct": 28,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 28,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "D",
+      "bucket": "6–20",
+      "textParts": 101,
+      "closed": 100,
+      "canonical": 100,
+      "correct": 99,
+      "wrong": 1,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 99,
+      "proseReferences": 3,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "D",
+      "bucket": ">20",
+      "textParts": 35,
+      "closed": 35,
+      "canonical": 35,
+      "correct": 35,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 35,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    }
+  ],
+  "firstMixed": [
+    {
+      "variant": "D",
+      "scenario": "fresh",
+      "replicate": 1,
+      "session": "ses_f0c64207bffe7FzR46wH4qZuT4",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Starting by reading the fixture and listing the directory in parallel.",
+      "identical": true
+    },
+    {
+      "variant": "D",
+      "scenario": "reduced",
+      "replicate": 1,
+      "session": "ses_f0c63a8e8ffesNGQCzGHjel9SL",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Reading fixture.txt and listing the directory in parallel first.",
+      "identical": true
+    },
+    {
+      "variant": "D",
+      "scenario": "literal-head",
+      "replicate": 1,
+      "session": "ses_f0c631727ffe1w1CoA48W7GY4b",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Starting with a parallel read of fixture.txt and listing of the directory.",
+      "identical": true
+    },
+    {
+      "variant": "D",
+      "scenario": "fresh",
+      "replicate": 2,
+      "session": "ses_f0c62a17dffeGn1HPv6fTjM8gk",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Starting by reading the fixture and listing the directory in parallel.",
+      "identical": true
+    },
+    {
+      "variant": "D",
+      "scenario": "reduced",
+      "replicate": 2,
+      "session": "ses_f0c620c12ffe6Mr5VXOVIY2zeE",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Reading fixture.txt and listing the fixture directory in parallel to start.",
+      "identical": true
+    },
+    {
+      "variant": "D",
+      "scenario": "literal-head",
+      "replicate": 2,
+      "session": "ses_f0c61900effep2ssFBn9q5ALR2",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Starting with a parallel read of the fixture and a listing of the fixture directory.",
+      "identical": true
+    },
+    {
+      "variant": "D",
+      "scenario": "reduced",
+      "replicate": 1,
+      "session": "ses_f0c5f3009ffe6D6Z3pD9EnlJoG",
+      "position": 3,
+      "assigned": 6,
+      "raw": "§6§ Starting with a parallel read of the fixture and a listing of the directory.",
+      "identical": true
+    }
+  ],
+  "usage": {
+    "input": 1051970,
+    "output": 15554,
+    "cacheHit": 975104,
+    "cacheMiss": 76866,
+    "reasoning": 9188,
+    "reasoningUnknown": 0
+  },
+  "calls": 176,
+  "reasoning": {
+    "callsWithReasoning": 169,
+    "callsWithNotation": 164,
+    "exactReplayParts": 169,
+    "emptyReplays": 0,
+    "lengthLimits": []
+  },
+  "estimatedOffPeakUSD": 0.023787612,
+  "estimatedPeakUSD": 0.047575224
+}

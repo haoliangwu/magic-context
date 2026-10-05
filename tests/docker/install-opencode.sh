@@ -11,10 +11,11 @@
 #     on shared runner egress ("Failed to fetch version information", release
 #     gates on 2026-09-13, 09-15 and again locally on 09-18).
 # So: download the installer to a file (its fetch has its own exit status),
-# resolve the latest tag from the releases redirect on github.com (no API), run the
-# installer with that version pinned (direct download URL, HEAD on github.com), retry
-# each network step with backoff, and assert the binary runs before the layer ends.
-# An explicit OPENCODE_VERSION (e.g. 1.18.30) skips the resolution step.
+# install the tested OpenCode 1.x host (or an explicit OPENCODE_VERSION), retry each
+# network step with backoff, and assert the binary runs before the layer ends.
+# This script installs OpenCode 1.x through its release installer. OpenCode 2 is not
+# installed this way: its images install `@opencode/cli` from npm (see
+# tests/docker/opencode2/Dockerfile), and this installer cannot unpack a 2.x release.
 set -euo pipefail
 
 retry() {
@@ -42,26 +43,29 @@ fetch_installer() {
 }
 retry "installer fetch" fetch_installer
 
-version="${OPENCODE_VERSION:-}"
-if [ -z "$version" ]; then
-    resolve_version() {
-        # github.com answers /releases/latest with a redirect to /releases/tag/vX.Y.Z;
-        # reading the Location header needs no API token and no rate-limit budget.
-        local location
-        location="$(curl -fsSI --connect-timeout 15 --max-time 60 \
-            https://github.com/anomalyco/opencode/releases/latest \
-            | tr -d '\r' | awk 'tolower($1) == "location:" { print $2 }' | tail -n 1)"
-        version="${location##*/tag/v}"
-        [ -n "$version" ] && [ "$version" != "$location" ]
+version="${OPENCODE_VERSION:-1.18.31}"
+if [ "$version" = latest ]; then
+    # Resolve the release tag through GitHub's redirect, not its rate-limited API.
+    resolve_latest_version() {
+        local latest_url
+        latest_url="$(curl -fsSL --connect-timeout 15 --max-time 120 -o /dev/null -w '%{url_effective}' https://github.com/anomalyco/opencode/releases/latest)" || return 1
+        version="${latest_url##*/}"
+        version="${version#v}"
+        if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "install-opencode: could not resolve latest release version from $latest_url" >&2
+            return 1
+        fi
     }
-    retry "latest version resolution" resolve_version
+    retry "latest version lookup" resolve_latest_version
 fi
 echo "install-opencode: installing opencode v${version}"
 
 run_installer() { bash "$installer" --version "$version"; }
 retry "installer run" run_installer
 
-export PATH="/root/.opencode/bin:$PATH"
+# The installer writes to $HOME/.opencode/bin (/root inside the images, the runner's
+# home on a CI host).
+export PATH="$HOME/.opencode/bin:$PATH"
 if ! command -v opencode >/dev/null 2>&1; then
     echo "install-opencode: installer completed but no opencode binary on PATH" >&2
     exit 1

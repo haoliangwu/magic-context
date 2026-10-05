@@ -50,56 +50,35 @@ describe("buildAllowOnlyPermission", () => {
 });
 
 describe("HISTORIAN_ALLOWED_TOOLS", () => {
-    it("includes `read` (for state-file offload)", () => {
-        // Historian's primary tool need is reading the offloaded
-        // existing-state XML the runner writes to a temp file.
-        expect(HISTORIAN_ALLOWED_TOOLS).toContain("read");
-    });
-
-    it("includes `aft_outline`, `aft_zoom`, `aft_search` for token-efficient repo navigation/search", () => {
-        // Read-only AFT navigation + search tools let historian/compressor
-        // find or verify a symbol or skim file structure when writing
-        // accurate compartment summaries without dragging in whole files.
-        expect(HISTORIAN_ALLOWED_TOOLS).toContain("aft_outline");
-        expect(HISTORIAN_ALLOWED_TOOLS).toContain("aft_zoom");
-        expect(HISTORIAN_ALLOWED_TOOLS).toContain("aft_search");
-    });
-
-    it("does NOT include `task` (the bug we're fixing — preventing subagent fanout)", () => {
-        expect(HISTORIAN_ALLOWED_TOOLS).not.toContain("task");
-    });
-
-    it("does NOT include any edit / bash / web tools", () => {
-        for (const dangerous of ["bash", "edit", "write", "webfetch", "websearch"]) {
-            expect(HISTORIAN_ALLOWED_TOOLS).not.toContain(dangerous);
-        }
-    });
-
-    it("does NOT include `grep` or `glob` (historian summarizes, not explores)", () => {
-        // Historian's job is summarizing the input it was given.
-        // Repo-wide exploration belongs to dreamer / primary agents.
-        expect(HISTORIAN_ALLOWED_TOOLS).not.toContain("grep");
-        expect(HISTORIAN_ALLOWED_TOOLS).not.toContain("glob");
+    it("has no tools: all reference state is supplied inline", () => {
+        expect([...HISTORIAN_ALLOWED_TOOLS]).toEqual([]);
     });
 });
 
 describe("applyDisallowedTools", () => {
     it("returns the defaults unchanged when disallowed is empty", () => {
-        expect(applyDisallowedTools(HISTORIAN_ALLOWED_TOOLS, [])).toEqual([
-            ...HISTORIAN_ALLOWED_TOOLS,
-        ]);
+        expect(applyDisallowedTools(["read", "aft_outline", "aft_zoom", "aft_search"], [])).toEqual(
+            ["read", "aft_outline", "aft_zoom", "aft_search"],
+        );
     });
 
     it('removes all tools when "*" is in the disallowed list', () => {
-        expect(applyDisallowedTools(HISTORIAN_ALLOWED_TOOLS, ["*"])).toEqual([]);
+        expect(
+            applyDisallowedTools(["read", "aft_outline", "aft_zoom", "aft_search"], ["*"]),
+        ).toEqual([]);
     });
 
     it('removes all tools when "*" appears alongside other entries', () => {
-        expect(applyDisallowedTools(HISTORIAN_ALLOWED_TOOLS, ["*", "read"])).toEqual([]);
+        expect(
+            applyDisallowedTools(["read", "aft_outline", "aft_zoom", "aft_search"], ["*", "read"]),
+        ).toEqual([]);
     });
 
     it("removes a single tool by name", () => {
-        const result = applyDisallowedTools(HISTORIAN_ALLOWED_TOOLS, ["read"]);
+        const result = applyDisallowedTools(
+            ["read", "aft_outline", "aft_zoom", "aft_search"],
+            ["read"],
+        );
         expect(result).not.toContain("read");
         expect(result).toContain("aft_outline");
         expect(result).toContain("aft_zoom");
@@ -107,25 +86,34 @@ describe("applyDisallowedTools", () => {
     });
 
     it("removes multiple tools by name", () => {
-        const result = applyDisallowedTools(HISTORIAN_ALLOWED_TOOLS, ["read", "aft_search"]);
+        const result = applyDisallowedTools(
+            ["read", "aft_outline", "aft_zoom", "aft_search"],
+            ["read", "aft_search"],
+        );
         expect(result).toEqual(["aft_outline", "aft_zoom"]);
     });
 
     it("silently ignores unknown tool names (defense-in-depth)", () => {
-        expect(applyDisallowedTools(HISTORIAN_ALLOWED_TOOLS, ["nonexistent"])).toEqual([
-            ...HISTORIAN_ALLOWED_TOOLS,
-        ]);
+        expect(
+            applyDisallowedTools(
+                ["read", "aft_outline", "aft_zoom", "aft_search"],
+                ["nonexistent"],
+            ),
+        ).toEqual(["read", "aft_outline", "aft_zoom", "aft_search"]);
     });
 
     it("produces empty allow-list → buildAllowOnlyPermission yields wildcard deny only", () => {
-        const allowed = applyDisallowedTools(HISTORIAN_ALLOWED_TOOLS, ["*"]);
+        const allowed = applyDisallowedTools(
+            ["read", "aft_outline", "aft_zoom", "aft_search"],
+            ["*"],
+        );
         const perm = buildAllowOnlyPermission(allowed);
         expect(perm).toEqual({ "*": "deny" });
     });
 });
 
 describe("DREAMER_CURATE_ALLOWED_TOOLS (base dreamer = curate only)", () => {
-    it("is ctx_memory ONLY — curate edits the memory store and reads no code", () => {
+    it("allows only ctx_memory — the category snapshot replaces enumeration", () => {
         // A separate verify task owns memory-vs-code correctness; curate is
         // pure pool hygiene, so it has no read/grep/bash/write/edit surface.
         expect([...DREAMER_CURATE_ALLOWED_TOOLS]).toEqual(["ctx_memory"]);
@@ -150,42 +138,34 @@ describe("DREAMER_CURATE_ALLOWED_TOOLS (base dreamer = curate only)", () => {
 });
 
 describe("DREAMER_DOCS_ALLOWED_TOOLS (maintain-docs)", () => {
-    it("includes read/grep/glob/bash + write/edit + aft for doc maintenance", () => {
-        for (const tool of [
-            "read",
-            "grep",
-            "glob",
-            "bash",
-            "write",
-            "edit",
-            "aft_outline",
-            "aft_zoom",
-            "aft_search",
-        ]) {
+    it("includes read-only source investigation tools for doc proposals", () => {
+        for (const tool of ["read", "grep", "glob", "aft_outline", "aft_zoom", "aft_search"]) {
             expect(DREAMER_DOCS_ALLOWED_TOOLS).toContain(tool);
         }
     });
 
-    it("does NOT include memory tools (it edits docs, not the memory store)", () => {
-        for (const denied of ["ctx_memory", "ctx_search", "ctx_note", "task"]) {
+    it("denies write, shell and memory tools", () => {
+        for (const denied of [
+            "bash",
+            "write",
+            "edit",
+            "ctx_memory",
+            "ctx_search",
+            "ctx_note",
+            "task",
+        ]) {
             expect(DREAMER_DOCS_ALLOWED_TOOLS).not.toContain(denied);
         }
     });
 });
 
 describe("integration: full hidden-agent permission shape", () => {
-    it("historian permission object: `*` denied + read + aft_outline + aft_zoom + aft_search allowed", () => {
+    it("historian permission object denies every tool", () => {
         const perm = buildAllowOnlyPermission(HISTORIAN_ALLOWED_TOOLS);
-        expect(perm).toEqual({
-            "*": "deny",
-            read: "allow",
-            aft_outline: "allow",
-            aft_zoom: "allow",
-            aft_search: "allow",
-        });
+        expect(perm).toEqual({ "*": "deny" });
     });
 
-    it("base dreamer (curate) permission object: `*` denied + ctx_memory only", () => {
+    it("base dreamer permission object denies all except ctx_memory", () => {
         const perm = buildAllowOnlyPermission(DREAMER_CURATE_ALLOWED_TOOLS);
         expect(perm).toEqual({
             "*": "deny",
@@ -193,16 +173,13 @@ describe("integration: full hidden-agent permission shape", () => {
         });
     });
 
-    it("dreamer-docs permission object: `*` denied + repo-exploration + write/edit + aft_* (no memory)", () => {
+    it("dreamer-docs permission object denies writes and allows read-only source tools", () => {
         const perm = buildAllowOnlyPermission(DREAMER_DOCS_ALLOWED_TOOLS);
         expect(perm).toEqual({
             "*": "deny",
             read: "allow",
             grep: "allow",
             glob: "allow",
-            bash: "allow",
-            write: "allow",
-            edit: "allow",
             aft_outline: "allow",
             aft_zoom: "allow",
             aft_search: "allow",

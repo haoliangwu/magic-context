@@ -235,7 +235,6 @@ A recuperação funciona **entre sessões** (uma nova sessão herda tudo) e **en
 | `/ctx-status` | Visão de debug: tags, pending drops, cache TTL, estado de nudge, progresso do historian, cobertura de compartimentos, orçamento de histórico |
 | `/ctx-flush` | Forçar todas as operações enfileiradas imediatamente, ignorando cache TTL |
 | `/ctx-recomp` | Reconstruir compartimentos a partir do histórico bruto (aceita um intervalo `start-end`). Use quando o estado armazenado parecer errado |
-| `/ctx-session-upgrade` | Atualizar esta sessão para o formato de histórico mais recente: reconstruir compartimentos e migrar memórias do projeto |
 | `/ctx-dream` | Executar manutenção dreamer sob demanda: manter memória, docs, smart notes e revisão de user-profile |
 
 ---

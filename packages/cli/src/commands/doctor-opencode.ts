@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
 import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
@@ -11,6 +11,10 @@ import {
     stripRemovedAgentConfig,
 } from "@magic-context/core/config/removed-agent-config";
 import { substituteConfigVariables } from "@magic-context/core/config/variable";
+import {
+    formatDreamerTickFailure,
+    getDreamerTickFailure,
+} from "@magic-context/core/features/magic-context/dreamer/tick-failure";
 import type { LocalEmbeddingRuntime } from "@magic-context/core/features/magic-context/memory/embedding-local";
 import {
     type EmbeddingProbeOutcome,
@@ -53,6 +57,7 @@ import {
     isDevPathPluginEntry,
     isLocalPathPluginEntry,
     matchesPluginEntry,
+    pluginEntryPackage,
 } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import { migrateConfigLocationsForCli } from "../lib/config-location-migration";
@@ -62,7 +67,7 @@ import {
     UnsupportedSchemaVersionError,
 } from "../lib/database-access";
 import { formatDatabaseRepairGuidance } from "../lib/database-repair-guidance";
-import { collectDiagnostics } from "../lib/diagnostics-opencode";
+import { collectDiagnostics, type DiagnosticReport } from "../lib/diagnostics-opencode";
 import {
     checkLocalEmbeddingRuntime,
     formatLocalEmbeddingRuntimeDoctorWarning,
@@ -79,12 +84,14 @@ import { detectOpenCodeInstallations } from "../lib/opencode-detect";
 import {
     describeOpenCodeInstallations,
     type OpenCodeInstallationReport,
+    selectOpenCodeStoreHost,
 } from "../lib/opencode-helpers";
 import {
     getOpenCodePluginCacheRoots,
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION as PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME as PLUGIN_NAME,
 } from "../lib/opencode-plugin-cache";
+import { pluginConfigKeyFor, readPluginEntries } from "../lib/opencode-plugin-registration";
 import { inspectPinnedOpenCodePluginSchemaFences } from "../lib/opencode-plugin-schema-fence";
 import { detectConfigPaths } from "../lib/paths";
 import { confirm, intro, log, outro, selectOne, spinner, text } from "../lib/prompts";
@@ -99,14 +106,258 @@ import {
     readStorageVersions,
 } from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
-import { reportAuthorityMarkers } from "./doctor-authority";
+import {
+    compareCachedPluginFences,
+    listCachedOpenCodePluginFences,
+    readContextDbSchemaVersion,
+    reportCachedPluginFences,
+} from "./doctor-cached-plugin-fence";
+import {
+    checkOpenCodeCompactionMarkerConversion,
+    formatOpenCodeCompactionMarkerConversion,
+    formatOpenCodeV2MissingMarkerNotice,
+} from "./doctor-compaction-markers";
 import {
     formatDanglingCompartmentBoundary,
     listDanglingCompartmentBoundaries,
 } from "./doctor-compartment-boundaries";
+import { reportUnresolvedHarnessRelabel } from "./doctor-harness-relabel";
 import { clearPluginCache } from "./doctor-opencode-cache";
+import { checkPluginDuplicates } from "./doctor-opencode-plugin-duplicates";
+import {
+    checkOpenCodePluginEntry,
+    isPinnedOpenCodePluginSpecifier,
+    withPluginEntrySpecifier,
+} from "./doctor-opencode-plugin-entry";
+import {
+    checkOpenCodeV2PluginCache,
+    compareSemverPrecedence,
+    configuredOpenCodeV2DistTag,
+    openCodeHostDatabaseFiles,
+    reportOpenCodeV2PluginCache,
+} from "./doctor-opencode2-cache";
+import { runDiscoveryDoctorCheck } from "./doctor-prune-discovery";
+import {
+    countPendingCoordinateRebases,
+    formatPendingCoordinateRebases,
+    formatUnresolvedCompartmentSession,
+    listUnresolvedCompartments,
+    supportsCoordinateGenerationReporting,
+} from "./doctor-store-generation";
 
 const CLI_PACKAGE_NAME = "@cortexkit/magic-context";
+
+const SHARED_DB_ROW_COUNT_TABLES = ["tags", "compartments", "memories", "notes", "dream_runs"];
+
+/**
+ * Summarize row counts of the shared context DB. A count that cannot be read
+ * shows as `n/a` with the reason. It used to show as 0, which is
+ * indistinguishable from an empty table and made doctor contradict the rows
+ * the plugin and other SQLite readers could see.
+ */
+export function formatSharedDbRowCounts(db: {
+    prepare(sql: string): { get(...params: unknown[]): unknown };
+}): string {
+    return SHARED_DB_ROW_COUNT_TABLES.map((table) => {
+        try {
+            const row = db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as
+                | { c?: unknown }
+                | undefined;
+            return `${table}=${typeof row?.c === "number" ? row.c : "n/a"}`;
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            return `${table}=n/a (${sanitizeDiagnosticText(reason)})`;
+        }
+    }).join(", ");
+}
+
+export function findUndeclaredConfiguredVariants(
+    configured: Array<{ agent: string; model: string; variant: string }>,
+    catalog: ReturnType<typeof parseOpenCodeModelCatalog>,
+): Array<{ agent: string; model: string; variant: string }> {
+    return configured.filter((entry) => {
+        const [providerID, id] = entry.model.split("/", 2);
+        const model = catalog.find((item) => item.providerID === providerID && item.id === id);
+        return model !== undefined && !Object.hasOwn(model.variants, entry.variant);
+    });
+}
+
+/**
+ * Configured hidden-agent models this host's catalog does not list. A model
+ * whose provider is missing from the catalog entirely is reported as an unknown
+ * provider (typically a provider id that is not configured in OpenCode); a
+ * known provider without that model id is reported as an unknown model.
+ */
+export function findUnknownConfiguredModels(
+    configured: Array<{ agent: string; model: string; fallback: boolean }>,
+    catalog: ReturnType<typeof parseOpenCodeModelCatalog>,
+): Array<{ agent: string; model: string; fallback: boolean; unknown: "provider" | "model" }> {
+    return configured.flatMap((entry): Array<typeof entry & { unknown: "provider" | "model" }> => {
+        const [providerID, id] = entry.model.split("/", 2);
+        if (!catalog.some((item) => item.providerID === providerID)) {
+            return [{ ...entry, unknown: "provider" as const }];
+        }
+        if (!catalog.some((item) => item.providerID === providerID && item.id === id)) {
+            return [{ ...entry, unknown: "model" as const }];
+        }
+        return [];
+    });
+}
+
+export function checkConfiguredVariantCatalog(
+    config: unknown,
+    hostGeneration: "v1" | "v2",
+    warn: (message: string) => void,
+    run: (
+        args: string[],
+        cwd: string,
+    ) => { stdout: string; status: number | null; error?: Error } = (args, cwd) =>
+        spawnSync("opencode", args, {
+            windowsHide: true,
+            cwd,
+            encoding: "utf8",
+            timeout: hostGeneration === "v2" ? 90_000 : 45_000,
+            maxBuffer: 16 * 1024 * 1024,
+        }),
+    projectDir = process.cwd(),
+): void {
+    const configured: Array<{ agent: string; model: string; variant: string }> = [];
+    const models: Array<{ agent: string; model: string; fallback: boolean }> = [];
+    const root = config && typeof config === "object" ? (config as Record<string, unknown>) : {};
+    for (const agent of ["historian", "dreamer"] as const) {
+        const section = root[agent];
+        if (!section || typeof section !== "object") continue;
+        const block = (section as Record<string, unknown>).opencode ?? section;
+        if (!block || typeof block !== "object") continue;
+        const record = block as Record<string, unknown>;
+        const add = (entry: unknown, defaultVariant: unknown, fallback: boolean) => {
+            const value =
+                entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+            const model = typeof entry === "string" ? entry : value.model;
+            const variant = value.variant ?? defaultVariant;
+            if (typeof model !== "string" || !model.includes("/")) return;
+            if (!models.some((known) => known.agent === agent && known.model === model)) {
+                models.push({ agent, model, fallback });
+            }
+            if (typeof variant === "string") configured.push({ agent, model, variant });
+        };
+        add(record.model, record.variant, false);
+        if (Array.isArray(record.fallback_models)) {
+            for (const entry of record.fallback_models) add(entry, undefined, true);
+        }
+    }
+    if (models.length === 0) return;
+    const tempRoot = mkdtempSync(join(tmpdir(), "magic-context-opencode-catalog-"));
+    try {
+        const command =
+            hostGeneration === "v2"
+                ? ["api", "model.list", "--param", `directory=${projectDir}`]
+                : ["models", "--verbose"];
+        const guidance = `opencode ${command.join(" ")}`;
+        const result = run(command, tempRoot);
+        const catalog =
+            hostGeneration === "v2"
+                ? parseOpenCodeV2ModelCatalog(result.stdout ?? "")
+                : parseOpenCodeModelCatalog(result.stdout ?? "");
+        if (result.error || result.status !== 0 || catalog.length === 0) {
+            warn(
+                `Could not verify configured hidden-agent models and variants: this OpenCode host did not provide a readable model catalog. ${hostGeneration === "v2" ? "Start the background service with opencode service start, then check" : "Check"} ${guidance}.`,
+            );
+            return;
+        }
+        // Nothing else reports this before a run: the historian or dreamer just
+        // fails each time it is due, and without a historian no history is
+        // ever compacted into compartments.
+        for (const entry of findUnknownConfiguredModels(models, catalog)) {
+            const [providerID] = entry.model.split("/", 1);
+            const role = `${entry.agent}${entry.fallback ? " fallback" : ""} model ${entry.model}`;
+            warn(
+                entry.unknown === "provider"
+                    ? `${role} names provider '${providerID}', which this OpenCode host does not have. The ${entry.agent} cannot run on it; configure that provider in OpenCode or choose a model listed by ${guidance}.`
+                    : `${role} is not offered by provider '${providerID}' on this OpenCode host. The ${entry.agent} cannot run on it; choose a model listed by ${guidance}.`,
+            );
+        }
+        for (const entry of findUndeclaredConfiguredVariants(configured, catalog)) {
+            warn(
+                `${entry.agent} model ${entry.model} requests variant '${entry.variant}', which this host does not offer. Remove the variant or choose one listed by ${guidance}.`,
+            );
+        }
+    } finally {
+        rmSync(tempRoot, { recursive: true, force: true });
+    }
+}
+
+export function parseOpenCodeV2ModelCatalog(
+    output: string,
+): ReturnType<typeof parseOpenCodeModelCatalog> {
+    try {
+        const payload: unknown = JSON.parse(output);
+        const rows =
+            payload && typeof payload === "object" && "data" in payload
+                ? (payload as { data: unknown }).data
+                : payload;
+        if (!Array.isArray(rows)) return [];
+        return rows.flatMap((row) => {
+            if (!row || typeof row !== "object") return [];
+            const model = row as Record<string, unknown>;
+            if (
+                typeof model.providerID !== "string" ||
+                typeof model.id !== "string" ||
+                !Array.isArray(model.variants)
+            )
+                return [];
+            const variants: Record<string, unknown> = {};
+            for (const variant of model.variants) {
+                if (variant && typeof variant === "object" && typeof variant.id === "string") {
+                    variants[variant.id] = variant;
+                }
+            }
+            return [{ providerID: model.providerID, id: model.id, variants }];
+        });
+    } catch {
+        return [];
+    }
+}
+
+export function parseOpenCodeModelCatalog(output: string): Array<{
+    providerID: string;
+    id: string;
+    variants: Record<string, unknown>;
+}> {
+    const models: Array<{ providerID: string; id: string; variants: Record<string, unknown> }> = [];
+    const lines = output.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index++) {
+        if (lines[index]?.trim() !== "{") continue;
+        const jsonLines = [lines[index] ?? "{"];
+        while (++index < lines.length) {
+            jsonLines.push(lines[index] ?? "");
+            if (lines[index] === "}") break;
+        }
+        try {
+            const value = JSON.parse(jsonLines.join("\n")) as {
+                providerID?: unknown;
+                id?: unknown;
+                variants?: unknown;
+            };
+            if (
+                typeof value.providerID === "string" &&
+                typeof value.id === "string" &&
+                value.variants &&
+                typeof value.variants === "object" &&
+                !Array.isArray(value.variants)
+            ) {
+                models.push({
+                    providerID: value.providerID,
+                    id: value.id,
+                    variants: value.variants as Record<string, unknown>,
+                });
+            }
+        } catch {
+            // Ignore non-model output; a wholly unparseable catalog is reported by the caller.
+        }
+    }
+    return models;
+}
 
 export function describeOpenCodeDatabaseDoctorCheck(
     resolution: OpenCodeDbPathResolution,
@@ -222,18 +473,25 @@ export function checkUserMemoriesDreamerCompatibility(
 }
 
 /**
- * Fetch the latest version of an npm package from the registry. Returns null
- * on any error so the doctor can report "check unavailable" rather than fail.
+ * Fetch the version an npm dist-tag (`latest` by default) points at. Returns
+ * null on any error so the doctor can report "check unavailable" rather than fail.
  */
-async function fetchNpmLatest(pkg: string, timeoutMs = 5000): Promise<string | null> {
+async function fetchNpmLatest(
+    pkg: string,
+    distTag = "latest",
+    timeoutMs = 5000,
+): Promise<string | null> {
     try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
         try {
-            const res = await fetch(`https://registry.npmjs.org/${pkg}/latest`, {
-                signal: controller.signal,
-                headers: { Accept: "application/json" },
-            });
+            const res = await fetch(
+                `${resolveNpmRegistryUrl()}/${pkg}/${encodeURIComponent(distTag)}`,
+                {
+                    signal: controller.signal,
+                    headers: { Accept: "application/json" },
+                },
+            );
             if (!res.ok) return null;
             const body = (await res.json()) as { version?: unknown };
             return typeof body.version === "string" ? body.version : null;
@@ -243,6 +501,16 @@ async function fetchNpmLatest(pkg: string, timeoutMs = 5000): Promise<string | n
     } catch {
         return null;
     }
+}
+
+/**
+ * Registry doctor asks for the latest version. OpenCode installs plugins through
+ * npm's own config loader, which honours `npm_config_registry`; reading the
+ * same variable keeps doctor's "latest" equal to what the host would install.
+ */
+export function resolveNpmRegistryUrl(env: NodeJS.ProcessEnv = process.env): string {
+    const configured = (env.npm_config_registry ?? env.NPM_CONFIG_REGISTRY)?.trim();
+    return (configured || "https://registry.npmjs.org").replace(/\/+$/, "");
 }
 
 /** Self-version with src/dist layout fallback. */
@@ -259,10 +527,7 @@ function getSelfVersion(): string {
     return "0.0.0";
 }
 
-export function isPinnedOpenCodePluginSpecifier(specifier: string): boolean {
-    if (specifier === PLUGIN_NAME || specifier === PLUGIN_ENTRY_WITH_VERSION) return false;
-    return specifier.startsWith(`${PLUGIN_NAME}@`);
-}
+export { isPinnedOpenCodePluginSpecifier };
 
 export function describeAutoUpdateStall(
     specifier: string,
@@ -305,18 +570,13 @@ export function collectNpmReleaseAgeWarnings(): string[] {
 }
 
 /** Compare semver-like strings. Returns -1 if a<b, 0 if equal, 1 if a>b. */
-function compareVersions(a: string, b: string): number {
-    const pa = a.split(/[.-]/).map((s) => Number.parseInt(s, 10));
-    const pb = b.split(/[.-]/).map((s) => Number.parseInt(s, 10));
-    const len = Math.max(pa.length, pb.length);
-    for (let i = 0; i < len; i++) {
-        const x = pa[i] ?? 0;
-        const y = pb[i] ?? 0;
-        if (Number.isNaN(x) || Number.isNaN(y)) return 0;
-        if (x < y) return -1;
-        if (x > y) return 1;
-    }
-    return 0;
+/**
+ * Semver precedence of the CLI version against npm's: a prerelease ranks
+ * below its release, so a beta CLI is reported as behind the matching
+ * release. Null when either version is not semver.
+ */
+export function compareVersions(a: string, b: string): number | null {
+    return compareSemverPrecedence(a, b);
 }
 
 // ── Issue flow ──────────────────────────────────────────────────────
@@ -324,13 +584,16 @@ function compareVersions(a: string, b: string): number {
 function openBrowser(url: string): void {
     try {
         if (process.platform === "darwin") {
-            const child = spawnSync("open", [url], { stdio: "ignore" });
+            const child = spawnSync("open", [url], { windowsHide: true, stdio: "ignore" });
             if (child.status === 0) return;
         } else if (process.platform === "linux") {
-            const child = spawnSync("xdg-open", [url], { stdio: "ignore" });
+            const child = spawnSync("xdg-open", [url], { windowsHide: true, stdio: "ignore" });
             if (child.status === 0) return;
         } else if (process.platform === "win32") {
-            const child = spawnSync("cmd", ["/c", "start", "", url], { stdio: "ignore" });
+            const child = spawnSync("cmd", ["/c", "start", "", url], {
+                windowsHide: true,
+                stdio: "ignore",
+            });
             if (child.status === 0) return;
         }
     } catch {
@@ -338,7 +601,33 @@ function openBrowser(url: string): void {
     }
 }
 
-async function runIssueFlow(): Promise<number> {
+export async function runIssueFlow(
+    options: { reportPath?: string } = {},
+    deps: { collectDiagnostics: () => Promise<DiagnosticReport> } = { collectDiagnostics },
+): Promise<number> {
+    if (options.reportPath) {
+        // Scripted runs (CI, bug templates) need a report without prompts.
+        try {
+            const report = await deps.collectDiagnostics();
+            const bundled = await bundleIssueReport(
+                report,
+                "Generated non-interactively by `doctor --issue --report`.",
+                "Magic Context diagnostic report",
+                null,
+                { outputPath: resolve(process.cwd(), options.reportPath) },
+            );
+            log.info(
+                bundled.fullPath
+                    ? `Report written to ${bundled.path}; full bundle at ${bundled.fullPath}`
+                    : `Report written to ${bundled.path}`,
+            );
+            return 0;
+        } catch (error) {
+            log.error(error instanceof Error ? error.message : String(error));
+            return 1;
+        }
+    }
+
     intro("Magic Context Issue Report");
 
     const title = await text("Issue title", {
@@ -354,19 +643,19 @@ async function runIssueFlow(): Promise<number> {
     s.start("Collecting diagnostics");
 
     try {
-        const report = await collectDiagnostics();
+        const report = await deps.collectDiagnostics();
         s.stop("Diagnostics collected");
 
         // Ask the user which session this issue relates to. Only show the
         // picker when there's more than one recent session — otherwise the
         // single-session case is unambiguous, and the no-session case
-        // (Node-only run without bun:sqlite) skips filtering entirely.
+        // or unavailable-store case skips filtering entirely.
         let sessionFilter: string | null = null;
-        if (report.recentSessions.length > 1) {
+        if (report.recentSessions.available && report.recentSessions.rows.length > 1) {
             const choice = await selectOne(
                 "Which session is this issue about? (filters log lines from other sessions)",
                 [
-                    ...report.recentSessions.map((session, index) => {
+                    ...report.recentSessions.rows.map((session, index) => {
                         const displayTitle = session.title.trim() || "(no title)";
                         const truncatedTitle =
                             displayTitle.length > 50
@@ -464,7 +753,7 @@ function checkLocalEmbeddingRuntimeForDoctor(runtimePreference: LocalEmbeddingRu
         runtimePreference,
     );
     if (runtime.state === "wasm-selected") {
-        log.info(formatLocalEmbeddingRuntimeWasmSelected(runtime));
+        log.warn(formatLocalEmbeddingRuntimeWasmSelected(runtime));
         return { issues: 0 };
     }
     if (runtime.state === "wasm-fallback") {
@@ -713,13 +1002,23 @@ function logOpenCodeInstallationTable(installations: OpenCodeInstallationReport[
     }
 }
 
+export function describeOpenCode2SessionAPIRequirement(hostVersion: string): string {
+    return `OpenCode host ${hostVersion}; Magic Context requires OpenCode 2.0.22 or newer with session.remove and session.compact.`;
+}
+
 export async function runDoctor(
-    options: { force?: boolean; issue?: boolean } & V22BackfillCommandArgs = {},
+    options: {
+        force?: boolean;
+        fix?: boolean;
+        issue?: boolean;
+        /** With `issue`, write the report here without prompting. */
+        report?: string;
+    } & V22BackfillCommandArgs = {},
 ): Promise<number> {
     migrateConfigLocationsForCli(process.cwd(), log);
 
     if (options.issue) {
-        return runIssueFlow();
+        return runIssueFlow({ reportPath: options.report });
     }
 
     let v22Db: ReturnType<typeof openExistingContextDatabase> = null;
@@ -773,13 +1072,15 @@ export async function runDoctor(
     try {
         authorityDb = openExistingContextDatabase(authorityDbPath, { readonly: true });
         if (authorityDb) {
-            await reportAuthorityMarkers({ db: authorityDb, info: log.info, warn });
+            // Sessions whose OpenCode harness label the v87 repair could not verify
+            // because no OpenCode store was readable when it ran.
+            reportUnresolvedHarnessRelabel({ db: authorityDb, warn, detail: log.warn });
         } else {
-            log.info("Authority: no context database found");
+            log.info("Harness relabel: no context database found");
         }
     } catch (error) {
         warn(
-            `Authority check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            `Harness relabel check unavailable: ${error instanceof Error ? error.message : String(error)}`,
         );
     } finally {
         authorityDb?.close();
@@ -794,7 +1095,9 @@ export async function runDoctor(
         // Help users whose binary IS on PATH but is shadowed by a wrapper
         // script or lives in a directory not searched by our detection
         // (e.g. tool-version shims that only inject PATH at shell time).
-        log.info("Doctor checked ~/.opencode/bin/opencode and each entry in $PATH.");
+        log.info(
+            "Doctor checked ~/.opencode/bin/opencode, each entry in $PATH, and the OpenCode CLI bundled in OpenChamber.app.",
+        );
         log.info(
             "If `which opencode` succeeds outside doctor, your wrapper or shim may not be readable by Node — please share that wrapper in the issue.",
         );
@@ -823,12 +1126,77 @@ export async function runDoctor(
     }
 
     const hostGeneration = openCodeHostGenerationFromVersion(activeInstallation.version);
-    const openCodeDbResolution = resolveOpenCodeDbPath(hostGeneration);
+    if (hostGeneration === "v2") {
+        log.info(describeOpenCode2SessionAPIRequirement(activeInstallation.version));
+    }
+    // Plugin registration follows the active (PATH) install; store checks follow the
+    // OpenCode 2 CLI when one is installed beside an OpenCode 1 that PATH resolves
+    // first, because that is the host converting and serving the store.
+    const storeHostSelection = selectOpenCodeStoreHost(
+        installationReports,
+        openCodeHostGenerationFromVersion,
+    );
+    const storeHost = storeHostSelection?.host ?? activeInstallation;
+    const storeGeneration = openCodeHostGenerationFromVersion(storeHost.version);
+    const openCodeDbResolution = resolveOpenCodeDbPath(storeGeneration);
+    if (storeHostSelection?.shadowed) {
+        const activeStore = resolveOpenCodeDbPath(hostGeneration).path;
+        const shared = activeStore === openCodeDbResolution.path;
+        // OpenChamber's bundled CLI prints "opencode v2.0.16" rather than "2.0.16".
+        const versionLabel = (version: string) => version.replace(/^opencode\s+v?/i, "");
+        const activeVersion = versionLabel(activeInstallation.version);
+        const storeVersion = versionLabel(storeHost.version);
+        warn(
+            `OpenCode ${activeVersion} (${activeInstallation.path}) is first on PATH, and OpenCode ${storeVersion} is also installed (${storeHost.path})${shared ? `; both use ${openCodeDbResolution.path}` : ""}.`,
+        );
+        log.warn(
+            `  Store and conversion checks below use OpenCode ${storeVersion}. Plugin configuration checks use OpenCode ${activeVersion}; to check OpenCode ${storeVersion}'s configuration instead, put its binary first on PATH and run doctor again.`,
+        );
+    }
     const openCodeDbCheck = describeOpenCodeDatabaseDoctorCheck(openCodeDbResolution);
     if (openCodeDbCheck.ok) pass(openCodeDbCheck.message);
     else fail(openCodeDbCheck.message);
 
     if (openCodeDbCheck.ok) {
+        let markerDb: Database | null = null;
+        try {
+            markerDb = new Database(openCodeDbResolution.path, {
+                readonly: !options.fix,
+                fileMustExist: true,
+            });
+            const report = checkOpenCodeCompactionMarkerConversion(markerDb, {
+                fix: options.fix,
+            });
+            const summary = formatOpenCodeCompactionMarkerConversion(report);
+            if (report.missingBefore === 0) {
+                pass(summary);
+            } else if (options.fix && report.missingAfter === 0) {
+                pass(`${summary}; repaired=${report.repaired}`);
+                fixed += report.repaired;
+            } else if (options.fix) {
+                warn(`${summary}; repaired=${report.repaired}, but some rows remain unconvertible`);
+            } else if (report.migrationCompleted) {
+                // The backfill only matters for a conversion that has not run yet; this
+                // store's conversion is finished and will not run again on its own.
+                log.info(`${summary}; OpenCode 2 already converted this store`);
+            } else {
+                warn(`${summary}; run \`magic-context doctor --fix\` before upgrading OpenCode`);
+            }
+
+            const notice = formatOpenCodeV2MissingMarkerNotice(report);
+            if (notice) {
+                for (const [index, line] of notice.entries()) {
+                    log.info(index === 0 ? line : `  ${line}`);
+                }
+            }
+        } catch (error) {
+            warn(
+                `OpenCode compaction marker conversion check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+            );
+        } finally {
+            markerDb?.close();
+        }
+
         let contextDb: ReturnType<typeof openExistingContextDatabase> = null;
         let sessionDb: Database | null = null;
         try {
@@ -838,13 +1206,71 @@ export async function runDoctor(
                     readonly: true,
                     fileMustExist: true,
                 });
-                const dangling = listDanglingCompartmentBoundaries(contextDb, sessionDb);
+                // Only a parsed version identifies the host; Desktop installs report
+                // "unknown" (which maps to v1), so leave those to store detection.
+                const dangling = listDanglingCompartmentBoundaries(
+                    contextDb,
+                    sessionDb,
+                    /\d/.test(storeHost.version) ? storeGeneration : undefined,
+                    (line) => log.info(line),
+                );
                 if (dangling.length === 0) {
                     pass("Compartment boundary ids resolve in the OpenCode session store");
+                } else if (storeGeneration === "v2" && /\d/.test(storeHost.version)) {
+                    // OpenCode 2's conversion drops some OpenCode 1 rows, such as the
+                    // summary half of a compaction pair or a compaction whose summary
+                    // never completed, so a compartment anchored there loses its id.
+                    // Magic Context places such a compartment from its neighbours; one
+                    // it cannot place is reported by the unresolved-compartment check.
+                    log.info(
+                        `${dangling.length} compartment(s) point at OpenCode message ids that are not in the OpenCode 2 store. Magic Context places these from the neighbouring compartments; any it cannot place are listed as excluded from range recovery below.`,
+                    );
+                    for (const boundary of dangling) {
+                        log.info(`  ${formatDanglingCompartmentBoundary(boundary)}`);
+                    }
                 } else {
                     warn(`${dangling.length} compartment(s) have dangling OpenCode boundary ids`);
                     for (const boundary of dangling) {
                         log.warn(`  ${formatDanglingCompartmentBoundary(boundary)}`);
+                    }
+                }
+
+                // Read-only view of the store-projection rebase: what the next
+                // open would re-anchor, and what an earlier open could not.
+                // Doctor never rebases; the plugin owns that on its own pass.
+                if (!supportsCoordinateGenerationReporting(contextDb)) {
+                    log.info(
+                        "Store projection check: this context database predates the coordinate columns",
+                    );
+                } else if (!/\d/.test(storeHost.version)) {
+                    log.info(
+                        "Store projection check: OpenCode reported no version, so the running projection is unknown",
+                    );
+                } else {
+                    const pendingRebases = countPendingCoordinateRebases(
+                        contextDb,
+                        storeGeneration,
+                    );
+                    const pendingLine = formatPendingCoordinateRebases(
+                        pendingRebases,
+                        storeGeneration,
+                    );
+                    if (pendingRebases.changed + pendingRebases.unrecorded === 0) {
+                        pass(pendingLine);
+                    } else {
+                        log.info(pendingLine);
+                    }
+
+                    const unresolved = listUnresolvedCompartments(contextDb);
+                    if (unresolved.total === 0) {
+                        pass("No compartment is excluded from range recovery by a store change");
+                    } else {
+                        warn(
+                            `${unresolved.total} compartment(s) across ${unresolved.sessions} session(s) could not be re-anchored and are excluded from range recovery`,
+                        );
+                        for (const session of unresolved.top) {
+                            log.warn(`  ${formatUnresolvedCompartmentSession(session)}`);
+                        }
                     }
                 }
             } else {
@@ -866,9 +1292,12 @@ export async function runDoctor(
         fetchNpmLatest(CLI_PACKAGE_NAME),
         fetchNpmLatest(PLUGIN_NAME),
     ]);
+    const cliComparison = npmLatest ? compareVersions(selfVersion, npmLatest) : null;
     if (!npmLatest) {
         log.info(`Magic Context CLI v${selfVersion}; npm latest check unavailable`);
-    } else if (compareVersions(selfVersion, npmLatest) < 0) {
+    } else if (cliComparison === null) {
+        log.info(`Magic Context CLI v${selfVersion}; cannot compare with npm latest v${npmLatest}`);
+    } else if (cliComparison < 0) {
         warn(`Magic Context CLI v${selfVersion} is older than npm latest v${npmLatest}`);
     } else {
         pass(`Magic Context CLI v${selfVersion} is current (npm latest v${npmLatest})`);
@@ -916,6 +1345,7 @@ export async function runDoctor(
         try {
             const result = loadPluginConfig(process.cwd());
             autoUpdateEnabled = result.auto_update !== false;
+            checkConfiguredVariantCatalog(result, hostGeneration, warn);
             const warnings = result.configWarnings ?? [];
             if (warnings.length > 0) {
                 warn(
@@ -1168,94 +1598,68 @@ export async function runDoctor(
         try {
             const raw = readFileSync(paths.opencodeConfig, "utf-8");
             const config = parse(raw) as Record<string, unknown>;
-            // Operate on the raw plugin array. Entries can be:
-            //   • a string  "@cortexkit/opencode-magic-context@latest"
-            //   • a tuple   ["@pkg/name@latest", { ...options }]
-            //   • a dev URL "file:///abs/path/.../packages/plugin"
-            // We MUST preserve every entry shape on write — filtering out
-            // tuples (or stripping options) would silently drop user config.
-            // matchesPluginEntry / isDevPathPluginEntry are imported from
-            // ../adapters/opencode and accept both strings and tuples.
-            const rawPlugins: unknown[] = Array.isArray(config?.plugin) ? config.plugin : [];
-            const existingIdx = rawPlugins.findIndex(
-                (entry) => matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
-            );
+            const configName =
+                paths.opencodeConfigFormat === "jsonc" ? "opencode.jsonc" : "opencode.json";
+            // Relative checkout paths resolve against the config file's directory.
+            const configDir = dirname(paths.opencodeConfig);
+            // Duplicates first, so the single-entry checks below see the
+            // deduplicated config when --fix removed the extra entries.
             if (
-                rawPlugins.some(
-                    (entry) =>
+                checkPluginDuplicates(
+                    config,
+                    configName,
+                    { fix: options.fix, configDir },
+                    {
+                        warn,
+                        pass: (message) => {
+                            pass(message);
+                            fixed++;
+                        },
+                        info: (message) => log.info(message),
+                    },
+                )
+            ) {
+                writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
+            }
+            // OpenCode 2 loads the legacy `plugin` array and its native `plugins`
+            // array together, so an entry under either key is a live registration
+            // and a fresh entry must go under the running host's own key.
+            const allEntries = readPluginEntries(config);
+            if (
+                allEntries.some(
+                    ({ entry }) =>
                         isLocalPathPluginEntry(entry) &&
                         String(entry).includes("magic-context") &&
-                        !isDevPathPluginEntry(entry),
+                        !isDevPathPluginEntry(entry, configDir),
                 )
             ) {
                 warn(
                     "An unverifiable local OpenCode plugin path was ignored because its package name is not Magic Context",
                 );
             }
-            const configName =
-                paths.opencodeConfigFormat === "jsonc" ? "opencode.jsonc" : "opencode.json";
-
-            // Helper: extract the plain string (or first element of a tuple) so
-            // we can compare against the desired @latest entry.
-            const entryAsString = (entry: unknown): string | null => {
-                if (typeof entry === "string") return entry;
-                if (Array.isArray(entry) && typeof entry[0] === "string") return entry[0];
-                return null;
-            };
-
+            // String, tuple and OpenCode 2 `{ package, options }` entries are all
+            // read, and a rewrite keeps the entry's shape and options.
             if (
-                existingIdx >= 0 &&
-                entryAsString(rawPlugins[existingIdx]) === PLUGIN_ENTRY_WITH_VERSION
+                checkOpenCodePluginEntry(
+                    config,
+                    configName,
+                    {
+                        force: options.force,
+                        registrationKey: pluginConfigKeyFor(hostGeneration),
+                        configDir,
+                    },
+                    {
+                        pass,
+                        warn,
+                        fixed: (message) => {
+                            pass(message);
+                            fixed++;
+                        },
+                        autoUpdateStall: reportAutoUpdateStall,
+                    },
+                )
             ) {
-                pass(`Plugin registered in ${configName}`);
-            } else if (existingIdx >= 0) {
-                const oldEntry = rawPlugins[existingIdx];
-                const oldEntryStr = entryAsString(oldEntry) ?? "";
-
-                // Dev-path entries (file://, absolute, relative) are detected
-                // so we don't double-add @latest, but we MUST NOT replace them
-                // — that would silently disable the developer's local plugin
-                // checkout. Always log as-is and leave the entry alone, even
-                // under --force.
-                if (isDevPathPluginEntry(oldEntry)) {
-                    pass(`Plugin registered in ${configName} (dev path: ${oldEntryStr})`);
-                } else {
-                    const isPinned = isPinnedOpenCodePluginSpecifier(oldEntryStr);
-
-                    if (isPinned && !options.force) {
-                        reportAutoUpdateStall(oldEntryStr);
-                        // Without --force, doctor reports pin ownership but leaves the config unchanged.
-                        warn(
-                            `Plugin pinned to ${oldEntryStr} in ${configName} — use 'doctor --force' to upgrade`,
-                        );
-                    } else {
-                        // Upgrade versionless entry to @latest, or --force upgrades pinned.
-                        // If the existing entry is a tuple, preserve options by
-                        // updating only the package-name slot; otherwise replace
-                        // with the plain string entry.
-                        if (Array.isArray(oldEntry) && oldEntry.length >= 1) {
-                            const replacement = [...oldEntry];
-                            replacement[0] = PLUGIN_ENTRY_WITH_VERSION;
-                            rawPlugins[existingIdx] = replacement;
-                        } else {
-                            rawPlugins[existingIdx] = PLUGIN_ENTRY_WITH_VERSION;
-                        }
-                        config.plugin = rawPlugins;
-                        writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
-                        pass(
-                            `Upgraded plugin entry in ${configName}: ${oldEntryStr} → ${PLUGIN_ENTRY_WITH_VERSION}`,
-                        );
-                        fixed++;
-                    }
-                }
-            } else {
-                // Auto-add plugin entry — preserves comments AND every existing
-                // tuple/options entry the user already had.
-                rawPlugins.push(PLUGIN_ENTRY_WITH_VERSION);
-                config.plugin = rawPlugins;
                 writeFileAtomic(paths.opencodeConfig, `${stringify(config, null, 2)}\n`);
-                pass(`Added plugin to ${configName}`);
-                fixed++;
             }
         } catch {
             warn("Could not parse opencode config to verify plugin entry");
@@ -1316,80 +1720,83 @@ export async function runDoctor(
         }
     }
 
-    // 6. Check tui.json
-    const tuiAdded = ensureTuiPluginEntry();
-    if (tuiAdded) {
-        pass("Added TUI sidebar plugin to tui.json");
-        warn("Restart OpenCode to see the sidebar");
-        fixed++;
-    } else if (existsSync(paths.tuiConfig)) {
-        // Check for pinned version in tui config. Same tuple/dev-path rules
-        // as the main opencode config — preserve every entry shape on write.
-        try {
-            const tuiRaw = readFileSync(paths.tuiConfig, "utf-8");
-            const tuiConfig = parse(tuiRaw) as Record<string, unknown>;
-            const tuiRawPlugins: unknown[] = Array.isArray(tuiConfig?.plugin)
-                ? tuiConfig.plugin
-                : [];
-            const tuiIdx = tuiRawPlugins.findIndex(
-                (entry) => matchesPluginEntry(entry, PLUGIN_NAME) || isDevPathPluginEntry(entry),
-            );
-            if (
-                tuiRawPlugins.some(
+    // 6. Check tui.json. OpenCode 2 loads the sidebar from the plugin entry itself
+    // (its host resolves a `tui` entrypoint next to `server`), so tui.json is a
+    // 1.x-only surface and writing it on a 2.x host would register nothing.
+    if (hostGeneration === "v2") {
+        pass("TUI sidebar loads from the plugin entry on OpenCode 2 (tui.json not used)");
+    } else {
+        const tuiAdded = ensureTuiPluginEntry();
+        if (tuiAdded) {
+            pass("Added TUI sidebar plugin to tui.json");
+            warn("Restart OpenCode to see the sidebar");
+            fixed++;
+        } else if (existsSync(paths.tuiConfig)) {
+            // Check for pinned version in tui config. Same tuple/dev-path rules
+            // as the main opencode config — preserve every entry shape on write.
+            try {
+                const tuiRaw = readFileSync(paths.tuiConfig, "utf-8");
+                const tuiConfig = parse(tuiRaw) as Record<string, unknown>;
+                const tuiConfigDir = dirname(paths.tuiConfig);
+                const tuiRawPlugins: unknown[] = Array.isArray(tuiConfig?.plugin)
+                    ? tuiConfig.plugin
+                    : [];
+                const tuiIdx = tuiRawPlugins.findIndex(
                     (entry) =>
-                        isLocalPathPluginEntry(entry) &&
-                        String(entry).includes("magic-context") &&
-                        !isDevPathPluginEntry(entry),
-                )
-            ) {
-                warn(
-                    "An unverifiable local TUI plugin path was ignored because its package name is not Magic Context",
+                        matchesPluginEntry(entry, PLUGIN_NAME) ||
+                        isDevPathPluginEntry(entry, tuiConfigDir),
+                );
+                if (
+                    tuiRawPlugins.some(
+                        (entry) =>
+                            isLocalPathPluginEntry(entry) &&
+                            String(entry).includes("magic-context") &&
+                            !isDevPathPluginEntry(entry, tuiConfigDir),
+                    )
+                ) {
+                    warn(
+                        "An unverifiable local TUI plugin path was ignored because its package name is not Magic Context",
+                    );
+                }
+                if (tuiIdx >= 0) {
+                    const tuiEntry = tuiRawPlugins[tuiIdx];
+                    const tuiEntryStr = pluginEntryPackage(tuiEntry) ?? "";
+                    if (isDevPathPluginEntry(tuiEntry, tuiConfigDir)) {
+                        pass(`TUI sidebar plugin configured (dev path: ${tuiEntryStr})`);
+                    } else {
+                        const tuiPinned = isPinnedOpenCodePluginSpecifier(tuiEntryStr);
+                        if (tuiPinned && !options.force) {
+                            reportAutoUpdateStall(tuiEntryStr);
+                            warn(
+                                `TUI plugin pinned to ${tuiEntryStr} — use 'doctor --force' to upgrade`,
+                            );
+                        } else if (tuiPinned && options.force) {
+                            // Preserve tuple or object options when upgrading.
+                            tuiRawPlugins[tuiIdx] = withPluginEntrySpecifier(
+                                tuiEntry,
+                                PLUGIN_ENTRY_WITH_VERSION,
+                            );
+                            tuiConfig.plugin = tuiRawPlugins;
+                            writeFileAtomic(paths.tuiConfig, `${stringify(tuiConfig, null, 2)}\n`);
+                            pass(
+                                `Upgraded TUI plugin: ${tuiEntryStr} → ${PLUGIN_ENTRY_WITH_VERSION}`,
+                            );
+                            fixed++;
+                        } else {
+                            pass("TUI sidebar plugin configured");
+                        }
+                    }
+                } else {
+                    fail("TUI sidebar plugin is missing after the repair attempt");
+                }
+            } catch (error) {
+                fail(
+                    `Could not verify TUI sidebar config: ${error instanceof Error ? error.message : String(error)}`,
                 );
             }
-            const tuiEntryAsString = (entry: unknown): string => {
-                if (typeof entry === "string") return entry;
-                if (Array.isArray(entry) && typeof entry[0] === "string") return entry[0];
-                return "";
-            };
-            if (tuiIdx >= 0) {
-                const tuiEntry = tuiRawPlugins[tuiIdx];
-                const tuiEntryStr = tuiEntryAsString(tuiEntry);
-                if (isDevPathPluginEntry(tuiEntry)) {
-                    pass(`TUI sidebar plugin configured (dev path: ${tuiEntryStr})`);
-                } else {
-                    const tuiPinned = isPinnedOpenCodePluginSpecifier(tuiEntryStr);
-                    if (tuiPinned && !options.force) {
-                        reportAutoUpdateStall(tuiEntryStr);
-                        warn(
-                            `TUI plugin pinned to ${tuiEntryStr} — use 'doctor --force' to upgrade`,
-                        );
-                    } else if (tuiPinned && options.force) {
-                        // Preserve tuple options when upgrading.
-                        if (Array.isArray(tuiEntry) && tuiEntry.length >= 1) {
-                            const replacement = [...tuiEntry];
-                            replacement[0] = PLUGIN_ENTRY_WITH_VERSION;
-                            tuiRawPlugins[tuiIdx] = replacement;
-                        } else {
-                            tuiRawPlugins[tuiIdx] = PLUGIN_ENTRY_WITH_VERSION;
-                        }
-                        tuiConfig.plugin = tuiRawPlugins;
-                        writeFileAtomic(paths.tuiConfig, `${stringify(tuiConfig, null, 2)}\n`);
-                        pass(`Upgraded TUI plugin: ${tuiEntryStr} → ${PLUGIN_ENTRY_WITH_VERSION}`);
-                        fixed++;
-                    } else {
-                        pass("TUI sidebar plugin configured");
-                    }
-                }
-            } else {
-                fail("TUI sidebar plugin is missing after the repair attempt");
-            }
-        } catch (error) {
-            fail(
-                `Could not verify TUI sidebar config: ${error instanceof Error ? error.message : String(error)}`,
-            );
+        } else {
+            fail("Could not create or verify the TUI sidebar config");
         }
-    } else {
-        fail("Could not create or verify the TUI sidebar config");
     }
 
     // 7. Check user memories + dreamer compatibility.
@@ -1496,35 +1903,13 @@ export async function runDoctor(
                 }
 
                 // Row counts across the major tables — informational, not pass/fail.
-                try {
-                    const counts: Record<string, number> = {};
-                    for (const table of [
-                        "tags",
-                        "compartments",
-                        "memories",
-                        "notes",
-                        "dream_runs",
-                    ]) {
-                        try {
-                            const row = db.prepare(`SELECT COUNT(*) as c FROM ${table}`).get() as
-                                | { c?: number }
-                                | undefined;
-                            counts[table] = row?.c ?? 0;
-                        } catch {
-                            // Table may not exist on a brand-new DB before migrations run
-                            counts[table] = 0;
-                        }
-                    }
-                    const summary = Object.entries(counts)
-                        .map(([k, v]) => `${k}=${v}`)
-                        .join(", ");
-                    log.info(`Shared DB row counts: ${summary}`);
-                } catch {
-                    // Don't fail the doctor on row-count introspection issues
-                }
+                log.info(`Shared DB row counts: ${formatSharedDbRowCounts(db)}`);
                 for (const stall of listShadowBackfillStalls(db)) {
                     warn(formatShadowBackfillStall(stall));
                 }
+                const tickFailure = getDreamerTickFailure(db);
+                if (tickFailure) warn(formatDreamerTickFailure(tickFailure));
+                else pass("Background maintenance completed its last pass");
             } finally {
                 db.close();
             }
@@ -1544,10 +1929,32 @@ export async function runDoctor(
         }
     }
 
+    // 7d. RPC discovery records. Inspection removes records proven stale; any
+    // left unresolved block offline maintenance such as merge-identities, so
+    // they count as an issue instead of passing silently. --fix also removes
+    // empty discovery directories.
+    try {
+        if (
+            runDiscoveryDoctorCheck(
+                storage.path,
+                { fix: options.fix },
+                { pass, warn, info: (message) => log.info(message) },
+            )
+        ) {
+            issues++;
+        }
+    } catch (error) {
+        warn(
+            `RPC discovery check unavailable: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        issues++;
+    }
+
     // 8. Check plugin npm cache — clear only if outdated
     const cacheResult = await clearPluginCache({
         force: options.force,
         latestVersion: pluginNpmLatest,
+        hostFiles: openCodeHostDatabaseFiles([openCodeDbResolution.path]),
     });
     if (cacheResult.action === "cleared") {
         const versionInfo = cacheResult.cached
@@ -1565,6 +1972,18 @@ export async function runDoctor(
         warn(
             `Plugin cache version check unavailable; preserving cached plugin${cacheResult.cached ? ` (cached: ${cacheResult.cached})` : ""}. Use doctor --force to reinstall it.`,
         );
+    } else if (cacheResult.action === "in_use" || cacheResult.action === "in_use_unknown") {
+        const versionInfo = cacheResult.cached
+            ? ` (cached: ${cacheResult.cached}${cacheResult.latest ? `, latest: ${cacheResult.latest}` : ""})`
+            : "";
+        const why =
+            cacheResult.action === "in_use"
+                ? `OpenCode is running (pid ${cacheResult.pids?.join(", ")})`
+                : (cacheResult.reason ?? "could not tell whether OpenCode is running");
+        warn(`Plugin cache${versionInfo} was not cleared: ${why}`);
+        log.info("  Quit OpenCode and rerun doctor to clear it.");
+        for (const path of cacheResult.paths ?? [cacheResult.path]) log.info(`  ${path}`);
+        issues++;
     } else if (cacheResult.action === "error") {
         warn(`Could not clear plugin cache: ${cacheResult.error}`);
         if (cacheResult.clearedPaths && cacheResult.clearedPaths.length > 0) {
@@ -1576,8 +1995,53 @@ export async function runDoctor(
             log.info(`  Manually delete: ${cacheResult.path}`);
         }
         issues++;
-    } else {
+    } else if (hostGeneration !== "v2") {
+        // OpenCode 2 never uses the 1.x `packages/` tree; its own cache is
+        // reported by the next step, so an empty 1.x tree says nothing there.
         pass("Plugin cache clean (no cached version found)");
+    }
+
+    // 8b. OpenCode 2 caches plugins under `npm/<name>@<spec>/<generation>/` and
+    // never replaces an `@latest` install on its own. An entry that follows
+    // another dist-tag (`@beta`, `@next`) loads from that tag's slot, which is
+    // stale against the tag's current version, not against `latest`. The config
+    // is read again here because the entry check above may have rewritten it.
+    let v2DistTag: string | undefined;
+    if (paths.opencodeConfigFormat !== "none") {
+        try {
+            v2DistTag = configuredOpenCodeV2DistTag(
+                parse(readFileSync(paths.opencodeConfig, "utf-8")) as Record<string, unknown>,
+            );
+        } catch {
+            // An unreadable config was already reported; check the `@latest` slot.
+        }
+    }
+    const v2Cache = reportOpenCodeV2PluginCache(
+        checkOpenCodeV2PluginCache({
+            fix: options.fix,
+            force: options.force,
+            latestVersion: v2DistTag
+                ? await fetchNpmLatest(PLUGIN_NAME, v2DistTag)
+                : pluginNpmLatest,
+            distTag: v2DistTag,
+            hostFiles: openCodeHostDatabaseFiles([openCodeDbResolution.path]),
+        }),
+        { pass, warn, info: (message) => log.info(message) },
+        { reportMissing: hostGeneration === "v2" },
+    );
+    if (v2Cache.fixed) fixed++;
+    if (v2Cache.issue) issues++;
+
+    // 8c. OpenCode 1 and OpenCode 2 share context.db but cache Magic Context
+    // separately. Once the newer copy migrates the database, every cached copy
+    // whose compiled schema fence is behind it fails closed in its host. Runs
+    // after the cache steps above so a copy they just removed is not reported.
+    const sharedDbVersion = readContextDbSchemaVersion(dbPath);
+    if (sharedDbVersion !== null) {
+        reportCachedPluginFences(
+            compareCachedPluginFences(listCachedOpenCodePluginFences(), sharedDbVersion),
+            { pass, fail, info: (message) => log.info(message) },
+        );
     }
 
     // 9. Check for min-release-age / before restrictions in ~/.npmrc.
@@ -1607,7 +2071,15 @@ export async function runDoctor(
 
     // 10. Show diagnostics info (log file, historian dumps)
 
-    const logFiles = inspectMagicContextLogs("opencode");
+    // The OpenCode 2 plugin writes its own log (under the `opencode2` temp subtree),
+    // so a machine running both hosts needs both files read.
+    const logHarnesses: Array<"opencode" | "opencode2"> = [
+        ...(hostGeneration === "v1" ? ["opencode" as const] : []),
+        ...(hostGeneration === "v2" || storeGeneration === "v2" ? ["opencode2" as const] : []),
+    ];
+    const logFiles = logHarnesses
+        .flatMap((harness) => inspectMagicContextLogs(harness))
+        .filter((file, index, all) => all.findIndex((other) => other.path === file.path) === index);
     const existingLogFiles = logFiles.filter((file) => file.exists);
     if (existingLogFiles.length === 0) {
         log.info(

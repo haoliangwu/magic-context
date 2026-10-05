@@ -1,13 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 
 import { readJsoncConfig } from "./jsonc-config";
 
 describe("readJsoncConfig prototype-pollution hardening", () => {
     it("refuses dangerous keys recursively before config mutation", () => {
-        const directory = mkdtempSync(join(tmpdir(), "mc-cli-jsonc-"));
+        const directory = createTestTempDirFromPath(join(tmpdir(), "mc-cli-jsonc-"));
         const path = join(directory, "config.jsonc");
         writeFileSync(
             path,

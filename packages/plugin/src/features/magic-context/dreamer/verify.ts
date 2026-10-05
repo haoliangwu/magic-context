@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { DREAMER_MEMORY_MAPPER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import {
@@ -24,11 +25,15 @@ import {
     invalidateMemory,
     type Memory,
     normalizeVerificationFiles,
+    readGitHead,
     recordMemoryVerifications,
 } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { queueMemoryMutation } from "../storage-memory-mutation-log";
-import { recordChildInvocation } from "../subagent-token-capture";
+import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
+import { failedInvocationStatus, recordChildInvocation } from "../subagent-token-capture";
+import { readFailedChildMessages } from "./failed-invocation-evidence";
+import { runHiddenSingleShotPrompt } from "./hidden-single-shot";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertNoDuplicateManifestIds } from "./manifest-parser";
 import { isDirectiveShapedProjectRule } from "./memory-claim-safety";
@@ -42,6 +47,8 @@ import {
     providerOutputFailureFromInvalidManifest,
 } from "./provider-output-failure";
 import { getTaskScheduleState, writeTaskScheduleState } from "./storage-task-schedule";
+import { DreamTokenBudgetExceeded } from "./token-budget";
+import { buildVerifyDiffEvidence } from "./verify-diff";
 import { partitionVerifyScope } from "./verify-gate";
 import {
     buildVerifyPrompt,
@@ -59,21 +66,44 @@ import {
  * Per-memory verified_at (no global watermark): a timed-out batch banks what it
  * checked; the next run continues. Cost is unique-file-bounded like map, but
  * verify reads DEEPER (it checks claims, not just locates files), so it batches
- * SMALLER than map (~50 vs 80; harness: 96 memories peaked ~177K). No max-turns;
+ * SMALLER than map because deeper reads replay more prompt tokens. No max-turns;
  * a batch that fails to emit a manifest banks nothing and is retried next run.
  *
- * Apply is cache-NEUTRAL: update/archive route through queueMemoryMutation (the
- * m[1] supersede-delta), never bumping the project memory epoch — the dreamer
+ * Apply is cache-NEUTRAL: update/archive route through queueMemoryMutation,
+ * never bumping the project memory epoch — the dreamer
  * must never bust the prompt cache.
  */
 
-// Verify reads deeper than map → smaller batch keeps peak context under a 128K
-// window with margin (harness: 96 mapped → ~177K on a large-window model).
-const VERIFY_BATCH_SIZE = 50;
+// A 14-day Gemini fit predicts ~1.73M prompt tokens for 20 memories, including
+// ~600K fixed per-child overhead (~69% of the 2.5M incremental default budget).
+// Broad verification fits ~2.00M at 20, below 70% of its 3M default budget.
+// Both leave room to finalize without repeatedly paying overhead for tiny batches.
+// Observed costs vary widely around these means; heavy batches can still finalize
+// early (docs/reports/verify-token-budget-2026-09-30.md).
+const VERIFY_BATCH_SIZE = 20;
 // One batch already exhausts the configured model fallback chain. A second
 // identical provider-shaped completion means continuing this run only hammers
 // the same outage, so leave the remaining memories for the scheduler retry.
 const IDENTICAL_PROVIDER_FAILURE_BATCH_LIMIT = 2;
+
+/**
+ * Minimum wall-clock budget for one verify batch. Verify reads deeper
+ * than map, which already gets this floor, so an even split of
+ * the task deadline across many batches (120 s for ten batches in 20 minutes)
+ * cannot finish one tool loop. A batch below the floor is not started; its
+ * memories keep their old verified_at and a later run picks them up.
+ */
+export const VERIFY_BATCH_FLOOR_MS = 240_000;
+
+/** Evenly split the remaining deadline, but never below the batch floor. The
+ * caller checks that the remaining budget covers the floor before starting a
+ * batch, so the result always fits the deadline. */
+export function computeVerifyBatchSliceMs(remainingMs: number, batchesRemaining: number): number {
+    return Math.min(
+        remainingMs,
+        Math.max(VERIFY_BATCH_FLOOR_MS, Math.floor(remainingMs / batchesRemaining)),
+    );
+}
 
 export interface VerifyVerdictCounts {
     verified: number;
@@ -85,11 +115,14 @@ export interface VerifyVerdictCounts {
 
 interface VerifyBatchResult extends VerifyVerdictCounts {
     providerFailure?: DreamerProviderOutputFailureError;
+    /** The batch's prompt ran out of time (our slice or a host request timer). */
+    timedOut?: boolean;
 }
 
 export interface VerifyArgs {
     db: Database;
-    client: PluginContext["client"];
+    client?: PluginContext["client"];
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     projectIdentity: string;
     parentSessionId: string | undefined;
     sessionDirectory: string;
@@ -100,9 +133,12 @@ export interface VerifyArgs {
     forceBroad?: boolean;
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
+    tokenBudget?: number;
+    onBudgetUpdate?: (state: { spent: number; finalizeFired: boolean }) => void;
     language?: string;
     moduleRoute?: DreamerModuleRoute;
     onProgress?: (processed: number, refused: number) => void;
+    normalizeFiles?: (files: readonly string[]) => Promise<string[]>;
 }
 
 export interface VerifyResult extends VerifyVerdictCounts {
@@ -113,6 +149,13 @@ export interface VerifyResult extends VerifyVerdictCounts {
     mode: string;
     /** The open broad-cycle watermark, when this run used verify-broad. */
     broadCycleStartAt?: number;
+    /**
+     * Why a run stopped before draining its scope. "deadline": the remaining
+     * budget could not give the next batch its floor. "batch-timeout": a batch
+     * ran out of time, so the next batch would meet the same budget; earlier
+     * batches stay banked.
+     */
+    stopReason?: "deadline" | "batch-timeout";
 }
 
 function closeBroadCycle(args: VerifyArgs, cycleStartAt: number | undefined): void {
@@ -171,8 +214,14 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
     }
 
     const batches: VerifyPromptMemory[][] = [];
-    for (let i = 0; i < gate.inScope.length; i += VERIFY_BATCH_SIZE) {
-        batches.push(gate.inScope.slice(i, i + VERIFY_BATCH_SIZE));
+    const groups =
+        !args.forceBroad && gate.mode === "incremental"
+            ? [gate.inScope.filter((m) => m.verifiedAt), gate.inScope.filter((m) => !m.verifiedAt)]
+            : [gate.inScope];
+    for (const group of groups) {
+        for (let i = 0; i < group.length; i += VERIFY_BATCH_SIZE) {
+            batches.push(group.slice(i, i + VERIFY_BATCH_SIZE));
+        }
     }
 
     const abortController = new AbortController();
@@ -180,7 +229,7 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
         args.db,
         args.holderId,
         args.leaseKey,
-        () => abortController.abort(),
+        (reason) => abortController.abort(new Error(reason)),
         args.leaseAcquisition,
     );
 
@@ -190,9 +239,14 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
     try {
         for (let i = 0; i < batches.length; i += 1) {
             const remainingMs = Math.max(0, args.deadline - Date.now());
-            if (remainingMs <= 0) break;
-            const batchesRemaining = batches.length - i;
-            const sliceMs = Math.max(1, Math.floor(remainingMs / batchesRemaining));
+            if (remainingMs < VERIFY_BATCH_FLOOR_MS) {
+                result.stopReason = "deadline";
+                log(
+                    `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: stopping before batch ${i + 1}/${batches.length} — remaining budget ${remainingMs}ms is below the ${VERIFY_BATCH_FLOOR_MS}ms batch floor`,
+                );
+                break;
+            }
+            const sliceMs = computeVerifyBatchSliceMs(remainingMs, batches.length - i);
 
             const counts = await verifyOneBatch(args, batches[i], sliceMs, abortController.signal);
             result.verified += counts.verified;
@@ -216,6 +270,17 @@ export async function runVerify(args: VerifyArgs): Promise<VerifyResult> {
                     result.refused,
                 result.refused,
             );
+
+            if (counts.timedOut) {
+                // Every later batch gets the same or a smaller share of the deadline,
+                // so starting one would repeat this timeout. Keep what earlier
+                // batches committed and stop.
+                result.stopReason = "batch-timeout";
+                log(
+                    `[dreamer] ${args.forceBroad ? "verify-broad" : "verify"}: batch ${i + 1}/${batches.length} timed out after its ${sliceMs}ms slice; stopping with ${result.remaining} remaining`,
+                );
+                break;
+            }
 
             if (counts.providerFailure) {
                 lastProviderFailure = counts.providerFailure;
@@ -261,12 +326,61 @@ async function verifyOneBatch(
     let agentSessionId: string | null = null;
     let promptSettled = false;
     const startedAt = Date.now();
+    let budgetFinalized = false;
+    const onBudgetUpdate: NonNullable<VerifyArgs["onBudgetUpdate"]> = (state) => {
+        budgetFinalized ||= state.finalizeFired;
+        args.onBudgetUpdate?.(state);
+    };
     try {
+        const headAtPrompt = await readGitHead(args.sessionDirectory);
+        const evidence =
+            !args.forceBroad && batch.every((m) => m.verifiedAt)
+                ? await buildVerifyDiffEvidence(args.sessionDirectory, batch)
+                : null;
+        const prompt = buildVerifyPrompt(args.projectIdentity, batch, evidence);
+        if (args.hiddenCompletionExecutor) {
+            const run = await runHiddenSingleShotPrompt({
+                executor: args.hiddenCompletionExecutor,
+                parentSessionId: args.parentSessionId,
+                sessionDirectory: args.sessionDirectory,
+                agent: DREAMER_MEMORY_MAPPER_AGENT,
+                system: VERIFY_SYSTEM_PROMPT,
+                prompt,
+                title: "magic-context-dream-verify",
+                callContext: "dreamer:verify",
+                metadata: { tokenBudget: args.tokenBudget, onBudgetUpdate },
+                model: args.model,
+                fallbackModels: args.fallbackModels,
+                language: args.language,
+                timeoutMs: sliceMs,
+                signal,
+                parse: (text) => {
+                    const providerFailure = providerOutputFailureFromInvalidManifest([], text);
+                    if (providerFailure) throw providerFailure;
+                    return validateVerifyManifest(text, new Set(batch.map((memory) => memory.id)));
+                },
+            });
+            recordInvocation(args, startedAt, {
+                status: "completed",
+                messages: run.completion.messages ?? [],
+            });
+            return applyParsedVerifyManifest(
+                args,
+                batch,
+                run.validated,
+                evidence?.head ?? headAtPrompt,
+                budgetFinalized,
+            );
+        }
+        const client = args.client;
+        if (!client) throw new Error("verify requires a client or hidden completion executor");
         const createResponse = await createChildSessionWithFence({
-            client: args.client,
+            client,
             db: args.db,
             parentSessionId: args.parentSessionId,
-            title: "magic-context-dream-verify",
+            title: args.forceBroad
+                ? "magic-context-dream-verify-broad"
+                : "magic-context-dream-verify",
             directory: args.sessionDirectory,
         });
         const created = shared.normalizeSDKResponse(
@@ -279,9 +393,8 @@ async function verifyOneBatch(
         agentSessionId = typeof created?.id === "string" ? created.id : null;
         if (!agentSessionId) throw new Error("Could not create verify session.");
 
-        const prompt = buildVerifyPrompt(args.projectIdentity, batch);
         const run = await shared.promptSyncWithValidatedOutputRetry(
-            args.client,
+            client,
             {
                 path: { id: agentSessionId },
                 query: { directory: args.sessionDirectory },
@@ -293,12 +406,18 @@ async function verifyOneBatch(
                 },
             },
             {
+                // Send without holding a request open for the whole batch, so the
+                // slice below is the only timer (see prompt-async-transport.ts).
+                transport: shared.createPromptAsyncTransport(client, agentSessionId, {
+                    tokenBudget: args.tokenBudget,
+                    onBudgetUpdate,
+                }),
                 timeoutMs: sliceMs,
                 signal,
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:verify",
                 fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
+                    const messagesResponse = await client.session.messages({
                         path: { id: agentSessionId as string },
                         query: { directory: args.sessionDirectory, limit: 100 },
                     });
@@ -327,7 +446,13 @@ async function verifyOneBatch(
         promptSettled = true;
 
         recordInvocation(args, startedAt, { status: "completed", messages: run.output });
-        return await applyParsedVerifyManifest(args, batch, run.validated);
+        return await applyParsedVerifyManifest(
+            args,
+            batch,
+            run.validated,
+            evidence?.head ?? headAtPrompt,
+            budgetFinalized,
+        );
     } catch (error) {
         const desc = describeError(error);
         const providerFailure =
@@ -337,13 +462,40 @@ async function verifyOneBatch(
             `[dreamer] verify batch ${providerFailure ? "provider failure" : "failed"}: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: "failed", error });
+        recordInvocation(args, startedAt, {
+            status: failedInvocationStatus(error),
+            error,
+            messages: await readFailedChildMessages(
+                args.client,
+                agentSessionId,
+                args.sessionDirectory,
+            ),
+        });
         if (
             error instanceof DreamerModuleFailureError ||
-            signal.aborted ||
-            (promptFailure !== null &&
-                promptFailure.failureClass !== "parse_failed" &&
-                !providerFailure)
+            error instanceof DreamTokenBudgetExceeded ||
+            signal.aborted
+        )
+            throw error;
+        // A timeout is a budget verdict, not a failure of this run: report it so the
+        // run can stop cleanly with its earlier batches banked.
+        if (
+            promptFailure?.failureClass === "provider_timeout" ||
+            shared.isPromptTimeoutError(error)
+        ) {
+            return {
+                verified: 0,
+                updated: 0,
+                archived: 0,
+                skipped: 0,
+                refused: 0,
+                timedOut: true,
+            };
+        }
+        if (
+            promptFailure !== null &&
+            promptFailure.failureClass !== "parse_failed" &&
+            !providerFailure
         )
             throw error;
         return {
@@ -355,15 +507,16 @@ async function verifyOneBatch(
             providerFailure,
         };
     } finally {
-        await teardownChildSession({
-            client: args.client,
-            sessionId: agentSessionId,
-            sessionDirectory: args.sessionDirectory,
-            promptSettled,
-            privacySensitive: true,
-            context: "[dreamer] verify",
-            log,
-        });
+        if (agentSessionId && args.client)
+            await teardownChildSession({
+                client: args.client,
+                sessionId: agentSessionId,
+                sessionDirectory: args.sessionDirectory,
+                promptSettled,
+                privacySensitive: true,
+                context: "[dreamer] verify",
+                log,
+            });
     }
 }
 
@@ -396,6 +549,8 @@ async function applyParsedVerifyManifest(
     args: VerifyArgs,
     batch: VerifyPromptMemory[],
     parsed: ParsedVerifyManifest,
+    headAtPrompt?: string | null,
+    budgetFinalized = false,
 ): Promise<VerifyVerdictCounts> {
     const batchIds = new Set(batch.map((m) => m.id));
     const batchById = new Map(batch.map((memory) => [memory.id, memory]));
@@ -421,18 +576,25 @@ async function applyParsedVerifyManifest(
     );
     assertNoDuplicateManifestIds(validIds, "verify");
 
-    // A closed root rules out truncation, but fewer than half of the requested ids
-    // is more likely a confused response to another request than an ordinary tail
-    // omission. Reject before any writes so an unrelated minority cannot be banked.
-    if (validIds.length * 2 < batch.length) {
+    // The token guard asks the child to stop investigating and return only ids it
+    // checked, so low coverage is expected then. Without that stop request, reject
+    // low coverage before writes: the child may have answered a different batch.
+    if (!budgetFinalized && validIds.length * 2 < batch.length) {
         throw new Error(
             `verify manifest covers ${validIds.length}/${batch.length} batch ids after filtering unknown entries; rejecting mostly-wrong manifest`,
+        );
+    }
+    if (budgetFinalized && validIds.length < batch.length) {
+        log(
+            `[dreamer] verify: accepted partial manifest after token budget: ${validIds.length}/${batch.length}`,
         );
     }
     if (validIds.length === 0) {
         return { verified: 0, updated: 0, archived: 0, skipped: 0, refused: 0 };
     }
     const now = Date.now();
+    const verifiedHead =
+        headAtPrompt === undefined ? await readGitHead(args.sessionDirectory) : headAtPrompt;
 
     // Pre-normalize files OUTSIDE the transaction (git/realpath I/O). For each
     // affected id, the COMPLETE backing set the agent reports.
@@ -513,7 +675,7 @@ async function applyParsedVerifyManifest(
             if (!identity)
                 throw new DreamerModuleFailureError(
                     "memory.set_verification",
-                    new Error(`missing mirror identity for ${write.id}`),
+                    new Error(`shared memory no longer belongs to the project: ${write.id}`),
                 );
             return {
                 memory_id: identity.moduleId,
@@ -533,8 +695,6 @@ async function applyParsedVerifyManifest(
                     name: "memory.set_verification",
                     arguments: {
                         memory_project: args.projectIdentity,
-                        context_store_uuid: args.moduleRoute.moduleContextStoreUuid,
-                        authority_generation: args.moduleRoute.moduleAuthorityGeneration,
                         command_id: `${args.moduleRoute.moduleCommandId}:${createHash("sha256")
                             .update(rows.map((row) => row.memory_id).join(","))
                             .digest("hex")
@@ -572,6 +732,7 @@ async function applyParsedVerifyManifest(
             if (!isPrimaryMutable(memory)) continue;
             if (w.kind === "verify") {
                 recordMemoryVerifications(args.db, w.id, w.files, now);
+                if (verifiedHead) recordVerifiedCommit(args.db, memory, now, verifiedHead);
                 verified += 1;
             } else if (w.kind === "update") {
                 rewriteMemoryContent(args.db, memory, w.content, w.hash);
@@ -597,8 +758,24 @@ async function applyParsedVerifyManifest(
     return { verified, updated, archived, skipped, refused };
 }
 
+function recordVerifiedCommit(db: Database, memory: Memory, at: number, head: string): void {
+    let metadata: Record<string, unknown> = {};
+    try {
+        const parsed: unknown = JSON.parse(memory.metadataJson ?? "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+            metadata = parsed as Record<string, unknown>;
+    } catch {
+        /* Preserve verification even when old metadata is malformed. */
+    }
+    db.prepare("UPDATE memories SET metadata_json = ? WHERE id = ?").run(
+        JSON.stringify({ ...metadata, dreamerVerifiedAt: at, dreamerVerifiedCommit: head }),
+        memory.id,
+    );
+}
+
 async function normalizeFiles(args: VerifyArgs, rawFiles: readonly string[]): Promise<string[]> {
     if (rawFiles.length === 0) return [];
+    if (args.normalizeFiles) return args.normalizeFiles(rawFiles);
     const normalized = await normalizeVerificationFiles({
         cwd: args.sessionDirectory,
         files: rawFiles,
@@ -635,7 +812,7 @@ function rewriteMemoryContent(db: Database, memory: Memory, content: string, has
 function recordInvocation(
     args: VerifyArgs,
     startedAt: number,
-    params: { status: "completed" | "failed"; messages?: unknown[]; error?: unknown },
+    params: { status: SubagentInvocationStatus; messages?: unknown[]; error?: unknown },
 ): void {
     if (!args.parentSessionId) return;
     recordChildInvocation({

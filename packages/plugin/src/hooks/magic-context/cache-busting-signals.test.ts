@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { canConsumeDeferredOnThisPass } from "./cache-busting-signals";
+import {
+    canConsumeDeferredOnThisPass,
+    hasReclaimRide,
+    type ReclaimRideSignals,
+    reclaimRideLabel,
+} from "./cache-busting-signals";
 
 /**
  * `canConsumeDeferredOnThisPass` is the mid-turn-aware gate that decides whether
@@ -64,5 +69,59 @@ describe("canConsumeDeferredOnThisPass", () => {
                 activeRunBlocksMaterialization: true,
             }),
         ).toBe(true);
+    });
+});
+
+/**
+ * The logs that announce the mutation permission must name the signal that
+ * granted it. They used to print "scheduler_execute" on every pass that reached
+ * the fall-through, including passes where the scheduler had decided to defer
+ * and the real grant was freshly published history.
+ */
+describe("reclaimRideLabel", () => {
+    const noRide: ReclaimRideSignals = {
+        hardFold: false,
+        force: false,
+        explicitFlush: false,
+        publishedHistory: false,
+    };
+
+    it("gives two passes with different true rides two different labels", () => {
+        const publishedHistoryPass = reclaimRideLabel({ ...noRide, publishedHistory: true });
+        const forcePass = reclaimRideLabel({ ...noRide, force: true });
+
+        expect(publishedHistoryPass).toBe("ride=publishedHistory");
+        expect(forcePass).toBe("ride=force");
+        expect(publishedHistoryPass).not.toBe(forcePass);
+    });
+
+    it("names every true ride when more than one granted the pass", () => {
+        expect(reclaimRideLabel({ ...noRide, hardFold: true, publishedHistory: true })).toBe(
+            "ride=hardFold+publishedHistory",
+        );
+        expect(
+            reclaimRideLabel({
+                hardFold: true,
+                force: true,
+                explicitFlush: true,
+                publishedHistory: true,
+            }),
+        ).toBe("ride=hardFold+force+explicitFlush+publishedHistory");
+    });
+
+    it("labels each single ride distinctly and says none when there is no permission", () => {
+        const labels = (["hardFold", "force", "explicitFlush", "publishedHistory"] as const).map(
+            (ride) => reclaimRideLabel({ ...noRide, [ride]: true }),
+        );
+
+        expect(new Set(labels).size).toBe(labels.length);
+        expect(reclaimRideLabel(noRide)).toBe("ride=none");
+        expect(hasReclaimRide(noRide)).toBe(false);
+    });
+
+    it("names the subagent execute permission without inventing a primary ride", () => {
+        expect(hasReclaimRide({ ...noRide, subagentExecute: true })).toBe(true);
+        expect(reclaimRideLabel({ ...noRide, subagentExecute: true })).toBe("ride=subagentExecute");
+        expect(hasReclaimRide({ ...noRide, subagentExecute: false })).toBe(false);
     });
 });

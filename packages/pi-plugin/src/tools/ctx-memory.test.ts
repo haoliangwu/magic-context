@@ -7,11 +7,12 @@ import {
 } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { getMemoryMutationsForRender } from "@magic-context/core/features/magic-context/storage";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { Value } from "typebox/value";
 import { createTestDb, fakeContext } from "../test-utils.test";
-import { createCtxMemoryTool } from "./ctx-memory";
+import { createCtxMemoryListTool, createCtxMemoryTool } from "./ctx-memory";
 
 describe("createCtxMemoryTool", () => {
-	it("rejects list for primary agents and allows it for dreamer agents", async () => {
+	it("advertises list only through the separate dreamer tool", async () => {
 		const db = createTestDb();
 		try {
 			const primary = createCtxMemoryTool({
@@ -26,9 +27,24 @@ describe("createCtxMemoryTool", () => {
 				embeddingEnabled: false,
 				allowDreamerActions: true,
 			});
+			const list = createCtxMemoryListTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+			});
 
 			expect(primary.parameters.properties).not.toHaveProperty("superseded_by");
 			expect(dreamer.parameters.properties).toHaveProperty("superseded_by");
+			expect(
+				JSON.stringify(primary.parameters.properties.action),
+			).not.toContain("list");
+			expect(
+				JSON.stringify(dreamer.parameters.properties.action),
+			).not.toContain("list");
+			expect(Object.keys(list.parameters.properties).sort()).toEqual([
+				"category",
+				"limit",
+			]);
 
 			const ctx = fakeContext("ses-memory") as never;
 			const primaryResult = await primary.execute(
@@ -38,9 +54,9 @@ describe("createCtxMemoryTool", () => {
 				undefined,
 				ctx,
 			);
-			const dreamerResult = await dreamer.execute(
+			const dreamerResult = await list.execute(
 				"call-2",
-				{ action: "list" },
+				{},
 				new AbortController().signal,
 				undefined,
 				ctx,
@@ -52,6 +68,45 @@ describe("createCtxMemoryTool", () => {
 			);
 			expect(dreamerResult.isError).toBeUndefined();
 			expect(dreamerResult.content[0]?.text).toBe("No active memories found.");
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("advertises limit only where the list action can run (issue 575)", () => {
+		const db = createTestDb();
+		try {
+			const primary = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: false,
+			});
+			const dreamer = createCtxMemoryTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+				allowDreamerActions: true,
+			});
+			const list = createCtxMemoryListTool({
+				db,
+				memoryEnabled: true,
+				embeddingEnabled: false,
+			});
+
+			expect(primary.parameters.properties).not.toHaveProperty("limit");
+			expect(dreamer.parameters.properties).toHaveProperty("limit");
+			expect(list.parameters.properties).toHaveProperty("limit");
+			// A replayed older primary call that still carries `limit` must stay
+			// valid: the schema tolerates unknown fields rather than rejecting them.
+			expect(primary.parameters.additionalProperties).toBe(true);
+			expect(
+				Value.Check(primary.parameters, {
+					action: "get",
+					ids: [1],
+					limit: 5,
+				}),
+			).toBe(true);
 		} finally {
 			closeQuietly(db);
 		}
@@ -122,16 +177,15 @@ describe("createCtxMemoryTool", () => {
 				category: "CONSTRAINTS",
 				content: "Use the shared formatter.",
 			});
-			const dreamer = createCtxMemoryTool({
+			const dreamer = createCtxMemoryListTool({
 				db,
 				memoryEnabled: true,
 				embeddingEnabled: false,
-				allowDreamerActions: true,
 			});
 
 			const result = await dreamer.execute(
 				"call-list",
-				{ action: "list" },
+				{},
 				new AbortController().signal,
 				undefined,
 				ctx,
@@ -1515,11 +1569,10 @@ describe("createCtxMemoryTool", () => {
 						content: `List filler ${label}.`,
 					});
 				}
-				const dreamer = createCtxMemoryTool({
+				const dreamer = createCtxMemoryListTool({
 					db,
 					memoryEnabled: true,
 					embeddingEnabled: false,
-					allowDreamerActions: true,
 				});
 				const primary = createCtxMemoryTool({
 					db,
@@ -1530,7 +1583,7 @@ describe("createCtxMemoryTool", () => {
 				const ctx = fakeContext("ses-memory") as never;
 				const clean = await dreamer.execute(
 					"call-list-clean",
-					{ action: "list" },
+					{},
 					new AbortController().signal,
 					undefined,
 					ctx,
@@ -1538,14 +1591,13 @@ describe("createCtxMemoryTool", () => {
 				const filler = await dreamer.execute(
 					"call-list-filler",
 					{
-						action: "list",
 						ids: [1],
 						content: "",
 						category: "PROJECT_RULES",
 						limit: 0,
 						reason: "",
 						superseded_by: 0,
-					},
+					} as never,
 					new AbortController().signal,
 					undefined,
 					ctx,

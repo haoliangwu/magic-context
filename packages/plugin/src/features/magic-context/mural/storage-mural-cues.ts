@@ -75,13 +75,12 @@ export function getMuralCueState(
     if (!hasMuralCueColumns(db)) return out;
     const ids = Array.from(new Set(memoryIds.filter(Number.isInteger)));
     if (ids.length === 0) return out;
-    const placeholders = ids.map(() => "?").join(", ");
     const rejectionCountColumn = hasMuralCueRejectionCountColumn(db)
         ? "COALESCE(mural_cue_rejection_count, 0) AS mural_cue_rejection_count"
         : "0 AS mural_cue_rejection_count";
     const rows = db
         .prepare<
-            number[],
+            [string],
             {
                 id: number;
                 mural_cue: string | null;
@@ -89,9 +88,9 @@ export function getMuralCueState(
                 mural_cue_rejection_count: number;
             }
         >(
-            `SELECT id, mural_cue, mural_cue_hash, ${rejectionCountColumn} FROM memories WHERE id IN (${placeholders})`,
+            `SELECT id, mural_cue, mural_cue_hash, ${rejectionCountColumn} FROM memories WHERE id IN (SELECT value FROM json_each(?))`,
         )
-        .all(...ids);
+        .all(JSON.stringify(ids));
     for (const row of rows) {
         out.set(row.id, {
             cue: row.mural_cue ?? null,

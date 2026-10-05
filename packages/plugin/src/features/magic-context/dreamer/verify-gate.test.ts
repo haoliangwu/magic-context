@@ -1,23 +1,21 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { applyMirrorPage, type ChangefeedPage } from "../context-authority";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import {
     __resetVerificationPathsForTests,
     __setVerificationPathsTestHooks,
-    getMemoryVerifications,
-    getUnmappedMemoryIds,
     insertMemory,
     readGitFileChangeTimesSince,
     recordMemoryMapping,
     recordMemoryVerifications,
 } from "../memory";
+import { resolveGitTopLevel } from "../memory/verification-paths";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { acquireLease } from "./lease";
@@ -50,7 +48,7 @@ function gitCommand(args: readonly string[]): string {
 }
 
 function makeGitMetadataDirectory(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     dirs.push(dir);
     mkdirSync(join(dir, ".git"));
     writeFileSync(join(dir, "a.ts"), "export const a = 1;\n", "utf8");
@@ -86,7 +84,72 @@ afterEach(() => {
     dirs.length = 0;
 });
 
+test("git verification timeout reports the stalled command", async () => {
+    const dir = makeGitMetadataDirectory("mc-verify-git-timeout-");
+    const timeout = Object.assign(new Error("git exceeded its deadline"), { killed: true });
+    installGitScript(new Map([[gitCommand(["rev-parse", "--show-toplevel"]), timeout]]));
+    await expect(resolveGitTopLevel(dir)).rejects.toThrow(
+        "Git verification command git rev-parse --show-toplevel timed out after 10000ms",
+    );
+});
+
 describe("partitionVerifyScope (per-memory verified_at gate)", () => {
+    test("a failed top-level lookup retains full verification even if git log could succeed", async () => {
+        const db = freshDb();
+        const dir = makeGitMetadataDirectory("mc-verify-no-worktree-");
+        __setVerificationPathsTestHooks({
+            execFile: async (_binary, args) => {
+                if (args[0] === "rev-parse") throw new Error("not a working tree");
+                return { stdout: "", stderr: "" };
+            },
+        });
+        try {
+            const id = mem(db, PROJECT, "mapped fact without a working tree");
+            recordMemoryVerifications(db, id, ["a.ts"], 10000);
+            const result = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+            });
+            expect(result.mode).toBe("full");
+            expect(result.inScopeIds).toEqual([id]);
+        } finally {
+            db.close();
+        }
+    });
+    test("incremental verification resolves the repository once and preserves skipped ids", async () => {
+        const db = freshDb();
+        const dir = makeGitMetadataDirectory("mc-verify-one-root-");
+        const calls: string[][] = [];
+        __setVerificationPathsTestHooks({
+            execFile: async (_binary, args) => {
+                calls.push([...args]);
+                if (args[0] === "rev-parse")
+                    return { stdout: `${args[1] === "HEAD" ? HEAD_SHA : dir}\n`, stderr: "" };
+                return { stdout: "", stderr: "" };
+            },
+        });
+        try {
+            const id = mem(db, PROJECT, "unchanged mapped fact");
+            recordMemoryVerifications(db, id, ["a.ts"], 10000);
+            const result = await partitionVerifyScope({
+                db,
+                projectIdentity: PROJECT,
+                projectDirectory: dir,
+                now: 20000,
+            });
+            expect(result.skippedIds).toEqual([id]);
+            expect(result.inScopeIds).toEqual([]);
+            expect(calls).toEqual([
+                ["rev-parse", "--show-toplevel"],
+                ["log", "--since=@10", "--name-only", "--format=%ct"],
+                ["rev-parse", "HEAD"],
+                ["diff", "--name-only", "-z", HEAD_SHA],
+            ]);
+        } finally {
+            db.close();
+        }
+    });
     test("excludes both no-file sentinel origins and unmapped memories", async () => {
         const db = freshDb();
         const dir = makeGitMetadataDirectory("mc-verify-gate-scope-");
@@ -114,135 +177,6 @@ describe("partitionVerifyScope (per-memory verified_at gate)", () => {
                 now: 1000,
             });
             expect(gate.inScopeIds).toEqual([mapped]);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("module feed drives mapped, verified, updated, and remapped gate state", async () => {
-        const db = freshDb();
-        const dir = makeGitMetadataDirectory("mc-verify-gate-module-feed-");
-        installGitScript(
-            new Map([
-                [gitCommand(["rev-parse", "--show-toplevel"]), `${dir}\n`],
-                [gitCommand(["log", "--since=@5", "--name-only", "--format=%ct"]), ""],
-                [gitCommand(["log", "--since=@10", "--name-only", "--format=%ct"]), ""],
-                [gitCommand(["rev-parse", "HEAD"]), `${HEAD_SHA}\n`],
-                [gitCommand(["diff", "--name-only", "-z", HEAD_SHA]), ""],
-            ]),
-        );
-        const snapshot = (
-            content: string,
-            hash: string,
-            verifiedAt: number | null,
-            mapping: string[] | null,
-        ) => ({
-            id: 77,
-            project_path: PROJECT,
-            category: "ARCHITECTURE",
-            content,
-            normalized_hash: hash,
-            importance: 50,
-            scope: "project",
-            shareable: 0,
-            source_session_id: "ses",
-            source_type: "dreamer",
-            seen_count: 1,
-            retrieval_count: 0,
-            first_seen_at: 1,
-            created_at: 1,
-            updated_at: verifiedAt ?? 1,
-            last_seen_at: 1,
-            last_retrieved_at: null,
-            status: "active",
-            expires_at: null,
-            verification_status: verifiedAt === null ? "unverified" : "verified",
-            verified_at: verifiedAt,
-            classified_at: null,
-            superseded_by_memory_id: null,
-            merged_from: null,
-            metadata_json: null,
-            mapping,
-        });
-        const apply = (
-            cursor: number,
-            content: string,
-            hash: string,
-            verifiedAt: number | null,
-            mapping: string[] | null,
-            op: ChangefeedPage["rows"][number]["op"] = "update",
-        ) =>
-            applyMirrorPage({
-                db,
-                page: {
-                    domain: "memories",
-                    cursor,
-                    next_cursor: cursor + 1,
-                    has_more: false,
-                    rows: [
-                        {
-                            feed_seq: cursor + 1,
-                            domain: "memories",
-                            op,
-                            module_row_id: 77,
-                            full_row_snapshot: snapshot(content, hash, verifiedAt, mapping),
-                            content_hash: hash,
-                        },
-                    ],
-                },
-            });
-
-        try {
-            apply(0, "A in a.ts", "hash-a", null, ["a.ts"], "insert");
-            const contextId = Number(
-                (
-                    db.prepare("SELECT id FROM memories WHERE project_path = ?").get(PROJECT) as {
-                        id: number;
-                    }
-                ).id,
-            );
-            const mappedGate = await partitionVerifyScope({
-                db,
-                projectIdentity: PROJECT,
-                projectDirectory: dir,
-                now: 5_000,
-            });
-            expect(mappedGate.inScopeIds).toEqual([contextId]);
-
-            apply(1, "A in a.ts", "hash-a", 10_000, ["a.ts"]);
-            const verifiedGate = await partitionVerifyScope({
-                db,
-                projectIdentity: PROJECT,
-                projectDirectory: dir,
-                now: 20_000,
-            });
-            expect(verifiedGate.inScopeIds).toEqual([]);
-            expect(verifiedGate.skippedIds).toEqual([contextId]);
-            expect(getMemoryVerifications(db, [contextId]).get(contextId)?.verifiedAt).toBe(10_000);
-
-            apply(2, "B in b.ts", "hash-b", 30_000, null);
-            expect(getUnmappedMemoryIds(db, [contextId])).toEqual([contextId]);
-            const updatedGate = await partitionVerifyScope({
-                db,
-                projectIdentity: PROJECT,
-                projectDirectory: dir,
-                now: 40_000,
-            });
-            expect(updatedGate.inScopeIds).toEqual([]);
-            expect(updatedGate.reason).toBe("no file-mapped memories in scope");
-
-            apply(3, "B in b.ts", "hash-b", 30_000, ["b.ts"]);
-            const remapped = getMemoryVerifications(db, [contextId]).get(contextId);
-            expect(remapped?.files).toEqual(["b.ts"]);
-            expect(remapped?.verifiedAt).toBe(30_000);
-            const broadGate = await partitionVerifyScope({
-                db,
-                projectIdentity: PROJECT,
-                projectDirectory: dir,
-                now: 50_000,
-                forceBroad: true,
-            });
-            expect(broadGate.inScope[0]?.mappedFiles).toEqual(["b.ts"]);
         } finally {
             closeQuietly(db);
         }

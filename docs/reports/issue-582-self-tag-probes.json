@@ -1,0 +1,426 @@
+{
+  "root": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/self-tag-trial/run-52t2Xj",
+  "cases": {
+    "single": {
+      "messages": [
+        {
+          "info": {
+            "id": "user",
+            "role": "user"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ prompt"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "assistant",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§2§ one"
+            }
+          ]
+        }
+      ],
+      "assignments": [
+        [
+          "user:p0",
+          1
+        ],
+        [
+          "assistant:p0",
+          2
+        ]
+      ]
+    },
+    "several": {
+      "messages": [
+        {
+          "info": {
+            "id": "user",
+            "role": "user"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ prompt"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "assistant",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§2§ one"
+            },
+            {
+              "type": "text",
+              "text": "§3§ two"
+            }
+          ]
+        }
+      ],
+      "assignments": [
+        [
+          "user:p0",
+          1
+        ],
+        [
+          "assistant:p0",
+          2
+        ],
+        [
+          "assistant:p1",
+          3
+        ]
+      ]
+    },
+    "reasoning": {
+      "messages": [
+        {
+          "info": {
+            "id": "user",
+            "role": "user"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ prompt"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "assistant",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "reasoning",
+              "text": "private"
+            },
+            {
+              "type": "text",
+              "text": "§2§ one"
+            }
+          ]
+        }
+      ],
+      "assignments": [
+        [
+          "user:p0",
+          1
+        ],
+        [
+          "assistant:p1",
+          2
+        ]
+      ]
+    },
+    "mixed": {
+      "messages": [
+        {
+          "info": {
+            "id": "user",
+            "role": "user"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ prompt"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "assistant",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§2§ one"
+            },
+            {
+              "type": "tool",
+              "callID": "c1",
+              "tool": "read",
+              "state": {
+                "status": "completed",
+                "input": {},
+                "output": "§3§ fixture"
+              }
+            }
+          ]
+        }
+      ],
+      "assignments": [
+        [
+          "user:p0",
+          1
+        ],
+        [
+          "assistant:p0",
+          2
+        ],
+        [
+          "assistant\u0000c1",
+          3
+        ]
+      ]
+    },
+    "parallel": {
+      "messages": [
+        {
+          "info": {
+            "id": "user",
+            "role": "user"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ prompt"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "assistant",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "tool",
+              "callID": "c1",
+              "state": {
+                "output": "§2§ one"
+              }
+            },
+            {
+              "type": "tool",
+              "callID": "c2",
+              "state": {
+                "output": "§3§ two"
+              }
+            },
+            {
+              "type": "text",
+              "text": "§4§ after tools"
+            }
+          ]
+        }
+      ],
+      "assignments": [
+        [
+          "user:p0",
+          1
+        ],
+        [
+          "assistant\u0000c1",
+          2
+        ],
+        [
+          "assistant\u0000c2",
+          3
+        ],
+        [
+          "assistant:p2",
+          4
+        ]
+      ]
+    },
+    "invocationOnly": {
+      "messages": [
+        {
+          "info": {
+            "id": "user",
+            "role": "user"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ prompt"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "assistant",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "tool-invocation",
+              "callID": "c1"
+            }
+          ]
+        }
+      ],
+      "assignments": [
+        [
+          "user:p0",
+          1
+        ]
+      ]
+    },
+    "blank": {
+      "messages": [
+        {
+          "info": {
+            "id": "user",
+            "role": "user"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ prompt"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "assistant",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "   "
+            }
+          ]
+        }
+      ],
+      "assignments": [
+        [
+          "user:p0",
+          1
+        ]
+      ]
+    },
+    "separateResult": {
+      "messages": [
+        {
+          "info": {
+            "id": "user",
+            "role": "user"
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ prompt"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "assistant",
+            "role": "assistant"
+          },
+          "parts": [
+            {
+              "type": "tool-invocation",
+              "callID": "separate"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "result",
+            "role": "tool"
+          },
+          "parts": [
+            {
+              "type": "tool",
+              "callID": "separate",
+              "state": {
+                "output": "§2§ result"
+              }
+            }
+          ]
+        }
+      ],
+      "assignments": [
+        [
+          "user:p0",
+          1
+        ],
+        [
+          "assistant\u0000separate",
+          2
+        ]
+      ]
+    }
+  },
+  "firstWire": [
+    {
+      "info": {
+        "id": "probe-loop-1",
+        "sessionID": "probe-loop",
+        "role": "user"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "§1§ start"
+        }
+      ]
+    }
+  ],
+  "secondWire": [
+    {
+      "info": {
+        "id": "probe-loop-1",
+        "sessionID": "probe-loop",
+        "role": "user"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "§1§ start"
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "probe-loop-2",
+        "sessionID": "probe-loop",
+        "role": "assistant"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "§2§ Seven fruit."
+        }
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "model": "offline-control-not-a-model",
+      "variant": "B",
+      "session": "probe-loop",
+      "position": 1,
+      "part": 0,
+      "raw": "§2§ Seven fruit.",
+      "rawFirst60": "§2§ Seven fruit.",
+      "assignedTag": 2,
+      "wellFormed": true,
+      "correct": true,
+      "delta": 0,
+      "malformed": false,
+      "misplaced": false,
+      "byteIdentity": true,
+      "retagged": "§2§ Seven fruit."
+    }
+  ]
+}

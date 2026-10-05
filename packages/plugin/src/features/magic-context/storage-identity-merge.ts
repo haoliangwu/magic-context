@@ -1,4 +1,5 @@
 import type { Database } from "../../shared/sqlite";
+import { nextDueAtMs } from "./dreamer/cron";
 
 const IDENTITY_COLUMNS = new Set(["project_path", "project_identity"]);
 const DERIVED_TABLE_SUFFIXES = [
@@ -29,6 +30,9 @@ export interface IdentityMergeReport {
     auditedTables: IdentityMergeTableReport[];
     changedRows: number;
     dryRun: boolean;
+    duplicateMemoryIds: number[];
+    reviewMemoryIds: number[];
+    changes: string[];
 }
 
 function quoteIdentifier(identifier: string): string {
@@ -182,12 +186,17 @@ function logRow(
     ).run(fromIdentity, toIdentity, tableName, rowId, action, targetRowId, mergedAt);
 }
 
+function normalizedContent(value: unknown): string {
+    return String(value).toLowerCase().replace(/\s+/g, " ").trim();
+}
+
 function mergeMemoryRow(
     db: Database,
     row: SqliteRow,
     fromIdentity: string,
     toIdentity: string,
     mergedAt: number,
+    review: boolean,
 ): boolean {
     const sourceId = row.id;
     if (typeof sourceId !== "number") return false;
@@ -199,10 +208,21 @@ function mergeMemoryRow(
               LIMIT 1`,
         )
         .get(toIdentity, row.category, row.normalized_hash, sourceId) as SqliteRow | undefined;
-    if (collision && typeof collision.id === "number") {
+    if (collision && normalizedContent(collision.content) !== normalizedContent(row.content)) {
+        // A stale or colliding hash is not permission to discard different content.
+        db.prepare(
+            "UPDATE memories SET normalized_hash = ?, metadata_json = json_set(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END, '$.identity_merge_original_hash', ?, '$.identity_merge_review', ?) WHERE id = ?",
+        ).run(
+            `${row.normalized_hash}:identity-conflict:${sourceId}`,
+            row.normalized_hash,
+            fromIdentity,
+            sourceId,
+        );
+        review = true;
+    } else if (collision && typeof collision.id === "number") {
         const targetId = collision.id;
         const targetSeen = Number(collision.seen_count ?? 1);
-        const mergedSeen = Math.max(targetSeen, Number(row.seen_count ?? 1));
+        const mergedSeen = targetSeen + Number(row.seen_count ?? 1);
         const sourceClassifiedAt = Number(row.classified_at ?? 0);
         const targetClassifiedAt = Number(collision.classified_at ?? 0);
         if (sourceClassifiedAt > targetClassifiedAt) {
@@ -254,9 +274,19 @@ function mergeMemoryRow(
             collision.status === undefined
         ) {
             db.prepare(
-                "UPDATE memories SET seen_count = ?, status = COALESCE(status, 'active'), updated_at = ? WHERE id = ?",
-            ).run(mergedSeen, mergedAt, targetId);
+                "UPDATE memories SET seen_count = ?, status = CASE WHEN ? = 'active' THEN 'active' ELSE COALESCE(status, 'active') END, updated_at = ? WHERE id = ?",
+            ).run(mergedSeen, row.status, mergedAt, targetId);
         }
+        db.prepare(
+            `UPDATE memories SET first_seen_at = MIN(first_seen_at, ?), last_seen_at = MAX(last_seen_at, ?), retrieval_count = COALESCE(retrieval_count, 0) + ?, merged_from = CASE WHEN merged_from IS NULL OR merged_from = '' THEN ? ELSE merged_from || ',' || ? END WHERE id = ?`,
+        ).run(
+            row.first_seen_at,
+            row.last_seen_at,
+            Number(row.retrieval_count ?? 0),
+            String(sourceId),
+            String(sourceId),
+            targetId,
+        );
         db.prepare(
             `UPDATE memories
                 SET status = 'archived',
@@ -286,6 +316,11 @@ function mergeMemoryRow(
         return true;
     }
 
+    if (review) {
+        db.prepare(
+            "UPDATE memories SET metadata_json = json_set(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END, '$.identity_merge_review', ?) WHERE id = ?",
+        ).run(fromIdentity, sourceId);
+    }
     const result = db
         .prepare(
             "UPDATE memories SET project_path = ?, updated_at = ? WHERE id = ? AND project_path = ?",
@@ -308,10 +343,18 @@ function oldestOpenCycleStart(left: unknown, right: unknown): number | null {
     return values.length > 0 ? Math.min(...values) : null;
 }
 
-function reconcileTaskScheduleCollision(db: Database, source: SqliteRow, target: SqliteRow): void {
+function reconcileTaskScheduleCollision(
+    db: Database,
+    source: SqliteRow,
+    target: SqliteRow,
+    mergedAt: number,
+): void {
     const sourceIsNewer =
-        typeof source.last_run_at === "number" &&
-        (typeof target.last_run_at !== "number" || source.last_run_at > target.last_run_at);
+        source.last_status === "completed" &&
+        (target.last_status !== "completed" ||
+            (typeof source.last_run_at === "number" &&
+                (typeof target.last_run_at !== "number" ||
+                    source.last_run_at > target.last_run_at)));
     const latest = sourceIsNewer ? source : target;
 
     // Take schedule outcome fields from the newest completed run. Merge progress
@@ -325,9 +368,12 @@ function reconcileTaskScheduleCollision(db: Database, source: SqliteRow, target:
                 last_broad_run_at = ?, retrospective_watermark_ms = ?
           WHERE project_path = ? AND task = ?`,
     ).run(
-        nullableMaximum(source.last_run_at, target.last_run_at),
-        latest.next_due_at,
-        latest.schedule,
+        latest.last_run_at,
+        nextDueAtMs(
+            String(target.schedule ?? ""),
+            Math.max(mergedAt, Number(source.last_run_at ?? 0), Number(target.last_run_at ?? 0)),
+        ),
+        target.schedule,
         latest.last_status,
         latest.last_error,
         latest.retry_count,
@@ -351,7 +397,24 @@ function rekeyGenericRow(
     const collision = findUniqueCollision(db, table, row, fromIdentity, toIdentity);
     if (collision) {
         if (table.name === "task_schedule_state") {
-            reconcileTaskScheduleCollision(db, row, collision);
+            reconcileTaskScheduleCollision(db, row, collision, mergedAt);
+        }
+        const maximumColumns: Record<string, string[]> = {
+            retrospective_processed_windows: ["processed_at"],
+            embedding_identity_active: ["last_active_at"],
+            memory_embedding_watermarks: ["written_memory_id", "embedded_memory_id", "updated_at"],
+            project_state: ["project_memory_epoch", "project_user_profile_version", "updated_at"],
+            project_key_files_version: ["version"],
+        };
+        const columns = maximumColumns[table.name];
+        if (columns) {
+            const targetPredicate = rowPredicate(db, table.name, collision);
+            db.prepare(
+                `UPDATE ${quoteIdentifier(table.name)} SET ${columns.map((column) => `${quoteIdentifier(column)} = ?`).join(", ")} WHERE ${targetPredicate.sql}`,
+            ).run(
+                ...columns.map((column) => nullableMaximum(row[column], collision[column])),
+                ...targetPredicate.values,
+            );
         }
         const sourcePredicate = rowPredicate(db, table.name, row);
         const result = db
@@ -371,6 +434,18 @@ function rekeyGenericRow(
         return true;
     }
 
+    if (table.name === "task_schedule_state") {
+        db.prepare(
+            "UPDATE task_schedule_state SET next_due_at = ? WHERE project_path = ? AND task = ?",
+        ).run(
+            nextDueAtMs(
+                String(row.schedule ?? ""),
+                Math.max(mergedAt, Number(row.last_run_at ?? 0)),
+            ),
+            fromIdentity,
+            row.task,
+        );
+    }
     const predicate = rowPredicate(db, table.name, row);
     const result = db
         .prepare(
@@ -385,22 +460,53 @@ function rekeyGenericRow(
     return true;
 }
 
+function sourceRowsWhere(table: TableInfo): string {
+    return `WHERE ${quoteIdentifier(table.identityColumn)} = ?${table.name === "memories" ? " AND NOT (status = 'archived' AND superseded_by_memory_id IS NOT NULL AND EXISTS (SELECT 1 FROM identity_merge_log l WHERE l.table_name = 'memories' AND l.row_id = CAST(memories.id AS TEXT) AND l.from_identity = memories.project_path AND l.action = 'superseded'))" : ""}`;
+}
+
 function tableSourceRows(db: Database, table: TableInfo, fromIdentity: string): SqliteRow[] {
     return db
-        .prepare(
-            `SELECT rowid, * FROM ${quoteIdentifier(table.name)} WHERE ${quoteIdentifier(table.identityColumn)} = ?`,
-        )
+        .prepare(`SELECT rowid, * FROM ${quoteIdentifier(table.name)} ${sourceRowsWhere(table)}`)
         .all(fromIdentity) as SqliteRow[];
 }
 
+/**
+ * Rows an identity owns in every non-derived table keyed by project identity: the rows a
+ * merge from this identity would move. Memories already merged away (archived and
+ * superseded under the merge log) are not counted.
+ */
+export function countIdentityRows(db: Database, identity: string): number {
+    let total = 0;
+    for (const table of discoverIdentityTables(db)) {
+        if (table.derived) continue;
+        const row = db
+            .prepare(
+                `SELECT COUNT(*) AS n FROM ${quoteIdentifier(table.name)} ${sourceRowsWhere(table)}`,
+            )
+            .get(identity) as { n: number };
+        total += Number(row.n);
+    }
+    return total;
+}
+
 function assertMergeAllowed(db: Database, fromIdentity: string, toIdentity: string): void {
+    const memberships = db
+        .prepare(
+            `SELECT m.project_path, w.id, w.name FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id WHERE m.project_path IN (?, ?)`,
+        )
+        .all(fromIdentity, toIdentity) as Array<{ project_path: string; id: number; name: string }>;
+    if (memberships.length === 2 && memberships[0].id !== memberships[1].id) {
+        throw new Error(
+            `Refusing identity merge: different workspaces ${memberships[0].name} and ${memberships[1].name}. Choose membership before merging.`,
+        );
+    }
     if (!tableExists(db, "authority_managed")) return;
     const source = db
         .prepare("SELECT 1 FROM authority_managed WHERE project_path = ? LIMIT 1")
         .get(fromIdentity);
     if (source) {
         throw new Error(
-            `Refusing identity merge: ${fromIdentity} is managed by the Rust module. Drain module authority before re-keying; module-store re-keying is not in scope.`,
+            `Refusing identity merge: ${fromIdentity} is managed by the Rust module: this project runs in Rust mode and its data lives in the module store. Merging will be possible once the single-store migration lands.`,
         );
     }
     const target = db
@@ -408,15 +514,45 @@ function assertMergeAllowed(db: Database, fromIdentity: string, toIdentity: stri
         .get(toIdentity);
     if (target) {
         throw new Error(
-            `Refusing identity merge: ${toIdentity} is managed by the Rust module. Module-owned target pools cannot be re-keyed by this command.`,
+            `Refusing identity merge: ${toIdentity} is managed by the Rust module: this project runs in Rust mode and its data lives in the module store. Merging will be possible once the single-store migration lands.`,
         );
     }
+}
+
+function memoryDisposition(
+    db: Database,
+    from: string,
+    to: string,
+): { duplicateMemoryIds: number[]; reviewMemoryIds: number[] } {
+    const duplicateMemoryIds: number[] = [];
+    const reviewMemoryIds: number[] = [];
+    for (const row of tableSourceRows(
+        db,
+        { name: "memories", identityColumn: "project_path", derived: false },
+        from,
+    )) {
+        const collision = db
+            .prepare(
+                "SELECT content FROM memories WHERE project_path = ? AND category = ? AND normalized_hash = ?",
+            )
+            .get(to, row.category, row.normalized_hash) as { content: string } | undefined;
+        if (collision && normalizedContent(collision.content) === normalizedContent(row.content))
+            duplicateMemoryIds.push(Number(row.id));
+        else if (
+            db
+                .prepare("SELECT 1 FROM memories WHERE project_path = ? AND category = ? LIMIT 1")
+                .get(to, row.category)
+        )
+            reviewMemoryIds.push(Number(row.id));
+    }
+    return { duplicateMemoryIds, reviewMemoryIds };
 }
 
 export function auditIdentityMerge(
     db: Database,
     fromIdentity: string,
     toIdentity: string,
+    now = Date.now(),
 ): IdentityMergeReport {
     const auditedTables = discoverIdentityTables(db).map((table) => ({
         tableName: table.name,
@@ -425,12 +561,43 @@ export function auditIdentityMerge(
         sourceRows: table.derived ? 0 : tableSourceRows(db, table, fromIdentity).length,
         changedRows: 0,
     }));
+    const changes: string[] = [];
+    for (const table of discoverIdentityTables(db).filter(
+        (table) => !table.derived && table.name !== "memories",
+    )) {
+        for (const row of tableSourceRows(db, table, fromIdentity)) {
+            const collision = findUniqueCollision(db, table, row, fromIdentity, toIdentity);
+            if (collision)
+                changes.push(
+                    `${table.name} ${rowKey(db, table.name, row)}: collapse into ${rowKey(db, table.name, collision)} (target content/configuration retained; progress counters reconciled)`,
+                );
+            if (table.name === "workspace_members")
+                changes.push(
+                    `workspace ${row.workspace_id}: ${collision ? "collapse aliases" : "transfer source membership"}`,
+                );
+            if (table.name === "task_schedule_state") {
+                const schedule = String((collision ?? row).schedule ?? "");
+                changes.push(
+                    `task ${row.task}: schedule ${JSON.stringify(row.schedule)} → ${JSON.stringify(schedule)}; next_due_at → ${nextDueAtMs(schedule, Math.max(now, Number(row.last_run_at ?? 0), Number(collision?.last_run_at ?? 0)))}`,
+                );
+            }
+        }
+    }
+    const queues = db
+        .prepare(
+            "SELECT reason, COUNT(*) AS n FROM dream_queue WHERE project_path IN (?, ?) GROUP BY reason HAVING COUNT(*) > 1",
+        )
+        .all(fromIdentity, toIdentity) as Array<{ reason: string; n: number }>;
+    for (const queue of queues)
+        changes.push(`dream_queue ${JSON.stringify(queue.reason)}: ${queue.n} → 1 queued row`);
     return {
         fromIdentity,
         toIdentity,
+        changes,
         auditedTables,
         changedRows: auditedTables.reduce((total, table) => total + table.sourceRows, 0),
         dryRun: true,
+        ...memoryDisposition(db, fromIdentity, toIdentity),
     };
 }
 
@@ -448,12 +615,14 @@ export function mergeProjectIdentities(
     }
     assertMergeAllowed(db, fromIdentity, toIdentity);
     const tables = discoverIdentityTables(db);
-    const report = auditIdentityMerge(db, fromIdentity, toIdentity);
+    const report = auditIdentityMerge(db, fromIdentity, toIdentity, options.now);
     if (options.dryRun) return report;
+    if (report.changedRows === 0) return { ...report, dryRun: false };
 
     const mergedAt = options.now ?? Date.now();
     const run = db
         .transaction(() => {
+            assertMergeAllowed(db, fromIdentity, toIdentity);
             // v22's identity-level map remains useful for legacy consumers; the row-level
             // log below is the authoritative audit trail for this command.
             if (tableExists(db, "v22_identity_rekey_map")) {
@@ -476,12 +645,31 @@ export function mergeProjectIdentities(
                 for (const row of rows) {
                     const changed =
                         table.name === "memories"
-                            ? mergeMemoryRow(db, row, fromIdentity, toIdentity, mergedAt)
+                            ? mergeMemoryRow(
+                                  db,
+                                  row,
+                                  fromIdentity,
+                                  toIdentity,
+                                  mergedAt,
+                                  report.reviewMemoryIds.includes(Number(row.id)),
+                              )
                             : rekeyGenericRow(db, table, row, fromIdentity, toIdentity, mergedAt);
                     if (changed) tableReport.changedRows += 1;
                 }
             }
 
+            db.prepare(
+                `DELETE FROM dream_queue WHERE project_path = ? AND id NOT IN (SELECT MIN(id) FROM dream_queue WHERE project_path = ? GROUP BY reason)`,
+            ).run(toIdentity, toIdentity);
+            db.prepare(`UPDATE dream_queue SET started_at = NULL WHERE project_path = ?`).run(
+                toIdentity,
+            );
+            db.prepare(
+                `UPDATE git_sweep_coordinator SET lease_holder = NULL, lease_expires_at = NULL, last_swept_at = NULL WHERE project_path = ?`,
+            ).run(toIdentity);
+            db.prepare(
+                `UPDATE session_meta SET cached_m0_bytes = NULL, cached_m0_project_identity = NULL WHERE cached_m0_project_identity IN (?, ?)`,
+            ).run(fromIdentity, toIdentity);
             db.prepare(
                 `INSERT INTO project_state
                 (project_path, project_memory_epoch, project_user_profile_version, updated_at)

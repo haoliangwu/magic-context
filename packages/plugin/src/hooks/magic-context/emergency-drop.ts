@@ -19,6 +19,8 @@
 
 import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
 import { TOKENS_PER_BYTE } from "./ctx-reduce-nudge";
+import { estimateTokens } from "./read-session-formatting";
+import type { TagTarget } from "./tag-messages";
 
 /** Reclaim target = fixedFloor + TARGET_FRACTION × (ceiling − fixedFloor). */
 export const TARGET_FRACTION = 0.3;
@@ -32,6 +34,16 @@ export const TIER_RECENCY_RESERVE = 0.2;
  * force-band-to-94.9% oscillation).
  */
 export const EMERGENCY_REARM_MIN_TOKENS = 2000;
+
+/**
+ * The selected candidates must together reclaim at least this many tokens, or
+ * the pass is skipped. The gap check above only proves there is something to
+ * close; it says nothing about what the candidates can actually win back. One
+ * live session spent an hour at 100% context dropping one fresh tool result
+ * per pass, 28 to 149 tokens each against a ~9,200-token gap, rewriting a
+ * cached prefix of ~300K tokens every time.
+ */
+export const EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS = EMERGENCY_REARM_MIN_TOKENS;
 
 export type Tier = 1 | 2 | 3;
 
@@ -72,6 +84,9 @@ export interface EmergencyDropTag {
     /** Tool-arg bytes — `drop()` removes the invocation too, so these reclaim. */
     inputByteSize: number;
     reasoningByteSize: number;
+    /** Provider-token observations from the current representation, never persisted raw tag counts. */
+    servedTokens?: number;
+    reclaimableTokens?: number;
 }
 
 /**
@@ -97,6 +112,8 @@ export interface EmergencyDropPlan {
 }
 
 export function estimateEmergencyDropReclaimTokens(tag: EmergencyDropTag): number {
+    if (tag.reclaimableTokens !== undefined)
+        return Number.isFinite(tag.reclaimableTokens) ? Math.max(0, tag.reclaimableTokens) : 0;
     return Math.round(tagReclaimBytes(tag) * TOKENS_PER_BYTE);
 }
 
@@ -104,17 +121,13 @@ export function estimateEmergencyDropReclaimTokens(tag: EmergencyDropTag): numbe
  * Plan a tiered target-headroom emergency drop. Pure: returns the ordered set of
  * tool tag numbers to drop, a token target, and a reason; the caller applies them.
  *
- * fixedFloor is derived as `currentTotalInputTokens − Σ(active floor-tag tokens)`.
- * Tags cover exactly the live-tail content (messages, tool outputs, files,
- * reasoning); system, tool defs, and m[0]/m[1] are untagged. So this difference
- * IS `system + toolDefs + (primary ? m0 + m1 : 0)` — the irreducible prefix —
- * with no extra plumbing, and it self-adjusts for subagents (no m0/m1 in their
- * total) by construction.
+ * fixedFloor is estimated as current provider input minus measured active-tail mass.
+ * Content with no observable token count remains in that fixed portion. This is
+ * conservative reclaim planning, not proof that every remaining token is irreducible.
  *
  * The two tag sets serve DIFFERENT contracts and must not be conflated:
  * - `floorTags`: the ENTIRE active live-window tag set (all types, including
- *   non-droppable tool tags). Only their token sum matters — it makes
- *   `fixedFloor` the true irreducible prefix. Passing a narrower set (e.g.
+ *   non-droppable tool tags). Their served mass determines the estimated fixed floor. Passing a narrower set (e.g.
  *   tool-only) folds real conversation/reasoning tail into the "floor",
  *   raising the target and systematically under-evicting at the derived force band.
  * - `tags`: the evictable candidates — active tool tags whose drop target
@@ -151,6 +164,12 @@ export function planEmergencyDrop(input: {
     priorInputSample: number;
     /** True while the persisted pressure-episode latch is non-zero. */
     hasPriorDrop: boolean;
+    /**
+     * True when another mutation already rewrites the cached prefix on this
+     * pass. The selection then rides that rewrite for free, so the minimum
+     * achievable reclaim does not apply.
+     */
+    passAlreadyPriced?: boolean;
 }): EmergencyDropPlan {
     const {
         tags,
@@ -197,16 +216,22 @@ export function planEmergencyDrop(input: {
     let tailTokens = 0;
     for (const tag of floorTags) {
         if (tag.status !== "active") continue;
-        tailTokens += estimateEmergencyDropReclaimTokens(tag);
+        tailTokens += tag.servedTokens ?? estimateEmergencyDropReclaimTokens(tag);
     }
     const fixedFloor = Math.max(currentTotalInputTokens - tailTokens, 0);
     const workingSpan = Math.max(ceilingTokens - fixedFloor, 0);
     const target = fixedFloor + TARGET_FRACTION * workingSpan;
     const reclaimTokens = Math.round(currentTotalInputTokens - target);
+    // When the fixed floor alone is already above the ceiling, dropping tool
+    // outputs cannot bring the request under it; say so in every reason.
+    const floorNote =
+        fixedFloor > ceilingTokens
+            ? `; fixed floor ≈${Math.round(fixedFloor)} already exceeds ceiling ${Math.round(ceilingTokens)}: tool drops cannot reach the target`
+            : "";
 
     // Already at/under target, or reclaim too small to justify a cache bust.
     if (reclaimTokens <= EMERGENCY_REARM_MIN_TOKENS) {
-        return noop(`reclaim<=min (${reclaimTokens} <= ${EMERGENCY_REARM_MIN_TOKENS})`);
+        return noop(`reclaim<=min (${reclaimTokens} <= ${EMERGENCY_REARM_MIN_TOKENS})${floorNote}`);
     }
 
     // Union projection form: exact tag-number cutoff directly.
@@ -287,13 +312,47 @@ export function planEmergencyDrop(input: {
     if (selected.length === 0) {
         // No cache rewrite occurred; the caller leaves the episode armed so
         // later completed outputs can form a batch.
-        return noop("no-candidates");
+        return noop(`no-candidates${floorNote}`);
+    }
+
+    // Price the selection before committing it. Skipping leaves the episode
+    // armed, so the candidates can still ride a later rewrite.
+    if (!input.passAlreadyPriced && reclaimed < EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS) {
+        return noop(
+            `achievable reclaim below minimum (${selected.length} tags, reclaim≈${Math.round(reclaimed)} < ${EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS} against gap ${reclaimTokens})${floorNote}`,
+        );
     }
 
     return {
         shouldDrop: true,
         tagNumbers: selected,
         reclaimTokens,
-        reason: `tiered drop: ${selected.length} tags, reclaim≈${reclaimed}/${reclaimTokens} tokens (floor≈${fixedFloor}, ceiling=${Math.round(ceilingTokens)})`,
+        reason: `tiered drop: ${selected.length} tags, reclaim≈${reclaimed}/${reclaimTokens} tokens (floor≈${fixedFloor}, ceiling=${Math.round(ceilingTokens)})${floorNote}`,
     };
+}
+
+/** Count current content and the planned replacement without mutating either cached representation. */
+export function measureEmergencyTag<T extends EmergencyDropTag>(
+    tag: T,
+    target: TagTarget | undefined,
+    calibration: { toolsRatio: number; proseRatio: number },
+    skeleton: boolean,
+): T & EmergencyDropTag {
+    const observation = target?.measureReclaim?.(skeleton);
+    if (observation) {
+        const before =
+            observation.beforeTools * calibration.toolsRatio +
+            observation.beforeProse * calibration.proseRatio;
+        const after =
+            observation.afterTools * calibration.toolsRatio +
+            observation.afterProse * calibration.proseRatio;
+        return { ...tag, servedTokens: before, reclaimableTokens: Math.max(0, before - after) };
+    }
+    const content = target?.getContent?.();
+    const served = content
+        ? estimateTokens(content) *
+          (tag.type === "tool" ? calibration.toolsRatio : calibration.proseRatio)
+        : 0;
+    // No replacement observation means no reclaim credit; original byte_size may describe unserved content.
+    return { ...tag, servedTokens: served, reclaimableTokens: 0 };
 }

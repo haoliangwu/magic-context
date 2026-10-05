@@ -69,7 +69,18 @@ const SECRET_QUALIFIERS = new Set([
     "huggingface",
     "aws",
     "azure",
+    // OpenID Connect `id_token`.
+    "id",
 ]);
+
+/**
+ * Words that name a secret on their own. `key` and `token` need a qualifier
+ * (`api_key`, `access_token`) because `max_tokens` or `cache_key` are not
+ * secrets, but `db_password`, `secret_value` or `aws_credentials` are secrets
+ * whatever comes before them.
+ */
+const UNQUALIFIED_SECRET_SEGMENT_PATTERN =
+    /^(?:password|secret|credential|bearer|authorization)s?$/;
 
 export function isSecretKey(key: string): boolean {
     const segments = key
@@ -98,6 +109,7 @@ export function isSecretKey(key: string): boolean {
             break;
         }
         if (!trailingOk) continue;
+        if (UNQUALIFIED_SECRET_SEGMENT_PATTERN.test(seg)) return true;
 
         for (let k = i - 1; k >= 0; k--) {
             const lead = segments[k];
@@ -162,6 +174,27 @@ const SECRET_TEXT_PATTERNS: Array<{
     {
         pattern: /\b(Authorization\s*:\s*Bearer\s+)([A-Za-z0-9._~+/=-]{8,})/gi,
         replacement: (_full: string, prefix: string) => `${prefix}<REDACTED:bearer>`,
+    },
+    {
+        // Other Authorization schemes carry credentials too; Basic is just
+        // base64 of user:password.
+        pattern:
+            /\b((?:Proxy-)?Authorization\s*:\s*(?:Basic|Digest|Token|Negotiate|NTLM)\s+)([A-Za-z0-9._~+/=-]{4,})/gi,
+        replacement: (_full: string, prefix: string) => `${prefix}<REDACTED:authorization>`,
+    },
+    {
+        // API-key style headers (`x-api-key: ...`), which the `name=value`
+        // pattern below does not reach because of the colon separator.
+        pattern:
+            /\b((?:x-)?(?:api-?key|api-?token|auth-?token|access-?token)\s*:\s*)([^\s'"`,;<>]{6,})/gi,
+        replacement: (full: string, prefix: string, value: string) =>
+            isNonSecretScalarValue(value) ? full : `${prefix}<REDACTED:api_key>`,
+    },
+    {
+        // Credentials embedded in a URL: scheme://user:password@host.
+        pattern: /\b([a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)([^\s/@]+)(@)/gi,
+        replacement: (_full: string, prefix: string, _password: string, at: string) =>
+            `${prefix}<REDACTED:password>${at}`,
     },
     {
         pattern: /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,

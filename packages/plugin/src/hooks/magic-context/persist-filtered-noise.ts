@@ -23,29 +23,31 @@ export function persistFilteredNoise(
         rows.some((row, index) => row.ordinal !== start + index || !row.messageId)
     )
         return false;
-    const saved = db.transaction(() => {
-        const prior = getCompartments(db, sessionId);
-        const last = prior.at(-1);
-        if ((last?.endMessage ?? 0) + 1 !== start) return false;
-        appendCompartments(db, sessionId, [
-            {
-                sequence: (last?.sequence ?? -1) + 1,
-                startMessage: start,
-                endMessage: eligibleEnd - 1,
-                startMessageId: rows[0].messageId,
-                endMessageId: rows[rows.length - 1].messageId,
-                title: "",
-                content: "",
-                p1: "",
-                p2: "",
-                p3: "",
-                p4: "",
-                episodeType: "filtered-noise",
-                importance: 1,
-            },
-        ]);
-        return true;
-    })();
+    const saved = db
+        .transaction(() => {
+            const prior = getCompartments(db, sessionId);
+            const last = prior.at(-1);
+            if ((last?.endMessage ?? 0) + 1 !== start) return false;
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: (last?.sequence ?? -1) + 1,
+                    startMessage: start,
+                    endMessage: eligibleEnd - 1,
+                    startMessageId: rows[0].messageId,
+                    endMessageId: rows[rows.length - 1].messageId,
+                    title: "",
+                    content: "",
+                    p1: "",
+                    p2: "",
+                    p3: "",
+                    p4: "",
+                    episodeType: "filtered-noise",
+                    importance: 1,
+                },
+            ]);
+            return true;
+        })
+        .immediate();
     if (saved)
         sessionLog(
             sessionId,

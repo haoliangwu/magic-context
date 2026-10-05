@@ -8,8 +8,10 @@
  * installation and native context/memory conflict handling.
  */
 import type { HarnessAdapter } from "../adapters/types";
+import { ensureDocsProposalGitignore } from "../lib/docs-proposal-gitignore";
 import { resolveAdaptersForCommand } from "../lib/harness-select";
 import { intro, log, note, outro } from "../lib/prompts";
+import { runDoctorStoreInit } from "./doctor-store";
 import { runSetup as runOmpSetup } from "./setup-omp";
 import { runSetup as runOpenCodeSetup } from "./setup-opencode";
 import { runSetup as runPiSetup } from "./setup-pi";
@@ -33,6 +35,11 @@ export async function runSetup(argv: string[]): Promise<number> {
         return 1;
     }
 
+    if (!dryRun && runDoctorStoreInit(log.info) !== 0) {
+        outro("Setup stopped — shared store initialization failed.");
+        return 1;
+    }
+
     if (adapters.length === 0) {
         outro("No harness selected. Nothing to do.");
         return 0;
@@ -49,7 +56,15 @@ export async function runSetup(argv: string[]): Promise<number> {
             anyFailure = true;
             continue;
         }
-        if (!dryRun) printNextSteps(adapter);
+        if (!dryRun) {
+            const ignore = ensureDocsProposalGitignore(process.cwd());
+            if (ignore.status === "added") {
+                log.info(`Added .cortexkit/magic-context/ to ${ignore.path}`);
+            } else if (ignore.status === "failed") {
+                log.warn(`Could not update ${ignore.path}: ${ignore.error}`);
+            }
+            printNextSteps(adapter);
+        }
     }
 
     if (anyFailure) {

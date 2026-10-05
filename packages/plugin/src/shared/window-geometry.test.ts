@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveLimit, resolveOutputReserve } from "./models-dev-cache";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 import {
     applyProvenInputFloor,
     deriveWindowGeometry,
+    formatCompactTokens,
     formatWindowDerivationLine,
     parseWindowOverlay,
     placeholderFilteredOutput,
@@ -159,7 +161,7 @@ describe("Fusiform overlay v1", () => {
     });
 
     test("a missing file is silent and a bad file logs one summary", () => {
-        const dir = mkdtempSync(join(tmpdir(), "window-overlay-test-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "window-overlay-test-"));
         tempDirs.push(dir);
         const logs: string[] = [];
         expect(
@@ -372,15 +374,32 @@ describe("window geometry", () => {
         }
     });
 
-    test("display percentage uses the same usableSoft scheduler base", () => {
+    test("prints one line without the internal geometry tag or a second percentage", () => {
         const result = deriveWindowGeometry("openai", "model", {
             context: 204_000,
             output: 30_600,
         }) as NonNullable<ReturnType<typeof deriveWindowGeometry>>;
-        const input = 105_900;
-        const schedulerPercentage = (input / result.usableSoft) * 100;
-        expect(formatWindowDerivationLine(input, result)).toContain(
-            `(${schedulerPercentage.toFixed(1)}%)`,
+        const line = formatWindowDerivationLine(105_900, result);
+        // The headline row above this line already carries the percentage, and
+        // the bracketed geometry mode is window-geometry's own vocabulary.
+        expect(line).not.toContain("%");
+        expect(line).not.toContain("[");
+        expect(line).not.toContain("—");
+        expect(line).toBe(
+            `105.9k / ${formatCompactTokens(result.usableSoft)} usable · window ${formatCompactTokens(result.derivation.window)} · ${formatCompactTokens(result.derivation.reserve)} output reserve`,
         );
+    });
+
+    test("fits one line at the dialog's narrowest content width", () => {
+        // The narrowest dialog content width is 56 columns (an 88-column dialog
+        // less its padding); a longer line wraps onto a second row. The 1m
+        // window with a 128k output reserve is the shape the dialog shows.
+        const result = deriveWindowGeometry("openai", "model", {
+            context: 1_000_000,
+            output: 128_000,
+        }) as NonNullable<ReturnType<typeof deriveWindowGeometry>>;
+        const line = formatWindowDerivationLine(533_700, result);
+        expect(line).toBe("533.7k / 872k usable · window 1m · 128k output reserve");
+        expect(line.length).toBeLessThanOrEqual(56);
     });
 });

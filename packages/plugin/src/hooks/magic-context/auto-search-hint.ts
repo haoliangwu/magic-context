@@ -20,7 +20,7 @@
  */
 
 import type { UnifiedSearchResult } from "../../features/magic-context/search";
-import { cavemanCompress } from "./caveman";
+import { type CavemanWordRules, CURRENT_CAVEMAN_RULES, cavemanCompress } from "./caveman";
 
 const MAX_FRAGMENTS = 3;
 const FRAGMENT_CHAR_CAP = 80; // ~20 tokens at 3.5 chars/token
@@ -30,6 +30,8 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
 export interface AutoSearchHintOptions {
     maxFragments?: number;
     fragmentCharCap?: number;
+    /** English word rules unless the user-level `language` is another language. */
+    wordRules?: CavemanWordRules;
 }
 
 function truncate(text: string, limit: number): string {
@@ -52,10 +54,19 @@ function formatAge(committedAtMs: number): string {
     return years === 1 ? "1y ago" : `${years}y ago`;
 }
 
-function renderFragment(result: UnifiedSearchResult, charCap: number): string {
+function renderFragment(
+    result: UnifiedSearchResult,
+    charCap: number,
+    wordRules: CavemanWordRules,
+): string {
     switch (result.source) {
         case "memory": {
-            const compressed = cavemanCompress(result.content, "ultra");
+            const compressed = cavemanCompress(
+                result.content,
+                "ultra",
+                CURRENT_CAVEMAN_RULES,
+                wordRules,
+            );
             return truncate(compressed, charCap);
         }
         case "git_commit": {
@@ -67,20 +78,35 @@ function renderFragment(result: UnifiedSearchResult, charCap: number): string {
             return `commit ${result.shortSha} ${formatAge(result.committedAtMs)}: ${body}`;
         }
         case "message": {
-            const compressed = cavemanCompress(result.content, "ultra");
+            const compressed = cavemanCompress(
+                result.content,
+                "ultra",
+                CURRENT_CAVEMAN_RULES,
+                wordRules,
+            );
             return truncate(compressed, charCap);
         }
         case "compartment": {
             const source = result.snippet ?? result.title;
-            const compressed = cavemanCompress(source, "ultra");
+            const compressed = cavemanCompress(source, "ultra", CURRENT_CAVEMAN_RULES, wordRules);
             return truncate(compressed, charCap);
         }
         case "primer": {
-            const compressed = cavemanCompress(result.content, "ultra");
+            const compressed = cavemanCompress(
+                result.content,
+                "ultra",
+                CURRENT_CAVEMAN_RULES,
+                wordRules,
+            );
             return truncate(compressed, charCap);
         }
         case "note": {
-            const compressed = cavemanCompress(result.content, "ultra");
+            const compressed = cavemanCompress(
+                result.content,
+                "ultra",
+                CURRENT_CAVEMAN_RULES,
+                wordRules,
+            );
             return truncate(compressed, charCap);
         }
     }
@@ -104,7 +130,7 @@ export function buildAutoSearchHint(
     const lines: string[] = [];
 
     for (const result of picks) {
-        const fragment = renderFragment(result, fragmentCharCap);
+        const fragment = renderFragment(result, fragmentCharCap, options.wordRules ?? "english");
         if (fragment.length === 0) continue;
         lines.push(`- ${fragment}`);
     }

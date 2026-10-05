@@ -6,7 +6,43 @@ import {
 	convertEntriesToRawMessagePage,
 	convertEntriesToRawMessages,
 	findLastModelKeyFromBranch,
+	findRestartModelSeedFromBranch,
 } from "./read-session-pi";
+
+describe("findRestartModelSeedFromBranch", () => {
+	const reply = (provider: string, model: string) => ({
+		type: "message",
+		message: { role: "assistant", provider, model },
+	});
+	const change = (provider: string, modelId: string) => ({
+		type: "model_change",
+		provider,
+		modelId,
+	});
+
+	it("uses the last reply's model when a model_change follows it", () => {
+		expect(
+			findRestartModelSeedFromBranch([
+				change("google-antigravity", "gemini"),
+				reply("google-antigravity", "gemini"),
+				change("openai-codex", "gpt-6-sol"),
+			]),
+		).toBe("google-antigravity/gemini");
+	});
+
+	it("keeps the last model_change when no switch follows the last reply", () => {
+		expect(
+			findRestartModelSeedFromBranch([
+				change("openai-codex", "gpt-6-sol"),
+				reply("test-provider", "test-model"),
+			]),
+		).toBe("openai-codex/gpt-6-sol");
+		expect(
+			findRestartModelSeedFromBranch([change("openai-codex", "gpt-6-sol")]),
+		).toBe("openai-codex/gpt-6-sol");
+		expect(findRestartModelSeedFromBranch([reply("a", "b")])).toBeUndefined();
+	});
+});
 
 describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () => {
 	// Regression coverage for the cortexkit/magic-context X1+X2 production
@@ -38,6 +74,19 @@ describe("convertEntriesToRawMessages: synthetic-user entry-id propagation", () 
 	): Record<string, unknown> {
 		return { type: "message", id, message };
 	}
+
+	it("parses Pi JSONL ISO entry timestamps into indexed epoch milliseconds", () => {
+		const entries = [
+			{
+				...messageEntry("user-time", { role: "user", content: "timed" }),
+				timestamp: "2026-09-22T12:34:56.789Z",
+			},
+		];
+
+		expect(convertEntriesToRawMessages(entries)[0]?.createdAt).toBe(
+			Date.parse("2026-09-22T12:34:56.789Z"),
+		);
+	});
 
 	it("skips current custom entries and historical ctx-status custom messages", () => {
 		const entries = [
@@ -411,5 +460,46 @@ describe("convertEntriesToRawMessagePage", () => {
 		];
 
 		expect(paged).toEqual(full);
+	});
+
+	it("keeps tool output on its carrier when a non-chat entry sits between them", () => {
+		const entry = (id: string, message: Record<string, unknown>) => ({
+			type: "message",
+			id,
+			message,
+		});
+		// A `!cmd` bashExecution entry lands between the tool result and the
+		// next chat message: it takes an ordinal of its own, so the folded
+		// tool output is carried one ordinal later than the result entry.
+		const entries = [
+			entry("user-1", { role: "user", content: "start" }),
+			entry("asst-1", {
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call-1", name: "read" }],
+			}),
+			entry("result-1", {
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "read",
+				content: [{ type: "text", text: "TOOL OUTPUT" }],
+			}),
+			entry("bash-1", {
+				role: "bashExecution",
+				command: "ls",
+				output: "a b",
+			}),
+			entry("user-2", { role: "user", content: "finish" }),
+		];
+		const full = convertEntriesToRawMessages(entries);
+		const carrier = full.find((message) => message.id === "user-2");
+		expect(carrier?.parts).toContainEqual(
+			expect.objectContaining({ callID: "call-1" }),
+		);
+
+		for (let after = 0; after < full.length; after++) {
+			expect(
+				convertEntriesToRawMessagePage(entries, after, 1, full.length),
+			).toEqual([full[after]]);
+		}
 	});
 });

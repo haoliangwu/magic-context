@@ -12,9 +12,10 @@
  * same `session.prompt({ noReply: true, ignored })` append Magic Context uses.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, expect, it } from "bun:test";
 import { join } from "node:path";
 import { TestHarness } from "../src/harness";
+import { forEachHost } from "../src/scenario-hosts";
 import { openTestDb } from "../src/test-db";
 
 const NOTICE_TEXT = "## Magic Context status notice (e2e)";
@@ -50,17 +51,7 @@ interface OcPartRow {
 
 let h: TestHarness;
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            memory: { auto_search: { enabled: false } },
-        },
-    });
-});
 
-afterAll(async () => {
-    await h?.dispose();
-});
 
 function noticeClient(): NoticeClient {
     return h.client as unknown as NoticeClient;
@@ -168,7 +159,18 @@ function findUserByText(sessionId: string, text: string): OcMessageRow | undefin
     return readMessages(sessionId).find((row) => row.role === "user" && ids.has(row.id));
 }
 
-describe("status-notice loop-exit ordering", () => {
+forEachHost(import.meta.url, "status-notice loop-exit ordering", () => {
+    beforeAll(async () => {
+        h = await TestHarness.create({
+            magicContextConfig: {
+                memory: { auto_search: { enabled: false } },
+            },
+        });
+    });
+
+    afterAll(async () => {
+        await h?.dispose();
+    });
     it("idle notice then a real prompt produces one assistant whose parentID is the real user", async () => {
         h.mock.reset();
         h.mock.setDefault({

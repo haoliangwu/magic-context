@@ -667,13 +667,13 @@ After outputting compartments, facts, and events, also output a `<user_observati
 - User observations capture UNIVERSAL behavioral patterns about the human user — not project-specific or technical.
 - Good observations: communication preferences, review focus areas, expertise level, decision-making patterns, frustration triggers, working style.
 - Bad observations (DO NOT emit): project-specific preferences, framework choices, coding language preferences, one-off moods, task-local frustration.
-- Each observation must be a single concise sentence in present tense.
+- Each observation must be a single concise, present-tense statement phrased verb-first without a subject.
 - Only emit observations you have strong evidence for from the conversation. Do not speculate. Zero observations is fine when nothing stands out.
 - The output shape gains an additional section:
 ```
 <user_observations>
-* User prefers terse communication and dislikes verbose explanations.
-* User is technically deep — understands cache invalidation, SQLite internals, and prompt engineering.
+* Prefers terse communication and dislikes verbose explanations.
+* Understands cache invalidation, SQLite internals, and prompt engineering.
 </user_observations>
 ```
 If no observations, omit the `<user_observations>` section entirely.

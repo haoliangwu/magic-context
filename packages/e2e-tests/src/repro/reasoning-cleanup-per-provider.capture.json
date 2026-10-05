@@ -1,0 +1,1273 @@
+{
+  "opencode": "1.18.30",
+  "rawCaptureSha256": "2c05f5dff7690104eee2f87a3f4b33b0fa5bb3a1abd229ceef91e6bd51eb37bf",
+  "scope": "Synthetic earlier completed assistant; deliberately rejected recording endpoints; not acceptance evidence",
+  "cases": [
+    {
+      "route": "anthropic",
+      "mode": "intact",
+      "path": "/messages",
+      "beta": "context-management-2025-06-27,structured-outputs-2025-11-13",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "OLD_REASONING_FIXTURE",
+              "signature": "mock-signature"
+            },
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "anthropic",
+      "mode": "cleared",
+      "path": "/messages",
+      "beta": "context-management-2025-06-27,structured-outputs-2025-11-13",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "[cleared]",
+              "signature": "mock-signature"
+            },
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "anthropic",
+      "mode": "empty-reasoning",
+      "path": "/messages",
+      "beta": "context-management-2025-06-27,structured-outputs-2025-11-13",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "",
+              "signature": "mock-signature"
+            },
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "anthropic",
+      "mode": "sentinel",
+      "path": "/messages",
+      "beta": "context-management-2025-06-27,structured-outputs-2025-11-13",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "anthropic",
+      "mode": "removed",
+      "path": "/messages",
+      "beta": "context-management-2025-06-27,structured-outputs-2025-11-13",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "anthropic",
+      "mode": "unsigned",
+      "path": "/messages",
+      "beta": "context-management-2025-06-27,structured-outputs-2025-11-13",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "vertex-eu-anthropic",
+      "mode": "intact",
+      "path": "/claude-sonnet-5:streamRawPredict",
+      "beta": "context-management-2025-06-27",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "OLD_REASONING_FIXTURE",
+              "signature": "mock-signature"
+            },
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "vertex-eu-anthropic",
+      "mode": "cleared",
+      "path": "/claude-sonnet-5:streamRawPredict",
+      "beta": "context-management-2025-06-27",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "[cleared]",
+              "signature": "mock-signature"
+            },
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "vertex-eu-anthropic",
+      "mode": "empty-reasoning",
+      "path": "/claude-sonnet-5:streamRawPredict",
+      "beta": "context-management-2025-06-27",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "",
+              "signature": "mock-signature"
+            },
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "vertex-eu-anthropic",
+      "mode": "sentinel",
+      "path": "/claude-sonnet-5:streamRawPredict",
+      "beta": "context-management-2025-06-27",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "vertex-eu-anthropic",
+      "mode": "removed",
+      "path": "/claude-sonnet-5:streamRawPredict",
+      "beta": "context-management-2025-06-27",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "vertex-eu-anthropic",
+      "mode": "unsigned",
+      "path": "/claude-sonnet-5:streamRawPredict",
+      "beta": "context-management-2025-06-27",
+      "contextManagement": {
+        "edits": [
+          {
+            "type": "clear_thinking_20251015",
+            "keep": {
+              "type": "thinking_turns",
+              "value": 1
+            }
+          }
+        ]
+      },
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "OLD_ANSWER_FIXTURE",
+              "cache_control": {
+                "type": "ephemeral"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "bedrock-probe",
+      "mode": "intact",
+      "path": "/model/anthropic.claude-sonnet-5/converse-stream",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "reasoningContent": {
+                "reasoningText": {
+                  "text": "OLD_REASONING_FIXTURE",
+                  "signature": "mock-signature"
+                }
+              }
+            },
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            },
+            {
+              "cachePoint": {
+                "type": "default"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "bedrock-probe",
+      "mode": "cleared",
+      "path": "/model/anthropic.claude-sonnet-5/converse-stream",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "reasoningContent": {
+                "reasoningText": {
+                  "text": "[cleared]",
+                  "signature": "mock-signature"
+                }
+              }
+            },
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            },
+            {
+              "cachePoint": {
+                "type": "default"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "bedrock-probe",
+      "mode": "empty-reasoning",
+      "path": "/model/anthropic.claude-sonnet-5/converse-stream",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "reasoningContent": {
+                "reasoningText": {
+                  "text": "",
+                  "signature": "mock-signature"
+                }
+              }
+            },
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            },
+            {
+              "cachePoint": {
+                "type": "default"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "bedrock-probe",
+      "mode": "sentinel",
+      "path": "/model/anthropic.claude-sonnet-5/converse-stream",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            },
+            {
+              "cachePoint": {
+                "type": "default"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "bedrock-probe",
+      "mode": "removed",
+      "path": "/model/anthropic.claude-sonnet-5/converse-stream",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            },
+            {
+              "cachePoint": {
+                "type": "default"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "bedrock-probe",
+      "mode": "unsigned",
+      "path": "/model/anthropic.claude-sonnet-5/converse-stream",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            },
+            {
+              "cachePoint": {
+                "type": "default"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "copilot-probe",
+      "mode": "intact",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_text": "OLD_REASONING_FIXTURE",
+          "reasoning_opaque": "mock-opaque"
+        }
+      ]
+    },
+    {
+      "route": "copilot-probe",
+      "mode": "cleared",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_text": "[cleared]",
+          "reasoning_opaque": "mock-opaque"
+        }
+      ]
+    },
+    {
+      "route": "copilot-probe",
+      "mode": "empty-reasoning",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_opaque": "mock-opaque"
+        }
+      ]
+    },
+    {
+      "route": "copilot-probe",
+      "mode": "sentinel",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "copilot-probe",
+      "mode": "removed",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "copilot-probe",
+      "mode": "unsigned",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "openai",
+      "mode": "intact",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "type": "reasoning",
+          "encrypted_content": "mock-encrypted",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "OLD_REASONING_FIXTURE"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "openai",
+      "mode": "cleared",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "type": "reasoning",
+          "encrypted_content": "mock-encrypted",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "[cleared]"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "openai",
+      "mode": "empty-reasoning",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "type": "reasoning",
+          "encrypted_content": "mock-encrypted",
+          "summary": []
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "openai",
+      "mode": "sentinel",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "openai",
+      "mode": "removed",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "openai",
+      "mode": "unsigned",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "codex-probe",
+      "mode": "intact",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "type": "reasoning",
+          "encrypted_content": "mock-encrypted",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "OLD_REASONING_FIXTURE"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "codex-probe",
+      "mode": "cleared",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "type": "reasoning",
+          "encrypted_content": "mock-encrypted",
+          "summary": [
+            {
+              "type": "summary_text",
+              "text": "[cleared]"
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "codex-probe",
+      "mode": "empty-reasoning",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "type": "reasoning",
+          "encrypted_content": "mock-encrypted",
+          "summary": []
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "codex-probe",
+      "mode": "sentinel",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "codex-probe",
+      "mode": "removed",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "codex-probe",
+      "mode": "unsigned",
+      "path": "/responses",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "gemini-probe",
+      "mode": "intact",
+      "path": "/models/gemini-2.5-pro:streamGenerateContent",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "text": "OLD_REASONING_FIXTURE",
+              "thought": true,
+              "thoughtSignature": "mock-thought-signature"
+            },
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "gemini-probe",
+      "mode": "cleared",
+      "path": "/models/gemini-2.5-pro:streamGenerateContent",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "text": "[cleared]",
+              "thought": true,
+              "thoughtSignature": "mock-thought-signature"
+            },
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "gemini-probe",
+      "mode": "empty-reasoning",
+      "path": "/models/gemini-2.5-pro:streamGenerateContent",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "gemini-probe",
+      "mode": "sentinel",
+      "path": "/models/gemini-2.5-pro:streamGenerateContent",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "gemini-probe",
+      "mode": "removed",
+      "path": "/models/gemini-2.5-pro:streamGenerateContent",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "gemini-probe",
+      "mode": "unsigned",
+      "path": "/models/gemini-2.5-pro:streamGenerateContent",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "model",
+          "parts": [
+            {
+              "text": "OLD_REASONING_FIXTURE",
+              "thought": true
+            },
+            {
+              "text": "OLD_ANSWER_FIXTURE"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "route": "deepseek-probe",
+      "mode": "intact",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_content": "OLD_REASONING_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "deepseek-probe",
+      "mode": "cleared",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_content": "[cleared]"
+        }
+      ]
+    },
+    {
+      "route": "deepseek-probe",
+      "mode": "empty-reasoning",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_content": ""
+        }
+      ]
+    },
+    {
+      "route": "deepseek-probe",
+      "mode": "sentinel",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_content": ""
+        }
+      ]
+    },
+    {
+      "route": "deepseek-probe",
+      "mode": "removed",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_content": ""
+        }
+      ]
+    },
+    {
+      "route": "deepseek-probe",
+      "mode": "unsigned",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning_content": "OLD_REASONING_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "groq-probe",
+      "mode": "intact",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning": "OLD_REASONING_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "groq-probe",
+      "mode": "cleared",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning": "[cleared]"
+        }
+      ]
+    },
+    {
+      "route": "groq-probe",
+      "mode": "empty-reasoning",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "groq-probe",
+      "mode": "sentinel",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "groq-probe",
+      "mode": "removed",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "groq-probe",
+      "mode": "unsigned",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE",
+          "reasoning": "OLD_REASONING_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "xai-probe",
+      "mode": "intact",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "xai-probe",
+      "mode": "cleared",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "xai-probe",
+      "mode": "empty-reasoning",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "xai-probe",
+      "mode": "sentinel",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "xai-probe",
+      "mode": "removed",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    },
+    {
+      "route": "xai-probe",
+      "mode": "unsigned",
+      "path": "/chat/completions",
+      "beta": null,
+      "contextManagement": null,
+      "historicalAssistant": [
+        {
+          "role": "assistant",
+          "content": "OLD_ANSWER_FIXTURE"
+        }
+      ]
+    }
+  ]
+}

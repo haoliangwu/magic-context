@@ -19,10 +19,11 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 import {
     isPersistedTrailingBlankDecision,
     type PersistedTrailingBlankDecision,
-    parseReplayDocument,
     ReplayDocumentError,
+    readAllTrailingBlankDecisions,
     readReplayDocument,
-    updateReplayDocument,
+    readReplayTrailingBlankSubset,
+    updateTrailingBlankDecisions,
 } from "./storage-replay-document";
 
 export type { PersistedTrailingBlankDecision } from "./storage-replay-document";
@@ -183,6 +184,8 @@ export interface ProtectedTailDrainReservation {
     sessionId: string;
     runId: string;
     tokens: number;
+    /** Start of the drain window the tokens were charged to. */
+    windowStartedAt: number;
 }
 
 export interface ProtectedTailDrainBudgetState {
@@ -450,7 +453,7 @@ export function markProtectedTailPolicyV3Seeded(
             ).run(Math.max(1, Math.floor(priorBoundaryOrdinal)), sessionId);
             seeded = true;
         }
-    })();
+    }).immediate();
     return { ...loadProtectedTailMeta(db, sessionId), seeded };
 }
 
@@ -467,7 +470,7 @@ export function recordProtectedTailPublicationFloor(
                  recovery_no_eligible_head_count = 0
              WHERE session_id = ?`,
         ).run(Math.max(1, Math.floor(floorOrdinal)), sessionId);
-    })();
+    }).immediate();
 }
 
 export function recordProtectedTailNoEligibleHead(db: Database, sessionId: string): number {
@@ -478,7 +481,7 @@ export function recordProtectedTailNoEligibleHead(db: Database, sessionId: strin
              SET recovery_no_eligible_head_count = COALESCE(recovery_no_eligible_head_count, 0) + 1
              WHERE session_id = ?`,
         ).run(sessionId);
-    })();
+    }).immediate();
     return loadProtectedTailMeta(db, sessionId).recoveryNoEligibleHeadCount;
 }
 
@@ -488,7 +491,7 @@ export function resetProtectedTailNoEligibleHead(db: Database, sessionId: string
         db.prepare(
             "UPDATE session_meta SET recovery_no_eligible_head_count = 0 WHERE session_id = ?",
         ).run(sessionId);
-    })();
+    }).immediate();
 }
 
 export const DRAIN_WINDOW_MS = 10 * 60 * 1000;
@@ -538,7 +541,6 @@ export function getWrapupInProgressState(
     const state = readRawWrapupState(db, sessionId);
     if (!state) return null;
     if (state.expiresAt > now) return state;
-    const transactionStartedAt = performance.now();
     try {
         db.exec("BEGIN IMMEDIATE");
     } catch {
@@ -547,6 +549,7 @@ export function getWrapupInProgressState(
         // reclaim the stale blob.
         return null;
     }
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         const current = readRawWrapupState(db, sessionId);
@@ -587,8 +590,8 @@ export function acquireWrapupInProgress(
         expiresAt: acquiredAt + WRAPUP_IN_PROGRESS_TTL_MS,
         updatedAt: acquiredAt,
     };
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         ensureSessionMetaRow(db, sessionId);
@@ -625,8 +628,8 @@ export function updateWrapupInProgress(
     updates: Partial<Omit<WrapupInProgressState, "holderId" | "acquiredAt">>,
     now = Date.now(),
 ): WrapupInProgressState | null {
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         const current = readRawWrapupState(db, sessionId);
@@ -662,8 +665,8 @@ export function updateWrapupInProgress(
 }
 
 export function releaseWrapupInProgress(db: Database, sessionId: string, holderId: string): void {
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     let finished = false;
     try {
         const current = readRawWrapupState(db, sessionId);
@@ -858,95 +861,110 @@ export function reserveProtectedTailDrainTokens(args: {
         budgetState: null,
         skippedReason: "internal drain budget spent",
     };
-    args.db.transaction(() => {
-        ensureSessionMetaRow(args.db, args.sessionId);
-        let meta = loadProtectedTailMeta(args.db, args.sessionId);
-        const windowStartedAt = meta.protectedTailDrainWindowStartedAt;
-        const windowExpired =
-            windowStartedAt <= 0 ||
-            windowStartedAt > now ||
-            now - windowStartedAt >= DRAIN_WINDOW_MS;
-        if (windowExpired) {
-            // Expiry is checked before every reservation, including skipped attempts.
-            // A future timestamp is invalid wall-clock state and starts a fresh window
-            // instead of holding the session behind the limiter until that time arrives.
+    args.db
+        .transaction(() => {
+            ensureSessionMetaRow(args.db, args.sessionId);
+            let meta = loadProtectedTailMeta(args.db, args.sessionId);
+            const windowStartedAt = meta.protectedTailDrainWindowStartedAt;
+            const windowExpired =
+                windowStartedAt <= 0 ||
+                windowStartedAt > now ||
+                now - windowStartedAt >= DRAIN_WINDOW_MS;
+            if (windowExpired) {
+                // Expiry is checked before every reservation, including skipped attempts.
+                // A future timestamp is invalid wall-clock state and starts a fresh window
+                // instead of holding the session behind the limiter until that time arrives.
+                args.db
+                    .prepare(
+                        `UPDATE session_meta
+                     SET protected_tail_drain_window_started_at = ?, protected_tail_drain_tokens = 0
+                     WHERE session_id = ?`,
+                    )
+                    .run(now, args.sessionId);
+                meta = loadProtectedTailMeta(args.db, args.sessionId);
+            }
+
+            // Drain catch-up latch lifecycle (usage-driven). Enter when the session
+            // reaches the derived force band; exit once usage falls back below
+            // the safe zone, or after a self-expiry backstop. Persisted unconditionally
+            // so the next pass sees the resolved state even when we skip below.
+            const exitThreshold = emergencyDrainExitThreshold(args.executeThresholdPercentage);
+            let latchActiveSince = meta.emergencyDrainActive;
+            const { forceMaterializationPercentage } = escalationBands(
+                args.executeThresholdPercentage,
+            );
+            if (args.usagePercentage >= forceMaterializationPercentage) {
+                if (latchActiveSince <= 0) latchActiveSince = now;
+            } else if (latchActiveSince > 0) {
+                const expired = now - latchActiveSince > EMERGENCY_DRAIN_MAX_LATCH_MS;
+                if (args.usagePercentage < exitThreshold || expired) latchActiveSince = 0;
+            }
+            if (latchActiveSince !== meta.emergencyDrainActive) {
+                args.db
+                    .prepare(
+                        "UPDATE session_meta SET emergency_drain_active = ? WHERE session_id = ?",
+                    )
+                    .run(latchActiveSince, args.sessionId);
+            }
+            const latchActive = latchActiveSince > 0;
+
+            const budget = protectedTailWindowBudget(
+                args.usagePercentage,
+                args.usable,
+                args.perRunCap,
+            );
+            const remaining = Math.max(0, budget - meta.protectedTailDrainTokens);
+            let reserved = Math.min(requested, args.perRunCap, remaining);
+            let bypass = false;
+            // While emergency draining is active, reserve a chunk on every pass beyond
+            // the normal window budget unless a recent historian failure is still backing
+            // off. A future failure timestamp is ignored because it cannot represent a
+            // recent failure after the wall clock moved backward.
+            const inFailureBackoff =
+                meta.historianDrainFailureAt > 0 &&
+                meta.historianDrainFailureAt <= now &&
+                now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
+            if (reserved <= 0 && latchActive && !inFailureBackoff) {
+                reserved = Math.min(requested, args.perRunCap);
+                bypass = true;
+            }
+
+            const activeWindowStartedAt = meta.protectedTailDrainWindowStartedAt;
+            const budgetState = (spentTokens: number): ProtectedTailDrainBudgetState => ({
+                windowStartedAt: activeWindowStartedAt,
+                resetsAt: activeWindowStartedAt + DRAIN_WINDOW_MS,
+                resetInMs: Math.max(0, activeWindowStartedAt + DRAIN_WINDOW_MS - now),
+                spentTokens,
+                limitTokens: budget,
+            });
+            if (reserved <= 0) {
+                result = {
+                    ...result,
+                    budgetState: budgetState(meta.protectedTailDrainTokens),
+                };
+                return;
+            }
             args.db
                 .prepare(
                     `UPDATE session_meta
-                     SET protected_tail_drain_window_started_at = ?, protected_tail_drain_tokens = 0
-                     WHERE session_id = ?`,
-                )
-                .run(now, args.sessionId);
-            meta = loadProtectedTailMeta(args.db, args.sessionId);
-        }
-
-        // Drain catch-up latch lifecycle (usage-driven). Enter when the session
-        // reaches the derived force band; exit once usage falls back below
-        // the safe zone, or after a self-expiry backstop. Persisted unconditionally
-        // so the next pass sees the resolved state even when we skip below.
-        const exitThreshold = emergencyDrainExitThreshold(args.executeThresholdPercentage);
-        let latchActiveSince = meta.emergencyDrainActive;
-        const { forceMaterializationPercentage } = escalationBands(args.executeThresholdPercentage);
-        if (args.usagePercentage >= forceMaterializationPercentage) {
-            if (latchActiveSince <= 0) latchActiveSince = now;
-        } else if (latchActiveSince > 0) {
-            const expired = now - latchActiveSince > EMERGENCY_DRAIN_MAX_LATCH_MS;
-            if (args.usagePercentage < exitThreshold || expired) latchActiveSince = 0;
-        }
-        if (latchActiveSince !== meta.emergencyDrainActive) {
-            args.db
-                .prepare("UPDATE session_meta SET emergency_drain_active = ? WHERE session_id = ?")
-                .run(latchActiveSince, args.sessionId);
-        }
-        const latchActive = latchActiveSince > 0;
-
-        const budget = protectedTailWindowBudget(args.usagePercentage, args.usable, args.perRunCap);
-        const remaining = Math.max(0, budget - meta.protectedTailDrainTokens);
-        let reserved = Math.min(requested, args.perRunCap, remaining);
-        let bypass = false;
-        // While emergency draining is active, reserve a chunk on every pass beyond
-        // the normal window budget unless a recent historian failure is still backing
-        // off. A future failure timestamp is ignored because it cannot represent a
-        // recent failure after the wall clock moved backward.
-        const inFailureBackoff =
-            meta.historianDrainFailureAt > 0 &&
-            meta.historianDrainFailureAt <= now &&
-            now - meta.historianDrainFailureAt < EMERGENCY_DRAIN_FAILURE_BACKOFF_MS;
-        if (reserved <= 0 && latchActive && !inFailureBackoff) {
-            reserved = Math.min(requested, args.perRunCap);
-            bypass = true;
-        }
-
-        const activeWindowStartedAt = meta.protectedTailDrainWindowStartedAt;
-        const budgetState = (spentTokens: number): ProtectedTailDrainBudgetState => ({
-            windowStartedAt: activeWindowStartedAt,
-            resetsAt: activeWindowStartedAt + DRAIN_WINDOW_MS,
-            resetInMs: Math.max(0, activeWindowStartedAt + DRAIN_WINDOW_MS - now),
-            spentTokens,
-            limitTokens: budget,
-        });
-        if (reserved <= 0) {
-            result = {
-                ...result,
-                budgetState: budgetState(meta.protectedTailDrainTokens),
-            };
-            return;
-        }
-        args.db
-            .prepare(
-                `UPDATE session_meta
                  SET protected_tail_drain_tokens = COALESCE(protected_tail_drain_tokens, 0) + ?
                  WHERE session_id = ?`,
-            )
-            .run(reserved, args.sessionId);
-        result = {
-            ok: true,
-            reservedTokens: reserved,
-            overQuotaBypass: bypass,
-            reservation: { sessionId: args.sessionId, runId: args.runId, tokens: reserved },
-            budgetState: budgetState(meta.protectedTailDrainTokens + reserved),
-        };
-    })();
+                )
+                .run(reserved, args.sessionId);
+            result = {
+                ok: true,
+                reservedTokens: reserved,
+                overQuotaBypass: bypass,
+                reservation: {
+                    sessionId: args.sessionId,
+                    runId: args.runId,
+                    tokens: reserved,
+                    windowStartedAt: activeWindowStartedAt,
+                },
+                budgetState: budgetState(meta.protectedTailDrainTokens + reserved),
+            };
+        })
+        .immediate();
     return result;
 }
 
@@ -958,7 +976,7 @@ export function clearEmergencyDrainLatch(db: Database, sessionId: string): void 
         db.prepare("UPDATE session_meta SET emergency_drain_active = 0 WHERE session_id = ?").run(
             sessionId,
         );
-    })();
+    }).immediate();
 }
 
 /** Record a genuine historian drain FAILURE (model error / no output). Suppresses
@@ -970,7 +988,7 @@ export function recordHistorianDrainFailure(db: Database, sessionId: string, now
         db.prepare(
             "UPDATE session_meta SET historian_drain_failure_at = ? WHERE session_id = ?",
         ).run(ts, sessionId);
-    })();
+    }).immediate();
 }
 
 /** Clear the historian drain-failure backoff (called on a successful publish). */
@@ -980,9 +998,16 @@ export function clearHistorianDrainFailure(db: Database, sessionId: string): voi
         db.prepare(
             "UPDATE session_meta SET historian_drain_failure_at = 0 WHERE session_id = ?",
         ).run(sessionId);
-    })();
+    }).immediate();
 }
 
+/**
+ * Give back the tokens of a run that did not spend them. The refund applies
+ * only while the window the tokens were charged to is still the current one:
+ * once the window has rolled over its counter already started again from zero,
+ * and subtracting the old reservation would hand a later run budget it never
+ * had.
+ */
 export function rollbackProtectedTailDrainReservation(
     db: Database,
     reservation: ProtectedTailDrainReservation | null,
@@ -993,9 +1018,9 @@ export function rollbackProtectedTailDrainReservation(
         db.prepare(
             `UPDATE session_meta
              SET protected_tail_drain_tokens = MAX(0, COALESCE(protected_tail_drain_tokens, 0) - ?)
-             WHERE session_id = ?`,
-        ).run(reservation.tokens, reservation.sessionId);
-    })();
+             WHERE session_id = ? AND protected_tail_drain_window_started_at = ?`,
+        ).run(reservation.tokens, reservation.sessionId, reservation.windowStartedAt);
+    }).immediate();
 }
 
 export function getPersistedReasoningWatermark(db: Database, sessionId: string): number {
@@ -1066,7 +1091,7 @@ export function setEmergencyDropSample(db: Database, sessionId: string, inputSam
         db.prepare(
             "UPDATE session_meta SET last_emergency_input_sample = ? WHERE session_id = ?",
         ).run(Math.max(0, Math.round(inputSample)), sessionId);
-    })();
+    }).immediate();
 }
 
 export function clearEmergencyDropSample(db: Database, sessionId: string): void {
@@ -1075,7 +1100,7 @@ export function clearEmergencyDropSample(db: Database, sessionId: string): void 
         db.prepare(
             "UPDATE session_meta SET last_emergency_input_sample = 0 WHERE session_id = ?",
         ).run(sessionId);
-    })();
+    }).immediate();
 }
 
 // ---- Channel 1 (in-turn tool-output ctx_reduce nudge) cadence + band state ----
@@ -1198,7 +1223,7 @@ export function setLastNudgeUndropped(db: Database, sessionId: string, value: nu
             Math.max(0, Math.round(value)),
             sessionId,
         );
-    })();
+    }).immediate();
 }
 
 export function getChannel1NudgeState(
@@ -1224,7 +1249,7 @@ export function setChannel1NudgeState(
             serializeChannel1NudgeState(value),
             sessionId,
         );
-    })();
+    }).immediate();
 }
 
 /** Record compliance without guessing U from the stale pre-drop baseline. */
@@ -1232,21 +1257,23 @@ export function markChannel1PostReduceGracePending(
     db: Database,
     sessionId: string,
 ): PersistedChannel1NudgeState {
-    return db.transaction(() => {
-        ensureSessionMetaRow(db, sessionId);
-        const current = getChannel1NudgeState(db, sessionId);
-        const next: PersistedChannel1NudgeState = {
-            level: current.level,
-            ordinal: current.ordinal,
-            postReduceGracePending: true,
-            postReduceGracePreLevel: current.level,
-        };
-        db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
-            serializeChannel1NudgeState(next),
-            sessionId,
-        );
-        return next;
-    })();
+    return db
+        .transaction(() => {
+            ensureSessionMetaRow(db, sessionId);
+            const current = getChannel1NudgeState(db, sessionId);
+            const next: PersistedChannel1NudgeState = {
+                level: current.level,
+                ordinal: current.ordinal,
+                postReduceGracePending: true,
+                postReduceGracePreLevel: current.level,
+            };
+            db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
+                serializeChannel1NudgeState(next),
+                sessionId,
+            );
+            return next;
+        })
+        .immediate();
 }
 
 /** Start grace from the first U value that has already excluded queued drops. */
@@ -1255,23 +1282,25 @@ export function captureChannel1PostReduceGraceBaseline(
     sessionId: string,
     measuredUndropped: number,
 ): PersistedChannel1NudgeState {
-    return db.transaction(() => {
-        ensureSessionMetaRow(db, sessionId);
-        const current = getChannel1NudgeState(db, sessionId);
-        if (current.postReduceGracePending !== true) return current;
-        const baselineU = Math.max(0, Math.round(measuredUndropped));
-        const next: PersistedChannel1NudgeState = {
-            level: current.level,
-            ordinal: current.ordinal,
-            postReduceGraceBaselineU: baselineU,
-            postReduceGracePreLevel: current.postReduceGracePreLevel ?? current.level,
-        };
-        db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
-            serializeChannel1NudgeState(next),
-            sessionId,
-        );
-        return next;
-    })();
+    return db
+        .transaction(() => {
+            ensureSessionMetaRow(db, sessionId);
+            const current = getChannel1NudgeState(db, sessionId);
+            if (current.postReduceGracePending !== true) return current;
+            const baselineU = Math.max(0, Math.round(measuredUndropped));
+            const next: PersistedChannel1NudgeState = {
+                level: current.level,
+                ordinal: current.ordinal,
+                postReduceGraceBaselineU: baselineU,
+                postReduceGracePreLevel: current.postReduceGracePreLevel ?? current.level,
+            };
+            db.prepare("UPDATE session_meta SET last_nudge_level = ? WHERE session_id = ?").run(
+                serializeChannel1NudgeState(next),
+                sessionId,
+            );
+            return next;
+        })
+        .immediate();
 }
 
 export function resetLastNudgeCycle(db: Database, sessionId: string): void {
@@ -1280,7 +1309,7 @@ export function resetLastNudgeCycle(db: Database, sessionId: string): void {
         db.prepare(
             "UPDATE session_meta SET last_nudge_undropped = 0, last_nudge_level = ? WHERE session_id = ?",
         ).run(serializeChannel1NudgeState(EMPTY_CHANNEL1_NUDGE_STATE), sessionId);
-    })();
+    }).immediate();
 }
 
 /**
@@ -1310,7 +1339,7 @@ export function resetLastNudgeCycleIfTailShrank(
                 Math.max(0, Math.round(measuredUndropped)),
             );
         changed = (result.changes ?? 0) > 0;
-    })();
+    }).immediate();
     return changed;
 }
 
@@ -1410,7 +1439,7 @@ export function setChannel2NudgeState(
         db.prepare(
             "UPDATE session_meta SET channel2_nudge_state = ?, channel2_nudge_claimed_at = ?, channel2_nudge_claim_token = '' WHERE session_id = ?",
         ).run(state, claimedAt, sessionId);
-    })();
+    }).immediate();
 }
 
 /**
@@ -1434,7 +1463,7 @@ export function casChannel2NudgeState(
             )
             .run(to, claimedAt, sessionId, from);
         changed = (result.changes ?? 0) > 0;
-    })();
+    }).immediate();
     return changed;
 }
 
@@ -1452,7 +1481,7 @@ export function claimChannel2NudgeState(
             )
             .run(Date.now(), claimToken, sessionId);
         changed = (result.changes ?? 0) > 0;
-    })();
+    }).immediate();
     return changed;
 }
 
@@ -1473,7 +1502,7 @@ export function casChannel2NudgeClaim(
             )
             .run(to, claimedAt, nextClaimToken, sessionId, claimToken);
         changed = (result.changes ?? 0) > 0;
-    })();
+    }).immediate();
     return changed;
 }
 
@@ -1512,7 +1541,7 @@ export function setPersistedNoteNudgeTrigger(
         db.prepare(
             "UPDATE session_meta SET note_nudge_trigger_pending = 1, note_nudge_trigger_message_id = ? WHERE session_id = ?",
         ).run(triggerMessageId, sessionId);
-    })();
+    }).immediate();
 }
 
 export function setPersistedNoteNudgeTriggerMessageId(
@@ -1525,7 +1554,7 @@ export function setPersistedNoteNudgeTriggerMessageId(
         db.prepare(
             "UPDATE session_meta SET note_nudge_trigger_message_id = ? WHERE session_id = ?",
         ).run(triggerMessageId, sessionId);
-    })();
+    }).immediate();
 }
 
 export function clearPersistedNoteNudge(db: Database, sessionId: string): void {
@@ -1852,7 +1881,7 @@ export function setPersistedTodoSyntheticAnchor(
         db.prepare(
             "UPDATE session_meta SET todo_synthetic_call_id = ?, todo_synthetic_anchor_message_id = ?, todo_synthetic_state_json = ? WHERE session_id = ?",
         ).run(callId, messageId, stateJson, sessionId);
-    })();
+    }).immediate();
 }
 
 export function clearPersistedTodoSyntheticAnchor(db: Database, sessionId: string): void {
@@ -1894,7 +1923,7 @@ export function setNoteLastReadAt(db: Database, sessionId: string, at = Date.now
             at,
             sessionId,
         );
-    })();
+    }).immediate();
 }
 
 export function getHistorianFailureState(
@@ -1925,7 +1954,7 @@ export function incrementHistorianFailure(db: Database, sessionId: string, error
         // Normalize error to single line for log greppability
         const reason = error.replace(/\s+/g, " ").trim().slice(0, 300);
         sessionLog(sessionId, `historian failure recorded: count=${nextCount} reason="${reason}"`);
-    })();
+    }).immediate();
     return nextCount;
 }
 
@@ -1935,7 +1964,7 @@ export function clearHistorianFailureState(db: Database, sessionId: string): voi
         db.prepare(
             "UPDATE session_meta SET historian_failure_count = 0, historian_last_error = NULL, historian_last_failure_at = NULL WHERE session_id = ?",
         ).run(sessionId);
-    })();
+    }).immediate();
 }
 
 // ── Overflow detection state ──
@@ -2097,6 +2126,7 @@ export function recordOverflowDetected(
     modelKey?: string | null,
     origin: EmergencyRecoveryOrigin = "provider_overflow",
     provenance: ContextLimitProvenance = "unknown",
+    reportedInputTokens?: number,
 ): void {
     // Arm before the durable write so an unreadable or failed write remains fail-closed.
     emergencyRecoveryArmedSessions.add(sessionId);
@@ -2107,8 +2137,12 @@ export function recordOverflowDetected(
     db.transaction(() => {
         ensureSessionMetaRow(db, sessionId);
         const prior = db
-            .prepare("SELECT needs_emergency_recovery FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { needs_emergency_recovery?: number } | undefined;
+            .prepare(
+                "SELECT needs_emergency_recovery, detected_context_limit FROM session_meta WHERE session_id = ?",
+            )
+            .get(sessionId) as
+            | { needs_emergency_recovery?: number; detected_context_limit?: number }
+            | undefined;
         if (
             origin === "provider_overflow" &&
             typeof prior?.needs_emergency_recovery === "number" &&
@@ -2131,7 +2165,23 @@ export function recordOverflowDetected(
                 "UPDATE session_meta SET needs_emergency_recovery = 1, emergency_recovery_origin = ?, observed_safe_input_tokens = 0, cache_alert_sent = 0 WHERE session_id = ?",
             ).run(origin, sessionId);
         }
-    })();
+        if (
+            origin === "provider_overflow" &&
+            typeof reportedInputTokens === "number" &&
+            Number.isFinite(reportedInputTokens) &&
+            reportedInputTokens > 0
+        ) {
+            const effectiveLimit =
+                typeof reportedLimit === "number" && reportedLimit > 0
+                    ? reportedLimit
+                    : (prior?.detected_context_limit ?? 0);
+            const percentage =
+                effectiveLimit > 0 ? (reportedInputTokens / effectiveLimit) * 100 : 100;
+            db.prepare(
+                "UPDATE session_meta SET last_input_tokens = ?, last_context_percentage = MAX(last_context_percentage, ?) WHERE session_id = ?",
+            ).run(reportedInputTokens, percentage, sessionId);
+        }
+    }).immediate();
 }
 
 /**
@@ -2158,7 +2208,7 @@ export function recordDetectedContextLimit(
             normalizeContextLimitProvenance(provenance),
             sessionId,
         );
-    })();
+    }).immediate();
 }
 
 /** Clear the recovery flag. Keeps the detected limit (valuable even after recovery). */
@@ -2174,7 +2224,7 @@ export function clearEmergencyRecovery(db: Database, sessionId: string): void {
                 "UPDATE session_meta SET needs_emergency_recovery = 0, emergency_recovery_origin = '' WHERE session_id = ?",
             ).run(sessionId);
         }
-    })();
+    }).immediate();
     // Clear only after the durable clear succeeds.
     emergencyRecoveryArmedSessions.delete(sessionId);
     emergencyRecoveryArmedAtBySession.delete(sessionId);
@@ -2192,7 +2242,7 @@ export function clearDetectedContextLimit(db: Database, sessionId: string): void
         db.prepare(
             "UPDATE session_meta SET detected_context_limit = 0, detected_context_limit_model_key = NULL, detected_context_limit_provenance = 'unknown' WHERE session_id = ?",
         ).run(sessionId);
-    })();
+    }).immediate();
 }
 
 // ── Compaction marker state ──
@@ -2283,7 +2333,7 @@ export function setPersistedCompactionMarkerState(
         db.prepare(
             "UPDATE session_meta SET compaction_marker_state = ?, compaction_marker_target_end_message_id = ? WHERE session_id = ?",
         ).run(json, state?.targetEndMessageId ?? null, sessionId);
-    })();
+    }).immediate();
 }
 
 /** Read the last wire marker retained by a logical clear, including across restarts. */
@@ -2319,12 +2369,14 @@ export function retireDeferredClearedCompactionMarkerState(db: Database, session
  */
 export const MAX_STRIPPED_PLACEHOLDER_IDS = 4096;
 
-interface StrippedPlaceholderState {
+export interface StrippedPlaceholderState {
     ids: string[];
     hiddenSeamIds: string[];
 }
 
-function parseStrippedPlaceholderState(raw: string | null | undefined): StrippedPlaceholderState {
+export function parseStrippedPlaceholderState(
+    raw: string | null | undefined,
+): StrippedPlaceholderState {
     if (!raw || raw.length === 0) return { ids: [], hiddenSeamIds: [] };
     try {
         const parsed = JSON.parse(raw) as unknown;
@@ -2365,7 +2417,7 @@ function parseStrippedBlob(raw: string | null | undefined): string[] {
     }
 }
 
-function serializeStrippedPlaceholderState(state: StrippedPlaceholderState): string {
+export function serializeStrippedPlaceholderState(state: StrippedPlaceholderState): string {
     if (state.ids.length === 0) return "";
     if (state.hiddenSeamIds.length === 0) return JSON.stringify(state.ids);
     return JSON.stringify(state);
@@ -2461,10 +2513,24 @@ export function removeStrippedPlaceholderId(
     return true;
 }
 
-// ── State for retrying Fable 5.1 requests after a thinking-prefix binding rejection ──
+// ── State for recovering from a thinking-prefix binding rejection (Fable 5.1, Opus 5.5) ──
 
-export const NEWEST_REASONING_BEARING_ASSISTANT = "newest_reasoning_bearing_assistant";
+/**
+ * Armed-flag value: the next live pass strips reasoning from every assistant
+ * that still carries it. Any other non-empty stored value (an older build wrote
+ * `newest_reasoning_bearing_assistant` or a message id) is read the same way,
+ * so no migration is needed.
+ */
+export const THINKING_BINDING_RECOVERY_ALL_ASSISTANTS = "all_reasoning_bearing_assistants";
 export const THINKING_BINDING_RECOVERY_FROZEN_PREFIX = "binding_mismatch:";
+/**
+ * Ledger control entry (not a message id) recording that a Pi session strips
+ * its binding-mismatch thinking after the context pass's pipeline stages ran.
+ * Sessions whose strips were written by earlier builds, which stripped before
+ * the stages, keep that behaviour until a pass allowed to change served bytes
+ * writes this entry.
+ */
+export const THINKING_BINDING_STRIP_ORDER_END_MARKER = "binding_mismatch_order:end";
 
 export function thinkingBindingRecoveryFrozenId(messageId: string): string {
     return `${THINKING_BINDING_RECOVERY_FROZEN_PREFIX}${messageId}`;
@@ -2479,31 +2545,16 @@ export function getThinkingBindingRecoveryTarget(db: Database, sessionId: string
 }
 
 /**
- * Persist the provider-supplied assistant id. When no id is available, store a
- * marker that makes the next live transform select the newest assistant that
- * still contains reasoning.
+ * Arm recovery after a binding 400. Anthropic invalidates every signed thinking
+ * block after the first changed prefix position, and its error names only a
+ * provider request-array path, so the next live pass strips reasoning from all
+ * assistants still carrying it. That converges after one failed request.
  */
-export function armThinkingBindingRecovery(
-    db: Database,
-    sessionId: string,
-    messageId?: string,
-): void {
+export function armThinkingBindingRecovery(db: Database, sessionId: string): void {
     ensureSessionMetaRow(db, sessionId);
-    const target =
-        typeof messageId === "string" && messageId.length > 0
-            ? messageId
-            : NEWEST_REASONING_BEARING_ASSISTANT;
-    if (target === NEWEST_REASONING_BEARING_ASSISTANT) {
-        // A later session.error without an id must not replace a more precise id
-        // already captured from message.updated or the provider error body.
-        db.prepare(
-            "UPDATE session_meta SET thinking_binding_recovery_target = ? WHERE session_id = ? AND COALESCE(thinking_binding_recovery_target, '') = ''",
-        ).run(target, sessionId);
-        return;
-    }
     db.prepare(
         "UPDATE session_meta SET thinking_binding_recovery_target = ? WHERE session_id = ?",
-    ).run(target, sessionId);
+    ).run(THINKING_BINDING_RECOVERY_ALL_ASSISTANTS, sessionId);
 }
 
 /** Clear only the flag this live pass actually applied; a concurrent re-arm wins. */
@@ -2588,17 +2639,6 @@ export function addMergedReasoningStrippedIds(
 
 // ── Trailing assistant blank decisions (frozen replay map) ──
 
-function parseTrailingBlankDecisions(
-    raw: string | null | undefined,
-): Map<string, PersistedTrailingBlankDecision> {
-    try {
-        return new Map(Object.entries(parseReplayDocument(raw, "read").trailingBlank));
-    } catch (error) {
-        if (error instanceof ReplayDocumentError) return new Map();
-        throw error;
-    }
-}
-
 /**
  * Read each assistant's replay choice. A historical choice is immutable; the live
  * newest assistant may replace its choice until a later assistant freezes it.
@@ -2606,8 +2646,10 @@ function parseTrailingBlankDecisions(
 export function getTrailingBlankDecisions(
     db: Database,
     sessionId: string,
+    messageIds?: Iterable<string>,
 ): Map<string, PersistedTrailingBlankDecision> {
     try {
+        if (messageIds) return readReplayTrailingBlankSubset(db, sessionId, messageIds);
         return new Map(Object.entries(readReplayDocument(db, sessionId, "read").trailingBlank));
     } catch (error) {
         if (error instanceof ReplayDocumentError) return new Map();
@@ -2632,29 +2674,30 @@ export function addTrailingBlankDecisions(
         if (id.length === 0 || !isPersistedTrailingBlankDecision(decision)) return false;
     }
 
-    return updateReplayDocument(db, sessionId, (doc) => {
-        let changed = false;
-        for (const [id, decision] of add) {
-            const currentDecision = Object.hasOwn(doc.trailingBlank, id)
-                ? doc.trailingBlank[id]
-                : undefined;
-            if (
-                currentDecision === undefined ||
-                (id === options?.overwriteMessageId &&
-                    currentDecision !== decision &&
-                    currentDecision !== "strip")
-            ) {
-                Object.defineProperty(doc.trailingBlank, id, {
-                    value: decision,
-                    enumerable: true,
-                    writable: true,
-                    configurable: true,
-                });
-                changed = true;
+    return updateTrailingBlankDecisions(
+        db,
+        sessionId,
+        add.map(([id]) => id),
+        (current) => {
+            // Apply the additions in order, so a repeated id sees the decision an
+            // earlier entry in the same batch just recorded.
+            const working = new Map(current);
+            const changed = new Map<string, PersistedTrailingBlankDecision>();
+            for (const [id, decision] of add) {
+                const currentDecision = working.get(id);
+                if (
+                    currentDecision === undefined ||
+                    (id === options?.overwriteMessageId &&
+                        currentDecision !== decision &&
+                        currentDecision !== "strip")
+                ) {
+                    working.set(id, decision);
+                    changed.set(id, decision);
+                }
             }
-        }
-        return changed;
-    });
+            return changed;
+        },
+    );
 }
 
 /**
@@ -2674,18 +2717,17 @@ export function demoteTrailingBlankKeepDecisions(
     if (ids.size === 0) return [];
 
     let demotedIds: string[] = [];
-    const persisted = updateReplayDocument(db, sessionId, (doc) => {
+    const persisted = updateTrailingBlankDecisions(db, sessionId, ids, (current) => {
         demotedIds = [];
+        const changed = new Map<string, PersistedTrailingBlankDecision>();
         for (const id of ids) {
-            const decision = Object.hasOwn(doc.trailingBlank, id)
-                ? doc.trailingBlank[id]
-                : undefined;
+            const decision = current.get(id);
             if (decision === "keep" || decision?.startsWith("keep:") === true) {
-                doc.trailingBlank[id] = "strip";
+                changed.set(id, "strip");
                 demotedIds.push(id);
             }
         }
-        return demotedIds.length > 0;
+        return changed;
     });
     return persisted ? demotedIds : null;
 }
@@ -2830,6 +2872,12 @@ export interface PendingCompactionMarker {
     endMessageId: string;
     /** Unix ms of publication. Diagnostic only; used by doctor stale-pending checks. */
     publishedAt: number;
+    /** Consecutive host-store injection failures for this target. */
+    injectAttempts?: number;
+    /** Most recent host-store injection error. */
+    lastInjectError?: string | null;
+    /** Unix ms of the first injection failure for this target. */
+    firstInjectFailedAt?: number | null;
 }
 
 /** Type guard for a parsed PendingCompactionMarker payload. */
@@ -2839,7 +2887,17 @@ function isPendingCompactionMarker(value: unknown): value is PendingCompactionMa
         value !== null &&
         typeof (value as { ordinal?: unknown }).ordinal === "number" &&
         typeof (value as { endMessageId?: unknown }).endMessageId === "string" &&
-        typeof (value as { publishedAt?: unknown }).publishedAt === "number"
+        typeof (value as { publishedAt?: unknown }).publishedAt === "number" &&
+        ((value as { injectAttempts?: unknown }).injectAttempts === undefined ||
+            (typeof (value as { injectAttempts?: unknown }).injectAttempts === "number" &&
+                Number.isSafeInteger((value as { injectAttempts: number }).injectAttempts) &&
+                (value as { injectAttempts: number }).injectAttempts >= 0)) &&
+        ((value as { lastInjectError?: unknown }).lastInjectError === undefined ||
+            (value as { lastInjectError?: unknown }).lastInjectError === null ||
+            typeof (value as { lastInjectError?: unknown }).lastInjectError === "string") &&
+        ((value as { firstInjectFailedAt?: unknown }).firstInjectFailedAt === undefined ||
+            (value as { firstInjectFailedAt?: unknown }).firstInjectFailedAt === null ||
+            typeof (value as { firstInjectFailedAt?: unknown }).firstInjectFailedAt === "number")
     );
 }
 
@@ -2865,6 +2923,35 @@ export function getPendingCompactionMarkerState(
         .prepare("SELECT pending_compaction_marker_state FROM session_meta WHERE session_id = ?")
         .get(sessionId) as { pending_compaction_marker_state?: string | null } | null;
     return parsePendingCompactionMarkerState(row?.pending_compaction_marker_state);
+}
+
+export interface CompactionMarkerHealth {
+    code: "MC-C11" | null;
+    attempts: number;
+    lastError: string | null;
+    pendingSinceMs: number | null;
+}
+
+const COMPACTION_MARKER_ATTEMPT_BUDGET = 3;
+const COMPACTION_MARKER_PENDING_BUDGET_MS = 5 * 60_000;
+
+export function getCompactionMarkerHealth(
+    db: Database,
+    sessionId: string,
+    now = Date.now(),
+): CompactionMarkerHealth {
+    const pending = getPendingCompactionMarkerState(db, sessionId);
+    const attempts = pending?.injectAttempts ?? 0;
+    const firstFailedAt = pending?.firstInjectFailedAt ?? null;
+    const exhausted =
+        attempts >= COMPACTION_MARKER_ATTEMPT_BUDGET ||
+        (firstFailedAt !== null && now - firstFailedAt >= COMPACTION_MARKER_PENDING_BUDGET_MS);
+    return {
+        code: exhausted ? "MC-C11" : null,
+        attempts,
+        lastError: pending?.lastInjectError ?? null,
+        pendingSinceMs: firstFailedAt,
+    };
 }
 
 /** Frozen rendering decisions consumed by one postprocess pass. */
@@ -2953,7 +3040,13 @@ export function loadPostprocessReplaySnapshot(
             thinkingBindingRecoveryTarget.length > 0
                 ? thinkingBindingRecoveryTarget
                 : null,
-        trailingBlankDecisions: parseTrailingBlankDecisions(row?.trailing_blank_decisions),
+        // The decisions are rows of their own (storage-replay-document.ts),
+        // overlaid on whatever the column read above still carries.
+        trailingBlankDecisions: readAllTrailingBlankDecisions(
+            db,
+            sessionId,
+            row?.trailing_blank_decisions,
+        ),
     };
 }
 
@@ -2987,6 +3080,21 @@ export function setPendingCompactionMarkerState(
  * B overwrites with blob_Y before A's CAS runs, A's CAS fails and B's
  * pending stays intact for B's own next consuming pass.
  */
+export function replacePendingCompactionMarkerStateIf(
+    db: Database,
+    sessionId: string,
+    expected: PendingCompactionMarker,
+    replacement: PendingCompactionMarker,
+): boolean {
+    const result = db
+        .prepare(
+            `UPDATE session_meta SET pending_compaction_marker_state = ?
+             WHERE session_id = ? AND pending_compaction_marker_state = ?`,
+        )
+        .run(stableStringify(replacement), sessionId, stableStringify(expected));
+    return result.changes > 0;
+}
+
 export function clearPendingCompactionMarkerStateIf(
     db: Database,
     sessionId: string,

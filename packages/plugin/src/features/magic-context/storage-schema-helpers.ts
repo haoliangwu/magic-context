@@ -1,4 +1,48 @@
-import type { Database } from "../../shared/sqlite";
+import type { Database, Statement } from "../../shared/sqlite";
+import { isKnownAutocommit } from "../../shared/sqlite-helpers";
+
+interface ColumnCache {
+    version: number;
+    stamp: Statement;
+    tables: Map<string, Set<string>>;
+}
+const columnCaches = new WeakMap<Database, ColumnCache>();
+
+function readColumnNames(db: Database, table: string): Set<string> {
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+    return new Set(rows.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])));
+}
+
+function columnNames(db: Database, table: string): ReadonlySet<string> {
+    if (!isKnownAutocommit(db)) {
+        // Never retain an uncommitted schema. Rollback can reuse its schema_version
+        // for a different subsequent ALTER, so a version alone cannot fence it.
+        columnCaches.delete(db);
+        return readColumnNames(db, table);
+    }
+    let cache = columnCaches.get(db);
+    if (!cache) {
+        cache = { version: -1, stamp: db.prepare("PRAGMA schema_version"), tables: new Map() };
+        columnCaches.set(db, cache);
+    }
+    const [{ schema_version: version }] = cache.stamp.all() as { schema_version: number }[];
+    if (version !== cache.version) {
+        cache.tables.clear();
+        cache.version = version;
+    }
+    let columns = cache.tables.get(table);
+    if (!columns) {
+        columns = readColumnNames(db, table);
+        cache.tables.set(table, columns);
+    }
+    return columns;
+}
+
+/** Read-only schema discovery for projections that also accept older tables. */
+export function getTableColumnNames(db: Database, table: string): ReadonlySet<string> {
+    if (!/^[a-z][a-z0-9_]*$/.test(table)) throw new Error(`Unsafe schema identifier: ${table}`);
+    return columnNames(db, table);
+}
 
 /**
  * Schema-mutation helpers shared by storage-db (fresh-DB init) and migrations
@@ -24,13 +68,13 @@ export function ensureColumn(
     ) {
         throw new Error(`Unsafe schema identifier: ${table}.${column} ${definition}`);
     }
-    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
-    if (rows.some((row) => row.name === column)) {
+    if (columnNames(db, table).has(column)) {
         return;
     }
     try {
         db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     } catch (err) {
+        columnCaches.delete(db);
         const recheck = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
         if (recheck.some((row) => row.name === column)) {
             return;

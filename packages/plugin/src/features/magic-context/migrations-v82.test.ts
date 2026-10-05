@@ -37,7 +37,6 @@ describe("migration v82: memory mapping origin", () => {
             runMigrations(db);
 
             expect(columnNames(db, "memory_verifications")).toContain("mapping_origin");
-            expect(LATEST_SUPPORTED_VERSION).toBe(85);
             expect(LATEST_SUPPORTED_VERSION).toBe(LATEST_MIGRATION_VERSION);
         } finally {
             closeQuietly(db);

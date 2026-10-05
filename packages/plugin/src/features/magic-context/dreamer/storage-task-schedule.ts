@@ -1,4 +1,5 @@
 import type { Database } from "../../../shared/sqlite";
+import type { DreamTaskFailureState } from "./task-registry";
 
 /**
  * Per-task dreamer scheduling state (Dreamer v2). One row per (project, task):
@@ -103,6 +104,41 @@ export function getTaskScheduleStatesForProject(
 }
 
 /**
+ * Every dreamer task whose last scheduled run failed, in task order.
+ *
+ * The scheduler has always written `last_error`, but only the dashboard displayed it, so
+ * a task could fail on its schedule for weeks while the only in-session signal was a
+ * backlog count that never fell. The status surfaces read this to say so out loud.
+ */
+export function getFailingDreamTasks(db: Database, projectPath: string): DreamTaskFailureState[] {
+    return db
+        .prepare<[string], RawRow>(
+            `SELECT ${SELECT_COLUMNS} FROM task_schedule_state
+              WHERE project_path = ? AND last_status = 'failed'
+                AND last_error IS NOT NULL AND last_error <> ''
+              ORDER BY task`,
+        )
+        .all(projectPath)
+        .map((row) => ({
+            task: row.task,
+            error: row.last_error ?? "",
+            lastSucceededAt: row.last_run_at,
+            retryCount: row.retry_count ?? 0,
+        }));
+}
+
+/** Explicit unavailable/disabled outcomes, not activity-gate skips with no reason. */
+export function getSkippedDreamTasks(db: Database, projectPath: string): string[] {
+    return db
+        .prepare<[string], { task: string; last_error: string }>(`
+        SELECT task, last_error FROM task_schedule_state
+        WHERE project_path = ? AND last_status = 'skipped' AND last_error IS NOT NULL AND last_error <> ''
+        ORDER BY task`)
+        .all(projectPath)
+        .map((row) => `${row.task}: ${row.last_error}`);
+}
+
+/**
  * Most recent successful Dreamer task run for a project, as an epoch-ms value,
  * or null if no task has run yet. `last_run_at` advances only on task success
  * (see the scheduler), so this is "last successful dreamer activity", the
@@ -145,11 +181,16 @@ export function pruneNonCanonicalTaskRows(
 }
 
 /**
- * Delete ALL task_schedule_state rows for a project. Used to GC a fully-orphaned
- * project — a `dir:<md5>` identity whose backing directory is gone (e.g. a
- * finalized mason worktree). NEVER call this for a `git:` identity: that is
- * shared across worktrees/clones of the same repo, so a single dead worktree
- * must not delete the shared project's schedule. Returns rows deleted.
+ * Delete ALL task_schedule_state rows for a project. Returns rows deleted.
+ *
+ * Callers:
+ *  - the dream timer GCs a `dir:<md5>` identity whose backing directory is gone
+ *    (e.g. a finalized mason worktree). A dead directory must NOT trigger this
+ *    for a `git:` identity: that is shared across worktrees/clones of the same
+ *    repo, so one dead worktree says nothing about the others.
+ *  - the idle-identity prune removes an identity with no memories and nothing
+ *    to do. That decision is about the identity itself, so it applies to
+ *    `git:` too.
  */
 export function deleteTaskScheduleRowsForProject(db: Database, projectPath: string): number {
     const result = db

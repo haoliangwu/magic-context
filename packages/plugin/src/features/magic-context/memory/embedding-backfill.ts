@@ -1,3 +1,4 @@
+import { isEmbeddingHostBusy } from "../../../shared/embedding-activity";
 import { log } from "../../../shared/logger";
 import type { Database } from "../../../shared/sqlite";
 import { embedBatchForProject, getProjectEmbeddingSnapshot } from "./embedding";
@@ -13,6 +14,7 @@ export async function ensureMemoryEmbeddings(args: {
     memories: Memory[];
     existingEmbeddings: Map<number, StoredMemoryEmbedding>;
 }): Promise<Map<number, StoredMemoryEmbedding>> {
+    if (isEmbeddingHostBusy()) return args.existingEmbeddings;
     const snapshot = getProjectEmbeddingSnapshot(args.projectIdentity);
     if (!snapshot?.enabled) {
         return args.existingEmbeddings;
@@ -37,32 +39,34 @@ export async function ensureMemoryEmbeddings(args: {
         // Stage results before committing — only merge into the in-memory cache after
         // the transaction succeeds, so a rollback doesn't leave stale Map entries.
         const staged = new Map<number, StoredMemoryEmbedding>();
-        args.db.transaction(() => {
-            for (const [index, memory] of missingMemories.entries()) {
-                const embedding = result.vectors[index];
-                if (!embedding) {
-                    continue;
-                }
+        args.db
+            .transaction(() => {
+                for (const [index, memory] of missingMemories.entries()) {
+                    const embedding = result.vectors[index];
+                    if (!embedding) {
+                        continue;
+                    }
 
-                // The vector was computed from the content this memory had when the
-                // batch was assembled. If the memory was edited while the provider
-                // call was in flight, its normalized_hash no longer matches and the
-                // guarded save discards the stale vector — leaving the row unembedded
-                // so the proactive drain re-embeds the current content next round.
-                // A skipped memory must not enter the cache either: a stale cached
-                // vector would score searches until the cache is rebuilt.
-                const saved = saveEmbeddingIfHashMatches(
-                    args.db,
-                    memory.id,
-                    embedding,
-                    result.modelId,
-                    memory.normalizedHash,
-                );
-                if (saved) {
-                    staged.set(memory.id, { embedding, modelId: result.modelId });
+                    // The vector was computed from the content this memory had when the
+                    // batch was assembled. If the memory was edited while the provider
+                    // call was in flight, its normalized_hash no longer matches and the
+                    // guarded save discards the stale vector — leaving the row unembedded
+                    // so the proactive drain re-embeds the current content next round.
+                    // A skipped memory must not enter the cache either: a stale cached
+                    // vector would score searches until the cache is rebuilt.
+                    const saved = saveEmbeddingIfHashMatches(
+                        args.db,
+                        memory.id,
+                        embedding,
+                        result.modelId,
+                        memory.normalizedHash,
+                    );
+                    if (saved) {
+                        staged.set(memory.id, { embedding, modelId: result.modelId });
+                    }
                 }
-            }
-        })();
+            })
+            .immediate();
 
         const currentSnapshot = getProjectEmbeddingSnapshot(args.projectIdentity);
         if (!currentSnapshot || currentSnapshot.generation !== result.generation) {

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import type { PromptIO, PromptSpinner, SelectOption } from "../lib/prompts";
 import { __test, type OmpSetupDeps } from "./setup-omp";
 
@@ -51,7 +52,7 @@ afterEach(() => {
 });
 
 function makeVirtualOmp(options: { failMemorySet?: boolean; pluginEnabled?: boolean } = {}) {
-    const cwd = mkdtempSync(join(tmpdir(), "mc-omp-setup-"));
+    const cwd = createTestTempDirFromPath(join(tmpdir(), "mc-omp-setup-"));
     roots.push(cwd);
     const binaryPath = "/virtual/bin/omp";
     const state = { compaction: true, memory: "mnemopi" };
@@ -168,7 +169,7 @@ describe("OMP setup transaction", () => {
 
     it("refuses global setting writes when a project OMP config is active", async () => {
         const { binaryPath, commands, host, state } = makeVirtualOmp();
-        const cwd = mkdtempSync(join(tmpdir(), "mc-omp-project-"));
+        const cwd = createTestTempDirFromPath(join(tmpdir(), "mc-omp-project-"));
         roots.push(cwd);
         mkdirSync(join(cwd, ".omp"), { recursive: true });
         writeFileSync(join(cwd, ".omp", "config.yml"), "compaction:\n  enabled: true\n");
@@ -190,7 +191,7 @@ describe("OMP setup transaction", () => {
 
     it("refuses global setting writes when PI_CONFIG_FILES overlays are active", async () => {
         const { binaryPath, commands, host, state } = makeVirtualOmp();
-        const cwd = mkdtempSync(join(tmpdir(), "mc-omp-overlay-"));
+        const cwd = createTestTempDirFromPath(join(tmpdir(), "mc-omp-overlay-"));
         roots.push(cwd);
         process.env.PI_CONFIG_FILES = "settings/omp.yml";
         const prompts = new MockPrompts([true, true]);

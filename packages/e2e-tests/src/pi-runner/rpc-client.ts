@@ -12,6 +12,8 @@
  * they are valid inside JSON strings.
  */
 
+import { cleanupE2ETempDir } from "../temp-dir";
+
 import { type ChildProcess, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -207,6 +209,11 @@ export interface PiState extends Record<string, unknown> {
 export type PiMessage = Record<string, unknown>;
 export type PiSessionStats = Record<string, unknown>;
 
+const livePiChildren = new Set<ChildProcess>();
+process.prependOnceListener("exit", () => {
+  for (const child of livePiChildren) child.kill("SIGKILL");
+});
+
 export class PiRpcClient {
   readonly env: PiIsolatedEnv;
   readonly protocol = new PiRpcProtocol();
@@ -216,8 +223,10 @@ export class PiRpcClient {
   private process: ChildProcess | null = null;
   private stopReadingStdout: (() => void) | null = null;
   private stderr = "";
+  private readonly ownsEnv: boolean;
 
   constructor(options: PiRpcClientOptions) {
+    this.ownsEnv = !options.env;
     this.env = options.env ?? createPiIsolatedEnv(undefined, options.host);
     this.options = { ...options, env: this.env };
     this.protocol.onEvent((event) => {
@@ -229,54 +238,66 @@ export class PiRpcClient {
     return this.extensionErrors;
   }
 
+  get pid(): number | undefined {
+    return this.process?.pid;
+  }
+
   async start(): Promise<void> {
     if (this.process) throw new Error("Pi RPC client already started");
-    writeConfigs(this.env, this.options);
+    try {
+      writeConfigs(this.env, this.options);
 
-    const host = this.options.host ?? "pi";
-    const invocation = resolvePiHostInvocation(host);
-    const discoveryArgs = host === "omp"
-      ? ["--no-skills", "--no-rules"]
-      : ["--no-skills", "--no-prompt-templates", "--no-themes"];
-    this.process = spawn(
-      invocation.command,
-      [
-        ...invocation.prefixArgs,
-        "--mode",
-        "rpc",
-        "--no-extensions",
-        ...(this.options.extensionsBeforeMagicContext ?? []).flatMap((extension) => [
+      const host = this.options.host ?? "pi";
+      const invocation = resolvePiHostInvocation(host);
+      const discoveryArgs = host === "omp"
+        ? ["--no-skills", "--no-rules"]
+        : ["--no-skills", "--no-prompt-templates", "--no-themes"];
+      this.process = spawn(
+        invocation.command,
+        [
+          ...invocation.prefixArgs,
+          "--mode",
+          "rpc",
+          "--no-extensions",
+          ...(this.options.extensionsBeforeMagicContext ?? []).flatMap((extension) => [
+            "--extension",
+            extension,
+          ]),
           "--extension",
-          extension,
-        ]),
-        "--extension",
-        this.env.pluginDir,
-        "--extension",
-        PI_RELOAD_EXTENSION,
-        ...discoveryArgs,
-        "--model",
-        host === "omp" ? "mock/mock-model" : "anthropic/claude-haiku-4-5",
-        "--api-key",
-        "test-key-not-real",
-      ],
-      { cwd: this.env.workdir, env: childEnv(this.env), stdio: ["pipe", "pipe", "pipe"] },
-    );
-
-    this.process.stderr?.on("data", (chunk: Buffer) => {
-      this.stderr += chunk.toString();
-    });
-    this.stopReadingStdout = attachStrictJsonlReader(this.process.stdout!, (line) => {
-      this.protocol.dispatchLine(line);
-    });
-    this.process.once("exit", (code, signal) => {
-      this.protocol.rejectPending(
-        new Error(`Pi RPC process exited with code ${code ?? "null"} signal ${signal ?? "null"}\n${this.stderr}`),
+          this.env.pluginDir,
+          "--extension",
+          PI_RELOAD_EXTENSION,
+          ...discoveryArgs,
+          "--model",
+          host === "omp" ? "mock/mock-model" : "anthropic/claude-haiku-4-5",
+          "--api-key",
+          "test-key-not-real",
+        ],
+        { cwd: this.env.workdir, env: childEnv(this.env), windowsHide: true, stdio: ["pipe", "pipe", "pipe"] },
       );
-    });
 
-    await Bun.sleep(100);
-    if (this.process.exitCode !== null) {
-      throw new Error(`Pi RPC process exited during startup with code ${this.process.exitCode}\n${this.stderr}`);
+      const child = this.process;
+      livePiChildren.add(child);
+      child.once("close", () => livePiChildren.delete(child));
+      this.process.stderr?.on("data", (chunk: Buffer) => {
+        this.stderr += chunk.toString();
+      });
+      this.stopReadingStdout = attachStrictJsonlReader(this.process.stdout!, (line) => {
+        this.protocol.dispatchLine(line);
+      });
+      this.process.once("exit", (code, signal) => {
+        this.protocol.rejectPending(
+          new Error(`Pi RPC process exited with code ${code ?? "null"} signal ${signal ?? "null"}\n${this.stderr}`),
+        );
+      });
+
+      await Bun.sleep(100);
+      if (this.process.exitCode !== null) {
+        throw new Error(`Pi RPC process exited during startup with code ${this.process.exitCode}\n${this.stderr}`);
+      }
+    } catch (error) {
+      await this.shutdown();
+      throw error;
     }
   }
 
@@ -312,31 +333,34 @@ export class PiRpcClient {
   }
 
   async restart(): Promise<void> {
-    await this.shutdown();
+    await this.shutdown(2_000, true);
     this.extensionErrors.length = 0;
     this.stderr = "";
     await this.start();
   }
 
-  async shutdown(timeoutMs = 2_000): Promise<void> {
-    if (!this.process) return;
-    const child = this.process;
-    this.stopReadingStdout?.();
-    this.stopReadingStdout = null;
-    this.process = null;
+  async shutdown(timeoutMs = 2_000, preserveEnv = false): Promise<void> {
+    try {
+      if (!this.process) return;
+      const child = this.process;
+      this.stopReadingStdout?.();
+      this.stopReadingStdout = null;
+      this.process = null;
 
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    child.kill("SIGTERM");
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-        resolve();
-      }, timeoutMs);
-      child.once("exit", () => {
-        clearTimeout(timer);
-        resolve();
+      if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+      child.kill("SIGTERM");
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        }, timeoutMs);
+        child.once("exit", () => {
+          clearTimeout(timer);
+          resolve();
+        });
       });
-    });
+    } finally {
+      if (this.ownsEnv && !preserveEnv) cleanupE2ETempDir(this.env.baseDir);
+    }
   }
 }
 

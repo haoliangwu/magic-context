@@ -26,6 +26,7 @@ export type GithubIssueSubmission =
 function runGhCommand(args: string[]): GhCommandResult {
     try {
         const result = spawnSync("gh", args, {
+            windowsHide: true,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "pipe"],
         });

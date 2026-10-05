@@ -1,7 +1,7 @@
 import {
 	detectOverflow,
 	detectThinkingBindingMismatch,
-	isFable51ThinkingBindingModel,
+	isPrefixBoundThinkingModel,
 } from "@magic-context/core/features/magic-context/overflow-detection";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import {
@@ -9,9 +9,9 @@ import {
 	armThinkingBindingRecovery,
 	getMergedReasoningStrippedIds,
 	getThinkingBindingRecoveryTarget,
-	NEWEST_REASONING_BEARING_ASSISTANT,
 	recordOverflowDetected,
 	THINKING_BINDING_RECOVERY_FROZEN_PREFIX,
+	THINKING_BINDING_STRIP_ORDER_END_MARKER,
 	thinkingBindingRecoveryFrozenId,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { dropSlot } from "@magic-context/core/hooks/magic-context/lkg-slot";
@@ -71,18 +71,18 @@ export function handlePiProviderFailure(args: {
 		const enabled =
 			args.thinkingBindingRecoveryEnabled !== false &&
 			!args.compactionOff &&
-			isFable51ThinkingBindingModel(provider, model);
+			isPrefixBoundThinkingModel(provider, model);
 		if (enabled) {
-			// Pi's AgentMessage has no OpenCode-style internal assistant id. The
-			// branch projection provides stable entry ids on the next context pass,
-			// so recover the newest reasoning-bearing assistant there.
+			// The 400 names only provider request-array paths. The next context
+			// pass maps the flag onto stable branch entry ids and strips thinking
+			// from every assistant that still carries it.
 			armThinkingBindingRecovery(args.db, args.sessionId);
 			clearPiLkgSessionState(args.sessionId);
 			dropSlot(args.sessionId, "thinking-binding-recovery-arm");
 			reportBindingRecovery(
 				args.sessionId,
 				args.report,
-				`Fable thinking-binding recovery armed from message_end target=${NEWEST_REASONING_BEARING_ASSISTANT}`,
+				`thinking-binding recovery armed from message_end (provider paths: failing=${binding.failingBlockPath ?? "?"} firstChanged=${binding.firstChangedPath ?? "?"})`,
 			);
 		}
 		return { kind: "thinking_binding", armed: enabled };
@@ -99,6 +99,7 @@ export function handlePiProviderFailure(args: {
 		modelKey,
 		"provider_overflow",
 		overflow.reportedLimitProvenance,
+		overflow.reportedInputTokens,
 	);
 	return {
 		kind: "overflow",
@@ -161,11 +162,22 @@ function stripThinkingParts(message: unknown): number {
 }
 
 export interface PiThinkingBindingApplication {
+	/** The flag value read, so the caller clears only that value. */
 	flagTarget: string;
-	entryId: string;
+	/** Every branch entry whose thinking this pass removes. */
+	entryIds: string[];
 }
 
-/** Apply and replay the persisted Fable thinking-binding recovery decision. */
+/**
+ * Apply an armed thinking-binding recovery and replay earlier ones.
+ *
+ * An armed flag freezes every assistant entry that still carries thinking,
+ * the newest one included even when its tool call waits on a pending tool
+ * result: after a prefix edit all of those blocks are invalid, and removing
+ * all of them is always valid, so one failed request is enough. The frozen
+ * set is persisted before bytes change and replays on every later pass, so a
+ * removed block never comes back; blocks produced afterwards are kept.
+ */
 export function applyPiThinkingBindingRecovery(args: {
 	db: ContextDatabase;
 	sessionId: string;
@@ -174,54 +186,44 @@ export function applyPiThinkingBindingRecovery(args: {
 	provider?: string;
 	model?: string;
 	report?: (message: string) => void;
+	/**
+	 * The session strips thinking after the pipeline stages ran (see
+	 * resolvePiBindingStripOrder). New entries are then written together with
+	 * THINKING_BINDING_STRIP_ORDER_END_MARKER, so later passes keep stripping
+	 * after the stages instead of reverting to stripping before them.
+	 */
+	endOfPassOrder?: boolean;
 }): PiThinkingBindingApplication | null {
-	if (args.provider?.toLowerCase() !== "anthropic") return null;
-	const frozenEntryIds = new Set<string>();
-	for (const frozenId of getMergedReasoningStrippedIds(
-		args.db,
-		args.sessionId,
-	)) {
-		if (!frozenId.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
-		const entryId = frozenId.slice(
-			THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length,
-		);
-		if (entryId.length > 0) frozenEntryIds.add(entryId);
-	}
+	const frozenEntryIds = frozenBindingEntryIds(args.db, args.sessionId);
 
-	const flagTarget = isFable51ThinkingBindingModel(args.provider, args.model)
+	const flagTarget = isPrefixBoundThinkingModel(args.provider, args.model)
 		? getThinkingBindingRecoveryTarget(args.db, args.sessionId)
 		: null;
 	let applied: PiThinkingBindingApplication | null = null;
 	if (flagTarget) {
-		let messageIndex = -1;
-		if (flagTarget === NEWEST_REASONING_BEARING_ASSISTANT) {
-			for (let index = args.messages.length - 1; index >= 0; index -= 1) {
-				if (hasThinkingPart(args.messages[index]) && args.entryIds[index]) {
-					messageIndex = index;
-					break;
-				}
-			}
-		} else {
-			messageIndex = args.entryIds.findIndex(
-				(entryId, index) =>
-					entryId === flagTarget && hasThinkingPart(args.messages[index]),
-			);
+		const entryIds = new Set<string>();
+		for (let index = 0; index < args.messages.length; index += 1) {
+			const entryId = args.entryIds[index];
+			if (entryId && hasThinkingPart(args.messages[index]))
+				entryIds.add(entryId);
 		}
-		const entryId = messageIndex >= 0 ? args.entryIds[messageIndex] : undefined;
-		if (entryId) {
-			const frozenId = thinkingBindingRecoveryFrozenId(entryId);
-			if (
-				frozenEntryIds.has(entryId) ||
-				addMergedReasoningStrippedIds(args.db, args.sessionId, [frozenId])
-			) {
-				frozenEntryIds.add(entryId);
-				applied = { flagTarget, entryId };
-				reportBindingRecovery(
-					args.sessionId,
-					args.report,
-					`Fable thinking-binding recovery consumed on context pass target=${flagTarget} entry=${entryId}`,
-				);
-			}
+		const newEntryIds = [...entryIds].filter((id) => !frozenEntryIds.has(id));
+		if (
+			newEntryIds.length === 0 ||
+			addMergedReasoningStrippedIds(args.db, args.sessionId, [
+				...newEntryIds.map(thinkingBindingRecoveryFrozenId),
+				...(args.endOfPassOrder
+					? [THINKING_BINDING_STRIP_ORDER_END_MARKER]
+					: []),
+			])
+		) {
+			for (const id of newEntryIds) frozenEntryIds.add(id);
+			applied = { flagTarget, entryIds: [...entryIds] };
+			reportBindingRecovery(
+				args.sessionId,
+				args.report,
+				`thinking-binding recovery consumed on context pass target=${flagTarget} entries=${applied.entryIds.length} [${applied.entryIds.join(",")}]`,
+			);
 		}
 	}
 
@@ -231,4 +233,167 @@ export function applyPiThinkingBindingRecovery(args: {
 			stripThinkingParts(args.messages[index]);
 	}
 	return applied;
+}
+
+/** Thinking removed by a busting pass because the same pass changed bytes before it. */
+export interface PiProactiveThinkingStrip {
+	/** Branch entries whose thinking this pass froze into the binding-mismatch set. */
+	entryIds: string[];
+}
+
+/**
+ * Remove every thinking block still on the wire on a busting pass of a
+ * prefix-bound model (Fable 5.1, Opus 5.5, Sonnet 5.5).
+ *
+ * On those models a thinking block is valid only while every byte before it is
+ * unchanged, and a busting pass is the pass that changes those bytes: older
+ * accounts then drop the blocks silently, `drop_block` drops them, and newer
+ * accounts reject the request with a 400. The pass therefore removes all of
+ * them itself. The newest assistant of an open tool round is included and its
+ * tool call stays: a live probe on Fable 5.1 and Opus 5.5 accepted that turn
+ * with its thinking removed (docs/reports/anthropic-open-tool-round-thinking.md).
+ *
+ * `messages` is the final array this pass serves, after binding-mismatch strips
+ * were replayed on it at the end of the pass. The entries are persisted into
+ * the binding-mismatch set before anything is stripped, the same contract as
+ * the reactive recovery; later passes replay the set at the same point of the
+ * pass, so they serve identical bytes, and a removed block never comes back.
+ * When the write fails, nothing is stripped and nothing is remembered; the
+ * reactive recovery remains the fallback. An entry without a stable id cannot
+ * be replayed and is left alone. Thinking produced after this pass is kept
+ * until the next busting pass.
+ *
+ * `cacheBustingPass` must be true only on a pass that already busts the cache;
+ * a defer pass never originates a strip.
+ */
+export function applyPiProactiveThinkingStrip(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	messages: unknown[];
+	entryIds: readonly (string | undefined)[];
+	provider?: string;
+	model?: string;
+	cacheBustingPass: boolean;
+	report?: (message: string) => void;
+}): PiProactiveThinkingStrip | null {
+	if (!args.cacheBustingPass) return null;
+	if (!isPrefixBoundThinkingModel(args.provider, args.model)) return null;
+	const entryIds: string[] = [];
+	const indices: number[] = [];
+	for (let index = 0; index < args.messages.length; index += 1) {
+		const entryId = args.entryIds[index];
+		if (!entryId || !hasThinkingPart(args.messages[index])) continue;
+		entryIds.push(entryId);
+		indices.push(index);
+	}
+	if (entryIds.length === 0) return null;
+	let persisted = false;
+	try {
+		// The strip runs after the pipeline stages, so the end-order marker is
+		// persisted with the entries. Later passes then replay the strip after
+		// the stages too, instead of moving it earlier and rendering differently.
+		persisted = addMergedReasoningStrippedIds(args.db, args.sessionId, [
+			...entryIds.map(thinkingBindingRecoveryFrozenId),
+			THINKING_BINDING_STRIP_ORDER_END_MARKER,
+		]);
+	} catch {
+		persisted = false;
+	}
+	if (!persisted) {
+		reportBindingRecovery(
+			args.sessionId,
+			args.report,
+			"proactive thinking strip: persistence failed; serving the thinking unchanged",
+		);
+		return null;
+	}
+	for (const index of indices) stripThinkingParts(args.messages[index]);
+	reportBindingRecovery(
+		args.sessionId,
+		args.report,
+		`proactive thinking strip: busting pass froze thinking of ${entryIds.length} entr${entryIds.length === 1 ? "y" : "ies"} [${entryIds.join(",")}]`,
+	);
+	return { entryIds };
+}
+
+/** Branch entries whose thinking the binding-mismatch set removes on every pass. */
+export function frozenBindingEntryIds(
+	db: ContextDatabase,
+	sessionId: string,
+): Set<string> {
+	const ids = new Set<string>();
+	for (const entry of getMergedReasoningStrippedIds(db, sessionId)) {
+		if (!entry.startsWith(THINKING_BINDING_RECOVERY_FROZEN_PREFIX)) continue;
+		const entryId = entry.slice(THINKING_BINDING_RECOVERY_FROZEN_PREFIX.length);
+		if (entryId.length > 0) ids.add(entryId);
+	}
+	return ids;
+}
+
+/**
+ * Where this pass replays the binding-mismatch strips.
+ *
+ * Builds before this one stripped at the start of the context pass, before any
+ * stage ran, and a stage's output can depend on whether an assistant carries
+ * thinking (a dropped tool arc beside native reasoning renders as a skeleton,
+ * without it as a removal). A session that already carries strips therefore
+ * keeps the start-of-pass order ("start") until a pass may change served bytes:
+ * a pass with a queued explicit flush, which always holds the shared bust
+ * permission, writes the end-order marker before it serves and switches. A pass
+ * whose stripped entries are all off the branch does not switch: an undo can
+ * bring them back on a later defer pass, which must still render them in the
+ * start order. A session without strips uses the end order from the start.
+ *
+ * The proactive strip runs only in the end order, because it is decided on the
+ * array the pass serves and must replay at that same point.
+ */
+export function resolvePiBindingStripOrder(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	messages: readonly unknown[];
+	entryIds: readonly (string | undefined)[];
+	/** Known before any stage runs: this pass is allowed to change served bytes. */
+	bustPermittedAtStart: boolean;
+}): "start" | "end" {
+	const ledger = getMergedReasoningStrippedIds(args.db, args.sessionId);
+	if (ledger.has(THINKING_BINDING_STRIP_ORDER_END_MARKER)) return "end";
+	const frozen = frozenBindingEntryIds(args.db, args.sessionId);
+	if (frozen.size === 0) return "end";
+	let onBranch = false;
+	let carriesThinking = false;
+	for (let index = 0; index < args.messages.length; index += 1) {
+		const entryId = args.entryIds[index];
+		if (!entryId || !frozen.has(entryId)) continue;
+		onBranch = true;
+		if (hasThinkingPart(args.messages[index])) carriesThinking = true;
+	}
+	// Switch only on a pass that may change bytes and renders the difference
+	// itself: stripped entries on the branch that still carry thinking. With
+	// them off the branch, or their thinking already gone, both orders render
+	// alike now, and switching would move the byte change to a later pass,
+	// which could be a defer pass.
+	const mayChangeOrder =
+		onBranch && carriesThinking && args.bustPermittedAtStart;
+	if (
+		mayChangeOrder &&
+		addMergedReasoningStrippedIds(args.db, args.sessionId, [
+			THINKING_BINDING_STRIP_ORDER_END_MARKER,
+		])
+	) {
+		return "end";
+	}
+	return "start";
+}
+
+/**
+ * Whether this pass may run the proactive thinking strip. Subagents are
+ * included, as in OpenCode: their busting passes invalidate signed blocks
+ * exactly as a primary's do.
+ */
+export function shouldRunPiProactiveThinkingStrip(args: {
+	compactionOff: boolean;
+	bindingStripOrder: "start" | "end";
+	isSubagent: boolean;
+}): boolean {
+	return !args.compactionOff && args.bindingStripOrder === "end";
 }

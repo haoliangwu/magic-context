@@ -1,0 +1,218 @@
+{
+  "responseModels": [
+    "deepseek-flash"
+  ],
+  "variants": {
+    "A": {
+      "sessions": 1,
+      "sessionsStarted": 1,
+      "calls": 29,
+      "usage": {
+        "input": 192283,
+        "output": 967,
+        "cacheHit": 165248,
+        "cacheMiss": 27035
+      },
+      "text": {
+        "rows": 24,
+        "wellFormed": 19,
+        "canonicalPrefix": 19,
+        "correct": 19,
+        "wrong": 0,
+        "untagged": 5,
+        "malformed": 1,
+        "misplaced": 1,
+        "byteIdentity": 18
+      },
+      "toolOnly": 5,
+      "toolOnlyMisplaced": 0,
+      "signedDeltas": {}
+    },
+    "B": {
+      "sessions": 1,
+      "sessionsStarted": 1,
+      "calls": 26,
+      "usage": {
+        "input": 187111,
+        "output": 794,
+        "cacheHit": 163712,
+        "cacheMiss": 23399
+      },
+      "text": {
+        "rows": 22,
+        "wellFormed": 21,
+        "canonicalPrefix": 21,
+        "correct": 21,
+        "wrong": 0,
+        "untagged": 1,
+        "malformed": 1,
+        "misplaced": 1,
+        "byteIdentity": 20
+      },
+      "toolOnly": 4,
+      "toolOnlyMisplaced": 0,
+      "signedDeltas": {}
+    }
+  },
+  "sessions": [
+    {
+      "session": "ses_f0d195cb8ffebp1ygdGT8mjsmo",
+      "variant": "A",
+      "scenario": "reduced",
+      "replicate": 1,
+      "completed": true,
+      "lastCompletedTurn": 18,
+      "replies": 29,
+      "parallelSeen": true,
+      "placeholderSeen": true,
+      "providerHookTextEqual": true,
+      "reductionTarget": 28,
+      "providerSawReductionTarget": true,
+      "reductionStatus": "dropped",
+      "rows": 24,
+      "wellFormed": 19,
+      "canonicalPrefix": 19,
+      "correct": 19,
+      "wrong": 0,
+      "untagged": 5,
+      "malformed": 1,
+      "misplaced": 1,
+      "byteIdentity": 18
+    },
+    {
+      "session": "ses_f0d0ceb8affersrAuCX1brRsg2",
+      "variant": "B",
+      "scenario": "reduced",
+      "replicate": 1,
+      "completed": true,
+      "lastCompletedTurn": 18,
+      "replies": 26,
+      "parallelSeen": true,
+      "placeholderSeen": true,
+      "providerHookTextEqual": true,
+      "reductionTarget": 24,
+      "providerSawReductionTarget": true,
+      "reductionStatus": "dropped",
+      "rows": 22,
+      "wellFormed": 21,
+      "canonicalPrefix": 21,
+      "correct": 21,
+      "wrong": 0,
+      "untagged": 1,
+      "malformed": 1,
+      "misplaced": 1,
+      "byteIdentity": 20
+    }
+  ],
+  "buckets": [
+    {
+      "variant": "A",
+      "bucket": "1",
+      "rows": 1,
+      "wellFormed": 0,
+      "canonicalPrefix": 0,
+      "correct": 0,
+      "wrong": 0,
+      "untagged": 1,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 0
+    },
+    {
+      "variant": "A",
+      "bucket": "2–5",
+      "rows": 3,
+      "wellFormed": 1,
+      "canonicalPrefix": 1,
+      "correct": 1,
+      "wrong": 0,
+      "untagged": 2,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 1
+    },
+    {
+      "variant": "A",
+      "bucket": "6–20",
+      "rows": 12,
+      "wellFormed": 10,
+      "canonicalPrefix": 10,
+      "correct": 10,
+      "wrong": 0,
+      "untagged": 2,
+      "malformed": 1,
+      "misplaced": 1,
+      "byteIdentity": 9
+    },
+    {
+      "variant": "A",
+      "bucket": ">20",
+      "rows": 8,
+      "wellFormed": 8,
+      "canonicalPrefix": 8,
+      "correct": 8,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 8
+    },
+    {
+      "variant": "B",
+      "bucket": "1",
+      "rows": 1,
+      "wellFormed": 1,
+      "canonicalPrefix": 1,
+      "correct": 1,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 1
+    },
+    {
+      "variant": "B",
+      "bucket": "2–5",
+      "rows": 4,
+      "wellFormed": 3,
+      "canonicalPrefix": 3,
+      "correct": 3,
+      "wrong": 0,
+      "untagged": 1,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 3
+    },
+    {
+      "variant": "B",
+      "bucket": "6–20",
+      "rows": 12,
+      "wellFormed": 12,
+      "canonicalPrefix": 12,
+      "correct": 12,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 1,
+      "misplaced": 1,
+      "byteIdentity": 11
+    },
+    {
+      "variant": "B",
+      "bucket": ">20",
+      "rows": 5,
+      "wellFormed": 5,
+      "canonicalPrefix": 5,
+      "correct": 5,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 5
+    }
+  ],
+  "errors": [],
+  "credentials": {
+    "copiedDeleted": true,
+    "stagedDeleted": true
+  }
+}

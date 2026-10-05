@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -12,7 +13,7 @@ afterEach(() => {
 
 describe("ensureTuiPluginEntry", () => {
     it("preserves tuple dev-path plugin entry and does not add @latest", async () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-tui-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-tui-"));
         roots.push(root);
         const devPath = "/Work/magic-context/packages/plugin";
         const tuiPath = join(root, "tui.json");
@@ -33,7 +34,7 @@ describe("ensureTuiPluginEntry", () => {
     });
 
     it("upgrades bare npm name to @latest while preserving tuple options", async () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-tui-npm-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-tui-npm-"));
         roots.push(root);
         const tuiPath = join(root, "tui.json");
         writeFileSync(
@@ -56,7 +57,7 @@ describe("ensureTuiPluginEntry", () => {
     });
 
     it("creates tui.jsonc (not tui.json) on a fresh install", async () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-tui-fresh-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-tui-fresh-"));
         roots.push(root);
 
         const { ensureTuiPluginEntry } = await import("./tui-config");
@@ -73,7 +74,7 @@ describe("ensureTuiPluginEntry", () => {
     });
 
     it("writes into the existing tui.jsonc when both files exist", async () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-tui-both-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-tui-both-"));
         roots.push(root);
         // A real user config in tui.jsonc plus a leftover empty tui.json.
         writeFileSync(

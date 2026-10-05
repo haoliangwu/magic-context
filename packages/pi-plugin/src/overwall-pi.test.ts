@@ -235,6 +235,10 @@ test("bounded provider pressure drives the next scheduler pass without proving c
 			lastContextPercentage: 0.5,
 			cacheTtl: "never",
 		});
+		// The floor was proven on the model this reply comes from; a floor with
+		// no recorded model would be dropped instead of kept.
+		const { recordPiProvenFloorModel } = await import("./pi-proven-floor");
+		recordPiProvenFloorModel(db, sessionId, "openai-codex/gpt-5.6-sol", 140000);
 		await persistPiPressureFromMessageEnd({
 			db,
 			sessionId,

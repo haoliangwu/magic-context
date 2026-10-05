@@ -1,11 +1,21 @@
 /// <reference types="bun-types" />
 
-import { afterEach, describe, expect, mock, test } from "bun:test";
-
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { MagicContextConfigSchema } from "../config/schema/magic-context";
 import { replaceAllCompartmentState } from "../features/magic-context/compartment-storage";
 import { insertMemory } from "../features/magic-context/memory";
-import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
+import {
+    __clearProjectIdentityTransientCooldownForTests,
+    __resetProjectIdentityForTests,
+    __setProjectIdentityTestHooks,
+    resolveProjectIdentity,
+    setHomeProjectPermission,
+} from "../features/magic-context/memory/project-identity";
 import { FORK_MIGRATION_VERSION_FLOOR, runMigrations } from "../features/magic-context/migrations";
 import { upsertMural } from "../features/magic-context/mural/storage-mural";
 import {
@@ -20,10 +30,15 @@ import {
 import { createLiveSessionState } from "../hooks/magic-context/live-session-state";
 import { estimateTokens } from "../hooks/magic-context/read-session-formatting";
 import type { RustModeModuleClient } from "../hooks/magic-context/rust-mode-transform";
+import * as logger from "../shared/logger";
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../shared/models-dev-cache";
+import { pluginPackageVersion } from "../shared/plugin-package-version";
 import type { MagicContextRpcServer } from "../shared/rpc-server";
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
+import { buildStatusViewFor } from "../shared/status-view";
+import { checkStatusDetailPayload } from "../shared/status-view-check";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 import {
     buildCompartmentCount,
     buildDebugMemoryUsage,
@@ -46,7 +61,10 @@ function createTestDb(): Database {
 
 type TestRpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
-function registeredRpcMethods(debugRpc: boolean): Map<string, TestRpcHandler> {
+function registeredRpcMethods(
+    debugRpc: boolean,
+    getDatabase?: () => Database | null,
+): Map<string, TestRpcHandler> {
     const handlers = new Map<string, TestRpcHandler>();
     const rpcServer = {
         handle(method: string, handler: TestRpcHandler) {
@@ -58,6 +76,7 @@ function registeredRpcMethods(debugRpc: boolean): Map<string, TestRpcHandler> {
         config: MagicContextConfigSchema.parse({ debug_rpc: debugRpc }),
         client: {},
         liveSessionState: createLiveSessionState(),
+        getDatabase,
     });
     return handlers;
 }
@@ -65,6 +84,114 @@ function registeredRpcMethods(debugRpc: boolean): Map<string, TestRpcHandler> {
 afterEach(() => {
     resetSidebarSnapshotCache();
     clearModelsDevCache();
+    __resetProjectIdentityForTests();
+});
+
+describe("home project sidebar", () => {
+    test("does not poll memory while gated and serves a snapshot after opt-in", () => {
+        const directory = process.cwd();
+        __setProjectIdentityTestHooks({ homeDirectory: () => directory });
+        const db = createTestDb();
+        try {
+            expect(buildSidebarSnapshotRpcResponse(db, "ses_home", directory)).toEqual({
+                sessionId: "ses_home",
+                disabled: true,
+            });
+            setHomeProjectPermission(true);
+            const snapshot = buildSidebarSnapshotRpcResponse(db, "ses_home", directory);
+            expect(snapshot.error).toBeUndefined();
+            expect(snapshot).toHaveProperty("sessionId", "ses_home");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("session-owner", () => {
+    function ownerHandler(directory: string, sessionDirectories: Record<string, string>) {
+        const handlers = new Map<string, TestRpcHandler>();
+        const rpcServer = {
+            handle(method: string, handler: TestRpcHandler) {
+                handlers.set(method, handler);
+            },
+        } as unknown as MagicContextRpcServer;
+        registerRpcHandlers(rpcServer, {
+            directory,
+            config: MagicContextConfigSchema.parse({}),
+            client: {
+                session: {
+                    get: async ({ path }: { path: { id: string } }) => ({
+                        data: sessionDirectories[path.id]
+                            ? { directory: sessionDirectories[path.id] }
+                            : undefined,
+                    }),
+                },
+            },
+            liveSessionState: createLiveSessionState(),
+        });
+        const handler = handlers.get("session-owner");
+        if (!handler) throw new Error("session-owner is not registered");
+        return handler;
+    }
+
+    test("claims a session whose host directory is this server's directory in another spelling", async () => {
+        const root = createTestTempDirFromPath(join(tmpdir(), "session-owner-"));
+        try {
+            const handler = ownerHandler(root, {
+                ses_mine: `${root}/`,
+                ses_other: join(root, "elsewhere"),
+            });
+            expect(await handler({ sessionId: "ses_mine" })).toEqual({ owner: true });
+            expect(await handler({ sessionId: "ses_other" })).toEqual({ owner: false });
+            expect(await handler({ sessionId: "ses_unknown" })).toEqual({ owner: false });
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("status-detail replies the /ctx-status dialog can draw", () => {
+    test("a session with no stored state yet passes the dialog's check and names the server version", async () => {
+        const db = createTestDb();
+        try {
+            const handler = registeredRpcMethods(false, () => db).get("status-detail");
+            if (!handler) throw new Error("status-detail is not registered");
+            const reply = await handler({ sessionId: "ses-never-seen", directory: process.cwd() });
+            const version = pluginPackageVersion();
+            expect(version).toMatch(/^\d+\.\d+\.\d+/);
+            expect(reply.pluginVersion).toBe(version);
+            const check = checkStatusDetailPayload(reply, version ?? "");
+            expect(check.state).toBe("ready");
+            const view = buildStatusViewFor(check, { version: version ?? "" });
+            expect(view.headline.left.text).toBe("0.0% / 65%");
+            expect(view.warnings).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("the home-directory reply carries the server version and draws as unavailable", async () => {
+        const directory = process.cwd();
+        __setProjectIdentityTestHooks({ homeDirectory: () => directory });
+        const db = createTestDb();
+        try {
+            const handler = registeredRpcMethods(false, () => db).get("status-detail");
+            if (!handler) throw new Error("status-detail is not registered");
+            const reply = await handler({ sessionId: "ses_home", directory });
+            expect(reply).toEqual({
+                sessionId: "ses_home",
+                disabled: true,
+                pluginVersion: pluginPackageVersion() ?? undefined,
+            });
+            const check = checkStatusDetailPayload(reply, pluginPackageVersion() ?? "");
+            expect(check.state === "unavailable" && check.reason).toEqual({
+                kind: "not_tracked",
+                cause: "home_directory",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
 });
 
 describe("debug RPC guard", () => {
@@ -179,6 +306,73 @@ describe("Rust session status reads", () => {
 });
 
 describe("sidebar snapshot RPC failures", () => {
+    test("unborn repo sidebar loads existing directory memories", () => {
+        const directory = createTestTempDirFromPath(join(tmpdir(), "sidebar-unborn-"));
+        const db = createTestDb();
+        try {
+            execFileSync("git", ["init", "-q", directory], { windowsHide: true });
+            const identity = `dir:${createHash("md5").update(directory).digest("hex").slice(0, 12)}`;
+            insertMemory(db, {
+                projectPath: identity,
+                category: "USER_DIRECTIVES",
+                content: "Existing unborn memory",
+            });
+            const snapshot = buildSidebarSnapshotRpcResponse(db, "ses_unborn", directory);
+            expect(snapshot.error).toBeUndefined();
+            expect(snapshot.memoryCount).toBe(1);
+        } finally {
+            closeQuietly(db);
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    test("paused sidebar logs once per directory and reason without stacks", () => {
+        const directory = createTestTempDirFromPath(join(tmpdir(), "sidebar-paused-"));
+        execFileSync("git", ["init", "-q", directory], { windowsHide: true });
+        const db = createTestDb();
+        const logged = spyOn(logger, "log").mockImplementation(() => {});
+        try {
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => {
+                    throw Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+                }) as typeof execFileSync,
+            });
+            for (let i = 0; i < 4; i++) {
+                expect(buildSidebarSnapshotRpcResponse(db, "ses_paused", directory)).toEqual({
+                    sessionId: "ses_paused",
+                    disabled: true,
+                    paused: true,
+                });
+            }
+            expect(logged).toHaveBeenCalledTimes(1);
+            expect(logged.mock.calls[0]).toEqual([
+                `[magic-context] memory features paused for ${directory}: git_timeout`,
+            ]);
+            __clearProjectIdentityTransientCooldownForTests(directory);
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => {
+                    throw new Error("other git failure");
+                }) as typeof execFileSync,
+            });
+            buildSidebarSnapshotRpcResponse(db, "ses_paused", directory);
+            expect(logged).toHaveBeenCalledTimes(2);
+            expect(logged.mock.calls[1]).toEqual([
+                `[magic-context] memory features paused for ${directory}: unknown`,
+            ]);
+            __clearProjectIdentityTransientCooldownForTests(directory);
+            __setProjectIdentityTestHooks({
+                execFileSync: (() => {
+                    throw Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+                }) as typeof execFileSync,
+            });
+            buildSidebarSnapshotRpcResponse(db, "ses_paused", directory);
+            expect(logged).toHaveBeenCalledTimes(2);
+        } finally {
+            logged.mockRestore();
+            closeQuietly(db);
+            rmSync(directory, { recursive: true, force: true });
+        }
+    });
     test("returns an error envelope when snapshot construction hits SQLITE_BUSY", () => {
         const busyDb = {
             prepare() {
@@ -206,6 +400,149 @@ describe("buildStatusDetail — active profile", () => {
             expect(
                 buildStatusDetail(db, "ses-base-status", process.cwd()).activeProfile,
             ).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildStatusDetail — historian refusal provenance", () => {
+    test("preserves the runner stage and received text from module status", () => {
+        const db = createTestDb();
+        try {
+            const refusal =
+                "historian refusal stage=credential provider=google model=google/model-a received=\"open_failed: no apikey credential for provider 'google'\"";
+            const detail = buildStatusDetail(
+                db,
+                "ses-refusal-status",
+                process.cwd(),
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                {
+                    historian: {
+                        last_failure: refusal,
+                        refusal_stage: "credential",
+                        canonical_cause: "credential_unavailable",
+                    },
+                },
+            );
+
+            expect(detail.historianRefusal).toEqual({
+                stage: "credential",
+                canonicalCause: "credential_unavailable",
+                detail: refusal,
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildStatusDetail — completion runner provenance", () => {
+    test("carries which runner the module used for the session and why", () => {
+        const db = createTestDb();
+        try {
+            const detail = buildStatusDetail(
+                db,
+                "ses-runner-status",
+                process.cwd(),
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                {
+                    historian: {
+                        runner: {
+                            runner: "host",
+                            source: "default_for_harness",
+                            harness: "opencode2",
+                            observed: "last_completion",
+                        },
+                    },
+                    dreamer: {
+                        runner: {
+                            runner: "broca",
+                            source: "configured",
+                            harness: "opencode2",
+                            observed: "resolved_for_route",
+                        },
+                    },
+                },
+            );
+
+            expect(detail.historianRunner).toEqual({
+                runner: "host",
+                source: "default_for_harness",
+                harness: "opencode2",
+                observed: "last_completion",
+            });
+            expect(detail.dreamerRunner).toEqual({
+                runner: "broca",
+                source: "configured",
+                harness: "opencode2",
+                observed: "resolved_for_route",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("drops a runner value it does not recognise instead of rendering it", () => {
+        const db = createTestDb();
+        try {
+            const detail = buildStatusDetail(
+                db,
+                "ses-runner-unknown",
+                process.cwd(),
+                undefined,
+                { transform_mode: "rust" },
+                undefined,
+                undefined,
+                { historian: { runner: { runner: "llm", source: "configured" } } },
+            );
+            expect(detail.historianRunner).toBeUndefined();
+            expect(detail.dreamerRunner).toBeUndefined();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildStatusDetail — memory importance histogram", () => {
+    test("returns the exact active distribution and unclassified denominator", () => {
+        const db = createTestDb();
+        try {
+            const projectIdentity = resolveProjectIdentity(process.cwd());
+            const rows = [5, 25, 50, 65, 100].map((importance, index) =>
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "CONSTRAINTS",
+                    content: `rpc-status-memory-${index}`,
+                    importance,
+                }),
+            );
+            db.prepare("UPDATE memories SET classified_at = 123 WHERE id IN (?, ?, ?, ?)").run(
+                rows[0]!.id,
+                rows[1]!.id,
+                rows[3]!.id,
+                rows[4]!.id,
+            );
+
+            const detail = buildStatusDetail(db, "ses-memory-histogram", process.cwd());
+
+            expect(detail.memoryImportanceHistogram).toEqual({
+                total: 5,
+                unclassified: 1,
+                bands: {
+                    "0-19": 1,
+                    "20-39": 1,
+                    "40-59": 1,
+                    "60-79": 1,
+                    "80-100": 1,
+                },
+            });
         } finally {
             closeQuietly(db);
         }
@@ -371,6 +708,39 @@ describe("buildSidebarSnapshot — persisted tail hygiene", () => {
                 computedAt: 123,
                 reclaimableToolOutputCount: 0,
             });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("buildSidebarSnapshot — compartments served in m[1]", () => {
+    test("counts compartments published since the last m[0] fold", () => {
+        const db = createTestDb();
+        try {
+            const sessionId = "ses-sidebar-m1-compartments";
+            const m0History = "<session-history>\n</session-history>";
+            const newCompartments =
+                "<new-compartments>\n## 11-14 · Continued runtime inspection\nRead production, gear and ABI record code before implementing the plan.\n</new-compartments>";
+            db.prepare(
+                `INSERT INTO session_meta (
+                    session_id, last_input_tokens, last_context_percentage,
+                    system_prompt_tokens, memory_block_cache, memory_block_count,
+                    cached_m0_bytes, cached_m1_bytes
+                ) VALUES (?, 50000, 25, 5000, '', 0, ?, ?)`,
+            ).run(
+                sessionId,
+                Buffer.from(m0History, "utf8"),
+                Buffer.from(
+                    `<session-history-since>\n${newCompartments}\n</session-history-since>`,
+                    "utf8",
+                ),
+            );
+
+            const snapshot = buildSidebarSnapshot(db, sessionId, process.cwd(), undefined, 4000);
+            expect(snapshot.compartmentTokens).toBe(
+                estimateTokens(m0History) + estimateTokens(newCompartments),
+            );
         } finally {
             closeQuietly(db);
         }
@@ -898,67 +1268,6 @@ describe("buildStatusDetail — cacheNeverExpires with 'never' TTL", () => {
 });
 
 describe("buildStatusDetail — Rust host paths", () => {
-    test("surfaces a frozen non-frontier memory mirror from module and host evidence", () => {
-        const db = createTestDb();
-        try {
-            db.prepare(
-                "INSERT INTO mirror_cursors(domain, cursor, updated_at) VALUES ('memories', 3726, ?)",
-            ).run(Date.now() - 40_001);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES ('git:status', 1, 'ARCHITECTURE', 'hash')",
-            ).run();
-
-            const detail = buildStatusDetail(
-                db,
-                "ses-rust-mirror-stall",
-                process.cwd(),
-                undefined,
-                { transform_mode: "rust" },
-                undefined,
-                undefined,
-                { memory_mirror: { feed_head: 4850 } },
-            );
-
-            expect(detail.memoryMirror).toMatchObject({
-                cursor: 3726,
-                feedHead: 4850,
-                liveRows: 1,
-                pendingRows: 1124,
-                stalled: true,
-                code: "MC-M01",
-            });
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("surfaces a host marker that disagrees with module authority status", () => {
-        const db = createTestDb();
-        try {
-            const directory = process.cwd();
-            const projectIdentity = resolveProjectIdentity(directory);
-            expect(projectIdentity).not.toBeNull();
-            db.prepare(
-                "INSERT INTO authority_managed(project_path, context_store_uuid, marked_at) VALUES (?, 'store', 1)",
-            ).run(projectIdentity);
-
-            const detail = buildStatusDetail(
-                db,
-                "ses-rust-authority-mismatch",
-                directory,
-                undefined,
-                { transform_mode: "rust" },
-                undefined,
-                undefined,
-                { authority: { memories: { project: projectIdentity ?? "", state: "TS" } } },
-            );
-
-            expect(detail.memoryAuthorityMismatch).toBe(true);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
     test("marks host paths module-side only for Rust mode", () => {
         const db = createTestDb();
         try {
@@ -979,4 +1288,16 @@ describe("buildStatusDetail — Rust host paths", () => {
             closeQuietly(db);
         }
     });
+});
+
+test("sidebar uses the host storage gate instead of reopening a refused database", async () => {
+    let calls = 0;
+    const handlers = registeredRpcMethods(false, () => {
+        calls++;
+        return null;
+    });
+    expect(await handlers.get("sidebar-snapshot")!({ sessionId: "blocked" })).toEqual({
+        error: "unavailable",
+    });
+    expect(calls).toBe(1);
 });

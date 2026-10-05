@@ -2,10 +2,15 @@ import { randomUUID } from "node:crypto";
 import { COMPACTION_ENABLED_PATH } from "../../config/agent-disable";
 import type { DreamerConfig, MagicContextConfig } from "../../config/schema/magic-context";
 import type { ResolvedTransformMode } from "../../config/transform-mode";
-import type { MagicContextBuiltinCommandName } from "../../features/builtin-commands/commands";
+import { summarizeManualDream } from "../../features/magic-context/dreamer/manual-summary";
+import {
+    getFailingDreamTasks,
+    getSkippedDreamTasks,
+} from "../../features/magic-context/dreamer/storage-task-schedule";
 import { getDreamTaskBacklogs } from "../../features/magic-context/dreamer/task-gates";
 import {
     CANONICAL_DREAM_TASKS,
+    type DreamTaskFailureState,
     type DreamTaskName,
     formatDreamTaskBacklogs,
     isCanonicalDreamTask,
@@ -14,14 +19,12 @@ import type { ManualRunResult } from "../../features/magic-context/dreamer/task-
 import { getCompartments, getOrCreateSessionMeta } from "../../features/magic-context/storage";
 import type { RustSessionStatus } from "../../plugin/rpc-handlers";
 import { sessionLog } from "../../shared";
+import type { MagicContextBuiltinCommandName } from "../../shared/builtin-commands";
 import type { ConfigParseFailure } from "../../shared/config-diagnostics";
 import { isTuiConnected, pushNotification } from "../../shared/rpc-notifications";
 import type { StatusDetail } from "../../shared/rpc-types";
 import type { Database } from "../../shared/sqlite";
-import {
-    formatStatusDetailMarkdown,
-    formatStatusDiagnosticsMarkdown,
-} from "../../shared/status-detail-text";
+import { formatStatusDetailMarkdown } from "../../shared/status-detail-text";
 import {
     resolveTailHygieneStatus,
     type WireTailHygieneBaseline,
@@ -39,7 +42,7 @@ import {
 import { resolveContextWindowGeometry } from "./event-resolvers";
 import { executeFlush } from "./execute-flush";
 import { executeStatus } from "./execute-status";
-import { RUST_PARTIAL_RECOMP_REFUSAL, RUST_SESSION_UPGRADE_REFUSAL } from "./maintenance-authority";
+import { RUST_PARTIAL_RECOMP_REFUSAL } from "./maintenance-authority";
 import { MAX_WRAPUP_REQUEST_BUDGET_MS } from "./module-transport";
 import type { RustModeModuleClient } from "./rust-mode-transform";
 import type { NotificationParams } from "./send-session-notification";
@@ -150,7 +153,6 @@ const commandArgumentValidators: Record<MagicContextBuiltinCommandName, (raw: st
         },
         "ctx-recomp": (raw) => parseRecompArgs(raw).kind !== "error",
         "ctx-wrapup": (raw) => parseWrapupArgs(raw).ok,
-        "ctx-session-upgrade": (raw) => raw.trim() === "",
         "ctx-flush": (raw) => raw.trim() === "",
         "ctx-dream": (raw) => {
             const requested = raw.trim();
@@ -256,6 +258,21 @@ function rustCommandId(operation: string): string {
     return `opencode-${operation}-${randomUUID()}`;
 }
 
+/** Summary text a module sends when it has no transform snapshot for the session.
+ *  Modules that predate the `transform_not_observed` reason send it under the
+ *  generic `snapshot_unavailable` reason, so this text is how a newer host still
+ *  recognizes that case when talking to an older module. */
+const LEGACY_TRANSFORM_NOT_OBSERVED_SUMMARY =
+    "wrapup unavailable until a full session transform has been observed";
+
+function wrapupNeedsSessionMessage(value: Record<string, unknown>): boolean {
+    if (value.reason === "transform_not_observed") return true;
+    return (
+        value.reason === "snapshot_unavailable" &&
+        value.summary === LEGACY_TRANSFORM_NOT_OBSERVED_SUMMARY
+    );
+}
+
 function formatRustOperationMessage(
     operation: "wrapup" | "recomp",
     value: Record<string, unknown>,
@@ -275,8 +292,15 @@ function formatRustOperationMessage(
                 // The module's nonterminal disposition: progress was made but the
                 // drain stopped short of the keep watermark for a retryable reason.
                 // The TypeScript orchestrator presents the same shape as a Partial
-                // with the prescribed continuation, not a terminal failure.
-                return `## Magic Wrapup — Partial\n\n${renderCapabilityRefusal("history_compression")}`;
+                // with the prescribed continuation, not a terminal failure. The
+                // continuation depends on the reason: most clear on a retry, but a
+                // session the module has not seen since its route bound only clears
+                // after a message in that session.
+                return `## Magic Wrapup — Partial\n\n${
+                    wrapupNeedsSessionMessage(value)
+                        ? renderUserFacingFailure("history_compression_needs_message")
+                        : renderCapabilityRefusal("history_compression")
+                }`;
             default:
                 return `## Magic Wrapup — Failed\n\n${renderCapabilityRefusal("history_compression")}`;
         }
@@ -293,71 +317,20 @@ function formatRustOperationMessage(
     }
 }
 
-function formatRustStatusText(value: Record<string, unknown>): string {
-    const usage =
-        value.usage && typeof value.usage === "object"
-            ? (value.usage as Record<string, unknown>)
-            : {};
-    const tokens =
-        typeof usage.current_total_input_tokens === "number" ? usage.current_total_input_tokens : 0;
-    const limit = typeof usage.context_limit_tokens === "number" ? usage.context_limit_tokens : 0;
-    const coverage = value.coverage_ordinal == null ? "none" : String(value.coverage_ordinal);
-    const boundary = value.boundary_present === true ? "present" : "absent";
-    const compartments = typeof value.compartment_count === "number" ? value.compartment_count : 0;
-    return [
-        "### Module Cache",
-        `- Usage: ${tokens.toLocaleString()}${limit > 0 ? ` / ${limit.toLocaleString()} tokens` : " tokens"}`,
-        `- Boundary: ${boundary}`,
-        `- Coverage ordinal: ${coverage}`,
-        `- Compartments: ${compartments}`,
-    ].join("\n");
-}
-
 function executeRecompUpgradeStub(db: Database, sessionId: string): string {
     const legacyCount = getLegacyCompartmentCount(db, sessionId);
     if (legacyCount === 0) {
         return "## Magic Recomp Upgrade\n\nNothing to upgrade: this session has no legacy compartments.";
     }
 
-    // Legacy --upgrade flag is superseded by the /ctx-session-upgrade command.
+    // The legacy --upgrade flag no longer has a separate runner: a plain recomp
+    // rebuilds legacy compartments into the current format.
     return [
         "## Magic Recomp Upgrade",
         "",
         `Found ${legacyCount} legacy compartment${legacyCount === 1 ? "" : "s"} for this session.`,
-        "The `--upgrade` flag is deprecated. Run `/ctx-session-upgrade` to upgrade this session.",
+        "The `--upgrade` flag is deprecated. Run `/ctx-recomp` to rebuild them in the current format.",
     ].join("\n");
-}
-
-/**
- * Execute /ctx-session-upgrade: upgrade THIS session to the v2 history format.
- *
- * Two halves (locked design):
- *  1. Compartment upgrade — run a full recomp, which rebuilds every legacy v1
- *     compartment into the v2 tiered/scored shape (legacy=0). This is just the
- *     normal full-recomp path; recomp already produces v2 compartments.
- *  2. Memory migration (E3.2) — re-evaluate project memories into the 5-category
- *     taxonomy via a transient historian-model prompt, once per project. Wired
- *     in a follow-up; this command runs the compartment upgrade today and notes
- *     the pending migration step.
- *
- * Session-scoped: recomp rebuilds THIS session's compartments. The memory
- * migration is project-scoped and idempotent (guarded once-per-project).
- */
-async function executeSessionUpgrade(
-    deps: {
-        /** Runs the full session upgrade (compartment recomp → once-per-project
-         *  memory migration) via the shared orchestrator. Optional: unavailable
-         *  when no historian model is configured. The orchestrator gives the
-         *  command path identical model fallback + live progress + terminal
-         *  state as the RPC dialog path (dogfood 2026-05-30 unification). */
-        runUpgrade?: (sessionId: string) => Promise<string>;
-    },
-    sessionId: string,
-): Promise<string> {
-    if (!deps.runUpgrade) {
-        return "## Session Upgrade\n\nUpgrade is unavailable because the recomp handler is not configured.";
-    }
-    return deps.runUpgrade(sessionId);
 }
 
 export type ManualDreamSummary = ManualRunResult;
@@ -375,39 +348,22 @@ function readDreamTaskBacklogsSafely(
     }
 }
 
-function summarizeManualDream(s: ManualDreamSummary): string {
-    const lines: string[] = ["## /ctx-dream", ""];
-    if (s.ran.length > 0) lines.push(`Ran: ${s.ran.join(", ")}`);
-    if ((s.details?.length ?? 0) > 0) {
-        lines.push("Details:", ...(s.details ?? []).map((detail) => `- ${detail}`));
+function readFailingDreamTasksSafely(db: Database, projectPath: string): DreamTaskFailureState[] {
+    try {
+        return getFailingDreamTasks(db, projectPath);
+    } catch {
+        // Same reason as the backlog read: status must survive an older/empty database.
+        return [];
     }
-    if (s.failed.length > 0) lines.push(`Failed: ${s.failed.join(", ")}`);
-    if ((s.failureDetails?.length ?? 0) > 0) {
-        lines.push("Failure details:", ...(s.failureDetails ?? []).map((detail) => `- ${detail}`));
+}
+
+function readSkippedDreamTasksSafely(db: Database, projectPath: string): string[] {
+    try {
+        return getSkippedDreamTasks(db, projectPath);
+    } catch {
+        // Status must remain available before the task schedule tables exist.
+        return [];
     }
-    if (s.skippedNoWork.length > 0) lines.push(`Skipped (no work): ${s.skippedNoWork.join(", ")}`);
-    if (s.deferredBusy.length > 0)
-        lines.push(
-            // "Busy" means the task's DOMAIN lease is held — usually a sibling
-            // task (e.g. a scheduled verify blocking a manual curate), not
-            // this task itself. Say so, or the message reads as a lie.
-            `Busy: ${s.deferredBusy.join(", ")} — another dream task holds this domain's lease; retry in a minute`,
-        );
-    if (Object.keys(s.backlogBefore ?? {}).length > 0) {
-        lines.push("", "Backlog at run start:", formatDreamTaskBacklogs(s.backlogBefore ?? {}));
-    }
-    if (Object.keys(s.backlogAfter ?? {}).length > 0) {
-        lines.push("", "Backlog at run end:", formatDreamTaskBacklogs(s.backlogAfter ?? {}));
-    }
-    if (
-        s.ran.length === 0 &&
-        s.failed.length === 0 &&
-        s.skippedNoWork.length === 0 &&
-        s.deferredBusy.length === 0
-    ) {
-        lines.push("No enabled dream tasks to run.");
-    }
-    return lines.join("\n");
 }
 
 async function executeDreaming(
@@ -419,6 +375,7 @@ async function executeDreaming(
             params: NotificationParams,
         ) => Promise<void>;
         toastDurationMs?: number;
+        sampleToastDurationMs?: () => number | undefined;
         dreamer?: {
             config: DreamerConfig;
             projectPath: string;
@@ -431,7 +388,7 @@ async function executeDreaming(
     argText?: string,
 ): Promise<never> {
     const dreamNotificationParams: NotificationParams = {
-        toastDurationMs: deps.toastDurationMs ?? 5000,
+        toastDurationMs: deps.sampleToastDurationMs?.() ?? deps.toastDurationMs ?? 5000,
     };
 
     if (!deps.dreamer) {
@@ -479,9 +436,21 @@ async function executeDreaming(
 
     try {
         const summary = await deps.dreamer.runManual(task);
+        // The starting backlog was already sent before the run, over the same task list.
+        // Re-read the end backlog over that list too, so both panels show the same tasks
+        // (the runner only reports the tasks it selected).
         await deps.sendNotification(
             sessionId,
-            summarizeManualDream(summary),
+            summarizeManualDream({
+                ...summary,
+                // An empty map suppresses the summary's own start panel.
+                backlogBefore: {},
+                backlogAfter: readDreamTaskBacklogsSafely(
+                    deps.db,
+                    deps.dreamer.projectPath,
+                    backlogTasks,
+                ),
+            }),
             dreamNotificationParams,
         );
     } catch (error) {
@@ -507,6 +476,7 @@ export function createMagicContextCommandHandler(deps: {
     executeThresholdTokens?: { default?: number; [modelKey: string]: number | undefined };
     historyBudgetPercentage?: number;
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
+    sampleCommitClusterTrigger?: () => { enabled: boolean; min_clusters: number } | undefined;
     getLiveModelKey?: (sessionId: string) => string | undefined;
     cacheTtlConfig?: MagicContextConfig["cache_ttl"];
     cacheTtlConfigured?: boolean;
@@ -530,10 +500,6 @@ export function createMagicContextCommandHandler(deps: {
     ) => Promise<string>;
     /** Runs /ctx-wrapup over the live raw tail, keeping the newest N raw messages. */
     executeWrapup?: (sessionId: string, options: { messagesToKeep: number }) => Promise<string>;
-    /** Runs the once-per-project 5-cat memory migration for /ctx-session-upgrade.
-     *  Optional: when unavailable, /ctx-session-upgrade still upgrades compartments
-     *  via recomp and skips the memory re-evaluation. */
-    runUpgrade?: (sessionId: string) => Promise<string>;
     /** `/ctx-embed start` — backfill this session's compartment embeddings. */
     executeEmbedHistory?: (
         sessionId: string,
@@ -548,6 +514,7 @@ export function createMagicContextCommandHandler(deps: {
     ) => Promise<void>;
     /** Configured toast lifetime (ms) forwarded into diagnostics logs. */
     toastDurationMs?: number;
+    sampleToastDurationMs?: () => number | undefined;
     transformMode?: ResolvedTransformMode;
     rustModeModuleClient?: RustModeModuleClient;
     projectRoot?: string;
@@ -585,7 +552,6 @@ export function createMagicContextCommandHandler(deps: {
     const isRecompCommand = (command: string): boolean => command === "ctx-recomp";
     const isWrapupCommand = (command: string): boolean => command === "ctx-wrapup";
     const isDreamCommand = (command: string): boolean => command === "ctx-dream";
-    const isSessionUpgradeCommand = (command: string): boolean => command === "ctx-session-upgrade";
     const isEmbedCommand = (command: string): boolean => command === "ctx-embed";
     const rustMode = deps.transformMode === "rust" && deps.rustModeModuleClient;
     const callRust = async (
@@ -616,18 +582,9 @@ export function createMagicContextCommandHandler(deps: {
             const isRecomp = isRecompCommand(input.command);
             const isWrapup = isWrapupCommand(input.command);
             const isDream = isDreamCommand(input.command);
-            const isSessionUpgrade = isSessionUpgradeCommand(input.command);
             const isEmbed = isEmbedCommand(input.command);
 
-            if (
-                !isStatus &&
-                !isFlush &&
-                !isRecomp &&
-                !isWrapup &&
-                !isDream &&
-                !isSessionUpgrade &&
-                !isEmbed
-            ) {
+            if (!isStatus && !isFlush && !isRecomp && !isWrapup && !isDream && !isEmbed) {
                 return;
             }
 
@@ -737,7 +694,6 @@ export function createMagicContextCommandHandler(deps: {
             }
 
             if (isStatus) {
-                const statusDiagnostics = input.arguments.trim().toLowerCase() === "diagnostics";
                 let rustStatus: Record<string, unknown> | undefined;
                 if (rustMode) {
                     try {
@@ -752,11 +708,7 @@ export function createMagicContextCommandHandler(deps: {
                 }
                 if (isTuiConnected(sessionId)) {
                     // In TUI, push an RPC action so the TUI poller shows a native dialog
-                    pushNotification(
-                        "action",
-                        { action: "show-status-dialog", diagnostics: statusDiagnostics },
-                        sessionId,
-                    );
+                    pushNotification("action", { action: "show-status-dialog" }, sessionId);
                     sessionLog(sessionId, "command ctx-status: pushed show-status-dialog to TUI");
                     throwSentinel(input.command);
                 }
@@ -772,9 +724,7 @@ export function createMagicContextCommandHandler(deps: {
                     if (rustMode && !rustStatus) {
                         combinedStatus = `## Magic Status — Unavailable\n\n${renderUserFacingFailure("status_unavailable")}`;
                     } else if (detail) {
-                        combinedStatus = statusDiagnostics
-                            ? formatStatusDiagnosticsMarkdown(detail)
-                            : formatStatusDetailMarkdown(detail);
+                        combinedStatus = formatStatusDetailMarkdown(detail);
                     } else {
                         // Compatibility for isolated handler consumers that have not yet
                         // supplied the shared TUI status builder.
@@ -802,7 +752,7 @@ export function createMagicContextCommandHandler(deps: {
                             deps.executeThresholdPercentage,
                             liveModelKey,
                             deps.historyBudgetPercentage,
-                            deps.commitClusterTrigger,
+                            deps.sampleCommitClusterTrigger?.() ?? deps.commitClusterTrigger,
                             deps.executeThresholdTokens,
                             liveContextLimit,
                             deps.dreamer
@@ -813,6 +763,14 @@ export function createMagicContextCommandHandler(deps: {
                                           CANONICAL_DREAM_TASKS,
                                       ),
                                       progress: deps.getDreamerProgress?.() ?? null,
+                                      skipped: readSkippedDreamTasksSafely(
+                                          deps.db,
+                                          deps.dreamer.projectPath,
+                                      ),
+                                      failures: readFailingDreamTasksSafely(
+                                          deps.db,
+                                          deps.dreamer.projectPath,
+                                      ),
                                   }
                                 : undefined,
                             windowGeometry,
@@ -823,19 +781,11 @@ export function createMagicContextCommandHandler(deps: {
                                 cacheTtlConfig: deps.cacheTtlConfig ?? "5m",
                                 cacheTtlConfigured: deps.cacheTtlConfigured === true,
                                 configParseFailures: deps.configParseFailures ?? [],
-                                diagnostics: statusDiagnostics,
+                                diagnostics: false,
                                 compactionEnabled: !deps.compactionOff,
                             },
                         );
-                        const moduleStatus =
-                            rustStatus && statusDiagnostics
-                                ? `\n\n${formatRustStatusText(rustStatus)}`
-                                : "";
-                        const modeStatus =
-                            deps.compactionOff && statusDiagnostics
-                                ? `**Compaction:** disabled (${COMPACTION_ENABLED_PATH}: false) — native compaction owns the context window.\n\n`
-                                : "";
-                        combinedStatus = `${modeStatus}${statusOutput}${moduleStatus}`;
+                        combinedStatus = statusOutput;
                     }
                 } catch (error) {
                     sessionLog(
@@ -1024,20 +974,6 @@ export function createMagicContextCommandHandler(deps: {
                             result = warningLines.join("\n");
                         }
                     }
-                }
-            }
-
-            if (isSessionUpgrade) {
-                // TUI-no-session edge: before the first message, the prompt may
-                // not be bound to a session. Resolve defensively — nothing to
-                // upgrade without a session id.
-                if (!sessionId) {
-                    result =
-                        "## Session Upgrade\n\nThis prompt is not attached to a session yet — send a message first, then run `/ctx-session-upgrade`.";
-                } else if (rustMode) {
-                    result = `## Session Upgrade — Unavailable\n\n${RUST_SESSION_UPGRADE_REFUSAL}`;
-                } else {
-                    result = await executeSessionUpgrade(deps, sessionId);
                 }
             }
 

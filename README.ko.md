@@ -235,7 +235,6 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 | `/ctx-status` | 디버그 보기: tags, pending drops, cache TTL, nudge state, historian 진행, 구획 범위, 기록 예산 |
 | `/ctx-flush` | 캐시 TTL을 우회하여 모든 대기 작업을 즉시 강제 실행 |
 | `/ctx-recomp` | 원시 기록에서 구획을 다시 빌드합니다(`start-end` 범위 허용). 저장 상태가 잘못된 것 같을 때 사용 |
-| `/ctx-session-upgrade` | 이 세션을 최신 기록 형식으로 업그레이드합니다: 구획 재빌드와 프로젝트 메모리 마이그레이션 |
 | `/ctx-dream` | 필요할 때 dreamer 유지 관리를 실행: 메모리, 문서, smart notes, user-profile 검토 관리 |
 
 ---

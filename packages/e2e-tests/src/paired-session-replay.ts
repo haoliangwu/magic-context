@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { readReplayDocument } from "../../plugin/src/features/magic-context/storage-replay-document";
 import type { MockResponse } from "./mock-provider/server";
 import { RustTestHarness } from "./rust-harness";
 
@@ -740,13 +741,11 @@ async function driveTrailingBlankLane(
     });
     const targetMessageId = harness.prepareTrailingBlankReplay(sessionId);
     const readDecision = (): string | null => {
-        const row = harness
-            .contextDb()
-            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { trailing_blank_decisions?: string | null } | undefined;
-        if (!row?.trailing_blank_decisions) return null;
-        const decisions = JSON.parse(row.trailing_blank_decisions) as Record<string, string>;
-        return decisions[targetMessageId] ?? null;
+        // TTL policy shares the trailing_blank_decisions column and can wrap its decisions
+        // in a versioned replay document before this assistant's first replay pass.
+        return (
+            readReplayDocument(harness.contextDb(), sessionId).trailingBlank[targetMessageId] ?? null
+        );
     };
     const sourceParts = async (): Promise<string[]> =>
         (await harness.listMessages(sessionId))

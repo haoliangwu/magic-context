@@ -12,7 +12,6 @@ Date: 2026-08-29
 |---|---|---|
 | `packages/plugin/src/hooks/magic-context/module-transport.ts` | Plugin host under OpenCode | Its typed local route-open wrapper accepts `Omit<RouteOpenOptions, "consumerIdentity">` and pins `consumerIdentity: null`. |
 | `packages/plugin/scripts/probe-subc-transport.ts` | Shell-run transport probe | Passes `consumerIdentity: null` directly. |
-| `packages/plugin/scripts/drive-preseed.ts` | Shell-run maintenance script | Passes `consumerIdentity: null` directly. |
 | `packages/e2e-tests/src/rust-runner/hermetic-subc.ts` | Hermetic test-host status client | Its typed local route-open wrapper accepts `Omit<RouteOpenOptions, "consumerIdentity">` and pins `consumerIdentity: null`. |
 
 Each host/script call has a one-line explanation: inherited `SUBC_*` credentials identify a daemon-supervised module, not an independent host. The wrappers make an ordinary caller unable to reintroduce `consumerIdentity` through their options argument.

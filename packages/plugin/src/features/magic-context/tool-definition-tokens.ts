@@ -252,6 +252,16 @@ export function recordToolDefinition(
  * Returns the summed measured tokens for a `{provider, model, agent}` key,
  * or `undefined` when never measured (e.g. fresh session before first turn).
  */
+export function getLargestMeasuredToolDefinitionTokens(): number | undefined {
+    let largest = 0;
+    for (const tools of measurements.values()) {
+        let total = 0;
+        for (const tokens of tools.values()) total += tokens;
+        largest = Math.max(largest, total);
+    }
+    return largest > 0 ? largest : undefined;
+}
+
 export function getMeasuredToolDefinitionTokens(
     providerID: string,
     modelID: string,

@@ -1,22 +1,30 @@
-import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { describe, expect, spyOn, test } from "bun:test";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as formatting from "../../hooks/magic-context/read-session-formatting";
 import { estimateTokens, formatBlock } from "../../hooks/magic-context/read-session-formatting";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
+    _resetCompartmentChunkCoverageMemoForTests,
     _resetCompartmentChunkSearchCacheForTests,
     buildCanonicalChunkTextFromFts,
     CHUNK_WINDOW_SAFETY_RATIO,
     canonicalizeInMemoryChunkTextForEmbedding,
     chunkCanonicalText,
     chunkEmbeddingWindowsAreCurrent,
+    chunkWindowSourceKey,
     countSessionCompartmentEmbedCoverage,
+    countSessionCompartmentEmbedCoveragePolite,
     countUnembeddedSessionCompartments,
+    countUnembeddedSessionCompartmentsPolite,
     loadCompartmentChunkEmbeddingsForSearch,
     loadUnembeddedCompartmentChunkCandidates,
     loadUnembeddedSessionChunkCandidates,
+    loadUnembeddedSessionChunkCandidatesPolite,
+    recordChunkEmbedBackoff,
     replaceCompartmentChunkEmbeddings,
 } from "./compartment-chunk-embedding";
 import { embedAndStoreCompartmentChunks } from "./compartment-embedding";
@@ -296,8 +304,56 @@ describe("compartment chunk embedding core", () => {
         }
     });
 
+    test("search pool reflects compartment ranges rewritten after the pool was cached", () => {
+        const db = createDb();
+        try {
+            appendCompartments(db, "ses-rebased", [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 2,
+                    startMessageId: "u1",
+                    endMessageId: "a2",
+                    title: "Rebased range",
+                    content: "P1 content",
+                    p1: "P1 content",
+                },
+            ]);
+            const compartment = getCompartments(db, "ses-rebased")[0];
+            replaceCompartmentChunkEmbeddings(
+                db,
+                chunkCanonicalText("[1] U: hello\n[2] A: world", 1, 2, 10_000).map((window) => ({
+                    compartmentId: compartment.id,
+                    sessionId: "ses-rebased",
+                    projectPath: "/repo/rebased",
+                    window,
+                    modelId: "mock:model",
+                    vector: new Float32Array([1, 0]),
+                })),
+            );
+            const ranges = () =>
+                loadCompartmentChunkEmbeddingsForSearch(
+                    db,
+                    "ses-rebased",
+                    "/repo/rebased",
+                    "mock:model",
+                ).map((row) => [row.startOrdinal, row.endOrdinal]);
+            expect(ranges()).toEqual([[1, 2]]);
+
+            // A coordinate rebase rewrites compartment ranges in place and leaves
+            // the embedding rows untouched.
+            db.prepare(
+                "UPDATE compartments SET start_message = 5, end_message = 6 WHERE id = ?",
+            ).run(compartment.id);
+
+            expect(ranges()).toEqual([[5, 6]]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
     test("coverage stays read-only before the drain renumbers matching one-based rows", async () => {
-        const tempDirectory = mkdtempSync(join(tmpdir(), "chunk-window-renumber-"));
+        const tempDirectory = createTestTempDirFromPath(join(tmpdir(), "chunk-window-renumber-"));
         const databasePath = join(tempDirectory, "store.db");
         const db = createDb(databasePath);
         const embeddedTexts: string[] = [];
@@ -913,6 +969,688 @@ describe("compartment chunk embedding core", () => {
                     maxInputTokens,
                 ),
             ).toEqual({ embedded: 3, total: 3 });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("issue 564 coverage catch-up", () => {
+    test("steady-state coverage and count do not re-tokenize unchanged compartments", async () => {
+        const db = createDb();
+        const sessionId = "ses-coverage-memo";
+        const project = "/repo/coverage-memo";
+        const model = "mock:coverage-memo";
+        try {
+            recordSessionProjectIdentity(db, sessionId, project);
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "u1",
+                    endMessageId: "u1",
+                    title: "Memo",
+                    content: "Memo",
+                    p1: "Memo",
+                },
+            ]);
+            insertFtsRow(db, sessionId, 1, "user", "A unique message for the coverage memo");
+            const tokens = spyOn(formatting, "estimateTokens");
+            try {
+                expect(
+                    (
+                        await countSessionCompartmentEmbedCoveragePolite(
+                            db,
+                            project,
+                            sessionId,
+                            model,
+                        )
+                    ).total,
+                ).toBe(1);
+                expect(tokens.mock.calls.length).toBeGreaterThan(0);
+                tokens.mockClear();
+                expect(
+                    await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, model),
+                ).toBe(1);
+                expect(
+                    (
+                        await loadUnembeddedSessionChunkCandidatesPolite(
+                            db,
+                            project,
+                            sessionId,
+                            model,
+                            1,
+                        )
+                    ).length,
+                ).toBe(1);
+                expect(
+                    (
+                        await countSessionCompartmentEmbedCoveragePolite(
+                            db,
+                            project,
+                            sessionId,
+                            model,
+                        )
+                    ).embedded,
+                ).toBe(0);
+                expect(tokens).toHaveBeenCalledTimes(0);
+            } finally {
+                tokens.mockRestore();
+            }
+            // Replacing indexed message text must invalidate cached window hashes
+            // even when the owning compartment row remains unchanged.
+            insertFtsRow(db, sessionId, 1, "assistant", "New text");
+            expect(
+                (await countSessionCompartmentEmbedCoveragePolite(db, project, sessionId, model))
+                    .embedded,
+            ).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("recorded window sources skip re-chunking after a restart", () => {
+    const MAX_TOKENS = 64;
+    type Seeded = ReturnType<typeof getCompartments>[number];
+
+    // One compartment per ordinal, each long enough to need several windows.
+    function seed(db: Database, sessionId: string, projectPath: string, count: number): Seeded[] {
+        recordSessionProjectIdentity(db, sessionId, projectPath);
+        appendCompartments(
+            db,
+            sessionId,
+            Array.from({ length: count }, (_, index) => ({
+                sequence: index,
+                startMessage: index + 1,
+                endMessage: index + 1,
+                startMessageId: `u${index + 1}`,
+                endMessageId: `u${index + 1}`,
+                title: `Compartment ${index + 1}`,
+                content: "summary",
+                p1: "summary",
+            })),
+        );
+        for (let index = 0; index < count; index++) {
+            insertFtsRow(
+                db,
+                sessionId,
+                index + 1,
+                "user",
+                Array.from({ length: 320 }, (_, word) => `c${index}-token-${word}`).join(" "),
+            );
+        }
+        return getCompartments(db, sessionId);
+    }
+
+    function currentInput(db: Database, sessionId: string, compartment: Seeded) {
+        const text =
+            buildCanonicalChunkTextFromFts(
+                db,
+                sessionId,
+                compartment.startMessage,
+                compartment.endMessage,
+            ) ?? "";
+        const windows = chunkCanonicalText(
+            text,
+            compartment.startMessage,
+            compartment.endMessage,
+            MAX_TOKENS,
+        );
+        expect(windows.length).toBeGreaterThan(1);
+        const sourceKey = chunkWindowSourceKey(
+            text,
+            compartment.startMessage,
+            compartment.endMessage,
+            MAX_TOKENS,
+        );
+        return { windows, sourceKey };
+    }
+
+    function writeRows(
+        db: Database,
+        sessionId: string,
+        projectPath: string,
+        modelId: string,
+        compartment: Seeded,
+        windows: ReturnType<typeof chunkCanonicalText>,
+        sourceKey?: string,
+    ): void {
+        replaceCompartmentChunkEmbeddings(
+            db,
+            windows.map((window) => ({
+                compartmentId: compartment.id,
+                sessionId,
+                projectPath,
+                window,
+                modelId,
+                vector: new Float32Array([1, 0]),
+            })),
+            sourceKey,
+        );
+    }
+
+    function windowSourceKeys(db: Database): string[] {
+        return (
+            db
+                .prepare(
+                    "SELECT key FROM schema_migrations_meta WHERE key LIKE 'chunk_embed_windows:%' ORDER BY key",
+                )
+                .all() as Array<{ key: string }>
+        ).map((row) => row.key);
+    }
+
+    async function countWithTokenSpy(
+        run: () => Promise<unknown> | unknown,
+    ): Promise<{ result: unknown; tokenCalls: number }> {
+        const tokens = spyOn(formatting, "estimateTokens");
+        try {
+            const result = await run();
+            return { result, tokenCalls: tokens.mock.calls.length };
+        } finally {
+            tokens.mockRestore();
+        }
+    }
+
+    test("a cold coverage count confirms recorded rows without chunking", async () => {
+        const db = createDb();
+        const sessionId = "ses-window-source-cold";
+        const projectPath = "/repo/window-source-cold";
+        const modelId = "mock:window-source";
+        try {
+            const compartments = seed(db, sessionId, projectPath, 2);
+            for (const compartment of compartments) {
+                const { windows, sourceKey } = currentInput(db, sessionId, compartment);
+                writeRows(db, sessionId, projectPath, modelId, compartment, windows, sourceKey);
+            }
+            _resetCompartmentChunkCoverageMemoForTests();
+
+            const polite = await countWithTokenSpy(() =>
+                countSessionCompartmentEmbedCoveragePolite(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    MAX_TOKENS,
+                ),
+            );
+            expect(polite.result).toEqual({ embedded: 2, total: 2 });
+            expect(polite.tokenCalls).toBe(0);
+            const sync = await countWithTokenSpy(() =>
+                countSessionCompartmentEmbedCoverage(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    MAX_TOKENS,
+                ),
+            );
+            expect(sync.result).toEqual({ embedded: 2, total: 2 });
+            expect(sync.tokenCalls).toBe(0);
+
+            clearSession(db, sessionId);
+            expect(windowSourceKeys(db)).toEqual([]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("changed transcript text is detected despite a recorded source", async () => {
+        const db = createDb();
+        const sessionId = "ses-window-source-text";
+        const projectPath = "/repo/window-source-text";
+        const modelId = "mock:window-source";
+        try {
+            const [compartment] = seed(db, sessionId, projectPath, 1);
+            const { windows, sourceKey } = currentInput(db, sessionId, compartment);
+            writeRows(db, sessionId, projectPath, modelId, compartment, windows, sourceKey);
+            // Re-indexing the message replaces the text the windows were cut from.
+            insertFtsRow(
+                db,
+                sessionId,
+                1,
+                "user",
+                Array.from({ length: 320 }, (_, word) => `edited-token-${word}`).join(" "),
+            );
+            _resetCompartmentChunkCoverageMemoForTests();
+
+            expect(
+                await countSessionCompartmentEmbedCoveragePolite(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    MAX_TOKENS,
+                ),
+            ).toEqual({ embedded: 0, total: 1 });
+            expect(
+                loadUnembeddedSessionChunkCandidates(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    5,
+                    undefined,
+                    MAX_TOKENS,
+                ).map((candidate) => candidate.id),
+            ).toEqual([compartment.id]);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a different model id is detected despite a recorded source", async () => {
+        const db = createDb();
+        const sessionId = "ses-window-source-model";
+        const projectPath = "/repo/window-source-model";
+        try {
+            const [compartment] = seed(db, sessionId, projectPath, 1);
+            const { windows, sourceKey } = currentInput(db, sessionId, compartment);
+            writeRows(db, sessionId, projectPath, "mock:model-a", compartment, windows, sourceKey);
+            _resetCompartmentChunkCoverageMemoForTests();
+
+            expect(
+                countSessionCompartmentEmbedCoverage(
+                    db,
+                    projectPath,
+                    sessionId,
+                    "mock:model-a",
+                    MAX_TOKENS,
+                ),
+            ).toEqual({ embedded: 1, total: 1 });
+            expect(
+                await countSessionCompartmentEmbedCoveragePolite(
+                    db,
+                    projectPath,
+                    sessionId,
+                    "mock:model-b",
+                    MAX_TOKENS,
+                ),
+            ).toEqual({ embedded: 0, total: 1 });
+            expect(
+                countUnembeddedSessionCompartments(
+                    db,
+                    projectPath,
+                    sessionId,
+                    "mock:model-b",
+                    MAX_TOKENS,
+                ),
+            ).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a different token budget re-chunks instead of trusting the recorded source", async () => {
+        const db = createDb();
+        const sessionId = "ses-window-source-budget";
+        const projectPath = "/repo/window-source-budget";
+        const modelId = "mock:window-source";
+        try {
+            const [compartment] = seed(db, sessionId, projectPath, 1);
+            const { windows, sourceKey } = currentInput(db, sessionId, compartment);
+            writeRows(db, sessionId, projectPath, modelId, compartment, windows, sourceKey);
+            _resetCompartmentChunkCoverageMemoForTests();
+
+            const wider = await countWithTokenSpy(() =>
+                countSessionCompartmentEmbedCoveragePolite(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    MAX_TOKENS * 4,
+                ),
+            );
+            expect(wider.result).toEqual({ embedded: 0, total: 1 });
+            expect(wider.tokenCalls).toBeGreaterThan(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("rows without a recorded source are classified by chunking, and counts write nothing", async () => {
+        const tempDirectory = createTestTempDirFromPath(join(tmpdir(), "chunk-window-source-"));
+        const databasePath = join(tempDirectory, "store.db");
+        const db = createDb(databasePath);
+        const sessionId = "ses-window-source-legacy";
+        const projectPath = "/repo/window-source-legacy";
+        const modelId = "mock:window-source";
+        let observer: Database | null = null;
+        try {
+            const [current, stale] = seed(db, sessionId, projectPath, 2);
+            const currentRows = currentInput(db, sessionId, current);
+            writeRows(db, sessionId, projectPath, modelId, current, currentRows.windows);
+            const staleRows = currentInput(db, sessionId, stale);
+            writeRows(
+                db,
+                sessionId,
+                projectPath,
+                modelId,
+                stale,
+                staleRows.windows.map((window, index) =>
+                    index === 0 ? { ...window, chunkHash: `stale-${window.chunkHash}` } : window,
+                ),
+            );
+            expect(windowSourceKeys(db)).toEqual([]);
+            _resetCompartmentChunkCoverageMemoForTests();
+
+            observer = new Database(databasePath);
+            const dataVersion = () =>
+                (observer?.prepare("PRAGMA data_version").get() as { data_version: number })
+                    .data_version;
+            const before = dataVersion();
+            const counted = await countWithTokenSpy(() =>
+                countSessionCompartmentEmbedCoveragePolite(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    MAX_TOKENS,
+                ),
+            );
+            expect(counted.result).toEqual({ embedded: 1, total: 2 });
+            expect(counted.tokenCalls).toBeGreaterThan(0);
+            expect(
+                countSessionCompartmentEmbedCoverage(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    MAX_TOKENS,
+                ),
+            ).toEqual({ embedded: 1, total: 2 });
+            expect(
+                loadUnembeddedSessionChunkCandidates(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    5,
+                    undefined,
+                    MAX_TOKENS,
+                ).map((candidate) => candidate.id),
+            ).toEqual([stale.id]);
+            expect(dataVersion()).toBe(before);
+            expect(windowSourceKeys(db)).toEqual([]);
+        } finally {
+            if (observer) closeQuietly(observer);
+            closeQuietly(db);
+            rmSync(tempDirectory, { recursive: true, force: true });
+        }
+    });
+
+    test("a lease-held scan records sources for current and renumbered legacy rows", async () => {
+        const db = createDb();
+        const sessionId = "ses-window-source-backfill";
+        const projectPath = "/repo/window-source-backfill";
+        const modelId = "mock:window-source";
+        try {
+            const [current, oneBased] = seed(db, sessionId, projectPath, 2);
+            const currentRows = currentInput(db, sessionId, current);
+            writeRows(db, sessionId, projectPath, modelId, current, currentRows.windows);
+            const oneBasedRows = currentInput(db, sessionId, oneBased);
+            writeRows(
+                db,
+                sessionId,
+                projectPath,
+                modelId,
+                oneBased,
+                oneBasedRows.windows.map((window) => ({
+                    ...window,
+                    windowIndex: window.windowIndex + 1,
+                })),
+            );
+            _resetCompartmentChunkCoverageMemoForTests();
+
+            expect(
+                await loadUnembeddedSessionChunkCandidatesPolite(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    5,
+                    [],
+                    MAX_TOKENS,
+                    true,
+                ),
+            ).toEqual([]);
+            expect(windowSourceKeys(db)).toEqual(
+                [current.id, oneBased.id].map((id) => `chunk_embed_windows:${id}`).sort(),
+            );
+            expect(
+                loadCompartmentChunkEmbeddingsForSearch(db, sessionId, projectPath, modelId)
+                    .filter((row) => row.compartmentId === oneBased.id)
+                    .map((row) => row.windowIndex),
+            ).toEqual(oneBasedRows.windows.map((window) => window.windowIndex));
+
+            _resetCompartmentChunkCoverageMemoForTests();
+            const restarted = await countWithTokenSpy(() =>
+                countSessionCompartmentEmbedCoveragePolite(
+                    db,
+                    projectPath,
+                    sessionId,
+                    modelId,
+                    MAX_TOKENS,
+                ),
+            );
+            expect(restarted.result).toEqual({ embedded: 2, total: 2 });
+            expect(restarted.tokenCalls).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("classification with recorded sources equals classification by re-chunking", async () => {
+        const db = createDb();
+        const sessionId = "ses-window-source-mixed";
+        const projectPath = "/repo/window-source-mixed";
+        const modelId = "mock:window-source";
+        try {
+            const compartments = seed(db, sessionId, projectPath, 9);
+            const [
+                recordedCurrent,
+                recordedTextChanged,
+                recordedRowsStale,
+                recordedRowMissing,
+                recordedOtherModel,
+                legacyCurrent,
+                legacyOneBased,
+                legacyStale,
+                unembedded,
+            ] = compartments;
+            const inputs = new Map(
+                compartments.map((compartment) => [
+                    compartment.id,
+                    currentInput(db, sessionId, compartment),
+                ]),
+            );
+            const input = (compartment: Seeded) => {
+                const value = inputs.get(compartment.id);
+                if (!value) throw new Error("missing fixture input");
+                return value;
+            };
+            for (const compartment of [
+                recordedCurrent,
+                recordedTextChanged,
+                recordedRowsStale,
+                recordedRowMissing,
+            ]) {
+                const { windows, sourceKey } = input(compartment);
+                writeRows(db, sessionId, projectPath, modelId, compartment, windows, sourceKey);
+            }
+            writeRows(
+                db,
+                sessionId,
+                projectPath,
+                "mock:other-model",
+                recordedOtherModel,
+                input(recordedOtherModel).windows,
+                input(recordedOtherModel).sourceKey,
+            );
+            // Later writes without a source leave the old record in place.
+            writeRows(
+                db,
+                sessionId,
+                projectPath,
+                modelId,
+                recordedRowsStale,
+                input(recordedRowsStale).windows.map((window, index) =>
+                    index === 1 ? { ...window, chunkHash: `stale-${window.chunkHash}` } : window,
+                ),
+            );
+            writeRows(
+                db,
+                sessionId,
+                projectPath,
+                modelId,
+                recordedRowMissing,
+                input(recordedRowMissing).windows.slice(0, -1),
+            );
+            insertFtsRow(
+                db,
+                sessionId,
+                recordedTextChanged.startMessage,
+                "user",
+                // Same shape as the seeded text, so only the window hashes change.
+                Array.from({ length: 320 }, (_, word) => `x1-token-${word}`).join(" "),
+            );
+            writeRows(
+                db,
+                sessionId,
+                projectPath,
+                modelId,
+                legacyCurrent,
+                input(legacyCurrent).windows,
+            );
+            writeRows(
+                db,
+                sessionId,
+                projectPath,
+                modelId,
+                legacyOneBased,
+                input(legacyOneBased).windows.map((window) => ({
+                    ...window,
+                    windowIndex: window.windowIndex + 1,
+                })),
+            );
+            writeRows(
+                db,
+                sessionId,
+                projectPath,
+                modelId,
+                legacyStale,
+                input(legacyStale).windows.map((window, index) =>
+                    index === 0 ? { ...window, chunkHash: `stale-${window.chunkHash}` } : window,
+                ),
+            );
+            expect(unembedded.id).toBeGreaterThan(0);
+
+            const classify = async () => {
+                _resetCompartmentChunkCoverageMemoForTests();
+                return {
+                    coverage: countSessionCompartmentEmbedCoverage(
+                        db,
+                        projectPath,
+                        sessionId,
+                        modelId,
+                        MAX_TOKENS,
+                    ),
+                    politeCoverage: await countSessionCompartmentEmbedCoveragePolite(
+                        db,
+                        projectPath,
+                        sessionId,
+                        modelId,
+                        MAX_TOKENS,
+                    ),
+                    unembedded: countUnembeddedSessionCompartments(
+                        db,
+                        projectPath,
+                        sessionId,
+                        modelId,
+                        MAX_TOKENS,
+                    ),
+                    candidates: loadUnembeddedSessionChunkCandidates(
+                        db,
+                        projectPath,
+                        sessionId,
+                        modelId,
+                        20,
+                        undefined,
+                        MAX_TOKENS,
+                    ).map((candidate) => candidate.id),
+                };
+            };
+
+            const withRecords = await classify();
+            expect(windowSourceKeys(db).length).toBe(5);
+            db.prepare(
+                "DELETE FROM schema_migrations_meta WHERE key LIKE 'chunk_embed_windows:%'",
+            ).run();
+            const byChunking = await classify();
+
+            expect(withRecords).toEqual(byChunking);
+            // Missing windows sort ahead of stale ones; each group keeps ordinal order.
+            expect(byChunking).toEqual({
+                coverage: { embedded: 3, total: 9 },
+                politeCoverage: { embedded: 3, total: 9 },
+                unembedded: 6,
+                candidates: [
+                    recordedRowMissing.id,
+                    recordedOtherModel.id,
+                    unembedded.id,
+                    recordedTextChanged.id,
+                    recordedRowsStale.id,
+                    legacyStale.id,
+                ],
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+
+describe("issue 564 failed-compartment backoff", () => {
+    test("persists a content- and identity-scoped retry delay and removes it with the session", async () => {
+        const db = createDb();
+        const sessionId = "ses-backoff";
+        const project = "/repo/backoff";
+        try {
+            recordSessionProjectIdentity(db, sessionId, project);
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: 0,
+                    startMessage: 1,
+                    endMessage: 1,
+                    startMessageId: "u1",
+                    endMessageId: "u1",
+                    title: "Retry",
+                    content: "Retry",
+                    p1: "Retry",
+                },
+            ]);
+            insertFtsRow(db, sessionId, 1, "user", "Original text");
+            const candidate = getCompartments(db, sessionId)[0];
+            expect(
+                await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, "model:a"),
+            ).toBe(1);
+            recordChunkEmbedBackoff(db, candidate, project, "model:a");
+            expect(
+                await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, "model:a"),
+            ).toBe(0);
+            expect(
+                await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, "model:b"),
+            ).toBe(1);
+            insertFtsRow(db, sessionId, 1, "assistant", "Repaired text");
+            expect(
+                await countUnembeddedSessionCompartmentsPolite(db, project, sessionId, "model:a"),
+            ).toBe(1);
+            clearSession(db, sessionId);
+            expect(
+                db
+                    .prepare("SELECT key FROM schema_migrations_meta WHERE key = ?")
+                    .get(`chunk_embed_backoff:${candidate.id}`),
+            ).toBeNull();
         } finally {
             closeQuietly(db);
         }

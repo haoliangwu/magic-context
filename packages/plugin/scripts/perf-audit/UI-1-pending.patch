@@ -1,0 +1,620 @@
+diff --git a/packages/dashboard/src-tauri/src/db.rs b/packages/dashboard/src-tauri/src/db.rs
+index 493e3a4d32..fc6927edf9 100644
+--- a/packages/dashboard/src-tauri/src/db.rs
++++ b/packages/dashboard/src-tauri/src/db.rs
+@@ -1044,13 +1044,14 @@ pub struct PagedSessions {
+     pub conditions: Vec<SessionScanCondition>,
+ }
+
++// The Messages tab consumes previews only. Full harness metadata stays in the
++// harness readers for cache diagnostics, not in this potentially large IPC list.
+ #[derive(Debug, Serialize, Clone)]
+ pub struct SessionMessageRow {
+     pub message_id: String,
+     pub timestamp_ms: i64,
+     pub role: String,
+     pub text_preview: String,
+-    pub raw_json: serde_json::Value,
+ }
+
+ #[derive(Debug, Serialize, Clone)]
+@@ -6773,7 +6774,6 @@ pub fn get_session_messages(
+                     timestamp_ms: message.timestamp_ms,
+                     role: message.role.clone(),
+                     text_preview: message.text_preview.clone(),
+-                    raw_json: message.raw_json.clone(),
+                 })
+                 .collect())
+         }
+@@ -6947,12 +6947,14 @@ fn load_opencode_messages(
+     };
+     let mut stmt = conn.prepare(sql)?;
+     let rows = stmt.query_map([session_id], |row| {
++        // Preserve storage-type errors even when part text supplies the preview;
++        // only the expensive JSON deserialization is conditional.
+         let raw_string: String = row.get(3)?;
+-        let raw_json: serde_json::Value = serde_json::from_str(&raw_string).unwrap_or_default();
+         let aggregated_text: String = row.get(4)?;
+         // Use aggregated parts text when present; fall back to legacy in-message content
+         // (covers any future schema variants where text might live on the message row).
+         let text_preview = if aggregated_text.is_empty() {
++            let raw_json: serde_json::Value = serde_json::from_str(&raw_string).unwrap_or_default();
+             preview_from_json(&raw_json)
+         } else {
+             normalize_preview(&aggregated_text)
+@@ -6962,7 +6964,6 @@ fn load_opencode_messages(
+             timestamp_ms: row.get(1)?,
+             role: row.get(2)?,
+             text_preview,
+-            raw_json,
+         })
+     })?;
+     rows.collect()
+@@ -8355,6 +8356,10 @@ pub fn get_db_health(db_path: &PathBuf) -> DbHealth {
+     }
+ }
+
++#[cfg(all(test, unix))]
++#[path = "../tests/perf_ui/mod.rs"]
++mod perf_ui;
++
+ #[cfg(test)]
+ mod cache_session_list_query_tests {
+     use super::*;
+@@ -9602,6 +9607,52 @@ mod load_messages_tests {
+         conn
+     }
+
++    #[test]
++    fn message_ipc_contains_only_display_fields_and_keeps_legacy_preview() {
++        let conn = make_test_db();
++        conn.execute(
++            "INSERT INTO message VALUES ('legacy', 'ses_test', 123, ?1)",
++            [r#"{"role":"user","content":[{"text":"  legacy\ntext  "}],"private_metadata":"not displayed"}"#],
++        ).unwrap();
++        let rows = load_opencode_messages(&conn, OpenCodeStoreGeneration::V1, "ses_test").unwrap();
++        assert_eq!(
++            serde_json::to_value(rows).unwrap(),
++            serde_json::json!([{
++                "message_id": "legacy", "timestamp_ms": 123,
++                "role": "user", "text_preview": "legacy text"
++            }])
++        );
++    }
++
++    #[test]
++    fn v2_preview_and_control_row_filter_are_preserved_without_raw_metadata() {
++        let conn = Connection::open_in_memory().unwrap();
++        conn.execute_batch("CREATE TABLE session_message(id TEXT, session_id TEXT, seq INTEGER, time_created INTEGER, type TEXT, data TEXT);").unwrap();
++        for (seq, kind, data) in [
++            (0, "idle", r#"{"content":"invisible"}"#),
++            (1, "user", r#"{"content":"  hello\nworld "}"#),
++            (2, "assistant", r#"{"parts":[{"text":"answer"}]}"#),
++            (3, "user", "malformed metadata"),
++        ] {
++            conn.execute(
++                "INSERT INTO session_message VALUES (?1, 's', ?2, ?2, ?3, ?4)",
++                rusqlite::params![format!("m{seq}"), seq, kind, data],
++            )
++            .unwrap();
++        }
++        let rows = load_opencode_messages(&conn, OpenCodeStoreGeneration::V2, "s").unwrap();
++        assert_eq!(
++            serde_json::to_value(rows).unwrap(),
++            serde_json::json!([
++                {"message_id":"m1", "timestamp_ms":1, "role":"user", "text_preview":"hello world"},
++                {"message_id":"m2", "timestamp_ms":2, "role":"assistant", "text_preview":"answer"},
++                {"message_id":"m3", "timestamp_ms":3, "role":"user", "text_preview":""}
++            ])
++        );
++        conn.execute("INSERT INTO session_message VALUES ('null-data', 's', 4, 4, 'user', NULL)", []).unwrap();
++        assert!(load_opencode_messages(&conn, OpenCodeStoreGeneration::V2, "s").is_err());
++    }
++
+     fn insert_message(conn: &Connection, id: &str, role: &str, time: i64) {
+         conn.execute(
+             "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, 'ses_test', ?2, ?3)",
+diff --git a/packages/dashboard/src-tauri/tests/perf_ui/mod.rs b/packages/dashboard/src-tauri/tests/perf_ui/mod.rs
+new file mode 100644
+index 0000000000..1019bfd333
+--- /dev/null
++++ b/packages/dashboard/src-tauri/tests/perf_ui/mod.rs
+@@ -0,0 +1,486 @@
++//! Native read-only audit. Set PERF_UI_ROOT to an isolated root containing
++//! scrubbed VACUUM INTO copies, PERF_UI_SESSION to a large real session, and
++//! HOME/XDG_DATA_HOME/XDG_CONFIG_HOME/PI_CODING_AGENT_DIR/BROCA_STATE_ROOT to
++//! directories underneath that root. Never run this against a live store.
++use super::*;
++use sha2::{Digest, Sha256};
++use std::io::Write;
++use std::time::Instant;
++
++fn timed<T>(label: &str, run: impl FnOnce() -> T) -> T {
++    let start = Instant::now();
++    let result = run();
++    println!("{label}: {:.3} ms", start.elapsed().as_secs_f64() * 1000.0);
++    result
++}
++
++// Frozen pre-optimization message query and DTO. Keeping the original parse
++// and serialization path here lets one binary compare both on the same store.
++#[derive(Serialize)]
++struct LegacyMessage {
++    message_id: String,
++    timestamp_ms: i64,
++    role: String,
++    text_preview: String,
++    raw_json: serde_json::Value,
++}
++
++fn legacy_messages(conn: &Connection, generation: OpenCodeStoreGeneration, session: &str) -> Vec<LegacyMessage> {
++    let sql = match generation {
++        OpenCodeStoreGeneration::V1 => "SELECT CAST(m.id AS TEXT), m.time_created,
++        COALESCE(CAST(json_extract(m.data, '$.role') AS TEXT), ''), m.data,
++        COALESCE((SELECT GROUP_CONCAT(json_extract(p.data, '$.text'), ' ')
++            FROM part p WHERE p.message_id=m.id
++            AND json_extract(p.data, '$.type')='text'
++            AND json_extract(p.data, '$.text') IS NOT NULL), '')
++        FROM message m WHERE m.session_id=?1 ORDER BY m.time_created ASC",
++        OpenCodeStoreGeneration::V2 => "SELECT CAST(m.id AS TEXT), m.time_created,
++            CASE WHEN m.type='assistant' THEN 'assistant' ELSE 'user' END, m.data, ''
++            FROM session_message m WHERE m.session_id=?1
++            AND m.type NOT IN ('idle','agent-switched','model-switched','location-switched')
++            ORDER BY m.seq ASC",
++    };
++    let mut stmt = conn
++        .prepare(sql)
++        .unwrap();
++    let rows = stmt
++        .query_map([session], |row| {
++            let raw_string: String = row.get(3)?;
++            let raw_json: serde_json::Value = serde_json::from_str(&raw_string).unwrap_or_default();
++            let aggregated_text: String = row.get(4)?;
++            let text_preview = if aggregated_text.is_empty() {
++                preview_from_json(&raw_json)
++            } else {
++                normalize_preview(&aggregated_text)
++            };
++            Ok(LegacyMessage {
++                message_id: row.get(0)?,
++                timestamp_ms: row.get(1)?,
++                role: row.get(2)?,
++                text_preview,
++                raw_json,
++            })
++        })
++        .unwrap()
++        .collect::<Result<Vec<_>, _>>()
++        .unwrap();
++    rows
++}
++
++#[test]
++#[ignore = "requires isolated real-store copies; run with --ignored --nocapture"]
++fn native_dashboard_audit() {
++    let root = PathBuf::from(std::env::var("PERF_UI_ROOT").expect("isolated root required"));
++    assert!(
++        root.join("paths-isolated").is_file(),
++        "reroot recorded directory pointers before native discovery"
++    );
++    for key in [
++        "HOME",
++        "XDG_DATA_HOME",
++        "XDG_CONFIG_HOME",
++        "PI_CODING_AGENT_DIR",
++        "BROCA_STATE_ROOT",
++    ] {
++        assert!(
++            PathBuf::from(std::env::var(key).expect(key)).starts_with(&root),
++            "{key} not isolated"
++        );
++    }
++    let session = std::env::var("PERF_UI_SESSION").expect("large session required");
++    let host_path = resolve_opencode_db_path().unwrap();
++    let context_path = resolve_db_path().unwrap();
++    assert!(host_path.starts_with(&root) && context_path.starts_with(&root));
++    let host = open_readonly(&host_path).unwrap();
++    let context = open_readonly(&context_path).unwrap();
++    let generation = resolve_opencode_sessions(&host).unwrap().owner(&session).unwrap();
++    println!("session generation: {generation:?}");
++    let handles = std::process::Command::new("lsof")
++        .args(["-p", &std::process::id().to_string()])
++        .output()
++        .unwrap();
++    let handles = String::from_utf8(handles.stdout).unwrap();
++    let db_handles: Vec<_> = handles
++        .lines()
++        .filter(|line| line.contains(".db"))
++        .collect();
++    assert!(!db_handles.is_empty());
++    assert!(db_handles
++        .iter()
++        .all(|line| line.contains(root.to_str().unwrap())));
++    println!("lsof: {} isolated DB handles", db_handles.len());
++    for pass in ["cold", "warm"] {
++        println!("=== {pass} ===");
++        let before = timed("UI-1 legacy message query", || {
++            legacy_messages(&host, generation, &session)
++        });
++        let before_wire = timed("UI-1 legacy serde serialize", || {
++            serde_json::to_vec(&before).unwrap()
++        });
++        let after = timed("UI-1 current message query", || {
++            load_opencode_messages(&host, generation, &session).unwrap()
++        });
++        let after_wire = timed("UI-1 current serde serialize", || {
++            serde_json::to_vec(&after).unwrap()
++        });
++        let mut display_before = serde_json::to_value(&before).unwrap();
++        for row in display_before.as_array_mut().unwrap() {
++            row.as_object_mut().unwrap().remove("raw_json");
++        }
++        let display_after = serde_json::to_value(&after).unwrap();
++        assert_eq!(display_before, display_after, "displayed messages changed");
++        let display_wire = serde_json::to_vec(&display_after).unwrap();
++        println!(
++            "UI-1 rows={} IPC={} -> {} display_sha256={:x}",
++            after.len(),
++            before_wire.len(),
++            after_wire.len(),
++            Sha256::digest(&display_wire)
++        );
++        if pass == "warm" {
++            std::fs::write(root.join("native-before-ipc.json"), before_wire).unwrap();
++            std::fs::write(root.join("native-after-ipc.json"), after_wire).unwrap();
++        }
++        let detail = timed("UI-2/UI-8 session detail", || {
++            get_session_detail(Some(&context), Harness::Opencode, &session)
++                .unwrap()
++                .unwrap()
++        });
++        if pass == "warm" {
++            std::fs::write(
++                root.join("native-detail.json"),
++                serde_json::to_vec(&detail).unwrap(),
++            )
++            .unwrap();
++        }
++        let index: HashMap<_, _> = after
++            .iter()
++            .enumerate()
++            .map(|(i, m)| (m.message_id.as_str(), i))
++            .collect();
++        let last_boundary = detail
++            .compartments
++            .iter()
++            .filter_map(|c| c.end_message_id.as_deref().and_then(|id| index.get(id)))
++            .max()
++            .copied();
++        let visible_tail = after
++            .iter()
++            .skip(last_boundary.map_or(0, |i| i + 1))
++            .filter(|m| m.role != "assistant" || !m.text_preview.trim().is_empty())
++            .count();
++        println!(
++            "UI-2 compartments={} visible_live_tail={visible_tail}",
++            detail.compartments.len()
++        );
++        timed("UI-7 full session ownership index", || {
++            resolve_opencode_sessions(&host).unwrap()
++        });
++        timed("UI-7 point ID lower bound", || {
++            host.query_row(
++                "SELECT EXISTS(SELECT 1 FROM session WHERE id=?1)",
++                [&session],
++                |r| r.get::<_, bool>(0),
++            )
++            .unwrap()
++        });
++        timed("UI-8 badge count", || {
++            host.query_row("SELECT COUNT(*) FROM message WHERE session_id=?1 AND json_extract(data,'$.role')='assistant' AND COALESCE(CAST(json_extract(data,'$.tokens.total') AS INTEGER),0)>0", [&session], |r| r.get::<_, i64>(0)).unwrap()
++        });
++        let cards = timed("UI-3 project cards", || get_project_cards(&context));
++        println!("UI-3 cards={}", cards.len());
++        timed("UI-4 get_projects", || get_projects(&context).unwrap());
++        timed("UI-4 get_dreamer_projects", || {
++            get_dreamer_projects(&context).unwrap()
++        });
++        let stats = timed("UI-5 reconcile stats poll", || {
++            get_session_cache_stats_from_db(50, false, true, None)
++        });
++        println!(
++            "UI-5 stats={} IPC={}",
++            stats.len(),
++            serde_json::to_vec(&stats).unwrap().len()
++        );
++        let windows = timed("UI-5 top 10 window loads", || {
++            stats
++                .iter()
++                .take(10)
++                .map(|s| get_session_cache_events(s.harness, &s.session_id, Some(60), None))
++                .collect::<Vec<_>>()
++        });
++        assert!(
++            !stats.is_empty(),
++            "cache poll fixture did not reach any sessions"
++        );
++        if pass == "warm" {
++            std::fs::write(
++                root.join("native-cache-stats.json"),
++                serde_json::to_vec(&stats).unwrap(),
++            )
++            .unwrap();
++            std::fs::write(
++                root.join("native-cache-windows.json"),
++                serde_json::to_vec(&windows).unwrap(),
++            )
++            .unwrap();
++        }
++        timed("UI-5 incremental poll", || {
++            stats
++                .iter()
++                .zip(windows.iter())
++                .map(|(s, events)| {
++                    get_session_cache_events(
++                        s.harness,
++                        &s.session_id,
++                        None,
++                        events.last().map(|e| e.timestamp),
++                    )
++                })
++                .collect::<Vec<_>>()
++        });
++        let paged = timed("UI-9 first session page", || {
++            list_sessions_paged(SessionFilter {
++                limit: Some(50),
++                ..Default::default()
++            })
++        });
++        println!("UI-9 rows={} total={}", paged.rows.len(), paged.total);
++        let memory_stats = timed("UI-13 all memory stats", || {
++            get_memory_stats(&context, None, None).unwrap()
++        });
++        println!("UI-13 memories={}", memory_stats.total);
++    }
++    workspace_and_log_audit(&context, &root);
++    model_catalog_audit(&root);
++    broca_list_audit();
++    jsonl_append_audit(&root);
++}
++
++fn workspace_and_log_audit(context: &Connection, root: &Path) {
++    let mut memories = get_memories(context, None, None, None, None, None, 200, 0).unwrap();
++    assert_eq!(memories.len(), 200, "memory-page fixture too small");
++    let workspace = Connection::open_in_memory().unwrap();
++    workspace.execute_batch("CREATE TABLE schema_migrations(version INTEGER); INSERT INTO schema_migrations VALUES (94);
++        CREATE TABLE workspaces(id INTEGER, name TEXT, share_categories TEXT);
++        CREATE TABLE workspace_members(workspace_id INTEGER, project_path TEXT, display_name TEXT);
++        INSERT INTO workspaces VALUES (1, 'audit', '[]');").unwrap();
++    for i in 0..16 {
++        workspace
++            .execute(
++                "INSERT INTO workspace_members VALUES (1, ?1, ?2)",
++                rusqlite::params![format!("git:project{i}"), format!("Project {i}")],
++            )
++            .unwrap();
++    }
++    for (i, memory) in memories.iter_mut().enumerate() {
++        memory.project_path = format!("git:project{}", i % 16);
++    }
++    timed("UI-14 enrich 200 memories / 16 workspace members", || {
++        enrich_memories_workspace_source(&workspace, Some(1), &mut memories).unwrap()
++    });
++    assert!(memories.iter().all(|m| m.source_display_name.is_some()));
++    for count in [1_000, 10_000, 60_000] {
++        let path = root.join(format!("logs-{count}.log"));
++        let mut file = std::fs::File::create(&path).unwrap();
++        for i in 0..count {
++            writeln!(file, "2026-01-01T00:00:00.000Z INFO  magic-context.perf: [session=opencode:audit] transform pass={i} duration=42").unwrap();
++        }
++        drop(file);
++        let entries = timed(
++            &format!("UI-15 native log tail {count} / 500 visible rows"),
++            || crate::log_parser::read_log_tail(&path, 500),
++        );
++        assert_eq!(entries.len(), 500);
++        if count == 60_000 {
++            std::fs::write(
++                root.join("native-log-entries.json"),
++                serde_json::to_vec(&entries).unwrap(),
++            )
++            .unwrap();
++        }
++        std::fs::remove_file(path).unwrap();
++    }
++}
++
++fn model_catalog_audit(root: &Path) {
++    use std::os::unix::fs::PermissionsExt;
++    let bin = root.join("catalog-bin");
++    std::fs::create_dir_all(&bin).unwrap();
++    let trace = root.join("catalog.trace");
++    let shell_quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
++    for name in ["opencode", "pi", "omp"] {
++        let models = if name == "opencode" {
++            (0..500)
++                .map(|i| format!("anthropic/model-{i}\n"))
++                .collect::<String>()
++        } else {
++            format!(
++                "provider model context max-output reasoning images\n{}",
++                (0..500)
++                    .map(|i| format!("anthropic model-{i} 200k 64k yes yes\n"))
++                    .collect::<String>()
++            )
++        };
++        let path = bin.join(name);
++        std::fs::write(
++            &path,
++            format!(
++                "#!/bin/sh\nprintf '%s\\n' '{name}' >> {}\ncat <<'MODELS'\n{models}MODELS\n",
++                shell_quote(trace.to_str().unwrap())
++            ),
++        )
++        .unwrap();
++        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
++    }
++    let mut env = crate::test_env::EnvGuard::new();
++    env.set(
++        "PATH",
++        format!(
++            "{}:{}",
++            bin.display(),
++            std::env::var("PATH").unwrap_or_default()
++        ),
++    );
++    env.set(
++        "PI_PACKAGE_DIR",
++        root.join("empty-pi-package").to_str().unwrap(),
++    );
++    env.set("PI_CONFIG_DIR", root.join("pi-config").to_str().unwrap());
++    let runtime = tokio::runtime::Runtime::new().unwrap();
++    for pass in ["App", "Dreamer"] {
++        let catalogs = timed(
++            &format!("UI-11 {pass} model catalog / local mock CLIs"),
++            || runtime.block_on(crate::commands::get_model_catalogs()),
++        );
++        assert!(
++            !catalogs.opencode.is_empty(),
++            "catalog probe did not reach mock output"
++        );
++        println!(
++            "UI-11 catalogs opencode={} pi={} omp={}",
++            catalogs.opencode.len(),
++            catalogs.pi.len(),
++            catalogs.omp.len()
++        );
++    }
++    let probes = std::fs::read_to_string(trace).unwrap().lines().count();
++    println!("UI-11 CLI invocations across App and Dreamer: {probes}");
++}
++
++fn broca_list_audit() {
++    for count in [1_000, 10_000, 60_000] {
++        let conn = Connection::open_in_memory().unwrap();
++        conn.execute_batch("CREATE TABLE export_facts(segment_json TEXT); BEGIN;")
++            .unwrap();
++        {
++            let mut insert = conn
++                .prepare("INSERT INTO export_facts VALUES (?1)")
++                .unwrap();
++            for i in 0..count {
++                insert.execute([format!("{{\"session\":{{\"session\":\"s{}\",\"harness\":\"broca\"}},\"occurred_at_ms\":{i}}}", i % 200)]).unwrap();
++            }
++        }
++        conn.execute_batch("COMMIT;").unwrap();
++        let sessions = timed(
++            &format!("UI-5 Broca list {count} facts / 200 sessions"),
++            || load_broca_cache_sessions_from_conn(&conn, None, 50).unwrap(),
++        );
++        assert_eq!(sessions.len(), 50);
++    }
++}
++
++fn jsonl_append_audit(root: &Path) {
++    for count in [1_000, 10_000, 60_000] {
++        let pi_path = root.join(format!("pi-{count}.jsonl"));
++        let claude_path = root.join(format!("claude-{count}.jsonl"));
++        let pi_line = |i: usize| {
++            format!("{{\"type\":\"message\",\"id\":\"m{i}\",\"timestamp\":1700000000000,\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"hello\"}}],\"usage\":{{\"input\":100,\"output\":1,\"totalTokens\":101}}}}}}\n")
++        };
++        let claude_line = |i: usize| {
++            format!("{{\"type\":\"assistant\",\"uuid\":\"m{i}\",\"sessionId\":\"audit\",\"cwd\":\"/audit\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"message\":{{\"model\":\"test\",\"usage\":{{\"input_tokens\":100,\"output_tokens\":1}}}}}}\n")
++        };
++        let mut pi = std::fs::File::create(&pi_path).unwrap();
++        writeln!(
++            pi,
++            "{{\"type\":\"session\",\"id\":\"audit\",\"cwd\":\"/audit\"}}"
++        )
++        .unwrap();
++        let mut claude = std::fs::File::create(&claude_path).unwrap();
++        for i in 0..count {
++            pi.write_all(pi_line(i).as_bytes()).unwrap();
++            claude.write_all(claude_line(i).as_bytes()).unwrap();
++        }
++        drop(pi);
++        drop(claude);
++        timed(&format!("UI-6 Pi cold {count}"), || {
++            pi_sessions::read_pi_session_detail(&pi_path).unwrap()
++        });
++        timed(&format!("UI-6 Claude cold {count}"), || {
++            external_cache_sessions::read_claude_code_session_detail(&claude_path).unwrap()
++        });
++        std::fs::OpenOptions::new()
++            .append(true)
++            .open(&pi_path)
++            .unwrap()
++            .write_all(pi_line(count).as_bytes())
++            .unwrap();
++        std::fs::OpenOptions::new()
++            .append(true)
++            .open(&claude_path)
++            .unwrap()
++            .write_all(claude_line(count).as_bytes())
++            .unwrap();
++        let pi = timed(&format!("UI-6 Pi append {count}"), || {
++            pi_sessions::read_pi_session_detail(&pi_path).unwrap()
++        });
++        if count == 60_000 {
++            let legacy = timed("UI-1 Pi legacy DTO clone / 60k", || {
++                pi.messages
++                    .iter()
++                    .map(|m| LegacyMessage {
++                        message_id: m.entry_id.clone(),
++                        timestamp_ms: m.timestamp_ms,
++                        role: m.role.clone(),
++                        text_preview: m.text_preview.clone(),
++                        raw_json: m.raw_json.clone(),
++                    })
++                    .collect::<Vec<_>>()
++            });
++            let compact = timed("UI-1 Pi compact DTO clone / 60k", || {
++                pi.messages
++                    .iter()
++                    .map(|m| SessionMessageRow {
++                        message_id: m.entry_id.clone(),
++                        timestamp_ms: m.timestamp_ms,
++                        role: m.role.clone(),
++                        text_preview: m.text_preview.clone(),
++                    })
++                    .collect::<Vec<_>>()
++            });
++            let legacy_wire = timed("UI-1 Pi legacy serde serialize / 60k", || {
++                serde_json::to_vec(&legacy).unwrap()
++            });
++            let compact_wire = timed("UI-1 Pi compact serde serialize / 60k", || {
++                serde_json::to_vec(&compact).unwrap()
++            });
++            let mut visible = serde_json::to_value(&legacy).unwrap();
++            for row in visible.as_array_mut().unwrap() {
++                row.as_object_mut().unwrap().remove("raw_json");
++            }
++            assert_eq!(visible, serde_json::to_value(&compact).unwrap());
++            println!(
++                "UI-1 Pi rows={} IPC={} -> {}",
++                compact.len(),
++                legacy_wire.len(),
++                compact_wire.len()
++            );
++        }
++        let claude = timed(&format!("UI-6 Claude append {count}"), || {
++            external_cache_sessions::read_claude_code_session_detail(&claude_path).unwrap()
++        });
++        assert_eq!(pi.messages.len(), count + 1);
++        assert_eq!(claude.events.len(), count + 1);
++        std::fs::remove_file(pi_path).unwrap();
++        std::fs::remove_file(claude_path).unwrap();
++    }
++}
+diff --git a/packages/dashboard/src/lib/types.ts b/packages/dashboard/src/lib/types.ts
+index 9b8694e81f..ffbb87040a 100644
+--- a/packages/dashboard/src/lib/types.ts
++++ b/packages/dashboard/src/lib/types.ts
+@@ -154,7 +154,6 @@ export interface SessionMessageRow {
+   timestamp_ms: number;
+   role: string;
+   text_preview: string;
+-  raw_json: unknown;
+ }
+
+ export interface PiCompactionEntry {

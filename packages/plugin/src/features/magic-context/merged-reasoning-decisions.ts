@@ -1,6 +1,10 @@
 export const MERGED_REASONING_PARTS_PREFIX = "__merged_reasoning_parts_v1__:";
 export type FrozenReasoningPart = string | number;
 
+const decodedDecisions = new Map<string, [string, FrozenReasoningPart[]] | null>();
+let decodedDecisionBytes = 0;
+const MAX_DECODED_DECISION_BYTES = 32 * 1024 * 1024;
+
 /** Stable host part ids are preferred; adapters without ids use the part index. */
 export function decodeMergedReasoningParts(value: string): [string, FrozenReasoningPart[]] | null {
     if (!value.startsWith(MERGED_REASONING_PARTS_PREFIX)) return null;
@@ -36,8 +40,27 @@ export function readFrozenMergedReasoningParts(
 ): Map<string, FrozenReasoningPart[]> {
     const decisions = new Map<string, FrozenReasoningPart[]>();
     for (const value of ids) {
-        const record = decodeMergedReasoningParts(value);
-        if (record && !decisions.has(record[0])) decisions.set(...record);
+        let record = decodedDecisions.get(value);
+        if (record === undefined) {
+            record = decodeMergedReasoningParts(value);
+            const bytes = 2 * value.length + 128;
+            if (bytes <= MAX_DECODED_DECISION_BYTES) {
+                while (
+                    decodedDecisions.size >= 100_000 ||
+                    decodedDecisionBytes + bytes > MAX_DECODED_DECISION_BYTES
+                ) {
+                    const oldest = decodedDecisions.keys().next().value;
+                    if (oldest === undefined) break;
+                    decodedDecisionBytes -= 2 * oldest.length + 128;
+                    decodedDecisions.delete(oldest);
+                }
+                decodedDecisions.set(value, record);
+                decodedDecisionBytes += bytes;
+            }
+        }
+        // Encoded strings are immutable cache keys. Never lend the cached array
+        // to callers, whose pass-local edits must not alter a later replay.
+        if (record && !decisions.has(record[0])) decisions.set(record[0], [...record[1]]);
     }
     return decisions;
 }

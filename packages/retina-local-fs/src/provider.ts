@@ -170,8 +170,13 @@ async function evaluatePredicate(
                 "--verify",
                 `${predicate.sha}^{commit}`,
             ]);
+            // Revalidate both refs even on a quiet poll: the base may have been
+            // deleted or moved. An unchanged tip cannot emit an event, so only
+            // pay for ancestry when a new tip could actually be reported.
             const isAfter =
-                currentSha !== baseSha && (await gitIsAncestor(pathAtUse, baseSha, currentSha));
+                previous?.state !== currentSha &&
+                currentSha !== baseSha &&
+                (await gitIsAncestor(pathAtUse, baseSha, currentSha));
             return {
                 state: currentSha,
                 occurrence: previous?.occurrence ?? 0,
@@ -497,10 +502,10 @@ function parseAtomicPredicate(value: unknown): AtomicPredicate {
             return {
                 kind: predicate.kind,
                 repo_path: requireString(predicate.repo_path, "repo_path"),
-                sha: requireString(predicate.sha, "sha"),
+                sha: requireGitArgument(predicate.sha, "sha"),
                 ...(predicate.ref === undefined
                     ? {}
-                    : { ref: requireString(predicate.ref, "ref") }),
+                    : { ref: requireGitArgument(predicate.ref, "ref") }),
                 ...predicateAudit(predicate),
             };
         case "git_tag_matching": {
@@ -517,7 +522,7 @@ function parseAtomicPredicate(value: unknown): AtomicPredicate {
             return {
                 kind: predicate.kind,
                 repo_path: requireString(predicate.repo_path, "repo_path"),
-                pattern: requireString(predicate.pattern, "pattern"),
+                pattern: requireGitArgument(predicate.pattern, "pattern"),
                 ...(above === undefined ? {} : { above }),
                 ...predicateAudit(predicate),
             };
@@ -571,6 +576,24 @@ function requireString(value: unknown, field: string, allowEmpty = false): strin
         invalid(`${field} must be ${allowEmpty ? "a string" : "a non-empty string"}`);
     }
     return value as string;
+}
+
+/**
+ * A value passed to git as a revision or tag pattern. No shell is involved, but
+ * git parses an argument that starts with "-" as an option (for example
+ * `--format=...` on `git tag --list` rewrites what is reported as tags), and a
+ * control character has no place in a ref name or pattern.
+ */
+function requireGitArgument(value: unknown, field: string): string {
+    const text = requireString(value, field);
+    if (text.startsWith("-")) {
+        invalid(`${field} must not start with "-"`);
+    }
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are what this rejects.
+    if (/[\u0000-\u001f\u007f]/.test(text)) {
+        invalid(`${field} must not contain control characters`);
+    }
+    return text;
 }
 
 function predicateAudit(

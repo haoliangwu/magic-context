@@ -23,7 +23,7 @@
 //! `commons` home (with a vocab registry) if a second consumer — e.g. the
 //! llm-runner — ever needs a Claude tokenizer.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -111,10 +111,13 @@ const HISTORY_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 static HISTORY_COUNTS: OnceLock<std::sync::Mutex<HistoryCounts>> = OnceLock::new();
 
+/// The text of each entry is stored once and shared between the lookup map and
+/// the recency index, so refreshing an entry's recency on a hit copies a pointer
+/// rather than the (possibly very large) text.
 #[derive(Default)]
 struct HistoryCounts {
-    entries: std::collections::HashMap<String, HistoryCount>,
-    age: std::collections::BTreeMap<u64, String>,
+    entries: std::collections::HashMap<Arc<str>, HistoryCount>,
+    age: std::collections::BTreeMap<u64, Arc<str>>,
     clock: u64,
     bytes: usize,
 }
@@ -122,16 +125,32 @@ struct HistoryCounts {
 struct HistoryCount {
     counts: [Option<usize>; 2],
     age: u64,
+    /// The same allocation as this entry's key in `entries`.
+    key: Arc<str>,
+}
+
+/// Bytes charged against [`HISTORY_CACHE_BYTES`] for one cached text. The
+/// formula is the cache's budget convention and is kept stable so the set of
+/// texts that fit, and therefore eviction order, does not change.
+fn history_entry_cost(text_len: usize) -> usize {
+    text_len.saturating_mul(2).saturating_add(128)
 }
 
 impl HistoryCounts {
     fn count(&mut self, text: &str, continued: bool) -> usize {
+        self.count_within(text, continued, HISTORY_CACHE_BYTES)
+    }
+
+    /// [`Self::count`] against an explicit byte budget. Production always uses
+    /// [`HISTORY_CACHE_BYTES`]; tests pass a small budget so eviction can be
+    /// exercised without tokenizing megabytes of text.
+    fn count_within(&mut self, text: &str, continued: bool, budget: usize) -> usize {
         let slot = usize::from(continued);
         self.clock += 1;
         if let Some(entry) = self.entries.get_mut(text) {
             self.age.remove(&entry.age);
             entry.age = self.clock;
-            self.age.insert(self.clock, text.to_owned());
+            self.age.insert(self.clock, Arc::clone(&entry.key));
             if let Some(count) = entry.counts[slot] {
                 return count;
             }
@@ -145,25 +164,27 @@ impl HistoryCounts {
             entry.counts[slot] = Some(count);
             return count;
         }
-        let cost = text.len().saturating_mul(2).saturating_add(128);
-        if cost > HISTORY_CACHE_BYTES {
+        let cost = history_entry_cost(text.len());
+        if cost > budget {
             return count;
         }
-        while self.bytes + cost > HISTORY_CACHE_BYTES {
+        while self.bytes + cost > budget {
             let (_, key) = self.age.pop_first().expect("non-empty bounded cache");
-            self.bytes -= key.len() * 2 + 128;
-            self.entries.remove(&key);
+            self.bytes -= history_entry_cost(key.len());
+            self.entries.remove(&*key);
         }
         let mut counts = [None; 2];
         counts[slot] = Some(count);
+        let key: Arc<str> = Arc::from(text);
         self.entries.insert(
-            text.to_owned(),
+            Arc::clone(&key),
             HistoryCount {
                 counts,
                 age: self.clock,
+                key: Arc::clone(&key),
             },
         );
-        self.age.insert(self.clock, text.to_owned());
+        self.age.insert(self.clock, key);
         self.bytes += cost;
         count
     }
@@ -225,10 +246,10 @@ mod history_cache_tests {
             cache.count(&recent, false);
         }
         assert!(cache.bytes <= HISTORY_CACHE_BYTES);
-        assert!(cache.entries.contains_key(&recent));
+        assert!(cache.entries.contains_key(recent.as_str()));
         assert!(!cache
             .entries
-            .contains_key(&format!("1{}", "x ".repeat(25_000))));
+            .contains_key(format!("1{}", "x ".repeat(25_000)).as_str()));
         assert_eq!(
             cache.bytes,
             cache
@@ -237,5 +258,118 @@ mod history_cache_tests {
                 .map(|s| s.len() * 2 + 128)
                 .sum::<usize>()
         );
+    }
+
+    /// The cache as it was before entries shared their text between the lookup
+    /// map and the recency index: every recency refresh copied the text. Kept
+    /// only as the reference for the differential test below.
+    #[derive(Default)]
+    struct OwnedKeyHistoryCounts {
+        entries: std::collections::HashMap<String, ([Option<usize>; 2], u64)>,
+        age: std::collections::BTreeMap<u64, String>,
+        clock: u64,
+        bytes: usize,
+    }
+
+    impl OwnedKeyHistoryCounts {
+        fn count(&mut self, text: &str, continued: bool, budget: usize) -> usize {
+            let slot = usize::from(continued);
+            self.clock += 1;
+            if let Some(entry) = self.entries.get_mut(text) {
+                self.age.remove(&entry.1);
+                entry.1 = self.clock;
+                self.age.insert(self.clock, text.to_owned());
+                if let Some(count) = entry.0[slot] {
+                    return count;
+                }
+            }
+            let count = if continued {
+                tokenizer().count_ordinary(&format!("{text}#")) - 1
+            } else {
+                tokenizer().count_ordinary(text)
+            };
+            if let Some(entry) = self.entries.get_mut(text) {
+                entry.0[slot] = Some(count);
+                return count;
+            }
+            let cost = text.len().saturating_mul(2).saturating_add(128);
+            if cost > budget {
+                return count;
+            }
+            while self.bytes + cost > budget {
+                let (_, key) = self.age.pop_first().expect("non-empty bounded cache");
+                self.bytes -= key.len() * 2 + 128;
+                self.entries.remove(&key);
+            }
+            let mut counts = [None; 2];
+            counts[slot] = Some(count);
+            self.entries.insert(text.to_owned(), (counts, self.clock));
+            self.age.insert(self.clock, text.to_owned());
+            self.bytes += cost;
+            count
+        }
+    }
+
+    /// Drives the shared-key cache and the owned-key reference through the same
+    /// sequence of lookups (hits, misses, both count slots, evictions and
+    /// oversized bypasses) and requires identical counts, retained entries,
+    /// recency order and byte accounting after every step. A small budget keeps
+    /// the working set several times larger than the cache.
+    #[test]
+    fn shared_key_cache_matches_owned_key_reference() {
+        const BUDGET: usize = 16 * 1024;
+        let texts: Vec<String> = (0..40)
+            .map(|index| {
+                let bytes = match index % 7 {
+                    0 => 3_000,
+                    1 => 3,
+                    _ => 200 * (index % 5 + 1),
+                };
+                format!("## t{index}\n{}", "ab ".repeat(bytes / 3 + 1))
+            })
+            .collect();
+        // Larger than the whole budget: always counted, never cached.
+        let oversized = "ab ".repeat(BUDGET / 6 + 1);
+        let mut shared = HistoryCounts::default();
+        let mut owned = OwnedKeyHistoryCounts::default();
+        // Steps whose insertion evicted enough to shrink the cache; a lower
+        // bound on eviction activity that proves the walk exercised it.
+        let mut evictions = 0;
+        // A fixed pseudo-random walk so the order is reproducible.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for step in 0..3_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let text = if step % 500 == 100 {
+                &oversized
+            } else {
+                &texts[(state % texts.len() as u64) as usize]
+            };
+            let continued = (state >> 32) & 1 == 1;
+            let bytes_before = shared.bytes;
+            assert_eq!(
+                shared.count_within(text, continued, BUDGET),
+                owned.count(text, continued, BUDGET)
+            );
+            if shared.bytes < bytes_before {
+                evictions += 1;
+            }
+            assert_eq!(shared.bytes, owned.bytes);
+            assert_eq!(shared.clock, owned.clock);
+            let shared_age: Vec<(u64, &str)> = shared.age.iter().map(|(k, v)| (*k, &**v)).collect();
+            let owned_age: Vec<(u64, &str)> =
+                owned.age.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            assert_eq!(shared_age, owned_age);
+            for (key, entry) in &shared.entries {
+                let reference = owned.entries.get(&**key).expect("same retained set");
+                assert_eq!(entry.counts, reference.0);
+                assert_eq!(entry.age, reference.1);
+                assert!(Arc::ptr_eq(key, &entry.key));
+            }
+            assert_eq!(shared.entries.len(), owned.entries.len());
+            assert!(shared.bytes <= BUDGET);
+        }
+        assert!(evictions > 100, "only {evictions} evicting steps");
     }
 }

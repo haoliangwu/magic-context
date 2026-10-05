@@ -26,7 +26,7 @@
 //! - **deterministic merge**: exactly one decision per target; `drop` beats
 //!   `edit_marker`; stable output order.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::transform::{utf16_len, utf16_prefix, ReductionDecision};
 
@@ -55,8 +55,20 @@ pub(crate) const RECLAIM_HINT_EXCLUDED_TOOLS: &[&str] = &[
 /// `ctx_note` actions that carry no lasting value (droppable when positively read).
 const CTX_NOTE_ZERO_VALUE_ACTIONS: &[&str] = &["read", "dismiss"];
 /// Mirrors the duplicate-safe tool list in the TypeScript twin:
-/// `packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts`.
+/// `packages/plugin/src/hooks/magic-context/heuristic-cleanup.ts`. Hosts hand over bare tool
+/// names (OpenCode 1.18.30 stores `read`, `grep`, `glob`; Pi stores `read`, `grep`), so the bare
+/// names are what match; the `mcp_` forms cover MCP servers that expose the same tools under that
+/// prefix.
 const DEDUP_SAFE_TOOLS: &[&str] = &[
+    "grep",
+    "read",
+    "glob",
+    "ast_grep_search",
+    "lsp_diagnostics",
+    "lsp_symbols",
+    "lsp_find_references",
+    "lsp_goto_definition",
+    "lsp_prepare_rename",
     "mcp_grep",
     "mcp_read",
     "mcp_glob",
@@ -93,6 +105,12 @@ const TIER_RECENCY_RESERVE: f64 = 0.20;
 pub(crate) const AGE_RECLAIM_MIN_TOKENS: usize = 250;
 /// Minimum reclaim to justify an emergency cache bust (tokens).
 const EMERGENCY_REARM_MIN_TOKENS: f64 = 2000.0;
+/// The selected arcs must together reclaim at least this many tokens, or the pass is
+/// skipped unless another mutation already prices it. The gap check above only proves
+/// there is something to close. One live session spent an hour at 100% context dropping
+/// one fresh tool result per pass, 28 to 149 tokens each against a ~9,200-token gap.
+/// Mirrors the TS `EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS`.
+const EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS: f64 = EMERGENCY_REARM_MIN_TOKENS;
 /// Byte→token estimate for the emergency reclaim math (matches the TS nudge).
 const TOKENS_PER_BYTE: f64 = 0.25;
 /// T1 (keep longest): navigation/structure the agent re-uses.
@@ -103,13 +121,42 @@ const T2_TOOLS: &[&str] = &["edit", "write", "apply_patch", "grep", "glob", "aft
 /// reduce the call block. The skeleton-vs-full choice is frozen at freeze time.
 pub(crate) const RECENT_TOOL_SKELETON_WINDOW: usize = 20;
 
+/// The largest dropped-call input, measured by [`tool_input_string_bytes`], that keeps
+/// its real arguments inside the newest-call window. Larger inputs are removed.
+pub(crate) const SKELETON_REAL_INPUT_MAX_BYTES: usize = 1024;
+
+/// Size of a tool call's input for the real-or-absent rule: the total UTF-8 byte
+/// length of every string value, recursively through objects and arrays. Keys,
+/// numbers, booleans and nulls do not count. Defined on string leaves so the
+/// TypeScript, Pi and Rust lanes compute the same number from the same input
+/// regardless of JSON serialization; `tests/fixtures/tool-input-string-bytes.json`
+/// pins it across all three.
+pub(crate) fn tool_input_string_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(text) => text.len(),
+        serde_json::Value::Array(items) => items.iter().map(tool_input_string_bytes).sum(),
+        serde_json::Value::Object(map) => map.values().map(tool_input_string_bytes).sum(),
+        _ => 0,
+    }
+}
+
+fn is_small_tool_input(value: &serde_json::Value) -> bool {
+    tool_input_string_bytes(value) <= SKELETON_REAL_INPUT_MAX_BYTES
+}
+
 /// The reduction kind emitted per block. `drop` = `[dropped]` placeholder;
-/// `skeleton` = a name-preserving ToolCall shell (newest window, pairing context);
+/// `skeleton_real` = the ToolCall kept exactly as the host sent it (real arguments),
+/// its paired results reduced to the placeholder (newest window with a small input,
+/// the call whose result ends the request, or reasoning adjacency);
 /// `edit_marker` = filePath verbatim + region-hinted diff for a superseded edit.
+///
+/// The legacy `skeleton` kind (arguments replaced by `{"dropped": …}`) is no longer
+/// selected. Frozen legacy units keep replaying until a HARD fold converts them
+/// (see [`legacy_skeleton_conversions`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedKind {
     Drop,
-    Skeleton,
+    SkeletonReal,
     EditMarker,
 }
 
@@ -117,7 +164,7 @@ impl RedKind {
     fn as_str(self) -> &'static str {
         match self {
             RedKind::Drop => "drop",
-            RedKind::Skeleton => "skeleton",
+            RedKind::SkeletonReal => "skeleton_real",
             RedKind::EditMarker => "edit_marker",
         }
     }
@@ -156,6 +203,8 @@ pub enum SelKind {
 /// the selection logic needs on top of the raw incoming item.
 #[derive(Debug, Clone)]
 pub struct SelItem {
+    /// Current representation's local-token count for emergency budgeting; it does not change age-based eligibility.
+    pub served_token_count: Option<usize>,
     pub id: String,
     pub ordinal: u64,
     /// Provider-facing role of the owning message.
@@ -163,6 +212,8 @@ pub struct SelItem {
     pub kind: SelKind,
     /// True = the model's own SERVER-side tool (stays verbatim; never targeted).
     pub provider_executed: bool,
+    /// Host-owned marker: automatic selection must preserve user decisions.
+    pub user_answer: bool,
     /// Bytes this block contributes to reclaim accounting (output/content bytes).
     pub byte_size: usize,
     /// Persisted tag-token estimate for this block, when one exists.
@@ -179,6 +230,8 @@ pub struct SelItem {
 /// caller-owned). For the isolated build these are supplied directly.
 #[derive(Debug, Clone)]
 pub struct SelectionContext {
+    /// Static token policy for this cache-busting selection pass; None retains legacy uncalibrated math.
+    pub calibration: Option<crate::decision_calibration::DecisionCalibration>,
     pub pass_class: PassClass,
     /// Provider-reported current total input tokens from the request usage sample.
     pub current_total_input_tokens: f64,
@@ -209,6 +262,12 @@ pub struct SelectionContext {
     /// True when supersession can ride concrete work already scheduled for this pass.
     /// Unlike `pass_already_busting`, a held emergency latch alone does not set this.
     pub supersession_ride_available: bool,
+    /// True only when a rebuild that is independent of the emergency itself (a fold, an
+    /// m[1] or render-config change, a pending soft refresh) already rewrites the cached
+    /// prefix on this pass. The force-band edge and the 95% backstop are permissions to
+    /// rewrite, not rewrites that are already paid for, so they never set this. Only this
+    /// flag waives the emergency minimum achievable reclaim.
+    pub emergency_minimum_waived: bool,
     /// At the scheduler's >=95% backstop, the token window and tier reserve yield.
     pub emergency_window_yields: bool,
     /// Persisted token-window protection expressed as exact block ids.
@@ -669,8 +728,8 @@ struct ArcIntent {
 /// Selection modes an arc's ToolCall block can freeze into.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArcShape {
-    /// In the newest skeleton window: keep a name-preserving call skeleton.
-    Skeleton,
+    /// Keep the call with its real arguments; only the results are reduced.
+    SkeletonReal,
     /// Older than the window: fully drop the call block.
     FullDrop,
     /// TS duplicate-tool cleanup always fully drops older calls. It bypasses the ordinary
@@ -680,9 +739,10 @@ enum ArcShape {
     EditMarker,
 }
 
-/// Build the only model-visible input for a dropped ToolCall shell. The tagged
-/// form is a pure function of the durable tag id; selection freezes the untagged
-/// form and the renderer fills in the tag from its durable overlay.
+/// The legacy model-visible input of a frozen `skeleton` ToolCall shell. Only replayed
+/// for units frozen before the real-or-absent rule, until a HARD fold converts them.
+/// The tagged form is a pure function of the durable tag id; the renderer fills in
+/// the tag from its durable overlay.
 pub(crate) fn dropped_input_payload(tag_id: Option<i64>) -> String {
     let sentinel = tag_id.map_or_else(
         || DROPPED_PLACEHOLDER.to_string(),
@@ -691,8 +751,132 @@ pub(crate) fn dropped_input_payload(tag_id: Option<i64>) -> String {
     canonical_json(&serde_json::json!({ "dropped": sentinel }))
 }
 
-fn skeleton_payload(_input: &serde_json::Value) -> String {
-    dropped_input_payload(None)
+/// When removing every arc in `removed_arcs` would leave the request's final message
+/// without the content that makes it a valid request end, return the arc to keep (as a
+/// real-argument skeleton) instead: the newest removed arc in that message.
+///
+/// The final message is the newest non-system message in `items`. An assistant final
+/// message must keep at least one tool result (it is what closes the conversation with a
+/// user turn); any other role must keep some non-reasoning block. Frozen blocks are not
+/// counted as survivors, which can only keep an extra skeleton, never remove one.
+/// Anthropic models without assistant prefill reject a request that ends on assistant
+/// text, so this mirrors the TypeScript `wouldStrandConversationEnd` rule.
+fn request_end_arc_to_keep(
+    items: &[SelItem],
+    removed_arcs: &HashSet<String>,
+    frozen: &HashSet<String>,
+) -> Option<String> {
+    let end = items
+        .iter()
+        .filter(|item| item.message_role != SelMessageRole::System)
+        .max_by_key(|item| item.ordinal)?;
+    let end_mid = item_message_id(end)?;
+    let end_role = end.message_role;
+    let in_end = items
+        .iter()
+        .filter(|item| item_message_id(item) == Some(end_mid))
+        .collect::<Vec<_>>();
+    let removed_here = in_end
+        .iter()
+        .filter_map(|item| item.arc_id.as_deref())
+        .filter(|arc_id| removed_arcs.contains(*arc_id))
+        .collect::<BTreeSet<_>>();
+    if removed_here.is_empty() {
+        return None;
+    }
+    let survives = |item: &&&SelItem| {
+        item.arc_id
+            .as_deref()
+            .is_none_or(|arc_id| !removed_arcs.contains(arc_id))
+            && !frozen.contains(&item.id)
+            && !matches!(item.kind, SelKind::Reasoning | SelKind::RedactedReasoning)
+    };
+    let strands = if end_role == SelMessageRole::Assistant {
+        !in_end
+            .iter()
+            .filter(survives)
+            .any(|item| matches!(item.kind, SelKind::ToolResult { .. }))
+    } else {
+        !in_end.iter().any(|item| survives(&item))
+    };
+    if !strands {
+        return None;
+    }
+    in_end
+        .iter()
+        .filter(|item| {
+            item.arc_id
+                .as_deref()
+                .is_some_and(|arc_id| removed_here.contains(arc_id))
+        })
+        .max_by(|left, right| {
+            let index = |item: &SelItem| {
+                item.id
+                    .rsplit_once('#')
+                    .and_then(|(_, index)| index.parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            index(left)
+                .cmp(&index(right))
+                .then_with(|| left.arc_id.cmp(&right.arc_id))
+        })
+        .and_then(|item| item.arc_id.clone())
+}
+
+/// Re-decide legacy `skeleton` call units (arguments replaced by the `{"dropped": …}`
+/// marker) under the real-or-absent rule. Called ONLY while a HARD fold rebuilds the
+/// frozen unit set, so the byte change rides that fold's cache bust; every other pass
+/// keeps replaying the legacy bytes.
+///
+/// `legacy_call_ids` are the call block ids of the legacy units; `removed_call_ids` are
+/// call blocks already reduced to `drop` in the same rebuild (they count as removed for
+/// the request-end check). Returns the new kind per legacy call present in `items`:
+/// `skeleton_real` for a small input, a reasoning-adjacent arc, or the call whose result
+/// ends the request; `drop` otherwise. The legacy marker was only written inside the
+/// newest-call window or where removal was unsafe, so each is re-decided as a window drop.
+pub(crate) fn legacy_skeleton_conversions(
+    items: &[SelItem],
+    legacy_call_ids: &BTreeSet<String>,
+    removed_call_ids: &HashSet<String>,
+    frozen: &HashSet<String>,
+) -> BTreeMap<String, &'static str> {
+    let reasoning_adjacency = reasoning_adjacency_collapse_arc_ids(items);
+    let mut kinds = BTreeMap::new();
+    let mut candidates = HashSet::new();
+    let mut removed_arcs = HashSet::new();
+    for item in items {
+        let (SelKind::ToolCall { input, .. }, Some(arc_id)) = (&item.kind, &item.arc_id) else {
+            continue;
+        };
+        if removed_call_ids.contains(&item.id) {
+            removed_arcs.insert(arc_id.clone());
+        }
+        if !legacy_call_ids.contains(&item.id) {
+            continue;
+        }
+        if is_small_tool_input(input) || reasoning_adjacency.contains(arc_id) {
+            kinds.insert(item.id.clone(), "skeleton_real");
+        } else {
+            kinds.insert(item.id.clone(), "drop");
+            candidates.insert(arc_id.clone());
+            removed_arcs.insert(arc_id.clone());
+        }
+    }
+    // The request end may also be closed by frozen results the legacy arcs still carry;
+    // those stop surviving once their call is removed, so do not count them.
+    if let Some(keep) = request_end_arc_to_keep(items, &removed_arcs, frozen) {
+        if candidates.contains(&keep) {
+            for item in items {
+                if item.arc_id.as_deref() == Some(keep.as_str())
+                    && matches!(item.kind, SelKind::ToolCall { .. })
+                    && kinds.contains_key(&item.id)
+                {
+                    kinds.insert(item.id.clone(), "skeleton_real");
+                }
+            }
+        }
+    }
+    kinds
 }
 
 /// Expand a reduced arc into its per-block [`ReductionDecision`]s: the ToolCall block
@@ -708,7 +892,7 @@ fn expand_arc(
     for (call_id, input) in &arc.call_inputs {
         if !frozen.contains(call_id) {
             let (kind, payload) = match shape {
-                ArcShape::Skeleton => (RedKind::Skeleton, skeleton_payload(input)),
+                ArcShape::SkeletonReal => (RedKind::SkeletonReal, DROPPED_PLACEHOLDER.to_string()),
                 ArcShape::FullDrop | ArcShape::DedupFullDrop => {
                     (RedKind::Drop, DROPPED_PLACEHOLDER.to_string())
                 }
@@ -867,6 +1051,8 @@ fn select_supersession(
 /// Select older completed duplicate calls from safe tools. The owner is in both the lookup key
 /// and the fingerprint, so identical calls from distinct assistant messages stay distinct.
 /// Arguments use `serde_json` serialization; a serialization failure skips that candidate.
+/// Protected arcs join their group so a protected newest copy still anchors it, but are never
+/// selected themselves; leaving them out kept one unprotected copy beside the protected one.
 fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<String> {
     // Like the TS tag-side index, retain an owner-qualified lookup key separately
     // from the fingerprint bucket. The owner must also remain in the fingerprint value.
@@ -875,11 +1061,6 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
         if !DEDUP_SAFE_TOOLS.contains(&arc.dedup_name.as_str())
             || arc.owner_message_id.is_none()
             || arc.result_ids.is_empty()
-            || arc
-                .call_inputs
-                .iter()
-                .any(|(id, _)| ctx.block_is_protected(id))
-            || arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
         {
             continue;
         }
@@ -918,6 +1099,12 @@ fn select_tool_dedup(arcs: &[&ToolArc], ctx: &SelectionContext) -> HashSet<Strin
             group.pop();
             group
                 .into_iter()
+                .filter(|arc| {
+                    !arc.call_inputs
+                        .iter()
+                        .any(|(id, _)| ctx.block_is_protected(id))
+                        && !arc.result_ids.iter().any(|id| ctx.block_is_protected(id))
+                })
                 .map(|arc| arc.arc_id.clone())
                 .collect::<Vec<_>>()
         })
@@ -1012,7 +1199,32 @@ fn bytes_to_tokens(bytes: usize) -> f64 {
 
 /// Reconstruct the active floor-tag population. A tool arc is one tag in the TS planner, so its
 /// call/result/reasoning bytes are aggregated before the per-tag token rounding is applied.
-fn active_floor_tokens(items: &[SelItem], frozen_keys: &HashSet<String>) -> f64 {
+fn active_floor_tokens(
+    items: &[SelItem],
+    frozen_keys: &HashSet<String>,
+    calibration: Option<crate::decision_calibration::DecisionCalibration>,
+) -> f64 {
+    if let Some(seed) = calibration {
+        return items
+            .iter()
+            .filter(|item| {
+                !frozen_keys.contains(&item.id)
+                    && item.message_role != SelMessageRole::System
+                    && !matches!(item.kind, SelKind::Opaque | SelKind::Media)
+            })
+            .map(|item| {
+                let ratio = if matches!(
+                    item.kind,
+                    SelKind::ToolCall { .. } | SelKind::ToolResult { .. }
+                ) {
+                    seed.tools_ratio
+                } else {
+                    seed.prose_ratio
+                };
+                item.served_token_count.or(item.token_count).unwrap_or(0) as f64 * ratio
+            })
+            .sum();
+    }
     let mut tool_tag_bytes: HashMap<&str, usize> = HashMap::new();
     let mut tokens = 0.0;
     for item in items.iter().filter(|item| {
@@ -1044,6 +1256,7 @@ fn select_emergency(
     arcs: &[&ToolArc],
     ctx: &SelectionContext,
     all_active_floor_tokens: f64,
+    reclaim_by_arc: &HashMap<String, f64>,
     assessment: &mut Option<mc_store::EmergencyDropAssessment>,
 ) -> HashSet<String> {
     // Guards mirror the TS planner: unknown ceiling/usage → no-op; idempotence latch.
@@ -1064,7 +1277,25 @@ fn select_emergency(
     // comparison on that rounded value; comparing the raw float can fire for a
     // sub-threshold fractional remainder at the boundary.
     let reclaim_tokens = (ctx.current_total_input_tokens - target).round();
+    let floor_above_ceiling = fixed_floor > ctx.ceiling_tokens;
+    if floor_above_ceiling {
+        tracing::info!(
+            "mc-module: emergency drop: fixed floor ~{:.0} already exceeds ceiling {:.0}; tool drops cannot reach the target",
+            fixed_floor,
+            ctx.ceiling_tokens
+        );
+    }
     if reclaim_tokens <= EMERGENCY_REARM_MIN_TOKENS {
+        *assessment = Some(mc_store::EmergencyDropAssessment {
+            fixed_floor_tokens: fixed_floor,
+            target_tokens: target,
+            required_reclaim_tokens: reclaim_tokens.max(0.0),
+            selected_reclaim_tokens: 0.0,
+            candidate_tokens: 0.0,
+            target_unreachable: reclaim_tokens > 0.0,
+            floor_above_ceiling,
+            skipped_below_minimum_reclaim: false,
+        });
         return HashSet::new();
     }
 
@@ -1121,10 +1352,20 @@ fn select_emergency(
         by_tier.entry(tier).or_default().push(arc);
     }
 
-    let candidate_tokens = by_tier
-        .values()
-        .flatten()
-        .map(|arc| bytes_to_tokens(arc.reclaim_bytes()))
+    // Summed in tier order: floating-point addition is not associative, so summing in
+    // the hash map's per-process iteration order could give a different last bit for the
+    // same candidates from one run to the next.
+    let mut candidate_tiers = by_tier.keys().copied().collect::<Vec<_>>();
+    candidate_tiers.sort_unstable();
+    let candidate_tokens = candidate_tiers
+        .iter()
+        .flat_map(|tier| by_tier[tier].iter())
+        .map(|arc| {
+            reclaim_by_arc
+                .get(&arc.arc_id)
+                .copied()
+                .unwrap_or_else(|| bytes_to_tokens(arc.reclaim_bytes()))
+        })
         .sum::<f64>();
     // Walk T3 → T2 → T1, oldest-first within tier, until reclaim met.
     let mut selected: HashSet<String> = HashSet::new();
@@ -1138,21 +1379,47 @@ fn select_emergency(
             });
             for arc in group.iter() {
                 selected.insert(arc.arc_id.clone());
-                reclaimed += bytes_to_tokens(arc.reclaim_bytes());
+                reclaimed += reclaim_by_arc
+                    .get(&arc.arc_id)
+                    .copied()
+                    .unwrap_or_else(|| bytes_to_tokens(arc.reclaim_bytes()));
                 if reclaimed >= reclaim_tokens {
                     break 'outer;
                 }
             }
         }
     }
+    // Price the selection before committing it. Skipping leaves the pressure episode
+    // armed, so the candidates can still ride a later rewrite.
+    let skipped_below_minimum_reclaim = !selected.is_empty()
+        && !ctx.emergency_minimum_waived
+        && reclaimed < EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS;
+    if skipped_below_minimum_reclaim {
+        tracing::info!(
+            "mc-module: emergency drop skipped: achievable reclaim ~{:.0} < {:.0} against gap {:.0} ({} arcs)",
+            reclaimed,
+            EMERGENCY_MIN_ACHIEVABLE_RECLAIM_TOKENS,
+            reclaim_tokens,
+            selected.len()
+        );
+    }
     *assessment = Some(mc_store::EmergencyDropAssessment {
         fixed_floor_tokens: fixed_floor,
         target_tokens: target,
         required_reclaim_tokens: reclaim_tokens,
-        selected_reclaim_tokens: reclaimed,
+        selected_reclaim_tokens: if skipped_below_minimum_reclaim {
+            0.0
+        } else {
+            reclaimed
+        },
         candidate_tokens,
-        target_unreachable: reclaimed < reclaim_tokens,
+        target_unreachable: skipped_below_minimum_reclaim || reclaimed < reclaim_tokens,
+        floor_above_ceiling,
+        skipped_below_minimum_reclaim,
     });
+    if skipped_below_minimum_reclaim {
+        return HashSet::new();
+    }
     selected
 }
 
@@ -1188,6 +1455,96 @@ pub fn select_reductions(
     select_reductions_with_outcome(items, frozen_keys, ctx, cfg).decisions
 }
 
+/// Served-or-original token totals for one tool arc, as emergency reclaim
+/// accounting sees them: every call and result block, and the call blocks alone
+/// (a skeleton-kept call keeps its arguments, so only its results shrink).
+struct ArcTokenTotals {
+    call_and_result: f64,
+    call: f64,
+}
+
+impl Default for ArcTokenTotals {
+    /// Both totals start from the value `Iterator::sum` returns for an empty
+    /// `f64` iterator, and blocks are added one at a time in item order. That
+    /// is exactly the fold a per-arc `.sum()` over the same blocks performs, so
+    /// the totals are bit-identical to summing each arc separately.
+    fn default() -> Self {
+        let empty = std::iter::empty::<f64>().sum::<f64>();
+        Self {
+            call_and_result: empty,
+            call: empty,
+        }
+    }
+}
+
+/// Totals every arc's call and result tokens in one pass over `items`, so
+/// emergency accounting does not rescan all items once per arc.
+fn emergency_arc_token_totals(items: &[SelItem]) -> HashMap<&str, ArcTokenTotals> {
+    let mut totals: HashMap<&str, ArcTokenTotals> = HashMap::new();
+    for item in items {
+        let Some(arc_id) = item.arc_id.as_deref() else {
+            continue;
+        };
+        let is_call = matches!(item.kind, SelKind::ToolCall { .. });
+        if !is_call && !matches!(item.kind, SelKind::ToolResult { .. }) {
+            continue;
+        }
+        let tokens = item.served_token_count.or(item.token_count).unwrap_or(0) as f64;
+        let arc = totals.entry(arc_id).or_default();
+        arc.call_and_result += tokens;
+        if is_call {
+            arc.call += tokens;
+        }
+    }
+    totals
+}
+
+/// Calibrated reclaim estimate per active arc for an emergency pass; empty when
+/// the pass has no calibration seed.
+fn emergency_reclaim_by_arc(
+    items: &[SelItem],
+    active_arcs: &[&ToolArc],
+    ctx: &SelectionContext,
+    reasoning_adjacency_collapse_arcs: &HashSet<String>,
+) -> HashMap<String, f64> {
+    let mut reclaim_by_arc = HashMap::new();
+    let Some(seed) = ctx.calibration else {
+        return reclaim_by_arc;
+    };
+    let recent: HashSet<_> = active_arcs
+        .iter()
+        .rev()
+        .take(RECENT_TOOL_SKELETON_WINDOW)
+        .map(|a| a.arc_id.as_str())
+        .collect();
+    let arc_tokens = emergency_arc_token_totals(items);
+    let no_tokens = ArcTokenTotals::default();
+    for arc in active_arcs {
+        let totals = arc_tokens.get(arc.arc_id.as_str()).unwrap_or(&no_tokens);
+        let before = totals.call_and_result;
+        let skeleton = (!ctx.emergency_window_yields
+            && recent.contains(arc.arc_id.as_str())
+            && is_small_tool_input(&arc.input))
+            || reasoning_adjacency_collapse_arcs.contains(&arc.arc_id);
+        // A kept call keeps its real arguments, so its call blocks reclaim
+        // nothing; only the results shrink to the placeholder. Include a
+        // conservative tag-overlay allowance because tag ids are installed
+        // by the renderer.
+        let after = if skeleton {
+            totals.call
+                + (arc.result_ids.len() * (mc_tokenizer::estimate_tokens(DROPPED_PLACEHOLDER) + 32))
+                    as f64
+        } else {
+            0.0
+        };
+        reclaim_by_arc.insert(
+            arc.arc_id.clone(),
+            (before - after).max(0.0) * seed.tools_ratio,
+        );
+    }
+    reclaim_by_arc
+}
+
 pub(crate) fn select_reductions_with_outcome(
     items: &[SelItem],
     frozen_keys: &HashSet<String>,
@@ -1220,6 +1577,11 @@ pub(crate) fn select_reductions_with_outcome(
         .map(|arc| arc.arc_id.as_str())
         .collect::<HashSet<_>>();
     let reasoning_ineligible_arcs = reasoning_ineligible_arc_ids(items);
+    let user_answer_arcs: HashSet<&str> = items
+        .iter()
+        .filter(|item| item.user_answer)
+        .filter_map(|item| item.arc_id.as_deref())
+        .collect();
     let arc_by_block_id: HashMap<&str, &str> = items
         .iter()
         .filter_map(|item| Some((item.id.as_str(), item.arc_id.as_deref()?)))
@@ -1243,6 +1605,7 @@ pub(crate) fn select_reductions_with_outcome(
         .filter(|a| {
             !a.reduced
                 && !a.provider_executed
+                && !user_answer_arcs.contains(a.arc_id.as_str())
                 && !incomplete_arc_ids.contains(a.arc_id.as_str())
                 && !reasoning_ineligible_arcs.contains(&a.arc_id)
         })
@@ -1278,11 +1641,18 @@ pub(crate) fn select_reductions_with_outcome(
             // unfrozen tagged-content class contributes to the fixed-floor derivation, including
             // text, media, reasoning, and non-droppable tools; system-prefix and opaque metadata
             // remain outside that population. Only active client tool arcs can be selected below.
-            let all_active_floor_tokens = active_floor_tokens(items, frozen_keys);
+            let all_active_floor_tokens = active_floor_tokens(items, frozen_keys, ctx.calibration);
+            let reclaim_by_arc = emergency_reclaim_by_arc(
+                items,
+                &active_arcs,
+                ctx,
+                &reasoning_adjacency_collapse_arcs,
+            );
             let emergency_arc_ids = select_emergency(
                 &active_arcs,
                 ctx,
                 all_active_floor_tokens,
+                &reclaim_by_arc,
                 &mut emergency_drop_assessment,
             );
             if ctx.pass_already_busting
@@ -1396,10 +1766,11 @@ pub(crate) fn select_reductions_with_outcome(
     let supersession_arcs_with_exempt_message_protection =
         protected_supersession_arcs(&ctx.exempt_message_protected_block_ids);
 
-    // Resolve fresh full-drop intents to a skeleton when either recency or removal safety
-    // requires a result shell. Decided ONCE here (freeze-time): frozen_keys excludes replayed
-    // arcs, so neither an aging window nor a newly detected adjacency can change frozen bytes.
-    // EditMarker is window-independent.
+    // Resolve fresh full-drop intents to a real-argument skeleton when recency (with a small
+    // input) or removal safety requires a result shell; a large input in the window is
+    // removed like an older one. Decided ONCE here (freeze-time): frozen_keys excludes
+    // replayed arcs, so neither an aging window nor a newly detected adjacency can change
+    // frozen bytes. EditMarker is window-independent.
     let mut newest_arcs: Vec<&&ToolArc> = active_arcs.iter().collect();
     newest_arcs.sort_by(|a, b| {
         b.ordinal
@@ -1412,7 +1783,7 @@ pub(crate) fn select_reductions_with_outcome(
         .map(|a| a.arc_id.clone())
         .collect();
 
-    let mut out: Vec<ReductionDecision> = Vec::new();
+    let mut resolved_shapes: Vec<(&ToolArc, ArcShape)> = Vec::new();
     for (arc_id, shape) in &arc_shapes {
         let Some(arc) = arc_by_id.get(arc_id.as_str()) else {
             continue;
@@ -1428,20 +1799,37 @@ pub(crate) fn select_reductions_with_outcome(
         }
         let resolved = match shape {
             ArcShape::EditMarker => ArcShape::EditMarker,
-            ArcShape::Skeleton => ArcShape::Skeleton,
+            ArcShape::SkeletonReal => ArcShape::SkeletonReal,
             ArcShape::FullDrop
                 if reasoning_adjacency_collapse_arcs.contains(arc_id)
-                    || skeleton_window.contains(arc_id) =>
+                    || (skeleton_window.contains(arc_id) && is_small_tool_input(&arc.input)) =>
             {
-                ArcShape::Skeleton
+                ArcShape::SkeletonReal
             }
             ArcShape::DedupFullDrop if reasoning_adjacency_collapse_arcs.contains(arc_id) => {
-                ArcShape::Skeleton
+                ArcShape::SkeletonReal
             }
             ArcShape::FullDrop => ArcShape::FullDrop,
             ArcShape::DedupFullDrop => ArcShape::DedupFullDrop,
         };
-        expand_arc(arc, resolved, frozen_keys, &mut out);
+        resolved_shapes.push((arc, resolved));
+    }
+    // Never remove the tool result the request ends with: keep that call with its real
+    // arguments instead (see request_end_arc_to_keep).
+    let removed_arcs = resolved_shapes
+        .iter()
+        .filter(|(_, shape)| matches!(shape, ArcShape::FullDrop | ArcShape::DedupFullDrop))
+        .map(|(arc, _)| arc.arc_id.clone())
+        .collect::<HashSet<_>>();
+    let keep_request_end = request_end_arc_to_keep(items, &removed_arcs, frozen_keys);
+    let mut out: Vec<ReductionDecision> = Vec::new();
+    for (arc, shape) in resolved_shapes {
+        let shape = if keep_request_end.as_deref() == Some(arc.arc_id.as_str()) {
+            ArcShape::SkeletonReal
+        } else {
+            shape
+        };
+        expand_arc(arc, shape, frozen_keys, &mut out);
     }
 
     // ctx_reduce agent drops stay block-granular, but pass-through carriers are absent
@@ -1505,7 +1893,7 @@ fn dedupe_and_sort(decisions: Vec<ReductionDecision>) -> Vec<ReductionDecision> 
         match kind {
             "drop" => 3,
             "edit_marker" => 2,
-            "skeleton" => 1,
+            "skeleton" | "skeleton_real" => 1,
             _ => 0,
         }
     }
@@ -1551,6 +1939,8 @@ mod tests {
     ) -> SelItem {
         let id = call_block_id(mid);
         SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: id.clone(),
             ordinal,
             message_role: SelMessageRole::Assistant,
@@ -1567,6 +1957,8 @@ mod tests {
 
     fn tool_result(mid: &str, ordinal: u64, name: &str, bytes: usize) -> SelItem {
         SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: result_block_id(mid),
             ordinal,
             message_role: SelMessageRole::NonAssistant,
@@ -1582,6 +1974,8 @@ mod tests {
 
     fn reasoning(mid: &str, ordinal: u64, bytes: usize) -> SelItem {
         SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: reasoning_block_id(mid),
             ordinal,
             message_role: SelMessageRole::Assistant,
@@ -1595,6 +1989,8 @@ mod tests {
 
     fn reasoning_with_id(id: &str, arc_id: &str, ordinal: u64, bytes: usize) -> SelItem {
         SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: id.to_string(),
             ordinal,
             message_role: SelMessageRole::Assistant,
@@ -1608,6 +2004,8 @@ mod tests {
 
     fn text_with_id(id: &str, ordinal: u64, bytes: usize) -> SelItem {
         SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: id.to_string(),
             ordinal,
             message_role: SelMessageRole::NonAssistant,
@@ -1628,6 +2026,8 @@ mod tests {
         bytes: usize,
     ) -> SelItem {
         SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: id.to_string(),
             ordinal,
             message_role: SelMessageRole::Assistant,
@@ -1650,6 +2050,8 @@ mod tests {
         bytes: usize,
     ) -> SelItem {
         SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: id.to_string(),
             ordinal,
             message_role: SelMessageRole::NonAssistant,
@@ -1693,6 +2095,46 @@ mod tests {
         );
     }
 
+    /// A tool loop at >=95% pressure (the recency window yields): the newest tool
+    /// call/result pair is what ends the provider request with a user turn. The
+    /// emergency drop may reduce that pair only to a call skeleton plus a result
+    /// placeholder; removing it would end the request on an assistant turn, which
+    /// models without prefill support reject. The TypeScript OpenCode and Pi drop
+    /// targets enforce the same rule.
+    #[test]
+    fn emergency_at_window_yield_keeps_the_newest_arc_as_a_skeleton() {
+        let mut items = vec![text_with_id("prompt#0", 1, 100)];
+        for n in 1..=8u64 {
+            let mid = format!("c{n}");
+            items.push(tool_call(
+                &mid,
+                n * 2,
+                "bash",
+                serde_json::json!({"command": "cat"}),
+                100,
+            ));
+            items.push(tool_result(&mid, n * 2 + 1, "bash", 40_000));
+        }
+        // Pressure far past the ceiling so the tiered walk reaches every arc.
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 400_000.0;
+        ctx.ceiling_tokens = 65_000.0;
+        ctx.emergency_window_yields = true;
+        let decisions =
+            select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(!decisions.is_empty());
+        let newest_call = decisions
+            .iter()
+            .find(|d| d.target_id == call_block_id("c8"))
+            .expect("the newest arc is selected at window yield");
+        assert_eq!(newest_call.kind, "skeleton_real");
+        let newest_result = decisions
+            .iter()
+            .find(|d| d.target_id == result_block_id("c8"))
+            .expect("the newest result is reduced in place");
+        assert_eq!(newest_result.payload, DROPPED_PLACEHOLDER);
+    }
+
     #[test]
     fn contract_legacy_call_only_reduction_does_not_strand_result() {
         let items = vec![
@@ -1713,6 +2155,44 @@ mod tests {
             .any(|d| d.target_id == call_block_id("legacy")));
     }
 
+    /// The candidate total is the same on every run for the same candidates, whatever
+    /// order the per-tier map happens to iterate in.
+    #[test]
+    fn emergency_candidate_total_does_not_depend_on_map_iteration_order() {
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 142_021.0;
+        ctx.ceiling_tokens = 116_900.0;
+        ctx.emergency_window_yields = true;
+        let mut items = vec![text_with_id("text", 1, 240_000)];
+        let mut reclaim = HashMap::new();
+        // One arc per tier, with amounts whose sum depends on the order they are added in.
+        for (n, (name, tokens)) in [("read", 0.1), ("edit", 0.2), ("bash", 0.3)]
+            .into_iter()
+            .enumerate()
+        {
+            let mid = format!("tool-{n}");
+            items.push(tool_call(
+                &mid,
+                n as u64 + 2,
+                name,
+                serde_json::json!({}),
+                0,
+            ));
+            items.push(tool_result(&mid, n as u64 + 2, name, 8_000));
+            reclaim.insert(call_block_id(&mid), tokens);
+        }
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        let totals = (0..64)
+            .map(|_| {
+                let mut assessment = None;
+                select_emergency(&arcs, &ctx, 80_000.0, &reclaim, &mut assessment);
+                assessment.unwrap().candidate_tokens.to_bits()
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(totals.len(), 1, "{totals:?}");
+    }
+
     #[test]
     fn emergency_floor_walk_exhausts_candidates_or_reaches_target() {
         let mut ctx = base_ctx(PassClass::EmergencyForce);
@@ -1727,7 +2207,7 @@ mod tests {
         let arcs = group_arcs(&items, &HashSet::new());
         let arcs = arcs.iter().collect::<Vec<_>>();
         let mut assessment = None;
-        let selected = select_emergency(&arcs, &ctx, 80_000.0, &mut assessment);
+        let selected = select_emergency(&arcs, &ctx, 80_000.0, &HashMap::new(), &mut assessment);
         let report = assessment.as_ref().unwrap();
         assert_eq!(selected.len(), 10);
         assert_eq!(report.fixed_floor_tokens, 62_021.0);
@@ -1737,7 +2217,7 @@ mod tests {
         assert!(report.target_unreachable);
         ctx.tag_window_protected_block_ids
             .extend((1..10).map(|n| result_block_id(&format!("tool-{n}"))));
-        let selected = select_emergency(&arcs, &ctx, 80_000.0, &mut assessment);
+        let selected = select_emergency(&arcs, &ctx, 80_000.0, &HashMap::new(), &mut assessment);
         let report = assessment.as_ref().unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(report.candidate_tokens, 2_000.0);
@@ -1745,15 +2225,280 @@ mod tests {
         ctx.emergency_window_yields = true;
         ctx.current_total_input_tokens = 20_000.0;
         ctx.ceiling_tokens = 20_000.0;
-        let selected = select_emergency(&arcs, &ctx, 20_000.0, &mut assessment);
+        let selected = select_emergency(&arcs, &ctx, 20_000.0, &HashMap::new(), &mut assessment);
         let report = assessment.as_ref().unwrap();
         assert_eq!(selected.len(), 7);
         assert_eq!(report.selected_reclaim_tokens, 14_000.0);
         assert!(!report.target_unreachable);
     }
 
+    /// The live worker shape: the fixed floor (~326K) is already above the ceiling
+    /// (~251K) and the only candidate is a fresh result worth ~149 tokens. At the 95%
+    /// backstop production sets both `emergency_window_yields` and `pass_already_busting`;
+    /// neither waives the minimum, so the pass is skipped. Only an independent rebuild
+    /// (`emergency_minimum_waived`) lets the small selection ride. Mirrors the TS tests.
+    #[test]
+    fn emergency_skips_a_selection_below_the_minimum_achievable_reclaim() {
+        let items = vec![
+            text_with_id("conversation", 1, 36_204),
+            tool_call("fresh", 2, "bash", serde_json::json!({}), 0),
+            tool_result("fresh", 3, "bash", 596),
+        ];
+        let arcs = group_arcs(&items, &HashSet::new());
+        let arcs = arcs.iter().collect::<Vec<_>>();
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.current_total_input_tokens = 335_200.0;
+        ctx.ceiling_tokens = 251_000.0;
+        ctx.emergency_window_yields = true;
+        ctx.pass_already_busting = true;
+        let mut assessment = None;
+        let selected = select_emergency(&arcs, &ctx, 9_200.0, &HashMap::new(), &mut assessment);
+        let report = assessment.as_ref().unwrap();
+        assert!(selected.is_empty());
+        assert!(report.skipped_below_minimum_reclaim);
+        assert!(report.floor_above_ceiling);
+        assert_eq!(report.selected_reclaim_tokens, 0.0);
+
+        ctx.emergency_minimum_waived = true;
+        let selected = select_emergency(&arcs, &ctx, 9_200.0, &HashMap::new(), &mut assessment);
+        let report = assessment.as_ref().unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(!report.skipped_below_minimum_reclaim);
+        assert!(report.floor_above_ceiling);
+    }
+
+    #[test]
+    fn calibrated_emergency_uses_current_token_mass_not_original_bytes() {
+        let mut items = Vec::new();
+        for i in 1..=30 {
+            let id = format!("c{i}");
+            items.push(tool_call(&id, i, "bash", serde_json::json!({}), 40_000));
+            items.push(tool_result(&id, i, "bash", 40_000));
+        }
+        for item in &mut items {
+            item.token_count = Some(10);
+        }
+        let mut ctx = base_ctx(PassClass::EmergencyForce);
+        ctx.calibration = Some(crate::decision_calibration::DecisionCalibration::for_model(
+            Some("anthropic/claude-fable-5-1"),
+        ));
+        ctx.current_total_input_tokens = 10_000.0;
+        ctx.ceiling_tokens = 8_000.0;
+        let result = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert!(result.decisions.is_empty());
+    }
+
+    /// The emergency reclaim estimate as it was computed before arc token totals
+    /// were gathered in one pass: each arc rescanned every item. Kept only as
+    /// the differential reference for the test below.
+    fn rescanning_emergency_reclaim_by_arc(
+        items: &[SelItem],
+        active_arcs: &[&ToolArc],
+        ctx: &SelectionContext,
+        reasoning_adjacency_collapse_arcs: &HashSet<String>,
+    ) -> HashMap<String, f64> {
+        let mut reclaim_by_arc = HashMap::new();
+        let seed = ctx.calibration.unwrap();
+        let recent: HashSet<_> = active_arcs
+            .iter()
+            .rev()
+            .take(RECENT_TOOL_SKELETON_WINDOW)
+            .map(|a| a.arc_id.as_str())
+            .collect();
+        for arc in active_arcs {
+            let before = items
+                .iter()
+                .filter(|item| {
+                    item.arc_id.as_deref() == Some(arc.arc_id.as_str())
+                        && matches!(
+                            item.kind,
+                            SelKind::ToolCall { .. } | SelKind::ToolResult { .. }
+                        )
+                })
+                .map(|item| item.served_token_count.or(item.token_count).unwrap_or(0) as f64)
+                .sum::<f64>();
+            let skeleton = (!ctx.emergency_window_yields
+                && recent.contains(arc.arc_id.as_str())
+                && is_small_tool_input(&arc.input))
+                || reasoning_adjacency_collapse_arcs.contains(&arc.arc_id);
+            let after = if skeleton {
+                let call_tokens = items
+                    .iter()
+                    .filter(|item| {
+                        item.arc_id.as_deref() == Some(arc.arc_id.as_str())
+                            && matches!(item.kind, SelKind::ToolCall { .. })
+                    })
+                    .map(|item| item.served_token_count.or(item.token_count).unwrap_or(0) as f64)
+                    .sum::<f64>();
+                call_tokens
+                    + (arc.result_ids.len()
+                        * (mc_tokenizer::estimate_tokens(DROPPED_PLACEHOLDER) + 32))
+                        as f64
+            } else {
+                0.0
+            };
+            reclaim_by_arc.insert(
+                arc.arc_id.clone(),
+                (before - after).max(0.0) * seed.tools_ratio,
+            );
+        }
+        reclaim_by_arc
+    }
+
+    /// One-pass arc totals must give bit-identical reclaim estimates to the
+    /// per-arc rescan, and the full emergency selection built on them must pick
+    /// the same reductions in the same order. The fixture mixes served and
+    /// original counts, arcs with several calls and results, reasoning inside
+    /// arcs, reasoning-adjacent arcs, small and large inputs, and arcs with no
+    /// counted blocks.
+    #[test]
+    fn one_pass_emergency_totals_match_per_arc_rescan() {
+        let mut items = Vec::new();
+        let mut ordinal = 0;
+        for i in 0..120usize {
+            let arc = format!("arc{i}");
+            let input = if i % 3 == 0 {
+                serde_json::json!({ "command": "x".repeat(4_000) })
+            } else {
+                serde_json::json!({ "path": format!("f{i}") })
+            };
+            if i % 5 == 0 {
+                ordinal += 1;
+                items.push(reasoning_with_id(
+                    &format!("r{i}"),
+                    &arc,
+                    ordinal as u64,
+                    300,
+                ));
+            }
+            for call in 0..(1 + i % 2) {
+                ordinal += 1;
+                let mut item = tool_call_with_ids(
+                    &format!("{arc}c{call}"),
+                    &arc,
+                    ordinal as u64,
+                    "bash",
+                    input.clone(),
+                    500,
+                );
+                item.token_count = (i % 7 != 0).then_some(40 + i * 3 + call);
+                item.served_token_count = (i % 4 == 1).then_some(11 + i);
+                items.push(item);
+            }
+            for result in 0..(1 + i % 3) {
+                ordinal += 1;
+                let mut item = tool_result_with_ids(
+                    &format!("{arc}r{result}"),
+                    &arc,
+                    ordinal as u64,
+                    "bash",
+                    2_000,
+                );
+                item.token_count = Some(900 + i * 13 + result);
+                item.served_token_count = (i % 6 == 2).then_some(7 + result);
+                items.push(item);
+            }
+            if i % 10 == 0 {
+                ordinal += 1;
+                items.push(text_with_id(&format!("t{i}"), ordinal as u64, 1_000));
+            }
+        }
+        let arcs = group_arcs(&items, &HashSet::new());
+        let active_arcs: Vec<&ToolArc> = arcs.iter().collect();
+        assert!(active_arcs.len() >= 100);
+        let collapse = reasoning_adjacency_collapse_arc_ids(&items);
+        for yields in [false, true] {
+            let mut ctx = base_ctx(PassClass::EmergencyForce);
+            ctx.calibration = Some(crate::decision_calibration::DecisionCalibration::for_model(
+                Some("anthropic/claude-fable-5-1"),
+            ));
+            ctx.emergency_window_yields = yields;
+            let current = emergency_reclaim_by_arc(&items, &active_arcs, &ctx, &collapse);
+            let reference =
+                rescanning_emergency_reclaim_by_arc(&items, &active_arcs, &ctx, &collapse);
+            assert_eq!(current.len(), reference.len());
+            for (arc_id, value) in &reference {
+                assert_eq!(
+                    current[arc_id].to_bits(),
+                    value.to_bits(),
+                    "{arc_id} yields={yields}"
+                );
+            }
+            // The rest of the selector is unchanged, so identical estimates
+            // mean identical selection; assert it produces work to compare.
+            ctx.current_total_input_tokens = 400_000.0;
+            ctx.ceiling_tokens = 200_000.0;
+            let outcome = select_reductions_with_outcome(
+                &items,
+                &HashSet::new(),
+                &ctx,
+                &SelectionConfig::default(),
+            );
+            assert!(!outcome.decisions.is_empty(), "yields={yields}");
+        }
+    }
+
+    #[test]
+    fn user_answers_survive_every_automatic_selector_but_allow_agent_drops() {
+        let mut items = vec![
+            tool_call("answer", 1, "todowrite", serde_json::json!({}), 100),
+            tool_result("answer", 2, "todowrite", 32_000),
+            tool_call("ordinary", 3, "todowrite", serde_json::json!({}), 100),
+            tool_result("ordinary", 4, "todowrite", 16_000),
+            tool_call("latest", 5, "todowrite", serde_json::json!({}), 100),
+            tool_result("latest", 6, "todowrite", 16_000),
+        ];
+        items[1].user_answer = true;
+        for pass in [PassClass::Execute, PassClass::EmergencyForce] {
+            let mut ctx = base_ctx(pass);
+            ctx.current_total_input_tokens = 16_000.0;
+            ctx.ceiling_tokens = 12_000.0;
+            ctx.last_execute_ordinal = 100;
+            ctx.pass_already_busting = true;
+            ctx.supersession_ride_available = true;
+            let outcome = select_reductions_with_outcome(
+                &items,
+                &HashSet::new(),
+                &ctx,
+                &SelectionConfig::default(),
+            );
+            assert!(!outcome.decisions.is_empty());
+            assert!(outcome
+                .decisions
+                .iter()
+                .all(|d| !d.target_id.starts_with("answer#")));
+        }
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.agent_drop_ids = vec![result_block_id("answer")];
+        ctx.pass_already_busting = true;
+        let outcome = select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert!(outcome
+            .decisions
+            .iter()
+            .any(|d| d.target_id == result_block_id("answer")));
+        assert!(select_reductions_with_outcome(
+            &items,
+            &HashSet::new(),
+            &base_ctx(PassClass::Defer),
+            &SelectionConfig::default()
+        )
+        .decisions
+        .is_empty());
+    }
+
     fn base_ctx(pass: PassClass) -> SelectionContext {
         SelectionContext {
+            calibration: None,
             pass_class: pass,
             current_total_input_tokens: 0.0,
             ceiling_tokens: 0.0,
@@ -1766,6 +2511,7 @@ mod tests {
             first_applied_agent_drop_ids: HashSet::new(),
             pass_already_busting: false,
             supersession_ride_available: false,
+            emergency_minimum_waived: false,
             emergency_window_yields: false,
             tag_window_protected_block_ids: HashSet::new(),
             exempt_message_protected_block_ids: HashSet::new(),
@@ -1775,6 +2521,8 @@ mod tests {
     #[test]
     fn natural_bust_drains_a_single_command_remainder() {
         let items = vec![SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: "drop".to_string(),
             ordinal: 1,
             message_role: SelMessageRole::NonAssistant,
@@ -1972,6 +2720,8 @@ mod tests {
                         SelMessageRole::NonAssistant
                     };
                     SelItem {
+                        user_answer: false,
+                        served_token_count: None,
                         id: i.id.clone(),
                         ordinal: i.ordinal,
                         message_role,
@@ -2031,6 +2781,7 @@ mod tests {
                 _ => PassClass::Execute,
             };
             let ctx = SelectionContext {
+                calibration: None,
                 pass_class: pass,
                 current_total_input_tokens: case.ctx.current_total_input_tokens,
                 ceiling_tokens: case.ctx.ceiling_tokens,
@@ -2043,6 +2794,7 @@ mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: case.smart_drops || case.ctx.pass_already_busting,
                 supersession_ride_available: case.smart_drops || case.ctx.pass_already_busting,
+                emergency_minimum_waived: false,
                 emergency_window_yields: false,
                 tag_window_protected_block_ids: golden_ordinal_threshold_to_row_identities(
                     &items,
@@ -2064,7 +2816,7 @@ mod tests {
             );
         }
 
-        for kind in ["drop", "skeleton", "edit_marker"] {
+        for kind in ["drop", "skeleton_real", "edit_marker"] {
             assert!(
                 seen_reduction_kinds.contains(kind),
                 "selection golden stopped exercising reduction kind '{kind}'"
@@ -2080,6 +2832,9 @@ mod tests {
     struct DroppedInputMarkerGoldenCase {
         label: String,
         tag_id: i64,
+        // The legacy marker never depended on the call's input; the field stays so the
+        // shared golden keeps parsing.
+        #[allow(dead_code)]
         input: serde_json::Value,
         expected_frozen: serde_json::Value,
         expected_tagged: serde_json::Value,
@@ -2092,7 +2847,7 @@ mod tests {
                 .expect("parse dropped-input-marker-golden.json");
         assert!(!cases.is_empty(), "empty dropped-input marker golden");
         for case in cases {
-            let frozen = skeleton_payload(&case.input);
+            let frozen = dropped_input_payload(None);
             let tagged = dropped_input_payload(Some(case.tag_id));
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&frozen).unwrap(),
@@ -2371,6 +3126,8 @@ mod tests {
         }
         items.push(text_with_id("heavy-text#0", 7, 30_000));
         items.push(SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: "heavy-reasoning#0".to_string(),
             ordinal: 8,
             message_role: SelMessageRole::Assistant,
@@ -2381,6 +3138,8 @@ mod tests {
             arc_id: None,
         });
         items.push(SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: "irreducible-system#0".to_string(),
             ordinal: 9,
             message_role: SelMessageRole::System,
@@ -2418,6 +3177,8 @@ mod tests {
                 4_000,
             ));
             items.push(SelItem {
+                user_answer: false,
+                served_token_count: None,
                 id: format!("{mid}#3"),
                 ordinal,
                 message_role: SelMessageRole::Assistant,
@@ -3103,7 +3864,7 @@ mod tests {
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
         assert!(
             out.iter().any(|decision| {
-                decision.target_id == target_arc && decision.kind == "skeleton"
+                decision.target_id == target_arc && decision.kind == "skeleton_real"
             }),
             "the durable text sibling keeps the arc reclaimable while its result separates reasoning-bearing assistants: {out:?}"
         );
@@ -3207,10 +3968,379 @@ mod tests {
         };
         assert_eq!(call_kind("c1"), "drop", "oldest arc full-drops the call");
         assert_eq!(call_kind("c2"), "drop", "2nd oldest full-drops");
-        assert_eq!(call_kind("c22"), "skeleton", "newest keeps a skeleton call");
-        assert_eq!(call_kind("c3"), "skeleton", "inside the window → skeleton");
+        assert_eq!(
+            call_kind("c22"),
+            "skeleton_real",
+            "newest keeps a real-argument skeleton call"
+        );
+        assert_eq!(
+            call_kind("c3"),
+            "skeleton_real",
+            "inside the window with a small input → real-argument skeleton"
+        );
     }
 
+    #[derive(Deserialize)]
+    struct ToolInputSizeFixture {
+        max_small_bytes: usize,
+        cases: Vec<ToolInputSizeCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct ToolInputSizeCase {
+        name: String,
+        input: serde_json::Value,
+        expected_bytes: usize,
+        expected_small: bool,
+    }
+
+    #[test]
+    fn tool_input_string_bytes_matches_the_shared_cross_lane_fixture() {
+        let fixture: ToolInputSizeFixture = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/tool-input-string-bytes.json"
+        ))
+        .expect("parse tool-input-string-bytes.json");
+        assert_eq!(fixture.max_small_bytes, SKELETON_REAL_INPUT_MAX_BYTES);
+        assert!(!fixture.cases.is_empty());
+        for case in fixture.cases {
+            assert_eq!(
+                tool_input_string_bytes(&case.input),
+                case.expected_bytes,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                is_small_tool_input(&case.input),
+                case.expected_small,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    fn user_text(mid: &str, ordinal: u64) -> SelItem {
+        SelItem {
+            user_answer: false,
+            served_token_count: None,
+            id: format!("{mid}#0"),
+            ordinal,
+            message_role: SelMessageRole::NonAssistant,
+            kind: SelKind::Text,
+            provider_executed: false,
+            byte_size: 10,
+            token_count: None,
+            arc_id: None,
+        }
+    }
+
+    fn two_pass_kinds(items: &[SelItem], last_ordinal: u64) -> HashMap<String, String> {
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.last_execute_ordinal = last_ordinal;
+        ctx.pass_already_busting = true;
+        select_reductions(items, &HashSet::new(), &ctx, &SelectionConfig::default())
+            .into_iter()
+            .map(|decision| (decision.target_id, decision.kind))
+            .collect()
+    }
+
+    #[test]
+    fn window_drop_keeps_real_arguments_at_1024_bytes_and_removes_at_1025() {
+        let items = vec![
+            tool_call(
+                "at",
+                1,
+                "bash",
+                serde_json::json!({ "content": "a".repeat(1024) }),
+                1100,
+            ),
+            tool_result("at", 1, "bash", 5000),
+            tool_call(
+                "over",
+                2,
+                "bash",
+                serde_json::json!({ "content": "a".repeat(1025) }),
+                1100,
+            ),
+            tool_result("over", 2, "bash", 5000),
+            user_text("next", 3),
+        ];
+        let kinds = two_pass_kinds(&items, 3);
+        assert_eq!(
+            kinds.get(&call_block_id("at")).map(String::as_str),
+            Some("skeleton_real")
+        );
+        assert_eq!(
+            kinds.get(&result_block_id("at")).map(String::as_str),
+            Some("drop")
+        );
+        assert_eq!(
+            kinds.get(&call_block_id("over")).map(String::as_str),
+            Some("drop")
+        );
+        assert_eq!(
+            kinds.get(&result_block_id("over")).map(String::as_str),
+            Some("drop")
+        );
+    }
+
+    #[test]
+    fn window_drop_keeps_the_call_whose_result_ends_the_request() {
+        let items = vec![
+            user_text("start", 1),
+            tool_call(
+                "end",
+                2,
+                "write",
+                serde_json::json!({ "content": "b".repeat(5000) }),
+                5100,
+            ),
+            tool_result("end", 2, "write", 5000),
+        ];
+        let kinds = two_pass_kinds(&items, 2);
+        assert_eq!(
+            kinds.get(&call_block_id("end")).map(String::as_str),
+            Some("skeleton_real"),
+            "a large input is kept, with real arguments, when its result ends the request"
+        );
+        assert_eq!(
+            kinds.get(&result_block_id("end")).map(String::as_str),
+            Some("drop")
+        );
+    }
+
+    #[test]
+    fn legacy_skeletons_convert_to_real_or_absent() {
+        let items = vec![
+            user_text("start", 1),
+            tool_call(
+                "small",
+                2,
+                "bash",
+                serde_json::json!({ "command": "ls -la" }),
+                20,
+            ),
+            tool_result("small", 2, "bash", 500),
+            tool_call(
+                "large",
+                3,
+                "write",
+                serde_json::json!({ "content": "c".repeat(2000) }),
+                2100,
+            ),
+            tool_result("large", 3, "write", 500),
+            tool_call(
+                "end",
+                4,
+                "write",
+                serde_json::json!({ "content": "d".repeat(2000) }),
+                2100,
+            ),
+            tool_result("end", 4, "write", 500),
+        ];
+        let legacy = ["small", "large", "end"]
+            .iter()
+            .map(|mid| call_block_id(mid))
+            .collect::<BTreeSet<_>>();
+        let frozen = legacy
+            .iter()
+            .cloned()
+            .chain(
+                ["small", "large", "end"]
+                    .iter()
+                    .map(|mid| result_block_id(mid)),
+            )
+            .collect::<HashSet<_>>();
+        let kinds = legacy_skeleton_conversions(&items, &legacy, &HashSet::new(), &frozen);
+        assert_eq!(
+            kinds.get(&call_block_id("small")).copied(),
+            Some("skeleton_real")
+        );
+        assert_eq!(kinds.get(&call_block_id("large")).copied(), Some("drop"));
+        assert_eq!(
+            kinds.get(&call_block_id("end")).copied(),
+            Some("skeleton_real"),
+            "the request-ending call keeps real arguments"
+        );
+    }
+
+    // Adversarial gate reproductions: request-end protection when the tool result
+    // lives in a separate tool-role message, and when every block of an OpenCode
+    // assistant message (text, call, result) carries the assistant role.
+    fn adv_item(
+        id: &str,
+        ordinal: u64,
+        role: SelMessageRole,
+        kind: SelKind,
+        arc: Option<&str>,
+    ) -> SelItem {
+        SelItem {
+            user_answer: false,
+            served_token_count: None,
+            id: id.to_string(),
+            ordinal,
+            message_role: role,
+            kind,
+            provider_executed: false,
+            byte_size: 5000,
+            token_count: None,
+            arc_id: arc.map(str::to_string),
+        }
+    }
+
+    fn adv_call(input: serde_json::Value) -> SelKind {
+        SelKind::ToolCall {
+            name: "write".to_string(),
+            input,
+        }
+    }
+
+    fn adv_result() -> SelKind {
+        SelKind::ToolResult {
+            tool_name: "write".to_string(),
+        }
+    }
+
+    /// assistant `a` = [text, call(large)], tool-role `t` = [result]; the request ends
+    /// on `t`. Removing the arc would leave assistant text as the request end.
+    fn adv_separate_tool_message_items() -> Vec<SelItem> {
+        let large = serde_json::json!({ "content": "z".repeat(5000) });
+        vec![
+            adv_item("u#0", 1, SelMessageRole::NonAssistant, SelKind::Text, None),
+            adv_item("a#0", 2, SelMessageRole::Assistant, SelKind::Text, None),
+            adv_item(
+                "a#1",
+                2,
+                SelMessageRole::Assistant,
+                adv_call(large),
+                Some("a#1"),
+            ),
+            adv_item(
+                "t#0",
+                3,
+                SelMessageRole::NonAssistant,
+                adv_result(),
+                Some("a#1"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn adv_request_end_in_separate_tool_role_message_keeps_real_arguments() {
+        let items = adv_separate_tool_message_items();
+        let kinds = two_pass_kinds(&items, 3);
+        eprintln!("ADV_RUST_SEPARATE_TOOL_MSG new-drop kinds={kinds:?}");
+        assert_eq!(kinds.get("a#1").map(String::as_str), Some("skeleton_real"));
+        assert_eq!(kinds.get("t#0").map(String::as_str), Some("drop"));
+
+        let legacy = BTreeSet::from(["a#1".to_string()]);
+        let frozen = HashSet::from(["a#1".to_string(), "t#0".to_string()]);
+        let converted = legacy_skeleton_conversions(&items, &legacy, &HashSet::new(), &frozen);
+        eprintln!("ADV_RUST_SEPARATE_TOOL_MSG legacy conversion={converted:?}");
+        assert_eq!(converted.get("a#1").copied(), Some("skeleton_real"));
+    }
+
+    #[test]
+    fn adv_request_end_parallel_results_in_two_tool_role_messages() {
+        // assistant a = [text, call1(large), call2(large)], t1 = [result1], t2 = [result2].
+        let large = || serde_json::json!({ "content": "z".repeat(5000) });
+        let items = vec![
+            adv_item("u#0", 1, SelMessageRole::NonAssistant, SelKind::Text, None),
+            adv_item("a#0", 2, SelMessageRole::Assistant, SelKind::Text, None),
+            adv_item(
+                "a#1",
+                2,
+                SelMessageRole::Assistant,
+                adv_call(large()),
+                Some("a#1"),
+            ),
+            adv_item(
+                "a#2",
+                2,
+                SelMessageRole::Assistant,
+                adv_call(large()),
+                Some("a#2"),
+            ),
+            adv_item(
+                "t1#0",
+                3,
+                SelMessageRole::NonAssistant,
+                adv_result(),
+                Some("a#1"),
+            ),
+            adv_item(
+                "t2#0",
+                4,
+                SelMessageRole::NonAssistant,
+                adv_result(),
+                Some("a#2"),
+            ),
+        ];
+        let kinds = two_pass_kinds(&items, 4);
+        eprintln!("ADV_RUST_PARALLEL_TOOL_MSGS kinds={kinds:?}");
+        // At least one result must survive at the request end.
+        let kept = ["a#1", "a#2"]
+            .iter()
+            .filter(|id| kinds.get(**id).map(String::as_str) == Some("skeleton_real"))
+            .count();
+        assert!(kept >= 1, "{kinds:?}");
+        assert_eq!(kinds.get("a#2").map(String::as_str), Some("skeleton_real"));
+    }
+
+    #[test]
+    fn adv_request_end_opencode_single_assistant_message_all_blocks_assistant_role() {
+        // The OpenCode projection: text, call and result blocks share one assistant
+        // message and the assistant role. Removing the arc strands the assistant text.
+        let large = serde_json::json!({ "content": "z".repeat(5000) });
+        let items = vec![
+            adv_item("u#0", 1, SelMessageRole::NonAssistant, SelKind::Text, None),
+            adv_item("a#0", 2, SelMessageRole::Assistant, SelKind::Text, None),
+            adv_item(
+                "a#1",
+                2,
+                SelMessageRole::Assistant,
+                adv_call(large),
+                Some("a#1"),
+            ),
+            adv_item(
+                "a#2",
+                2,
+                SelMessageRole::Assistant,
+                adv_result(),
+                Some("a#1"),
+            ),
+        ];
+        let kinds = two_pass_kinds(&items, 2);
+        eprintln!("ADV_RUST_OPENCODE_ASSISTANT_END kinds={kinds:?}");
+        assert_eq!(kinds.get("a#1").map(String::as_str), Some("skeleton_real"));
+    }
+
+    #[test]
+    fn adv_request_end_result_then_trailing_system_item() {
+        // A trailing system block must not be taken as the request end.
+        let large = serde_json::json!({ "content": "z".repeat(5000) });
+        let items = vec![
+            adv_item("u#0", 1, SelMessageRole::NonAssistant, SelKind::Text, None),
+            adv_item("a#0", 2, SelMessageRole::Assistant, SelKind::Text, None),
+            adv_item(
+                "a#1",
+                2,
+                SelMessageRole::Assistant,
+                adv_call(large),
+                Some("a#1"),
+            ),
+            adv_item(
+                "t#0",
+                3,
+                SelMessageRole::NonAssistant,
+                adv_result(),
+                Some("a#1"),
+            ),
+            adv_item("s#0", 4, SelMessageRole::System, SelKind::Text, None),
+        ];
+        let kinds = two_pass_kinds(&items, 4);
+        eprintln!("ADV_RUST_TRAILING_SYSTEM kinds={kinds:?}");
+        assert_eq!(kinds.get("a#1").map(String::as_str), Some("skeleton_real"));
+    }
     #[test]
     fn drop_wins_over_edit_marker() {
         // c1 is an older edit to a.ts (edit_marker candidate) AND under the two-pass
@@ -3248,9 +4378,9 @@ mod tests {
             .map(|d| d.kind.clone());
         // Drop wins: the arc is on the DROP path (skeleton in-window, or full-drop
         // older), NEVER edit_marker. With only 2 arcs c1 is in the skeleton window, so
-        // the winning drop shapes to "skeleton" — a drop variant, not an edit_marker.
+        // the winning drop shapes to "skeleton_real" — a drop variant, not an edit_marker.
         assert!(
-            matches!(c1_call.as_deref(), Some("drop") | Some("skeleton")),
+            matches!(c1_call.as_deref(), Some("drop") | Some("skeleton_real")),
             "drop beats edit_marker for c1 (got {c1_call:?})"
         );
         assert_ne!(
@@ -3324,6 +4454,7 @@ mod tests {
         // plus non-zero pressure/latch fields. last_execute_ordinal stays 0 so c1 is NOT
         // a two-pass drop candidate (keeps it an edit_marker in both).
         let ctx_b = SelectionContext {
+            calibration: None,
             agent_drop_ids: vec![result_block_id("c9")],
             current_total_input_tokens: 123_456.0,
             ceiling_tokens: 200_000.0,
@@ -3331,6 +4462,7 @@ mod tests {
             has_prior_drop: true,
             pass_already_busting: true,
             supersession_ride_available: true,
+            emergency_minimum_waived: false,
             ..base_ctx(PassClass::Execute)
         };
 
@@ -3413,6 +4545,8 @@ mod tests {
     #[test]
     fn held_agent_drop_never_trickles_when_the_window_slides() {
         let items = vec![SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: "held#0".to_string(),
             ordinal: 1,
             message_role: SelMessageRole::NonAssistant,
@@ -3439,6 +4573,8 @@ mod tests {
     fn different_commands_wait_for_a_single_ride_opportunity() {
         let items = vec![
             SelItem {
+                user_answer: false,
+                served_token_count: None,
                 id: "held#0".to_string(),
                 ordinal: 1,
                 message_role: SelMessageRole::NonAssistant,
@@ -3449,6 +4585,8 @@ mod tests {
                 arc_id: None,
             },
             SelItem {
+                user_answer: false,
+                served_token_count: None,
                 id: "new#0".to_string(),
                 ordinal: 2,
                 message_role: SelMessageRole::NonAssistant,
@@ -3485,6 +4623,8 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, kind)| SelItem {
+                user_answer: false,
+                served_token_count: None,
                 id: format!("carrier#{index}"),
                 ordinal: 1,
                 message_role: SelMessageRole::NonAssistant,
@@ -3551,7 +4691,25 @@ mod tests {
 
     #[test]
     fn duplicate_non_safe_tools_never_deduplicate() {
-        let args = serde_json::json!({"path": "src/lib.rs"});
+        // `bash` can return different output for identical arguments, so it never dedups.
+        let args = serde_json::json!({"command": "date"});
+        let items = vec![
+            tool_call_with_ids("owner#0", "owner#0", 1, "bash", args.clone(), 50),
+            tool_result_with_ids("older-result#0", "owner#0", 2, "bash", 300),
+            tool_call_with_ids("owner#1", "owner#1", 1, "bash", args, 50),
+            tool_result_with_ids("newer-result#0", "owner#1", 3, "bash", 300),
+        ];
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.supersession_ride_available = true;
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        assert!(out.is_empty(), "non-safe tools must stay live: {out:?}");
+    }
+
+    #[test]
+    fn duplicate_bare_host_read_names_deduplicate() {
+        // OpenCode and Pi both hand over the bare `read` name, never `mcp_read`.
+        let args = serde_json::json!({"filePath": "src/lib.rs"});
         let items = vec![
             tool_call_with_ids("owner#0", "owner#0", 1, "read", args.clone(), 50),
             tool_result_with_ids("older-result#0", "owner#0", 2, "read", 300),
@@ -3562,7 +4720,54 @@ mod tests {
         ctx.supersession_ride_available = true;
 
         let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
-        assert!(out.is_empty(), "non-safe tools must stay live: {out:?}");
+        assert_eq!(
+            out.iter()
+                .map(|decision| (decision.target_id.as_str(), decision.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("older-result#0", "drop"), ("owner#0", "drop")],
+            "the older bare-name duplicate must fully drop: {out:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_safe_tools_keep_one_copy_when_the_newest_is_protected() {
+        let args = serde_json::json!({"filePath": "src/lib.rs"});
+        let mut items = Vec::new();
+        for index in 0..3 {
+            let call = format!("owner#{index}");
+            let result = format!("result-{index}#0");
+            items.push(tool_call_with_ids(
+                &call,
+                &call,
+                1,
+                "read",
+                args.clone(),
+                50,
+            ));
+            items.push(tool_result_with_ids(
+                &result,
+                &call,
+                2 + index as u64,
+                "read",
+                300,
+            ));
+        }
+        let mut ctx = base_ctx(PassClass::Execute);
+        ctx.supersession_ride_available = true;
+        ctx.tag_window_protected_block_ids =
+            HashSet::from(["owner#2".to_string(), "result-2#0".to_string()]);
+
+        let out = select_reductions(&items, &HashSet::new(), &ctx, &SelectionConfig::default());
+        let mut targets = out
+            .iter()
+            .map(|decision| decision.target_id.as_str())
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            vec!["owner#0", "owner#1", "result-0#0", "result-1#0"],
+            "both unprotected copies drop; only the protected newest stays: {out:?}"
+        );
     }
 
     #[test]
@@ -3605,6 +4810,26 @@ mod tests {
             "protected-owner#1".to_string(),
             "protected-new-result#0".to_string(),
         ]);
+        let out = select_reductions(
+            &protected_items,
+            &HashSet::new(),
+            &ctx,
+            &SelectionConfig::default(),
+        );
+        assert_eq!(
+            out.iter()
+                .map(|decision| decision.target_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["protected-old-result#0", "protected-owner#0"],
+            "a protected newest duplicate anchors its group, so the unprotected older copy drops: {out:?}"
+        );
+
+        ctx.tag_window_protected_block_ids = HashSet::from([
+            "protected-owner#0".to_string(),
+            "protected-old-result#0".to_string(),
+            "protected-owner#1".to_string(),
+            "protected-new-result#0".to_string(),
+        ]);
         assert!(
             select_reductions(
                 &protected_items,
@@ -3613,7 +4838,7 @@ mod tests {
                 &SelectionConfig::default(),
             )
             .is_empty(),
-            "a protected newest duplicate must not let the older candidate deduplicate"
+            "a protected duplicate is never selected, even with a newer copy"
         );
 
         let open_items = vec![
@@ -3711,6 +4936,8 @@ mod tests {
         let items = vec![
             reasoning_with_id("left#0", "left#2", 1, 50),
             SelItem {
+                user_answer: false,
+                served_token_count: None,
                 id: "left#1".to_string(),
                 ordinal: 1,
                 message_role: SelMessageRole::Assistant,
@@ -3724,6 +4951,8 @@ mod tests {
             tool_call_with_ids("left#3", "left#3", 1, "mcp_read", args, 50),
             tool_result_with_ids("older-result#0", "left#2", 2, "mcp_read", 300),
             SelItem {
+                user_answer: false,
+                served_token_count: None,
                 id: "right#0".to_string(),
                 ordinal: 3,
                 message_role: SelMessageRole::Assistant,
@@ -3743,7 +4972,7 @@ mod tests {
             out.iter()
                 .find(|decision| decision.target_id == "left#2")
                 .map(|decision| decision.kind.as_str()),
-            Some("skeleton"),
+            Some("skeleton_real"),
             "the dedup full drop must take the same reasoning-adjacency safety demotion: {out:?}"
         );
         assert_eq!(

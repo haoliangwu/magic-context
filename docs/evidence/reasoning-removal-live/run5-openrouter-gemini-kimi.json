@@ -1,0 +1,1809 @@
+{
+  "runAt": "2026-10-01T09:00:45.657Z",
+  "callCap": 105,
+  "used": 31,
+  "results": [
+    {
+      "scenario": "openrouter-gemini-3-flash:age",
+      "route": "openrouter-gemini-3-flash",
+      "model": "google/gemini-3-flash-preview",
+      "hostVersion": "1.18.30",
+      "pluginCommit": "7e61ac82fd4af47c6faf9e90d78dd34763daedc7",
+      "startedAt": "2026-10-01T08:52:18.949Z",
+      "finishedAt": "2026-10-01T08:53:43.746Z",
+      "outcome": "completed",
+      "abortReason": null,
+      "calls": [
+        {
+          "index": 1,
+          "at": "2026-10-01T08:53:16.882Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11454,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 0,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.005778,
+            "raw": {
+              "prompt_tokens": 11454,
+              "completion_tokens": 17,
+              "total_tokens": 11471,
+              "cost": 0.005778,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.005778,
+                "upstream_inference_prompt_cost": 0.005727,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 53132,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1134
+        },
+        {
+          "index": 2,
+          "at": "2026-10-01T08:53:18.945Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11476,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11387,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.00066485,
+            "raw": {
+              "prompt_tokens": 11476,
+              "completion_tokens": 17,
+              "total_tokens": 11493,
+              "cost": 0.00066485,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11387,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00066485,
+                "upstream_inference_prompt_cost": 0.00061385,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 53615,
+            "reasoningMap": "R",
+            "reasoningItems": 1,
+            "emptyReasoning": 0,
+            "toolCalls": 1,
+            "toolResults": 1,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 948
+        },
+        {
+          "index": 3,
+          "at": "2026-10-01T08:53:20.038Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11498,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11369,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.00068395,
+            "raw": {
+              "prompt_tokens": 11498,
+              "completion_tokens": 17,
+              "total_tokens": 11515,
+              "cost": 0.00068395,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11369,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00068395,
+                "upstream_inference_prompt_cost": 0.00063295,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 54098,
+            "reasoningMap": "RR",
+            "reasoningItems": 2,
+            "emptyReasoning": 0,
+            "toolCalls": 2,
+            "toolResults": 2,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1127
+        },
+        {
+          "index": 4,
+          "at": "2026-10-01T08:53:21.554Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11520,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11350,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.0007035,
+            "raw": {
+              "prompt_tokens": 11520,
+              "completion_tokens": 17,
+              "total_tokens": 11537,
+              "cost": 0.0007035,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11350,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0007035,
+                "upstream_inference_prompt_cost": 0.0006525,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 54581,
+            "reasoningMap": "RRR",
+            "reasoningItems": 3,
+            "emptyReasoning": 0,
+            "toolCalls": 3,
+            "toolResults": 3,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1067
+        },
+        {
+          "index": 5,
+          "at": "2026-10-01T08:53:23.036Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11542,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11332,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.0007226,
+            "raw": {
+              "prompt_tokens": 11542,
+              "completion_tokens": 17,
+              "total_tokens": 11559,
+              "cost": 0.0007226,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11332,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0007226,
+                "upstream_inference_prompt_cost": 0.0006716,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 55064,
+            "reasoningMap": "RRRR",
+            "reasoningItems": 4,
+            "emptyReasoning": 0,
+            "toolCalls": 4,
+            "toolResults": 4,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 987
+        },
+        {
+          "index": 6,
+          "at": "2026-10-01T08:53:24.103Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11564,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11314,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.0007417,
+            "raw": {
+              "prompt_tokens": 11564,
+              "completion_tokens": 17,
+              "total_tokens": 11581,
+              "cost": 0.0007417,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11314,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0007417,
+                "upstream_inference_prompt_cost": 0.0006907,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 55547,
+            "reasoningMap": "RRRRR",
+            "reasoningItems": 5,
+            "emptyReasoning": 0,
+            "toolCalls": 5,
+            "toolResults": 5,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 975
+        },
+        {
+          "index": 7,
+          "at": "2026-10-01T08:53:25.312Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11586,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11296,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.0007608,
+            "raw": {
+              "prompt_tokens": 11586,
+              "completion_tokens": 17,
+              "total_tokens": 11603,
+              "cost": 0.0007608,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11296,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0007608,
+                "upstream_inference_prompt_cost": 0.0007098,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 56030,
+            "reasoningMap": "RRRRRR",
+            "reasoningItems": 6,
+            "emptyReasoning": 0,
+            "toolCalls": 6,
+            "toolResults": 6,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 982
+        },
+        {
+          "index": 8,
+          "at": "2026-10-01T08:53:26.394Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11608,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11278,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.0007799,
+            "raw": {
+              "prompt_tokens": 11608,
+              "completion_tokens": 17,
+              "total_tokens": 11625,
+              "cost": 0.0007799,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11278,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0007799,
+                "upstream_inference_prompt_cost": 0.0007289,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 56513,
+            "reasoningMap": "RRRRRRR",
+            "reasoningItems": 7,
+            "emptyReasoning": 0,
+            "toolCalls": 7,
+            "toolResults": 7,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1022
+        },
+        {
+          "index": 9,
+          "at": "2026-10-01T08:53:27.537Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11630,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11260,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.000799,
+            "raw": {
+              "prompt_tokens": 11630,
+              "completion_tokens": 17,
+              "total_tokens": 11647,
+              "cost": 0.000799,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11260,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.000799,
+                "upstream_inference_prompt_cost": 0.000748,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 56996,
+            "reasoningMap": "RRRRRRRR",
+            "reasoningItems": 8,
+            "emptyReasoning": 0,
+            "toolCalls": 8,
+            "toolResults": 8,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 907
+        },
+        {
+          "index": 10,
+          "at": "2026-10-01T08:53:28.539Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11653,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11243,
+            "cacheWrite": 0,
+            "output": 18,
+            "reasoning": 0,
+            "cost": 0.00082115,
+            "raw": {
+              "prompt_tokens": 11653,
+              "completion_tokens": 18,
+              "total_tokens": 11671,
+              "cost": 0.00082115,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11243,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00082115,
+                "upstream_inference_prompt_cost": 0.00076715,
+                "upstream_inference_completions_cost": 0.000054
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 57480,
+            "reasoningMap": "RRRRRRRRR",
+            "reasoningItems": 9,
+            "emptyReasoning": 0,
+            "toolCalls": 9,
+            "toolResults": 9,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1110
+        },
+        {
+          "index": 11,
+          "at": "2026-10-01T08:53:29.729Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11678,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11225,
+            "cacheWrite": 0,
+            "output": 18,
+            "reasoning": 0,
+            "cost": 0.00084175,
+            "raw": {
+              "prompt_tokens": 11678,
+              "completion_tokens": 18,
+              "total_tokens": 11696,
+              "cost": 0.00084175,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11225,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00084175,
+                "upstream_inference_prompt_cost": 0.00078775,
+                "upstream_inference_completions_cost": 0.000054
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 57963,
+            "reasoningMap": "RRRRRRRRRR",
+            "reasoningItems": 10,
+            "emptyReasoning": 0,
+            "toolCalls": 10,
+            "toolResults": 10,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1216
+        },
+        {
+          "index": 12,
+          "at": "2026-10-01T08:53:31.074Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11703,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11208,
+            "cacheWrite": 0,
+            "output": 18,
+            "reasoning": 0,
+            "cost": 0.0008619,
+            "raw": {
+              "prompt_tokens": 11703,
+              "completion_tokens": 18,
+              "total_tokens": 11721,
+              "cost": 0.0008619,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11208,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0008619,
+                "upstream_inference_prompt_cost": 0.0008079,
+                "upstream_inference_completions_cost": 0.000054
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 58446,
+            "reasoningMap": "RRRRRRRRRRR",
+            "reasoningItems": 11,
+            "emptyReasoning": 0,
+            "toolCalls": 11,
+            "toolResults": 11,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1075
+        },
+        {
+          "index": 13,
+          "at": "2026-10-01T08:53:32.224Z",
+          "phase": "turn-1",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11728,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11191,
+            "cacheWrite": 0,
+            "output": 5,
+            "reasoning": 0,
+            "cost": 0.00084305,
+            "raw": {
+              "prompt_tokens": 11728,
+              "completion_tokens": 5,
+              "total_tokens": 11733,
+              "cost": 0.00084305,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11191,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00084305,
+                "upstream_inference_prompt_cost": 0.00082805,
+                "upstream_inference_completions_cost": 0.000015
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 58932,
+            "reasoningMap": "RRRRRRRRRRRR",
+            "reasoningItems": 12,
+            "emptyReasoning": 0,
+            "toolCalls": 12,
+            "toolResults": 12,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1015
+        },
+        {
+          "index": 14,
+          "at": "2026-10-01T08:53:33.882Z",
+          "phase": "turn-2",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11831,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11233,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.00091165,
+            "raw": {
+              "prompt_tokens": 11831,
+              "completion_tokens": 17,
+              "total_tokens": 11848,
+              "cost": 0.00091165,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11233,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00091165,
+                "upstream_inference_prompt_cost": 0.00086065,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 59384,
+            "reasoningMap": "RRRRRRRRRRRR-",
+            "reasoningItems": 12,
+            "emptyReasoning": 0,
+            "toolCalls": 12,
+            "toolResults": 12,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1044
+        },
+        {
+          "index": 15,
+          "at": "2026-10-01T08:53:35.003Z",
+          "phase": "turn-2",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11854,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11215,
+            "cacheWrite": 0,
+            "output": 5,
+            "reasoning": 0,
+            "cost": 0.00089525,
+            "raw": {
+              "prompt_tokens": 11854,
+              "completion_tokens": 5,
+              "total_tokens": 11859,
+              "cost": 0.00089525,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11215,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00089525,
+                "upstream_inference_prompt_cost": 0.00088025,
+                "upstream_inference_completions_cost": 0.000015
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 59868,
+            "reasoningMap": "RRRRRRRRRRRR-R",
+            "reasoningItems": 13,
+            "emptyReasoning": 0,
+            "toolCalls": 13,
+            "toolResults": 13,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 937
+        },
+        {
+          "index": 16,
+          "at": "2026-10-01T08:53:36.149Z",
+          "phase": "turn-3",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11884,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11213,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.00094715,
+            "raw": {
+              "prompt_tokens": 11884,
+              "completion_tokens": 17,
+              "total_tokens": 11901,
+              "cost": 0.00094715,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11213,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00094715,
+                "upstream_inference_prompt_cost": 0.00089615,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 60027,
+            "reasoningMap": "RRRRRRRRRRRR-R-",
+            "reasoningItems": 13,
+            "emptyReasoning": 0,
+            "toolCalls": 13,
+            "toolResults": 13,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 986
+        },
+        {
+          "index": 17,
+          "at": "2026-10-01T08:53:37.198Z",
+          "phase": "turn-3",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11907,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11196,
+            "cacheWrite": 0,
+            "output": 5,
+            "reasoning": 0,
+            "cost": 0.0009303,
+            "raw": {
+              "prompt_tokens": 11907,
+              "completion_tokens": 5,
+              "total_tokens": 11912,
+              "cost": 0.0009303,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11196,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0009303,
+                "upstream_inference_prompt_cost": 0.0009153,
+                "upstream_inference_completions_cost": 0.000015
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 60511,
+            "reasoningMap": "RRRRRRRRRRRR-R-R",
+            "reasoningItems": 14,
+            "emptyReasoning": 0,
+            "toolCalls": 14,
+            "toolResults": 14,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1062
+        },
+        {
+          "index": 18,
+          "at": "2026-10-01T08:53:38.447Z",
+          "phase": "turn-4",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11937,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11193,
+            "cacheWrite": 0,
+            "output": 17,
+            "reasoning": 0,
+            "cost": 0.00098265,
+            "raw": {
+              "prompt_tokens": 11937,
+              "completion_tokens": 17,
+              "total_tokens": 11954,
+              "cost": 0.00098265,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11193,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.00098265,
+                "upstream_inference_prompt_cost": 0.00093165,
+                "upstream_inference_completions_cost": 0.000051
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 60670,
+            "reasoningMap": "RRRRRRRRRRRR-R-R-",
+            "reasoningItems": 14,
+            "emptyReasoning": 0,
+            "toolCalls": 14,
+            "toolResults": 14,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 965
+        },
+        {
+          "index": 19,
+          "at": "2026-10-01T08:53:39.530Z",
+          "phase": "turn-4",
+          "path": "/api/v1/chat/completions",
+          "model": "google/gemini-3-flash-preview",
+          "status": 200,
+          "accepted": true,
+          "error": null,
+          "usage": {
+            "input": 11960,
+            "inputField": "prompt_tokens (includes cached)",
+            "cachedRead": 11176,
+            "cacheWrite": 0,
+            "output": 5,
+            "reasoning": 0,
+            "cost": 0.0009658,
+            "raw": {
+              "prompt_tokens": 11960,
+              "completion_tokens": 5,
+              "total_tokens": 11965,
+              "cost": 0.0009658,
+              "is_byok": false,
+              "prompt_tokens_details": {
+                "cached_tokens": 11176,
+                "cache_write_tokens": 0,
+                "audio_tokens": 0,
+                "video_tokens": 0
+              },
+              "cost_details": {
+                "upstream_inference_cost": 0.0009658,
+                "upstream_inference_prompt_cost": 0.0009508,
+                "upstream_inference_completions_cost": 0.000015
+              },
+              "completion_tokens_details": {
+                "reasoning_tokens": 0,
+                "image_tokens": 0,
+                "audio_tokens": 0
+              }
+            }
+          },
+          "request": {
+            "kind": "loop",
+            "bytes": 61151,
+            "reasoningMap": "RRRRRRRRRRRR-R-R-R",
+            "reasoningItems": 15,
+            "emptyReasoning": 0,
+            "toolCalls": 15,
+            "toolResults": 15,
+            "flags": {
+              "reasoning": {
+                "effort": "low"
+              },
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": null,
+              "usage": {
+                "include": true
+              }
+            }
+          },
+          "durationMs": 1074
+        }
+      ],
+      "removalLog": [
+        "[2026-10-01T08:53:10.295Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=1 fetched=0",
+        "[2026-10-01T08:53:10.579Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL APPLY — reason=m0_hard_fold (drain folded into executed m[0] bust, scheduler=defer), pendingOps=0, context=16.5%",
+        "[2026-10-01T08:53:10.580Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=applyPendingOperations elapsed=0.9ms",
+        "[2026-10-01T08:53:10.581Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=applyHeuristicCleanup elapsed=0.8ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0",
+        "[2026-10-01T08:53:18.344Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=2 fetched=0",
+        "[2026-10-01T08:53:18.346Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.0%",
+        "[2026-10-01T08:53:19.974Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=3 fetched=0",
+        "[2026-10-01T08:53:19.975Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.0%",
+        "[2026-10-01T08:53:21.433Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=4 fetched=0",
+        "[2026-10-01T08:53:21.434Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.0%",
+        "[2026-10-01T08:53:22.681Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=5 fetched=0",
+        "[2026-10-01T08:53:22.683Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.0%",
+        "[2026-10-01T08:53:24.075Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=6 fetched=0",
+        "[2026-10-01T08:53:24.076Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.0%",
+        "[2026-10-01T08:53:25.150Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=7 fetched=0",
+        "[2026-10-01T08:53:25.151Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.0%",
+        "[2026-10-01T08:53:26.347Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=8 fetched=0",
+        "[2026-10-01T08:53:26.348Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.0%",
+        "[2026-10-01T08:53:27.487Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=49.7ms targets=9 fetched=0",
+        "[2026-10-01T08:53:27.499Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.1%",
+        "[2026-10-01T08:53:28.471Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=10 fetched=0",
+        "[2026-10-01T08:53:28.472Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.1%",
+        "[2026-10-01T08:53:29.689Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=11 fetched=0",
+        "[2026-10-01T08:53:29.690Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.1%",
+        "[2026-10-01T08:53:31.031Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.5ms targets=12 fetched=0",
+        "[2026-10-01T08:53:31.033Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.1%",
+        "[2026-10-01T08:53:32.174Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=13 fetched=0",
+        "[2026-10-01T08:53:32.176Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.1%",
+        "[2026-10-01T08:53:33.385Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] command ctx-flush handled via command.execute.before",
+        "[2026-10-01T08:53:33.507Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=16 fetched=0",
+        "[2026-10-01T08:53:33.569Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL APPLY — reason=explicit_flush, pendingOps=0, context=6.1%",
+        "[2026-10-01T08:53:33.569Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=applyPendingOperations elapsed=0.3ms",
+        "[2026-10-01T08:53:33.569Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=applyHeuristicCleanup elapsed=0.3ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0",
+        "[2026-10-01T08:53:34.953Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=17 fetched=0",
+        "[2026-10-01T08:53:34.954Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.2%",
+        "[2026-10-01T08:53:36.046Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=19 fetched=0",
+        "[2026-10-01T08:53:36.048Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.2%",
+        "[2026-10-01T08:53:37.165Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=20 fetched=0",
+        "[2026-10-01T08:53:37.166Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.2%",
+        "[2026-10-01T08:53:38.315Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.1ms targets=22 fetched=0",
+        "[2026-10-01T08:53:38.316Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.2%",
+        "[2026-10-01T08:53:39.470Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] transform stage: stage=getDroppedTagsByNumbers elapsed=0.8ms targets=23 fetched=0",
+        "[2026-10-01T08:53:39.471Z] [magic-context][ses_f09552cb4ffenEUg6U8icDVqug] pending ops WILL NOT APPLY — reason=scheduler_defer pendingOps=0 context=6.2%"
+      ],
+      "isolation": {
+        "dbFiles": [
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db",
+          "/private<root>/data/cortexkit/magic-context/context.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db"
+        ],
+        "rootRemoved": true
+      },
+      "summary": {
+        "loopCalls": 19,
+        "rejectedCalls": 0,
+        "firstRemovalCall": null,
+        "acceptedAfterRemoval": null,
+        "callsAfterRemoval": 0,
+        "before": null,
+        "after": null
+      }
+    },
+    {
+      "scenario": "deepseek:age",
+      "route": "deepseek",
+      "model": "deepseek-v4-flash",
+      "hostVersion": "1.18.30",
+      "pluginCommit": "7e61ac82fd4af47c6faf9e90d78dd34763daedc7",
+      "startedAt": "2026-10-01T08:53:43.747Z",
+      "finishedAt": "2026-10-01T08:55:04.252Z",
+      "outcome": "completed",
+      "abortReason": null,
+      "calls": [],
+      "removalLog": [],
+      "isolation": {
+        "dbFiles": [
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db",
+          "/private<root>/data/cortexkit/magic-context/context.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal"
+        ],
+        "rootRemoved": true
+      },
+      "summary": {
+        "loopCalls": 0,
+        "rejectedCalls": 0,
+        "firstRemovalCall": null,
+        "acceptedAfterRemoval": null,
+        "callsAfterRemoval": 0,
+        "before": null,
+        "after": null
+      }
+    },
+    {
+      "scenario": "deepseek:drop",
+      "route": "deepseek",
+      "model": "deepseek-v4-flash",
+      "hostVersion": "1.18.30",
+      "pluginCommit": "7e61ac82fd4af47c6faf9e90d78dd34763daedc7",
+      "startedAt": "2026-10-01T08:55:04.255Z",
+      "finishedAt": "2026-10-01T08:56:15.333Z",
+      "outcome": "aborted",
+      "abortReason": "harness: Error: no tool tag to drop",
+      "calls": [],
+      "removalLog": [
+        "[2026-10-01T08:56:03.916Z] [magic-context] boot: entering pid=96009 dir=/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/live-providers/run5/roots/deepseek_drop/work",
+        "[2026-10-01T08:56:05.943Z] [magic-context] SQLite boot busy timeout: backend=Bun timeout=5000ms path=/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/live-providers/run5/roots/deepseek_drop/data/cortexkit/magic-context/context.db"
+      ],
+      "isolation": {
+        "dbFiles": [],
+        "rootRemoved": true
+      },
+      "summary": {
+        "loopCalls": 0,
+        "rejectedCalls": 0,
+        "firstRemovalCall": null,
+        "acceptedAfterRemoval": null,
+        "callsAfterRemoval": 0,
+        "before": null,
+        "after": null
+      }
+    },
+    {
+      "scenario": "kimi:age",
+      "route": "kimi",
+      "model": "kimi-for-coding",
+      "hostVersion": "1.18.30",
+      "pluginCommit": "7e61ac82fd4af47c6faf9e90d78dd34763daedc7",
+      "startedAt": "2026-10-01T08:56:15.572Z",
+      "finishedAt": "2026-10-01T08:58:44.278Z",
+      "outcome": "aborted",
+      "abortReason": "provider rejected call 6",
+      "calls": [
+        {
+          "index": 1,
+          "at": "2026-10-01T08:57:22.581Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46213,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 1004
+        },
+        {
+          "index": 2,
+          "at": "2026-10-01T08:57:25.738Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46213,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 981
+        },
+        {
+          "index": 3,
+          "at": "2026-10-01T08:57:31.155Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46213,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 966
+        },
+        {
+          "index": 4,
+          "at": "2026-10-01T08:57:40.580Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46213,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 905
+        },
+        {
+          "index": 5,
+          "at": "2026-10-01T08:57:59.188Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46213,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 941
+        },
+        {
+          "index": 6,
+          "at": "2026-10-01T08:58:39.748Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46213,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 974
+        }
+      ],
+      "removalLog": [
+        "[2026-10-01T08:57:09.312Z] [magic-context][ses_f09518bd4ffeOAde4vCB7mF1W5] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=1 fetched=0",
+        "[2026-10-01T08:57:09.948Z] [magic-context][ses_f09518bd4ffeOAde4vCB7mF1W5] pending ops WILL APPLY — reason=m0_hard_fold (drain folded into executed m[0] bust, scheduler=defer), pendingOps=0, context=5.5%",
+        "[2026-10-01T08:57:09.949Z] [magic-context][ses_f09518bd4ffeOAde4vCB7mF1W5] transform stage: stage=applyPendingOperations elapsed=1.1ms",
+        "[2026-10-01T08:57:10.028Z] [magic-context][ses_f09518bd4ffeOAde4vCB7mF1W5] transform stage: stage=applyHeuristicCleanup elapsed=79.0ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0"
+      ],
+      "isolation": {
+        "dbFiles": [
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db",
+          "/private<root>/data/cortexkit/magic-context/context.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal"
+        ],
+        "rootRemoved": true
+      },
+      "summary": {
+        "loopCalls": 6,
+        "rejectedCalls": 6,
+        "firstRemovalCall": null,
+        "acceptedAfterRemoval": null,
+        "callsAfterRemoval": 0,
+        "before": null,
+        "after": null
+      }
+    },
+    {
+      "scenario": "kimi:drop",
+      "route": "kimi",
+      "model": "kimi-for-coding",
+      "hostVersion": "1.18.30",
+      "pluginCommit": "7e61ac82fd4af47c6faf9e90d78dd34763daedc7",
+      "startedAt": "2026-10-01T08:58:44.280Z",
+      "finishedAt": "2026-10-01T09:00:45.656Z",
+      "outcome": "aborted",
+      "abortReason": "provider rejected call 6",
+      "calls": [
+        {
+          "index": 1,
+          "at": "2026-10-01T08:59:24.628Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46215,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 951
+        },
+        {
+          "index": 2,
+          "at": "2026-10-01T08:59:28.112Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46215,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 885
+        },
+        {
+          "index": 3,
+          "at": "2026-10-01T08:59:33.997Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46215,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 938
+        },
+        {
+          "index": 4,
+          "at": "2026-10-01T08:59:43.132Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46215,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 1015
+        },
+        {
+          "index": 5,
+          "at": "2026-10-01T09:00:03.445Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46215,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 916
+        },
+        {
+          "index": 6,
+          "at": "2026-10-01T09:00:41.388Z",
+          "phase": "turn-1",
+          "path": "/coding/v1/chat/completions",
+          "model": "kimi-for-coding",
+          "status": 403,
+          "accepted": false,
+          "error": "{\"error\":{\"message\":\"You've reached your weekly (7-day) usage limit. Your quota will reset when the current 7-day window ends. To continue now, purchase extra usage or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota\",\"type\":\"access_terminated_error\"}}",
+          "usage": null,
+          "request": {
+            "kind": "loop",
+            "bytes": 46215,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "reasoning": null,
+              "thinking": null,
+              "reasoningEffort": null,
+              "streamOptions": {
+                "include_usage": true
+              },
+              "usage": null
+            }
+          },
+          "durationMs": 884
+        }
+      ],
+      "removalLog": [
+        "[2026-10-01T08:59:14.613Z] [magic-context] boot: entering pid=26517 dir=/private/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/live-providers/run5/roots/kimi_drop/work",
+        "[2026-10-01T08:59:16.656Z] [magic-context] SQLite boot busy timeout: backend=Bun timeout=5000ms path=/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/magic-context/live-providers/run5/roots/kimi_drop/data/cortexkit/magic-context/context.db",
+        "[2026-10-01T08:59:19.550Z] [magic-context][ses_f094f8239ffe6fQGiPGB1eXSoO] transform stage: stage=getDroppedTagsByNumbers elapsed=0.2ms targets=1 fetched=0",
+        "[2026-10-01T08:59:19.661Z] [magic-context][ses_f094f8239ffe6fQGiPGB1eXSoO] pending ops WILL APPLY — reason=m0_hard_fold (drain folded into executed m[0] bust, scheduler=defer), pendingOps=0, context=5.5%",
+        "[2026-10-01T08:59:19.662Z] [magic-context][ses_f094f8239ffe6fQGiPGB1eXSoO] transform stage: stage=applyPendingOperations elapsed=0.9ms",
+        "[2026-10-01T08:59:19.663Z] [magic-context][ses_f094f8239ffe6fQGiPGB1eXSoO] transform stage: stage=applyHeuristicCleanup elapsed=0.7ms droppedTools=0 deduplicatedTools=0 droppedInjections=0 compressedTextTags=0 mutatedTextTags=0"
+      ],
+      "isolation": {
+        "dbFiles": [
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/opencode/live.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db",
+          "/private<root>/data/cortexkit/magic-context/context.db-wal",
+          "/private<root>/data/cortexkit/magic-context/context.db-shm",
+          "/private<root>/data/opencode/live.db",
+          "/private<root>/data/opencode/live.db-wal"
+        ],
+        "rootRemoved": true
+      },
+      "summary": {
+        "loopCalls": 6,
+        "rejectedCalls": 6,
+        "firstRemovalCall": null,
+        "acceptedAfterRemoval": null,
+        "callsAfterRemoval": 0,
+        "before": null,
+        "after": null
+      }
+    }
+  ]
+}

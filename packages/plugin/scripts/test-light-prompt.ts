@@ -5,25 +5,19 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildMagicContextSection } from "../src/agents/magic-context-prompt";
 import { parseRangeString } from "../src/features/magic-context/range-parser";
+import { LIGHT_TOOL_DESCRIPTIONS } from "../src/shared/prompt-surface-runtime";
+import { LIGHT_PARAMETER_DESCRIPTIONS } from "../src/tools/parameter-descriptions";
 
 const ARTIFACT_DIR = resolve(
     import.meta.dir,
     "../../..",
     "docs/specs/prompt-surface/light-validation",
 );
-const MODELS = [
-    { label: "DeepSeek V4 Flash", route: "ollama-cloud/deepseek-v4-flash", model: "deepseek-v4-flash" },
-    { label: "Gemma 4 31B", route: "ollama-cloud/gemma4:31b", model: "gemma4:31b" },
-] as const;
-const PRESETS = ["full", "light"] as const;
-const PROBE = `§101§ User instruction: preserve the requested migration order.
-§102§ Assistant: I extracted the relevant code paths.
-§103§ Tool output: a large file read already analyzed and acted on.
-§104§ Tool output: an unresolved compiler error that still needs diagnosis.
-§105§ Tool output: repeated passing status already recorded elsewhere.
-
-You have finished with §103§ and §105§, but §104§ is unresolved. Silently call ctx_reduce once with both eligible IDs in the documented drop grammar. Emit no prose or placeholder markers.`;
-const EXPECTED_DROP_IDS = [103, 105];
+const MODEL = {
+    label: "Gemma 4 31B",
+    route: "ollama-cloud/gemma4:31b",
+    model: "gemma4:31b",
+} as const;
 const TEMPERATURE = 0;
 const SEED = 268;
 const MAX_OUTPUT_TOKENS = 128;
@@ -46,19 +40,117 @@ interface OllamaResponse {
     eval_count?: number;
 }
 
+type ToolDefinition = {
+    type: "function";
+    function: {
+        name: string;
+        description: string;
+        parameters: Record<string, unknown>;
+    };
+};
+
+type Probe = {
+    id: "stamp" | "search" | "note";
+    prompt: string;
+    tools: ToolDefinition[];
+};
+
+const PROBES: Probe[] = [
+    {
+        id: "stamp",
+        prompt: `§101§ User instruction: preserve the requested migration order.
+§102§ Assistant: I extracted the relevant code paths.
+§103§ Tool output: a large file read already analyzed and acted on.
+§104§ Tool output: an unresolved compiler error that still needs diagnosis.
+§105§ Tool output: repeated passing status already recorded elsewhere.
+
+The next step uses only the unresolved compiler error. Continue with normal desk housekeeping before that step.`,
+        tools: [
+            {
+                type: "function",
+                function: {
+                    name: "ctx_reduce",
+                    description: LIGHT_TOOL_DESCRIPTIONS.ctx_reduce,
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            drop: {
+                                type: "string",
+                                description: LIGHT_PARAMETER_DESCRIPTIONS.ctx_reduce.drop,
+                            },
+                        },
+                        required: ["drop"],
+                        additionalProperties: false,
+                    },
+                },
+            },
+        ],
+    },
+    {
+        id: "search",
+        prompt:
+            "You need the recorded reason this project chose SQLite instead of Postgres. It is not on the desk, but it may already be in the archive. Resolve it using the available project tool before deciding whether the user must be asked.",
+        tools: [
+            {
+                type: "function",
+                function: {
+                    name: "ctx_search",
+                    description: LIGHT_TOOL_DESCRIPTIONS.ctx_search,
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            query: {
+                                type: "string",
+                                description: LIGHT_PARAMETER_DESCRIPTIONS.ctx_search.query,
+                            },
+                        },
+                        required: ["query"],
+                        additionalProperties: true,
+                    },
+                },
+            },
+        ],
+    },
+    {
+        id: "note",
+        prompt:
+            'The user says: "Take a note: after v1.0, revisit the cache invalidation benchmark. Evidence: the current run is noisy on CI, and compare it with the local baseline." Use the available session-note tool.',
+        tools: [
+            {
+                type: "function",
+                function: {
+                    name: "ctx_note",
+                    description: LIGHT_TOOL_DESCRIPTIONS.ctx_note,
+                    parameters: {
+                        type: "object",
+                        properties: {
+                            action: {
+                                type: "string",
+                                enum: ["write", "read", "update", "dismiss"],
+                                description: LIGHT_PARAMETER_DESCRIPTIONS.ctx_note.action,
+                            },
+                            content: {
+                                type: "string",
+                                description: LIGHT_PARAMETER_DESCRIPTIONS.ctx_note.content,
+                            },
+                        },
+                        required: ["action", "content"],
+                        additionalProperties: true,
+                    },
+                },
+            },
+        ],
+    },
+];
+
 interface RunRecord {
     model: string;
     requestedModel: string;
-    preset: (typeof PRESETS)[number];
+    preset: "light";
+    probe: Probe["id"];
     content: string;
     toolCalls: OllamaToolCall[];
-    drop: string | null;
-    checks: {
-        oneRealCtxReduceCall: boolean;
-        correctDropShape: boolean;
-        noTagImitation: boolean;
-        noFabricatedDroppedMarker: boolean;
-    };
+    checks: Record<string, boolean>;
     passed: boolean;
     usage: { promptTokens: number; completionTokens: number };
 }
@@ -76,7 +168,7 @@ function resolveOllamaCloudKey(): string {
     return key;
 }
 
-async function callModel(model: string, system: string): Promise<OllamaResponse> {
+async function callModel(probe: Probe, system: string): Promise<OllamaResponse> {
     let lastError: Error | undefined;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
         try {
@@ -87,26 +179,12 @@ async function callModel(model: string, system: string): Promise<OllamaResponse>
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
-                    model,
+                    model: MODEL.model,
                     messages: [
                         { role: "system", content: system },
-                        { role: "user", content: PROBE },
+                        { role: "user", content: probe.prompt },
                     ],
-                    tools: [
-                        {
-                            type: "function",
-                            function: {
-                                name: "ctx_reduce",
-                                description: "Mark spent tagged outputs discardable.",
-                                parameters: {
-                                    type: "object",
-                                    properties: { drop: { type: "string" } },
-                                    required: ["drop"],
-                                    additionalProperties: false,
-                                },
-                            },
-                        },
-                    ],
+                    tools: probe.tools,
                     think: false,
                     stream: false,
                     options: {
@@ -118,7 +196,8 @@ async function callModel(model: string, system: string): Promise<OllamaResponse>
                 signal: AbortSignal.timeout(TIMEOUT_MS),
             });
             const text = await response.text();
-            if (!response.ok) throw new Error(`ollama-cloud ${response.status}: ${text.slice(0, 500)}`);
+            if (!response.ok)
+                throw new Error(`ollama-cloud ${response.status}: ${text.slice(0, 500)}`);
             return JSON.parse(text) as OllamaResponse;
         } catch (error) {
             lastError = error instanceof Error ? error : new Error(String(error));
@@ -128,37 +207,60 @@ async function callModel(model: string, system: string): Promise<OllamaResponse>
     throw lastError ?? new Error("ollama-cloud request failed without an error");
 }
 
-function evaluate(
-    model: (typeof MODELS)[number],
-    preset: (typeof PRESETS)[number],
-    response: OllamaResponse,
-): RunRecord {
+function evaluate(probe: Probe, response: OllamaResponse): RunRecord {
     const content = response.message?.content?.trim() ?? "";
     const toolCalls = response.message?.tool_calls ?? [];
     const call = toolCalls[0]?.function;
-    const drop = typeof call?.arguments?.drop === "string" ? call.arguments.drop : null;
-    let parsedDrop: number[] = [];
-    try {
-        parsedDrop = drop ? [...new Set(parseRangeString(drop))].sort((a, b) => a - b) : [];
-    } catch {
-        parsedDrop = [];
+    let checks: Record<string, boolean>;
+    if (probe.id === "stamp") {
+        const drop = typeof call?.arguments?.drop === "string" ? call.arguments.drop : null;
+        let ids: number[] = [];
+        try {
+            ids = drop ? [...new Set(parseRangeString(drop))].sort((a, b) => a - b) : [];
+        } catch {
+            ids = [];
+        }
+        checks = {
+            stampsEarly:
+                toolCalls.length === 1 &&
+                call?.name === "ctx_reduce" &&
+                ids.includes(103) &&
+                ids.includes(105) &&
+                !ids.includes(101) &&
+                !ids.includes(104),
+            doesNotNarrate: content.length === 0 && !/§\d+§|\[dropped\s+§\d+§\]/i.test(content),
+        };
+    } else if (probe.id === "search") {
+        const query = typeof call?.arguments?.query === "string" ? call.arguments.query : "";
+        checks = {
+            searchesBeforeAsking:
+                toolCalls.length === 1 &&
+                call?.name === "ctx_search" &&
+                /sqlite/i.test(query) &&
+                /postgres/i.test(query) &&
+                !content.includes("?"),
+        };
+    } else {
+        const action = call?.arguments?.action;
+        const note = typeof call?.arguments?.content === "string" ? call.arguments.content : "";
+        const [title = "", ...detail] = note.split("\n");
+        checks = {
+            notesWithTitle:
+                toolCalls.length === 1 &&
+                call?.name === "ctx_note" &&
+                action === "write" &&
+                title.trim().length > 0 &&
+                title.length < 80 &&
+                detail.join("\n").trim().length > 0,
+        };
     }
-    const serializedOutput = JSON.stringify({ content, toolCalls });
-    const checks = {
-        oneRealCtxReduceCall: toolCalls.length === 1 && call?.name === "ctx_reduce",
-        correctDropShape:
-            parsedDrop.length === EXPECTED_DROP_IDS.length &&
-            parsedDrop.every((id, index) => id === EXPECTED_DROP_IDS[index]),
-        noTagImitation: !/§\d+§/.test(serializedOutput),
-        noFabricatedDroppedMarker: !/\[dropped\s+§\d+§\]/i.test(serializedOutput),
-    };
     return {
-        model: model.route,
-        requestedModel: model.model,
-        preset,
+        model: MODEL.route,
+        requestedModel: MODEL.model,
+        preset: "light",
+        probe: probe.id,
         content,
         toolCalls,
-        drop,
         checks,
         passed: Object.values(checks).every(Boolean),
         usage: {
@@ -168,61 +270,56 @@ function evaluate(
     };
 }
 
-function markdownFor(model: (typeof MODELS)[number], records: RunRecord[]): string {
+function markdownFor(records: RunRecord[]): string {
     const lines = [
-        `# ${model.label}: full vs light prompt behavior`,
+        `# ${MODEL.label}: light prompt behavior`,
         "",
-        `Route: \`${model.route}\` (request model \`${model.model}\`)`,
+        `Route: \`${MODEL.route}\` (request model \`${MODEL.model}\`)`,
         "",
-        "Both presets received the same tagged transcript and real `ctx_reduce` tool schema. Passing requires one real tool call with IDs 103 and 105, no §N§ imitation, and no fabricated dropped marker.",
+        "The light preset received three probes covering early stamping without narration, archive search before asking, and titled note creation.",
         "",
     ];
     for (const record of records) {
-        lines.push(`## ${record.preset}`, "", `Result: **${record.passed ? "PASS" : "FAIL"}**`, "");
+        lines.push(`## ${record.probe}`, "", `Result: **${record.passed ? "PASS" : "FAIL"}**`, "");
         lines.push("```json", JSON.stringify(record, null, 2), "```", "");
     }
     return lines.join("\n");
 }
 
 async function main(): Promise<void> {
+    const guidance = buildMagicContextSection(
+        null,
+        20,
+        true,
+        true,
+        true,
+        false,
+        false,
+        undefined,
+        true,
+        "light",
+    );
     const records: RunRecord[] = [];
-    for (const model of MODELS) {
-        for (const preset of PRESETS) {
-            const guidance = buildMagicContextSection(
-                null,
-                20,
-                true,
-                true,
-                true,
-                false,
-                false,
-                undefined,
-                true,
-                preset,
-            );
-            const response = await callModel(model.model, guidance);
-            const record = evaluate(model, preset, response);
-            records.push(record);
-            console.log(`${model.route} ${preset}: ${record.passed ? "PASS" : "FAIL"}`);
-        }
+    for (const probe of PROBES) {
+        const response = await callModel(probe, guidance);
+        const record = evaluate(probe, response);
+        records.push(record);
+        console.log(`${MODEL.route} ${probe.id}: ${record.passed ? "PASS" : "FAIL"}`);
     }
 
     mkdirSync(ARTIFACT_DIR, { recursive: true });
-    for (const model of MODELS) {
-        const modelRecords = records.filter((record) => record.model === model.route);
-        const name = model.route.replace(/[^A-Za-z0-9._-]+/g, "-");
-        writeFileSync(join(ARTIFACT_DIR, `${name}.md`), markdownFor(model, modelRecords));
-    }
+    const name = MODEL.route.replace(/[^A-Za-z0-9._-]+/g, "-");
+    writeFileSync(join(ARTIFACT_DIR, `${name}.md`), markdownFor(records));
     writeFileSync(
         join(ARTIFACT_DIR, "manifest.json"),
         `${JSON.stringify(
             {
                 artifactId: "prompt-surface-light-weak-model-validation",
-                revision: "s3-r1",
+                revision: "desk-r1",
                 timestamp: new Date().toISOString(),
                 endpoint: "https://ollama.com/api/chat",
-                models: MODELS,
-                presets: PRESETS,
+                model: MODEL,
+                preset: "light",
                 settings: {
                     temperature: TEMPERATURE,
                     seed: SEED,
@@ -232,24 +329,26 @@ async function main(): Promise<void> {
                     maxAttempts: MAX_ATTEMPTS,
                     repetitions: 1,
                 },
-                probe: PROBE,
-                expectedDropIds: EXPECTED_DROP_IDS,
+                probes: PROBES.map(({ id, prompt }) => ({ id, prompt })),
                 rubric: [
-                    "one real ctx_reduce tool call",
-                    "drop parses to exactly IDs 103 and 105",
-                    "no §N§ imitation in assistant output or tool arguments",
-                    "no fabricated [dropped §N§] marker",
+                    "stamps early: one ctx_reduce call includes spent outputs 103 and 105 while keeping user 101 and unresolved error 104",
+                    "does not narrate: the stamp call emits no prose or marker imitation",
+                    "searches before asking: one ctx_search query names SQLite and Postgres",
+                    "notes with title: one ctx_note write has a title under 80 chars and detail",
                 ],
                 unavailableModelPolicy: "fail the harness; do not substitute a model silently",
                 records,
-                passed: records.length === MODELS.length * PRESETS.length && records.every((record) => record.passed),
+                behaviors: Object.fromEntries(
+                    records.flatMap((record) => Object.entries(record.checks)),
+                ),
+                passed: records.length === PROBES.length && records.every((record) => record.passed),
             },
             null,
             2,
         )}\n`,
     );
 
-    if (records.length !== MODELS.length * PRESETS.length || records.some((record) => !record.passed)) {
+    if (records.length !== PROBES.length || records.some((record) => !record.passed)) {
         process.exitCode = 1;
     }
 }

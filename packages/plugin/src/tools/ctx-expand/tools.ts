@@ -2,42 +2,48 @@ import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { readSessionChunk } from "../../hooks/magic-context/read-session-chunk";
+import type { ToolExpansionMap } from "../../shared/historian-tool-template";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "./constants";
 import { resolveCtxExpandMode } from "./mode";
-import { renderMessageByOrdinal, renderVerboseRange } from "./render";
+import { renderItemByTag, renderMessageByOrdinal, renderVerboseRange } from "./render";
 import type { CtxExpandArgs } from "./types";
 
 export { CTX_EXPAND_LIGHT_DESCRIPTION } from "../light-descriptions";
 
 export interface CtxExpandToolDeps {
     db: ContextDatabase;
+    expandTools?: ToolExpansionMap;
 }
 
 const ctxExpandArgsShape = {
+    tag: tool.schema
+        .union([tool.schema.number(), tool.schema.string()])
+        .optional()
+        .describe(
+            "Tag number from a §N§ tag or a [dropped §N§] placeholder, not a message ordinal. Returns that one item in full. Use alone.",
+        ),
     start: tool.schema
         .number()
         .optional()
         .describe(
-            'First message ordinal to expand — a compartment\'s start="N" attribute, or an ordinal from a ctx_search message hit',
+            "First message ordinal of the range (a <session-history> heading's start, or a ctx_search hit), not a tag number.",
         ),
     end: tool.schema
         .number()
         .optional()
-        .describe(
-            'Last message ordinal to expand (inclusive) — a compartment\'s end="M" attribute',
-        ),
+        .describe("Last message ordinal of the range, inclusive, not a tag number."),
     verbose: tool.schema
         .boolean()
         .optional()
         .describe(
-            "With start/end: list each message separately with its ordinal [N] and per-part preview (each tool call shown with its output size), so you can pick one to recover in full by ordinal.",
+            "With start/end: one entry per message with ordinal and per-part preview instead of the transcript.",
         ),
     message: tool.schema
         .number()
         .optional()
         .describe(
-            "Full untruncated recovery of ONE message by its ordinal (every text part + every tool call's complete input/output). Use an ordinal from a compartment, ctx_search hit, or verbose range. Recovers a tool output you dropped with ctx_reduce.",
+            "Message ordinal from a <session-history> heading or a ctx_search hit, not a tag number. Returns that one message in full. Use alone.",
         ),
 };
 // The tool definition exposes only the documented argument shape to the model
@@ -52,7 +58,7 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
         async execute(rawArgs: CtxExpandArgs, toolContext) {
             const parsedArgs = ctxExpandArgsSchema.safeParse(rawArgs);
             let args = (parsedArgs.success ? parsedArgs.data : rawArgs) as CtxExpandArgs;
-            args = unwrapImitatedReducedArgs(args, ["message", "start"], {
+            args = unwrapImitatedReducedArgs(args, ["tag", "message", "start"], {
                 start: "number",
                 end: "number",
                 verbose: "boolean",
@@ -62,6 +68,9 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
             const mode = resolveCtxExpandMode(args, "positive");
             if (mode.kind === "error") {
                 return mode.message;
+            }
+            if (mode.kind === "tag") {
+                return renderItemByTag(deps.db, sessionId, mode.tag);
             }
             if (mode.kind === "message") {
                 return renderMessageByOrdinal(sessionId, mode.message);
@@ -86,6 +95,7 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                     start,
                     effectiveEnd,
                     CTX_EXPAND_TOKEN_BUDGET,
+                    deps.expandTools,
                 );
                 if (!v.text) {
                     return `No messages found in range ${start}-${effectiveEnd}. The range may be outside this session's history.`;
@@ -109,6 +119,7 @@ function createCtxExpandTool(deps: CtxExpandToolDeps): ToolDefinition {
                 CTX_EXPAND_TOKEN_BUDGET,
                 start,
                 effectiveEnd + 1, // readSessionChunk uses exclusive end
+                { expand: false },
             );
 
             if (!chunk.text || chunk.messageCount === 0) {

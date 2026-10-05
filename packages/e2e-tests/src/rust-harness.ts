@@ -35,17 +35,29 @@ import {
 import {
     buildHermeticBinaries,
     detectRustModePrereqs,
+    type HermeticHistorianRunner,
     HermeticSubcStack,
     type RustModePrereqs,
 } from "./rust-runner/hermetic-subc";
 
 export interface RustTestHarnessOptions {
+    /** Preallocated throwaway paths for database-copy drills. dispose() removes dataDir's parent. */
+    existingEnv?: IsolatedEnv;
     /** magic-context USER-tier config overrides (thresholds, memory, etc.). */
     magicContextConfig?: Record<string, unknown>;
     /** Extra opencode.json config. Merged onto test defaults. */
     openCodeConfigExtra?: Record<string, unknown>;
     /** Override the mock model's context token limit. Default 200000. */
     modelContextLimit?: number;
+    /**
+     * Give the historian its own mock model with this context window instead of
+     * the session model. A scenario that shrinks `modelContextLimit` to build
+     * pressure quickly needs this: the module refuses a historian prompt that does
+     * not fit the historian model's window, and it counts a prompt for a model it has
+     * no tokenizer calibration for (every mock model) at twice its local size. Default: the historian uses the
+     * session model and its window.
+     */
+    historianModelContextLimit?: number;
     /** Default response used when the mock queue is empty. */
     mockDefault?: MockResponse;
     /** Mock provider id exposed to OpenCode. Defaults to "mock-anthropic". */
@@ -70,6 +82,17 @@ export interface RustTestHarnessOptions {
     startHistorianProducer?: boolean;
     /** Copy an existing module store into the isolated data directory before ck-mc starts. */
     seedModuleStorePath?: string;
+    /** Build the hermetic module with the otherwise-absent drive-fault feature. */
+    driveFaultBinary?: boolean;
+    /** Module-only environment, for scenario-specific logging or fault controls. */
+    moduleEnv?: Record<string, string>;
+    /**
+     * The historian/dreamer runner named in BOTH user tiers (the module's and the
+     * plugin's). Default "broca", which keeps every scenario written against the
+     * Broca producer on that lane now that an unconfigured OpenCode request
+     * defaults to the host runner. `null` names none, so the harness default applies.
+     */
+    historianRunner?: HermeticHistorianRunner;
 }
 
 export interface SdkClient {
@@ -82,8 +105,10 @@ export interface SdkClient {
             path: { id: string };
             body: {
                 model: { providerID: string; modelID: string };
-                parts: Array<{ type: "text"; text: string }>;
+                parts: Array<{ type: "text"; text: string; synthetic?: boolean }>;
                 agent?: string;
+                messageID?: string;
+                variant?: string;
             };
         }) => Promise<{ data?: unknown; error?: unknown }>;
         revert: (opts: {
@@ -95,6 +120,9 @@ export interface SdkClient {
         }) => Promise<{ data?: unknown }>;
     };
 }
+
+/** The historian's own mock model, registered when `historianModelContextLimit` is set. */
+const HISTORIAN_MOCK_MODEL_ID = "mock-historian";
 
 const DEFAULT_MOCK_RESPONSE: MockResponse = {
     text: "ok",
@@ -150,12 +178,14 @@ export class RustTestHarness {
     private clientInstance: SdkClient;
     private contextDbCached: Database | null = null;
     private modelContextLimit: number | undefined;
+    private readonly historianModelContextLimit: number | undefined;
     private mockDefault: MockResponse;
     private readonly mockBaseURL: string;
     private readonly providerID: string;
     private readonly providerAPI: "@ai-sdk/anthropic" | "@ai-sdk/openai";
     private readonly modelID: string;
     private readonly historianProducerAvailable: boolean;
+    private readonly historianRunner: HermeticHistorianRunner;
     private readonly trailingBlankReplayRows = new Map<string, TrailingBlankReplayRows>();
 
     private constructor(args: {
@@ -167,11 +197,13 @@ export class RustTestHarness {
         client: SdkClient;
         logPath: string;
         modelContextLimit: number | undefined;
+        historianModelContextLimit: number | undefined;
         mockDefault: MockResponse;
         providerID: string;
         providerAPI: "@ai-sdk/anthropic" | "@ai-sdk/openai";
         modelID: string;
         historianProducerAvailable: boolean;
+        historianRunner: HermeticHistorianRunner;
     }) {
         this.mock = args.mock;
         this.mockBaseURL = args.mockBaseURL;
@@ -181,11 +213,13 @@ export class RustTestHarness {
         this.clientInstance = args.client;
         this.logPath = args.logPath;
         this.modelContextLimit = args.modelContextLimit;
+        this.historianModelContextLimit = args.historianModelContextLimit;
         this.mockDefault = args.mockDefault;
         this.providerID = args.providerID;
         this.providerAPI = args.providerAPI;
         this.modelID = args.modelID;
         this.historianProducerAvailable = args.historianProducerAvailable;
+        this.historianRunner = args.historianRunner;
     }
 
     /**
@@ -206,7 +240,9 @@ export class RustTestHarness {
             );
         }
 
-        const { ckMcBin, ckSubcBin } = await buildHermeticBinaries(prereqs.subconsciousRoot);
+        const { ckMcBin, ckSubcBin } = await buildHermeticBinaries(prereqs.subconsciousRoot, {
+            driveFault: options.driveFaultBinary,
+        });
 
         const mock = new MockProvider();
         const { baseURL } = await mock.start();
@@ -216,7 +252,7 @@ export class RustTestHarness {
         // Env first: the daemon must write its connection file into
         // <dataDir>/cortexkit/run/ before opencode boots and the plugin's Rust
         // client connects on the first transform.
-        const env = createIsolatedEnv();
+        const env = options.existingEnv ?? createIsolatedEnv();
         if (options.seedModuleStorePath) {
             const moduleStoreDir = join(env.dataDir, "cortexkit", "magic-context");
             mkdirSync(moduleStoreDir, { recursive: true });
@@ -236,6 +272,8 @@ export class RustTestHarness {
             ckMcBin,
             ckSubcBin,
             startProducer: options.startHistorianProducer ?? true,
+            moduleEnv: options.moduleEnv ?? {},
+            historianRunner: RustTestHarness.runnerOption(options),
         });
         if (options.seedModuleStorePath) {
             const deadline = Date.now() + 65_000;
@@ -287,12 +325,18 @@ export class RustTestHarness {
             client,
             logPath,
             modelContextLimit: options.modelContextLimit,
+            historianModelContextLimit: options.historianModelContextLimit,
             mockDefault,
             providerID: options.providerID ?? "mock-anthropic",
             providerAPI: options.providerAPI ?? "@ai-sdk/anthropic",
             modelID: options.modelID ?? "mock-sonnet",
             historianProducerAvailable: options.startHistorianProducer ?? true,
+            historianRunner: RustTestHarness.runnerOption(options),
         });
+    }
+
+    private static runnerOption(options: RustTestHarnessOptions): HermeticHistorianRunner {
+        return options.historianRunner === undefined ? "broca" : options.historianRunner;
     }
 
     private static spawnServe(args: {
@@ -305,6 +349,11 @@ export class RustTestHarness {
     }): Promise<SpawnedOpencode> {
         const providerID = args.options.providerID ?? "mock-anthropic";
         const modelID = args.options.modelID ?? "mock-sonnet";
+        const historianModel =
+            args.options.historianModelContextLimit === undefined
+                ? undefined
+                : { id: HISTORIAN_MOCK_MODEL_ID, contextLimit: args.options.historianModelContextLimit };
+        const historianModelID = historianModel?.id ?? modelID;
         return spawnOpencode({
             mockProviderURL: args.mockURL,
             mockProviderID: providerID,
@@ -312,13 +361,17 @@ export class RustTestHarness {
             mockModelID: modelID,
             existingEnv: args.env,
             modelContextLimit: args.options.modelContextLimit,
+            historianMockModel: historianModel,
             openCodeConfigExtra: args.options.openCodeConfigExtra,
-            magicContextConfig: {
-                ...(args.options.startHistorianProducer ?? true
-                    ? { historian: { opencode: { model: `${providerID}/${modelID}` } } }
-                    : {}),
-                ...(args.options.magicContextConfig ?? {}),
-            },
+            magicContextConfig: RustTestHarness.pinPluginRunner(
+                {
+                    ...(args.options.startHistorianProducer ?? true
+                        ? { historian: { opencode: { model: `${providerID}/${historianModelID}` } } }
+                        : {}),
+                    ...(args.options.magicContextConfig ?? {}),
+                },
+                RustTestHarness.runnerOption(args.options),
+            ),
             // The connection_file value is only used to flip `userTierHasSubc`
             // true (the resolver gate). The actual transport still reads the
             // DEFAULT connection path — which this same file happens to be.
@@ -328,6 +381,23 @@ export class RustTestHarness {
             },
             extraEnv: { MAGIC_CONTEXT_LOG_PATH: args.logPath },
         });
+    }
+
+    /**
+     * Name the runner in the plugin's user tier too, so the plugin's pull loop and
+     * the module agree on the lane. A scenario that names its own runner keeps it.
+     */
+    private static pinPluginRunner(
+        config: Record<string, unknown>,
+        runner: HermeticHistorianRunner,
+    ): Record<string, unknown> {
+        if (runner === null) return config;
+        const historian =
+            config.historian && typeof config.historian === "object"
+                ? (config.historian as Record<string, unknown>)
+                : {};
+        if (historian.runner !== undefined) return config;
+        return { ...config, historian: { ...historian, runner } };
     }
 
     get opencode(): SpawnedOpencode {
@@ -353,7 +423,7 @@ export class RustTestHarness {
             }
             this.contextDbCached = null;
         }
-        await this.opencodeInstance.kill();
+        await this.opencodeInstance.kill({ root: "keep" });
         this.opencodeInstance = await RustTestHarness.spawnServe({
             env: this.env,
             mockURL: this.mockBaseURL,
@@ -361,8 +431,10 @@ export class RustTestHarness {
             logPath: this.logPath,
             options: {
                 modelContextLimit: this.modelContextLimit,
+                historianModelContextLimit: this.historianModelContextLimit,
                 magicContextConfig: opts.magicContextConfig,
                 startHistorianProducer: this.historianProducerAvailable,
+                historianRunner: this.historianRunner,
                 providerID: this.providerID,
                 providerAPI: this.providerAPI,
                 modelID: this.modelID,
@@ -392,6 +464,43 @@ export class RustTestHarness {
             );
         }
         throw new Error("session.create failed");
+    }
+
+    /**
+     * Create a child session the way OpenCode's `task` tool does: POST /session with a
+     * `parentID`. The plugin reads that field from the `session.created` event and marks
+     * the row a subagent, which is the only way to drive subagent behaviour end to end.
+     */
+    async createChildSession(parentId: string, title?: string): Promise<string> {
+        const maxAttempts = 5;
+        for (let i = 1; i <= maxAttempts; i++) {
+            const res = await this.clientInstance.session.create({
+                query: { directory: this.env.workdir },
+                body: { parentID: parentId, ...(title ? { title } : {}) },
+            });
+            if (res.data) return res.data.id;
+            if (i < maxAttempts) {
+                await Bun.sleep(200 * i);
+                continue;
+            }
+            throw new Error(
+                `child session.create failed after ${maxAttempts} attempts. stderr:\n${this.opencodeInstance.stderr()}`,
+            );
+        }
+        throw new Error("child session.create failed");
+    }
+
+    /** Read the plugin's persisted subagent flag, or null before the row exists. */
+    isSubagent(sessionId: string): boolean | null {
+        try {
+            const row = this.contextDb()
+                .prepare("SELECT is_subagent FROM session_meta WHERE session_id = ?")
+                .get(sessionId) as { is_subagent?: unknown } | null;
+            if (!row) return null;
+            return row.is_subagent === 1 || row.is_subagent === true;
+        } catch {
+            return null;
+        }
     }
 
     /**
@@ -620,6 +729,19 @@ export class RustTestHarness {
             providerID?: string;
             modelID?: string;
             messageID?: string;
+            /**
+             * OpenCode reasoning variant for this turn. OpenCode hands it to the
+             * plugin's chat.message hook, and the adapter folds it into the render
+             * identity it sends the module.
+             */
+            variant?: string;
+            /**
+             * Send the prompt the way OpenCode's own notice deliveries do: a text part
+             * flagged `synthetic`. The flag keeps the message out of the terminal's
+             * human-turn rendering; OpenCode still persists it as an ordinary user row
+             * and still serializes it to the model on every later pass.
+             */
+            synthetic?: boolean;
         } = {},
     ): Promise<unknown> {
         const timeoutMs = options.timeoutMs ?? 180_000;
@@ -630,9 +752,10 @@ export class RustTestHarness {
                     providerID: options.providerID ?? this.providerID,
                     modelID: options.modelID ?? this.modelID,
                 },
-                parts: [{ type: "text", text }],
+                parts: [{ type: "text", text, ...(options.synthetic ? { synthetic: true } : {}) }],
                 ...(options.agent ? { agent: options.agent } : {}),
                 ...(options.messageID ? { messageID: options.messageID } : {}),
+                ...(options.variant ? { variant: options.variant } : {}),
             },
         });
         const timeout = new Promise<null>((r) => setTimeout(() => r(null), timeoutMs));
@@ -641,7 +764,8 @@ export class RustTestHarness {
             throw new Error(
                 `sendPrompt did not complete within ${timeoutMs}ms. stderr:\n${this.opencodeInstance
                     .stderr()
-                    .slice(-2000)}\nmodule log:\n${this.subc.moduleLog().slice(-2000)}`,
+                    .slice(-2000)}\nmodule log:\n${this.subc.moduleLog().slice(-2000)}\n` +
+                    `plugin log:\n${await this.flushedPluginLogTail()}`,
             );
         }
         if (result.data === undefined) {
@@ -649,7 +773,8 @@ export class RustTestHarness {
                 `sendPrompt returned without session data: ${JSON.stringify(result.error ?? null)}\n` +
                     `stdout:\n${this.opencodeInstance.stdout().slice(-2000)}\n` +
                     `stderr:\n${this.opencodeInstance.stderr().slice(-2000)}\n` +
-                    `module log:\n${this.subc.moduleLog().slice(-2000)}`,
+                    `module log:\n${this.subc.moduleLog().slice(-2000)}\n` +
+                    `plugin log:\n${await this.flushedPluginLogTail()}`,
             );
         }
         return result;
@@ -754,6 +879,17 @@ export class RustTestHarness {
             },
             { timeoutMs, label: `>= ${minCount} rust passes` },
         );
+    }
+
+    /**
+     * The end of the plugin's log, for a failure message. The plugin writes its
+     * diagnostics (a refused pass among them) to this file rather than to the
+     * host's stderr, and buffers them for up to half a second, so wait out one
+     * buffer interval before reading. Only failure reporting calls this.
+     */
+    private async flushedPluginLogTail(): Promise<string> {
+        await Bun.sleep(1_000);
+        return this.diagnosticLog().slice(-4000);
     }
 
     /** Read the subprocess diagnostic log for assertions about the active lineage. */
@@ -891,7 +1027,7 @@ export class RustTestHarness {
         }
         // Kill order: opencode (holds the plugin's subc client) → module → daemon.
         try {
-            await this.opencodeInstance.kill();
+            await this.opencodeInstance.kill({ root: "remove" });
         } catch {
             // ignore
         }

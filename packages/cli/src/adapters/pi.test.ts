@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { PiAdapter } from "./pi";
 
 const originalPiDir = process.env.PI_CODING_AGENT_DIR;
@@ -15,7 +16,7 @@ afterEach(() => {
 
 describe("PiAdapter settings safety", () => {
     it("aborts plugin updates when existing settings are malformed", async () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-pi-adapter-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-adapter-"));
         tempDirs.push(root);
         process.env.PI_CODING_AGENT_DIR = root;
         const settingsPath = join(root, "settings.json");
@@ -32,7 +33,7 @@ describe("PiAdapter settings safety", () => {
 
 describe("PiAdapter local checkout identity", () => {
     it("treats a local plugin checkout as registered and does not add the npm entry beside it", async () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-pi-adapter-local-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-adapter-local-"));
         tempDirs.push(root);
         process.env.PI_CODING_AGENT_DIR = root;
         // Pi stores `pi install <dir>` as a path relative to its agent directory.
@@ -56,7 +57,7 @@ describe("PiAdapter local checkout identity", () => {
     });
 
     it("still registers the npm entry when the only local path is an unrelated extension", async () => {
-        const root = mkdtempSync(join(tmpdir(), "mc-pi-adapter-unrelated-"));
+        const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-adapter-unrelated-"));
         tempDirs.push(root);
         process.env.PI_CODING_AGENT_DIR = root;
         const other = join(root, "other-extension");

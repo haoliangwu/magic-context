@@ -2,6 +2,10 @@ import { describe, expect, it, spyOn } from "bun:test";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { EmbeddingConfig } from "@magic-context/core/config/schema/magic-context";
+import {
+	appendCompartments,
+	getCompartments,
+} from "@magic-context/core/features/magic-context/compartment-storage";
 import * as projectEmbedding from "@magic-context/core/features/magic-context/memory/embedding";
 import {
 	_resetProjectEmbeddingRegistryForTests,
@@ -20,10 +24,83 @@ import * as logger from "@magic-context/core/shared/logger";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
 import { createTestTempDir } from "@magic-context/core/shared/test-temp-dir";
 
-import { ensureProjectRegisteredFromPiDirectory } from "./embedding-bootstrap";
+import {
+	ensureProjectRegisteredFromPiDirectory,
+	unregisterPiProjectEmbeddings,
+} from "./embedding-bootstrap";
 import { createTestDb } from "./test-utils.test";
 
 describe("ensureProjectRegisteredFromPiDirectory", () => {
+	it("resumes project repair on the cached Pi registration path", async () => {
+		const db = createTestDb();
+		const directory = createTestTempDir("pi-embedding-bootstrap-").dir;
+		const home = createTestTempDir("pi-embedding-home-").dir;
+		const previous = {
+			HOME: process.env.HOME,
+			XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+		};
+		process.env.HOME = home;
+		process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+		try {
+			const configDir = path.join(home, ".config", "cortexkit");
+			await fs.mkdir(configDir, { recursive: true });
+			await fs.writeFile(
+				path.join(configDir, "magic-context.json"),
+				JSON.stringify({
+					embedding: {
+						provider: "local",
+						model: "cache-repair",
+						local_runtime: "auto",
+					},
+				}),
+			);
+			const project = resolveProjectIdentity(directory);
+			await ensureProjectRegisteredFromPiDirectory(directory, db);
+			appendCompartments(db, "pi-cached-repair", [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: 2,
+					startMessageId: "u1",
+					endMessageId: "a2",
+					title: "repair",
+					content: "repair",
+					p1: "repair",
+				},
+			]);
+			const compartment = getCompartments(db, "pi-cached-repair")[0].id;
+			db.prepare("INSERT INTO session_projects VALUES (?, 'pi', ?, 0)").run(
+				"pi-cached-repair",
+				project,
+			);
+			const insert = db.prepare(`INSERT INTO compartment_chunk_embeddings(
+                compartment_id, session_id, project_path, harness, window_index, start_ordinal, end_ordinal,
+                chunk_hash, model_id, dims, vector, created_at) VALUES (?, ?, 'git:wrong', 'pi', ?, 1, 2, ?, 'old', 1, ?, 0)`);
+			for (let i = 0; i < 200; i++)
+				insert.run(
+					compartment,
+					"pi-cached-repair",
+					i,
+					`hash-${i}`,
+					new Uint8Array(4),
+				);
+			await ensureProjectRegisteredFromPiDirectory(directory, db);
+			expect(
+				db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM compartment_chunk_embeddings WHERE project_path=?",
+					)
+					.get(project),
+			).toEqual({ n: 200 });
+		} finally {
+			unregisterPiProjectEmbeddings(db);
+			closeQuietly(db);
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
 	it("preserves the embedding cache across consecutive identical registrations", async () => {
 		const db = createTestDb();
 		const oldHome = process.env.HOME;
@@ -58,6 +135,20 @@ describe("ensureProjectRegisteredFromPiDirectory", () => {
 			}
 			if (oldConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
 			else process.env.XDG_CONFIG_HOME = oldConfigHome;
+			closeQuietly(db);
+		}
+	});
+
+	it("shutdown unregisters project embedding providers", async () => {
+		const db = createTestDb();
+		const directory = createTestTempDir("pi-embedding-shutdown-").dir;
+		try {
+			await ensureProjectRegisteredFromPiDirectory(directory, db);
+			const identity = resolveProjectIdentity(directory);
+			expect(getProjectEmbeddingSnapshot(identity)).not.toBeNull();
+			unregisterPiProjectEmbeddings(db);
+			expect(getProjectEmbeddingSnapshot(identity)).toBeNull();
+		} finally {
 			closeQuietly(db);
 		}
 	});
@@ -114,8 +205,13 @@ describe("ensureProjectRegisteredFromPiDirectory", () => {
 			embed: async () => new Float32Array([1, 0]),
 			embedBatch: async (texts: string[]) =>
 				texts.map(() => new Float32Array([1, 0])),
-			dispose: async () => {
+			// Non-async: the flag is recorded when dispose is *called*, which is the
+			// deterministic contract. disposeProvider is fire-and-forget
+			// (`void provider.dispose()`), so an async body here would make the
+			// assertion below depend on that body running before its first await.
+			dispose: () => {
 				disposed = true;
+				return Promise.resolve();
 			},
 			isLoaded: () => true,
 		}));
@@ -214,8 +310,13 @@ describe("ensureProjectRegisteredFromPiDirectory", () => {
 			embed: async () => new Float32Array([1, 0]),
 			embedBatch: async (texts: string[]) =>
 				texts.map(() => new Float32Array([1, 0])),
-			dispose: async () => {
+			// Non-async: the flag is recorded when dispose is *called*, which is the
+			// deterministic contract. disposeProvider is fire-and-forget
+			// (`void provider.dispose()`), so an async body here would make the
+			// assertion below depend on that body running before its first await.
+			dispose: () => {
 				disposed = true;
+				return Promise.resolve();
 			},
 			isLoaded: () => true,
 		}));

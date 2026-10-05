@@ -1,0 +1,22 @@
+{
+  "control": "Neutralize C/D system-entry append in host-plugin.mjs with NON-VACUITY BREAK; no live requests were running",
+  "command": "bun test packages/plugin/scripts/self-tag-trial/measure.test.ts packages/plugin/scripts/self-tag-trial/host-probe.test.ts",
+  "expectedRed": "C and D guidance reaches the pinned host and is absent for A",
+  "actualFailure": "C and D guidance reaches the pinned host and is absent for A: C guidance variant not applied",
+  "otherFailures": [],
+  "passedDuringMutation": [
+    "provider errors redact authorization and bare credential values",
+    "dangling mid-text tags are misplaced, but a malformed leading token is only malformed",
+    "measurement reads the first subsequent real wire and independent DB number",
+    "tool-only responses use native call ownership and do not become missing-text failures",
+    "tag-only tool framing is misplaced even when stripping leaves an empty untagged part",
+    "canonical prefix, malformed notation and incidental tags are measured separately",
+    "only D enables thinking and raises the relay output cap"
+  ],
+  "baselineWorkingDiffStat": "empty after staging intentional files",
+  "mutatedWorkingDiffStat": "packages/plugin/scripts/self-tag-trial/host-plugin.mjs | 2 +-; 1 file changed, 1 insertion(+), 1 deletion(-)",
+  "restore": "git checkout -- packages/plugin/scripts/self-tag-trial/host-plugin.mjs && touch packages/plugin/scripts/self-tag-trial/host-plugin.mjs",
+  "restoredWorkingDiffStat": "empty",
+  "restoredResult": "8 pass, 0 fail",
+  "outcome": "reddened"
+}

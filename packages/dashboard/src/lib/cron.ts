@@ -10,15 +10,56 @@
 
 const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
-/** Loose 5-field shape check for inline UI feedback (not full cron validation). */
+/**
+ * Allowed values per field, matching the plugin's cron parser
+ * (`dreamer/cron.ts`): minute, hour, day-of-month, month, day-of-week (7 is
+ * Sunday).
+ */
+const FIELD_RANGES: Array<[number, number]> = [
+  [0, 59],
+  [0, 23],
+  [1, 31],
+  [1, 12],
+  [0, 7],
+];
+
+function fieldInRange(field: string, [min, max]: [number, number]): boolean {
+  const inRange = (n: string) => Number(n) >= min && Number(n) <= max;
+  if (field === "*") return true;
+  const step = field.match(/^\*\/(\d+)$/);
+  if (step) return Number(step[1]) >= 1;
+  const range = field.match(/^(\d+)-(\d+)$/);
+  if (range) return inRange(range[1]) && inRange(range[2]) && Number(range[1]) <= Number(range[2]);
+  return /^\d+(,\d+)*$/.test(field) && field.split(",").every(inRange);
+}
+
+/**
+ * 5-field check for inline UI feedback. Accepts the shapes the dreamer UI
+ * produces (*, *\/n, a, a-b, a,b,c) with values in each field's range; the
+ * plugin's parser remains authoritative and accepts a few more shapes.
+ */
 export function isValidCronShape(value: string): boolean {
   const v = value.trim();
   if (v === "") return true; // empty = disabled, valid
   const fields = v.split(/\s+/);
   if (fields.length !== 5) return false;
-  // Each field is one of: *, */n, a, a-b, a,b,c (digits only here — the plugin
-  // does the authoritative parse; this just rejects obvious garbage).
-  return fields.every((f) => /^(\*|\d+|\*\/\d+|\d+-\d+|\d+(,\d+)*)$/.test(f));
+  return fields.every((field, i) => fieldInRange(field, FIELD_RANGES[i]));
+}
+
+/** English ordinal: 1st, 2nd, 3rd, 4th, 11th, 12th, 13th, 21st, 22nd, 23rd, 31st. */
+function ordinal(n: number): string {
+  const lastTwo = n % 100;
+  if (lastTwo >= 11 && lastTwo <= 13) return `${n}th`;
+  switch (n % 10) {
+    case 1:
+      return `${n}st`;
+    case 2:
+      return `${n}nd`;
+    case 3:
+      return `${n}rd`;
+    default:
+      return `${n}th`;
+  }
 }
 
 function fmtTime(hour: number, minute: number): string {
@@ -73,9 +114,7 @@ export function describeCron(cron: string): string {
       }
       // Monthly on a day-of-month — "0 3 1 * *"
       if (/^\d+$/.test(dom) && month === "*" && dow === "*") {
-        const d = Number(dom);
-        const ord = d === 1 ? "1st" : d === 2 ? "2nd" : d === 3 ? "3rd" : `${d}th`;
-        return `Monthly on the ${ord} at ${time}`;
+        return `Monthly on the ${ordinal(Number(dom))} at ${time}`;
       }
     }
   }

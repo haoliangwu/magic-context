@@ -1,0 +1,230 @@
+[
+  {
+    "description": "Stamp an item as no longer needed for the work ahead. Not a delete: stamping QUEUES it, the item stays readable until Magic Context clears stamped items in one sweep, newest tags are protected, and a cleared item goes to the archive (recent: a [dropped §N§] placeholder; older: removed) recoverable via ctx_expand(tag=N). The question is \"does this need to stay on my desk for what comes next?\" — a file you keep editing stays, the grep that found it goes. Stamp used reads/searches/outputs, acted-on build/test output, redundant dumps, extracted pasted payloads; keep user messages, your own text, unresolved errors, raw evidence, exact wording that may matter. Look at each tag; never blanket-stamp \"1-50\". Grammar: \"3-5\", \"1,2,9\", \"1-5,8,12-15\".",
+    "execution_mode": "pure",
+    "name": "ctx_reduce",
+    "schema": {
+      "additionalProperties": false,
+      "properties": {
+        "drop": {
+          "description": "Tag IDs: \"3-5\", \"1,2,9\", \"1-5,8,12-15\".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "drop"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Durable facts about this project, shared with every agent on it and kept for the months this work lasts; active ones are already in <project-memory> as `#id: fact`. Write one standalone fact when it must not have to be found again — a rule, an architecture fact, a constraint, a config value, a naming convention — especially what cost you turns. A pending intention with evidence is ctx_note, not memory. write (content + category); update one id (content; category optional); archive one or more ids (reason optional); merge two or more ids (content); get 1–20 ids in any status.",
+    "execution_mode": "mutating",
+    "name": "ctx_memory",
+    "schema": {
+      "additionalProperties": true,
+      "properties": {
+        "action": {
+          "description": "write | update | archive | merge | get",
+          "enum": [
+            "write",
+            "update",
+            "archive",
+            "merge",
+            "get"
+          ],
+          "type": "string"
+        },
+        "category": {
+          "description": "Kind of fact (required for write; optional on update/merge).",
+          "type": "string"
+        },
+        "content": {
+          "description": "One standalone fact (write, update, merge).",
+          "maxLength": 65536,
+          "type": "string"
+        },
+        "id": {
+          "description": "Single memory id for update or archive.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "ids": {
+          "description": "Ids from <project-memory>: one for update, 1+ for archive, 2+ for merge, 1–20 for get.",
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "memory_project": {
+          "description": "Resolved MC project identity supplied by the host transport.",
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why it is archived (optional).",
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "source_ids": {
+          "description": "Merge form: memory ids to supersede into target_id.",
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxItems": 100,
+          "type": "array"
+        },
+        "target_id": {
+          "description": "Merge form: memory id to keep and update.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "description": "Recover one item with tag=N (a §N§ or dropped placeholder number), not a message ordinal; text or one tool call with full input/output. message=N and start/end are whole-message ordinals from history/search, never tag numbers. Recover raw conversation behind a <session-history> heading or around a ctx_search hit: ctx_expand(start, end) returns [N] U:/A: lines (~15K-token cap; oversized ranges return the head and where to continue). verbose=true lists messages with per-part previews to pick one; message=N returns that message in full, including a tool output released with ctx_reduce. Ranges after the last compartment are your live tail, not expandable.",
+    "execution_mode": "pure",
+    "name": "ctx_expand",
+    "schema": {
+      "additionalProperties": true,
+      "properties": {
+        "end": {
+          "description": "Last message ordinal of the range, inclusive, not a tag number.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "message": {
+          "description": "Message ordinal from a <session-history> heading or a ctx_search hit, not a tag number. Returns that one message in full. Use alone.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
+          "description": "First message ordinal of the range (a <session-history> heading's start, or a ctx_search hit), not a tag number.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tag": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Tag number from a §N§ tag or a [dropped §N§] placeholder, not a message ordinal. Returns that one item in full. Use alone."
+        },
+        "verbose": {
+          "description": "With start/end: one entry per message with previews instead of the transcript.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "description": "Search the archive — everything that ever happened here that is not on your desk: memories not in <project-memory>, compacted conversation, commits, notes. Phrase query as a natural-language question carrying the exact terms you expect (\"where is the opencode source code path?\", \"why did we choose SQLite over postgres?\", \"how does the dreamer lease work?\") — a keyword stack finds less. Sources (omit for all): memory (rules, conventions), message (compacted conversation; hits carry ordinals for ctx_expand), git_commit (when did this change), primer (reusable project Q&A the dreamer distils from recurring questions), note (parked follow-ups). Memory ids alone (`#7234`) resolve directly. from/to restrict every source to an inclusive UTC date range.",
+    "execution_mode": "pure",
+    "name": "ctx_search",
+    "schema": {
+      "additionalProperties": true,
+      "properties": {
+        "from": {
+          "description": "Earliest date, YYYY-MM-DD (inclusive).",
+          "type": "string"
+        },
+        "limit": {
+          "default": 8,
+          "description": "Maximum results (default 10).",
+          "maximum": 25,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "query": {
+          "description": "A natural-language question carrying the exact terms you expect in the answer.",
+          "maxLength": 1024,
+          "type": "string"
+        },
+        "to": {
+          "description": "Latest date, YYYY-MM-DD (inclusive; default open).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "description": "Session notes are pending intentions: work you intend to return to, with findings attached (\"take a note\" always qualifies). Not active steps, an executing plan, or restart insurance; a record of how things stand (world-state, a design at a point in time) with nothing you intend to do about it — that goes stale silently; a fact worth keeping is memory, the rest is nothing. First line = title (<80 chars). write saves; read lists rows (note_ids for bodies); update changes one; dismiss retires 1–50. Dismiss a note when its work lands or is abandoned; a queue you never dismiss from stops being read. surface_condition parks it until an outside check against repo files, git, GitHub or the web holds.",
+    "execution_mode": "mutating",
+    "name": "ctx_note",
+    "schema": {
+      "additionalProperties": true,
+      "properties": {
+        "action": {
+          "description": "write | read | update | dismiss (default: write with content, else read).",
+          "enum": [
+            "write",
+            "read",
+            "update",
+            "dismiss"
+          ],
+          "type": "string"
+        },
+        "content": {
+          "description": "Note text: first line title (<80 chars), then detail.",
+          "maxLength": 65536,
+          "type": "string"
+        },
+        "filter": {
+          "description": "Read filter: all, active, pending, ready, dismissed. Omitted: active notes plus every current smart note (pending included); active: only active-status notes.",
+          "enum": [
+            "all",
+            "active",
+            "pending",
+            "ready",
+            "dismissed"
+          ],
+          "type": "string"
+        },
+        "limit": {
+          "default": 25,
+          "description": "Rows per read (default 25).",
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "memory_project": {
+          "description": "Resolved MC project identity supplied by the host transport.",
+          "type": "string"
+        },
+        "note_ids": {
+          "description": "One id for update, 1–50 for dismiss or read (full bodies). Ignored by write.",
+          "items": {
+            "maximum": 9007199254740991,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxItems": 50,
+          "minItems": 1,
+          "type": "array"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Skip newest rows (default 0).",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "surface_condition": {
+          "description": "A condition an outside checker can verify on its own, periodically (repository, releases, web — anything it can look up); never something only this conversation knows.",
+          "maxLength": 4096,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  }
+]

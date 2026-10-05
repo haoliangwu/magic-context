@@ -2,6 +2,7 @@ import {
     getLastCompartmentEndMessage,
     getLastCompartmentEndMessageId,
 } from "../../features/magic-context/compartment-storage";
+import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import {
     deriveTagLoadFloor,
     getActiveTagsBySession,
@@ -13,6 +14,8 @@ import type { ContextUsage, SessionMeta, TagEntry } from "../../features/magic-c
 import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
+import { hasReclaimRide, type ReclaimRideSignals, reclaimRideLabel } from "./cache-busting-signals";
 import {
     createDefaultBoundarySnapshotForTests,
     getRawHistoryEligibility,
@@ -41,7 +44,6 @@ const MIN_PROACTIVE_TAIL_MESSAGE_COUNT = 12;
 const DEFAULT_MIN_COMMIT_CLUSTERS_FOR_TRIGGER = 3;
 const TAIL_SIZE_TRIGGER_MULTIPLIER = 3;
 const BLOCK_UNTIL_DONE_PERCENTAGE = 95;
-const CONTENT_TAG_OWNER_SUFFIX = /:(?:p|file)\d+$/;
 
 export { BLOCK_UNTIL_DONE_PERCENTAGE, POST_DROP_TARGET_RATIO };
 
@@ -95,7 +97,7 @@ function tagOwnerMessageId(row: {
     tool_owner_message_id: string | null;
 }): string {
     if (row.type === "tool") return row.tool_owner_message_id ?? row.message_id;
-    return row.message_id.replace(CONTENT_TAG_OWNER_SUFFIX, "");
+    return contentTagOwnerMessageId(row.message_id);
 }
 
 function getActiveOrDroppedTagOwnerMessageIds(
@@ -380,9 +382,13 @@ function getUnsummarizedTailInfo(
                 };
             }
 
-            const scanBudget = Math.max(
-                MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE,
-                triggerBudget * TAIL_SIZE_TRIGGER_MULTIPLIER,
+            const seed = sessionDecisionCalibration(db, sessionId);
+            const sourceRatio = Math.max(seed.proseRatio, seed.toolsRatio);
+            const scanBudget = Math.floor(
+                Math.max(
+                    MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE,
+                    triggerBudget * TAIL_SIZE_TRIGGER_MULTIPLIER,
+                ) / sourceRatio,
             );
             const chunk = readSessionChunk(
                 sessionId,
@@ -393,7 +399,7 @@ function getUnsummarizedTailInfo(
             const isMeaningful =
                 chunk.hasMore ||
                 boundary.trueRawEligibleTokens >= MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE ||
-                chunk.tokenEstimate >= MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE ||
+                Math.ceil(chunk.tokenEstimate * sourceRatio) >= MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE ||
                 chunk.messageCount >= MIN_PROACTIVE_TAIL_MESSAGE_COUNT;
 
             return {
@@ -401,7 +407,7 @@ function getUnsummarizedTailInfo(
                 hasNewRawHistory: true,
                 hasProtectedEligibleHead,
                 isMeaningful,
-                tokenEstimate: chunk.tokenEstimate,
+                tokenEstimate: Math.ceil(chunk.tokenEstimate * sourceRatio),
                 chunkHasMore: chunk.hasMore,
                 trueRawEligibleTokens: boundary.trueRawEligibleTokens,
                 commitClusterCount: chunk.commitClusterCount,
@@ -433,6 +439,7 @@ export function checkCompartmentTrigger(
     inMemoryTail?: InMemoryTailSource | LazyInMemoryTailSource,
     taggerFloorOverride?: number,
     reasoningProjection?: ReasoningProjectionCapability,
+    reclaimRide?: ReclaimRideSignals,
 ): CompartmentTriggerResult {
     if (sessionMeta.compartmentInProgress) {
         sessionLog(
@@ -536,7 +543,11 @@ export function checkCompartmentTrigger(
                           taggerFloor,
                       )
                     : 0;
-                const eligibleUpperBound = persistedBound + untaggedUpperBound;
+                const seed = sessionDecisionCalibration(db, sessionId);
+                const eligibleUpperBound = Math.ceil(
+                    (persistedBound + untaggedUpperBound) *
+                        Math.max(1, seed.proseRatio, seed.toolsRatio, seed.systemRatio),
+                );
                 // Smallest token floor any size trigger needs is triggerBudget
                 // (commit_clusters). tail_size needs even more. Equality falls
                 // through to preserve the existing conservative < semantics.
@@ -620,6 +631,10 @@ export function checkCompartmentTrigger(
         canClearReasoning,
     );
     const relativePostDropTarget = executeThresholdPercentage * POST_DROP_TARGET_RATIO;
+    // Queued drops need an existing cache-busting event to apply. A future history
+    // publication cannot justify skipping the historian that would produce it.
+    const rideLabel = reclaimRide ? reclaimRideLabel(reclaimRide) : "ride=none";
+    const dropsCanLand = reclaimRide !== undefined && hasReclaimRide(reclaimRide);
 
     const forceMaterializationPercentage = escalationBands(
         executeThresholdPercentage,
@@ -627,12 +642,13 @@ export function checkCompartmentTrigger(
     // Force only at the threshold-derived band; below it the proactive path retains precedence.
     if (usage.percentage >= forceMaterializationPercentage) {
         if (
+            dropsCanLand &&
             projectedPostDropPercentage !== null &&
             projectedPostDropPercentage <= relativePostDropTarget
         ) {
             sessionLog(
                 sessionId,
-                `historian redundancy skip: summarizer not needed this pass — force band is ${forceMaterializationPercentage}%; queued/automatic drops are projected to reclaim to ${projectedPostDropPercentage.toFixed(1)}% (target ${relativePostDropTarget.toFixed(1)}%) on the next eligible execute pass`,
+                `historian redundancy skip: summarizer not needed this pass — force band is ${forceMaterializationPercentage}%; queued/automatic drops are projected to reclaim to ${projectedPostDropPercentage.toFixed(1)}% (target ${relativePostDropTarget.toFixed(1)}%) on this pass (${rideLabel})`,
             );
             return { shouldFire: false };
         }
@@ -746,12 +762,13 @@ export function checkCompartmentTrigger(
     }
 
     if (
+        dropsCanLand &&
         projectedPostDropPercentage !== null &&
         projectedPostDropPercentage <= relativePostDropTarget
     ) {
         sessionLog(
             sessionId,
-            `historian redundancy skip: summarizer not needed this pass — usage is ${usage.percentage.toFixed(1)}%; queued/automatic drops are projected to reclaim to ${projectedPostDropPercentage.toFixed(1)}% (target ${relativePostDropTarget.toFixed(1)}%) on the next eligible execute pass`,
+            `historian redundancy skip: summarizer not needed this pass — usage is ${usage.percentage.toFixed(1)}%; queued/automatic drops are projected to reclaim to ${projectedPostDropPercentage.toFixed(1)}% (target ${relativePostDropTarget.toFixed(1)}%) on this pass (${rideLabel})`,
         );
         return { shouldFire: false };
     }

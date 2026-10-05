@@ -1,0 +1,7 @@
+{
+  "plugin": [
+    // pinned copy without options
+    "@cortexkit/opencode-magic-context@0.42.6",
+    ["@cortexkit/opencode-magic-context@latest", { "sidebar": false }]
+  ]
+}

@@ -1,0 +1,1279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CK session extensibility: an explainer (design r4.1)</title>
+<style>
+:root {
+  --bg: #fbfbf9; --fg: #1d1f21; --muted: #5d6166; --border: #cfd3d7;
+  --box: #ffffff; --box2: #eef3f8; --accent: #2458a6; --accent2: #8a4b00;
+  --ok: #1f7a3a; --work: #8a6d00; --gap: #a3262a; --note: #fff7e0; --notebd: #e0c060;
+  --code: #f1f2f4; --ill: #6b3fa0; --dim: #e4e6e9; --bp: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181b; --fg: #e3e5e8; --muted: #9aa0a8; --border: #3a3f46;
+    --box: #1f2226; --box2: #1d2733; --accent: #7fb0ff; --accent2: #f0a860;
+    --ok: #6fcf8a; --work: #e2c35a; --gap: #ff7b7f; --note: #2b2616; --notebd: #7a6420;
+    --code: #23262b; --ill: #c9a2ff; --dim: #2a2d31; --bp: #ff8a7a;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+.layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); max-width: 1320px; margin: 0 auto; }
+nav.toc { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto;
+  padding: 24px 16px; border-right: 1px solid var(--border); font-size: 14px; }
+nav.toc h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px;
+  border: 0; padding: 0; }
+nav.toc ol { padding-left: 20px; margin: 0; }
+nav.toc li { margin: 4px 0; }
+nav.toc a { color: var(--fg); text-decoration: none; }
+nav.toc a:hover { color: var(--accent); text-decoration: underline; }
+main { padding: 24px 40px 80px; min-width: 0; }
+h1 { font-size: 30px; line-height: 1.2; margin: 8px 0 4px; }
+h2 { font-size: 23px; margin: 48px 0 12px; padding-top: 8px; border-top: 1px solid var(--border); }
+h3 { font-size: 18px; margin: 28px 0 8px; }
+p, li { max-width: 80ch; }
+a { color: var(--accent); }
+code { font: 13.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code);
+  padding: 1px 4px; border-radius: 3px; overflow-wrap: anywhere; }
+/* Wide tables scroll sideways on a phone instead of squeezing their columns. */
+.tw { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14.5px; }
+th, td { border: 1px solid var(--border); padding: 6px 8px; vertical-align: top; text-align: left; }
+th { background: var(--box2); }
+.sub { color: var(--muted); }
+.cite { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.ill { display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--ill); border: 1px solid var(--ill); border-radius: 3px; padding: 0 5px; margin-right: 4px; }
+.silent { display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--work); border: 1px solid var(--work); border-radius: 3px; padding: 0 5px; margin-right: 4px; }
+.callout { background: var(--note); border: 1px solid var(--notebd); border-left-width: 4px; padding: 10px 14px;
+  border-radius: 4px; margin: 14px 0; max-width: 90ch; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+.card { background: var(--box); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }
+.card h3 { margin-top: 0; font-size: 16px; }
+.card p, .card li { font-size: 14.5px; }
+.changes h3 { font-size: 16px; margin: 18px 0 4px; }
+.changes li { margin: 3px 0; }
+figure { margin: 16px 0; }
+figcaption { color: var(--muted); font-size: 13.5px; margin-top: 6px; max-width: 90ch; }
+/* Flow diagrams drawn with HTML boxes rather than SVG, so they wrap on narrow screens. */
+.flow { display: flex; flex-wrap: wrap; align-items: stretch; gap: 6px; margin: 14px 0; }
+.flow .st { flex: 1 1 150px; background: var(--box); border: 1px solid var(--border); border-radius: 6px;
+  padding: 8px 10px; font-size: 14px; }
+.flow .st b { display: block; margin-bottom: 2px; }
+.flow .st.hl { border: 2px solid var(--accent); }
+.flow .ar { align-self: center; color: var(--accent); font-size: 20px; font-weight: 600; }
+/* UI mock-ups: sketches of what a screen could show, not a specified layout. */
+.mock { display: inline-block; vertical-align: top; width: 340px; max-width: 100%; margin: 8px 12px 8px 0;
+  background: var(--box); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; font-size: 14px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+.mock .bar { font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-bottom: 8px; }
+.mock .chip { display: inline-block; border-radius: 12px; padding: 2px 10px; font-size: 13px; background: var(--box2);
+  border: 1px solid var(--border); }
+.mock .chip.warn { border-color: var(--notebd); background: var(--note); }
+.mock .chip.err { border-color: var(--gap); color: var(--gap); }
+.mock .btn { display: inline-block; border: 1px solid var(--accent); color: var(--accent); border-radius: 5px;
+  padding: 1px 10px; margin: 6px 6px 0 0; font-size: 13px; }
+.mock .btn.pri { background: var(--accent); color: var(--bg); }
+.mock .step { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+/* SVG figures keep a minimum width and scroll sideways on a phone, so their text stays legible. */
+.sv { overflow-x: auto; }
+svg { width: 100%; min-width: 640px; height: auto; display: block; }
+svg .bx { fill: var(--box); stroke: var(--border); stroke-width: 1.2; }
+svg .bx2 { fill: var(--box2); stroke: var(--border); stroke-width: 1.2; }
+svg .dim { fill: var(--dim); stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 3; }
+svg .hl { fill: none; stroke: var(--accent); stroke-width: 1.8; }
+svg .bad { fill: none; stroke: var(--gap); stroke-width: 1.8; }
+svg .good { fill: none; stroke: var(--ok); stroke-width: 1.8; }
+svg .t { fill: var(--fg); font: 13px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+svg .ts { fill: var(--muted); font: 11.5px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+svg .th { fill: var(--fg); font: 600 14px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+svg .tm { fill: var(--fg); font: 11.5px ui-monospace, Menlo, Consolas, monospace; }
+svg .tbp { fill: var(--bp); font: 600 11.5px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+svg .tok { fill: var(--ok); font: 600 11.5px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+svg .ln { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+svg .ln2 { stroke: var(--accent2); stroke-width: 1.6; fill: none; stroke-dasharray: 5 4; }
+svg .lnm { stroke: var(--muted); stroke-width: 1.2; fill: none; stroke-dasharray: 3 3; }
+svg .ah { fill: var(--accent); } svg .ah2 { fill: var(--accent2); }
+svg .bp { fill: var(--bp); }
+svg .axis { stroke: var(--muted); stroke-width: 2; }
+svg .dot { fill: var(--accent); }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  nav.toc { position: sticky; height: auto; max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--border);
+    background: var(--bg); z-index: 2; }
+  main { padding: 16px; }
+}
+@media print { nav.toc { display: none; } .layout { display: block; } figure, table, .mock { break-inside: avoid; } }
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#overview">Overview: pieces and owners</a></li>
+    <li><a href="#changed">What changed since r3.1</a></li>
+    <li><a href="#principles">Principles and provider kinds</a></li>
+    <li><a href="#launch">Launch: params, preflight, manifest</a></li>
+    <li><a href="#trust">Project trust (entorhinal)</a></li>
+    <li><a href="#identity">Caller identity and credentials</a></li>
+    <li><a href="#step">Compaction: one model step</a></li>
+    <li><a href="#cm">The CompactionMessage</a></li>
+    <li><a href="#breakpoints">Cache breakpoints</a></li>
+    <li><a href="#waitrefuse">WAIT and REFUSE</a></li>
+    <li><a href="#hooks">Step-transform hooks</a></li>
+    <li><a href="#resume">Resume</a></li>
+    <li><a href="#tools">Tool calls and notices</a></li>
+    <li><a href="#changes">Change hints, policies, folds</a></li>
+    <li><a href="#runners">Runners: Broca and Thalamus</a></li>
+    <li><a href="#gate">The reader gate</a></li>
+    <li><a href="#stages">Build stages</a></li>
+    <li><a href="#open">Open questions (§16)</a></li>
+    <li><a href="#dropped">Dropped from r2</a></li>
+    <li><a href="#where">Where this is specified</a></li>
+  </ol>
+  <h2 style="margin-top:20px">Source</h2>
+  <p style="font-size:12.5px" class="sub">Design <code>ck-extensibility-design-r4.md</code>, draft r4.1 (2026-09-26). Citations like <span class="cite">[§5.2]</span> point at its sections.</p>
+</nav>
+<main>
+
+<h1>CK session extensibility: providers, preflight and a runner that freezes</h1>
+<p class="sub">An explainer of design draft r4.1, for the operator's review. It describes a design, not built behaviour; where the design says a piece is already live, this page says so. Each section cites the design section it summarises; where this page simplifies, the cited section has the full rule. <span class="ill">illustrative</span> marks a sketch made for this page (screen wording, example layouts) that the design doesn't specify. <span class="silent">design is silent</span> marks a point the design doesn't settle.</p>
+
+<p><b>The question it answers:</b> how modules contribute to a model session that a CortexKit runner executes. Broca is the first runner; Thalamus uses the same interface. Two constraints hold throughout <span class="cite">[§1]</span>:</p>
+<ul>
+  <li>the runner knows nothing about personas, session kinds or any module's internals;</li>
+  <li>the prompt cache is never broken by accident.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="overview">1. Overview: the pieces and who owns them</h2>
+<p>One row per piece. The rest of the page takes them one at a time.</p>
+
+<div class="tw"><table>
+<tr><th style="width:18%">Piece</th><th>What it is</th><th style="width:24%">Owner</th><th style="width:8%">Design</th></tr>
+<tr><td><b>Providers</b></td><td>Modules that supply a session. Four kinds: tools, system text, compaction, write-time transforms. A module may play several. Each returns a finished, self-consistent contribution; the engine never composes or repairs it.</td><td>Each module, for its own contribution (for example AFT, Magic Context, Plexus, Prefrontal)</td><td class="cite">§2, §3</td></tr>
+<tr><td><b>Preflight</b></td><td><code>preflight(cwd, params)</code> returns the exact bytes a provider would put on the wire, with digests. No side effects, deterministic, no trust input.</td><td>Each provider implements it. Prefrontal calls it, caches the result and invalidates the cache.</td><td class="cite">§4.2</td></tr>
+<tr><td><b>Persona check</b></td><td>Does the session have every tool the role requires? A strict role is refused before any worktree exists.</td><td>Prefrontal</td><td class="cite">§4.4</td></tr>
+<tr><td><b>Session manifest</b></td><td>The flat list of providers, params and manifests a session runs with. Sent once, on the session's first send, and frozen for the whole session.</td><td>Prefrontal builds it (and is itself the first system-prompt provider). Broca freezes and records it.</td><td class="cite">§4.5</td></tr>
+<tr><td><b>CompactionProvider</b></td><td>At most one per session. Shapes the history sent to the model: called at setup and on every step, answers NOOP, CompactionMessage, WAIT or REFUSE.</td><td>The provider (for example Magic Context). The runner checks and records every answer.</td><td class="cite">§5</td></tr>
+<tr><td><b>StepTransformProvider</b></td><td>Four write-time hooks that return prepend / append / replace operations, applied once and written with the message they change.</td><td>The provider (for example Magic Context's tags, reminders, recall). The runner applies and records.</td><td class="cite">§6</td></tr>
+<tr><td><b>Cache breakpoints</b></td><td>Where cache markers go, per model family.</td><td>Broca</td><td class="cite">§7</td></tr>
+<tr><td><b>Project trust</b></td><td>Has the user approved this repository, so its own configuration may act? Asked when a call executes; never changes the prefix.</td><td>entorhinal owns the record. Providers ask. Prefrontal prompts the user and writes the answer.</td><td class="cite">§4.6</td></tr>
+<tr><td><b>Caller identity and credentials</b></td><td>Who is making this call? The daemon-stamped route principal, plus a Prefrontal-signed agent credential that the runner carries on its own routes.</td><td>The daemon stamps the principal. Prefrontal issues credentials. The runner stores and carries them. Providers verify. Plexus owns agent grants and the verifier changes.</td><td class="cite">§4.7</td></tr>
+<tr><td><b>Change hints and policies</b></td><td>How a configuration change reaches a running session: detection, an optional bus hint, re-preflight, a policy for when it applies, then appends or a fold.</td><td>Providers watch and hint. Prefrontal re-preflights and picks the policy. Broca records and applies.</td><td class="cite">§11</td></tr>
+<tr><td><b>Runners</b></td><td>Execute the session. Each runner makes every request valid for its model family, per its own spec. Broca owns its transcript; Thalamus serves sessions whose harness owns the transcript (details in section 15).</td><td>Broca; Thalamus</td><td class="cite">§12</td></tr>
+<tr><td><b>Reader gate</b></td><td>Old WAL readers refuse records they can't understand instead of misreading them. Ships first.</td><td>Broca</td><td class="cite">§13</td></tr>
+<tr><td><b>Build stages</b></td><td>Seven stages, reader gate first, Thalamus last. The crash matrix is the exit test for stages 4 and 5.</td><td>Per stage, as listed in section 17 of this page. The crash matrix is BROCA's.</td><td class="cite">§15</td></tr>
+</table></div>
+
+<figure class="sv">
+<svg viewBox="0 0 1000 560" role="img" aria-label="Who talks to whom: Desktop and phone talk to Prefrontal; Prefrontal preflights providers, writes trust answers to entorhinal and sends the session manifest and credentials to the runner; the runner calls providers and the model provider; providers ask entorhinal for project trust and send notices; the daemon stamps every route's principal.">
+  <defs>
+    <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah2" d="M0,0 L10,5 L0,10 z"/></marker>
+  </defs>
+  <rect class="bx" x="20" y="14" width="250" height="52" rx="6"/>
+  <text class="t" x="34" y="36">Desktop · phone · board</text>
+  <text class="ts" x="34" y="54">pending changes, Apply Now, prompts</text>
+  <line class="ln" x1="145" y1="66" x2="145" y2="148" marker-end="url(#a1)"/>
+  <rect class="bx2" x="20" y="150" width="250" height="200" rx="8"/>
+  <text class="th" x="34" y="174">Prefrontal (caller)</text>
+  <text class="ts" x="34" y="194">owns personas; runs, caches preflight</text>
+  <text class="ts" x="34" y="211">checks required tools</text>
+  <text class="ts" x="34" y="228">builds the session manifest</text>
+  <text class="ts" x="34" y="245">first system-prompt provider</text>
+  <text class="ts" x="34" y="262">picks a policy for each change</text>
+  <text class="ts" x="34" y="279">issues agent credentials</text>
+  <text class="ts" x="34" y="296">turns approval requests into</text>
+  <text class="ts" x="34" y="313">user prompts</text>
+  <rect class="bx2" x="380" y="150" width="250" height="190" rx="8"/>
+  <text class="th" x="394" y="174">Runner (Broca / Thalamus)</text>
+  <text class="ts" x="394" y="194">freezes the manifest for the session</text>
+  <text class="ts" x="394" y="211">writes byte-affecting output (WAL)</text>
+  <text class="ts" x="394" y="228">checks CompactionMessages</text>
+  <text class="ts" x="394" y="245">applies hook operations</text>
+  <text class="ts" x="394" y="262">places cache breakpoints</text>
+  <text class="ts" x="394" y="279">applies changes under a policy</text>
+  <text class="ts" x="394" y="296">carries credentials on its routes</text>
+  <text class="ts" x="394" y="313">never sees personas or classes</text>
+  <rect class="bx" x="380" y="378" width="250" height="46" rx="6"/>
+  <text class="t" x="394" y="399">Model provider</text>
+  <text class="ts" x="394" y="415">the vendor API</text>
+  <line class="ln" x1="505" y1="340" x2="505" y2="376" marker-end="url(#a1)"/>
+  <rect class="bx2" x="740" y="14" width="245" height="410" rx="8"/>
+  <text class="th" x="754" y="38">Provider modules</text>
+  <text class="ts" x="754" y="56">e.g. AFT, Magic Context, Plexus</text>
+  <rect class="bx" x="754" y="70" width="217" height="70" rx="6"/>
+  <text class="t" x="764" y="92">ToolProvider</text>
+  <text class="ts" x="764" y="110">tool definitions, executes calls</text>
+  <rect class="bx" x="754" y="152" width="217" height="70" rx="6"/>
+  <text class="t" x="764" y="174">SystemPromptProvider</text>
+  <text class="ts" x="764" y="192">operator-chosen system text</text>
+  <rect class="bx" x="754" y="234" width="217" height="70" rx="6"/>
+  <text class="t" x="764" y="256">CompactionProvider (≤ 1)</text>
+  <text class="ts" x="764" y="274">shape of history, per step</text>
+  <rect class="bx" x="754" y="316" width="217" height="70" rx="6"/>
+  <text class="t" x="764" y="338">StepTransformProvider</text>
+  <text class="ts" x="764" y="356">four write-time hooks</text>
+  <line class="ln" x1="270" y1="190" x2="378" y2="190" marker-end="url(#a1)"/>
+  <text class="ts" x="276" y="182">session manifest</text>
+  <text class="ts" x="276" y="208">new manifest</text>
+  <text class="ts" x="276" y="222">  + policy</text>
+  <text class="ts" x="276" y="236">flush_prefix</text>
+  <text class="ts" x="276" y="250">agent credential</text>
+  <line class="ln" x1="378" y1="300" x2="272" y2="300" marker-end="url(#a1)"/>
+  <text class="ts" x="276" y="292">session status,</text>
+  <text class="ts" x="276" y="318">terminal result</text>
+  <polyline class="ln" points="220,150 220,100 738,100" marker-end="url(#a1)"/>
+  <text class="ts" x="290" y="92">preflight(cwd, params) → manifest</text>
+  <polyline class="ln2" points="738,128 180,128 180,148" marker-end="url(#a2)"/>
+  <text class="ts" x="290" y="146">change hint (optional, needs a bus)</text>
+  <line class="ln" x1="630" y1="210" x2="738" y2="210" marker-end="url(#a1)"/>
+  <text class="ts" x="636" y="186">tool calls, per-</text>
+  <text class="ts" x="636" y="200">step call, hooks</text>
+  <line class="ln" x1="738" y1="280" x2="632" y2="280" marker-end="url(#a1)"/>
+  <text class="ts" x="636" y="298">provider_notice,</text>
+  <text class="ts" x="636" y="312">compaction.ready,</text>
+  <text class="ts" x="636" y="326">session.read</text>
+  <rect class="bx2" x="20" y="410" width="250" height="60" rx="8"/>
+  <text class="th" x="34" y="434">entorhinal</text>
+  <text class="ts" x="34" y="454">project records, incl. trust approval</text>
+  <line class="ln" x1="145" y1="350" x2="145" y2="408" marker-end="url(#a1)"/>
+  <text class="ts" x="152" y="384">writes approval</text>
+  <polyline class="ln" points="860,424 860,446 272,446" marker-end="url(#a1)"/>
+  <text class="ts" x="660" y="440">project.trust(path)</text>
+  <rect class="dim" x="20" y="490" width="965" height="56" rx="6"/>
+  <text class="th" x="34" y="512">subc daemon</text>
+  <text class="ts" x="34" y="532">stamps the route principal on every bind · serves machine_id (HelloAck), live_roots, spawn_subscribe · every call reaches a provider through it</text>
+</svg>
+<figcaption>Figure 1. Who talks to whom. Prefrontal talks to providers only to preflight them (and hears their optional change hint). Once a session runs, the runner calls the providers it was given. Only Prefrontal tells the runner what a session gets. Providers ask entorhinal about project trust when a call executes <span class="cite">[§2, §4, §4.6, §4.7, §5, §6, §10, §11]</span>.</figcaption>
+</figure>
+
+<!-- ============================================================ -->
+<h2 id="changed">2. What changed since r3.1</h2>
+<p>The design changes between r3.1 and r4.1, grouped by area. Section numbers are r4.1's.</p>
+<div class="changes">
+<h3>Launch and preflight</h3>
+<ul>
+  <li>Trust is no longer an input to preflight. There is no trust fact on the route, no trust claim on the call and no <code>admission_facts_targets</code> list. A trusted and an untrusted run with the same params get byte-identical manifests <span class="cite">[§4.2]</span>.</li>
+  <li>Preflight no longer runs on a dedicated <code>internal_service</code> route per (provider, trust value). It must have no side effects; how a provider achieves that is its own business. Prefrontal opens preflight-only routes against the CK data home, never a project <span class="cite">[§4.2, §11.1]</span>.</li>
+  <li>A narrower toolset for unapproved projects is now an explicit param choice by Prefrontal, never a side effect of trust <span class="cite">[§4.2]</span>.</li>
+  <li>The manifest cache key grew: machine id, consumer profile, a digest of the provider's prefix-affecting config keys, host capability inputs, and (for system-prompt providers) the resolved tool names. Trust and a self-declared <code>module_version</code> are never part of it <span class="cite">[§4.2]</span>.</li>
+  <li>Cached manifests are dropped on every new spawn of the module, learned from <code>supervisor.spawn_subscribe</code>; a cursor gap drops the whole cache <span class="cite">[§4.2]</span>.</li>
+  <li>Determinism is scoped per (host, provider version, consumer) <span class="cite">[§4.2]</span>.</li>
+  <li>Capability names changed from dotted to dashed: <code>ck-provider-tool/v1</code> and so on. A dotted name now fails manifest deserialization, so the module is never registered <span class="cite">[§4.2]</span>.</li>
+  <li>System-prompt providers are preflighted after tool providers and receive the resolved model-facing tool names as an input <span class="cite">[§4.5]</span>.</li>
+  <li>The freeze covers the whole session, not one run. <code>tools</code> and <code>system</code> are sent only on the first send; a later send that changes them is refused with a named error <span class="cite">[§4.5]</span>.</li>
+  <li>Project docs: ruled for now. Magic Context's m0 keeps carrying them until Prefrontal ships its own carrier, and no second carrier runs meanwhile <span class="cite">[§4.3, §16.1]</span>.</li>
+</ul>
+<h3>Trust and identity (new sections)</h3>
+<ul>
+  <li>Project trust has an owner: entorhinal, as a journaled field of the project record, asked with <code>project.trust(path)</code> when a call executes. It has its own walk that handles clones and worktrees <span class="cite">[§4.6]</span>.</li>
+  <li>Caller identity is a separate question from project trust. The daemon-stamped route principal is the only caller fact a provider trusts <span class="cite">[§4.7]</span>.</li>
+  <li>Routes the runner opens carry a Prefrontal-signed agent credential (v2) that names the agent, the machine and the carrier. It has no expiry and isn't a security boundary; authority stays with each provider's per-call grant check <span class="cite">[§4.7]</span>.</li>
+  <li>A call with a credential needs both the carrier module's grant and the agent's own grant <span class="cite">[§4.7]</span>.</li>
+</ul>
+<h3>Compaction</h3>
+<ul>
+  <li>REFUSE no longer ends the run with a new <code>CompactionRefused</code> reason. It ends as <code>Error</code>, with the provider's code as <code>provider_code</code> <span class="cite">[§5.5, §13]</span>.</li>
+  <li>WAIT past the cap now ends as <code>Error</code> with <code>compaction_wait_exceeded</code>. Broca also won't send when it can't tell whether the request fits <span class="cite">[§5.4]</span>.</li>
+  <li>The status carries window limits and usage only when they are known, and the previous run's <code>provider_code</code> when it ended as <code>Error</code> <span class="cite">[§5.2]</span>.</li>
+  <li>An overflow ends the run as <code>Error</code> with the provider's code, which the next status carries <span class="cite">[§5.3]</span>.</li>
+  <li>New CompactionMessages, call timeouts, and entry into and exit from <code>compaction_wait</code> are written and synced before the request goes out <span class="cite">[§5.2]</span>.</li>
+  <li>Each CompactionMessage carries a monotonic version; a late answer never replaces a newer one <span class="cite">[§5.3]</span>.</li>
+  <li>The "kept signed thinking is byte-identical" check is gone. The runner's own validity rules for the family replace it <span class="cite">[§5.3, §12]</span>.</li>
+  <li><code>soft</code> and <code>hard</code> describe cache cost only. Mid-conversation appends are re-emitted after a <code>soft</code> replacement and folded into the new prefix on a <code>hard</code> one <span class="cite">[§5.3]</span>.</li>
+</ul>
+<h3>Hooks</h3>
+<ul>
+  <li>Hooks return operations (<code>prepend</code>, <code>append</code>, <code>replace</code>) instead of new values <span class="cite">[§6.2]</span>.</li>
+  <li>Per-tool allowed operations replace <code>result_integrity: append_only</code> <span class="cite">[§6.2]</span>.</li>
+  <li>Attribution is the list of operations with their module and note. The per-stage output digests are gone <span class="cite">[§6.2]</span>.</li>
+  <li>The final value lives in the record's existing rendered field, so a rolled-back Broca still renders the right bytes. Originals and attribution are new fields <span class="cite">[§6.3]</span>.</li>
+  <li>PreTool providers declare <code>on_unavailable: pass | refuse</code>, defaulting to <code>refuse</code> <span class="cite">[§6.3]</span>.</li>
+  <li>The runner's own step edits are ordinary recorded operations <span class="cite">[§6.3]</span>.</li>
+</ul>
+<h3>Changes while running</h3>
+<ul>
+  <li><code>manifest_applied</code> is replaced by two WAL records: <code>manifest_pending</code> (the full new manifest) and <code>prefix_rebuilt</code> at the fold. The drift guard compares against the latest fold <span class="cite">[§4.5, §11.2]</span>.</li>
+  <li>The fold model: while the prefix survives, a change is an append (only on routes with the append capability); any full bust rebuilds the prefix from the latest manifest and absorbs the appends <span class="cite">[§11.2]</span>.</li>
+  <li>Each route reports one append capability, yes or no, fixed at admission <span class="cite">[§11.2]</span>.</li>
+  <li>The watch set is seeded from <code>live_roots</code> once, then tracked by the provider from its own binds and closes <span class="cite">[§11.1]</span>.</li>
+  <li>The hint subject is <code>ck.&lt;account&gt;.ext.changed.&lt;module_id&gt;</code>. The module id is trustworthy because of per-module publish grants, which need a commons grant change and a ck-bus release <span class="cite">[§11.1]</span>.</li>
+</ul>
+<h3>Runners, cache and records</h3>
+<ul>
+  <li>§12 is now "Runners". It starts with the runner's obligation: every rendered request is valid for its family, and the rules live in the runner's own spec <span class="cite">[§12]</span>.</li>
+  <li>Whatever the runner strips after a prefix change is recorded in the same WAL record as the change <span class="cite">[§12]</span>.</li>
+  <li>The Thalamus section is now a detailed mapping: <code>ccm-N</code> ids, how each hook maps onto the harness's own hooks, 503 behaviour, WAIT bounds <span class="cite">[§12.1]</span>.</li>
+  <li>The breakpoint planner is now two explicit steps, and a bridge takes the lowest-priority chosen slot. Broca's <code>plan_markers</code> changes to this order <span class="cite">[§7]</span>.</li>
+  <li><code>provider_notice</code> gained durability: acknowledged after fsync, resent until acknowledged, deduplicated by event id <span class="cite">[§10]</span>.</li>
+  <li>The reader gate's mechanism is a new frame <code>ver</code>, with a <code>NewerWriter{ver}</code> step and a per-WAL rollback floor. It also covers new fields on known kinds <span class="cite">[§13]</span>.</li>
+  <li>Build stages name their dependencies (the entorhinal write check, the Plexus work). The crash matrix is the exit test for stages 4 and 5 <span class="cite">[§15]</span>.</li>
+</ul>
+<h3>Open items</h3>
+<ul>
+  <li>Closed: project trust, including the trust fact's schema (now §4.6), and the project-docs carrier for now. The per-family append table moved to Broca's own research note <span class="cite">[§11.2, §16]</span>.</li>
+  <li>New: whether a worker may act under its parent head's agent, Magic Context's <code>[cleared]</code>-thinking handling, and provider-restart reconciliation <span class="cite">[§16]</span>.</li>
+</ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="principles">3. Principles and provider kinds</h2>
+<ol>
+  <li><b>The caller decides, the runner executes, providers supply.</b> Prefrontal, or whoever starts a run, decides what a session gets. Broca runs it and applies changes when told. Modules provide tools, system text, compaction and write-time transforms.</li>
+  <li><b>Broca never sees a persona, a session class or a turn's origin.</b> It gets a flat manifest of providers and their contributions.</li>
+  <li><b>The prefix is frozen.</b> System text and tools are resolved once and replayed byte for byte. They change only through an explicit change applied under a declared policy.</li>
+  <li><b>Every module output that affects bytes is written when it's produced.</b> Resume replays the record and never calls a module to produce it again. There is one exception, in <a href="#resume">section 12 of this page</a>.</li>
+  <li><b>Each provider keeps itself coherent.</b> It returns a finished, self-consistent contribution for the params it was asked for. The engine doesn't compose, filter or repair it.</li>
+</ol>
+<p class="cite">[§2]</p>
+
+<div class="tw"><table>
+<tr><th>Kind</th><th>Supplies</th><th>Example</th><th>Declared in <code>capabilities.provides</code> as</th></tr>
+<tr><td>ToolProvider</td><td>tool definitions; executes calls</td><td>AFT; Magic Context's <code>ctx_*</code> tools</td><td><code>ck-provider-tool/v1</code></td></tr>
+<tr><td>SystemPromptProvider</td><td>system text</td><td>Magic Context's desk guidance (full or light); Prefrontal's persona and role text</td><td><code>ck-provider-system-prompt/v1</code></td></tr>
+<tr><td>CompactionProvider</td><td>the shape of the history sent to the model</td><td>Magic Context; a classic summarise-and-continue engine</td><td><code>ck-provider-compaction/v1</code></td></tr>
+<tr><td>StepTransformProvider</td><td>write-time changes to the newest message</td><td>Magic Context's tags, reminders and per-turn recall</td><td><code>ck-provider-step-transform/v1</code></td></tr>
+</table></div>
+<p>A module may play several kinds. A session has <b>at most one</b> CompactionProvider. Without one, history is sent as written, and a request that no longer fits the window ends the run as <code>Error</code> with the provider's own overflow code <span class="cite">[§3, §4.2]</span>.</p>
+
+<!-- ============================================================ -->
+<h2 id="launch">4. Launch: params, preflight and the session manifest</h2>
+
+<div class="flow" role="img" aria-label="Launch flow: persona chooses params; tool providers are preflighted; system-prompt providers are preflighted with the resolved tool names; the persona check runs; Prefrontal sends the session manifest on the first send; the runner freezes it for the whole session.">
+  <div class="st"><b>1 · Persona</b>params per provider, required tools, strict or lenient</div>
+  <div class="ar">→</div>
+  <div class="st"><b>2 · Preflight tool providers</b><code>preflight(cwd, params)</code> → manifest</div>
+  <div class="ar">→</div>
+  <div class="st"><b>3 · Preflight system-prompt providers</b>with the resolved model-facing tool names as input</div>
+  <div class="ar">→</div>
+  <div class="st"><b>4 · Persona check</b>a strict role missing a tool is refused before any worktree exists</div>
+  <div class="ar">→</div>
+  <div class="st"><b>5 · Session manifest</b>sent on the session's first send only</div>
+  <div class="ar">→</div>
+  <div class="st hl"><b>6 · Frozen</b>on the first <code>RunStarted</code>, for the whole session</div>
+</div>
+
+<h3>4.1 Params</h3>
+<p>The persona belongs to Prefrontal. It decides which tools the session needs, how strict it is about them, and which params to ask each provider for. CK defines a small shared vocabulary; a provider may add axes of its own. A value a provider doesn't know is refused at preflight, never guessed <span class="cite">[§4.1]</span>.</p>
+<div class="tw"><table>
+<tr><th>Param</th><th>Values</th></tr>
+<tr><td><code>behavior</code></td><td><code>autonomous</code> | <code>interactive</code></td></tr>
+<tr><td><code>scope</code></td><td><code>read</code> | <code>readwrite</code> | <code>all</code> (every tool provider serves <code>all</code>)</td></tr>
+<tr><td><code>tool_descs</code></td><td><code>concise</code> | <code>full</code></td></tr>
+<tr><td><code>exclude</code></td><td>tool names</td></tr>
+</table></div>
+<p class="sub">The final list is still open (§16.4).</p>
+
+<h3>4.2 Preflight</h3>
+<p><code>preflight(cwd, params)</code> returns a <b>manifest</b>: the exact tool definitions and system text the provider would put on the wire, a digest for each item, and one digest over the whole manifest <span class="cite">[§4.2]</span>.</p>
+<div class="cards">
+<div class="card"><h3>What the provider guarantees</h3>
+<ul>
+  <li><b>Own configuration.</b> It resolves its user, project and harness tiers with its own merge rules. No second merger exists.</li>
+  <li><b>No trust input.</b> Trusted and untrusted runs with the same params get byte-identical manifests. Trust is enforced only when a call executes.</li>
+  <li><b>Coherent.</b> Everything the tools and text refer to is in the manifest. AFT returns a foreground-only <code>bash</code> when <code>bash_status</code> is absent (AFT's own work, in its spec). Each provider tests this itself.</li>
+  <li><b>Deterministic</b> per (host, provider version, consumer): stable key order, no timestamps, counters or random ids. Manifests may differ between machines, versions or consumer profiles, never within one.</li>
+  <li><b>Bytes only.</b> Settings that don't change bytes (watch timeouts, size caps) travel with each call instead.</li>
+  <li><b>No side effects.</b> It writes nothing and starts nothing. How it achieves this is its own business.</li>
+</ul></div>
+<div class="card"><h3>What Prefrontal does</h3>
+<ul>
+  <li><b>Runs it early.</b> While planning, before a worktree exists or a model call is spent.</li>
+  <li><b>Bounds it.</b> A short deadline per preflight. On a timeout it keeps the last good manifest and retries later. A turn is never delayed by preflight.</li>
+  <li><b>Caches it</b> under the key below.</li>
+  <li><b>Invalidates it</b> on every new spawn of the module, learned from <code>supervisor.spawn_subscribe</code> (cursor <code>{daemon_incarnation, seq}</code>). A cursor gap drops the whole cache.</li>
+  <li><b>Discovers providers</b> from the catalog's <code>capabilities.provides</code>, with no calls. Names allow only <code>[a-z0-9-]</code> before <code>/vN</code>; a dotted name fails deserialization, so the module's HELLO is refused and it never registers.</li>
+</ul></div>
+</div>
+
+<div class="tw"><table>
+<tr><th style="width:36%">Manifest cache key part</th><th>Example or note</th></tr>
+<tr><td>module, <code>cwd</code>, params</td><td></td></tr>
+<tr><td>machine id</td><td>from <code>HelloAck</code></td></tr>
+<tr><td>consumer profile</td><td></td></tr>
+<tr><td>digest of prefix-affecting config keys</td><td>AFT: <code>disabled_tools</code>, <code>edit_mode</code>, <code>bash.background</code>/<code>compress</code>/<code>detach_on_user_message</code>, <code>backup.enabled</code>, <code>github.read</code>/<code>write</code></td></tr>
+<tr><td>host capability inputs</td><td>AFT: whether <code>pwsh</code> is present</td></tr>
+<tr><td>resolved tool names</td><td>system-prompt providers only</td></tr>
+<tr><td><i>never:</i> trust, <code>module_version</code></td><td>A self-declared version misses commits that change descriptions without bumping it.</td></tr>
+</table></div>
+<p class="cite">[§4.2]</p>
+
+<h3>4.3 System text is operator authority</h3>
+<p>A SystemPromptProvider is one the operator chose to install. Its text may vary with params and user-level configuration. It <b>never includes content supplied by a project</b>: a cloned repository must not be able to inject text into the system prompt. A project-level setting may only choose among texts the provider ships. Per-project and per-session content (project docs, memories, counts) goes into user-role content <span class="cite">[§4.3]</span>.</p>
+<p><b>Project docs today:</b> Magic Context's m0 carries ARCHITECTURE.md and STRUCTURE.md. It keeps them until Prefrontal ships a carrier of its own. Until then no second carrier runs for Magic Context sessions. What replaces it later is open (§16.1).</p>
+
+<h3>4.4 The persona check</h3>
+<p>Runs in Prefrontal. Each role declares its params per provider, its required tools (by model-facing name) and whether it's strict or lenient. A strict role missing a required tool fails with a typed launch refusal naming the tool, raised before any worktree exists. A lenient one runs without the tool <span class="cite">[§4.4]</span>.</p>
+
+<h3>4.5 The session manifest and the freeze</h3>
+<p>Prefrontal sends Broca <span class="cite">[§4.5]</span>:</p>
+<ul>
+  <li>the tool providers, each with its params and manifest;</li>
+  <li>the system-prompt providers, in order; the order is the precedence. Prefrontal is itself first: its persona and role text is preflighted and digested like any other. A persona catalog update is a change like any other (<a href="#changes">section 14 of this page</a>);</li>
+  <li>the compaction provider, or none;</li>
+  <li>the step-transform providers, in order.</li>
+</ul>
+<p><b>Preflight order is not manifest order.</b> System-prompt providers are preflighted after tool providers because they take the resolved tool names as input; Prefrontal's role and head templates branch on <code>tools.&lt;name&gt;</code>. Their digest covers that input, so a tool-set change re-preflights them. The order in the manifest stays the precedence order.</p>
+<div class="cards">
+<div class="card"><h3>The freeze covers the whole session</h3>
+<ul>
+  <li><code>tools</code> and <code>system</code> are sent only on the first send. The resend after an auth pause repeats that first send byte for byte.</li>
+  <li>Broca freezes the manifest on the first <code>RunStarted</code>.</li>
+  <li>A later send whose <code>tools</code> or <code>system</code> differ is refused with a named error code, never applied.</li>
+  <li>Tool-set changes go only through the change path: appends where the route allows them, or a fold.</li>
+  <li>Resume takes tools and system from the frozen manifest or the latest fold, never from the latest <code>RunStarted</code>.</li>
+</ul></div>
+<div class="card"><h3>A pending manifest is a WAL record</h3>
+<p>A changed manifest from Prefrontal is written as <code>manifest_pending{manifest, digest, policy}</code>, holding the full bytes, behind the reader gate. The step that applies it (a tool step included) rebuilds the prefix from that record and writes <code>prefix_rebuilt{manifest_digest, step}</code>. No new <code>RunStarted</code> is needed. The drift guard compares the latest fold's prefix with the <code>manifest_pending</code> record its digest names; both come from the WAL.</p></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="trust">5. Project trust (owned by entorhinal)</h2>
+<p><b>The question:</b> has the user approved this repository, so its own configuration may act (enable shell auto-approval, write tools, endpoints that could leak data)? <span class="cite">[§4.6]</span></p>
+<div class="callout"><b>Trust never changes the prefix.</b> Providers enforce it only when a call executes: they refuse, restrict paths or skip project filters. They never change tool definitions or system text. Approving or revoking a project mid-session changes no bytes and takes effect on the next call <span class="cite">[§4.2]</span>.</div>
+
+<div class="flow" role="img" aria-label="Trust flow: a provider executing a call asks entorhinal project.trust(path) when approval would unlock something; if approval is needed it returns project_approval_required; Prefrontal prompts the user and writes the answer to entorhinal.">
+  <div class="st"><b>Call executes</b>approval would unlock something (AFT: only when project filters exist)</div>
+  <div class="ar">→</div>
+  <div class="st"><b>Ask</b><code>project.trust(path)</code> to entorhinal</div>
+  <div class="ar">→</div>
+  <div class="st"><b>Needs approval</b>provider returns <code>project_approval_required{root, what}</code></div>
+  <div class="ar">→</div>
+  <div class="st"><b>Prompt</b>Prefrontal turns it into the user's prompt</div>
+  <div class="ar">→</div>
+  <div class="st hl"><b>Record</b>Prefrontal writes the answer to entorhinal</div>
+</div>
+
+<div class="cards">
+<div class="card"><h3>Owner and values</h3>
+<ul>
+  <li>entorhinal holds the approval as a journaled field of the project record and declares <code>project-trust/v1</code>.</li>
+  <li>Two values: approved and unapproved. Finer limits are each provider's own policy for an unapproved project.</li>
+</ul></div>
+<div class="card"><h3>Writers</h3>
+<ul>
+  <li>Only the <code>ck</code> CLI and <code>Reserved{prefrontal-core}</code> may write; mutations come only from <code>Direct</code> or <code>Reserved{prefrontal-core}</code>.</li>
+  <li>This check is hygiene against buggy writes, not a security boundary. The real protection: a repository's own content has no path to any writer.</li>
+  <li>Status: in entorhinal <code>cc6eedd</code> (0.1.6), pushed but not yet placed. Placing it is the precondition for <code>project.trust</code> writes.</li>
+</ul></div>
+<div class="card"><h3>AFT never refuses for trust</h3>
+<p>For AFT an unapproved project is never a refusal. The command runs; only the project's own output filters are skipped. AFT never returns <code>project_approval_required</code>.</p></div>
+</div>
+
+<h3>5.1 The walk</h3>
+<p>entorhinal answers <code>project.trust</code> with its own walk, separate from <code>resolve</code>. It canonicalises the path with <code>ProjectRootId</code>, then checks each level from the path upward. Check (a) comes first at every level, so the <code>.git</code>-directory boundary never applies to a registered root itself.</p>
+<figure class="sv">
+<svg viewBox="0 0 1000 400" role="img" aria-label="The trust walk: canonicalise; at each level check (a) registered root or derived parent, answer from its record; (b) a .git directory, boundary, unapproved; (c) a .git file, follow gitdir and commondir and check the back-link, registered repo's decision if both hold, otherwise boundary, unapproved; (d) go up one level and repeat.">
+  <defs>
+    <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+  </defs>
+  <rect class="bx" x="10" y="44" width="160" height="60" rx="6"/>
+  <text class="t" x="20" y="68">Canonicalise the</text>
+  <text class="t" x="20" y="86">path (ProjectRootId)</text>
+  <line class="ln" x1="170" y1="74" x2="198" y2="74" marker-end="url(#a4)"/>
+  <rect class="bx2" x="200" y="44" width="180" height="60" rx="6"/>
+  <text class="t" x="210" y="68">(a) registered root or</text>
+  <text class="t" x="210" y="86">derived parent?</text>
+  <line class="ln" x1="380" y1="74" x2="408" y2="74" marker-end="url(#a4)"/>
+  <text class="ts" x="384" y="66">no</text>
+  <rect class="bx2" x="410" y="44" width="170" height="60" rx="6"/>
+  <text class="t" x="420" y="68">(b) a .git directory</text>
+  <text class="t" x="420" y="86">at this level?</text>
+  <line class="ln" x1="580" y1="74" x2="608" y2="74" marker-end="url(#a4)"/>
+  <text class="ts" x="584" y="66">no</text>
+  <rect class="bx2" x="610" y="44" width="170" height="60" rx="6"/>
+  <text class="t" x="620" y="68">(c) a .git file</text>
+  <text class="t" x="620" y="86">(a worktree)?</text>
+  <line class="ln" x1="780" y1="74" x2="808" y2="74" marker-end="url(#a4)"/>
+  <text class="ts" x="784" y="66">no</text>
+  <rect class="bx" x="810" y="44" width="180" height="60" rx="6"/>
+  <text class="t" x="820" y="68">(d) go up one level</text>
+  <text class="ts" x="820" y="86">then check again</text>
+  <polyline class="ln" points="900,44 900,18 290,18 290,42" marker-end="url(#a4)"/>
+  <text class="ts" x="520" y="13">next level up</text>
+  <line class="ln" x1="290" y1="104" x2="290" y2="168" marker-end="url(#a4)"/>
+  <text class="ts" x="296" y="140">yes</text>
+  <rect class="bx" x="200" y="170" width="180" height="60" rx="6"/>
+  <rect class="good" x="200" y="170" width="180" height="60" rx="6"/>
+  <text class="t" x="210" y="194">Its record is the</text>
+  <text class="t" x="210" y="212">answer (exact lookup)</text>
+  <line class="ln" x1="495" y1="104" x2="495" y2="168" marker-end="url(#a4)"/>
+  <text class="ts" x="501" y="140">yes: a separate clone</text>
+  <rect class="bx" x="410" y="170" width="170" height="60" rx="6"/>
+  <rect class="bad" x="410" y="170" width="170" height="60" rx="6"/>
+  <text class="t" x="420" y="194">Boundary:</text>
+  <text class="t" x="420" y="212">path reads unapproved</text>
+  <line class="ln" x1="695" y1="104" x2="695" y2="168" marker-end="url(#a4)"/>
+  <text class="ts" x="701" y="140">yes</text>
+  <rect class="bx" x="610" y="170" width="380" height="76" rx="6"/>
+  <text class="t" x="620" y="192">Follow gitdir → commondir, and check the back-link:</text>
+  <text class="tm" x="620" y="212">&lt;commondir&gt;/worktrees/&lt;name&gt;/gitdir</text>
+  <text class="ts" x="620" y="232">must point back at this worktree's .git file</text>
+  <line class="ln" x1="800" y1="246" x2="800" y2="298" marker-end="url(#a4)"/>
+  <text class="ts" x="806" y="276">both hold</text>
+  <rect class="bx" x="700" y="300" width="290" height="56" rx="6"/>
+  <rect class="good" x="700" y="300" width="290" height="56" rx="6"/>
+  <text class="t" x="710" y="324">Gets the registered repo's decision</text>
+  <polyline class="ln" points="650,246 650,328 582,328" marker-end="url(#a4)"/>
+  <text class="ts" x="600" y="276">either</text>
+  <text class="ts" x="600" y="290">missing</text>
+  <rect class="bx" x="410" y="300" width="170" height="56" rx="6"/>
+  <rect class="bad" x="410" y="300" width="170" height="56" rx="6"/>
+  <text class="t" x="420" y="324">Boundary:</text>
+  <text class="t" x="420" y="342">path reads unapproved</text>
+  <text class="ts" x="10" y="388">The back-link stops a planted .git file (say, in a vendored tarball) from claiming an approved repo.</text>
+</svg>
+<figcaption>Figure 2. The trust walk, one level at a time from the path upward <span class="cite">[§4.6]</span>.</figcaption>
+</figure>
+
+<div class="tw"><table>
+<tr><th>Walk test</th><th>Answer</th></tr>
+<tr><td>a subfolder of an approved root</td><td>approved</td></tr>
+<tr><td>a clone under <code>vendor/</code></td><td>unapproved</td></tr>
+<tr><td>a worktree of the approved repo outside its tree</td><td>approved</td></tr>
+<tr><td>the same worktree after <code>git worktree remove</code></td><td>unapproved</td></tr>
+<tr><td>a worktree of an unrelated repo inside an approved tree</td><td>unapproved</td></tr>
+<tr><td>a planted <code>.git</code> file pointing into the approved repo with no back-link</td><td>unapproved</td></tr>
+</table></div>
+
+<div class="cards">
+<div class="card"><h3>Provider cache</h3>
+<ul>
+  <li>Never cache "unapproved".</li>
+  <li>Cache "approved" with a short TTL (about 60 s) plus the change hint.</li>
+  <li>When the TTL expires, ask again. No generation-only probe: <code>project.trust</code> costs the same (one local route call, one indexed read), and the journal generation also moves on unrelated registry edits.</li>
+  <li>Drop the whole cache on any bus disconnect or cursor gap.</li>
+</ul></div>
+<div class="card"><h3>Failure answers</h3>
+<ul>
+  <li>entorhinal unreachable on a cold cache → <code>approval_unverifiable{root}</code>, never an approval prompt.</li>
+  <li>entorhinal not installed → one fast <code>unknown_module</code> refusal, cached until the catalog changes; the provider then uses its own record.</li>
+</ul></div>
+<div class="card"><h3>Without entorhinal</h3>
+<p>For example a standalone AFT inside OpenCode. The provider keeps its own record, as AFT's per-project trust list and Magic Context's project-config boundary do today. Records are keyed on a canonical path or an id the provider resolves itself, never on the bind's caller-supplied <code>project_id</code>.</p></div>
+</div>
+<p class="cite">[§4.6]</p>
+
+<!-- ============================================================ -->
+<h2 id="identity">6. Caller identity and agent credentials</h2>
+<p><b>The question:</b> who is making this call? Two callers in the same project can differ, so this can't come from a project record. For example, AFT gives an MCP facade or an unverified principal text-only replies, forced root-path restriction and permission-gated <code>bash</code>, while the same project is fully trusted when Prefrontal or AFT's own plugin calls <span class="cite">[§4.7]</span>.</p>
+<ul>
+  <li><b>The route principal</b> is stamped by the daemon on every bind. It is the only caller fact a provider trusts. The bind's <code>session</code> is never trusted.</li>
+  <li><b>Runner-opened routes.</b> Broca opens the routes for its tool calls itself, as <code>reserved:broca</code>. That principal names the runner, not the agent. So authority for an agent on such a route has two layers, and neither substitutes for the other:
+    <ul>
+      <li>the carrying module's own grant: may <code>reserved:broca</code> carry agents at all;</li>
+      <li>a Prefrontal-signed agent credential naming the agent.</li>
+    </ul>
+    This is the same shape as the live GitHub bot path through <code>reserved:aft</code>.</li>
+</ul>
+
+<figure class="sv">
+<svg viewBox="0 0 1000 330" role="img" aria-label="Credential path: Prefrontal issues a v2 credential at launch to the runner; the runner keeps it in a 0600 sidecar beside the WAL, which records only agent_id and a digest; at dispatch the runner adds it as a host-only argument on its reserved:broca route; the daemon stamps the principal; the provider verifies version, machine, carrier and both grants, then strips the credential before any vendor call.">
+  <defs>
+    <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+  </defs>
+  <rect class="bx2" x="10" y="20" width="200" height="150" rx="8"/>
+  <text class="th" x="22" y="44">Prefrontal</text>
+  <text class="ts" x="22" y="64">signs with a key from this</text>
+  <text class="ts" x="22" y="80">machine's vault</text>
+  <text class="ts" x="22" y="100">issues at launch, when</text>
+  <text class="ts" x="22" y="116">admitting the session</text>
+  <text class="ts" x="22" y="136">heads: their own agent's</text>
+  <text class="ts" x="22" y="152">workers: none</text>
+  <line class="ln" x1="210" y1="80" x2="258" y2="80" marker-end="url(#a5)"/>
+  <text class="ts" x="216" y="72">v2</text>
+  <rect class="bx2" x="260" y="20" width="210" height="150" rx="8"/>
+  <text class="th" x="272" y="44">Runner (Broca)</text>
+  <text class="ts" x="272" y="64">sidecar file beside the WAL,</text>
+  <text class="ts" x="272" y="80">mode 0600, read at resume</text>
+  <text class="ts" x="272" y="100">WAL records only agent_id</text>
+  <text class="ts" x="272" y="116">and a digest</text>
+  <text class="ts" x="272" y="136">adds it at dispatch as a</text>
+  <text class="ts" x="272" y="152">host-only argument</text>
+  <line class="ln" x1="470" y1="80" x2="598" y2="80" marker-end="url(#a5)"/>
+  <text class="ts" x="478" y="72">tool call</text>
+  <rect class="dim" x="478" y="96" width="114" height="56" rx="6"/>
+  <text class="ts" x="486" y="116">daemon stamps</text>
+  <text class="tm" x="486" y="138">reserved:broca</text>
+  <rect class="bx2" x="600" y="20" width="390" height="220" rx="8"/>
+  <text class="th" x="612" y="44">Provider verifies</text>
+  <text class="ts" x="612" y="66">1. dispatch on v; refuse v2 lacking carrier or machine_id</text>
+  <text class="ts" x="612" y="86">2. machine_id equals its own daemon's (from HelloAck)</text>
+  <text class="ts" x="626" y="102">else assertion_machine_mismatch;</text>
+  <text class="ts" x="626" y="118">no id in its own HelloAck → assertion_machine_unknown</text>
+  <text class="ts" x="612" y="138">3. calling principal equals the credential's carrier</text>
+  <text class="ts" x="626" y="154">else assertion_carrier_mismatch</text>
+  <text class="ts" x="612" y="174">4. carrier module's grant AND the agent's own grant</text>
+  <text class="ts" x="626" y="190">each refuses by name; no fallback to module-only</text>
+  <text class="ts" x="612" y="210">5. strips the credential before any vendor call</text>
+  <text class="ts" x="612" y="230">The design lists these checks; it doesn't fix their order.</text>
+  <rect class="bx" x="10" y="200" width="490" height="120" rx="8"/>
+  <text class="th" x="22" y="224">Claims (v: 2)</text>
+  <text class="tm" x="22" y="246">agent_id · surface · capability scope</text>
+  <text class="tm" x="22" y="266">machine_id · carrier · (no exp)</text>
+  <text class="ts" x="22" y="290">Today's AFT relay assertion is v1 (surface "github", handle,</text>
+  <text class="ts" x="22" y="306">installation_id, 4 h exp). Every credential moves to v2.</text>
+</svg>
+<figcaption>Figure 3. Where the agent credential lives and how a provider checks it. The credential is never model-visible and never in the prefix <span class="cite">[§4.7]</span>.</figcaption>
+</figure>
+
+<div class="cards">
+<div class="card"><h3>What the credential is for</h3>
+<p>It identifies the agent and keeps a carrier's bookkeeping honest: a provider doesn't have to trust which agent a carrier says a call belongs to. <b>It is not a security boundary.</b> Every call reaches a provider through this machine's daemon, which stamps who opened the route. A call relayed from another machine arrives under the relaying module's principal (for example <code>reserved:callosum</code>), which the carrier binding refuses. Using a credential needs a carrier holding a module grant, and grants are the operator's act. Anything on the machine can read Prefrontal's key anyway.</p></div>
+<div class="card"><h3>No expiry</h3>
+<p>v2 claims carry no <code>exp</code>, and a verifier reads a missing <code>exp</code> as non-expiring on v2 only. No far-future <code>exp</code> is used, so nobody mistakes a number for a policy. Plexus's verifier requires <code>exp</code> today, so this is a verifier change. Authority stays with the provider's per-call grant check: revoking an agent's grant takes effect on its next call.</p></div>
+<div class="card"><h3>Machine-bound</h3>
+<ul>
+  <li>The signing key is created in this machine's vault. Nothing replicates it, though a vault backup carries it. Plexus verifies against its own machine's Prefrontal key.</li>
+  <li>Both sides take the machine id from the daemon, never the OS: <code>ModuleHelloAckBody.machine_id</code>, served from subc-protocol 0.25.0, read through <code>subc-client-rs</code> 0.18.0+. Prefrontal already reads it.</li>
+  <li>Absent is not a match. Prefrontal never issues a credential while its own <code>HelloAck</code> had no machine id.</li>
+  <li>A match only ever narrows. The id survives a full restore (<code>ck machine adopt</code>), so binding catches a vault copied to a second machine without its id, not a restore that adopts it.</li>
+</ul></div>
+<div class="card"><h3>Carrier-bound</h3>
+<p>The credential names the carrier it was issued to (for example <code>reserved:broca</code>). Federation can deliver a call from a paired device with the tool arguments byte for byte, but under <code>reserved:callosum</code>. A replayed credential therefore fails on principal alone, whatever the relay's exposure config says.</p></div>
+<div class="card"><h3>Resume and storage</h3>
+<ul>
+  <li>A resume with the sidecar missing refuses dependent tool calls by name (<code>agent credential missing for this session</code>). Calls that need no agent identity are unaffected.</li>
+  <li>After a Broca restart, Prefrontal re-issues only if the sidecar is missing and the run is still one it launched. Otherwise a missing sidecar is a permanent refusal for that run.</li>
+  <li>The runner never requests a credential. There are no Broca heads yet.</li>
+</ul></div>
+<div class="card"><h3>Relays and exposure</h3>
+<ul>
+  <li>A relaying module (for example callosum federation) gets no carrier grant for agent credentials without an explicit operator decision. Today no relaying principal holds any Plexus grant, and nothing on Plexus, AFT or Broca is exposed to federation peers.</li>
+  <li>An exposed Prefrontal operation that enqueues a prompt lets a paired peer make a local agent act under its own credential. Owner-paired devices act as the operator. Any wider audience needs its own exposure decision, outside this design.</li>
+</ul></div>
+</div>
+
+<h3>6.1 Provider authorization</h3>
+<div class="tw"><table>
+<tr><th style="width:36%">Call</th><th>Grants checked</th></tr>
+<tr><td>no credential</td><td>module grants only</td></tr>
+<tr><td>verified credential</td><td>the carrier module's grant <b>and</b> the agent's own grant, each refusing by name</td></tr>
+<tr><td>refused credential</td><td>refused; never falls back to module-only</td></tr>
+</table></div>
+<p>The agent grant generation is pinned at reservation, so a revoke between authorize and dispatch aborts the call. Plexus measured zero agent grants outside the GitHub bot connections, so this breaks nothing live. It is Plexus work and can land before Broca carries credentials. The migration keeps v1 accepted on the AFT relay route only; Prefrontal adds <code>carrier</code> and <code>machine_id</code> to the relay mint too, so every credential is checked the same way <span class="cite">[§4.7]</span>.</p>
+
+<!-- ============================================================ -->
+<h2 id="step">7. Compaction: setup and one model step</h2>
+
+<h3>7.1 Setup</h3>
+<p>Called once when the session starts. It returns <span class="cite">[§5.1]</span>:</p>
+<ul>
+  <li><b>The initial CompactionMessage.</b> This is how a session starts with its head already in place. For Magic Context it inserts m0 and m1 before the first user message, as an empty range replaced by <code>[m0, m1]</code>. A provider with no head returns an empty one.</li>
+  <li><b>Message stability.</b> A rank for each of the provider's own messages; higher means it changes less often. Magic Context's main sessions declare <code>{m[0]: 2, m[1]: 1}</code>. A subagent session declares nothing, because it has no m0 or m1. Indexes refer to the provider's output, not wire positions.</li>
+</ul>
+<p>Broca records the initial CompactionMessage before the first model call. If Setup fails or times out, no model call is made and the run ends as <code>Error</code> with a <code>provider_code</code>.</p>
+
+<h3>7.2 The per-step call</h3>
+<p>On every model step, Broca sends a status and waits for one of four answers <span class="cite">[§5.2]</span>.</p>
+
+<figure class="sv">
+<svg viewBox="0 0 1000 300" role="img" aria-label="One model step: Broca sends a status; the compaction provider answers NOOP, CompactionMessage, WAIT or REFUSE; for a CompactionMessage Broca checks it, then writes and syncs it; then it places breakpoints and sends the request. WAIT holds the step; REFUSE ends the run as Error with provider_code.">
+  <defs>
+    <marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+  </defs>
+  <text class="th" x="10" y="40">Broca</text>
+  <text class="th" x="10" y="148">Compaction</text>
+  <text class="th" x="10" y="166">provider</text>
+  <text class="th" x="10" y="262">Model</text>
+  <line class="lnm" x1="110" y1="36" x2="990" y2="36"/>
+  <line class="lnm" x1="110" y1="152" x2="990" y2="152"/>
+  <line class="lnm" x1="110" y1="258" x2="990" y2="258"/>
+  <circle class="dot" cx="140" cy="36" r="6"/>
+  <text class="ts" x="118" y="22">step begins</text>
+  <line class="ln" x1="140" y1="42" x2="200" y2="146" marker-end="url(#a6)"/>
+  <text class="t" x="176" y="84">status</text>
+  <rect class="bx" x="205" y="118" width="250" height="68" rx="6"/>
+  <text class="t" x="215" y="138">answer, one of:</text>
+  <text class="tm" x="215" y="156">NOOP · CompactionMessage</text>
+  <text class="tm" x="215" y="174">WAIT · REFUSE</text>
+  <line class="ln" x1="330" y1="118" x2="380" y2="42" marker-end="url(#a6)"/>
+  <text class="ts" x="362" y="94">budget ≈ 2 s</text>
+  <text class="ts" x="362" y="108">(NOOP / CM)</text>
+  <rect class="bx2" x="385" y="10" width="190" height="54" rx="6"/>
+  <text class="t" x="395" y="30">check, then write + sync</text>
+  <text class="ts" x="395" y="48">new CM, timeouts, waits</text>
+  <line class="ln" x1="575" y1="36" x2="603" y2="36" marker-end="url(#a6)"/>
+  <rect class="bx2" x="605" y="10" width="160" height="54" rx="6"/>
+  <text class="t" x="615" y="30">place breakpoints</text>
+  <text class="ts" x="615" y="48">tail, m0, m1, …</text>
+  <line class="ln" x1="765" y1="36" x2="793" y2="36" marker-end="url(#a6)"/>
+  <rect class="bx2" x="795" y="10" width="190" height="54" rx="6"/>
+  <text class="t" x="805" y="30">send request</text>
+  <text class="ts" x="805" y="48">replacement + raw tail</text>
+  <line class="ln" x1="865" y1="64" x2="865" y2="250" marker-end="url(#a6)"/>
+  <text class="ts" x="872" y="214">request</text>
+  <rect class="bx" x="500" y="100" width="150" height="72" rx="6"/>
+  <text class="t" x="510" y="120">WAIT</text>
+  <text class="ts" x="510" y="138">hold; call again on</text>
+  <text class="ts" x="510" y="154">ready or bound_ms</text>
+  <rect class="bx" x="665" y="100" width="170" height="72" rx="6"/>
+  <text class="t" x="675" y="120">REFUSE</text>
+  <text class="ts" x="675" y="138">nothing sent; run ends</text>
+  <text class="ts" x="675" y="154">Error + provider_code</text>
+  <text class="ts" x="500" y="196">WAIT and REFUSE: no send (section 10 of this page)</text>
+</svg>
+<figcaption>Figure 4. One model step. NOOP and CompactionMessage lead to a send; WAIT holds the step; REFUSE ends the run without a send. Everything the step must record is durable before the request goes out; NOOP writes nothing <span class="cite">[§5.2–§5.5, §7]</span>.</figcaption>
+</figure>
+
+<div class="cards">
+<div class="card"><h3>The status</h3>
+<p>Only what Broca already has in its WAL or model catalog. The status itself isn't written to the WAL.</p>
+<ul>
+  <li>the step id; new user turn or tool step;</li>
+  <li>the model and variant;</li>
+  <li>the context window and output limit when the catalog resolves them, otherwise absent;</li>
+  <li>the previous step's usage (input, cache read, cache write, output) with completion time and finish reason, when recorded;</li>
+  <li>when the previous run ended as <code>Error</code>, its <code>provider_code</code>. An overflow ends a run this way with no usage;</li>
+  <li>Broca's <b>estimate</b> of the request, labelled as one (no tokenizer for most families), plus the previous step's measured input;</li>
+  <li><code>prefix_rebuilding</code> with its reason (flush, manifest change, model switch, expired cache);</li>
+  <li>the newest message id and the last applied CompactionMessage id;</li>
+  <li>the current time.</li>
+</ul></div>
+<div class="card"><h3>Written before the model call</h3>
+<p>Broca writes and syncs, before sending: a new CompactionMessage it will apply, with whatever the runner strips in response; a record of a call timeout; entry into and exit from <code>compaction_wait</code>. <code>NOOP</code> writes nothing. The request goes out only after these are durable.</p>
+<h3 style="margin-top:14px">Timeout</h3>
+<p>About 2 s for <code>NOOP</code> and <code>CompactionMessage</code>. On a timeout Broca records it and proceeds with the last recorded CompactionMessage. One always exists, because Setup's is recorded before the first model call.</p></div>
+</div>
+
+<div class="tw"><table>
+<tr><th style="width:20%">Answer</th><th style="width:34%">Meaning</th><th>What Broca does</th></tr>
+<tr><td><code>NOOP</code></td><td>Nothing changes. No bust.</td><td>Sends with the CompactionMessage already in force and the raw tail.</td></tr>
+<tr><td><code>CompactionMessage</code></td><td><code>{range: {from, to}, replacement: [messages], bust: soft | hard}</code>. Unlabelled counts as <code>hard</code>.</td><td>Checks it (section 8). If it passes, writes it and sends with it. If not, refuses and records it and proceeds with the previous one.</td></tr>
+<tr><td><code>WAIT</code></td><td><code>{reason, bound_ms}</code>: hold this step while the provider compacts.</td><td>Holds the step (section 10).</td></tr>
+<tr><td><code>REFUSE</code></td><td><code>{code, reason, retryable}</code>: fail this step.</td><td>Ends the run as <code>Error</code> with <code>provider_code</code> (section 10).</td></tr>
+</table></div>
+
+<!-- ============================================================ -->
+<h2 id="cm">8. The CompactionMessage</h2>
+<ul>
+  <li><b>The range.</b> <code>from</code> is the marker; messages before it aren't sent. <code>to</code> is exclusive: the start of the provider's protected tail, which goes out raw. Both ends are Broca's durable message ids, never array indexes. <code>to</code> may not separate a tool call from its result.</li>
+  <li><b>The replacement</b> stands in for the range. For Magic Context: <code>[m0, m1, reshaped messages from the range]</code>. It's the provider's finished output, so the hooks don't run over it.</li>
+  <li><b>The whole working range, never a delta.</b> The runner uses the latest one until another replaces it.</li>
+  <li><b>Monotonic version,</b> increased per session by the provider. The runner applies one only if its version is higher than the last applied. A late answer (a retry after a timeout, or overlapping requests on one key, which Thalamus sees) never replaces a newer one.</li>
+  <li><b>Drops.</b> <code>ctx_reduce</code> only queues. Queued drops land on the provider's next pass as a new replacement, with the marker unchanged.</li>
+</ul>
+<p class="cite">[§5.3]</p>
+
+<figure class="sv">
+<svg viewBox="0 0 1000 300" role="img" aria-label="The transcript with the marker and the protected tail, and the request on the wire: the prefix, the replacement starting with m0 and m1, appends re-emitted after a soft replacement, and the raw tail.">
+  <text class="th" x="10" y="24">Transcript (Broca's WAL)</text>
+  <rect class="dim" x="10" y="36" width="200" height="40" rx="4"/>
+  <text class="ts" x="20" y="61">older messages, not sent</text>
+  <rect class="bx" x="214" y="36" width="440" height="40" rx="4"/>
+  <text class="t" x="224" y="61">working range: from the marker up to, not including, to</text>
+  <rect class="bx2" x="658" y="36" width="332" height="40" rx="4"/>
+  <text class="t" x="668" y="61">protected tail: to → the newest message</text>
+  <line class="axis" x1="214" y1="30" x2="214" y2="84"/>
+  <text class="tm" x="190" y="98">from = marker</text>
+  <line class="axis" x1="656" y1="30" x2="656" y2="84"/>
+  <text class="tm" x="626" y="98">to (exclusive)</text>
+  <line class="lnm" x1="214" y1="104" x2="170" y2="180"/>
+  <line class="lnm" x1="654" y1="104" x2="610" y2="180"/>
+  <line class="lnm" x1="658" y1="104" x2="672" y2="180"/>
+  <line class="lnm" x1="990" y1="104" x2="990" y2="180"/>
+  <text class="ts" x="330" y="138">replaced by the provider's replacement</text>
+  <text class="ts" x="760" y="138">sent as written (raw)</text>
+  <text class="th" x="10" y="176">Request on the wire</text>
+  <rect class="bx2" x="10" y="186" width="150" height="44" rx="4"/>
+  <text class="t" x="20" y="206">prefix</text>
+  <text class="ts" x="20" y="222">system text + tools</text>
+  <rect class="bx" x="170" y="186" width="70" height="44" rx="4"/>
+  <rect class="hl" x="170" y="186" width="70" height="44" rx="4"/>
+  <text class="th" x="194" y="213">m0</text>
+  <rect class="bx" x="244" y="186" width="70" height="44" rx="4"/>
+  <rect class="hl" x="244" y="186" width="70" height="44" rx="4"/>
+  <text class="th" x="268" y="213">m1</text>
+  <rect class="bx" x="318" y="186" width="220" height="44" rx="4"/>
+  <text class="t" x="328" y="206">reshaped messages</text>
+  <text class="ts" x="328" y="222">from the range</text>
+  <rect class="bx2" x="542" y="186" width="120" height="44" rx="4"/>
+  <text class="ts" x="548" y="206">appends in range</text>
+  <text class="ts" x="548" y="222">(soft only)</text>
+  <rect class="bx" x="672" y="186" width="318" height="44" rx="4"/>
+  <text class="t" x="682" y="206">raw protected tail</text>
+  <text class="ts" x="682" y="222">… user · assistant · tool result</text>
+  <text class="ts" x="170" y="252">replacement = [m0, m1, reshaped …]</text>
+  <text class="ts" x="10" y="284">After a hard replacement the appends are folded into a rebuilt prefix instead of being re-emitted.</text>
+</svg>
+<figcaption>Figure 5. The working range goes out as the replacement, headed by m0 and m1. The protected tail goes out raw <span class="cite">[§5.1, §5.3]</span>.</figcaption>
+</figure>
+
+<div class="cards">
+<div class="card"><h3>Checks before sending</h3>
+<ul>
+  <li>roles follow the family's rules;</li>
+  <li>every tool call is paired with its result, over the replacement and the raw tail together;</li>
+  <li>no tool-call id appears that isn't in the range;</li>
+  <li>the rendered request meets the runner's own validity rules for the family.</li>
+</ul>
+<p>A view that fails is refused and recorded; Broca proceeds with the previous CompactionMessage.</p></div>
+<div class="card"><h3>What the label means</h3>
+<p><code>soft</code> and <code>hard</code> describe cache cost, not request validity. <code>soft</code> promises only that the cached prefix up to <code>from</code> survives. The runner may still discard content after <code>from</code> (for example reasoning) to keep the request valid for its family, per its own spec. Broca verifies the claim, and every check, against the array it rendered last; it doesn't trust the label.</p></div>
+<div class="card"><h3>Appends and compaction</h3>
+<p>Appends exist only on routes with the append capability.</p>
+<ul>
+  <li><b>soft:</b> each append the range covers is re-emitted byte for byte, in its original form and order, right after the replacement; never merged or rewritten. A <code>soft</code> replacement that would drop one is refused like a structural failure.</li>
+  <li><b>hard:</b> the prefix is rebuilt anyway, so the appends fold into it and are dropped from what's sent.</li>
+  <li>Turn-scoped (<code>clear_at</code>) messages stay in history byte-identical after they clear, until a fold.</li>
+</ul></div>
+<div class="card"><h3>Recorded in the WAL</h3>
+<p>Every CompactionMessage is a record; resume replays the latest. If the provider is down, Broca keeps serving the last recorded compaction plus the raw tail. The only risk left is overflow, which ends the run as <code>Error</code> with the provider's code; the next status carries it.</p></div>
+</div>
+<p class="cite">[§5.3]</p>
+
+<!-- ============================================================ -->
+<h2 id="breakpoints">9. Cache breakpoints</h2>
+<p>Broca owns breakpoint placement, per model family. Its planner works in two steps <span class="cite">[§7]</span>.</p>
+<ol>
+  <li><b>Choose which markers get a slot.</b> Candidates in priority order:
+    <ol>
+      <li>the tail;</li>
+      <li>the compaction provider's declared messages, highest stability rank first;</li>
+      <li>the end of system: cheap to lose, because the most stable message's cache entry already includes system;</li>
+      <li>the lookback bridge (for a step more than 20 blocks past the previous boundary) and the standby-model bridge.</li>
+    </ol>
+    With N slots the first N candidates get one. A bridge, when needed, takes the slot of the lowest-priority candidate chosen. Under pressure the tail is kept and the least stable candidates drop first.</li>
+  <li><b>Place each chosen marker.</b> The tail marker goes on the last block. A declared-message marker goes where that message is rendered after the replacement; Broca maps provider indexes to wire positions on every step, so positions are never fixed. The system marker goes on the last system block.</li>
+</ol>
+<figure class="sv">
+<svg viewBox="0 0 1000 170" role="img" aria-label="Breakpoints: with four slots, the tail, m0, m1, and the end of system or a bridge; with two slots, the tail and m0.">
+  <rect class="bx2" x="10" y="30" width="150" height="36" rx="4"/><text class="t" x="20" y="53">prefix</text>
+  <rect class="bx" x="170" y="30" width="70" height="36" rx="4"/><text class="th" x="194" y="53">m0</text>
+  <rect class="bx" x="244" y="30" width="70" height="36" rx="4"/><text class="th" x="268" y="53">m1</text>
+  <rect class="bx" x="318" y="30" width="340" height="36" rx="4"/><text class="t" x="328" y="53">reshaped messages</text>
+  <rect class="bx" x="672" y="30" width="318" height="36" rx="4"/><text class="t" x="682" y="53">raw tail</text>
+  <text class="th" x="10" y="100">4 slots</text>
+  <polygon class="bp" points="154,76 166,76 160,88"/><text class="tbp" x="100" y="104">system or a bridge</text>
+  <polygon class="bp" points="234,76 246,76 240,88"/><text class="tbp" x="228" y="104">m0</text>
+  <polygon class="bp" points="308,76 320,76 314,88"/><text class="tbp" x="302" y="104">m1</text>
+  <polygon class="bp" points="982,76 994,76 988,88"/><text class="tbp" x="958" y="104">tail</text>
+  <text class="th" x="10" y="146">2 slots</text>
+  <polygon class="bp" points="234,122 246,122 240,134"/><text class="tbp" x="228" y="150">m0</text>
+  <polygon class="bp" points="982,122 994,122 988,134"/><text class="tbp" x="958" y="150">tail</text>
+  <text class="ts" x="360" y="150">hypothetical: no production family has fewer than 4 slots today</text>
+</svg>
+<figcaption>Figure 6. ▼ marks a breakpoint at the end of the item. Families with implicit caching ignore all of this <span class="cite">[§7]</span>.</figcaption>
+</figure>
+<ul>
+  <li>Broca's <code>plan_markers</code> resolves slot pressure in the opposite order today. It changes to this order in build stage 4.</li>
+  <li>A caller's <code>cache.tail: volatile</code> removes the tail candidate. It is refused on runs with tools.</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="waitrefuse">10. WAIT and REFUSE</h2>
+<div class="cards">
+<div class="card"><h3>WAIT</h3>
+<ol>
+  <li>Broca holds the step and sends nothing. The run enters <code>compaction_wait</code>, written and synced before the wait begins.</li>
+  <li>Within the running daemon, Broca calls again with a fresh status on whichever comes first: <code>compaction.ready(session)</code> from the provider (the normal path), or <code>bound_ms</code> running out.</li>
+  <li>The provider may answer WAIT again, but an engine-wide cap limits the total wait per step.</li>
+  <li>At the cap Broca decides from its own numbers. If the window is resolved and the request is estimated to fit with the last recorded compaction, it sends. Otherwise the step ends as <code>Error</code> with <code>provider_code</code> <code>compaction_wait_exceeded</code>. It never sends a request it knows, or can't tell, will overflow.</li>
+  <li>Broca publishes "waiting on compaction: &lt;reason&gt;". The user can cancel the step; new user messages queue as usual.</li>
+  <li><b>Interruption.</b> A daemon stop seals the run Interrupted. After a crash, resume finds a wait entry with no exit, seals the run Interrupted and sends nothing. Either way, only a caller's resend continues it, with a fresh provider call.</li>
+</ol><p class="cite">[§5.4]</p></div>
+<div class="card"><h3>REFUSE</h3>
+<ol>
+  <li>Broca doesn't send. It ends the run as <code>Error</code>, written to the WAL. The provider's <code>code</code> becomes <code>provider_code</code>; the record also carries the provider id and <code>reason</code>. No new terminal reason or enum value exists for this. Nothing is added to the model's history.</li>
+  <li>Retryability maps onto the existing transient or permanent classes, never a new one.</li>
+  <li>Prefrontal gets it as the run's terminal result, like any other, and shows <code>reason</code> as user-facing text. This doesn't depend on the deferred user-notice channel.</li>
+  <li>The session stays usable; the next send calls the provider again. Transient: automatic retry makes sense (the historian was only busy). Permanent: the user has to act (switch to a larger model, fix the configuration).</li>
+  <li>A refusal on a tool step keeps the tool results already written.</li>
+</ol><p class="cite">[§5.5]</p></div>
+</div>
+<div>
+  <div class="mock"><div class="bar"><span class="ill">illustrative</span> while WAIT holds the step</div>
+    <span class="chip">⏳ waiting on compaction: &lt;reason&gt;</span><br>
+    <span class="sub" style="font-size:13px">New messages you send are queued.</span><br>
+    <span class="btn">Cancel step</span></div>
+  <div class="mock"><div class="bar"><span class="ill">illustrative</span> after REFUSE, permanent</div>
+    <span class="chip err">Run stopped by the compaction provider</span><br>
+    &lt;reason text, e.g. switch to a larger model&gt;<br>
+    <span class="sub" style="font-size:13px">The session stays usable once you act.</span></div>
+</div>
+<p class="sub">How Prefrontal displays the status and the refusal is Prefrontal's choice; the design doesn't specify screens.</p>
+
+<!-- ============================================================ -->
+<h2 id="hooks">11. Step-transform hooks</h2>
+<p>Step-transform providers change messages <b>when they are written</b>, not every time history is sent. Within a turn: the assistant message completes, <b>PostAssistant</b> runs and is written; then for each tool call <b>PreTool</b>, the tool, <b>PostTool</b>, written. When a user message or notice arrives, <b>PreUser</b> runs and is written <span class="cite">[§6.1]</span>.</p>
+
+<figure class="sv">
+<svg viewBox="0 0 1000 250" role="img" aria-label="Turn timeline: user message, PreUser, model step, PostAssistant, then for each tool call PreTool, the tool, PostTool. Each hook's output is written in the same WAL frame as its subject record.">
+  <defs>
+    <marker id="a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+  </defs>
+  <line class="axis" x1="20" y1="80" x2="980" y2="80"/>
+  <polygon class="ah" points="980,74 992,80 980,86"/>
+  <text class="ts" x="20" y="24">time →</text>
+  <rect class="bx" x="20" y="36" width="110" height="34" rx="4"/><text class="t" x="30" y="58">user message</text>
+  <rect class="bx2" x="140" y="36" width="90" height="34" rx="4"/><rect class="hl" x="140" y="36" width="90" height="34" rx="4"/><text class="th" x="152" y="58">PreUser</text>
+  <rect class="bx" x="240" y="36" width="140" height="34" rx="4"/><text class="t" x="250" y="58">model step</text>
+  <rect class="bx2" x="390" y="36" width="120" height="34" rx="4"/><rect class="hl" x="390" y="36" width="120" height="34" rx="4"/><text class="th" x="400" y="58">PostAssistant</text>
+  <rect class="bx2" x="540" y="36" width="90" height="34" rx="4"/><rect class="hl" x="540" y="36" width="90" height="34" rx="4"/><text class="th" x="552" y="58">PreTool</text>
+  <rect class="bx" x="640" y="36" width="110" height="34" rx="4"/><text class="t" x="650" y="58">tool executes</text>
+  <rect class="bx2" x="760" y="36" width="90" height="34" rx="4"/><rect class="hl" x="760" y="36" width="90" height="34" rx="4"/><text class="th" x="770" y="58">PostTool</text>
+  <text class="ts" x="860" y="58">next step …</text>
+  <text class="ts" x="640" y="100">for each tool call ↺</text>
+  <text class="th" x="20" y="166">Same WAL</text>
+  <text class="th" x="20" y="184">frame as:</text>
+  <rect class="bx" x="120" y="152" width="150" height="54" rx="4"/>
+  <text class="tm" x="128" y="172">RunStarted</text>
+  <text class="ts" x="128" y="190">or the notice record</text>
+  <rect class="bx" x="370" y="152" width="160" height="54" rx="4"/>
+  <text class="tm" x="378" y="172">ModelStepFinished</text>
+  <text class="ts" x="378" y="190">assistant_message</text>
+  <rect class="bx" x="520" y="214" width="170" height="30" rx="4"/>
+  <text class="tm" x="528" y="234">ToolDispatchIntent</text>
+  <rect class="bx" x="740" y="152" width="130" height="54" rx="4"/>
+  <text class="tm" x="748" y="172">ToolResult</text>
+  <text class="ts" x="748" y="190">result</text>
+  <line class="ln" x1="185" y1="70" x2="195" y2="150" marker-end="url(#a7)"/>
+  <line class="ln" x1="450" y1="70" x2="450" y2="150" marker-end="url(#a7)"/>
+  <line class="ln" x1="585" y1="70" x2="600" y2="212" marker-end="url(#a7)"/>
+  <line class="ln" x1="805" y1="70" x2="805" y2="150" marker-end="url(#a7)"/>
+</svg>
+<figcaption>Figure 7. Each hook runs <em>before</em> its subject record is written, and its output lands in the same WAL frame. A hook record written after its subject would reopen a window where the subject is on disk and its hook output isn't <span class="cite">[§6.1, §6.3]</span>.</figcaption>
+</figure>
+
+<div class="tw"><table>
+<tr><th style="width:14%">Hook</th><th style="width:30%">Acts on</th><th style="width:22%">Typical use</th><th>Record · final field · new fields</th></tr>
+<tr><td>PostAssistant</td><td>the text of existing text blocks only; never blocks, tool calls, thinking or signatures</td><td>tag prefix (<code>prepend</code>), trailing-blank cleanup (<code>replace</code>)</td><td><code>ModelStepFinished</code> · <code>assistant_message</code> · original text, attribution</td></tr>
+<tr><td>PreTool</td><td>what executes: pass, a rewritten input, or a refusal whose text becomes the tool result</td><td>the dropped-input guard</td><td><code>ToolDispatchIntent</code> · <code>args</code> (the input that executes) · attribution</td></tr>
+<tr><td>PostTool</td><td>the tool result</td><td>tag prefix, Channel 1 reminder (<code>append</code>), size cap (<code>replace</code>)</td><td><code>ToolResult</code> · <code>result</code> · original, attribution</td></tr>
+<tr><td>PreUser</td><td>the user message or notice</td><td>tags, recall (<code>append</code>), reminder wrapping</td><td><code>RunStarted</code> or the notice record · <code>input</code> · original, attribution</td></tr>
+</table></div>
+<p class="cite">[§6.1, §6.3]</p>
+
+<div class="cards">
+<div class="card"><h3>Operations, not values</h3>
+<p>PostAssistant, PostTool and PreUser return <code>prepend(text)</code>, <code>append(text)</code> or <code>replace(value)</code>; Broca applies them.</p>
+<ul>
+  <li><b>Allowed operations.</b> Each tool declares which its results accept; default all three. AFT's <code>read</code> and <code>bash</code> accept <code>prepend</code> and <code>append</code> only: a later <code>edit</code> addresses <code>read</code>'s hashline tags, and AFT's line tags must survive a renderer rolled back to a build without hooks. Broca sets the rule for PostAssistant and PreUser. A disallowed operation is refused before it's applied, and recorded.</li>
+  <li><b>Stacking</b> in manifest order: prepends stack outward, appends in order, a <code>replace</code> sees the value as it stands then.</li>
+  <li><b>Attribution</b> is the operations themselves, each with its module and an optional short note. A UI shows original, final and the list. No diffing.</li>
+</ul><p class="cite">[§6.2]</p></div>
+<div class="card"><h3>One frame, applied once</h3>
+<ul>
+  <li>The final value lives in the record's existing rendered field, so a Broca rolled back to a build without hooks still renders the right bytes. Original and attribution are new fields.</li>
+  <li>PreTool needs no original field: the model's input stays in <code>ModelStepFinished.assistant_message</code>. <code>ToolDispatchIntent</code> holds the input that executes, which at-most-once execution depends on.</li>
+  <li>Every edit is applied before the message's first send and never changed after.</li>
+  <li>A crash before the frame syncs loses the hook output with its subject. Resume re-runs that step's hooks; it doesn't replay a guess or stop for review.</li>
+</ul><p class="cite">[§6.3]</p></div>
+<div class="card"><h3>Order, budget, failure</h3>
+<ul>
+  <li>Several providers on one hook run in manifest order, each receiving the previous one's output.</li>
+  <li>Each declares a per-hook time budget in its manifest, capped engine-wide. A hook that fails or times out passes the message through unchanged, recorded.</li>
+  <li><b>PreTool is the exception.</b> Each PreTool provider declares <code>on_unavailable: pass | refuse</code>, default <code>refuse</code>, applied on a timeout or any failure. <code>pass</code> runs the model's input; <code>refuse</code> returns a typed "pre-tool hook unavailable" refusal as the result. Only the provider knows if its hook is enforcing, and an executed call can't be undone.</li>
+  <li>PreTool changes only what executes; the recorded assistant message keeps what the model produced.</li>
+</ul><p class="cite">[§6.3]</p></div>
+<div class="card"><h3>Everything else</h3>
+<ul>
+  <li><b>PostAssistant and reasoning.</b> Text only. Whether a family accepts edited text next to reasoning is the runner's concern. The display lane already streamed the original; subscribers get the final on the control lane.</li>
+  <li><b>Reading history.</b> <code>session.read(from, to)</code> returns any range with raw and final forms: after a restart, for the provider's own history work, to recover originals.</li>
+  <li><b>Wakes and nudges.</b> The provider tells them apart itself, for example by their <code>&lt;system-reminder&gt;</code> wrapping. Broca doesn't classify turns.</li>
+  <li><b>The runner's own edits</b> (Broca's repetition guidance, a PostTool append) are ordinary recorded operations. Resume never reconstructs them.</li>
+</ul><p class="cite">[§6.3]</p></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="resume">12. Resume: replay only</h2>
+<div class="flow" role="img" aria-label="Resume: the prefix from the latest fold or the frozen manifest, plus the appends and history after it, the latest CompactionMessage, every hook output and every recorded strip; replay with no provider calls.">
+  <div class="st"><b>Prefix</b>from the latest fold, or the frozen manifest if none</div>
+  <div class="ar">+</div>
+  <div class="st"><b>After it</b>appends and history</div>
+  <div class="ar">+</div>
+  <div class="st"><b>Records</b>latest CompactionMessage, every hook output, what the runner stripped after each prefix change</div>
+  <div class="ar">→</div>
+  <div class="st hl"><b>Replay</b>no provider is called to reproduce anything the WAL holds</div>
+</div>
+<ul>
+  <li>A step whose hook outputs never became durable re-runs its hooks. Its subject record wasn't durable either, so nothing those hooks would change was sent.</li>
+  <li><b>The one exception.</b> When <code>ModelStepFinished</code> is durable but a call's <code>ToolDispatchIntent</code> isn't, replay re-dispatches that call. PreTool runs again and may answer differently. At-most-once still holds: the intent is written before the tool executes, so nothing ran.</li>
+</ul>
+<p class="cite">[§8]</p>
+
+<!-- ============================================================ -->
+<h2 id="tools">13. Tool calls and notices</h2>
+<div class="cards">
+<div class="card"><h3>Tool calls</h3>
+<ul>
+<li><b>Params.</b> Each call carries the params the provider was preflighted with, so behaviour matches the frozen description.</li>
+<li><b>Pinned revision.</b> Each call carries a digest of the <b>input schema</b> it was described with, plus a semantics version. Description text isn't pinned, so a description-only deploy keeps serving old pins. A provider refuses only when it can no longer honour the schema, with <code>tool_revision_mismatch</code>, which SDKs treat as terminal. Argument changes stay additive.</li>
+<li><b>Settings flipped mid-session.</b> A setting that changes description bytes (AFT's <code>bash.background</code>, <code>github.write</code>) stays frozen until a change is applied. Meanwhile the provider refuses by name any call the current config forbids.</li>
+<li><b>Host-only arguments</b> are rejected in calls from the model, and refused from any caller that hasn't declared it supplies them. The agent credential is one; the runner adds it at dispatch.</li>
+</ul><p class="cite">[§9]</p></div>
+<div class="card"><h3><code>provider_notice</code></h3>
+<ul>
+<li>Asynchronous events: AFT's finished background task, Magic Context's idle nudge. Sent with a per-event id.</li>
+<li>Written as a user-role message tagged with its provenance, at the next legal position, never between a tool call and its result. It passes through PreUser and can later be compacted.</li>
+<li><b>Durability.</b> The provider holds a notice until Broca acknowledges it; Broca acks only after the frame is fsynced. The provider resends un-acked notices, and Broca dedups by event id, so a redelivery after a crash is written once.</li>
+<li>One engine-wide size cap, published as a number. An oversized notice is refused back, never truncated.</li>
+<li>Whether an idle session wakes for a notice is Prefrontal's decision, outside this design.</li>
+</ul><p class="cite">[§10]</p></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="changes">14. Change hints, policies and folds</h2>
+<p>The prefix is frozen, so a changed configuration never leaks in by itself. Detection and application are separate steps <span class="cite">[§11]</span>.</p>
+
+<div class="flow" role="img" aria-label="Change flow: a watched config changes; the provider may publish a hint; Prefrontal re-runs preflight and compares digests; it sends a new manifest with a policy; Broca writes manifest_pending; the change applies as an append or at a fold that writes prefix_rebuilt.">
+  <div class="st"><b>Config changes</b>a file the provider watches</div>
+  <div class="ar">→</div>
+  <div class="st"><b>Hint (optional)</b><code>ck.&lt;account&gt;.ext.changed.&lt;module_id&gt;</code>, where a bus exists</div>
+  <div class="ar">→</div>
+  <div class="st"><b>Re-preflight</b>on the hint, and at every turn start and task start</div>
+  <div class="ar">→</div>
+  <div class="st"><b>Digest differs</b>Prefrontal sends the new manifest + one policy</div>
+  <div class="ar">→</div>
+  <div class="st"><b>Recorded</b><code>manifest_pending</code> in Broca's WAL</div>
+  <div class="ar">→</div>
+  <div class="st hl"><b>Applied</b>as an append, or at a fold (<code>prefix_rebuilt</code>)</div>
+</div>
+
+<h3>14.1 Detection</h3>
+<ul>
+  <li><b>Watch set.</b> The global configuration plus the configurations of roots the provider has a live session route for. <code>supervisor.live_roots</code> seeds it at start; after that the provider tracks its own binds and closes, and drops a root's watches when its last route closes. A missing file is watched through its nearest existing parent. Roots that were only preflighted aren't watched; turn-start re-preflight covers them.</li>
+  <li><b>Preflight routes are not session roots.</b> subc has no rootless route and <code>live_roots</code> doesn't distinguish targets, so Prefrontal opens preflight-only routes against the CK data home, never a project, and providers leave them out of the watch set.</li>
+  <li><b>The hint</b> is <code>{scope, generation, boot_id}</code>, with no content. <code>scope</code> is the entorhinal project id, never a path. The subject is named in the commons naming crate. NATS doesn't tell a subscriber who published, so the module id is trustworthy only because each module's grant lets it publish solely on its own subject. Today's participant grant publishes no workload subject at all, so this needs a commons grant change and a ck-bus release.</li>
+  <li><b>Correctness never depends on the bus.</b> A public install may have none. A missed hint only delays detection.</li>
+</ul>
+<p class="cite">[§11.1]</p>
+
+<h3>14.2 Policies</h3>
+<p>Prefrontal picks the policy per class: masons and readers default to <code>next_prefix_rebuild</code> (short-lived, never worth a bust); heads to <code>next_soft_bust</code>, with the pending change shown on the board and phone. Broca works out what changed from the per-item digests <span class="cite">[§11.2]</span>.</p>
+<div class="tw"><table>
+<tr><th style="width:26%">Policy</th><th>Applied when</th></tr>
+<tr><td><code>immediately</code></td><td>the next step, including a tool step; the prefix is rebuilt</td></tr>
+<tr><td><code>next_soft_bust</code></td><td>the next CompactionMessage labelled <code>soft</code> or <code>hard</code></td></tr>
+<tr><td><code>next_hard_bust</code></td><td>the next CompactionMessage labelled <code>hard</code></td></tr>
+<tr><td><code>next_prefix_rebuild</code></td><td>the next step whose prefix is dead anyway (an expired cache, a model switch)</td></tr>
+</table></div>
+
+<h3>14.3 The append capability and the fold model</h3>
+<p>Each route has one capability the caller sees: can it apply a mid-session tool or instruction change without rebuilding the prefix? Yes or no. The runner reports it once, at admission, derived from the frozen (provider family, model). It never changes mid-session, because a model switch is a fold anyway. How a runner decides it is in the runner's own spec; Broca's per-family table is in its research note <code>append-capability-by-family.md</code> <span class="cite">[§11.2]</span>.</p>
+
+<figure class="sv">
+<svg viewBox="0 0 1000 250" role="img" aria-label="Fold model. On a route whose append capability is yes, changes are appended while the prefix survives, and a full bust rebuilds the prefix from the latest manifest, absorbing the appends. On a route whose capability is no, the change stays pending until the next full bust.">
+  <text class="th" x="10" y="22">Append capability: yes</text>
+  <rect class="bx2" x="10" y="34" width="140" height="44" rx="4"/><text class="t" x="20" y="54">frozen prefix P1</text><text class="ts" x="20" y="70">system + tools</text>
+  <rect class="bx" x="155" y="34" width="110" height="44" rx="4"/><text class="t" x="165" y="60">history</text>
+  <rect class="bx" x="270" y="34" width="100" height="44" rx="4"/><rect class="hl" x="270" y="34" width="100" height="44" rx="4"/><text class="t" x="278" y="54">append</text><text class="ts" x="278" y="70">tool change</text>
+  <rect class="bx" x="375" y="34" width="100" height="44" rx="4"/><text class="t" x="385" y="60">history</text>
+  <rect class="bx" x="480" y="34" width="100" height="44" rx="4"/><rect class="hl" x="480" y="34" width="100" height="44" rx="4"/><text class="t" x="488" y="54">append</text><text class="ts" x="488" y="70">instruction</text>
+  <rect class="bx" x="585" y="34" width="95" height="44" rx="4"/><text class="t" x="595" y="60">history</text>
+  <line class="axis" x1="692" y1="26" x2="692" y2="90"/>
+  <text class="tbp" x="686" y="104" text-anchor="end">full bust</text>
+  <rect class="bx2" x="704" y="34" width="170" height="44" rx="4"/><rect class="hl" x="704" y="34" width="170" height="44" rx="4"/><text class="t" x="714" y="54">rebuilt prefix P2</text><text class="ts" x="714" y="70">from the latest manifest</text>
+  <rect class="bx" x="880" y="34" width="110" height="44" rx="4"/><text class="t" x="890" y="60">history …</text>
+  <text class="ts" x="704" y="104">appends absorbed, no longer sent</text>
+  <text class="th" x="10" y="150">Append capability: no</text>
+  <rect class="bx2" x="10" y="162" width="140" height="44" rx="4"/><text class="t" x="20" y="182">frozen prefix P1</text><text class="ts" x="20" y="198">system + tools</text>
+  <rect class="bx" x="155" y="162" width="525" height="44" rx="4"/><text class="t" x="165" y="188">history (the change stays pending; nothing is appended)</text>
+  <line class="axis" x1="692" y1="154" x2="692" y2="218"/>
+  <text class="tbp" x="686" y="232" text-anchor="end">full bust</text>
+  <rect class="bx2" x="704" y="162" width="170" height="44" rx="4"/><rect class="hl" x="704" y="162" width="170" height="44" rx="4"/><text class="t" x="714" y="182">rebuilt prefix P2</text><text class="ts" x="714" y="198">from the latest manifest</text>
+  <rect class="bx" x="880" y="162" width="110" height="44" rx="4"/><text class="t" x="890" y="188">history …</text>
+  <text class="ts" x="704" y="232">WAL: prefix_rebuilt{manifest_digest, step}</text>
+</svg>
+<figcaption>Figure 8. The fold model. A full bust is a <code>hard</code> compaction, a flush, a model switch, an expired cache, or <code>immediately</code>; it rebuilds the prefix from the latest manifest and applies any pending change on the same bust. On a "no" route, <code>immediately</code> means a rebuild on the next step and every other policy waits for the next full bust. The figure shows one possible sequence of appends; it doesn't imply their timing <span class="cite">[§11.2]</span>.</figcaption>
+</figure>
+<ul>
+  <li><b>Why appends are dropped at a fold.</b> Keeping one would, for example, add a tool that's already in the tool list, which a family may reject. The rebuild changes previously sent prefix bytes, which the runner handles (section 15).</li>
+  <li><b>Placement.</b> Only right after a user turn (tool results count) and before an assistant turn, never between a tool call and its result; the renderer enforces this. Only operator text rides this carrier, never recall or tool output.</li>
+  <li><b>Presets declare tools up front,</b> so most later changes narrow the toolset rather than add to it.</li>
+  <li><b>Recorded.</b> An append is an ordinary transcript entry. A fold writes one WAL entry, <code>prefix_rebuilt{manifest_digest, step}</code>, behind the reader gate, with whatever the runner strips in the same record. Resume uses the latest fold as the frozen prefix and replays the appends after it.</li>
+  <li><b>A change that never finds its moment</b> stays pending. Prefrontal can show it and flush.</li>
+</ul>
+
+<h3>14.4 Flush and disabled tools</h3>
+<p><code>session.flush_prefix</code> drops the frozen prefix and applies any pending manifest on the next step, whatever the policy. It backs the Desktop flow: "toolset changed, applies on next bust", then Apply Now, then a warning that the cache will be rebuilt, then continue. Apply Now is a Prefrontal op that calls <code>session.flush_prefix</code>; Desktop and phone go through Prefrontal and never talk to Broca directly <span class="cite">[§11.3]</span>.</p>
+<div>
+  <div class="mock"><div class="bar"><span class="ill">illustrative</span> Desktop · session header</div>
+    <div class="step">1 · a change is pending</div>
+    <span class="chip warn">Toolset changed, applies on next bust</span><br>
+    <span class="btn">Apply Now</span></div>
+  <div class="mock"><div class="bar"><span class="ill">illustrative</span> Desktop · confirm</div>
+    <div class="step">2 · warning</div>
+    The prompt cache will be rebuilt on the next step.<br>
+    <span class="btn">Cancel</span><span class="btn pri">Continue</span></div>
+</div>
+<p><b>Disabled tools.</b> Until the change is applied, a provider refuses calls to a tool the user has just disabled, with a clear reason. The disable takes effect at once; the policy only decides when the model stops seeing the tool <span class="cite">[§11.4]</span>.</p>
+
+<!-- ============================================================ -->
+<h2 id="runners">15. Runners: Broca and Thalamus</h2>
+<div class="callout"><b>The runner's obligation.</b> The runner makes every rendered request valid for its model family, including reasoning-validity rules when the prefix changes. Those rules live in the runner's own spec, not in this protocol. Compaction and hook providers need not know them <span class="cite">[§12]</span>.</div>
+<p>Two parts are protocol-level:</p>
+<ul>
+  <li><b>Prefix changes are known.</b> A CompactionMessage and a <code>prefix_rebuilt</code> change previously sent prefix bytes. The runner is told which positions changed: a CompactionMessage's range compared with the last one sent, or the fold's step.</li>
+  <li><b>Strips are recorded.</b> Whatever the runner strips in response is written durably in the same WAL record as the event, so resume reproduces it.</li>
+</ul>
+
+<h3>15.1 Broca</h3>
+<p>Broca is the first runner. It owns its transcript, keeps everything in its WAL, and is the subject of most of this page. Its own spec holds the per-family validity rules and live tests, its per-family append table, and the prerequisites for appends, including its renderer split. Until those land every Broca route reports append capability "no" <span class="cite">[§11.2, §15]</span>.</p>
+
+<h3>15.2 Thalamus</h3>
+<p>Thalamus uses the same interface and is the runner for Claude Code sessions. Claude Code owns its transcript and resends the whole array on every request. The design lists only what the protocol sees; the rest is in Thalamus's own spec. This is THALAMUS's first read, dated 2026-09-26 <span class="cite">[§12.1]</span>.</p>
+<figure class="sv">
+<svg viewBox="0 0 1000 150" role="img" aria-label="Same providers, two runners: Broca records in its WAL; Thalamus records by ccm-N message identity and applies records to each Claude Code request.">
+  <rect class="bx2" x="370" y="10" width="260" height="44" rx="6"/>
+  <text class="th" x="384" y="37">Same four provider kinds</text>
+  <rect class="bx" x="60" y="92" width="360" height="50" rx="6"/>
+  <text class="t" x="74" y="112">Broca</text>
+  <text class="ts" x="74" y="130">owns the transcript; everything in its WAL</text>
+  <rect class="bx" x="580" y="92" width="380" height="50" rx="6"/>
+  <text class="t" x="594" y="112">Thalamus (Claude Code sessions)</text>
+  <text class="ts" x="594" y="130">Claude Code owns the transcript; records keyed by ccm-N</text>
+  <line class="ln" x1="450" y1="54" x2="260" y2="90"/>
+  <line class="ln" x1="550" y1="54" x2="760" y2="90"/>
+</svg>
+<figcaption>Figure 9. One provider interface, two runners <span class="cite">[§1, §12]</span>.</figcaption>
+</figure>
+<ul>
+  <li><b>Identity.</b> Records are keyed by <code>ccm-N</code>: ordinals the gateway's message-id store mints, stable across resends and hook cuts. <code>ccd/v1</code> is only the join key to Claude Code's JSONL rows.</li>
+  <li><b>Hooks.</b> By the time a request shows a tool call, the tool has already run, so the gateway can't do PreTool itself. Claude Code's own hooks carry most hooks, and their outputs land in Claude Code's transcript, which serves as the WAL for them. Probed live on Claude Code 2.1.282:</li>
+</ul>
+<div class="tw"><table>
+<tr><th style="width:22%">Interface hook</th><th style="width:22%">Carried by</th><th>Notes</th></tr>
+<tr><td>PreUser</td><td><code>prompt.submit</code></td><td>A text rewrite works, but the transcript keeps only the rewritten text. <code>context</code> blocks work too.</td></tr>
+<tr><td>PreTool</td><td><code>tool.call</code></td><td>An input rewrite works; the transcript keeps the model's input and the tool runs the rewritten one. A deny reaches the model as a <code>&lt;tool_use_error&gt;</code> result.</td></tr>
+<tr><td>PostTool <code>append</code></td><td><code>tool.call</code>, natively</td><td>Stored as its own <code>hook_additional_context</code> record, rendered as a separate <code>&lt;system-reminder&gt;</code> after the result.</td></tr>
+<tr><td>PostTool <code>prepend</code></td><td>the gateway, on each resend</td><td>Native only per tool: works for <code>Bash</code>, lands inside line 1 for <code>Read</code>, untested for MCP tools. So the gateway applies it, keyed by <code>ccm-N</code>.</td></tr>
+<tr><td>PostAssistant</td><td>the gateway, on each resend</td><td>Not expressible natively (<code>turn.complete</code>'s rewrite doesn't reach the stored message).</td></tr>
+<tr><td>Attribution</td><td>the hook itself, or MC's store</td><td>Claude Code keeps neither the original of a PreUser rewrite nor the executed input of a PreTool rewrite, so these are recorded by <code>ccm-N</code>.</td></tr>
+</table></div>
+<ul>
+  <li><code>tool.call</code> hooks run concurrently for parallel calls, so per-session hook state must tolerate concurrent writers.</li>
+  <li><b>Status</b> also carries the new messages since the last step, by <code>ccm-N</code>, so the provider doesn't depend on JSONL, whose lead or lag against the wire is unmeasured.</li>
+  <li><b>The latest CompactionMessage</b> persists in Thalamus's store per key, fenced by the monotonic version. On a timeout Thalamus serves it plus the raw tail. With nothing recorded and the provider unreachable, it returns 503, never raw. If a new one fails validation and the previous one no longer applies (the raw tail changed underneath it), it refuses with 503. "Proceed with the previous one" never means "forward raw".</li>
+  <li><b>Resend rules.</b> A missing <code>from</code> is valid only when a hook cut removed everything before the kept head. A missing <code>to</code> is a 503, never a guess. Side requests (title, token counting, spinner subsets) never call the provider and never get the replacement. <code>session.compact</code> cuts at the latest <code>from</code>, snapped earlier to a clean point.</li>
+  <li><b>WAIT</b> holds the HTTP request. <code>bound_ms</code> is capped at 120 s here, the longest hold calibrated so far. The user sees only the spinner. Claude Code resends after a 503, so a resend whose newest <code>ccm-N</code> matches the waiting step is the same step: the cap covers the step, not each request.</li>
+  <li><b>REFUSE</b> is a 503 today, which Claude Code retries about 12 times over roughly 180 s. What Claude Code shows for a permanent refusal is unmeasured, so user-facing refusal text here waits on that measurement.</li>
+  <li><b>Provider errors across retries</b> are kept per key, so the next step's status carries them.</li>
+  <li><b>Reasoning validity.</b> Thalamus asks the provider to drop failing blocks on every qualifying turn. It strips nothing itself, so there is no strip record, and every resend carries the same control.</li>
+</ul>
+
+<h3>15.3 OpenCode and Pi</h3>
+<p>Adapters to the same interface are possible, keeping the record by message identity as Thalamus does. Not in scope for the first build <span class="cite">[§12.2]</span>.</p>
+<div class="tw"><table>
+<tr><th>Interface</th><th>OpenCode seam</th></tr>
+<tr><td>PreUser</td><td><code>chat.message</code></td></tr>
+<tr><td>PreTool</td><td><code>tool.execute.before</code></td></tr>
+<tr><td>PostTool</td><td><code>tool.execute.after</code></td></tr>
+<tr><td>PostAssistant</td><td>the text-completion hook (OpenCode 1 only)</td></tr>
+<tr><td>CompactionMessage</td><td>applied in <code>messages.transform</code></td></tr>
+</table></div>
+<p class="sub">The design gives no Pi seam table <span class="silent">design is silent</span>.</p>
+
+<!-- ============================================================ -->
+<h2 id="gate">16. The reader gate and other carried-over rules</h2>
+<p>Carried over from r2 unchanged: operator text is static and never interpolated per session; recalled content, tool output and notices are user-role, never operator authority; host-only arguments are rejected in model calls; nothing activates implicitly on the next send <span class="cite">[§13]</span>.</p>
+<div class="cards">
+<div class="card"><h3>Why today's WAL decode can't carry new records</h3>
+<ul>
+  <li><code>WalRecord::Unknown</code> drops the payload;</li>
+  <li>a new value in a closed enum fails serde and makes the whole WAL <code>Corrupt</code>;</li>
+  <li>new fields on known kinds are silently ignored;</li>
+  <li><code>RECORD_SCHEMA_VERSION</code> is inert.</li>
+</ul></div>
+<div class="card"><h3>The mechanism: a new frame <code>ver</code></h3>
+<p>Every deployed build already refuses an unknown <code>ver</code> before digest and decode, with a named error ("unsupported WAL framing version 3"). The digest covers <code>ver</code>. From the gate build on, readers return a distinct <code>NewerWriter{ver}</code> step that no tooling repairs. Older builds report the named <code>Corrupt</code>, which is safe because nothing auto-repairs corruption.</p></div>
+<div class="card"><h3>Coverage and floor</h3>
+<ul>
+  <li>Covers new kinds, new values in known records and new fields on known kinds: CompactionMessage, <code>manifest_pending</code>, <code>prefix_rebuilt</code>, strip records, appends, <code>compaction_wait</code>, notices, hook fields. <code>ModelAttemptFinished</code> stays skippable; <code>TransformUnavailable</code> stays decodable.</li>
+  <li>Refusals are <code>Error</code> + <code>provider_code</code>, never a new enum value.</li>
+  <li>"Ships" means confirmed on the running Broca image, not a merged commit or a lock.</li>
+  <li>Each WAL carries a writer and high-water stamp. Rolling Broca back below the floor it names is blocked, and the rollback card names that floor. This holds for every Broca that might resume a WAL: one per machine today, to be restated before WALs travel with federation.</li>
+</ul></div>
+</div>
+<p class="cite">[§13]</p>
+
+<!-- ============================================================ -->
+<h2 id="stages">17. Build stages</h2>
+<div class="flow" role="img" aria-label="Seven build stages in order: reader gate, preflight and frozen manifest, hooks, compaction provider, mid-session changes, detection and policies, Thalamus.">
+  <div class="st hl"><b>1</b>Reader gate</div><div class="ar">→</div>
+  <div class="st"><b>2</b>Preflight + frozen manifest</div><div class="ar">→</div>
+  <div class="st"><b>3</b>Hooks</div><div class="ar">→</div>
+  <div class="st"><b>4</b>Compaction provider</div><div class="ar">→</div>
+  <div class="st"><b>5</b>Mid-session changes</div><div class="ar">→</div>
+  <div class="st"><b>6</b>Detection, policies, flush</div><div class="ar">→</div>
+  <div class="st"><b>7</b>Thalamus</div>
+</div>
+<div class="tw"><table>
+<tr><th style="width:4%">#</th><th style="width:22%">Stage</th><th>Contents</th><th style="width:28%">Depends on</th></tr>
+<tr><td>1</td><td>Broca: the full reader gate</td><td>Frame <code>ver</code>, <code>NewerWriter{ver}</code>, the per-WAL writer stamp and rollback floor, covering kinds, values and fields. Deployed and confirmed on the running image.</td><td>Nothing. No later stage writes a gated record before this is confirmed.</td></tr>
+<tr><td>2</td><td>Preflight and a frozen manifest</td><td>Tools and system text only: discovery, the cache key and invalidation, project trust through entorhinal, caller identity on runner routes, pinned schema revisions. Closes the tools-on-send path. AFT's and Magic Context's tools run on Broca without compaction.</td><td>The entorhinal write check placed. Plexus: agent grants, the verifier changes (v2, no <code>exp</code>, machine, carrier), and the move to subc-protocol 0.25 / subc-client-rs 0.18 in one coordinated bump, including its in-process test daemon. The Plexus work lands before Prefrontal's mint for <code>reserved:broca</code>.</td></tr>
+<tr><td>3</td><td>Step-transform hooks</td><td>Finals in the existing rendered fields; originals and attribution as new fields; operations with per-tool allowed operations. Tags and reminders move out of the whole-array transform.</td><td class="sub">—</td></tr>
+<tr><td>4</td><td>The compaction provider</td><td>Setup, the per-step call with all four answers, the structural checks, the WAL records including strips, <code>plan_markers</code> changed to the new order. Runner-specific validity rules and live tests are in Broca's spec.</td><td>Exit test: the crash matrix.</td></tr>
+<tr><td>5</td><td>Mid-session changes</td><td><code>manifest_pending</code>, the fold with <code>prefix_rebuilt</code>, the drift guard against the latest fold, crash-cut coverage on both sides of a fold. Appends only where the capability is yes; every Broca route reports no until Broca's own append prerequisites land. Until this stage lands, a changed manifest applies to new sessions only.</td><td>Broca's append prerequisites (in its spec), before any stage uses appends. Exit test: the crash matrix.</td></tr>
+<tr><td>6</td><td>Change detection, policies, flush</td><td>Plus the bus hint where a bus exists.</td><td>The design lists the commons grant change and ck-bus release under §11.1, not here.</td></tr>
+<tr><td>7</td><td>Thalamus</td><td>On the same interface.</td><td class="sub">—</td></tr>
+</table></div>
+<div class="cards">
+<div class="card"><h3>Exit test for stages 4 and 5: the crash matrix</h3>
+<p>Owner: BROCA. Broca's crash-cut harness cuts on both sides of <code>manifest_pending</code>, <code>prefix_rebuilt</code>, each CompactionMessage, and the <code>compaction_wait</code> entry and exit. Each cut asserts no duplicate side effect and a byte-identical prefix on resume.</p></div>
+<div class="card"><h3>Plexus as a tool provider</h3>
+<p>For Plexus's six tools to run on Broca, Plexus needs preflight (a static manifest of the six tools), <code>ck-provider-tool/v1</code> in <code>capabilities.provides</code>, and per-call schema-pin acceptance with <code>tool_revision_mismatch</code>.</p></div>
+<div class="card"><h3>Daemon prerequisites</h3>
+<p>None new. <code>live_roots</code>, <code>spawn_subscribe</code> and <code>machine_id</code> are all on the running daemon. The entorhinal write check is on entorhinal main as 0.1.6 (<code>cc6eedd</code>), pushed but not yet placed.</p></div>
+</div>
+<p class="cite">[§15]</p>
+
+<!-- ============================================================ -->
+<h2 id="open">18. Open questions (§16)</h2>
+<p>Where the design names no owner, this page says so rather than guessing.</p>
+<div class="tw"><table>
+<tr><th style="width:4%">#</th><th style="width:34%">Question</th><th>State</th><th style="width:24%">Owner</th></tr>
+<tr><td>1</td><td><b>Project docs after Prefrontal ships</b></td><td>Ruled for now: Magic Context's m0 carries them. When Prefrontal ships, ALF proposes a frozen user-role block written with the first user turn, which also serves sessions without Magic Context; m0 would then drop its copy.</td><td>Proposal from ALF (Prefrontal). <span class="silent">design is silent</span> on who decides.</td></tr>
+<tr><td>2</td><td>Project trust</td><td><b>Closed</b>, settled in §4.6.</td><td>—</td></tr>
+<tr><td>3</td><td><b>A notice channel to the user, not the model,</b> for Magic Context's toasts and status notices</td><td>Deliberately later, as a separate design.</td><td><span class="silent">design is silent</span></td></tr>
+<tr><td>4</td><td><b>The final list for the shared param vocabulary</b></td><td>Open.</td><td><span class="silent">design is silent</span></td></tr>
+<tr><td>5</td><td><b>The engine-wide caps,</b> published as readable numbers: total WAIT per step, hook budgets, the notice size cap</td><td>Open.</td><td><span class="silent">design is silent</span></td></tr>
+<tr><td>6</td><td><b>Magic Context's state held in memory between passes:</b> persisted, or served by one long-lived instance</td><td>Magic Context's own concern, not part of the protocol.</td><td>Magic Context</td></tr>
+<tr><td>7</td><td><b>Should a worker ever act under its parent head's agent, with a narrowed scope?</b></td><td>Owner policy question. Today Prefrontal gives a worker session no credential.</td><td>Ufuk</td></tr>
+<tr><td>8</td><td><b>Magic Context's <code>[cleared]</code>-thinking handling</b> under the runner's reasoning-validity rules</td><td>Not judged by the panel.</td><td>Owner seat not named; Magic Context owns the behaviour.</td></tr>
+<tr><td>9</td><td><b>Provider-restart reconciliation</b></td><td>Not judged by the panel. The design doesn't describe the problem further.</td><td>Owner seat not named.</td></tr>
+</table></div>
+<p class="cite">[§16]</p>
+
+<!-- ============================================================ -->
+<h2 id="dropped">19. Dropped from r2</h2>
+<ul>
+  <li>Named presets without parameters (R1).</li>
+  <li>Delivering the session class to modules, and keeping the composition table inside the engine.</li>
+  <li>The engine-side admission algorithm, the removal chain, variant selection, and R7 as an engine rule.</li>
+  <li>The whole-array transform on every step, and the in-memory last-known-good store.</li>
+  <li>ReductionProvider, RecallProvider and <code>turn_origin</code>.</li>
+  <li>The <code>recalled_context</code> field on <code>RunStarted</code>. Recall is now a PreUser output written with the user turn.</li>
+  <li>"Wants attention" on notices. That's Prefrontal's concern.</li>
+</ul>
+<p class="cite">[§14]</p>
+
+<!-- ============================================================ -->
+<h2 id="where">20. Where this is specified</h2>
+<p>All in <code>.cortexkit/alfonso/plans/ck-extensibility-design-r4.md</code> (draft r4.1). r4.1 replaces r3.2 and r2, both kept for history. Its section numbers §1–§15 match r3.2's; §4.6 and §4.7 are new.</p>
+<ul>
+  <li>Constraints, principles, provider kinds: §1–§3</li>
+  <li>Params, preflight, system text authority, persona check, session manifest: §4.1–§4.5</li>
+  <li>Project trust: §4.6 · Caller identity: §4.7</li>
+  <li>Compaction setup, per-step call, CompactionMessage, WAIT, REFUSE: §5.1–§5.5</li>
+  <li>Step-transform hooks: §6.1–§6.3</li>
+  <li>Cache breakpoints: §7 · Resume: §8 · Tool calls: §9 · <code>provider_notice</code>: §10</li>
+  <li>Changes while running: §11.1–§11.4</li>
+  <li>Runners (obligation, Thalamus, OpenCode and Pi): §12, §12.1, §12.2</li>
+  <li>Carried over from r2, including the reader gate: §13 · Dropped from r2: §14</li>
+  <li>Build stages: §15 · Open: §16</li>
+</ul>
+
+</main>
+</div>
+</body>
+</html>

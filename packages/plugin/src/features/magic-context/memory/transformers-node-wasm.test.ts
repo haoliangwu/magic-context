@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 
 const pluginRoot = resolve(import.meta.dir, "../../../..");
 
 function run(cmd: string[]): { exitCode: number; stderr: string; stdout: string } {
     const result = Bun.spawnSync({
+        windowsHide: true,
         cmd,
         cwd: pluginRoot,
         stdout: "pipe",
@@ -21,7 +23,7 @@ function run(cmd: string[]): { exitCode: number; stderr: string; stdout: string 
 
 describe("Node WASM Transformers fixture", () => {
     test("builds with real fs and persists a model for offline reuse", () => {
-        const outputDir = mkdtempSync(join(tmpdir(), "mc-node-wasm-build-"));
+        const outputDir = createTestTempDirFromPath(join(tmpdir(), "mc-node-wasm-build-"));
         try {
             const build = run(["bun", "scripts/build-transformers-node-wasm.ts", outputDir]);
             expect(build.exitCode, build.stderr).toBe(0);

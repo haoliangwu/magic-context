@@ -1,8 +1,9 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import * as logger from "../shared/logger";
 import { parsePluginConfig, resetProtectedTagsDeprecationWarningForTest } from "./index";
 import { constrainProjectThresholdOverrides } from "./project-security";
 import { deriveDefaultProtectedTokens, MagicContextConfigSchema } from "./schema/magic-context";
@@ -248,9 +249,13 @@ describe("protected_tokens config and derivation", () => {
 
         it("emits a once-per-process loud deprecation warning naming the replacement", () => {
             resetProtectedTagsDeprecationWarningForTest();
-            const warnCalls: string[] = [];
-            const originalWarn = console.warn;
-            console.warn = (...args: unknown[]) => warnCalls.push(args.map(String).join(" "));
+            // The once-per-process line goes to the plugin log; the host passes
+            // console output straight to the operator's terminal.
+            const logged = spyOn(logger, "log");
+            const warnCalls = () =>
+                logged.mock.calls
+                    .map(([message]) => message)
+                    .filter((message) => message.includes("protected_tags is deprecated"));
 
             try {
                 const res1 = parsePluginConfig({ protected_tags: 20 });
@@ -261,14 +266,14 @@ describe("protected_tokens config and derivation", () => {
                         ),
                     ),
                 ).toBe(true);
-                expect(warnCalls).toHaveLength(1);
-                expect(warnCalls[0]).toContain("protected_tokens");
+                expect(warnCalls()).toHaveLength(1);
+                expect(warnCalls()[0]).toContain("protected_tokens");
 
-                // Second parse in same process must NOT log to console again
+                // Second parse in same process must NOT log again
                 parsePluginConfig({ protected_tags: 10 });
-                expect(warnCalls).toHaveLength(1);
+                expect(warnCalls()).toHaveLength(1);
             } finally {
-                console.warn = originalWarn;
+                logged.mockRestore();
             }
         });
     });

@@ -122,6 +122,8 @@ describe("task-scheduler — manual lease wait", () => {
 describe("task-scheduler — planDueTasks", () => {
     it("first-seed does NOT fire immediately (next_due in the future)", () => {
         db = freshDb();
+        // An active memory gives verify its input; without one it gets no row.
+        seedActiveMemory(db);
         const now = Date.UTC(2026, 0, 1, 12, 0); // midday
         const due = planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
         expect(due).toHaveLength(0);
@@ -133,6 +135,7 @@ describe("task-scheduler — planDueTasks", () => {
 
     it("seeds last_run_at from legacy last_dream_at (no full historical pass)", () => {
         db = freshDb();
+        seedActiveMemory(db);
         setDreamState(db, `last_dream_at:${PROJECT}`, "555000");
         planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], Date.now());
         expect(getTaskScheduleState(db, PROJECT, "verify")?.lastRunAt).toBe(555000);
@@ -140,6 +143,9 @@ describe("task-scheduler — planDueTasks", () => {
 
     it("prunes retired task rows not in the canonical config set", () => {
         db = freshDb();
+        // An active memory gives verify and curate their input, and keeps the
+        // project from being pruned as idle while retired rows are checked.
+        seedActiveMemory(db);
         // Simulate stale rows from old scheduler configurations so pruning can
         // remove task names that are no longer canonical.
         for (const task of ["improve", "consolidate", "archive-stale", "render-mural"] as const) {
@@ -171,9 +177,41 @@ describe("task-scheduler — planDueTasks", () => {
         expect(getTaskScheduleState(db, PROJECT, "curate")).not.toBeNull();
     });
 
+    it("prunes against the canonical set, not the caller's filtered list", () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const nextDueAt = Date.now() + 60_000;
+        // A canonical task omitted by a host capability filter must retain its
+        // durable schedule coordinates and incremental watermarks.
+        writeTaskScheduleState(db, {
+            projectPath: PROJECT,
+            task: "map-memories",
+            lastRunAt: 1234,
+            nextDueAt,
+            schedule: "0 3 * * *",
+            lastStatus: "completed",
+            lastError: null,
+            retryCount: 0,
+            lastCheckedCommit: "abc",
+            retrospectiveWatermarkMs: 99,
+        });
+        planDueTasks(
+            db,
+            PROJECT,
+            [cfg("verify", "0 3 * * *"), cfg("curate", "0 4 * * 0")],
+            Date.now(),
+        );
+        const preserved = getTaskScheduleState(db, PROJECT, "map-memories");
+        expect(preserved?.lastRunAt).toBe(1234);
+        expect(preserved?.nextDueAt).toBe(nextDueAt);
+        expect(preserved?.retrospectiveWatermarkMs).toBe(99);
+    });
+
     it("deleteTaskScheduleRowsForProject removes ALL rows for an orphaned project only", () => {
         db = freshDb();
         const orphan = "dir:deadworktree";
+        seedActiveMemory(db, orphan);
+        seedActiveMemory(db);
         planDueTasks(
             db,
             orphan,
@@ -191,11 +229,11 @@ describe("task-scheduler — planDueTasks", () => {
         expect(getTaskScheduleState(db, PROJECT, "verify")).not.toBeNull();
     });
 
-    it("disabled schedule ('') seeds a NULL-due row that is never due", () => {
+    it("disabled schedule does not register a shared row", () => {
         db = freshDb();
         const due = planDueTasks(db, PROJECT, [cfg("maintain-docs", "")], Date.now());
         expect(due).toHaveLength(0);
-        expect(getTaskScheduleState(db, PROJECT, "maintain-docs")?.nextDueAt).toBeNull();
+        expect(getTaskScheduleState(db, PROJECT, "maintain-docs")).toBeNull();
     });
 
     it("a past next_due_at is collected as due", () => {
@@ -218,27 +256,32 @@ describe("task-scheduler — planDueTasks", () => {
     });
 
     // ── Config-authoritative reconciliation (Oracle P0 #1) ──────────────
-    it("disabling a task AFTER it was seeded forces next_due_at NULL (no stale fire)", () => {
+    it("disabling a task leaves its shared slot untouched and never runs it", () => {
         db = freshDb();
         const now = Date.now();
         // Seed enabled, force it due.
         planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
         forceDue(db, "verify", now);
         // Now the config disables it. The stale past-due slot must NOT fire.
+        const before = getTaskScheduleState(db, PROJECT, "verify");
         const due = planDueTasks(db, PROJECT, [cfg("verify", "")], now);
         expect(due).toHaveLength(0);
-        expect(getTaskScheduleState(db, PROJECT, "verify")?.nextDueAt).toBeNull();
+        expect(getTaskScheduleState(db, PROJECT, "verify")).toEqual(before);
+        expect(planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now)).toHaveLength(1);
     });
 
-    it("enabling a task that was seeded NULL (disabled) makes it due-eligible", () => {
+    it("enabling a previously disabled task seeds a future slot", () => {
         db = freshDb();
+        // An active memory gives verify its input, so only the schedule decides
+        // whether its row is seeded.
+        seedActiveMemory(db);
         const now = Date.UTC(2026, 0, 1, 12, 0);
-        // Seed disabled → next_due NULL.
-        planDueTasks(db, PROJECT, [cfg("maintain-docs", "")], now);
-        expect(getTaskScheduleState(db, PROJECT, "maintain-docs")?.nextDueAt).toBeNull();
+        // Disabled registration leaves no shared row.
+        planDueTasks(db, PROJECT, [cfg("verify", "")], now);
+        expect(getTaskScheduleState(db, PROJECT, "verify")).toBeNull();
         // Now enable it: a fresh next_due is computed (future, not immediate).
-        planDueTasks(db, PROJECT, [cfg("maintain-docs", "0 3 * * *")], now);
-        const state = getTaskScheduleState(db, PROJECT, "maintain-docs");
+        planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
+        const state = getTaskScheduleState(db, PROJECT, "verify");
         expect(state?.nextDueAt).not.toBeNull();
         expect(state?.nextDueAt).toBeGreaterThan(now);
         expect(state?.schedule).toBe("0 3 * * *");
@@ -246,6 +289,7 @@ describe("task-scheduler — planDueTasks", () => {
 
     it("changing the cron recomputes next_due_at from the new schedule", () => {
         db = freshDb();
+        seedActiveMemory(db);
         const now = Date.UTC(2026, 0, 1, 12, 0);
         planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now);
         const before = getTaskScheduleState(db, PROJECT, "verify")?.nextDueAt;
@@ -257,8 +301,21 @@ describe("task-scheduler — planDueTasks", () => {
         expect(after?.nextDueAt).toBeLessThan(before ?? Number.POSITIVE_INFINITY);
     });
 
+    it("schedule edits keep an armed earlier slot without replaying old successful runs", () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.UTC(2026, 0, 1, 12, 0);
+        planDueTasks(db, PROJECT, [cfg("verify", "0 * * * *")], now);
+        const before = getTaskScheduleState(db, PROJECT, "verify");
+        if (!before) throw new Error("missing schedule row");
+        writeTaskScheduleState(db, { ...before, lastRunAt: now - 24 * 60 * 60_000 });
+        expect(planDueTasks(db, PROJECT, [cfg("verify", "0 3 * * *")], now)).toHaveLength(0);
+        expect(getTaskScheduleState(db, PROJECT, "verify")?.nextDueAt).toBe(before.nextDueAt);
+    });
+
     it("legacy row (schedule IS NULL) with a live next_due is backfilled, not recomputed", () => {
         db = freshDb();
+        seedActiveMemory(db);
         const now = Date.now();
         const due = now - 1000;
         // Simulate a pre-column row: live next_due in the past, schedule NULL.
@@ -374,6 +431,31 @@ describe("task-scheduler — runDueTasksForProject", () => {
         const state = getTaskScheduleState(db, PROJECT, "verify");
         expect(state?.lastStatus).toBe("skipped");
         expect(state?.nextDueAt).toBeGreaterThan(now);
+    });
+
+    it("failed runs persist retrospective recovery state without moving last_run_at", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.now();
+        const tasks = [cfg("curate", "0 3 * * *")];
+        planDueTasks(db, PROJECT, tasks, now);
+        forceDue(db, "curate", now);
+
+        const executor = async (): Promise<TaskExecOutcome> => ({
+            status: "failed",
+            transient: true,
+            error: "prompt is too long",
+            schedulePatch: {
+                retrospectiveWatermarkMs: 1700000000000,
+                taskStateJson: JSON.stringify({ retrospectiveOverflow: { failures: 2 } }),
+            },
+        });
+        await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
+
+        const state = getTaskScheduleState(db, PROJECT, "curate");
+        expect(state?.lastRunAt).toBeNull();
+        expect(state?.retrospectiveWatermarkMs).toBe(1700000000000);
+        expect(state?.taskStateJson).toContain("retrospectiveOverflow");
     });
 
     it("completed runs persist the retrospective content watermark patch", async () => {
@@ -567,6 +649,32 @@ describe("task-scheduler — runDueTasksForProject", () => {
         expect(s?.retryCount).toBe(0);
         expect(s?.nextDueAt).toBeGreaterThan(now);
         expect(s?.lastStatus).toBe("failed");
+    });
+
+    it("alternating schedules preserve the retry cap and cannot re-arm past slots", async () => {
+        db = freshDb();
+        seedActiveMemory(db);
+        const now = Date.UTC(2026, 0, 1, 12, 0);
+        const schedules = ["0 * * * *", "30 * * * *"];
+        planDueTasks(db, PROJECT, [cfg("verify", schedules[0])], now);
+        forceDue(db, "verify", now);
+        const armed = getTaskScheduleState(db, PROJECT, "verify");
+        if (!armed) throw new Error("missing armed row");
+        writeTaskScheduleState(db, { ...armed, lastRunAt: now - 24 * 60 * 60_000 });
+        const executor = async (): Promise<TaskExecOutcome> => ({
+            status: "failed",
+            transient: true,
+            error: "rate limit",
+        });
+        for (let attempt = 1; attempt <= 4; attempt++) {
+            const tasks = [cfg("verify", schedules[attempt % 2])];
+            await runDueTasksForProject({ db, projectIdentity: PROJECT, tasks, executor, now });
+            expect(getTaskScheduleState(db, PROJECT, "verify")?.retryCount).toBe(attempt % 4);
+        }
+        expect(getTaskScheduleState(db, PROJECT, "verify")?.nextDueAt).toBeGreaterThan(now);
+        for (const schedule of [...schedules, ...schedules]) {
+            expect(planDueTasks(db, PROJECT, [cfg("verify", schedule)], now)).toHaveLength(0);
+        }
     });
 
     it("permanent failure advances to the next cron slot (no hot-retry)", async () => {

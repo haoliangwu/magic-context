@@ -125,6 +125,45 @@ describe("detectOpenCode", () => {
         ]);
     });
 
+    it("finds the OpenCode CLI bundled in OpenChamber after PATH and before the Desktop app", () => {
+        const pathBin = "/somewhere/opencode";
+        const bundled = "/Applications/OpenChamber.app/Contents/Resources/opencode-cli/opencode";
+        const userBundled = join(
+            HOME,
+            "Applications",
+            "OpenChamber.app",
+            "Contents",
+            "Resources",
+            "opencode-cli",
+            "opencode",
+        );
+        const desktopApp = "/Applications/OpenCode.app";
+        expect(
+            detectOpenCodeInstallations(
+                deps(new Set([pathBin, bundled, userBundled, desktopApp]), "darwin", () => pathBin),
+            ),
+        ).toEqual([
+            { path: pathBin, source: "PATH", kind: "cli" },
+            { path: bundled, source: "openchamber", kind: "cli" },
+            { path: userBundled, source: "openchamber", kind: "cli" },
+            { path: desktopApp, source: "app", kind: "desktop" },
+        ]);
+    });
+
+    it("selects the OpenChamber CLI when it is the only runnable OpenCode", () => {
+        const bundled = "/Applications/OpenChamber.app/Contents/Resources/opencode-cli/opencode";
+        expect(detectOpenCode(deps(new Set([bundled]), "darwin"))).toEqual({
+            kind: "cli",
+            binary: bundled,
+        });
+        // A bundle without an executable binary is not a runnable install.
+        expect(detectOpenCode(deps(new Set([bundled]), "darwin", () => null, new Set())).kind).toBe(
+            "none",
+        );
+        // The bundle path is macOS-only.
+        expect(detectOpenCode(deps(new Set([bundled]), "linux")).kind).toBe("none");
+    });
+
     it("prefers cli over desktop when both are present", () => {
         const bin = join(HOME, ".opencode", "bin", "opencode");
         const marker = openCodeDesktopSettingsMarkers(deps(new Set()))[0];

@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "input": "User strongly pushes back on untested changes.",
+      "expected": "Strongly pushes back on untested changes."
+    },
+    {
+      "input": "Users prefer clear explanations.",
+      "expected": "Users prefer clear explanations."
+    },
+    {
+      "input": "This User prefers clear explanations.",
+      "expected": "This User prefers clear explanations."
+    },
+    {
+      "input": "User überlegt gründlich.",
+      "expected": "Überlegt gründlich."
+    },
+    {
+      "input": "User ",
+      "expected": ""
+    }
+  ]
+}

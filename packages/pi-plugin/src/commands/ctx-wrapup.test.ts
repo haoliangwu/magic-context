@@ -1,6 +1,14 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it, mock, spyOn } from "bun:test";
+import {
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	mock,
+	spyOn,
+} from "bun:test";
 import { join } from "node:path";
 import {
 	acquireCompartmentLease,
@@ -27,6 +35,11 @@ import {
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import { recordChildInvocation } from "@magic-context/core/features/magic-context/subagent-token-capture";
+import {
+	clearProducerModelObservations,
+	observeProducerModelsForTest,
+} from "@magic-context/core/hooks/magic-context/producer-window-test-support";
+import { hasRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import * as logger from "@magic-context/core/shared/logger";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
@@ -347,6 +360,32 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 
+	it("shutdown interrupts the lease wait and releases the wrapup marker", async () => {
+		const db = createDb();
+		const sessionId = "pi-wrapup-shutdown-wait";
+		const controller = new AbortController();
+		try {
+			expect(acquireCompartmentLease(db, sessionId, "foreign")).not.toBeNull();
+			const run = runPiWrapup(
+				pi().api,
+				deps(db, {
+					shutdownSignal: controller.signal,
+					wrapupLeaseWaitTimeoutMs: 60_000,
+				}),
+				ctx(sessionId, 8),
+				sessionId,
+				2,
+			);
+			await Promise.resolve();
+			controller.abort();
+			const result = await run;
+			expect(result).toContain("## Magic Wrapup — Partial");
+			expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
 	it("contains SQLITE_BUSY while releasing a wrapup compartment lease", async () => {
 		const { dir, cleanup } = createTestTempDir(
 			"mc-test-temp-dir-helper-",
@@ -447,10 +486,13 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 
-	it("persists tokens when wrapup uses the real Pi historian", async () => {
+	it.each([
+		[8, 100_000],
+		[24, 100],
+	])("persists tokens and covers the full target with the real Pi historian (%i messages, %i tokens)", async (messageCount, historianChunkTokens) => {
 		const db = createDb();
 		try {
-			const sessionId = "pi-wrapup-persisted-tokens";
+			const sessionId = `pi-wrapup-persisted-tokens-${messageCount}`;
 			const runner = {
 				harness: "pi",
 				run: mock(async (options: SubagentRunOptions) => {
@@ -472,9 +514,16 @@ describe("Pi /ctx-wrapup", () => {
 					const range = ranges.at(-1);
 					if (!range)
 						throw new Error("historian prompt did not include a message range");
+					const start = Number(range[1]);
+					const end = Number(range[2]);
+					// Non-final chunks need lookahead so the runner can discard only the last compartment.
+					const head =
+						start < end
+							? `<compartment start="${start}" end="${end - 1}" title="Pi wrapup"><p1>Summarized the eligible Pi history.</p1></compartment>`
+							: "";
 					return {
 						ok: true as const,
-						assistantText: `<compartment start="${range[1]}" end="${range[2]}" title="Pi wrapup"><p1>Summarized the eligible Pi history.</p1></compartment>`,
+						assistantText: `${head}<compartment start="${end}" end="${end}" title="Pi wrapup lookahead"><p1>Summarized the last message.</p1></compartment>`,
 						durationMs: 1,
 					};
 				}),
@@ -485,17 +534,42 @@ describe("Pi /ctx-wrapup", () => {
 				deps(db, {
 					runner,
 					runPiHistorianForWrapup: undefined,
-					historianChunkTokens: 100_000,
+					historianChunkTokens,
 				}),
-				ctx(sessionId, 8),
+				ctx(
+					sessionId,
+					branch(messageCount).map((entry, index) => ({
+						...entry,
+						message: {
+							role: index % 2 === 0 ? "user" : "assistant",
+							content: [{ type: "text", text: entry.message.content }],
+						},
+					})),
+				),
 				sessionId,
 				2,
 			);
 
 			expect(result).toContain("## Magic Wrapup");
 			expect(result).not.toContain("## Magic Wrapup — Partial");
+			expect(getLastCompartmentEndMessage(db, sessionId)).toBe(
+				messageCount - 2,
+			);
+			expect(getPendingPiCompactionMarkerState(db, sessionId)?.ordinal).toBe(
+				messageCount - 2,
+			);
+			expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+			expect(hasRawMessageProvider(sessionId)).toBe(false);
+			const compartments = getCompartments(db, sessionId);
+			expect(compartments[0].startMessage).toBe(1);
+			for (let i = 1; i < compartments.length; i++) {
+				expect(compartments[i].startMessage).toBe(
+					compartments[i - 1].endMessage + 1,
+				);
+			}
 			const rows = getSubagentInvocations(db, sessionId);
-			expect(rows).toHaveLength(1);
+			if (messageCount === 8) expect(rows).toHaveLength(1);
+			else expect(rows.length).toBeGreaterThan(1);
 			expect(rows[0]).toMatchObject({
 				harness: "pi",
 				subagent: "historian",
@@ -647,3 +721,8 @@ describe("Pi /ctx-wrapup", () => {
 		}
 	});
 });
+
+beforeEach(async () => {
+	await observeProducerModelsForTest(["test/model"]);
+});
+afterEach(clearProducerModelObservations);

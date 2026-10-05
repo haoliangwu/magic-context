@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { checkPackedTuiGraph } from "./tui-pack-graph";
 
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const packageName = "@cortexkit/opencode-magic-context";
@@ -82,6 +83,10 @@ try {
     const packStdout = run("npm", ["pack", "--json", "--pack-destination", tempRoot], pluginRoot);
     const tarball = join(tempRoot, parsePackedFilename(packStdout));
     check("npm pack produced a tarball", existsSync(tarball), tarball);
+
+    const packed = JSON.parse(packStdout.trim()) as Array<{ files: Array<{ path: string }> }>;
+    const graphSize = checkPackedTuiGraph(pluginRoot, new Set(packed[0]?.files.map(({ path }) => path)));
+    check(`all ${graphSize} TUI-reachable runtime files ship in the tarball`, true);
 
     await mkdir(installRoot, { recursive: true });
     await writeFile(

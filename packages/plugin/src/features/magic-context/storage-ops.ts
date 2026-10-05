@@ -6,6 +6,7 @@ import type { PendingOp } from "./types";
 const queuePendingOpStatements = new WeakMap<Database, PreparedStatement>();
 const getPendingOpsStatements = new WeakMap<Database, PreparedStatement>();
 const getPendingOpsCountStatements = new WeakMap<Database, PreparedStatement>();
+const hasPendingDropOpsStatements = new WeakMap<Database, PreparedStatement>();
 const clearPendingOpsStatements = new WeakMap<Database, PreparedStatement>();
 const removePendingOpStatements = new WeakMap<Database, PreparedStatement>();
 
@@ -98,6 +99,25 @@ export function getPendingOps(db: Database, sessionId: string): PendingOp[] {
     const rows = getPendingOpsStatement(db).all(sessionId).filter(isPendingOpRow);
 
     return rows.map(toPendingOp).filter((op): op is PendingOp => op !== null);
+}
+
+/** Test the same valid drop rows as getPendingOps without materializing the queue. */
+export function hasPendingDropOps(db: Database, sessionId: string): boolean {
+    let statement = hasPendingDropOpsStatements.get(db);
+    if (!statement) {
+        // Keep malformed/unsupported rows out of the permission-probe signal,
+        // just as the row validator in getPendingOps does. Number fields can
+        // be either SQLite integers or reals, but never text or NULL.
+        statement = db.prepare(`SELECT EXISTS (
+            SELECT 1 FROM pending_ops WHERE session_id = ? AND operation = 'drop'
+                AND typeof(id) IN ('integer', 'real')
+                AND typeof(session_id) = 'text'
+                AND typeof(tag_id) IN ('integer', 'real')
+                AND typeof(queued_at) IN ('integer', 'real')
+        ) AS present`);
+        hasPendingDropOpsStatements.set(db, statement);
+    }
+    return (statement.get(sessionId) as { present: number }).present === 1;
 }
 
 /** Read durable queue depth without loading rows on a deferred pass. */

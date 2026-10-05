@@ -1,27 +1,19 @@
+import { withContentLanguageDirective } from "../../agents/language-directive";
 import { embedAndStoreCompartmentChunks } from "../../features/magic-context/compartment-embedding";
 import { insertCompartmentEvents } from "../../features/magic-context/compartment-events";
+import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
-// Re-export the historian-state-file helpers so existing callers
-// (compartment-runner-recomp.ts, compartment-runner.ts, tests) keep working
-// unchanged. The implementation moved to ./historian-state-file.ts so Pi
-// can import it without pulling in the full incremental runner.
-import { cleanupHistorianStateFile } from "./historian-state-file";
-
-export {
-    cleanupHistorianStateFile,
-    HISTORIAN_STATE_INLINE_THRESHOLD,
-    maybeWriteHistorianStateFile,
-} from "./historian-state-file";
-
-import { isCompartmentLeaseHeld } from "../../features/magic-context/compartment-lease";
 import {
     embedPromotedFacts,
     promoteSessionFactsDurable,
 } from "../../features/magic-context/memory";
-import { resolveProjectIdentity } from "../../features/magic-context/memory/project-identity";
+import {
+    resolveProjectIdentity,
+    shouldSkipHomeProjectMemory,
+} from "../../features/magic-context/memory/project-identity";
 import {
     getMemoriesByProject,
     ModuleMemoryAuthorityError,
@@ -32,9 +24,11 @@ import {
     clearHistorianDrainFailure,
     clearHistorianFailureState,
     describeProtectedTailDrainBudgetSkip,
+    getHistorianFailureState,
     getOverflowState,
     incrementHistorianFailure,
     isWrapupInProgress,
+    loadProtectedTailMeta,
     recordHistorianDrainFailure,
     recordProtectedTailPublicationFloor,
     reserveProtectedTailDrainTokens,
@@ -50,6 +44,10 @@ import {
 import { updateSessionMeta } from "../../features/magic-context/storage-meta";
 import { insertPrimerCandidates } from "../../features/magic-context/storage-primers";
 import { getLatestHistorianInvocationId } from "../../features/magic-context/storage-subagent-invocations";
+import {
+    readCoordinateRebaseNotice,
+    recoverUnresolvedCompartments,
+} from "../../features/magic-context/store-generation-rebase";
 import { insertUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import { normalizeSDKResponse } from "../../shared";
 import { describeError } from "../../shared/error-message";
@@ -59,24 +57,40 @@ import {
     openCodeDbPathExists,
     resolveOpenCodeDbPath,
 } from "../../shared/opencode-db-path";
+import { toModelEntry } from "../../shared/resolve-fallbacks";
+import { beginSqliteWriterAsync } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
-import { buildCompartmentAgentPrompt } from "./compartment-prompt";
+import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
 import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
 import type { HiddenCompartmentRunnerDeps } from "./compartment-runner-types";
 import {
     buildHistorianFailureNotice,
+    buildHistorianWindowTooSmallNotice,
+    buildStoredCompartmentsInvalidNotice,
     HISTORIAN_BOUNDARY_HEALING_SLACK,
     shouldDiscardLastHistorianCompartment,
     validateChunkCoverage,
     validateStoredCompartments,
 } from "./compartment-runner-validation";
-import { clearInjectionCache, renderMemoryBlock } from "./inject-compartments";
+import { producerSourceLocalBudget } from "./derive-budgets";
+import {
+    describeHistorianPromptTrim,
+    fitHistorianPrompt,
+    resolveHistorianProducerWindow,
+} from "./historian-prompt-fit";
+import {
+    finishHistorianPublishStage,
+    startHistorianPublishStage,
+} from "./historian-publish-stage-logger";
+import { snapTerminalCompartmentToServedRow } from "./host-served-rows";
+import { clearInjectionCache } from "./inject-compartments";
 import { onNoteTrigger } from "./note-nudger";
 import { persistFilteredNoise } from "./persist-filtered-noise";
 import {
     fitAtomicHistorianSourceToProducerWindow,
+    producerInputTokenLimit,
     producerWindowFailureReason,
 } from "./producer-window-guard";
 import {
@@ -91,17 +105,78 @@ import {
 import {
     getRawSessionTagKeysThrough,
     hasRawMessageProvider,
+    hasRawSessionMessageById,
     readRawSessionMessageOrdinalById,
+    readRawSessionMessageRange,
     readSessionChunk,
 } from "./read-session-chunk";
 import { getMessageTimesFromOpenCodeDb } from "./read-session-db";
 import { estimateTokens } from "./read-session-formatting";
-import { buildReferenceBlocks } from "./reference-retrieval";
+import { isStrictGapHealingMessage } from "./read-session-raw";
 import { sendStatusNotification } from "./send-session-notification";
+
+const inconsistentProducerWindows = new Set<string>();
+function logInconsistentProducerWindowOnce(
+    sessionId: string,
+    model: string,
+    window: number,
+    reserve: number,
+): void {
+    if (inconsistentProducerWindows.has(model)) return;
+    inconsistentProducerWindows.add(model);
+    sessionLog(
+        sessionId,
+        `producer window inconsistent for ${model}: window=${window} reserve=${reserve}; sending unguarded`,
+    );
+}
 
 /** Suppress repeated historian failure notifications — at most once per 60 seconds per session */
 const HISTORIAN_ALERT_COOLDOWN_MS = 60 * 1000;
+
+export function v2NonNarrativeStoredGapRanges(
+    db: HiddenCompartmentRunnerDeps["db"],
+    sessionId: string,
+    compartments: ReadonlyArray<{ startMessage: number; endMessage: number }>,
+): Array<{ start: number; end: number }> {
+    if (readCoordinateRebaseNotice(db, sessionId)?.generation !== "v2") return [];
+    const safeRanges: Array<{ start: number; end: number }> = [];
+    for (let index = 1; index < compartments.length; index += 1) {
+        const previous = compartments[index - 1];
+        const current = compartments[index];
+        if (!previous || !current) continue;
+        const start = previous.endMessage + 1;
+        const end = current.startMessage - 1;
+        if (end < start) continue;
+        const messages = readRawSessionMessageRange(sessionId, start, end);
+        const ordinals = new Set(messages.map((message) => message.ordinal));
+        const complete =
+            ordinals.size === end - start + 1 &&
+            messages.every((message) => isStrictGapHealingMessage(message));
+        if (complete) safeRanges.push({ start, end });
+    }
+    return safeRanges;
+}
 const lastHistorianAlertBySession = new Map<string, number>();
+
+/**
+ * How long the historian waits before re-checking stored compartments that
+ * failed validation with the same error. Those rows only change through a
+ * rebuild or a repair, so retrying on every trigger could never succeed.
+ */
+export const STORED_COMPARTMENT_FAILURE_BACKOFF_MS = 30 * 60 * 1000;
+
+function storedCompartmentFailureBackingOff(
+    db: HiddenCompartmentRunnerDeps["db"],
+    sessionId: string,
+    validationError: string,
+    now: number = Date.now(),
+): boolean {
+    if (getHistorianFailureState(db, sessionId).lastError !== validationError) return false;
+    const failedAt = loadProtectedTailMeta(db, sessionId).historianDrainFailureAt;
+    return (
+        failedAt > 0 && failedAt <= now && now - failedAt < STORED_COMPARTMENT_FAILURE_BACKOFF_MS
+    );
+}
 
 function shouldSuppressHistorianAlert(sessionId: string): boolean {
     const lastAlert = lastHistorianAlertBySession.get(sessionId);
@@ -127,20 +202,17 @@ export function findDanglingPublicationBoundary(
         startMessageId: string;
         endMessageId: string;
     }>,
-    resolveOrdinal: (
-        sessionId: string,
-        messageId: string,
-    ) => number | null = readRawSessionMessageOrdinalById,
+    messageExists: (sessionId: string, messageId: string) => boolean = hasRawSessionMessageById,
 ): DanglingPublicationBoundary | null {
     for (const compartment of compartments) {
-        if (resolveOrdinal(sessionId, compartment.startMessageId) === null) {
+        if (!messageExists(sessionId, compartment.startMessageId)) {
             return {
                 sequence: compartment.sequence,
                 side: "start",
                 messageId: compartment.startMessageId,
             };
         }
-        if (resolveOrdinal(sessionId, compartment.endMessageId) === null) {
+        if (!messageExists(sessionId, compartment.endMessageId)) {
             return {
                 sequence: compartment.sequence,
                 side: "end",
@@ -157,19 +229,29 @@ export function clearHistorianAlertState(sessionId: string): void {
 }
 
 export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Promise<void> {
+    if (shouldSkipHomeProjectMemory(deps.directory ?? process.cwd())) return;
     const {
         client,
         db,
         sessionId,
-        historianChunkTokens,
+        historianChunkTokens: providerHistorianChunkTokens,
         directory,
         historianTimeoutMs,
         getNotificationParams,
     } = deps;
+    const producerKey =
+        (typeof deps.model === "string" ? deps.model : deps.model?.model) ?? deps.fallbackModelId;
+    const historianChunkTokens = producerSourceLocalBudget(
+        providerHistorianChunkTokens,
+        producerKey,
+    );
     let completedSuccessfully = false;
+    // Set at COMMIT of the publish transaction. From then on the new compartments are
+    // durable and already signaled, so a later throw is a failed side step, not a
+    // failed historian run.
+    let publishCommitted = false;
     let retainDrainReservationForRetryThrottle = false;
     let issueNotified = false;
-    let stateFilePath: string | undefined;
     let drainReservation: ReturnType<typeof reserveProtectedTailDrainTokens>["reservation"] = null;
 
     // historian_runs telemetry (migration v24). Captured across the run and
@@ -265,11 +347,55 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             }
             return;
         }
-        const priorCompartments = getCompartments(db, sessionId);
+        let priorCompartments = getCompartments(db, sessionId);
         // v2: session facts are no longer read here — the unbounded existing_state
         // dump is gone. Facts dedup against <project-memory> in the prompt instead.
 
-        const existingValidationError = validateStoredCompartments(priorCompartments);
+        let existingValidationError = validateStoredCompartments(
+            priorCompartments,
+            v2NonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
+        );
+        // A compartment a store-projection rebase left unresolved keeps stale
+        // ordinals that can overlap its neighbour. Stored rows in that state do
+        // not change on their own, so this class of failure gets a repair
+        // attempt, a notice that names the rebuild, and a backoff.
+        const unresolvedInvolved =
+            existingValidationError !== null &&
+            priorCompartments.some((compartment) => compartment.rebaseStatus === "unresolved");
+        if (
+            unresolvedInvolved &&
+            existingValidationError &&
+            storedCompartmentFailureBackingOff(db, sessionId, existingValidationError)
+        ) {
+            // The same stored rows already failed this check recently. Nothing
+            // but a rebuild changes them, so re-running now would only repeat
+            // the failure and its notice.
+            sessionLog(
+                sessionId,
+                `historian no-op: stored compartments still invalid ("${existingValidationError}"); backing off`,
+            );
+            telemetry.status = "noop";
+            telemetry.failureReason = `existing-validation backoff: ${existingValidationError}`;
+            return;
+        }
+        if (unresolvedInvolved && existingValidationError) {
+            // The neighbours usually still say where the unresolved row belongs,
+            // so place it from them before giving up on the run.
+            const recovery = recoverUnresolvedCompartments({
+                db,
+                sessionId,
+                resolveOrdinal: (messageId) =>
+                    readRawSessionMessageOrdinalById(sessionId, messageId) ?? undefined,
+                reason: `historian pre-run check failed: ${existingValidationError}`,
+            });
+            if (recovery.rowsRewritten > 0) {
+                priorCompartments = getCompartments(db, sessionId);
+                existingValidationError = validateStoredCompartments(
+                    priorCompartments,
+                    v2NonNarrativeStoredGapRanges(db, sessionId, priorCompartments),
+                );
+            }
+        }
         if (existingValidationError) {
             sessionLog(
                 sessionId,
@@ -279,9 +405,16 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             // it so `doctor --issue` and the >=95% abort path can see it.
             const failCount = incrementHistorianFailure(db, sessionId, existingValidationError);
             telemetry.failureReason = `existing-validation: ${existingValidationError}`;
-            await notifyHistorianIssue(
-                buildHistorianFailureNotice(failCount, existingValidationError),
-            );
+            if (unresolvedInvolved) {
+                // Record the failure time like any other permanent historian
+                // failure, which is also what the backoff above measures from.
+                retainDrainReservationForRetryThrottle = true;
+                await notifyHistorianIssue(buildStoredCompartmentsInvalidNotice());
+            } else {
+                await notifyHistorianIssue(
+                    buildHistorianFailureNotice(failCount, existingValidationError),
+                );
+            }
             return;
         }
 
@@ -394,6 +527,64 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             return;
         }
 
+        // Size the prompt to the producer model before reserving drain budget or
+        // reading the chunk: the fixed prompt parts and the output reserve come off
+        // the window first, and the chunk gets what is left.
+        const producerModel = toModelEntry(deps.model)?.model ?? deps.fallbackModelId;
+        const producerWindow = resolveHistorianProducerWindow(
+            producerModel,
+            deps.historianMaxOutputTokens,
+            deps.historianContextLimit,
+        );
+        const producerContext = producerWindow.contextLimitTokens;
+        const producerLimits = { input: producerWindow.inputLimitTokens };
+        const producerReserve = producerWindow.maxOutputTokens;
+        const projectPath = resolveProjectIdentity(directory ?? process.cwd());
+        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
+        const promptFit = fitHistorianPrompt({
+            window: producerWindow,
+            systemPrompt: withContentLanguageDirective(
+                COMPARTMENT_AGENT_SYSTEM_PROMPT,
+                deps.language,
+            ),
+            requestedChunkTokens: historianChunkTokens,
+            sessionId,
+            chunkStart: Math.max(1, offset),
+            lastOrdinal: eligibleEndOrdinal - 1,
+            sessionCompartments: priorCompartments,
+            memories,
+            memoryEnabled: deps.memoryEnabled !== false,
+        });
+        if (!promptFit.ok) {
+            telemetry.failureReason = promptFit.reason;
+            if (getHistorianFailureState(db, sessionId).lastError === promptFit.reason) {
+                // The same model and window already failed this way. Nothing but a
+                // model, window or instruction change alters the reason, so running
+                // again would only repeat the failure and its notice.
+                telemetry.status = "noop";
+                sessionLog(
+                    sessionId,
+                    `historian no-op: prompt still cannot fit the historian model (${promptFit.reason}); waiting for a model or window change`,
+                );
+                return;
+            }
+            sessionLog(
+                sessionId,
+                `historian failure: source=prompt-fit reason="${promptFit.reason}"`,
+            );
+            incrementHistorianFailure(db, sessionId, promptFit.reason);
+            retainDrainReservationForRetryThrottle = true;
+            await notifyHistorianIssue(buildHistorianWindowTooSmallNotice());
+            return;
+        }
+        const chunkTokens = promptFit.chunkTokens;
+        if (promptFit.trimmed || chunkTokens < historianChunkTokens) {
+            sessionLog(
+                sessionId,
+                `historian prompt fit: sized to ${producerModel ?? "unknown"} (${describeHistorianPromptTrim(promptFit)}; requestedChunkTokens=${historianChunkTokens})`,
+            );
+        }
+
         const perRunCap = selectPerRunCap(boundarySnapshot);
         const usable = Math.max(
             1,
@@ -421,7 +612,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         }
         drainReservation = reserve.reservation;
 
-        const chunk = readSessionChunk(sessionId, historianChunkTokens, offset, eligibleEndOrdinal);
+        const chunk = readSessionChunk(sessionId, chunkTokens, offset, eligibleEndOrdinal, {
+            expandTools: deps.historianExpandTools,
+        });
         const forceKeepLastCompartmentForChunk =
             deps.forceKeepLastCompartment === true && !chunk.hasMore;
         telemetry.chunkStartOrdinal = chunk.startIndex;
@@ -455,18 +648,20 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             ? fitAtomicHistorianSourceToProducerWindow({
                   text: chunk.text,
                   resultBoundaries: chunk.toolResultBoundaries,
-                  contextLimitTokens: deps.historianContextLimit,
-                  maxOutputTokens: deps.historianMaxOutputTokens ?? 32_000,
+                  contextLimitTokens: producerContext,
+                  inputLimitTokens: producerLimits.input,
+                  maxOutputTokens: producerReserve,
+                  maxSourceTokens: promptFit.roomTokens,
               })
             : null;
         const chunkText = chunk.oversizeAtomicUnit
             ? (fittedAtomicSource?.text ?? chunk.text)
-            : truncateHistorianInputIfNeeded(chunk.text, historianChunkTokens);
+            : truncateHistorianInputIfNeeded(chunk.text, chunkTokens);
         const producerSourceTokens = estimateTokens(chunkText);
         if (boundarySnapshot.oversizeAtomicUnit || chunk.oversizeAtomicUnit) {
             sessionLog(
                 sessionId,
-                `historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${historianChunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
+                `historian oversize admission: range=${chunk.startIndex}-${chunk.endIndex} rawComponentTokens=${boundarySnapshot.diagnostics?.head.completedFence.tokenMass ?? "unknown"} perRunCap=${perRunCap} producerSourceTokens=${producerSourceTokens} historianChunkTokens=${chunkTokens}; ${describeBoundaryDiagnostics(boundarySnapshot)}`,
             );
         }
         if (fittedAtomicSource && fittedAtomicSource.removedTokens > 0) {
@@ -477,13 +672,25 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         }
         const producerWindowFailure = producerWindowFailureReason({
             producerSourceTokens,
-            contextLimitTokens: deps.historianContextLimit,
-            maxOutputTokens: deps.historianMaxOutputTokens ?? 32_000,
+            contextLimitTokens: producerContext,
+            inputLimitTokens: producerLimits.input,
+            maxOutputTokens: producerReserve,
         });
+        if (
+            deps.historianContextLimit !== undefined &&
+            producerInputTokenLimit(producerContext, producerReserve, producerLimits.input) ===
+                undefined
+        ) {
+            logInconsistentProducerWindowOnce(
+                sessionId,
+                producerModel ?? "unknown",
+                deps.historianContextLimit,
+                producerReserve,
+            );
+        }
         if (producerWindowFailure) {
             telemetry.failureReason = producerWindowFailure;
-            retainDrainReservationForRetryThrottle = true;
-            incrementHistorianFailure(db, sessionId, producerWindowFailure);
+            rollbackDrainReservation();
             sessionLog(
                 sessionId,
                 `historian oversize admission refused before spawn: ${producerWindowFailure}`,
@@ -493,7 +700,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         if (chunkText !== chunk.text) {
             sessionLog(
                 sessionId,
-                `historian pre-flight: truncated formatted input for ${chunk.startIndex}-${chunk.endIndex} to fit ${historianChunkTokens} tokens`,
+                `historian pre-flight: truncated formatted input for ${chunk.startIndex}-${chunk.endIndex} to fit ${chunkTokens} tokens`,
             );
         }
 
@@ -523,26 +730,19 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         deps.onHistorianRunStarted?.();
 
         // v2 bounded reference model (replaces the unbounded existing_state dump):
-        //   - 4 rotating cross-project seeds + last-6 recency compartments (no
-        //     embedding at historian time), built from this session's prior
-        //     compartments.
-        //   - <project-memory> for fact dedup (consolidation-bounded).
-        // No temp-file offload needed — the bounded blocks stay well within
-        // serialization limits.
-        const projectPath = resolveProjectIdentity(directory ?? process.cwd());
-        const memories = getMemoriesByProject(db, projectPath, ["active", "permanent"]);
-        const projectMemory = renderMemoryBlock(memories) ?? "";
-
-        const references = buildReferenceBlocks({
-            sessionId,
-            chunkStart: chunk.startIndex,
-            sessionCompartments: priorCompartments,
-        });
-
+        //   - 3 rotating seeds + 3 diverse older + 4 recent session compartments
+        //     (no embedding at historian time). Only seeds and diverse references
+        //     show scores, preventing recent-score anchoring in one-compartment runs.
+        //   - <project-memory> for fact dedup, rendered id-free because the
+        //     historian dedups by content and never addresses a memory by id.
+        //     Byte-parity with the Rust port is pinned by the historian prompt
+        //     golden.
+        // The prompt fit above rendered these blocks, trimmed if the producer
+        // window needed room for the chunk.
         const prompt = buildCompartmentAgentPrompt({
-            seedExamples: references.seedExamples,
-            sessionReferences: references.sessionReferences,
-            projectMemory,
+            seedExamples: promptFit.seedExamples,
+            sessionReferences: promptFit.sessionReferences,
+            projectMemory: promptFit.projectMemory,
             inputSource: `Messages ${chunk.startIndex}-${chunk.endIndex}:\n\n${chunkText}`,
             memoryEnabled: deps.memoryEnabled !== false,
         });
@@ -590,6 +790,9 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             twoPass: deps.historianTwoPass,
             language: deps.language,
         });
+        // A window refusal here comes from a fallback model (the primary was fitted
+        // above). Treat it like any other failed pass: count it, notify, and keep
+        // the reserved drain budget spent so the next trigger does not retry at once.
         if (!validatedPass.ok) {
             // Always track historian failures regardless of usage percentage.
             // The emergency abort path at 95% checks failureCount > 0, so failures
@@ -639,6 +842,24 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             );
         }
 
+        // The historian may end its last compartment on a row the host never
+        // serves by id (an OpenCode 2 instruction update). A request can never
+        // be trimmed at such a boundary, so end on the nearest served row and
+        // leave the unserved rows for the next run.
+        const servedBoundary = snapTerminalCompartmentToServedRow(
+            persistedCompartments,
+            chunk.lines,
+        );
+        if (servedBoundary.snapped) {
+            const before = persistedCompartments[persistedCompartments.length - 1];
+            const after = servedBoundary.compartments[servedBoundary.compartments.length - 1];
+            sessionLog(
+                sessionId,
+                `historian boundary moved off a row the host does not serve: ${before?.startMessage}-${before?.endMessage} -> ${after ? `${after.startMessage}-${after.endMessage}` : "(dropped)"}`,
+            );
+            persistedCompartments = servedBoundary.compartments;
+        }
+
         const newCompartments = persistedCompartments;
 
         const lastNewEnd = newCompartments[newCompartments.length - 1]?.endMessage ?? 0;
@@ -648,6 +869,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 sessionId,
                 `historian failure: source=no-progress reason="historian returned compartments that did not advance past raw message ${offset - 1}" newCompartmentCount=${newCompartments.length} lastNewEnd=${lastNewEnd} priorEnd=${offset - 1}`,
             );
+            sessionLog(sessionId, "historian output discarded: reason=no_forward_progress");
             const failCount = incrementHistorianFailure(
                 db,
                 sessionId,
@@ -707,14 +929,17 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         // wrote project memories (with embeddings) even for users who
         // explicitly disabled the memory feature in config.
         // Two distinct gates:
-        //  - embeddingActive: embeddings + project registration fire whenever the
-        //    memory FEATURE is enabled. They are the substrate for ctx_search +
-        //    future dreamer cross-linking and must NOT depend on auto_promote.
-        //  - promotionActive: writing facts as project memories additionally
-        //    requires auto_promote (a user who disabled auto-promotion still wants
-        //    search/embedding, just not auto-written memories).
-        const embeddingActive = !!promotionDirectory && deps.memoryEnabled !== false;
-        const promotionActive = embeddingActive && deps.autoPromote !== false;
+        //  - embeddingActive: project registration + history (compartment chunk)
+        //    embedding fire whenever the session has a project directory. History
+        //    embedding is the ctx_search substrate and depends only on the
+        //    embedding provider (checked inside the embed call), never on
+        //    `memory.enabled` or auto_promote.
+        //  - promotionActive: writing facts as project memories requires the
+        //    memory feature AND auto_promote (a user who disabled auto-promotion
+        //    still wants search/embedding, just not auto-written memories).
+        const embeddingActive = !!promotionDirectory;
+        const promotionActive =
+            embeddingActive && deps.memoryEnabled !== false && deps.autoPromote !== false;
         const promotionProjectIdentity = promotionDirectory
             ? resolveProjectIdentity(promotionDirectory)
             : "";
@@ -754,30 +979,58 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         const holderId = deps.compartmentLeaseHolderId;
         if (!holderId) {
             sessionLog(sessionId, "historian publish skipped: missing compartment lease holder");
+            sessionLog(
+                sessionId,
+                "historian output discarded: reason=missing_compartment_lease_holder",
+            );
             rollbackDrainReservation();
             return;
         }
-        const compartmentTagKeys = await getRawSessionTagKeysThrough(
+        const boundaryCheckStarted = startHistorianPublishStage(
             sessionId,
-            lastCompartmentEnd,
-            { db },
+            "dangling-boundary-check",
+            `compartments=${newCompartments.length}`,
         );
         const danglingBoundary = findDanglingPublicationBoundary(sessionId, newCompartments);
         if (danglingBoundary) {
             const reason = `compartment boundary disappeared before publication (sequence=${danglingBoundary.sequence} side=${danglingBoundary.side} missing_id=${danglingBoundary.messageId})`;
             telemetry.failureReason = `publish-boundary: ${reason}`;
+            finishHistorianPublishStage(
+                sessionId,
+                "dangling-boundary-check",
+                boundaryCheckStarted,
+                "discarded",
+                `missing_id=${danglingBoundary.messageId}`,
+            );
             sessionLog(
                 sessionId,
                 `historian publish refused: sequence=${danglingBoundary.sequence} side=${danglingBoundary.side} missing_id=${danglingBoundary.messageId}; raw snapshot changed during the historian run`,
             );
+            sessionLog(sessionId, "historian output discarded: reason=dangling_boundary");
             const failCount = incrementHistorianFailure(db, sessionId, reason);
             await notifyHistorianIssue(buildHistorianFailureNotice(failCount, reason));
             rollbackDrainReservation();
             return;
         }
+        finishHistorianPublishStage(
+            sessionId,
+            "dangling-boundary-check",
+            boundaryCheckStarted,
+            "completed",
+        );
+        const dropsStarted = startHistorianPublishStage(
+            sessionId,
+            "post-publish-drops",
+            `range=${offset}-${lastCompartmentEnd}`,
+        );
+        const compartmentTagKeys = await getRawSessionTagKeysThrough(
+            sessionId,
+            lastCompartmentEnd,
+            { db, fromMessageIndex: offset },
+        );
         let published = false;
-        const transactionStartedAt = performance.now();
-        db.exec("BEGIN IMMEDIATE");
+        const transactionStartedAt = startHistorianPublishStage(sessionId, "publish-txn");
+        const lockAcquiredAt = await beginSqliteWriterAsync(db, "historian-publish");
         try {
             if (!isCompartmentLeaseHeld(db, sessionId, holderId)) {
                 db.exec("ROLLBACK");
@@ -785,6 +1038,14 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 sessionLog(
                     sessionId,
                     "historian publish skipped: compartment lease no longer held",
+                );
+                sessionLog(sessionId, "historian output discarded: reason=compartment_lease_lost");
+                finishHistorianPublishStage(
+                    sessionId,
+                    "publish-txn",
+                    transactionStartedAt,
+                    "discarded",
+                    "reason=compartment_lease_lost",
                 );
                 return;
             }
@@ -855,6 +1116,14 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 sessionId,
                 lastCompartmentEnd,
                 compartmentTagKeys,
+                offset,
+            );
+            finishHistorianPublishStage(
+                sessionId,
+                "post-publish-drops",
+                dropsStarted,
+                "completed",
+                `range=${offset}-${lastCompartmentEnd}`,
             );
 
             clearHistorianFailureState(db, sessionId);
@@ -880,7 +1149,20 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             }
             db.exec("COMMIT");
             published = true;
-            logSlowWriteTransaction("historian-publish", transactionStartedAt);
+            publishCommitted = true;
+            finishHistorianPublishStage(
+                sessionId,
+                "publish-txn",
+                transactionStartedAt,
+                "completed",
+                `compartments=${persistedCompartments.length}`,
+            );
+            // Held time only: the publish stage above already includes the wait
+            // for the writer lock.
+            logSlowWriteTransaction("historian-publish", lockAcquiredAt);
+        } catch (error) {
+            finishHistorianPublishStage(sessionId, "publish-txn", transactionStartedAt, "failed");
+            throw error;
         } finally {
             if (!published) {
                 try {
@@ -912,12 +1194,18 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         if (deferMarkerApplication) {
             deps.onDeferredMarkerPending?.(sessionId);
         } else {
-            (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(
-                db,
-                sessionId,
-                lastCompartmentEnd,
-                sessionDirectory,
-            );
+            try {
+                (deps.compactionMarkerStrategy?.publish ?? updateCompactionMarkerAfterPublication)(
+                    db,
+                    sessionId,
+                    lastCompartmentEnd,
+                    sessionDirectory,
+                );
+            } catch (error) {
+                // Same outcome as the update reporting false: the compartments stand and
+                // the marker catches up on a later publication.
+                sessionLog(sessionId, "compaction-marker update after publish failed:", error);
+            }
         }
 
         // v2: the LLM compressor is gone — deterministic decay-tier rendering
@@ -953,6 +1241,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         // v2: compute + store raw chunk embeddings (the ctx_search semantic
         // substrate over session history). Fire-and-forget, best-effort, gated by
         // memory flags so a memory-off user never hits the embedding endpoint.
+        const embeddingsStarted = startHistorianPublishStage(sessionId, "embeddings");
         if (embeddingActive) {
             const chunksToEmbed = persistedCompartments
                 .map((c, i) => ({
@@ -963,9 +1252,11 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 }))
                 .filter((c) => typeof c.id === "number");
             void (async () => {
+                let failed = false;
                 try {
                     await deps.ensureProjectRegistered?.(promotionDirectory, db);
                 } catch (error) {
+                    failed = true;
                     sessionLog(sessionId, "project registration after publish failed:", error);
                 }
                 try {
@@ -976,6 +1267,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                         promotedFactRefs,
                     );
                 } catch (error) {
+                    failed = true;
                     sessionLog(sessionId, "promoted fact embedding dispatch failed:", error);
                 }
                 try {
@@ -986,9 +1278,26 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                         chunksToEmbed,
                     );
                 } catch (error) {
+                    failed = true;
                     sessionLog(sessionId, "compartment embedding dispatch failed:", error);
+                } finally {
+                    finishHistorianPublishStage(
+                        sessionId,
+                        "embeddings",
+                        embeddingsStarted,
+                        failed ? "failed" : "completed",
+                        `compartments=${chunksToEmbed.length}`,
+                    );
                 }
             })();
+        } else {
+            finishHistorianPublishStage(
+                sessionId,
+                "embeddings",
+                embeddingsStarted,
+                "completed",
+                "skipped=memory_disabled",
+            );
         }
 
         // Store user behavior observations as candidates ONLY when the user-memory
@@ -1079,9 +1388,25 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 sessionLog(sessionId, "failed to store primer candidates:", error);
             }
         }
+        sessionLog(
+            sessionId,
+            `historian publish completed: compartments=${persistedCompartments.length} range=${offset}-${lastCompartmentEnd}`,
+        );
     } catch (error: unknown) {
-        // Historian runs are fail-closed because they update durable compartment state.
         const desc = describeError(error);
+        if (publishCommitted) {
+            // The publication is durable and was signaled right after COMMIT. Counting this
+            // as a historian failure would warn the user about a run that succeeded and
+            // feed the failure backoff.
+            telemetry.status = "success";
+            telemetry.failureReason = `post_publish_exception: ${desc.brief}`;
+            sessionLog(
+                sessionId,
+                `historian post-publish step failed; publication stands: ${desc.brief}`,
+            );
+            return;
+        }
+        // Historian runs are fail-closed because they update durable compartment state.
         telemetry.failureReason = `exception: ${desc.brief}`;
         sessionLog(
             sessionId,
@@ -1107,6 +1432,5 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
         }
         // Record one historian_runs row for this attempt (every exit path).
         recordTelemetry();
-        cleanupHistorianStateFile(stateFilePath);
     }
 }

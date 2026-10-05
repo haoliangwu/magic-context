@@ -1,13 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
     ACTIVE_TOOL_IDS,
     createPromptSurfaceRuntime,
     LIGHT_TOOL_DESCRIPTIONS,
 } from "../../shared/prompt-surface-runtime";
+import { createTestTempDir } from "../../shared/test-temp-dir";
 import { applyV2PromptSurfaceTools, catalogModels, createHostSeams } from "./context";
 import type { SessionContext, V2Context } from "./types";
 
@@ -33,7 +33,8 @@ function draft(modelID: string): SessionContext {
 describe("v2 per-model tool surface", () => {
     it("is byte-identical across three same-model passes and follows a model switch", () => {
         const runtime = createPromptSurfaceRuntime({
-            userConfigDirectory: mkdtempSync(join(tmpdir(), "mc-v2-surface-")),
+            // Registered, so the test preload removes it when the suite ends.
+            userConfigDirectory: createTestTempDir("mc-v2-surface-").dir,
             warn: () => undefined,
         });
         const config = {
@@ -68,7 +69,7 @@ describe("v2 draft-authoritative model tracking", () => {
             getCount: () => 0,
         });
         const draftModels = new Map<string, { providerID: string; modelID: string }>();
-        const seams = createHostSeams({} as V2Context, read, draftModels);
+        const seams = createHostSeams({} as V2Context, read, read, draftModels);
         expect(seams.hostModelFallback("ses-1")).toBeNull();
         draftModels.set("ses-1", { providerID: "openai", modelID: "mock-model" });
         expect(seams.hostModelFallback("ses-1")).toEqual({
@@ -98,8 +99,49 @@ describe("catalogModels", () => {
         expect(catalogModels({ data: [mock] })).toEqual([mock]);
     });
 
+    it("lets the outgoing draft override a stale catalog limit", () => {
+        expect(
+            catalogModels(
+                { data: [mock] },
+                {
+                    providerID: "openai",
+                    id: "mock-model",
+                    limit: { context: 1_048_576, output: 32_000 },
+                },
+            ),
+        ).toEqual([
+            {
+                id: "mock-model",
+                providerID: "openai",
+                limit: { context: 1_048_576, output: 32_000 },
+            },
+        ]);
+    });
+
     it("does not iterate a thenable or empty object", () => {
         expect(catalogModels({})).toEqual([]);
         expect(catalogModels(Promise.resolve([mock]))).toEqual([]);
+    });
+});
+
+// The v2 context hook edits the request draft only. A `context.tool.transform`
+// call from inside the hook would register a persistent host-state transform on
+// every pass (eight after seven passes in the issue 492 reproduction) and let a
+// light-preset session's shortened descriptions become the baseline for every
+// later request on the host. This pins the call out of the hook body; the only
+// permitted registration is the one-time setup in tools.ts.
+describe("v2 context hook never registers a persistent tool transform", () => {
+    it("has no context.tool.transform call in the context pass or its registration", () => {
+        const source = readFileSync(join(import.meta.dir, "context.ts"), "utf8");
+        // Include the named body as well as its scope wrapper; registration alone
+        // no longer contains the actual context-pass operations.
+        const bodyStart = source.indexOf("const runManagedContext =");
+        const hookStart = source.indexOf('context.session.hook("context"', bodyStart);
+        expect(bodyStart).toBeGreaterThan(0);
+        expect(hookStart).toBeGreaterThan(bodyStart);
+        expect(source.slice(hookStart)).toContain("await runManagedContext(draft)");
+        const hookBody = source.slice(bodyStart);
+        expect(hookBody).not.toContain("context.tool.transform(");
+        expect(hookBody).toContain("applyV2PromptSurfaceTools(draft");
     });
 });

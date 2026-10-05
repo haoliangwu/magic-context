@@ -1,0 +1,14 @@
+{
+  "broca_usage": {
+    "input_tokens": 19000,
+    "output_tokens": 50,
+    "reasoning_tokens": 30,
+    "cached_input_tokens": 4000
+  },
+  "usage": {
+    "promptTokenCount": 23000,
+    "candidatesTokenCount": 20,
+    "thoughtsTokenCount": 30,
+    "cachedContentTokenCount": 4000
+  }
+}

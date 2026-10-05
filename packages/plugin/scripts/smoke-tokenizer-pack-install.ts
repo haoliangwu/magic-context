@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,6 +57,19 @@ const projectRoot = join(tempRoot, "project");
 const dataRoot = join(tempRoot, "data");
 const hostSource = join(installRoot, "tokenizer-host.mjs");
 const hostExecutable = join(tempRoot, process.platform === "win32" ? "opencode-host.exe" : "opencode-host");
+// The tokenizer fallback warning is a diagnostic, so the plugin writes it to its
+// log file rather than the host's stderr (OpenCode shows plugin stderr in the
+// operator's terminal). Each probe gets its own log file so the count below
+// belongs to exactly one run.
+const resolvedLogPath = join(tempRoot, "resolved.log");
+const fallbackLogPath = join(tempRoot, "fallback.log");
+const fallbackWarning = "ai-tokenizer is unavailable";
+
+async function readLog(logPath: string): Promise<string> {
+    // The plugin creates its log only when it has something to write, so a run
+    // that logged nothing leaves no file behind.
+    return existsSync(logPath) ? readFile(logPath, "utf8") : "";
+}
 
 try {
     run("bun", ["run", "build"], pluginRoot);
@@ -123,11 +136,14 @@ console.log("packed tokenizer estimates completed");
         ...process.env,
         XDG_CACHE_HOME: canonicalCacheRoot,
         MAGIC_CONTEXT_TEST_DATA_DIR: dataRoot,
+        MAGIC_CONTEXT_LOG_PATH: resolvedLogPath,
     });
     if (!resolvedOutput.stdout.includes("packed tokenizer estimates completed")) {
         throw new Error("compiled packed-install probe did not exercise tokenizer estimates");
     }
-    if (resolvedOutput.stderr.includes("ai-tokenizer is unavailable")) {
+    // The fallback probe below proves the warning reaches this log channel, so
+    // its absence here means the packed tokenizer really resolved.
+    if (`${resolvedOutput.stderr}${await readLog(resolvedLogPath)}`.includes(fallbackWarning)) {
         throw new Error("packed tokenizer resolved only through the approximate fallback");
     }
 
@@ -137,13 +153,19 @@ console.log("packed tokenizer estimates completed");
         ...process.env,
         XDG_CACHE_HOME: emptyCacheRoot,
         MAGIC_CONTEXT_TEST_DATA_DIR: dataRoot,
+        MAGIC_CONTEXT_LOG_PATH: fallbackLogPath,
     });
     if (!fallbackOutput.stdout.includes("packed tokenizer estimates completed")) {
         throw new Error("tokenizer resolution failure did not degrade to approximate estimates");
     }
-    const fallbackWarnings = fallbackOutput.stderr.match(/ai-tokenizer is unavailable/g)?.length ?? 0;
+    // Two estimates ran, so exactly one warning proves the once-per-process
+    // guard; the warning must also stay off the operator's terminal.
+    const fallbackWarnings = (await readLog(fallbackLogPath)).split(fallbackWarning).length - 1;
     if (fallbackWarnings !== 1) {
-        throw new Error(`expected one tokenizer fallback warning, got ${fallbackWarnings}`);
+        throw new Error(`expected one tokenizer fallback warning in the plugin log, got ${fallbackWarnings}`);
+    }
+    if (fallbackOutput.stderr.includes(fallbackWarning)) {
+        throw new Error("tokenizer fallback warning was written to the host's stderr");
     }
 } finally {
     if (process.env.KEEP_TOKENIZER_PACK_SMOKE !== "1") {

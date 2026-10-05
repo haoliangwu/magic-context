@@ -14,7 +14,7 @@ describe("SQLite doctor preflight", () => {
         expect(result).toBe(false);
         expect(reports).toHaveLength(1);
         expect(reports[0]).toContain("No such built-in module: node:sqlite");
-        expect(reports[0]).toContain("install Node.js >= 24");
+        expect(reports[0]).toContain("install Node.js 22.16+ (22.x) or >= 24");
         expect(reports[0]).toContain("Bun build with node:sqlite");
         expect(reports[0]).toContain("node:24-slim");
         expect(reports[0]).toContain("two-runtime image");

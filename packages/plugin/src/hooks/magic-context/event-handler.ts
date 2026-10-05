@@ -1,16 +1,19 @@
 import type { createCompactionHandler } from "../../features/magic-context/compaction";
+import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
     detectOverflow,
     detectThinkingBindingMismatch,
-    isFable51ThinkingBindingModel,
+    isPrefixBoundThinkingModel,
 } from "../../features/magic-context/overflow-detection";
+import { observeSessionActivity } from "../../features/magic-context/session-activity";
+import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
+import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     armThinkingBindingRecovery,
     clearDetectedContextLimit,
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
-    clearSession,
     deleteIndexedMessage,
     deleteTagsByMessageId,
     getHistorianFailureState,
@@ -33,6 +36,7 @@ import {
     getChannel2NudgeState,
     getPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
+import { clearSession } from "../../features/magic-context/storage-meta-session";
 import type { Tagger } from "../../features/magic-context/tagger";
 import {
     clearTransformDecisionSession,
@@ -46,9 +50,15 @@ import {
     refreshModelLimitsAfterAuthOnce,
     refreshModelLimitsFromApi,
 } from "../../shared/models-dev-cache";
+import { recordPromptSessionError } from "../../shared/prompt-async-transport";
+import {
+    isSuccessfulProviderCompletion,
+    providerResponseFailed,
+} from "../../shared/provider-response-completion";
 import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
+import { noteContextLimitResolution, provenFloorForModel } from "./context-limit-resolution";
 import {
     getMessageRemovedInfo,
     getMessageUpdatedAssistantInfo,
@@ -58,7 +68,6 @@ import {
     getSessionProperties,
 } from "./event-payloads";
 import {
-    resolveCacheTtl,
     resolveContextLimit,
     resolveContextWindowGeometry,
     resolveModelKey,
@@ -78,7 +87,8 @@ import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
 
 const CONTEXT_USAGE_TTL_MS = 60 * 60 * 1000;
-const usageRefusalLogSeen = new Set<string>();
+// Session/model pairs whose current run of above-window readings was logged.
+const usageAboveWallLogSeen = new Set<string>();
 
 type CacheTtlConfig = string | Record<string, string>;
 
@@ -109,6 +119,7 @@ export interface EventHandlerDeps {
     onRustWireInvalidated?: (sessionId: string) => void;
     onSessionDeleted?: (sessionId: string) => Promise<void> | void;
     rustSessionCleanup?: boolean;
+    allowHomeProject?: boolean;
     config: {
         clear_reasoning_age?: number;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
@@ -192,82 +203,91 @@ function cleanupRemovedMessageState(
     sessionId: string,
     messageId: string,
 ): MessageRemovedCleanupResult {
-    return deps.db.transaction(() => {
-        const removedTagNumbers = deleteTagsByMessageId(deps.db, sessionId, messageId);
-        sessionLog(
-            sessionId,
-            `event message.removed: deleted ${removedTagNumbers.length} tag(s) for message ${messageId}`,
-        );
-
-        const strippedPlaceholderRemoved = removeStrippedPlaceholderId(
-            deps.db,
-            sessionId,
-            messageId,
-        );
-        sessionLog(
-            sessionId,
-            strippedPlaceholderRemoved
-                ? `event message.removed: removed ${messageId} from stripped placeholder ids`
-                : `event message.removed: stripped placeholder ids unchanged for ${messageId}`,
-        );
-
-        const removedNoteNudgeAnchor = removeNoteNudgeAnchorByMessageId(
-            deps.db,
-            sessionId,
-            messageId,
-        );
-        const removedAutoSearchDecision = removeAutoSearchHintDecisionByMessageId(
-            deps.db,
-            sessionId,
-            messageId,
-        );
-        const persistedNoteNudge = getPersistedNoteNudge(deps.db, sessionId);
-        const clearedNoteNudgeTrigger = persistedNoteNudge.triggerMessageId === messageId;
-        if (clearedNoteNudgeTrigger) {
-            clearNoteNudgeTriggerOnly(deps.db, sessionId);
-        }
-        const clearedNoteNudge = removedNoteNudgeAnchor || clearedNoteNudgeTrigger;
-        sessionLog(
-            sessionId,
-            clearedNoteNudge
-                ? `event message.removed: pruned note nudge state for ${messageId}`
-                : `event message.removed: note nudge state unchanged for ${messageId}`,
-        );
-        sessionLog(
-            sessionId,
-            removedAutoSearchDecision
-                ? `event message.removed: pruned auto-search decision for ${messageId}`
-                : `event message.removed: auto-search decision unchanged for ${messageId}`,
-        );
-
-        const currentWatermark = getPersistedReasoningWatermark(deps.db, sessionId);
-        const maxRemainingTag = getMaxTagNumberBySession(deps.db, sessionId);
-        if (currentWatermark > maxRemainingTag) {
-            setPersistedReasoningWatermark(deps.db, sessionId, maxRemainingTag);
+    return deps.db
+        .transaction(() => {
+            const removedTagNumbers = deleteTagsByMessageId(deps.db, sessionId, messageId);
             sessionLog(
                 sessionId,
-                `event message.removed: reset reasoning watermark ${currentWatermark}→${maxRemainingTag}`,
+                `event message.removed: deleted ${removedTagNumbers.length} tag(s) for message ${messageId}`,
             );
-        } else {
+
+            const strippedPlaceholderRemoved = removeStrippedPlaceholderId(
+                deps.db,
+                sessionId,
+                messageId,
+            );
             sessionLog(
                 sessionId,
-                `event message.removed: reasoning watermark unchanged at ${currentWatermark} (max tag ${maxRemainingTag})`,
+                strippedPlaceholderRemoved
+                    ? `event message.removed: removed ${messageId} from stripped placeholder ids`
+                    : `event message.removed: stripped placeholder ids unchanged for ${messageId}`,
             );
-        }
 
-        const removedIndexedMessages = deleteIndexedMessage(deps.db, sessionId, messageId);
-        sessionLog(
-            sessionId,
-            `event message.removed: deleted ${removedIndexedMessages} indexed message row(s) for ${messageId}`,
-        );
+            const removedNoteNudgeAnchor = removeNoteNudgeAnchorByMessageId(
+                deps.db,
+                sessionId,
+                messageId,
+            );
+            const removedAutoSearchDecision = removeAutoSearchHintDecisionByMessageId(
+                deps.db,
+                sessionId,
+                messageId,
+            );
+            const persistedNoteNudge = getPersistedNoteNudge(deps.db, sessionId);
+            const clearedNoteNudgeTrigger = persistedNoteNudge.triggerMessageId === messageId;
+            if (clearedNoteNudgeTrigger) {
+                clearNoteNudgeTriggerOnly(deps.db, sessionId);
+            }
+            const clearedNoteNudge = removedNoteNudgeAnchor || clearedNoteNudgeTrigger;
+            sessionLog(
+                sessionId,
+                clearedNoteNudge
+                    ? `event message.removed: pruned note nudge state for ${messageId}`
+                    : `event message.removed: note nudge state unchanged for ${messageId}`,
+            );
+            sessionLog(
+                sessionId,
+                removedAutoSearchDecision
+                    ? `event message.removed: pruned auto-search decision for ${messageId}`
+                    : `event message.removed: auto-search decision unchanged for ${messageId}`,
+            );
 
-        return {
-            clearedNoteNudge,
-        };
-    })();
+            const currentWatermark = getPersistedReasoningWatermark(deps.db, sessionId);
+            const maxRemainingTag = getMaxTagNumberBySession(deps.db, sessionId);
+            if (currentWatermark > maxRemainingTag) {
+                setPersistedReasoningWatermark(deps.db, sessionId, maxRemainingTag);
+                sessionLog(
+                    sessionId,
+                    `event message.removed: reset reasoning watermark ${currentWatermark}→${maxRemainingTag}`,
+                );
+            } else {
+                sessionLog(
+                    sessionId,
+                    `event message.removed: reasoning watermark unchanged at ${currentWatermark} (max tag ${maxRemainingTag})`,
+                );
+            }
+
+            const removedIndexedMessages = deleteIndexedMessage(deps.db, sessionId, messageId);
+            sessionLog(
+                sessionId,
+                `event message.removed: deleted ${removedIndexedMessages} indexed message row(s) for ${messageId}`,
+            );
+
+            return {
+                clearedNoteNudge,
+            };
+        })
+        .immediate();
 }
 
 export function createEventHandler(deps: EventHandlerDeps) {
+    // The newest assistant message whose usage reached the pressure state, per
+    // session. OpenCode delivers events to plugins without waiting for the
+    // previous handler, so the event for one step of a tool turn can reach
+    // this handler after the event for the next step. OpenCode message ids
+    // ascend, so an older id arriving late must not overwrite the newer step's
+    // prompt size.
+    const newestUsageMessageIdBySession = new Map<string, string>();
     return async (input: { event: { type: string; properties?: unknown } }): Promise<void> => {
         evictExpiredUsageEntries(deps.contextUsageMap);
         observeOpenCodeTurnEvent(input.event.type, input.event.properties);
@@ -280,7 +300,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
-            // Flag our own hidden children (historian/dreamer/memory-migration)
+            // Flag our own hidden children (historian/dreamer)
             // by their `magic-context-` title prefix so the
             // transform + system-prompt hooks can fully exempt them. In-memory
             // only — these sessions never span a restart.
@@ -298,10 +318,23 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
 
             try {
+                // The host's creation directory also covers children that never run a transform.
+                if (info.directory) {
+                    recordSessionProjectIdentity(
+                        deps.db,
+                        info.id,
+                        resolveProjectIdentityForSession(info.directory, deps.allowHomeProject),
+                    );
+                }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
                 updateSessionMeta(deps.db, info.id, {
                     isSubagent: info.parentID.length > 0,
-                    cacheTtl: resolveCacheTtl(deps.config.cache_ttl, modelKey),
+                    cacheTtl: resolveSessionCacheTtl(
+                        deps.db,
+                        info.id,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value,
                 });
             } catch (error) {
                 sessionLog(info.id, "event session.created persistence failed:", error);
@@ -314,6 +347,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             if (!errInfo) {
                 return;
             }
+            recordPromptSessionError(errInfo.sessionID, errInfo.error);
             try {
                 const bindingMismatch = detectThinkingBindingMismatch(errInfo.error);
                 if (bindingMismatch.isBindingMismatch) {
@@ -321,12 +355,12 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     if (
                         deps.thinkingBindingRecoveryEnabled !== false &&
                         !deps.compactionOff &&
-                        isFable51ThinkingBindingModel(model?.providerID, model?.modelID)
+                        isPrefixBoundThinkingModel(model?.providerID, model?.modelID)
                     ) {
-                        armThinkingBindingRecovery(
-                            deps.db,
+                        armThinkingBindingRecovery(deps.db, errInfo.sessionID);
+                        sessionLog(
                             errInfo.sessionID,
-                            bindingMismatch.messageId,
+                            `thinking binding recovery armed from session.error (provider paths: failing=${bindingMismatch.failingBlockPath ?? "?"} firstChanged=${bindingMismatch.firstChangedPath ?? "?"})`,
                         );
                         dropSlot(errInfo.sessionID, "thinking-binding-recovery-arm");
                         deps.onSessionCacheInvalidated?.(errInfo.sessionID);
@@ -419,7 +453,26 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     overflowModelKey,
                     "provider_overflow",
                     detection.reportedLimitProvenance,
+                    detection.reportedInputTokens,
                 );
+                if (detection.reportedInputTokens) {
+                    const provenLimit = getOverflowState(
+                        deps.db,
+                        errInfo.sessionID,
+                        overflowModelKey,
+                    ).detectedContextLimit;
+                    deps.contextUsageMap.set(errInfo.sessionID, {
+                        usage: {
+                            inputTokens: detection.reportedInputTokens,
+                            percentage:
+                                provenLimit > 0
+                                    ? (detection.reportedInputTokens / provenLimit) * 100
+                                    : 100,
+                        },
+                        hasUsageTokens: true,
+                        updatedAt: Date.now(),
+                    });
+                }
                 sessionLog(
                     errInfo.sessionID,
                     `overflow detected via session.error: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"} (previousRecovery=${existing.needsEmergencyRecovery})`,
@@ -432,6 +485,27 @@ export function createEventHandler(deps: EventHandlerDeps) {
         }
 
         if (input.event.type === "message.updated") {
+            const message = getMessageUpdatedInfo(input.event.properties);
+            if (message?.sessionID) {
+                try {
+                    const rawInfo = properties?.info;
+                    const time =
+                        rawInfo && typeof rawInfo === "object" && "time" in rawInfo
+                            ? (rawInfo.time as { created?: unknown } | undefined)?.created
+                            : undefined;
+                    observeSessionActivity(
+                        deps.db,
+                        message.sessionID,
+                        typeof time === "number" ? time : Date.now(),
+                    );
+                } catch (error) {
+                    sessionLog(
+                        message.sessionID,
+                        "event message.updated activity persistence failed:",
+                        error,
+                    );
+                }
+            }
             const info = getMessageUpdatedAssistantInfo(input.event.properties);
             if (!info) {
                 const genericInfo = getMessageUpdatedInfo(input.event.properties);
@@ -478,13 +552,13 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     bindingMismatch.isBindingMismatch &&
                     deps.thinkingBindingRecoveryEnabled !== false &&
                     !deps.compactionOff &&
-                    isFable51ThinkingBindingModel(info.providerID, info.modelID)
+                    isPrefixBoundThinkingModel(info.providerID, info.modelID)
                 ) {
                     try {
-                        armThinkingBindingRecovery(
-                            deps.db,
+                        armThinkingBindingRecovery(deps.db, info.sessionID);
+                        sessionLog(
                             info.sessionID,
-                            bindingMismatch.messageId,
+                            `thinking binding recovery armed from message.updated (provider paths: failing=${bindingMismatch.failingBlockPath ?? "?"} firstChanged=${bindingMismatch.firstChangedPath ?? "?"})`,
                         );
                         dropSlot(info.sessionID, "thinking-binding-recovery-arm");
                         deps.onSessionCacheInvalidated?.(info.sessionID);
@@ -573,7 +647,27 @@ export function createEventHandler(deps: EventHandlerDeps) {
                                 overflowModelKey,
                                 "provider_overflow",
                                 detection.reportedLimitProvenance,
+                                detection.reportedInputTokens,
                             );
+                            if (detection.reportedInputTokens) {
+                                const provenLimit = getOverflowState(
+                                    deps.db,
+                                    info.sessionID,
+                                    overflowModelKey,
+                                ).detectedContextLimit;
+                                deps.contextUsageMap.set(info.sessionID, {
+                                    usage: {
+                                        inputTokens: detection.reportedInputTokens,
+                                        percentage:
+                                            provenLimit > 0
+                                                ? (detection.reportedInputTokens / provenLimit) *
+                                                  100
+                                                : 100,
+                                    },
+                                    hasUsageTokens: true,
+                                    updatedAt: Date.now(),
+                                });
+                            }
                             sessionLog(
                                 info.sessionID,
                                 `overflow detected via message.updated: reportedLimit=${detection.reportedLimit ?? "unknown"} provenance=${detection.reportedLimitProvenance ?? "n/a"} pattern=${detection.matchedPattern ?? "n/a"}`,
@@ -599,10 +693,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
             const hasUsageTokens = usageTokens.some(
                 (value) => typeof value === "number" && value > 0,
             );
-            const terminalAssistantUpdate =
-                info.messageID !== undefined &&
-                hasUsageTokens &&
-                (typeof info.finish === "string" || typeof info.completedAt === "number");
+            const successfulCompletion = isSuccessfulProviderCompletion({
+                completedAt: info.completedAt,
+                finish: info.finish,
+                error: info.error,
+            });
+            const responseFailed = providerResponseFailed({
+                finish: info.finish,
+                error: info.error,
+            });
+            const responseTime =
+                typeof info.completedAt === "number" &&
+                Number.isFinite(info.completedAt) &&
+                info.completedAt > 0
+                    ? info.completedAt
+                    : now;
+            const terminalAssistantUpdate = info.messageID !== undefined && successfulCompletion;
             if (terminalAssistantUpdate && info.messageID) {
                 scheduleOpenCodeTransformDecisionWrite({
                     db: deps.db,
@@ -617,10 +723,26 @@ export function createEventHandler(deps: EventHandlerDeps) {
 
             sessionLog(
                 info.sessionID,
-                `event message.updated: provider=${info.providerID} model=${info.modelID} hasUsageTokens=${hasUsageTokens} tokens.input=${info.tokens?.input} cache.read=${info.tokens?.cache?.read} cache.write=${info.tokens?.cache?.write}`,
+                `event message.updated: provider=${info.providerID} model=${info.modelID} hasUsageTokens=${hasUsageTokens} tokens.input=${info.tokens?.input} cache.read=${info.tokens?.cache?.read} cache.write=${info.tokens?.cache?.write} message.id=${info.messageID} session.id=${info.sessionID}`,
             );
 
             const hasKnownUsage = hasUsageTokens || deps.contextUsageMap.has(info.sessionID);
+            // Completion and pressure are independent. Some providers omit usage
+            // entirely; their successful replies still refresh the idle clock.
+            // A shell, error or abort cannot spend an expiry, even with time.completed.
+            if (successfulCompletion && !hasUsageTokens) {
+                try {
+                    const meta = getOrCreateSessionMeta(deps.db, info.sessionID);
+                    const completedAt = responseTime;
+                    if (completedAt > meta.lastResponseTime) {
+                        updateSessionMeta(deps.db, info.sessionID, {
+                            lastResponseTime: completedAt,
+                        });
+                    }
+                } catch (error) {
+                    sessionLog(info.sessionID, "event completion clock persistence failed:", error);
+                }
+            }
             if (!hasKnownUsage) {
                 sessionLog(
                     info.sessionID,
@@ -631,56 +753,81 @@ export function createEventHandler(deps: EventHandlerDeps) {
 
             try {
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
-                const updates: Partial<SessionMeta> & { lastResponseTime: number } = {
-                    lastResponseTime: now,
-                };
-
-                if (typeof deps.config.cache_ttl === "string") {
-                    updates.cacheTtl = resolveCacheTtl(deps.config.cache_ttl, modelKey);
-                } else if (modelKey) {
-                    updates.cacheTtl = resolveCacheTtl(deps.config.cache_ttl, modelKey);
+                const updates: Partial<SessionMeta> = {};
+                // last_response_time is the idle clock for the provider cache:
+                // the scheduler's TTL execute and the ttl_idle HARD fold both
+                // measure from it. Usage proves the provider served a request;
+                // successful completion above also proves it when usage is absent. OpenCode
+                // creates the assistant message for a new request with zero
+                // tokens before it runs that request's transform, and a request
+                // the provider refuses (a spent quota) ends with zero tokens.
+                // Stamping on those made the first pass after a long idle look
+                // like it followed a fresh response, so it deferred and queued
+                // drops never applied.
+                if (hasUsageTokens && !responseFailed) {
+                    updates.lastResponseTime = responseTime;
                 }
 
-                if (hasUsageTokens) {
-                    const totalInputTokens =
-                        (info.tokens?.input ?? 0) +
-                        (info.tokens?.cache?.read ?? 0) +
-                        (info.tokens?.cache?.write ?? 0);
-                    const baseGeometry = resolveContextWindowGeometry(
-                        info.providerID,
-                        info.modelID,
-                    );
-                    const trustedAbsoluteWall =
-                        baseGeometry && hasTrustedAbsoluteWall(baseGeometry)
-                            ? baseGeometry.derivation.absoluteWall
-                            : undefined;
-                    const usageReadingValid =
-                        trustedAbsoluteWall === undefined ||
-                        totalInputTokens <= trustedAbsoluteWall;
-                    if (!usageReadingValid && trustedAbsoluteWall !== undefined) {
-                        const refusalKey = `${info.sessionID}|${modelKey ?? "unknown"}`;
-                        if (!usageRefusalLogSeen.has(refusalKey)) {
-                            usageRefusalLogSeen.add(refusalKey);
-                            sessionLog(
-                                info.sessionID,
-                                `usage accounting refused reading ${totalInputTokens} above trusted absolute wall ${trustedAbsoluteWall}; sample ignored`,
-                            );
-                        }
-                    }
-                    const pressureInputTokens = usageReadingValid ? totalInputTokens : 0;
-                    // Auth is provably live now (a request returned usage), so
-                    // re-warm the model-limit cache once per process to overwrite
-                    // any stale pre-auth limit (e.g. gpt-5.5 cached at the raw
-                    // 922k before the OAuth 272k downshift applied, #179). No-op
-                    // after the first successful warm.
-                    if (deps.client) {
-                        await refreshModelLimitsAfterAuthOnce(
-                            deps.client as Parameters<typeof refreshModelLimitsAfterAuthOnce>[0],
+                if (typeof deps.config.cache_ttl === "string") {
+                    updates.cacheTtl = resolveSessionCacheTtl(
+                        deps.db,
+                        info.sessionID,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value;
+                } else if (modelKey) {
+                    updates.cacheTtl = resolveSessionCacheTtl(
+                        deps.db,
+                        info.sessionID,
+                        deps.config.cache_ttl,
+                        modelKey,
+                    ).value;
+                }
+
+                const totalInputTokens =
+                    (info.tokens?.input ?? 0) +
+                    (info.tokens?.cache?.read ?? 0) +
+                    (info.tokens?.cache?.write ?? 0);
+                const baseGeometry = hasUsageTokens
+                    ? resolveContextWindowGeometry(info.providerID, info.modelID)
+                    : undefined;
+                const trustedAbsoluteWall =
+                    baseGeometry && hasTrustedAbsoluteWall(baseGeometry)
+                        ? baseGeometry.derivation.absoluteWall
+                        : undefined;
+                // Provider usage is the prompt size of a request the provider
+                // accepted, so it is real pressure at any size. The trusted
+                // window is configured (overlay or provider metadata) and can be
+                // smaller than what the model actually serves. A reading past it
+                // is real overflow of the user's limit: it counts in full
+                // against the configured usable limit (pressure above 100%
+                // drives the emergency band) but is not recorded as proven
+                // capacity, which would silently widen the configured window.
+                const aboveTrustedWall =
+                    trustedAbsoluteWall !== undefined && totalInputTokens > trustedAbsoluteWall;
+                const aboveWallLogKey = `${info.sessionID}|${modelKey ?? "unknown"}`;
+                if (hasUsageTokens && aboveTrustedWall) {
+                    if (!usageAboveWallLogSeen.has(aboveWallLogKey)) {
+                        usageAboveWallLogSeen.add(aboveWallLogKey);
+                        sessionLog(
+                            info.sessionID,
+                            `provider usage ${totalInputTokens} exceeds configured window ${trustedAbsoluteWall}; counted as real pressure against the configured limit`,
                         );
                     }
+                } else {
+                    usageAboveWallLogSeen.delete(aboveWallLogKey);
+                }
+                // Set when this reading needs a model-limit refresh. It runs only
+                // after the reading is recorded (see below).
+                let refreshLimitsAfterRecording: (() => Promise<void>) | undefined;
+                if (hasUsageTokens) {
+                    const pressureInputTokens = totalInputTokens;
                     const requestSucceeded = !messageHadOverflowError;
-                    const successfulUsageProof = requestSucceeded && usageReadingValid;
-                    if (successfulUsageProof) {
+                    const successfulUsageProof = requestSucceeded && !aboveTrustedWall;
+                    // A limit learned from an earlier overflow error is stale
+                    // once the provider accepts a larger request, whatever the
+                    // configured window says, so it is cleared.
+                    if (requestSucceeded) {
                         const rawOverflow = getOverflowState(deps.db, info.sessionID);
                         const detectedLimitMatchesModel =
                             rawOverflow.detectedContextLimitModelKey === null ||
@@ -700,38 +847,155 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         }
                     }
 
-                    let contextLimit = resolveContextLimit(info.providerID, info.modelID, {
-                        db: deps.db,
-                        sessionID: info.sessionID,
-                    });
                     const sessionMeta = getOrCreateSessionMeta(deps.db, info.sessionID);
-                    const observedSafeInputTokens = sessionMeta.observedSafeInputTokens ?? 0;
+                    // A delayed usage update may follow a newer usage-less reply.
+                    // It must not move the independently tracked response clock back.
+                    if (!responseFailed) {
+                        updates.lastResponseTime = Math.max(
+                            sessionMeta.lastResponseTime,
+                            responseTime,
+                        );
+                    }
+                    // A proven floor belongs to the model whose accepted request
+                    // proved it, the same rule resolveContextLimit applies. Carrying
+                    // another model's floor over would give this model a limit none
+                    // of its own requests supports.
+                    const observedSafeInputTokens = provenFloorForModel(
+                        sessionMeta.observedSafeInputTokens,
+                        sessionMeta.lastObservedModelKey,
+                        modelKey,
+                    );
                     const provenSafeInputTokens = successfulUsageProof
                         ? Math.max(observedSafeInputTokens, pressureInputTokens)
                         : observedSafeInputTokens;
-                    let catalogLimit =
+                    const readCatalogLimit = () =>
                         info.providerID && info.modelID
                             ? getSdkContextLimit(info.providerID, info.modelID)
                             : undefined;
+                    const resolvePressure = () => {
+                        const resolvedLimit = resolveContextLimit(info.providerID, info.modelID, {
+                            db: deps.db,
+                            sessionID: info.sessionID,
+                        });
+                        const contextLimit = successfulUsageProof
+                            ? Math.max(resolvedLimit, provenSafeInputTokens)
+                            : resolvedLimit;
+                        return {
+                            contextLimit,
+                            catalogLimit: readCatalogLimit(),
+                            percentage:
+                                contextLimit > 0 ? (pressureInputTokens / contextLimit) * 100 : 0,
+                        };
+                    };
 
+                    const newestMessageId = newestUsageMessageIdBySession.get(info.sessionID);
                     if (
-                        successfulUsageProof &&
-                        catalogLimit !== undefined &&
-                        catalogLimit < provenSafeInputTokens
+                        info.messageID !== undefined &&
+                        newestMessageId !== undefined &&
+                        info.messageID < newestMessageId
                     ) {
-                        const oldLimit = catalogLimit;
+                        sessionLog(
+                            info.sessionID,
+                            `event message.updated: usage ${pressureInputTokens} from ${info.messageID} arrived after newer message ${newestMessageId}; keeping the newer reading`,
+                        );
+                        // Nothing is written: the newer event already recorded
+                        // its usage and a later response time.
+                        return;
+                    }
+                    if (info.messageID !== undefined) {
+                        newestUsageMessageIdBySession.set(info.sessionID, info.messageID);
+                    }
+
+                    const recordPressure = (pressure: ReturnType<typeof resolvePressure>) => {
+                        noteContextLimitResolution(info.sessionID, {
+                            modelKey: modelKey ?? null,
+                            limit: pressure.contextLimit,
+                            catalog: pressure.catalogLimit ?? null,
+                            detected: getOverflowState(deps.db, info.sessionID, modelKey)
+                                .detectedContextLimit,
+                            provenFloor: successfulUsageProof
+                                ? provenSafeInputTokens
+                                : observedSafeInputTokens,
+                        });
+                        sessionLog(
+                            info.sessionID,
+                            `event message.updated: totalInputTokens=${pressureInputTokens} contextLimit=${pressure.contextLimit} percentage=${pressure.percentage.toFixed(1)}%`,
+                        );
+                        const entry = {
+                            usage: {
+                                percentage: pressure.percentage,
+                                inputTokens: pressureInputTokens,
+                            },
+                            updatedAt: now,
+                            lastResponseTime: now,
+                            hasUsageTokens: true,
+                        };
+                        deps.contextUsageMap.set(info.sessionID, entry);
+
+                        const historianFailureState = getHistorianFailureState(
+                            deps.db,
+                            info.sessionID,
+                        );
+                        if (historianFailureState.failureCount > 0 && pressure.percentage < 90) {
+                            clearHistorianFailureState(deps.db, info.sessionID);
+                            sessionLog(
+                                info.sessionID,
+                                `event message.updated: cleared historian failure state at ${pressure.percentage.toFixed(1)}%`,
+                            );
+                        }
+                        return entry;
+                    };
+
+                    // The reading is recorded before anything is awaited.
+                    // OpenCode does not wait for this handler before it runs the
+                    // next transform, so a reading recorded after a network
+                    // round trip can miss the pass it describes. That pass is
+                    // the one that must see an over-limit reading to force
+                    // compaction.
+                    const recorded = resolvePressure();
+                    const recordedEntry = recordPressure(recorded);
+
+                    updates.lastContextPercentage = recorded.percentage;
+                    updates.lastInputTokens = pressureInputTokens;
+                    updates.lastUsageContextLimit = recorded.contextLimit;
+                    updates.lastObservedModelKey = modelKey ?? null;
+                    // Stored together with the model key above, so a switch to a
+                    // model with no proof of its own stores no floor for it.
+                    updates.observedSafeInputTokens = successfulUsageProof
+                        ? provenSafeInputTokens
+                        : observedSafeInputTokens;
+
+                    // The model-limit refresh runs after the reading is recorded.
+                    // A limit it changes is applied by recording this reading
+                    // again, and only while it is still the session's latest
+                    // reading. A transform pass reads its usage and its model
+                    // limits together, with nothing awaited in between, so every
+                    // pass sees either the reading before the refresh or the one
+                    // after it, never a mix of the two.
+                    refreshLimitsAfterRecording = async () => {
+                        // Auth is provably live now (a request returned usage), so
+                        // re-warm the model-limit cache once per process to
+                        // overwrite any stale pre-auth limit (e.g. gpt-5.5 cached
+                        // at the raw 922k before the OAuth 272k downshift applied,
+                        // #179). No-op after the first successful warm.
                         if (deps.client) {
+                            await refreshModelLimitsAfterAuthOnce(
+                                deps.client as Parameters<
+                                    typeof refreshModelLimitsAfterAuthOnce
+                                >[0],
+                            );
+                        }
+                        let catalogLimit = readCatalogLimit();
+                        const catalogBelowProof =
+                            successfulUsageProof &&
+                            catalogLimit !== undefined &&
+                            catalogLimit < provenSafeInputTokens;
+                        if (catalogBelowProof && deps.client) {
+                            const oldLimit = catalogLimit;
                             await refreshModelLimitsFromApi(
                                 deps.client as Parameters<typeof refreshModelLimitsFromApi>[0],
                             );
-                            catalogLimit =
-                                info.providerID && info.modelID
-                                    ? getSdkContextLimit(info.providerID, info.modelID)
-                                    : undefined;
-                            contextLimit = resolveContextLimit(info.providerID, info.modelID, {
-                                db: deps.db,
-                                sessionID: info.sessionID,
-                            });
+                            catalogLimit = readCatalogLimit();
                             if (
                                 catalogLimit !== undefined &&
                                 catalogLimit >= provenSafeInputTokens
@@ -743,7 +1007,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             }
                         }
 
+                        const refreshedUpdates: Partial<SessionMeta> = {};
+                        // A newer reading, or a transform that cleared this one,
+                        // replaces the map entry; either way this reading is no
+                        // longer the one to update.
                         if (
+                            catalogLimit !== recorded.catalogLimit &&
+                            deps.contextUsageMap.get(info.sessionID) === recordedEntry
+                        ) {
+                            const refreshed = resolvePressure();
+                            recordPressure(refreshed);
+                            refreshedUpdates.lastContextPercentage = refreshed.percentage;
+                            refreshedUpdates.lastUsageContextLimit = refreshed.contextLimit;
+                        }
+
+                        if (
+                            catalogBelowProof &&
                             catalogLimit !== undefined &&
                             catalogLimit < provenSafeInputTokens &&
                             !sessionMeta.cacheAlertSent
@@ -756,47 +1035,14 @@ export function createEventHandler(deps: EventHandlerDeps) {
                             );
                             // Retry only if the RPC notification could not be enqueued.
                             if (delivery === "sent") {
-                                updates.cacheAlertSent = true;
+                                refreshedUpdates.cacheAlertSent = true;
                             }
                         }
-                    }
 
-                    if (successfulUsageProof) {
-                        contextLimit = Math.max(contextLimit, provenSafeInputTokens);
-                    }
-                    const percentage =
-                        contextLimit > 0 ? (pressureInputTokens / contextLimit) * 100 : 0;
-                    sessionLog(
-                        info.sessionID,
-                        `event message.updated: totalInputTokens=${pressureInputTokens} contextLimit=${contextLimit} percentage=${percentage.toFixed(1)}%`,
-                    );
-
-                    deps.contextUsageMap.set(info.sessionID, {
-                        usage: {
-                            percentage,
-                            inputTokens: pressureInputTokens,
-                        },
-                        updatedAt: now,
-                        lastResponseTime: now,
-                        hasUsageTokens: true,
-                    });
-
-                    updates.lastContextPercentage = percentage;
-                    updates.lastInputTokens = pressureInputTokens;
-                    updates.lastUsageContextLimit = contextLimit;
-                    updates.lastObservedModelKey = modelKey ?? null;
-                    if (successfulUsageProof) {
-                        updates.observedSafeInputTokens = provenSafeInputTokens;
-                    }
-
-                    const historianFailureState = getHistorianFailureState(deps.db, info.sessionID);
-                    if (historianFailureState.failureCount > 0 && percentage < 90) {
-                        clearHistorianFailureState(deps.db, info.sessionID);
-                        sessionLog(
-                            info.sessionID,
-                            `event message.updated: cleared historian failure state at ${percentage.toFixed(1)}%`,
-                        );
-                    }
+                        if (Object.keys(refreshedUpdates).length > 0) {
+                            updateSessionMeta(deps.db, info.sessionID, refreshedUpdates);
+                        }
+                    };
 
                     // NOTE: the historian trigger decision used to run here on
                     // every message.updated event — but this handler has no
@@ -812,6 +1058,9 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
 
                 updateSessionMeta(deps.db, info.sessionID, updates);
+                if (refreshLimitsAfterRecording) {
+                    await refreshLimitsAfterRecording();
+                }
             } catch (error) {
                 sessionLog(info.sessionID, "event message.updated persistence failed:", error);
             }
@@ -992,6 +1241,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
             resetDegradedCacheCount(sessionId);
             deps.onSessionCacheInvalidated?.(sessionId);
             deps.contextUsageMap.delete(sessionId);
+            newestUsageMessageIdBySession.delete(sessionId);
             deps.tagger.cleanup(sessionId);
             clearTransformDecisionSession(sessionId);
             clearMessageTokensCache(sessionId);

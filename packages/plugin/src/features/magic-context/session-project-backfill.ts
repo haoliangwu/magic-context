@@ -3,8 +3,9 @@ import { existsSync } from "node:fs";
 import { getHarness } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
+import { withoutSqliteTransformPass, withSqliteBackgroundWriter } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
-import { resolveProjectIdentity } from "./memory/project-identity";
+import { isUserHomeDirectory, resolveProjectIdentityForSession } from "./memory/project-identity";
 import { recordSessionProjectIdentity } from "./session-project-storage";
 
 const LEASE_TTL_MS = 10 * 60 * 1000;
@@ -48,10 +49,13 @@ export interface SessionProjectBackfillStateRow {
 }
 
 interface RunSessionProjectBackfillOptions {
-    resolveIdentity?: (directory: string) => string | Promise<string>;
+    resolveIdentity?: (directory: string) => string | undefined | Promise<string | undefined>;
     now?: () => number;
     yieldFn?: () => Promise<void>;
     holderId?: string;
+    /** Separate a new one-time discovery pass from an older completed pass. */
+    leaseKey?: string;
+    allowHomeProject?: boolean;
 }
 
 function ensureBackfillStateTable(db: Database): void {
@@ -78,8 +82,9 @@ function ensureBackfillStateTable(db: Database): void {
 }
 
 function withImmediateTransaction<T>(db: Database, fn: () => T): T {
+    withoutSqliteTransformPass(() => withSqliteBackgroundWriter(() => db.exec("BEGIN IMMEDIATE")));
+    // BEGIN has acquired the write lock; exclude time waiting for other writers.
     const transactionStartedAt = performance.now();
-    db.exec("BEGIN IMMEDIATE");
     try {
         const result = fn();
         db.exec("COMMIT");
@@ -261,10 +266,25 @@ export async function runSessionProjectBackfill(
     source: SessionProjectBackfillSource,
     options: RunSessionProjectBackfillOptions = {},
 ): Promise<BackfillResult> {
+    // Every write in discovery, including implicit upserts, is background work.
+    // A busy acquisition leaves the lease/state available for the next pass.
+    return withoutSqliteTransformPass(() =>
+        withSqliteBackgroundWriter(() => runSessionProjectBackfillPass(db, source, options)),
+    );
+}
+
+async function runSessionProjectBackfillPass(
+    db: Database,
+    source: SessionProjectBackfillSource,
+    options: RunSessionProjectBackfillOptions = {},
+): Promise<BackfillResult> {
     const startedAt = performance.now();
     const harness = getHarness();
     const now = options.now ?? Date.now;
-    const resolveIdentity = options.resolveIdentity ?? resolveProjectIdentity;
+    const resolveIdentity =
+        options.resolveIdentity ??
+        ((directory: string) =>
+            resolveProjectIdentityForSession(directory, options.allowHomeProject));
     const yieldFn = options.yieldFn ?? defaultYieldFn;
     const holderId = options.holderId ?? randomUUID();
     const readPage = createPageReader(source);
@@ -280,7 +300,8 @@ export async function runSessionProjectBackfill(
         durationMs: 0,
     };
 
-    const leaseStatus = acquireBackfillLease(db, harness, holderId, now());
+    const leaseKey = options.leaseKey ?? harness;
+    const leaseStatus = acquireBackfillLease(db, leaseKey, holderId, now());
     if (leaseStatus !== "acquired") {
         result.status = leaseStatus;
         result.durationMs = performance.now() - startedAt;
@@ -293,9 +314,9 @@ export async function runSessionProjectBackfill(
         return result;
     };
     const yieldAndRenew = async (): Promise<boolean> => {
-        if (!renewBackfillLease(db, harness, holderId, now())) return false;
+        if (!renewBackfillLease(db, leaseKey, holderId, now())) return false;
         await yieldFn();
-        return renewBackfillLease(db, harness, holderId, now());
+        return renewBackfillLease(db, leaseKey, holderId, now());
     };
 
     const existenceCache = new Map<string, boolean>();
@@ -311,7 +332,7 @@ export async function runSessionProjectBackfill(
             sourcePage = await readPage(afterSessionId, SESSION_PAGE_SIZE);
         } catch (error) {
             try {
-                if (!markBackfillRetryPending(db, harness, holderId, now())) {
+                if (!markBackfillRetryPending(db, leaseKey, holderId, now())) {
                     log("[session-projects] backfill lease changed before failure cleanup");
                 }
             } catch (releaseError) {
@@ -338,7 +359,10 @@ export async function runSessionProjectBackfill(
                 result.alreadyMappedSessions += 1;
             } else {
                 result.unmappedSessions += 1;
-                if (!session.directory) {
+                if (
+                    !session.directory ||
+                    (!options.allowHomeProject && isUserHomeDirectory(session.directory))
+                ) {
                     result.skippedEmptyDirectories += 1;
                 } else {
                     const stillExists =
@@ -358,13 +382,17 @@ export async function runSessionProjectBackfill(
                             identityResolutionsSinceYield += 1;
                             // A synchronous resolver can block past the lease deadline.
                             // Revalidate ownership before persisting its result.
-                            if (!renewBackfillLease(db, harness, holderId, now())) {
+                            if (!renewBackfillLease(db, leaseKey, holderId, now())) {
                                 return finishWithLostLease();
                             }
-                            identityCache.set(session.directory, identity);
+                            if (identity) identityCache.set(session.directory, identity);
                         }
-                        recordSessionProjectIdentity(db, session.sessionId, identity);
-                        result.backfilledSessions += 1;
+                        if (identity) {
+                            recordSessionProjectIdentity(db, session.sessionId, identity);
+                            result.backfilledSessions += 1;
+                        } else {
+                            result.skippedEmptyDirectories += 1;
+                        }
                     }
                 }
             }
@@ -382,11 +410,11 @@ export async function runSessionProjectBackfill(
     const hasSkippedSessions =
         result.skippedDeadDirectories > 0 || result.skippedEmptyDirectories > 0;
     if (hasSkippedSessions) {
-        if (!markBackfillRetryPending(db, harness, holderId, now())) {
+        if (!markBackfillRetryPending(db, leaseKey, holderId, now())) {
             return finishWithLostLease();
         }
         result.status = "retry_pending";
-    } else if (!markBackfillCompleted(db, harness, holderId, now())) {
+    } else if (!markBackfillCompleted(db, leaseKey, holderId, now())) {
         return finishWithLostLease();
     }
 

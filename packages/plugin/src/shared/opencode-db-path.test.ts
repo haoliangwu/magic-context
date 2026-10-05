@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,12 +10,14 @@ import {
     formatOpenCodeDbDoctorLine,
     formatOpenCodeDbMissingBanner,
     formatOpenCodeDbMissingStatusLine,
+    hasV1MessageTables,
     openCodeDbPathExists,
     resetOpenCodeDbPathStateForTesting,
     resolveOpenCodeDbPath,
     sourceOpenCodeDatabaseFilename,
 } from "./opencode-db-path";
 import { Database } from "./sqlite";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 const ORIGINAL_ENV = {
     XDG_DATA_HOME: process.env.XDG_DATA_HOME,
@@ -41,7 +43,7 @@ afterEach(() => {
 });
 
 function useDataHome(): { dataHome: string; openCodeDir: string } {
-    const dataHome = mkdtempSync(join(tmpdir(), "opencode-db-path-"));
+    const dataHome = createTestTempDirFromPath(join(tmpdir(), "opencode-db-path-"));
     const openCodeDir = join(dataHome, "opencode");
     mkdirSync(openCodeDir, { recursive: true });
     tempDirs.push(dataHome);
@@ -196,6 +198,24 @@ describe("resolveOpenCodeDbPath", () => {
         });
     });
 
+    it("takes an absolute v2 OPENCODE_DB as is and resolves a relative one against the data dir", () => {
+        // OpenCode 2 resolves the database with `path.resolve(data, OPENCODE_DB)`;
+        // verified against the 2.0.15 binary's `opencode debug paths db`.
+        const { dataHome, openCodeDir } = useDataHome();
+        const absolute = join(dataHome, "elsewhere", "custom.db");
+        expect(resolveOpenCodeDbPath("v2", { dataHome, env: { OPENCODE_DB: absolute } })).toEqual({
+            path: absolute,
+            source: "OPENCODE_DB",
+            channel: null,
+        });
+        expect(
+            resolveOpenCodeDbPath("v2", { dataHome, env: { OPENCODE_DB: "nested/../rel.db" } }),
+        ).toEqual({ path: join(openCodeDir, "rel.db"), source: "OPENCODE_DB", channel: null });
+        expect(resolveOpenCodeDbPath("v2", { dataHome, env: { OPENCODE_DB: ":memory:" } })).toEqual(
+            { path: ":memory:", source: "OPENCODE_DB", channel: null },
+        );
+    });
+
     it("detects store generations and refuses a mismatched schema before reading", () => {
         const { openCodeDir } = useDataHome();
         const v1Path = join(openCodeDir, "v1.db");
@@ -250,6 +270,83 @@ describe("resolveOpenCodeDbPath", () => {
             );
         } finally {
             live.close();
+        }
+    });
+
+    it("reports v1 message capability on a migrated store accepted by both readers", () => {
+        const { openCodeDir } = useDataHome();
+        const migratedPath = join(openCodeDir, "migrated-v2.db");
+        const migrated = new Database(migratedPath);
+        try {
+            // Captured from an OpenCode 2.0.7 store that the v2 host migrated from a 1.18.x
+            // store: it keeps the v1 `message`/`part` tables beside its own schema, so it
+            // carries BOTH generations. `session_v2` is written only by an OpenCode 2 host
+            // (the 1.18.31 binary never references it). Keep this table list as observed.
+            for (const table of [
+                "account",
+                "account_state",
+                "control_account",
+                "credential",
+                "event",
+                "event_sequence",
+                "instruction_blob",
+                "instruction_entry",
+                "instruction_state",
+                "kv",
+                "message",
+                "migration",
+                "part",
+                "permission",
+                "project",
+                "project_directory",
+                "session",
+                "session_inbox",
+                "session_message",
+                "session_pending",
+                "session_share",
+                "session_v2",
+                "todo",
+                "workspace",
+                "worktree",
+            ]) {
+                migrated.exec(`CREATE TABLE ${table}(id TEXT)`);
+            }
+            expect(hasV1MessageTables(migrated)).toBe(true);
+            expect(() => assertOpenCodeStoreGeneration(migrated, "v2", migratedPath)).not.toThrow();
+            expect(() => assertOpenCodeStoreGeneration(migrated, "v1", migratedPath)).not.toThrow();
+        } finally {
+            migrated.close();
+        }
+    });
+
+    it("reads a fresh OpenCode 2 store as v2 only", () => {
+        const { openCodeDir } = useDataHome();
+        const freshV2Path = join(openCodeDir, "fresh-v2.db");
+        const freshV2 = new Database(freshV2Path);
+        try {
+            // Captured from a new OpenCode 2.0.7 data directory: no v1 message tables.
+            for (const table of [
+                "account",
+                "event",
+                "migration",
+                "permission",
+                "project",
+                "session_inbox",
+                "session_message",
+                "session_pending",
+                "session_v2",
+                "workspace",
+            ]) {
+                freshV2.exec(`CREATE TABLE ${table}(id TEXT)`);
+            }
+            expect(hasV1MessageTables(freshV2)).toBe(false);
+            expect(detectOpenCodeStoreGeneration(freshV2)).toBe("v2");
+            expect(() => assertOpenCodeStoreGeneration(freshV2, "v2", freshV2Path)).not.toThrow();
+            expect(() => assertOpenCodeStoreGeneration(freshV2, "v1", freshV2Path)).toThrow(
+                "expected v1, found v2",
+            );
+        } finally {
+            freshV2.close();
         }
     });
 

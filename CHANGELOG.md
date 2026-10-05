@@ -19,6 +19,10 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Wh
 - `PATCH` bumps (`0.21.6` → `0.21.7`) carry bug fixes and small enhancements that don't change config shape or break existing setups.
 - Migrations that change config shape always ship with an in-memory shim so existing configs keep working until you run `doctor` to rewrite them on disk.
 
+## Unreleased
+
+The prompt surface is now split cleanly between desk-oriented system guidance and tool/parameter contracts: agents get a shorter orientation with explicit filing, search, pinboard, tray, and stamping triggers, while each tool owns its operational details. Dreamer bulk memory enumeration moved from `ctx_memory(action="list")` to the dreamer-only `ctx_memory_list` tool, which never appears in a primary provider tool list. Because the system prompt and tool schemas change, every existing session pays one prompt-cache rewrite on its first turn after upgrading.
+
 ## Highlights by release line
 
 ### 0.21.x (current)

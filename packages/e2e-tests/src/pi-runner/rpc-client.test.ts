@@ -1,10 +1,14 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { existsSync } from "node:fs";
+import { createPiIsolatedEnv } from "./spawn";
+import { cleanupE2ETempDir } from "../temp-dir";
 import { PassThrough } from "node:stream";
 import {
   attachStrictJsonlReader,
   PiRpcProtocol,
+  PiRpcClient,
   serializeRpcMessage,
   type PiRpcEvent,
 } from "./rpc-client";
@@ -59,5 +63,37 @@ describe("Pi RPC protocol", () => {
     protocol.dispatchLine(JSON.stringify({ type: "agent_end", messages: [] }));
 
     await expect(wait).resolves.toMatchObject({ type: "agent_end" });
+  });
+});
+
+
+describe("Pi RPC fixture ownership", () => {
+  it("removes an owned environment even when startup never reached spawn", async () => {
+    const client = new PiRpcClient({ mockProviderURL: "http://127.0.0.1:1" });
+    expect(existsSync(client.env.baseDir)).toBe(true);
+    await client.shutdown();
+    expect(existsSync(client.env.baseDir)).toBe(false);
+  });
+
+  it("preserves owned data for a restart but removes it on final shutdown", async () => {
+    const client = new PiRpcClient({ mockProviderURL: "http://127.0.0.1:1" });
+    try {
+      await client.shutdown(2_000, true);
+      expect(existsSync(client.env.baseDir)).toBe(true);
+    } finally {
+      await client.shutdown();
+    }
+    expect(existsSync(client.env.baseDir)).toBe(false);
+  });
+
+  it("does not remove a caller-owned environment on shutdown", async () => {
+    const env = createPiIsolatedEnv();
+    const client = new PiRpcClient({ mockProviderURL: "http://127.0.0.1:1", env });
+    try {
+      await client.shutdown();
+      expect(existsSync(env.baseDir)).toBe(true);
+    } finally {
+      cleanupE2ETempDir(env.baseDir);
+    }
   });
 });

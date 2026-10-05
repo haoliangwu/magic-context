@@ -45,7 +45,16 @@ export interface PluginCacheInfo {
     exists: boolean;
     /** Approximate cache size in bytes (0 when missing). */
     sizeBytes: number;
+    /** Which cache this is, when a harness reports more than one. */
+    label?: string;
+    /**
+     * Remove the cache, applying any harness-specific guard (such as refusing
+     * while the host is running). Without it, `doctor --clear` deletes `path`.
+     */
+    clear?: () => PluginCacheClearResult;
 }
+
+export type PluginCacheClearResult = { cleared: true } | { cleared: false; reason: string };
 
 /**
  * The full adapter contract. Implementations live next to this file.
@@ -89,8 +98,11 @@ export interface HarnessAdapter {
      */
     getInstallHint(): string;
 
-    /** Path to the harness's plugin cache, if it has one. */
-    getPluginCacheInfo(): PluginCacheInfo;
+    /**
+     * The harness's plugin caches. Usually one; a harness whose host versions
+     * keep different cache layouts reports each layout that exists.
+     */
+    getPluginCacheInfo(): PluginCacheInfo[];
 
     /** Path to the harness-specific log file (the plugin writes there). */
     getLogPath(): string;

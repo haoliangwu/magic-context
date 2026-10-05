@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     type CompartmentEventInput,
     getCompartmentEvents,
@@ -14,7 +15,7 @@ let tempHome: string;
 
 beforeEach(() => {
     prevDataHome = process.env.XDG_DATA_HOME;
-    tempHome = mkdtempSync(join(tmpdir(), "mc-events-"));
+    tempHome = createTestTempDirFromPath(join(tmpdir(), "mc-events-"));
     process.env.XDG_DATA_HOME = tempHome;
     // openDatabase() requires the cortexkit/magic-context parent dir to exist.
     mkdirSync(join(tempHome, "cortexkit", "magic-context"), { recursive: true });

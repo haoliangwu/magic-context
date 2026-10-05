@@ -235,7 +235,6 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 | `/ctx-status` | デバッグビュー：tags、pending drops、cache TTL、nudge 状態、historian 進捗、区画カバレッジ、履歴予算 |
 | `/ctx-flush` | キュー内のすべての操作を即時に強制実行し、cache TTL を迂回 |
 | `/ctx-recomp` | 生の履歴から区画を再構築（`start-end` 範囲を受け付けます）。保存状態がおかしく見えるときに使用 |
-| `/ctx-session-upgrade` | このセッションを最新の履歴形式へアップグレード：区画を再構築し、プロジェクトメモリを移行 |
 | `/ctx-dream` | 必要に応じて dreamer メンテナンスを実行：メモリ、docs、smart notes、user-profile review を維持 |
 
 ---

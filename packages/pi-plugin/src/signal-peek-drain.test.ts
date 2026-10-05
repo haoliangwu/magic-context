@@ -306,9 +306,14 @@ describe("source contract: peek-then-drain in before_agent_start (system prompt)
 	});
 
 	test("message_end indexes the ended assistant by deferred id lookup", () => {
-		expect(code).toContain("const messageId = endedMsg.id");
-		expect(code).toContain("readPiSessionMessages(ctx)");
-		expect(code).toContain("message.id === messageId");
+		// The lookup itself is exercised in message-end-index-pi.test.ts.
+		expect(code).toContain(
+			"schedulePiAssistantIndexOnMessageEnd(db, sessionId, event.message",
+		);
+		expect(code).toContain("readBranch: () => {");
+		expect(code).not.toContain(
+			"readMessages: () => readPiSessionMessages(ctx)",
+		);
 	});
 
 	test("runtime project identity resolves from ctx.cwd and tracks prompt path sessions", () => {

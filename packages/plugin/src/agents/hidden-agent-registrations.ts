@@ -1,4 +1,4 @@
-import { applyDisallowedTools, buildAllowOnlyPermission } from "./permissions";
+import { buildAllowOnlyPermission } from "./permissions";
 
 /**
  * Hidden-agent registration builders.
@@ -24,9 +24,8 @@ import { applyDisallowedTools, buildAllowOnlyPermission } from "./permissions";
 
 // Clamp a user-provided step override to the hidden-agent's built-in cap (loop
 // insurance — see buildHiddenAgentConfig). Caps live as inline literals in
-// buildHiddenAgentRegistrations (historian=40, dreamer=150): a handful
-// of tool calls for the historian, a real multi-step maintenance loop
-// for the dreamer.
+// buildHiddenAgentRegistrations (historian=4, dreamer=150): historians need one
+// text answer with a small safety margin, while the dreamer needs a maintenance loop.
 function clampHiddenAgentStepLimit(value: unknown, cap: number): number {
     return typeof value === "number" && Number.isFinite(value) ? Math.min(value, cap) : cap;
 }
@@ -78,8 +77,8 @@ export interface HiddenAgentRegistration {
  * Hoisted function declaration: returns the hidden-agent registrations with
  * INLINE id / allow-list / step-cap literals (see {@link HiddenAgentRegistration}
  * for why these must not come from module-level `var` consts). Prompts and
- * computed overrides are passed in by the caller; the historian disallow filter
- * is applied here against an inline default allow-list.
+ * computed overrides are passed in by the caller. Historians transform only
+ * the text supplied in their prompt and never receive tools.
  */
 export function buildHiddenAgentRegistrations(args: {
     dreamerPrompt: string | undefined;
@@ -89,12 +88,9 @@ export function buildHiddenAgentRegistrations(args: {
     historianEditorPrompt: string | undefined;
     dreamerOverrides?: Record<string, unknown>;
     historianOverrides?: Record<string, unknown>;
+    /** Legacy config input retained for compatibility; historians always have zero tools. */
     historianDisallowed: readonly string[];
 }): HiddenAgentRegistration[] {
-    const historianAllowedTools = applyDisallowedTools(
-        ["read", "aft_outline", "aft_zoom", "aft_search"],
-        args.historianDisallowed,
-    );
     return [
         {
             id: "dreamer",
@@ -102,10 +98,10 @@ export function buildHiddenAgentRegistrations(args: {
             hidden: true,
             description: HIDDEN_AGENT_DESCRIPTION,
             prompt: args.dreamerPrompt,
-            // CURATE-ONLY now. Curate edits the memory store via ctx_memory and
-            // never reads code (a separate verify task owns memory-vs-code
-            // correctness), so it needs only ctx_memory — not the former
-            // bash/write/edit/read/aft/ctx_search/ctx_note surface. maintain-docs
+            // Curate receives its category snapshot in the first message and edits
+            // through ctx_memory; it never reads code because a separate verify task
+            // owns memory-vs-code correctness. No former bash/write/edit/read/aft/
+            // ctx_search/ctx_note surface remains. maintain-docs
             // and review-user-memories moved to their own scoped agents below.
             // (Inline literal — kept byte-identical to DREAMER_CURATE_ALLOWED_TOOLS
             // by agent-registration-drift.test.ts; see the module header for why
@@ -126,23 +122,11 @@ export function buildHiddenAgentRegistrations(args: {
             hidden: true,
             description: HIDDEN_AGENT_DESCRIPTION,
             prompt: args.dreamerPrompt,
-            // maintain-docs: explore code + write/edit ARCHITECTURE.md/STRUCTURE.md
-            // + bash (git log, find). NO ctx_memory/ctx_search/ctx_note — it edits
-            // docs, never the memory store. (Inline literal — kept byte-identical to
-            // DREAMER_DOCS_ALLOWED_TOOLS by agent-registration-drift.test.ts.)
-            allowedTools: [
-                "read",
-                "grep",
-                "glob",
-                "bash",
-                "write",
-                "edit",
-                "aft_outline",
-                "aft_zoom",
-                "aft_search",
-            ],
-            // Docs maintenance reads the tree and writes two files — a bounded loop,
-            // not the whole-pool 150.
+            // Documentation proposals may inspect source files but cannot mutate them.
+            // Keep this list synchronized with DREAMER_DOCS_ALLOWED_TOOLS and locked against overrides.
+            allowedTools: ["read", "grep", "glob", "aft_outline", "aft_zoom", "aft_search"],
+            // Documentation investigation reads the repository tree in a bounded loop,
+            // unlike whole-memory-pool tasks with a 150-step limit.
             maxSteps: 60,
             overrides: args.dreamerOverrides,
             // Lock so a user override can't add the memory surface back.
@@ -261,9 +245,11 @@ export function buildHiddenAgentRegistrations(args: {
             hidden: true,
             description: HIDDEN_AGENT_DESCRIPTION,
             prompt: args.historianPrompt,
-            allowedTools: historianAllowedTools,
-            maxSteps: 40,
+            // Each pass emits one XML answer; repairs and edits use separate prompts.
+            allowedTools: [],
+            maxSteps: 4,
             overrides: args.historianOverrides,
+            lockPermissions: true,
         },
         {
             id: "historian-recomp",
@@ -271,9 +257,11 @@ export function buildHiddenAgentRegistrations(args: {
             hidden: true,
             description: HIDDEN_AGENT_DESCRIPTION,
             prompt: args.historianRecompPrompt ?? args.historianPrompt,
-            allowedTools: historianAllowedTools,
-            maxSteps: 40,
+            // Each pass emits one XML answer; repairs and edits use separate prompts.
+            allowedTools: [],
+            maxSteps: 4,
             overrides: args.historianOverrides,
+            lockPermissions: true,
         },
         {
             id: "historian-editor",
@@ -281,9 +269,11 @@ export function buildHiddenAgentRegistrations(args: {
             hidden: true,
             description: HIDDEN_AGENT_DESCRIPTION,
             prompt: args.historianEditorPrompt,
-            allowedTools: historianAllowedTools,
-            maxSteps: 40,
+            // Each pass emits one XML answer; repairs and edits use separate prompts.
+            allowedTools: [],
+            maxSteps: 4,
             overrides: args.historianOverrides,
+            lockPermissions: true,
         },
     ];
 }
@@ -340,6 +330,12 @@ export function buildHiddenAgentConfig(
               ...(overrideTools !== undefined ? { tools: overrideTools } : {}),
           };
     const basePermission = buildAllowOnlyPermission(allowedTools, agentLabel);
+    // The plugin appends named Task routing denies after the general wildcard.
+    // Seed an explicit Task deny so that routing also re-emits a final wildcard
+    // deny for Task itself; otherwise OpenCode exposes a callable-but-refused tool.
+    if (lockPermissions && agentLabel?.startsWith("historian") && allowedTools.length === 0) {
+        basePermission.task = "deny";
+    }
     return {
         prompt,
         // No builtin fallback chain: the user's `fallback_models` (if any) flow

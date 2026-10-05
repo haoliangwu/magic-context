@@ -1,11 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { formatGithubIssueFallback, type GhCommandResult, submitGithubIssue } from "./github-issue";
 
 function makeTempReport(content: string): { root: string; path: string } {
-    const root = mkdtempSync(join(tmpdir(), "mc-gh-issue-"));
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-gh-issue-"));
     const path = join(root, "report.md");
     writeFileSync(path, content);
     return { root, path };

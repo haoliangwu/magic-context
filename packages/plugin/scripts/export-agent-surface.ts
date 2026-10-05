@@ -139,7 +139,12 @@ out.push(
 );
 out.push("");
 
-const outPath = resolve(process.argv[2] ?? "../../.cortexkit/alfonso/agent-surface-export.md");
+// Resolve the default output against the repository root, not the process cwd:
+// run from a parent directory the cwd-relative form wrote outside the checkout.
+const repoRoot = resolve(import.meta.dir, "..", "..", "..");
+const outPath = resolve(
+    process.argv[2] ?? resolve(repoRoot, ".cortexkit", "alfonso", "agent-surface-export.md"),
+);
 mkdirSync(dirname(outPath), { recursive: true });
 writeFileSync(outPath, out.join("\n"));
 console.log(`written: ${outPath}`);

@@ -103,6 +103,15 @@ describe("matchesCron — dom/dow OR semantics", () => {
         expect(matchesCron(c, local(2026, 6, 7, 0, 0))).toBe(true); // dow (Sun) matches
         expect(matchesCron(c, local(2026, 6, 8, 0, 0))).toBe(false); // neither
     });
+    it("a star-step day-of-month counts as unrestricted, so it ANDs with the weekday", () => {
+        // Vixie cron: `*/2` starts with `*`, so the day must be odd AND a Monday.
+        const c = parsed("0 0 */2 * 1");
+        expect(local(2026, 1, 3).getDay()).toBe(6); // odd Saturday
+        expect(matchesCron(c, local(2026, 1, 3, 0, 0))).toBe(false);
+        expect(local(2026, 1, 5).getDay()).toBe(1); // odd Monday
+        expect(matchesCron(c, local(2026, 1, 5, 0, 0))).toBe(true);
+        expect(matchesCron(c, local(2026, 1, 12, 0, 0))).toBe(false); // even Monday
+    });
 });
 
 describe("nextOccurrence", () => {
@@ -139,6 +148,15 @@ describe("nextOccurrence", () => {
     it("impossible cron (Feb 31) → null", () => {
         const c = parsed("0 0 31 2 *");
         expect(nextOccurrence(c, local(2026, 1, 1, 0, 0))).toBeNull();
+    });
+    it("answers an impossible day-of-month at once instead of scanning years of minutes", () => {
+        const c = parsed("0 0 30,31 2 *");
+        const startedAt = performance.now();
+        for (let run = 0; run < 10; run++) {
+            expect(nextOccurrence(c, local(2026, 1, 1, 0, 0))).toBeNull();
+        }
+        // A full four-year minute scan takes tens of milliseconds per call.
+        expect(performance.now() - startedAt).toBeLessThan(20);
     });
     it("excludeCivilMinute skips a matching candidate (DST double-fire guard)", () => {
         const c = parsed("30 1 * * *"); // 01:30 daily

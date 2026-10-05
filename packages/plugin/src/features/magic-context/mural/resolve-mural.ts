@@ -1,8 +1,9 @@
 import type { Database } from "../../../shared/sqlite";
 import { getMemoriesByProject } from "../memory";
 import { getMemoryCategoryOrder } from "../memory/constants";
+import type { Memory } from "../memory/types";
 import { DEFAULT_MURAL_MEMORY_BUDGET, muralOverflowMemories } from "./mural-selection";
-import { computeCueContentHash, getMuralCueState } from "./storage-mural-cues";
+import { computeCueContentHash, getMuralCueState, type MuralCueState } from "./storage-mural-cues";
 
 /** Wire options for the m0 mural image injection: whether the feature is on,
  *  whether the fold's model accepts images, and (when both hold) the rendered
@@ -30,14 +31,40 @@ export interface MuralCoverage {
     cuedMemoryCount: number;
 }
 
-/** Count current cues across the full active and permanent memory pool before
- * limiting it to the overflow subset used to build the mural. */
-export function getMuralCoverage(db: Database, projectIdentity: string): MuralCoverage {
+export interface MuralPool {
+    memories: Memory[];
+    cueState: Map<number, MuralCueState>;
+    contentHashes: Map<number, { content: string; hash: string }>;
+}
+
+/** A call-local snapshot, never retained across refreshes or database writes. */
+export function readMuralPool(db: Database, projectIdentity: string): MuralPool {
     const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
-    const cueState = getMuralCueState(
-        db,
-        memories.map((memory) => memory.id),
-    );
+    return {
+        memories,
+        cueState: getMuralCueState(
+            db,
+            memories.map((memory) => memory.id),
+        ),
+        contentHashes: new Map(),
+    };
+}
+
+function poolContentHash(pool: MuralPool | undefined, memory: Memory): string {
+    const cached = pool?.contentHashes.get(memory.id);
+    if (cached?.content === memory.content) return cached.hash;
+    const value = computeCueContentHash(memory.content);
+    pool?.contentHashes.set(memory.id, { content: memory.content, hash: value });
+    return value;
+}
+
+/** Count current cues across the full live pool before the overflow trim. */
+export function getMuralCoverage(
+    db: Database,
+    projectIdentity: string,
+    pool?: MuralPool,
+): MuralCoverage {
+    const { memories, cueState } = pool ?? readMuralPool(db, projectIdentity);
     let cuedMemoryCount = 0;
     for (const memory of memories) {
         const state = cueState.get(memory.id);
@@ -46,7 +73,7 @@ export function getMuralCoverage(db: Database, projectIdentity: string): MuralCo
             typeof state.cue === "string" &&
             state.cue.trim() !== "" &&
             state.hash !== null &&
-            state.hash === computeCueContentHash(memory.content)
+            state.hash === poolContentHash(pool, memory)
         ) {
             cuedMemoryCount += 1;
         }
@@ -73,22 +100,26 @@ export function resolveMural(
     db: Database,
     projectIdentity: string,
     budgetTokens: number = DEFAULT_MURAL_MEMORY_BUDGET,
+    pool?: MuralPool,
 ): ResolvedMuralEntry[] {
-    const memories = getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
+    const memories =
+        pool?.memories ?? getMemoriesByProject(db, projectIdentity, ["active", "permanent"]);
     const overflow = muralOverflowMemories(memories, budgetTokens);
     if (overflow.length === 0) return [];
 
-    const cueState = getMuralCueState(
-        db,
-        overflow.map((memory) => memory.id),
-    );
+    const cueState =
+        pool?.cueState ??
+        getMuralCueState(
+            db,
+            overflow.map((memory) => memory.id),
+        );
     const entries: ResolvedMuralEntry[] = [];
     for (const memory of overflow) {
         const state = cueState.get(memory.id);
         if (!state || state.cue === null || state.hash === null) continue;
         // Hash-current only: a cue whose content hash no longer matches is stale
         // (the memory was edited after compression) and must not render.
-        if (state.hash !== computeCueContentHash(memory.content)) continue;
+        if (state.hash !== poolContentHash(pool, memory)) continue;
         entries.push({
             id: memory.id,
             category: memory.category,

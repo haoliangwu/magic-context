@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 
 import { classifyLocalEmbeddingFailure } from "./embedding-failure";
-import { getEmbeddingProviderIdentity } from "./embedding-identity";
+import {
+    getEmbeddingProviderIdentity,
+    LOCAL_EMBEDDING_RUNTIME_FINGERPRINT,
+} from "./embedding-identity";
 import {
     __resetLocalEmbeddingForTests,
     __setLocalEmbeddingTestHooks,
@@ -15,8 +19,12 @@ import {
     resolveLocalEmbeddingRuntime,
 } from "./embedding-local";
 
+const originalHfEndpoint = process.env.HF_ENDPOINT;
+
 afterEach(() => {
     __resetLocalEmbeddingForTests();
+    if (originalHfEndpoint === undefined) delete process.env.HF_ENDPOINT;
+    else process.env.HF_ENDPOINT = originalHfEndpoint;
 });
 
 function nativeBindingLoadError(): Error & { code: string } {
@@ -50,9 +58,47 @@ function fakeTransformersModule(options?: {
     };
 }
 
+describe("local embedding remote host", () => {
+    test("native runtime uses HF_ENDPOINT with one trailing slash", async () => {
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-native-hf-endpoint-"));
+        const transformersEnv = { remoteHost: "https://huggingface.co/" };
+        process.env.HF_ENDPOINT = "https://mirror.example///";
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false }),
+                importTransformers: async () => fakeTransformersModule({ env: transformersEnv }),
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
+            expect(transformersEnv.remoteHost).toBe("https://mirror.example/");
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+
+    test("native runtime uses the Transformers.js default without HF_ENDPOINT", async () => {
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-native-default-endpoint-"));
+        const transformersEnv = { remoteHost: "https://huggingface.co/" };
+        delete process.env.HF_ENDPOINT;
+        try {
+            __setLocalEmbeddingTestHooks({
+                host: () => ({ isElectron: false, isBun: false }),
+                importTransformers: async () => fakeTransformersModule({ env: transformersEnv }),
+                modelCacheDir: () => cacheDir,
+            });
+
+            expect(await new LocalEmbeddingProvider().initialize()).toBe(true);
+            expect(transformersEnv.remoteHost).toBe("https://huggingface.co/");
+        } finally {
+            rmSync(cacheDir, { recursive: true, force: true });
+        }
+    });
+});
+
 describe("WASM ONNX runtime module identity", () => {
     test("configures the injected WASM runtime single-threaded before pipeline construction", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-single-thread-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-wasm-single-thread-"));
         const ortWeb = { env: { wasm: {} as { numThreads?: number } } };
         let threadsAtTransformersImport: number | undefined;
         let threadsAtPipelineConstruction: number | undefined;
@@ -89,7 +135,7 @@ describe("WASM ONNX runtime module identity", () => {
     });
 
     test("imports the canonical resolved URL instead of a host-rewritten bare specifier", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-canonical-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-wasm-canonical-"));
         const requestedSpecifiers: string[] = [];
         const canonicalSpecifier =
             "file:///plugin/node_modules/onnxruntime-web/dist/ort.node.min.mjs";
@@ -121,7 +167,7 @@ describe("WASM ONNX runtime module identity", () => {
     });
 
     test("falls back to the bare specifier when import.meta.resolve is unavailable", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-resolution-fallback-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-wasm-resolution-fallback-"));
         const requestedSpecifiers: string[] = [];
         try {
             __setLocalEmbeddingTestHooks({
@@ -261,7 +307,16 @@ describe("isNativeRuntimeMissingError", () => {
 // dtype re-embeds rather than mixing vector spaces. The default (no dtype) must
 // produce the byte-identical identity as before this field existed.
 describe("LocalEmbeddingProvider dtype threading (#259)", () => {
-    test("default constructor (no dtype) keeps the golden identity", () => {
+    test("runtime upgrades change the local vector-space identity", () => {
+        expect(LOCAL_EMBEDDING_RUNTIME_FINGERPRINT).toBe(
+            "transformers@4.3.0;onnxruntime-node@1.30.0;onnxruntime-web@1.26.0-dev.20260416-b7804b056c",
+        );
+        const provider = new LocalEmbeddingProvider();
+        expect(provider.modelId).toBe("embedding-provider:ac1a4f8f0674f430a6c85a0e1a43a86a");
+        expect(provider.modelId).not.toBe("embedding-provider:c447205ebd551e83d18c4fd5fd8fc357");
+    });
+
+    test("default constructor (no dtype) keeps the current identity", () => {
         const provider = new LocalEmbeddingProvider();
         const expected = getEmbeddingProviderIdentity({
             provider: "local",
@@ -314,7 +369,7 @@ describe("LocalEmbeddingProvider dtype threading (#259)", () => {
 
 describe("local embedding runtime selection", () => {
     test("reports loaded provider count and clears it on dispose", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-embedding-memory-stats-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-embedding-memory-stats-"));
         try {
             __setLocalEmbeddingTestHooks({
                 host: () => ({ isElectron: false, isBun: false }),
@@ -383,7 +438,7 @@ describe("local embedding runtime selection", () => {
 
 describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     test("a vulnerable Bun host injects WASM before transformers and never takes the native fallback", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-bun-wasm-default-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-bun-wasm-default-"));
         const calls: string[] = [];
         let fallbackImports = 0;
         const pipelineOptions: Array<{ dtype: string; device?: string }> = [];
@@ -428,7 +483,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("native selection omits a device option and leaves WASM thread settings untouched", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-native-device-default-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-native-device-default-"));
         const pipelineOptions: Array<{ dtype: string; device?: string }> = [];
         const wasm = { numThreads: 4 };
         try {
@@ -454,7 +509,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("retries a fully absent native module with WASM", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-absent-native-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-wasm-absent-native-"));
         const logs: string[] = [];
         let nativeImports = 0;
         let wasmImports = 0;
@@ -483,7 +538,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("uses the Node filesystem WASM twin and produces embeddings after a native binding failure", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-node-fs-wasm-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-node-fs-wasm-"));
         let browserFallbackImports = 0;
         try {
             __setLocalEmbeddingTestHooks({
@@ -518,7 +573,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("keeps the browser-target fallback for hosts without Node filesystem access", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-browser-wasm-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-browser-wasm-"));
         let browserFallbackImports = 0;
         try {
             __setLocalEmbeddingTestHooks({
@@ -553,7 +608,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("classifies a Node WASM bundle without filesystem caching instead of returning an unexplained null", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-node-wasm-no-fs-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-node-wasm-no-fs-"));
         try {
             __setLocalEmbeddingTestHooks({
                 host: () => ({
@@ -583,7 +638,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("retries a classified native load failure once with WASM and keeps that decision process-sticky", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-fallback-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-wasm-fallback-"));
         const logs: string[] = [];
         let nativeImports = 0;
         let wasmImports = 0;
@@ -631,7 +686,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("latches disabled and routes to doctor only when native and WASM both fail", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-wasm-both-broken-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-wasm-both-broken-"));
         const logs: string[] = [];
         let nativeImports = 0;
         let wasmImports = 0;
@@ -669,7 +724,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("explicit WASM preserves Electron's existing Transformers consumer path", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-electron-explicit-wasm-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-electron-explicit-wasm-"));
         let regularImports = 0;
         try {
             __setLocalEmbeddingTestHooks({
@@ -702,7 +757,7 @@ describe("LocalEmbeddingProvider native-to-WASM fallback", () => {
     });
 
     test("Electron keeps its early WASM injection path without a second fallback initialization", async () => {
-        const cacheDir = mkdtempSync(join(tmpdir(), "mc-electron-wasm-"));
+        const cacheDir = createTestTempDirFromPath(join(tmpdir(), "mc-electron-wasm-"));
         let importsAfterEarlyInjection = 0;
         let fallbackImports = 0;
         let wasmInjections = 0;

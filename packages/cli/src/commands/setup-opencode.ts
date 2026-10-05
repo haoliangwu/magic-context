@@ -1,9 +1,7 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
 import { isCompactionEnabled } from "@magic-context/core/config/agent-disable";
-import { loadRawConfigFile } from "@magic-context/core/config/raw-loader";
-import { stripRemovedAgentConfig } from "@magic-context/core/config/removed-agent-config";
 import { detectConflicts } from "@magic-context/core/shared/conflict-detector";
 import { fixConflicts } from "@magic-context/core/shared/conflict-fixer";
 import {
@@ -11,12 +9,16 @@ import {
     removeJsoncArrayEntries,
     setJsoncValue,
 } from "@magic-context/core/shared/jsonc-edit";
-import { sanitizeParsedJson } from "@magic-context/core/shared/jsonc-parser";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import {
+    type OpenCodeHostGeneration,
+    openCodeHostGenerationFromVersion,
+} from "@magic-context/core/shared/opencode-db-path";
+import { stringify as stringifyJsonc } from "comment-json";
 import {
     isDevPathPluginEntry,
     isLocalPathPluginEntry,
     matchesPluginEntry,
+    pluginEntryPackage,
 } from "../adapters/opencode";
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
@@ -26,8 +28,10 @@ import {
 import { runDreamerSetup } from "../lib/dreamer-setup";
 import {
     assertJsoncConfigsParseable,
-    ConfigParseError,
+    editableChild,
     readJsoncConfigForUpdate,
+    readJsoncTextForEdit,
+    readMagicContextConfigForSetup,
 } from "../lib/jsonc-config";
 import { pickModel } from "../lib/model-picker";
 import { detectOpenCode } from "../lib/opencode-detect";
@@ -36,6 +40,11 @@ import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION as PLUGIN_ENTRY,
     OPENCODE_PLUGIN_NAME as PLUGIN_NAME,
 } from "../lib/opencode-plugin-cache";
+import {
+    OPENCODE_PLUGIN_CONFIG_KEYS,
+    pluginConfigKeyFor,
+    readPluginEntries,
+} from "../lib/opencode-plugin-registration";
 import { detectConfigPaths } from "../lib/paths";
 import { confirm, intro, log, note, outro, promptIO, spinner } from "../lib/prompts";
 
@@ -65,49 +74,19 @@ function resolveCompactionEnabledForWriter(): boolean {
 
 // ─── Helpers ──────────────────────────────────────────────
 
-function ensureDir(dir: string): void {
-    if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
-    }
-}
-
-function configObject(value: unknown): Record<string, unknown> {
-    return value !== null && typeof value === "object" && !Array.isArray(value)
-        ? { ...(value as Record<string, unknown>) }
-        : {};
-}
-
-/**
- * Read the shared config through the same raw-tier loader as runtime and doctor.
- * That loader performs any required per-harness migration before setup merges its
- * choices, so setup cannot reintroduce flat model fields into an existing config.
- */
-function readMagicContextConfigForSetup(configPath: string): Record<string, unknown> {
-    const raw = loadRawConfigFile({ configPath, tier: "user" });
-    if (!raw) return {};
-
-    try {
-        const rejectedKeyPaths: string[] = [];
-        const parsed = sanitizeParsedJson(parseJsonc(raw.text), {
-            onRejectedKey: (keyPath) => rejectedKeyPaths.push(keyPath.join(".")),
-        });
-        if (rejectedKeyPaths.length > 0) {
-            throw new Error(`unsafe prototype-pollution key at ${rejectedKeyPaths.join(", ")}`);
-        }
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-            throw new Error("expected a JSON object at the document root");
-        }
-        return parsed as Record<string, unknown>;
-    } catch (error) {
-        throw new ConfigParseError(configPath, raw.text, error);
-    }
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 // ─── Config Manipulators ──────────────────────────────────
 
-export function addPluginToOpenCodeConfig(
+/**
+ * The new contents of opencode.jsonc with the plugin registered, or null when
+ * the file already has everything setup would write. Nothing is written here,
+ * so setup can prepare every config before changing any of them.
+ */
+function planOpenCodeConfigUpdate(
     configPath: string,
-    _format: "json" | "jsonc" | "none",
     removeDcp = false,
     /**
      * The resolved MC compaction mode. When `false` (compaction-off mode), the
@@ -118,24 +97,32 @@ export function addPluginToOpenCodeConfig(
      * behavior for call sites that cannot supply the resolved mode.
      */
     compactionEnabled = true,
-): void {
+    /**
+     * Which key the running host reads registrations from. OpenCode 2 loads the
+     * legacy `plugin` array and its native `plugins` array together, so a fresh
+     * entry must go under the host's own key or the plugin loads twice.
+     */
+    hostGeneration: OpenCodeHostGeneration = "v1",
+): string | null {
+    const registrationKey = pluginConfigKeyFor(hostGeneration);
     // The detection result predates interactive prompts. Re-read at commit time so
     // a config created while the wizard was open is merged instead of overwritten.
     const existsAtCommit = existsSync(configPath);
     const existing = existsAtCommit ? readJsoncConfigForUpdate(configPath) : {};
     if (!existsAtCommit) {
-        ensureDir(dirname(configPath));
-        const created: Record<string, unknown> = { plugin: [PLUGIN_ENTRY] };
+        const created: Record<string, unknown> = { [registrationKey]: [PLUGIN_ENTRY] };
         if (compactionEnabled) {
             created.compaction = { auto: false, prune: false };
         }
-        writeFileAtomic(configPath, `${stringifyJsonc(created, null, 2)}\n`);
-        return;
+        return `${stringifyJsonc(created, null, 2)}\n`;
     }
 
-    let text = readFileSync(configPath, "utf-8");
+    const document = readJsoncTextForEdit(configPath);
+    let text = document.text;
     let changed = false;
-    const rawPlugins: unknown[] = Array.isArray(existing.plugin) ? existing.plugin : [];
+    // Both keys are live registrations on OpenCode 2; read them together so a
+    // checkout registered under `plugins` is never doubled by an npm entry.
+    const rawPlugins: unknown[] = readPluginEntries(existing).map(({ entry }) => entry);
     const retainedPlugins = removeDcp
         ? rawPlugins.filter((plugin) => !matchesPluginEntry(plugin, DCP_PLUGIN_NAME))
         : rawPlugins;
@@ -145,7 +132,7 @@ export function addPluginToOpenCodeConfig(
             (plugin) =>
                 isLocalPathPluginEntry(plugin) &&
                 String(plugin).includes("magic-context") &&
-                !isDevPathPluginEntry(plugin),
+                !isDevPathPluginEntry(plugin, dirname(configPath)),
         )
     ) {
         log.warn(
@@ -153,9 +140,10 @@ export function addPluginToOpenCodeConfig(
         );
     }
 
-    if (Array.isArray(existing.plugin)) {
-        if (removeDcp) {
-            const result = removeJsoncArrayEntries(text, ["plugin"], (plugin) =>
+    if (removeDcp) {
+        for (const key of OPENCODE_PLUGIN_CONFIG_KEYS) {
+            if (!Array.isArray(existing[key])) continue;
+            const result = removeJsoncArrayEntries(text, [key], (plugin) =>
                 matchesPluginEntry(plugin, DCP_PLUGIN_NAME),
             );
             if (result.removed) {
@@ -163,17 +151,16 @@ export function addPluginToOpenCodeConfig(
                 changed = true;
             }
         }
+    }
 
-        const hasNpmEntry = retainedPlugins.some((plugin) =>
-            matchesPluginEntry(plugin, PLUGIN_NAME),
-        );
-        const hasDevEntry = retainedPlugins.some((plugin) => isDevPathPluginEntry(plugin));
-        if (!hasNpmEntry && !hasDevEntry) {
-            text = appendJsoncArrayValues(text, ["plugin"], [PLUGIN_ENTRY]);
-            changed = true;
-        }
-    } else {
-        text = setJsoncValue(text, ["plugin"], [PLUGIN_ENTRY]);
+    const hasNpmEntry = retainedPlugins.some((plugin) => matchesPluginEntry(plugin, PLUGIN_NAME));
+    const hasDevEntry = retainedPlugins.some((plugin) =>
+        isDevPathPluginEntry(plugin, dirname(configPath)),
+    );
+    if (!hasNpmEntry && !hasDevEntry) {
+        text = Array.isArray(existing[registrationKey])
+            ? appendJsoncArrayValues(text, [registrationKey], [PLUGIN_ENTRY])
+            : setJsoncValue(text, [registrationKey], [PLUGIN_ENTRY]);
         changed = true;
     }
 
@@ -199,17 +186,30 @@ export function addPluginToOpenCodeConfig(
         }
     }
 
-    if (changed) writeFileAtomic(configPath, text);
+    return changed ? document.bom + text : null;
 }
 
-export function addPluginToTuiConfig(configPath: string, _format: "json" | "jsonc" | "none"): void {
+export function addPluginToOpenCodeConfig(
+    configPath: string,
+    _format: "json" | "jsonc" | "none",
+    removeDcp = false,
+    compactionEnabled = true,
+    hostGeneration: OpenCodeHostGeneration = "v1",
+): void {
+    const text = planOpenCodeConfigUpdate(configPath, removeDcp, compactionEnabled, hostGeneration);
+    if (text !== null) writeFileAtomic(configPath, text);
+}
+
+/**
+ * The new contents of tui.jsonc with the sidebar plugin registered, or null
+ * when it is already registered. Nothing is written here.
+ */
+function planTuiConfigUpdate(configPath: string): string | null {
     // Config discovery may be stale after prompts; merge the commit-time contents.
     const existsAtCommit = existsSync(configPath);
     const existing = existsAtCommit ? readJsoncConfigForUpdate(configPath) : {};
     if (!existsAtCommit) {
-        ensureDir(dirname(configPath));
-        writeFileAtomic(configPath, `${stringifyJsonc({ plugin: [PLUGIN_ENTRY] }, null, 2)}\n`);
-        return;
+        return `${stringifyJsonc({ plugin: [PLUGIN_ENTRY] }, null, 2)}\n`;
     }
 
     const rawPlugins: unknown[] = Array.isArray(existing.plugin) ? existing.plugin : [];
@@ -218,7 +218,7 @@ export function addPluginToTuiConfig(configPath: string, _format: "json" | "json
             (plugin) =>
                 isLocalPathPluginEntry(plugin) &&
                 String(plugin).includes("magic-context") &&
-                !isDevPathPluginEntry(plugin),
+                !isDevPathPluginEntry(plugin, dirname(configPath)),
         )
     ) {
         log.warn(
@@ -227,13 +227,28 @@ export function addPluginToTuiConfig(configPath: string, _format: "json" | "json
     }
 
     const hasNpmEntry = rawPlugins.some((plugin) => matchesPluginEntry(plugin, PLUGIN_NAME));
-    const hasDevEntry = rawPlugins.some((plugin) => isDevPathPluginEntry(plugin));
-    if (hasNpmEntry || hasDevEntry) return;
+    const hasDevEntry = rawPlugins.some((plugin) =>
+        isDevPathPluginEntry(plugin, dirname(configPath)),
+    );
+    if (hasNpmEntry || hasDevEntry) return null;
 
+    const document = readJsoncTextForEdit(configPath);
     const text = Array.isArray(existing.plugin)
-        ? appendJsoncArrayValues(readFileSync(configPath, "utf-8"), ["plugin"], [PLUGIN_ENTRY])
-        : setJsoncValue(readFileSync(configPath, "utf-8"), ["plugin"], [PLUGIN_ENTRY]);
-    writeFileAtomic(configPath, text);
+        ? appendJsoncArrayValues(document.text, ["plugin"], [PLUGIN_ENTRY])
+        : setJsoncValue(document.text, ["plugin"], [PLUGIN_ENTRY]);
+    return document.bom + text;
+}
+
+export function addPluginToTuiConfig(configPath: string, _format: "json" | "jsonc" | "none"): void {
+    const text = planTuiConfigUpdate(configPath);
+    if (text !== null) writeFileAtomic(configPath, text);
+}
+
+/** opencode-dcp registrations under either plugin key (OpenCode 2 loads both). */
+export function findDcpPluginEntries(config: Record<string, unknown>): unknown[] {
+    return readPluginEntries(config)
+        .map(({ entry }) => entry)
+        .filter((entry) => matchesPluginEntry(entry, DCP_PLUGIN_NAME));
 }
 
 export function findDcpPluginIndexes(plugins: unknown[]): number[] {
@@ -243,9 +258,7 @@ export function findDcpPluginIndexes(plugins: unknown[]): number[] {
 }
 
 function pluginEntryName(entry: unknown): string {
-    if (typeof entry === "string") return entry;
-    if (Array.isArray(entry) && typeof entry[0] === "string") return entry[0];
-    return String(entry);
+    return pluginEntryPackage(entry) ?? String(entry);
 }
 
 async function resolveDcpConflictBeforeSetup(
@@ -253,12 +266,10 @@ async function resolveDcpConflictBeforeSetup(
     format: "json" | "jsonc" | "none",
 ): Promise<boolean> {
     if (format === "none") return false;
-    const ocConfig = readJsoncConfigForUpdate(configPath);
-    const plugins = Array.isArray(ocConfig.plugin) ? ocConfig.plugin : [];
-    const dcpIndexes = findDcpPluginIndexes(plugins);
-    if (dcpIndexes.length === 0) return false;
+    const dcpEntries = findDcpPluginEntries(readJsoncConfigForUpdate(configPath));
+    if (dcpEntries.length === 0) return false;
 
-    log.warn(`Found conflicting plugin: ${pluginEntryName(plugins[dcpIndexes[0]])}`);
+    log.warn(`Found conflicting plugin: ${pluginEntryName(dcpEntries[0])}`);
     log.message(
         "opencode-dcp (Dynamic Context Pruning) and Magic Context both manage context.\n" +
             "Running both simultaneously will cause unpredictable behavior.",
@@ -270,19 +281,19 @@ async function resolveDcpConflictBeforeSetup(
     return shouldRemove;
 }
 
-export function writeMagicContextConfig(
-    configPath: string,
-    options: {
-        historianModel: string | null;
-        dreamerEnabled: boolean;
-        dreamerModel: string | null;
-        /** Per-task schedule overrides (Dreamer v2); undefined keeps schema defaults. */
-        dreamerTasks?: Record<string, { schedule: string }>;
-        claudeMax: boolean;
-    },
-): void {
+export interface MagicContextSetupChoices {
+    historianModel: string | null;
+    dreamerEnabled: boolean;
+    dreamerModel: string | null;
+    /** Per-task schedule overrides (Dreamer v2); undefined keeps schema defaults. */
+    dreamerTasks?: Record<string, { schedule: string }>;
+    claudeMax: boolean;
+}
+
+/** The new contents of magic-context.jsonc with the wizard's choices. Nothing is written here. */
+function planMagicContextConfig(configPath: string, options: MagicContextSetupChoices): string {
     // A malformed existing file must abort rather than become an empty config.
-    const config = stripRemovedAgentConfig(readMagicContextConfigForSetup(configPath), []);
+    const config = readMagicContextConfigForSetup(configPath);
 
     // Always set $schema for editor autocomplete/validation
     if (!config.$schema) {
@@ -290,22 +301,19 @@ export function writeMagicContextConfig(
             "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json";
     }
 
+    // Objects are edited in place so the comments comment-json attached to
+    // them are written back unchanged.
     if (options.historianModel) {
-        const historian = configObject(config.historian);
-        const opencode = configObject(historian.opencode);
-        opencode.model = options.historianModel;
-        historian.opencode = opencode;
-        config.historian = historian;
+        editableChild(editableChild(config, "historian"), "opencode").model =
+            options.historianModel;
     }
 
-    const dreamer = configObject(config.dreamer);
-    const opencode = configObject(dreamer.opencode);
+    const dreamer = editableChild(config, "dreamer");
     delete dreamer.enabled;
     if (options.dreamerEnabled) {
         delete dreamer.disable;
         if (options.dreamerModel) {
-            opencode.model = options.dreamerModel;
-            dreamer.opencode = opencode;
+            editableChild(dreamer, "opencode").model = options.dreamerModel;
         }
         // Dreamer schedules are harness-independent and remain at dreamer.tasks.
         // Only write explicit wizard overrides so an existing harness's schedule
@@ -316,17 +324,63 @@ export function writeMagicContextConfig(
     } else {
         dreamer.disable = true;
     }
-    config.dreamer = dreamer;
 
     if (options.claudeMax) {
-        const cacheTtl = (config.cache_ttl as Record<string, string>) ?? {};
+        // cache_ttl is either one TTL for every model or a per-model map. A
+        // single string becomes the map's default so other models keep it.
+        const existingTtl = config.cache_ttl;
+        if (typeof existingTtl === "string") {
+            config.cache_ttl = { default: existingTtl };
+        } else if (existingTtl !== undefined && !isPlainObject(existingTtl)) {
+            throw new Error(
+                `Refusing to rewrite ${configPath}: "cache_ttl" must be a string or an object of per-model TTLs. Fix it by hand, then rerun setup.`,
+            );
+        }
+        const cacheTtl = editableChild(config, "cache_ttl");
         if (!cacheTtl.default) cacheTtl.default = "5m";
         cacheTtl["anthropic/claude-sonnet-4-6"] = "59m";
         cacheTtl["anthropic/claude-opus-4-6"] = "59m";
-        config.cache_ttl = cacheTtl;
     }
 
-    writeFileAtomic(configPath, `${stringifyJsonc(config, null, 2)}\n`);
+    return `${stringifyJsonc(config, null, 2)}\n`;
+}
+
+export function writeMagicContextConfig(
+    configPath: string,
+    options: MagicContextSetupChoices,
+): void {
+    writeFileAtomic(configPath, planMagicContextConfig(configPath, options));
+}
+
+/**
+ * Prepare opencode.jsonc, magic-context.jsonc and (on OpenCode 1) tui.jsonc
+ * first, then write them. Any config that cannot be updated stops setup before
+ * the first write, instead of leaving the earlier files changed and the later
+ * ones not.
+ */
+export function applyOpenCodeSetupConfigs(
+    paths: { opencodeConfig: string; magicContextConfig: string; tuiConfig: string },
+    choices: {
+        removeDcp: boolean;
+        compactionEnabled: boolean;
+        hostGeneration: OpenCodeHostGeneration;
+        magicContext: MagicContextSetupChoices;
+    },
+): void {
+    const opencodeText = planOpenCodeConfigUpdate(
+        paths.opencodeConfig,
+        choices.removeDcp,
+        choices.compactionEnabled,
+        choices.hostGeneration,
+    );
+    const magicContextText = planMagicContextConfig(paths.magicContextConfig, choices.magicContext);
+    // OpenCode 2 resolves the sidebar from the plugin entry itself; tui.json
+    // is a 1.x-only surface and registers nothing on a 2.x host.
+    const tuiText = choices.hostGeneration === "v1" ? planTuiConfigUpdate(paths.tuiConfig) : null;
+
+    if (opencodeText !== null) writeFileAtomic(paths.opencodeConfig, opencodeText);
+    writeFileAtomic(paths.magicContextConfig, magicContextText);
+    if (tuiText !== null) writeFileAtomic(paths.tuiConfig, tuiText);
 }
 // ─── Main Setup Flow ──────────────────────────────────────
 
@@ -352,6 +406,8 @@ export async function runSetup(dryRun = false): Promise<number> {
     s.start("Checking OpenCode installation");
 
     const detection = detectOpenCode();
+    // Desktop-only installs have no binary to version and keep the 1.x key.
+    let hostGeneration: OpenCodeHostGeneration = "v1";
     if (detection.kind === "none") {
         s.stop("OpenCode not found");
         const shouldContinue = await confirm(
@@ -376,6 +432,7 @@ export async function runSetup(dryRun = false): Promise<number> {
     } else {
         const version = getOpenCodeVersion(detection.binary);
         s.stop(`OpenCode ${version ?? ""} detected`);
+        hostGeneration = openCodeHostGenerationFromVersion(version);
     }
 
     // ─── Step 2: Get available models ───────────────────
@@ -534,12 +591,24 @@ export async function runSetup(dryRun = false): Promise<number> {
     }
 
     if (!dryRun) {
-        addPluginToOpenCodeConfig(
-            paths.opencodeConfig,
-            paths.opencodeConfigFormat,
-            removeDcp,
-            compactionEnabled,
-        );
+        try {
+            applyOpenCodeSetupConfigs(paths, {
+                removeDcp,
+                compactionEnabled,
+                hostGeneration,
+                magicContext: {
+                    historianModel,
+                    dreamerEnabled,
+                    dreamerModel,
+                    dreamerTasks,
+                    claudeMax,
+                },
+            });
+        } catch (error) {
+            log.error(error instanceof Error ? error.message : String(error));
+            outro("Setup stopped — fix the problem above and rerun setup.");
+            return 1;
+        }
         log.success(`Plugin added to ${paths.opencodeConfig}`);
         if (removeDcp) log.success("Removed opencode-dcp from plugin list");
         if (compactionEnabled) {
@@ -550,7 +619,15 @@ export async function runSetup(dryRun = false): Promise<number> {
         } else {
             log.info("Compaction-off mode active — leaving native compaction config untouched");
         }
+        log.success(`Config written to ${paths.magicContextConfig}`);
+        if (hostGeneration === "v1") {
+            log.success(`TUI sidebar plugin added to ${basename(paths.tuiConfig)}`);
+        } else {
+            log.info("TUI sidebar loads from the plugin entry on OpenCode 2 (tui.json not used)");
+        }
 
+        // The conflict fixers edit other OpenCode and oh-my-opencode configs on
+        // disk; they run after Magic Context's own configs are in place.
         if (conflictFix) {
             const actions = fixConflicts(process.cwd(), conflictFix, {
                 compactionEnabled,
@@ -561,17 +638,6 @@ export async function runSetup(dryRun = false): Promise<number> {
                 log.info("No additional conflict changes were needed");
             }
         }
-
-        writeMagicContextConfig(paths.magicContextConfig, {
-            historianModel,
-            dreamerEnabled,
-            dreamerModel,
-            dreamerTasks,
-            claudeMax,
-        });
-        log.success(`Config written to ${paths.magicContextConfig}`);
-        addPluginToTuiConfig(paths.tuiConfig, paths.tuiConfigFormat);
-        log.success(`TUI sidebar plugin added to ${basename(paths.tuiConfig)}`);
 
         if (disableOmoHooks) {
             const actions = fixConflicts(

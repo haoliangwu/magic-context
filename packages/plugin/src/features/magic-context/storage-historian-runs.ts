@@ -3,8 +3,8 @@ import type { Database } from "../../shared/sqlite";
 /**
  * Per historian-invocation telemetry.
  *
- * One row per attempted historian run (incremental publish, recomp pass, or
- * session-upgrade), recording the INPUT (chunk range) and OUTPUT shape
+ * One row per attempted historian run (incremental publish or recomp pass),
+ * recording the INPUT (chunk range) and OUTPUT shape
  * (compartments / facts / events / importance) plus success/failure. Tokens and
  * the model used live on the FK-linked `subagent_invocations` row
  * (`subagentInvocationId`) — join to get cost/model.
@@ -22,6 +22,8 @@ export type HistorianRunStatus =
     /** A successful no-op (nothing eligible to compact, empty chunk). */
     | "noop";
 
+/** "upgrade" is only read, never written: rows from the removed session-upgrade
+ *  command are still in existing databases. */
 export type HistorianRunKind = "incremental" | "recomp" | "partial-recomp" | "upgrade";
 
 export interface HistorianRunInput {

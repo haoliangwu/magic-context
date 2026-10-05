@@ -379,8 +379,8 @@ export function bumpEpochsForWorkspaceMembers(
         run();
         return;
     }
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
         run();
         db.exec("COMMIT");
@@ -405,8 +405,8 @@ export function bumpEpochsForWorkspaceMemberSet(
         run();
         return;
     }
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
         run();
         db.exec("COMMIT");

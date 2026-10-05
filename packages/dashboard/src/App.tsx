@@ -9,27 +9,12 @@ import ProjectsGrid from "./components/Projects/ProjectsGrid";
 import UserMemories from "./components/UserMemories/UserMemories";
 import WorkspacesPanel from "./components/WorkspacesPanel/WorkspacesPanel";
 import { getDbHealth, getModelCatalogs, getOpencodeInstallState } from "./lib/api";
+import { loadCachedModelCatalogs, retainLoadedCatalogs } from "./lib/model-catalog-cache";
 import { initServeToken, listen } from "./lib/platform";
 import type { ModelCatalogs, NavSection, OpencodeInstallState, ProjectCard } from "./lib/types";
 import { checkForUpdate, installAndRelaunch, runUpdater } from "./lib/updater";
 
-const MODEL_CATALOGS_CACHE_KEY = "magic-context.model-catalogs";
 const UPDATE_POLL_INTERVAL = 10 * 60 * 1000; // 10 minutes
-
-function loadCachedModelCatalogs(): ModelCatalogs {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(MODEL_CATALOGS_CACHE_KEY) ?? "{}");
-    if (!parsed || typeof parsed !== "object") return { opencode: [], pi: [], omp: [] };
-    const catalogs = parsed as Partial<ModelCatalogs>;
-    return {
-      opencode: Array.isArray(catalogs.opencode) ? catalogs.opencode : [],
-      pi: Array.isArray(catalogs.pi) ? catalogs.pi : [],
-      omp: Array.isArray(catalogs.omp) ? catalogs.omp : [],
-    };
-  } catch {
-    return { opencode: [], pi: [], omp: [] };
-  }
-}
 
 export default function App() {
   initServeToken();
@@ -43,12 +28,38 @@ export default function App() {
     setActiveSection(section);
   };
   const [health] = createResource(getDbHealth);
-  const [modelCatalogs, setModelCatalogs] = createSignal<ModelCatalogs>(loadCachedModelCatalogs());
+  const [modelCatalogs, setModelCatalogs] = createSignal<ModelCatalogs>(
+    loadCachedModelCatalogs(localStorage),
+  );
+  const [catalogLoading, setCatalogLoading] = createSignal(true);
+  const [catalogError, setCatalogError] = createSignal<string | null>(null);
   const [opencodeInstallState, setOpencodeInstallState] =
     createSignal<OpencodeInstallState>("none");
   const [updateVersion, setUpdateVersion] = createSignal<string | null>(null);
   const [updateInstalling, setUpdateInstalling] = createSignal(false);
   const [updateDismissed, setUpdateDismissed] = createSignal(false);
+
+  let catalogRetry: ReturnType<typeof setTimeout> | undefined;
+  const refreshCatalogs = async (retry = false) => {
+    setCatalogLoading(true);
+    try {
+      const fresh = await getModelCatalogs();
+      setModelCatalogs((previous) => retainLoadedCatalogs(previous, fresh, localStorage));
+      setCatalogError(
+        fresh.opencodeError ?? (fresh.opencode.length ? null : "OpenCode returned no models"),
+      );
+      if (!retry && !fresh.opencode.length) {
+        catalogRetry = setTimeout(() => void refreshCatalogs(true), 5000);
+      }
+    } catch (error) {
+      setCatalogError(`Couldn't load models from OpenCode: ${String(error)}`);
+    } finally {
+      setCatalogLoading(false);
+    }
+  };
+  onCleanup(() => {
+    if (catalogRetry) clearTimeout(catalogRetry);
+  });
 
   // Background model refresh
   onMount(() => {
@@ -58,16 +69,7 @@ export default function App() {
         setOpencodeInstallState("none");
       });
 
-    getModelCatalogs()
-      .then((fresh) => {
-        setModelCatalogs(fresh);
-        try {
-          localStorage.setItem(MODEL_CATALOGS_CACHE_KEY, JSON.stringify(fresh));
-        } catch {}
-      })
-      .catch(() => {
-        /* keep cached */
-      });
+    void refreshCatalogs();
   });
 
   // Background update polling
@@ -172,6 +174,12 @@ export default function App() {
             <ConfigEditor
               modelCatalogs={modelCatalogs()}
               opencodeInstallState={opencodeInstallState()}
+              catalogLoading={catalogLoading()}
+              catalogError={catalogError()}
+              onRetryCatalogs={() => {
+                if (catalogRetry) clearTimeout(catalogRetry);
+                void refreshCatalogs(true);
+              }}
             />
           </Show>
           <Show when={activeSection() === "logs"}>

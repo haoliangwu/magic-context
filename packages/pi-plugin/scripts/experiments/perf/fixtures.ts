@@ -64,7 +64,7 @@ export function generateSyntheticFixture(
 			parentId,
 			timestamp: new Date(timestamp).toISOString(),
 			message,
-		} as SessionEntry);
+		} as unknown as SessionEntry);
 		parentId = id;
 		timestamp += 1_000;
 		sequence += 1;

@@ -147,7 +147,7 @@ export function registerIssue423Tests(
                     (tag) => tag.type === "tool" && tag.status === "dropped",
                 );
                 expect(droppedTools.length).toBeGreaterThan(0);
-                expect(droppedTools.every((tag) => tag.dropMode === "truncated")).toBe(true);
+                expect(droppedTools.every((tag) => tag.dropMode === "skeleton_real")).toBe(true);
 
                 const wire = JSON.parse(
                     serializeAnthropicWireWithAdjacentAssistantMerge(

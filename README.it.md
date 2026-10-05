@@ -235,7 +235,6 @@ Il richiamo funziona **tra sessioni** (una nuova sessione eredita tutto) e **tra
 | `/ctx-status` | Vista debug: tags, pending drops, TTL cache, stato dei suggerimenti, progresso historian, copertura dei compartimenti, budget cronologia |
 | `/ctx-flush` | Forza immediatamente tutte le operazioni in coda, bypassando il TTL cache |
 | `/ctx-recomp` | Ricostruisce i compartimenti dalla cronologia grezza (accetta un intervallo `start-end`). Da usare quando lo stato salvato sembra errato |
-| `/ctx-session-upgrade` | Aggiorna questa sessione al formato cronologia più recente: ricostruisci compartimenti e migra memorie di progetto |
 | `/ctx-dream` | Esegui manutenzione dreamer su richiesta: memoria, documenti, smart notes e review di user-profile |
 
 ---

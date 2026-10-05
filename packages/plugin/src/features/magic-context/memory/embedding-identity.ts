@@ -8,6 +8,12 @@ function normalizeEndpoint(endpoint?: string): string {
     return endpoint?.trim().replace(/\/+$/, "") ?? "";
 }
 
+// Local vectors can change when the Transformers or ONNX implementation changes,
+// even when the model files and fp32 configuration stay the same. Keep stored
+// memory and chunk vectors fenced to the runtime stack that produced them.
+export const LOCAL_EMBEDDING_RUNTIME_FINGERPRINT =
+    "transformers@4.3.0;onnxruntime-node@1.30.0;onnxruntime-web@1.26.0-dev.20260416-b7804b056c";
+
 /**
  * Stable embedding-provider identity used for provider/pipeline reuse.
  *
@@ -75,6 +81,7 @@ export function getEmbeddingProviderIdentity(config: EmbeddingConfig): string {
                   model: config.model?.trim() || DEFAULT_LOCAL_EMBEDDING_MODEL,
                   endpoint: "",
                   apiKeyPresent: false,
+                  runtimeFingerprint: LOCAL_EMBEDDING_RUNTIME_FINGERPRINT,
                   ...(localDtype ? { localDtype } : {}),
               };
 

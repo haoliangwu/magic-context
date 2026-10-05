@@ -71,7 +71,7 @@ export function incrementCompressionDepth(
         for (let ordinal = startOrdinal; ordinal <= endOrdinal; ordinal += 1) {
             stmt.run(sessionId, ordinal, getHarness());
         }
-    })();
+    }).immediate();
 }
 
 export function getAverageCompressionDepth(

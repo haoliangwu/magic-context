@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 
 import { createSmartNoteCapabilities, isSecretDeniedPath } from "./capabilities";
 
 async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
-    const dir = await mkdtemp(path.join(tmpdir(), "mc-smart-note-cap-"));
+    const dir = await createTestTempDirFromPath(path.join(tmpdir(), "mc-smart-note-cap-"));
     try {
         return await fn(dir);
     } finally {
@@ -90,7 +91,9 @@ describe("smart-note readFile capability", () => {
 
     test("denies final symlink and parent symlink escapes", async () => {
         await withTempDir(async (dir) => {
-            const outside = await mkdtemp(path.join(tmpdir(), "mc-smart-note-outside-"));
+            const outside = await createTestTempDirFromPath(
+                path.join(tmpdir(), "mc-smart-note-outside-"),
+            );
             try {
                 await writeFile(path.join(outside, "outside.txt"), "outside", "utf8");
                 await symlink(path.join(outside, "outside.txt"), path.join(dir, "link.txt"));

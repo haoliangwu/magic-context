@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Written by an older setup run.
+  "plugin": [
+    "opencode-other-plugin", // unrelated, must survive
+    "@cortexkit/opencode-magic-context@0.42.6"
+  ],
+  /* OpenCode 2 native list */
+  "plugins": [
+    "@cortexkit/opencode-magic-context@latest",
+    { "package": "some-v2-plugin", "options": { "a": 1 } }
+  ]
+}

@@ -1,11 +1,12 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 import { clearSession } from "./storage-meta-session";
@@ -40,7 +41,7 @@ afterEach(() => {
 });
 
 function createTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -60,7 +61,13 @@ interface OcPart {
     timeCreated: number;
 }
 
-function buildOpencodeDb(messages: OcMessage[], parts: OcPart[]): Database {
+type OpenCodeStoreShape = "v1" | "migrated-v2" | "pure-v2";
+
+function buildOpencodeDb(
+    messages: OcMessage[],
+    parts: OcPart[],
+    shape: OpenCodeStoreShape = "v1",
+): Database {
     const dataHome = createTempDir("mc-backfill-test-");
     process.env.XDG_DATA_HOME = dataHome;
 
@@ -70,39 +77,47 @@ function buildOpencodeDb(messages: OcMessage[], parts: OcPart[]): Database {
     const ocPath = join(ocDir, "opencode.db");
 
     const oc = new Database(ocPath);
-    oc.exec(`
-        CREATE TABLE message (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            time_created INTEGER NOT NULL,
-            data TEXT NOT NULL
-        );
-        CREATE TABLE part (
-            id TEXT PRIMARY KEY,
-            message_id TEXT NOT NULL,
-            time_created INTEGER NOT NULL,
-            data TEXT NOT NULL
-        );
-    `);
+    if (shape !== "pure-v2") {
+        oc.exec(`
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+        `);
 
-    const insertMessage = oc.prepare(
-        "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
-    );
-    for (const m of messages) {
-        insertMessage.run(m.id, m.sessionId, m.timeCreated, JSON.stringify({ role: m.role }));
-    }
-
-    const insertPart = oc.prepare(
-        "INSERT INTO part (id, message_id, time_created, data) VALUES (?, ?, ?, ?)",
-    );
-    for (const p of parts) {
-        const data: Record<string, unknown> = { type: p.type };
-        if (p.type === "tool" || p.type === "tool-invocation") {
-            if (p.callId) data.callID = p.callId;
-        } else if (p.type === "tool_use") {
-            if (p.callId) data.id = p.callId;
+        const insertMessage = oc.prepare(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES (?, ?, ?, ?)",
+        );
+        for (const m of messages) {
+            insertMessage.run(m.id, m.sessionId, m.timeCreated, JSON.stringify({ role: m.role }));
         }
-        insertPart.run(p.id, p.messageId, p.timeCreated, JSON.stringify(data));
+
+        const insertPart = oc.prepare(
+            "INSERT INTO part (id, message_id, time_created, data) VALUES (?, ?, ?, ?)",
+        );
+        for (const p of parts) {
+            const data: Record<string, unknown> = { type: p.type };
+            if (p.type === "tool" || p.type === "tool-invocation") {
+                if (p.callId) data.callID = p.callId;
+            } else if (p.type === "tool_use") {
+                if (p.callId) data.id = p.callId;
+            }
+            insertPart.run(p.id, p.messageId, p.timeCreated, JSON.stringify(data));
+        }
+    }
+    if (shape !== "v1") {
+        oc.exec(`
+            CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+            CREATE TABLE session_v2 (id TEXT PRIMARY KEY);
+        `);
     }
 
     oc.close();
@@ -137,7 +152,7 @@ describe("runToolOwnerBackfill", () => {
         closeQuietly(mc);
     });
 
-    test("OpenCode tool shape: backfills oldest assistant for callID", () => {
+    test("pure v1 store backfills the oldest assistant for callID", () => {
         // OC has two assistant messages, both with a 'tool' part for read:1.
         // The backfill should pick the older one as owner.
         const oc = buildOpencodeDb(
@@ -173,6 +188,43 @@ describe("runToolOwnerBackfill", () => {
         const tags = getTagsBySession(mc, "ses-1");
         expect(tags[0].toolOwnerMessageId).toBe("msg-old");
 
+        closeQuietly(mc);
+    });
+
+    test("migrated v2 store backfills retained v1 message rows", () => {
+        const oc = buildOpencodeDb(
+            [{ id: "msg-1", sessionId: "ses-1", role: "assistant", timeCreated: 1000 }],
+            [
+                {
+                    id: "part-1",
+                    messageId: "msg-1",
+                    type: "tool",
+                    callId: "read:1",
+                    timeCreated: 1100,
+                },
+            ],
+            "migrated-v2",
+        );
+        oc.close();
+        const mc = createMcDb();
+        insertTag(mc, "ses-1", "read:1", "tool", 100, 1);
+
+        const result = runToolOwnerBackfill(mc);
+
+        expect(result.sessionsCompleted).toBe(1);
+        expect(result.rowsUpdated).toBe(1);
+        expect(getTagsBySession(mc, "ses-1")[0]?.toolOwnerMessageId).toBe("msg-1");
+        closeQuietly(mc);
+    });
+
+    test("pure v2 store fails fast when no v1 message tables exist", () => {
+        const oc = buildOpencodeDb([], [], "pure-v2");
+        oc.close();
+        const mc = createMcDb();
+        insertTag(mc, "ses-1", "read:1", "tool", 100, 1);
+
+        expect(() => runToolOwnerBackfill(mc)).toThrow("no v1 message tables; nothing to backfill");
+        expect(getTagsBySession(mc, "ses-1")[0]?.toolOwnerMessageId).toBeNull();
         closeQuietly(mc);
     });
 
@@ -540,6 +592,39 @@ describe("runToolOwnerBackfill", () => {
         expect(r2.sessionsCompleted).toBe(1);
         expect(r2.rowsUpdated).toBe(1);
 
+        closeQuietly(mc);
+    });
+
+    test("rowsUpdated ignores writes from an unrelated AFTER UPDATE trigger", () => {
+        const oc = buildOpencodeDb(
+            [{ id: "msg-1", sessionId: "ses-1", role: "assistant", timeCreated: 1000 }],
+            [
+                {
+                    id: "p1",
+                    messageId: "msg-1",
+                    type: "tool",
+                    callId: "read:1",
+                    timeCreated: 1100,
+                },
+            ],
+        );
+        oc.close();
+        const mc = createMcDb();
+        mc.exec(`
+            CREATE TABLE tag_update_audit (tag_id INTEGER NOT NULL);
+            CREATE TRIGGER throwaway_backfill_tag_update AFTER UPDATE ON tags BEGIN
+                INSERT INTO tag_update_audit(tag_id) VALUES(NEW.id);
+            END;
+        `);
+        insertTag(mc, "ses-1", "read:1", "tool", 100, 1);
+
+        const result = runToolOwnerBackfill(mc);
+
+        expect(result.sessionsCompleted).toBe(1);
+        expect(result.rowsUpdated).toBe(1);
+        expect(mc.prepare("SELECT COUNT(*) AS count FROM tag_update_audit").get()).toEqual({
+            count: 1,
+        });
         closeQuietly(mc);
     });
 

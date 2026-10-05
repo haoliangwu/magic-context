@@ -46,6 +46,11 @@ export function stripPiProcessedImages(args: {
 	messageIdToMaxTag: ReadonlyMap<string, number>;
 	stableId: (message: unknown, index: number) => string | undefined;
 	addIds?: typeof addProcessedImageStrippedIds;
+	onFirstApplication?: (
+		message: unknown,
+		messageIndex: number,
+		partIndex: number,
+	) => void;
 }): StripPiProcessedImagesResult {
 	const frozenIds = getProcessedImageStrippedIds(args.db, args.sessionId);
 	const newlyStrippedIds: string[] = [];
@@ -102,6 +107,8 @@ export function stripPiProcessedImages(args: {
 		if (!Array.isArray(message.content)) continue;
 		for (let partIndex = 0; partIndex < message.content.length; partIndex++) {
 			if (!isLargeImagePart(message.content[partIndex])) continue;
+			if (newlyStrippedIds.includes(id))
+				args.onFirstApplication?.(raw, i, partIndex);
 			message.content[partIndex] = {
 				type: "text",
 				text: STRIPPED_IMAGE_MARKER,

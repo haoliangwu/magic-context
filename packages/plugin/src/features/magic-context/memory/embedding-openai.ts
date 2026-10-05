@@ -1,5 +1,7 @@
+import { estimateTokens } from "../../../hooks/magic-context/read-session-formatting";
 import { log } from "../../../shared/logger";
 import { sanitizeDiagnosticText } from "../../../shared/redaction";
+import { CHUNK_WINDOW_SAFETY_RATIO } from "../compartment-chunk-embedding";
 import type { EmbeddingFailure, EmbeddingFailureClass } from "./embedding-failure";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import { embeddingModelsMatch, resolveEmbeddingTextPrefixes } from "./embedding-model-match";
@@ -27,12 +29,73 @@ interface OpenAICompatibleEmbeddingProviderOptions {
 interface EmbeddingResponseBody {
     data?: Array<{
         embedding?: number[];
+        /** Position of the input this vector belongs to. */
+        index?: unknown;
     }>;
     /** The model the endpoint actually served. OpenAI and most compatible
      *  servers echo back the requested model; LMStudio/Ollama return the model
      *  they ACTUALLY ran, which can differ from the request when the requested
      *  model isn't loaded and the server substitutes a loaded one. */
     model?: string;
+}
+
+/**
+ * Map each response item to the input it embeds. The OpenAI contract tags
+ * every item with `index`, and a proxy may return items out of order, so the
+ * tag wins over array position; storing a vector against the wrong text would
+ * silently corrupt the index. Items without any `index` keep array order.
+ * Returns null when the tags are partial, duplicated or out of range.
+ */
+function responseSlots(items: readonly { index?: unknown }[], inputCount: number): number[] | null {
+    if (items.every((item) => item?.index === undefined)) {
+        return items.map((_, position) => position);
+    }
+    const slots: number[] = [];
+    const seen = new Set<number>();
+    for (const item of items) {
+        const index = item?.index;
+        if (
+            typeof index !== "number" ||
+            !Number.isInteger(index) ||
+            index < 0 ||
+            index >= inputCount ||
+            seen.has(index)
+        ) {
+            return null;
+        }
+        seen.add(index);
+        slots.push(index);
+    }
+    return slots;
+}
+
+function capEmbeddingInput(
+    input: string,
+    maxInputTokens: number,
+    purpose: EmbeddingPurpose | undefined,
+): string {
+    // Queries are raw user text, so they get the chunker's safety margin. Documents
+    // were already chunked to that margin without counting the instruction prefix,
+    // so they are only cut at the full limit: a full-size chunk plus a short prefix
+    // must reach the model whole.
+    const ratio = purpose === "query" ? CHUNK_WINDOW_SAFETY_RATIO : 1;
+    const budget = Math.max(1, Math.floor(maxInputTokens * ratio));
+    if (estimateTokens(input) <= budget) return input;
+    // Search tasks are usually stated first, so preserve the useful beginning.
+    let low = 0;
+    let high = input.length;
+    while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        if (estimateTokens(input.slice(0, mid)) <= budget) low = mid;
+        else high = mid - 1;
+    }
+    // UTF-16 slicing can otherwise leave an unmatched high surrogate.
+    if (low > 0 && low < input.length) {
+        const last = input.charCodeAt(low - 1);
+        const next = input.charCodeAt(low);
+        if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) low -= 1;
+    }
+    return input.slice(0, low);
 }
 
 function normalizeEndpoint(endpoint?: string): string {
@@ -100,6 +163,7 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
      *  to true is allowed to make a real HTTP call; everyone else short-
      *  circuits as if the circuit were still OPEN. */
     private halfOpenProbeInFlight = false;
+    private queryTruncationLogged = false;
 
     constructor(options: OpenAICompatibleEmbeddingProviderOptions) {
         this.endpoint = normalizeEndpoint(options.endpoint);
@@ -199,9 +263,21 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
         // sending empty content where possible, but this is the single chokepoint
         // that guarantees a stray empty string can't 400 the request.
         const textPrefix = purpose === "query" ? this.queryPrefix : this.documentPrefix;
-        const requestTexts = texts.map(
-            (text) => `${textPrefix}${text.trim().length === 0 ? " " : text}`,
-        );
+        const requestTexts = texts.map((text) => {
+            const input = `${textPrefix}${text.trim().length === 0 ? " " : text}`;
+            const capped = capEmbeddingInput(input, this.maxInputTokens, purpose);
+            if (
+                purpose === "query" &&
+                capped.length < input.length &&
+                !this.queryTruncationLogged
+            ) {
+                log(
+                    `[magic-context] embedding query truncated from ${input.length} to ${capped.length} characters to fit max_input_tokens`,
+                );
+                this.queryTruncationLogged = true;
+            }
+            return capped;
+        });
 
         if (!(await this.initialize())) {
             return Array.from({ length: texts.length }, () => null);
@@ -358,10 +434,29 @@ export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
                 return Array.from({ length: texts.length }, () => null);
             }
 
-            const items = body.data;
-            const results = Array.from({ length: texts.length }, (_, index) => {
-                const embedding = items[index]?.embedding;
-                return Array.isArray(embedding) ? Float32Array.from(embedding) : null;
+            const slots = responseSlots(body.data, texts.length);
+            if (!slots) {
+                const failure = this.failure(
+                    "invalid_envelope",
+                    "response data[].index values were missing, duplicated or out of range",
+                    false,
+                );
+                log(
+                    `[magic-context] openai-compatible embedding request failed: ${failure.reason}`,
+                );
+                this.recordFailure(isProbe, failure);
+                return Array.from({ length: texts.length }, () => null);
+            }
+            const results: (Float32Array | null)[] = Array.from(
+                { length: texts.length },
+                () => null,
+            );
+            body.data.forEach((item, position) => {
+                const embedding = item?.embedding;
+                const slot = slots[position];
+                if (slot !== undefined && slot < results.length && Array.isArray(embedding)) {
+                    results[slot] = Float32Array.from(embedding);
+                }
             });
 
             // A response with no usable vectors is still a failure — the

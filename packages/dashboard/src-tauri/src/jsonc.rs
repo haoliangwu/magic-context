@@ -66,13 +66,12 @@ pub fn strip_jsonc(input: &str) -> String {
             i += 2;
             continue;
         }
-        // Trailing comma (outside strings only): a `,` whose next non-whitespace
-        // char is `}` or `]`. Skip emitting it.
+        // Trailing comma (outside strings only): a `,` whose next char, past any
+        // whitespace and comments, is `}` or `]`. Skip emitting it. Comments
+        // must be skipped here too: `"a": 1, // note` before `}` is a trailing
+        // comma, and keeping it makes the whole file unparseable.
         if c == ',' {
-            let mut k = i + 1;
-            while k < chars.len() && chars[k].is_whitespace() {
-                k += 1;
-            }
+            let k = skip_whitespace_and_comments(&chars, i + 1);
             if k < chars.len() && (chars[k] == '}' || chars[k] == ']') {
                 i += 1;
                 continue;
@@ -82,6 +81,32 @@ pub fn strip_jsonc(input: &str) -> String {
         i += 1;
     }
     out
+}
+
+/// Index of the first char at or after `start` that is neither whitespace nor
+/// part of a `//` or `/* */` comment. Only called outside string literals.
+fn skip_whitespace_and_comments(chars: &[char], start: usize) -> usize {
+    let mut k = start;
+    loop {
+        while k < chars.len() && chars[k].is_whitespace() {
+            k += 1;
+        }
+        if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '/' {
+            while k < chars.len() && chars[k] != '\n' {
+                k += 1;
+            }
+            continue;
+        }
+        if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '*' {
+            k += 2;
+            while k + 1 < chars.len() && !(chars[k] == '*' && chars[k + 1] == '/') {
+                k += 1;
+            }
+            k = (k + 2).min(chars.len());
+            continue;
+        }
+        return k;
+    }
 }
 
 /// True when the config file at `path` exists AND declares a non-empty `dreamer`
@@ -155,6 +180,18 @@ mod tests {
         let input = "{\n  // line\n  \"a\": 1, /* block */\n  \"b\": [1, 2,],\n}";
         let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(input)).unwrap();
         assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn strips_a_trailing_comma_followed_by_a_comment() {
+        let input = "{\n  \"dreamer\": {\n    \"tasks\": { \"verify\": { \"schedule\": \"0 3 * * *\" }, // last\n    },\n  }, /* block */\n  \"b\": [1, 2, /* two */ ],\n}";
+        let parsed: serde_json::Value = serde_json::from_str(&strip_jsonc(input))
+            .unwrap_or_else(|e| panic!("stripped JSONC must parse: {e}"));
+        assert_eq!(
+            parsed["dreamer"]["tasks"]["verify"]["schedule"],
+            "0 3 * * *"
+        );
         assert_eq!(parsed["b"], serde_json::json!([1, 2]));
     }
 

@@ -235,7 +235,6 @@ Le rappel fonctionne **entre sessions** (une nouvelle session hérite de tout) e
 | `/ctx-status` | Vue de débogage : tags, suppressions en attente, TTL de cache, état des rappels, progression historian, couverture des compartiments, budget d'historique |
 | `/ctx-flush` | Forcer immédiatement toutes les opérations en file, en contournant le TTL de cache |
 | `/ctx-recomp` | Reconstruire les compartiments depuis l'historique brut (accepte une plage `start-end`). À utiliser quand l'état stocké semble faux |
-| `/ctx-session-upgrade` | Mettre cette session au dernier format d'historique : reconstruire les compartiments et migrer les mémoires de projet |
 | `/ctx-dream` | Exécuter la maintenance dreamer à la demande : mémoire, docs, smart notes et revue user-profile |
 
 ---

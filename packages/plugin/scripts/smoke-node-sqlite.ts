@@ -3,6 +3,7 @@
 // REAL wrapper under Node to validate: construction, readonly mapping, the
 // transaction() shim (top-level + nested savepoint rollback), exec/prepare/
 // run/get/all, and ATTACH. Run with: node packages/plugin/scripts/smoke-node-sqlite.ts
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +12,7 @@ import { join } from "node:path";
 // `bun test` cannot reach. Node's ESM type-stripping resolver requires the
 // extension. The file is excluded from tsconfig.scripts.json for the same
 // reason (running it IS the validation).
-import { Database } from "../src/shared/sqlite.ts";
+import { Database, withSqliteTransformPass } from "../src/shared/sqlite.ts";
 
 let failures = 0;
 function check(name: string, cond: boolean, detail?: string): void {
@@ -117,6 +118,62 @@ try {
     }
     check("readonly open blocks writes", blocked);
     ro.close();
+
+    const writer = new Database(dbPath);
+    writer.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=50");
+    // A BEGIN inside a transform pass waits up to 250 ms for another writer
+    // (the async admission retries, not this synchronous attempt, cover longer
+    // holds). A 120 ms hold must be waited out; a 650 ms hold must surface as
+    // SqliteAcquisitionBusyError so the pass can replay or refuse.
+    const holdLock = (holdMs: number) => {
+        const locker = spawn(process.execPath, ["--input-type=module", "-e", `
+            import { DatabaseSync } from 'node:sqlite';
+            const db = new DatabaseSync(${JSON.stringify(dbPath)});
+            db.exec('BEGIN IMMEDIATE');
+            console.log('LOCKED');
+            setTimeout(() => { db.exec('ROLLBACK'); db.close(); }, ${holdMs});
+        `], { stdio: ["ignore", "pipe", "pipe"] });
+        const exited = new Promise<void>((resolve, reject) => {
+            locker.once("error", reject);
+            locker.once("exit", code => code === 0 ? resolve() : reject(new Error(`locker exit ${code}`)));
+        });
+        const locked = new Promise<void>((resolve, reject) => {
+            let output = "";
+            locker.stdout.on("data", chunk => { output += String(chunk); if (output.includes("LOCKED")) resolve(); });
+            locker.once("error", reject);
+        });
+        return { exited, locked };
+    };
+    {
+        const { exited, locked } = holdLock(650);
+        await locked;
+        let threw = "";
+        try {
+            withSqliteTransformPass(() => {
+                writer.transaction(() => writer.prepare("INSERT INTO t(v,flag) VALUES(?,?)").run("long-hold", 1)).immediate();
+            });
+        } catch (error) {
+            threw = error instanceof Error ? error.name : String(error);
+        } finally { await exited; }
+        check("in-pass acquisition past its budget surfaces SqliteAcquisitionBusyError", threw === "SqliteAcquisitionBusyError");
+    }
+    for (const mode of ["default", "immediate", "exclusive", "literal"] as const) {
+        const { exited, locked } = holdLock(120);
+        await locked;
+        let callbacks = 0;
+        const callback = () => { callbacks++; writer.prepare("INSERT INTO t(v,flag) VALUES(?,?)").run(mode, 1); };
+        try {
+            withSqliteTransformPass(() => {
+                if (mode === "literal") { writer.exec("BEGIN IMMEDIATE"); callback(); writer.exec("COMMIT"); }
+                else { const tx = writer.transaction(callback); if (mode === "default") tx(); else tx[mode](); }
+            });
+            check(`${mode} acquisition retries before callback under node:sqlite`, callbacks === 1);
+        } finally { await exited; }
+    }
+    writer.close();
+    const snapshot = new Database(dbPath, { readonly: true });
+    check("readonly default transaction stays a read snapshot", snapshot.transaction(() => snapshot.prepare("SELECT COUNT(*) AS n FROM t").get())() !== undefined);
+    snapshot.close();
 } finally {
     rmSync(dir, { recursive: true, force: true });
 }

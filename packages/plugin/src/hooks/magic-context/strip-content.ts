@@ -3,11 +3,21 @@ import {
     readFrozenMergedReasoningParts,
 } from "../../features/magic-context/merged-reasoning-decisions";
 import { isRecord } from "../../shared/record-type-guard";
-import { isSentinel, makeSentinel, makeWholeMessageSentinel } from "./sentinel";
+import {
+    isSentinel,
+    makeSentinel,
+    makeWholeMessageSentinel,
+    modelAcceptsEmptyContent,
+} from "./sentinel";
 import { stripWellFormedLeadingTagPrefix } from "./tag-content-primitives";
 import type { MessageLike, ThinkingLikePart } from "./tag-messages";
 
-const DROPPED_PLACEHOLDER_PATTERN = /^\[dropped §\d+§\]$/;
+const MARKER_ONLY_PATTERN = /^(?:(?:§\d+§|\[dropped(?: §\d+§)?\]|\[cleared\])\s*)+$/;
+
+export function isMarkerOnlyText(text: string): boolean {
+    const trimmed = text.trim();
+    return trimmed.length > 0 && MARKER_ONLY_PATTERN.test(trimmed);
+}
 const TAG_PREFIX_PATTERN = /^§\d+§\s*/;
 
 // Patterns that identify system-injected messages (notifications, reminders, etc.)
@@ -52,6 +62,7 @@ export function stripSystemInjectedMessages(
     messages: MessageLike[],
     protectedTailStart: number,
     providerID?: string,
+    onFirstApplication?: (message: MessageLike, partIndex: number) => void,
 ): { stripped: number; sentineledIds: string[] } {
     let stripped = 0;
     const sentineledIds: string[] = [];
@@ -104,6 +115,7 @@ export function stripSystemInjectedMessages(
         }
 
         if (hasContentPart && allContentIsSystemInjection) {
+            onFirstApplication?.(msg, 0);
             msg.parts.length = 0;
             msg.parts.push(makeWholeMessageSentinel(providerID));
             stripped++;
@@ -165,6 +177,7 @@ const METADATA_PART_TYPES = new Set([
 export function stripDroppedPlaceholderMessages(
     messages: MessageLike[],
     providerID?: string,
+    onFirstApplication?: (message: MessageLike, partIndex: number) => void,
 ): {
     stripped: number;
     sentineledIds: string[];
@@ -186,7 +199,10 @@ export function stripDroppedPlaceholderMessages(
         let hasNonDroppedContent = false;
 
         for (const part of msg.parts) {
-            if (!isRecord(part)) continue;
+            if (!isRecord(part)) {
+                hasNonDroppedContent = true;
+                break;
+            }
             const partType = part.type as string;
 
             // Skip metadata parts — they don't reach the model
@@ -198,40 +214,15 @@ export function stripDroppedPlaceholderMessages(
                 break;
             }
 
-            // Text parts: check if they're only dropped placeholders
-            if (partType === "text" && typeof part.text === "string") {
+            // Blank parts and complete markers both qualify; the sentinel below uses
+            // empty text only for Anthropic and [dropped] for other providers.
+            if (
+                (partType === "text" || partType === "reasoning") &&
+                typeof part.text === "string"
+            ) {
                 hasContentPart = true;
-                const trimmed = part.text.trim();
-                if (trimmed.length === 0) continue;
-                if (!trimmed.includes("[dropped §")) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                const allSegmentsDropped = trimmed
-                    .split(/(?=\[dropped §)/)
-                    .filter((s) => s.trim().length > 0)
-                    .every((segment) => DROPPED_PLACEHOLDER_PATTERN.test(segment.trim()));
-                if (!allSegmentsDropped) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                continue;
-            }
-
-            // Reasoning parts: check similarly
-            if (partType === "reasoning" && typeof part.text === "string") {
-                hasContentPart = true;
-                const trimmed = part.text.trim();
-                if (trimmed.length === 0) continue;
-                if (!trimmed.includes("[dropped §")) {
-                    hasNonDroppedContent = true;
-                    break;
-                }
-                const allSegmentsDropped = trimmed
-                    .split(/(?=\[dropped §)/)
-                    .filter((s) => s.trim().length > 0)
-                    .every((segment) => DROPPED_PLACEHOLDER_PATTERN.test(segment.trim()));
-                if (!allSegmentsDropped) {
+                if (part.text.trim().length === 0) continue;
+                if (!isMarkerOnlyText(part.text)) {
                     hasNonDroppedContent = true;
                     break;
                 }
@@ -244,6 +235,7 @@ export function stripDroppedPlaceholderMessages(
         }
 
         if (hasContentPart && !hasNonDroppedContent) {
+            onFirstApplication?.(msg, 0);
             msg.parts.length = 0;
             msg.parts.push(makeWholeMessageSentinel(providerID));
             stripped++;
@@ -276,6 +268,9 @@ export function replayClearedReasoning(
         if (!parts) continue;
 
         for (const tp of parts) {
+            // A drop may already have rewritten this part to an empty text
+            // sentinel; it is no longer reasoning and must stay empty.
+            if (tp.type === "text") continue;
             if (tp.thinking !== undefined && tp.thinking !== "[cleared]") {
                 tp.thinking = "[cleared]";
                 cleared++;
@@ -341,6 +336,9 @@ export function clearOldReasoning(
         if (!parts) continue;
 
         for (const tp of parts) {
+            // A drop may already have rewritten this part to an empty text
+            // sentinel; it is no longer reasoning and must stay empty.
+            if (tp.type === "text") continue;
             if (tp.thinking !== undefined && tp.thinking !== "[cleared]") {
                 tp.thinking = "[cleared]";
                 cleared++;
@@ -468,36 +466,26 @@ function hasReasoningReplayContent(message: MessageLike): boolean {
 }
 
 /**
- * Return the newest assistant that is visible in the provider replay. OpenCode may append a
- * metadata-only request shell; the adapter drops that shell, so it cannot own the exemption for
- * the completed assistant whose signed reasoning is actually replayed last.
+ * Ids of every assistant that still sends a thinking-like part, oldest first.
+ * Binding recovery strips all of them: after a prefix edit Anthropic rejects
+ * every signed block past the edit, and removing all blocks is always valid.
+ * That includes the newest assistant even when it holds an open tool round.
  */
-export function findNewestReasoningBearingAssistantId(messages: MessageLike[]): string | undefined {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const message = messages[index];
+export function findReasoningBearingAssistantIds(messages: MessageLike[]): string[] {
+    const ids = new Set<string>();
+    for (const message of messages) {
         if (message.info.role !== "assistant") continue;
+        const id = message.info.id;
+        if (typeof id !== "string" || id.length === 0) continue;
         if (
-            !message.parts.some(
+            message.parts.some(
                 (part) => isRecord(part) && REASONING_PART_TYPES.has(String(part.type)),
             )
         ) {
-            continue;
+            ids.add(id);
         }
-        const id = message.info.id;
-        if (typeof id === "string" && id.length > 0) return id;
     }
-    return undefined;
-}
-
-export function assistantHasReasoningPart(messages: MessageLike[], messageId: string): boolean {
-    return messages.some(
-        (message) =>
-            message.info.role === "assistant" &&
-            message.info.id === messageId &&
-            message.parts.some(
-                (part) => isRecord(part) && REASONING_PART_TYPES.has(String(part.type)),
-            ),
-    );
+    return [...ids];
 }
 
 export function findLatestAssistantReasoningMutationExemptMessage(
@@ -874,7 +862,8 @@ export function stripReasoningFromAssistantIds(
     providerID: string | undefined,
     messageIds: ReadonlySet<string>,
 ): number {
-    if (providerID !== "anthropic" || messageIds.size === 0) return 0;
+    if (messageIds.size === 0) return 0;
+    const emptySentinels = modelAcceptsEmptyContent(providerID);
     let stripped = 0;
     for (const message of messages) {
         const id = message.info.id;
@@ -882,9 +871,16 @@ export function stripReasoningFromAssistantIds(
         for (let index = 0; index < message.parts.length; index += 1) {
             const part = message.parts[index];
             if (!isRecord(part) || !REASONING_PART_TYPES.has(String(part.type))) continue;
-            message.parts[index] = makeSentinel(part);
+            if (emptySentinels) {
+                message.parts[index] = makeSentinel(part);
+            } else {
+                // Cloud and custom adapters may forward empty blocks instead of filtering them.
+                message.parts.splice(index, 1);
+                index -= 1;
+            }
             stripped += 1;
         }
+        if (message.parts.length === 0) message.parts.push(makeWholeMessageSentinel(providerID));
     }
     return stripped;
 }
@@ -1010,6 +1006,8 @@ export function stripProcessedImages(
         detect: boolean;
         watermark: number;
         messageTagNumbers: Map<MessageLike, number>;
+        /** Reports only first strips, never restoring an already frozen image. */
+        onFirstApplication?: (message: MessageLike, partIndex: number) => void;
     },
 ): StripProcessedImagesResult {
     const { detect, watermark, messageTagNumbers } = options;
@@ -1053,6 +1051,7 @@ export function stripProcessedImages(
                 part.url.startsWith("data:") &&
                 part.url.length > 200
             ) {
+                if (isNewDetection) options.onFirstApplication?.(msg, j);
                 msg.parts[j] = makeSentinel(part);
                 stripped++;
                 touchedThisMsg = true;

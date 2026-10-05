@@ -1,6 +1,10 @@
 import { expect, test } from "bun:test";
 import { OpenCode } from "@opencode/client";
-import { spawnOpencode2, waitForPluginActive } from "../../src/opencode2-runner/spawn";
+import {
+	spawnOpencode2,
+	waitForPluginActive,
+	waitForPluginLog,
+} from "../../src/opencode2-runner/spawn";
 
 test("I1 s2 dual-loader directory entry activates on the real GA host", async () => {
 	const host = await spawnOpencode2();
@@ -28,9 +32,9 @@ test("I1 s2 dual-loader directory entry activates on the real GA host", async ()
 				.requests()
 				.filter((request) => request.body.model === "mock-model"),
 		).toHaveLength(1);
-		expect(host.stdout() + host.stderr()).toContain(
-			"@cortexkit/opencode-magic-context v2 setup",
-		);
+		expect(
+			await waitForPluginLog(host.env, "@cortexkit/opencode-magic-context v2 setup"),
+		).toContain("@cortexkit/opencode-magic-context v2 setup");
 	} catch (error) {
 		console.error(host.stdout(), host.stderr());
 		throw error;

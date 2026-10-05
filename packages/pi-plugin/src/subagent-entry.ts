@@ -51,7 +51,9 @@
  *                                     action surface. Off by default.
  */
 
+import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { TOKEN_BUDGET_TOOL_REFUSAL } from "@magic-context/core/features/magic-context/dreamer/token-budget";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
@@ -78,6 +80,20 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 		type: "boolean",
 		default: false,
 	});
+
+	const budgetGuardFile = process.env.MAGIC_CONTEXT_SUBAGENT_BUDGET_GUARD_FILE;
+	if (budgetGuardFile) {
+		pi.on("tool_call", () => {
+			try {
+				if (readFileSync(budgetGuardFile, "utf8") === "finalize") {
+					return { block: true, reason: TOKEN_BUDGET_TOOL_REFUSAL };
+				}
+			} catch {
+				return { block: true, reason: TOKEN_BUDGET_TOOL_REFUSAL };
+			}
+			return undefined;
+		});
+	}
 
 	pi.on("session_start", async () => {
 		try {
@@ -112,13 +128,13 @@ export default function magicContextSubagentExtension(pi: ExtensionAPI): void {
 				// child session, so session-scoped ctx_note/ctx_expand would write
 				// orphaned notes / expand an empty transcript. Drop them; keep ctx_search.
 				sessionScopedToolsDisabled: true,
-				todowriteEnabled: cfg.todowrite.enabled !== false,
+				todowriteEnabled: cfg.todowrite.enabled,
 				todowriteCommandEnabled: false,
 				promptSurface: registrationPromptSurface,
 			});
 
 			log(
-				`[pi-subagent] registered tools: ctx_search${dreamerActionsEnabled ? ", ctx_memory" : ""}${cfg.todowrite.enabled !== false ? ", todowrite" : ""}` +
+				`[pi-subagent] registered tools: ctx_search${dreamerActionsEnabled ? ", ctx_memory" : ""}${cfg.todowrite.enabled ? ", todowrite" : ""}` +
 					` (ctx_note/ctx_expand omitted: --no-session child;` +
 					` memory=${cfg.memory.enabled}, embedding=${cfg.embedding.provider !== "off"},` +
 					` git_commits=${cfg.memory.git_commit_indexing.enabled}, dreamer_actions=${dreamerActionsEnabled})`,

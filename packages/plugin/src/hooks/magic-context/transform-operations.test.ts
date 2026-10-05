@@ -1,12 +1,14 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import toolLoopGolden from "../../../../../crates/mc-module/testdata/cc-tool-loop-tag-golden.json";
 import { closeDatabase, getTagById, openDatabase } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { isNeutralizedReasoningPart } from "./sentinel";
 import { byteSize } from "./tag-content-primitives";
 import { clearOldReasoning, tagMessages } from "./transform-operations";
 
@@ -45,7 +47,7 @@ afterEach(() => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -211,7 +213,9 @@ describe("tagMessages", () => {
                 const toolTagId = tagger.getToolTag("ses-1", "call-1", "m-assistant")!;
                 targets.get(toolTagId)!.setContent("[dropped]");
 
-                expect(thinkingPart.thinking).toBe("[cleared]");
+                // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                expect(thinkingPart).toEqual({ type: "text", text: "" });
+                expect(isNeutralizedReasoningPart(thinkingPart)).toBe(true);
             });
         });
     });
@@ -281,7 +285,9 @@ describe("tagMessages", () => {
                 const textTagId = tagger.getTag("ses-1", "m-assistant:p1", "message")!;
                 targets.get(textTagId)!.setContent("[dropped]");
 
-                expect(thinkingPart.thinking).toBe("[cleared]");
+                // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                expect(thinkingPart).toEqual({ type: "text", text: "" });
+                expect(isNeutralizedReasoningPart(thinkingPart)).toBe(true);
             });
         });
     });
@@ -324,11 +330,15 @@ describe("tagMessages", () => {
 
                 const toolTag1 = tagger.getToolTag("ses-1", "call-1", "m-assistant")!;
                 targets.get(toolTag1)!.setContent("[dropped]");
-                expect(thinkingPart.thinking).toBe("[cleared]");
+                // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                expect(thinkingPart).toEqual({ type: "text", text: "" });
+                expect(isNeutralizedReasoningPart(thinkingPart)).toBe(true);
 
                 const toolTag2 = tagger.getToolTag("ses-1", "call-2", "m-assistant")!;
                 targets.get(toolTag2)!.setContent("[dropped]");
-                expect(thinkingPart.thinking).toBe("[cleared]");
+                // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                expect(thinkingPart).toEqual({ type: "text", text: "" });
+                expect(isNeutralizedReasoningPart(thinkingPart)).toBe(true);
             });
         });
     });
@@ -407,7 +417,9 @@ describe("tagMessages", () => {
                 const toolTagId = tagger.getToolTag("ses-1", "call-1", "m-assistant")!;
                 targets.get(toolTagId)!.setContent("[dropped]");
 
-                expect(reasoningPart.text).toBe("[cleared]");
+                // A drop takes the reasoning off the wire whole instead of writing "[cleared]" into it.
+                expect(reasoningPart).toEqual({ type: "text", text: "" });
+                expect(isNeutralizedReasoningPart(reasoningPart)).toBe(true);
             });
         });
     });

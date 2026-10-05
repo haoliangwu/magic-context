@@ -1,0 +1,4312 @@
+[
+  {
+    "scenario": "fresh",
+    "variant": "A",
+    "finalWire": [
+      {
+        "info": {
+          "id": "A-fresh-1",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§1§ Turn 1: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-2",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§2§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-3",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§3§ Turn 2: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-4",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§4§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-5",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§5§ Turn 3: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-6",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§6§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§7§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t3parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§8§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-7",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t3s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§9§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-8",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§10§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§11§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-9",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§12§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§13§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-10",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§14§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-11",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§15§ Turn 4: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-12",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§16§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-13",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§17§ Turn 5: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-14",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§18§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-15",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§19§ Turn 6: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-16",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§20§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-17",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§21§ Turn 7: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-18",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§22§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-19",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§23§ Turn 8: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-20",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§24§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§25§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t8parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§26§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-21",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t8s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§27§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-22",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§28§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§29§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-23",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§30§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§31§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-24",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§32§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-25",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§33§ Turn 9: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-26",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§34§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-27",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§35§ Turn 10: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-28",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§36§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-29",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§37§ Turn 11: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-30",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§38§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-31",
+          "sessionID": "A-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§39§ Turn 12: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-fresh-32",
+          "sessionID": "A-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§40§ There are seven fruit."
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "scenario": "reduced",
+    "variant": "A",
+    "afterReduction": [
+      {
+        "info": {
+          "id": "A-reduced-1",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§1§ Turn 1: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-2",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§2§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-3",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§3§ Turn 2: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-4",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§4§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-5",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§5§ Turn 3: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-6",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§6§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§7§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t3parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§8§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-7",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t3s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§9§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-8",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§10§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§11§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-9",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§12§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§13§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-10",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§14§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-11",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§15§ Turn 4: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-12",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§16§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-13",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§17§ Turn 5: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-14",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§18§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-15",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§19§ Turn 6: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-16",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§20§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-17",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§21§ Turn 7: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-18",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§22§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-19",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§23§ Turn 8: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-20",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§24§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§25§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t8parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§26§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-21",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t8s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§27§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-22",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§28§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§29§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-23",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§30§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§31§ [dropped §31§]"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-24",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§32§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-25",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§33§ Turn 9: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-26",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§34§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-27",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§35§ Turn 10: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-28",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§36§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-29",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "reduce",
+            "tool": "ctx_reduce",
+            "state": {
+              "status": "completed",
+              "input": {
+                "drop": "31"
+              },
+              "output": "§37§ Queued for reduction."
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "scenario": "reduced",
+    "variant": "A",
+    "finalWire": [
+      {
+        "info": {
+          "id": "A-reduced-1",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§1§ Turn 1: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-2",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§2§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-3",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§3§ Turn 2: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-4",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§4§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-5",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§5§ Turn 3: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-6",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§6§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§7§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t3parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§8§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-7",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t3s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§9§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-8",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§10§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§11§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-9",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§12§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§13§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-10",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§14§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-11",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§15§ Turn 4: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-12",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§16§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-13",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§17§ Turn 5: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-14",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§18§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-15",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§19§ Turn 6: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-16",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§20§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-17",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§21§ Turn 7: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-18",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§22§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-19",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§23§ Turn 8: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-20",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§24§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§25§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t8parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§26§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-21",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t8s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§27§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-22",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§28§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§29§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-23",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§30§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§31§ [dropped §31§]"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-24",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§32§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-25",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§33§ Turn 9: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-26",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§34§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-27",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§35§ Turn 10: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-28",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§36§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-29",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "reduce",
+            "tool": "ctx_reduce",
+            "state": {
+              "status": "completed",
+              "input": {
+                "drop": "31"
+              },
+              "output": "§37§ Queued for reduction."
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-30",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§38§ Turn 11: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-31",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§39§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-32",
+          "sessionID": "A-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§40§ Turn 12: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-reduced-33",
+          "sessionID": "A-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§41§ There are seven fruit."
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "scenario": "literal-head",
+    "variant": "A",
+    "finalWire": [
+      {
+        "info": {
+          "id": "A-literal-head-1",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§1§ <project-memory>Example from an older session: §9001§ is a literal quoted handle, not the next conversation tag.</project-memory>"
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-2",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§2§ Turn 1: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-3",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§3§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-4",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§4§ Turn 2: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-5",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§5§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-6",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§6§ Turn 3: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-7",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§7§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§8§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t3parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§9§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-8",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t3s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§10§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-9",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§11§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§12§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-10",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§13§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§14§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-11",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§15§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-12",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§16§ Turn 4: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-13",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§17§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-14",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§18§ Turn 5: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-15",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§19§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-16",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§20§ Turn 6: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-17",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§21§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-18",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§22§ Turn 7: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-19",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§23§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-20",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§24§ Turn 8: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-21",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§25§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§26§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t8parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§27§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-22",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t8s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§28§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-23",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§29§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§30§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-24",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§31§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§32§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-25",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§33§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-26",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§34§ Turn 9: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-27",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§35§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-28",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§36§ Turn 10: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-29",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§37§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-30",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§38§ Turn 11: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-31",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§39§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-32",
+          "sessionID": "A-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§40§ Turn 12: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "A-literal-head-33",
+          "sessionID": "A-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§41§ There are seven fruit."
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "scenario": "fresh",
+    "variant": "B",
+    "finalWire": [
+      {
+        "info": {
+          "id": "B-fresh-1",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§1§ Turn 1: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-2",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§2§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-3",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§3§ Turn 2: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-4",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§4§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-5",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§5§ Turn 3: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-6",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§6§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§7§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t3parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§8§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-7",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t3s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§9§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-8",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§10§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§11§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-9",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§12§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§13§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-10",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§14§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-11",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§15§ Turn 4: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-12",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§16§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-13",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§17§ Turn 5: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-14",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§18§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-15",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§19§ Turn 6: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-16",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§20§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-17",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§21§ Turn 7: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-18",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§22§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-19",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§23§ Turn 8: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-20",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§24§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§25§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t8parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§26§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-21",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t8s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§27§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-22",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§28§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§29§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-23",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§30§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§31§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-24",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§32§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-25",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§33§ Turn 9: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-26",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§34§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-27",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§35§ Turn 10: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-28",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§36§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-29",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§37§ Turn 11: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-30",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§38§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-31",
+          "sessionID": "B-fresh",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§39§ Turn 12: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-fresh-32",
+          "sessionID": "B-fresh",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§40§ There are seven fruit."
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "scenario": "reduced",
+    "variant": "B",
+    "afterReduction": [
+      {
+        "info": {
+          "id": "B-reduced-1",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§1§ Turn 1: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-2",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§2§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-3",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§3§ Turn 2: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-4",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§4§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-5",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§5§ Turn 3: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-6",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§6§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§7§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t3parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§8§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-7",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t3s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§9§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-8",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§10§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§11§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-9",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§12§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§13§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-10",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§14§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-11",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§15§ Turn 4: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-12",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§16§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-13",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§17§ Turn 5: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-14",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§18§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-15",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§19§ Turn 6: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-16",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§20§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-17",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§21§ Turn 7: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-18",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§22§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-19",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§23§ Turn 8: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-20",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§24§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§25§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t8parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§26§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-21",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t8s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§27§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-22",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§28§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§29§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-23",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§30§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§31§ [dropped §31§]"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-24",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§32§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-25",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§33§ Turn 9: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-26",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§34§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-27",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§35§ Turn 10: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-28",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§36§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-29",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "reduce",
+            "tool": "ctx_reduce",
+            "state": {
+              "status": "completed",
+              "input": {
+                "drop": "31"
+              },
+              "output": "§37§ Queued for reduction."
+            }
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "scenario": "reduced",
+    "variant": "B",
+    "finalWire": [
+      {
+        "info": {
+          "id": "B-reduced-1",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§1§ Turn 1: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-2",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§2§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-3",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§3§ Turn 2: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-4",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§4§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-5",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§5§ Turn 3: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-6",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§6§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§7§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t3parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§8§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-7",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t3s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§9§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-8",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§10§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§11§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-9",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§12§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§13§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-10",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§14§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-11",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§15§ Turn 4: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-12",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§16§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-13",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§17§ Turn 5: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-14",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§18§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-15",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§19§ Turn 6: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-16",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§20§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-17",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§21§ Turn 7: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-18",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§22§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-19",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§23§ Turn 8: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-20",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§24§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§25§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t8parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§26§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-21",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t8s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§27§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-22",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§28§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§29§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-23",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§30§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§31§ [dropped §31§]"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-24",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§32§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-25",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§33§ Turn 9: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-26",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§34§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-27",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§35§ Turn 10: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-28",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§36§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-29",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "reduce",
+            "tool": "ctx_reduce",
+            "state": {
+              "status": "completed",
+              "input": {
+                "drop": "31"
+              },
+              "output": "§37§ Queued for reduction."
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-30",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§38§ Turn 11: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-31",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§39§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-32",
+          "sessionID": "B-reduced",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§40§ Turn 12: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-reduced-33",
+          "sessionID": "B-reduced",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§41§ There are seven fruit."
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "scenario": "literal-head",
+    "variant": "B",
+    "finalWire": [
+      {
+        "info": {
+          "id": "B-literal-head-1",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§1§ <project-memory>Example from an older session: §9001§ is a literal quoted handle, not the next conversation tag.</project-memory>"
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-2",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§2§ Turn 1: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-3",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§3§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-4",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§4§ Turn 2: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-5",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§5§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-6",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§6§ Turn 3: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-7",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§7§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§8§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t3parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§9§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-8",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t3s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§10§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-9",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§11§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§12§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-10",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§13§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t3s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§14§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-11",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§15§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-12",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§16§ Turn 4: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-13",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§17§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-14",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§18§ Turn 5: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-15",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§19§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-16",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§20§ Turn 6: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-17",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§21§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-18",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§22§ Turn 7: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-19",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§23§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-20",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§24§ Turn 8: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-21",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "reasoning",
+            "text": "Need the total"
+          },
+          {
+            "type": "text",
+            "text": "§25§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s0",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§26§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          },
+          {
+            "type": "tool",
+            "callID": "t8parallel",
+            "tool": "list",
+            "state": {
+              "status": "completed",
+              "input": {},
+              "output": "§27§ fixture.txt\nREADME.md\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-22",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "tool",
+            "callID": "t8s1",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§28§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-23",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§29§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s2",
+            "tool": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§30§ fixture.txt: apples=3, pears=4, total=7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-24",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§31§ Inspecting the fixture."
+          },
+          {
+            "type": "tool",
+            "callID": "t8s3",
+            "tool": "echo",
+            "state": {
+              "status": "completed",
+              "input": {
+                "text": "7"
+              },
+              "output": "§32§ 7\n"
+            }
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-25",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§33§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-26",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§34§ Turn 9: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-27",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§35§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-28",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§36§ Turn 10: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-29",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§37§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-30",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§38§ Turn 11: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-31",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§39§ There are seven fruit."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-32",
+          "sessionID": "B-literal-head",
+          "role": "user"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§40§ Turn 12: summarize the fruit fixture."
+          }
+        ]
+      },
+      {
+        "info": {
+          "id": "B-literal-head-33",
+          "sessionID": "B-literal-head",
+          "role": "assistant"
+        },
+        "parts": [
+          {
+            "type": "text",
+            "text": "§41§ There are seven fruit."
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -6,12 +6,14 @@ import { closeQuietly } from "../../shared/sqlite-helpers";
 import { queuePendingOp } from "./storage-ops";
 import {
     adoptFallbackTagMessageId,
+    deleteTagsByMessageId,
     findAdoptableFallbackTags,
     getActiveTagsBySession,
     getActiveTagTokenAggregate,
     getDroppedTagsByNumbers,
     getMaxDroppedTagNumber,
     getOldestActiveUnprotectedToolTags,
+    getRecentTagOwnerMessageIds,
     getTagById,
     getTagsByNumbers,
     getTagsBySession,
@@ -976,6 +978,36 @@ describe("storage-tags", () => {
             updateTagTokenCount(db, "ses-1", 9, 8000);
 
             expect(getTagById(db, "ses-1", 9)?.tokenCount).toBe(8000);
+        });
+    });
+    describe("#given content-derived text tag ids", () => {
+        // Pi re-keys a message's text tags by content when its text drifts:
+        // `<messageId>:mc-text-v1:<vector digest>:<content digest>:o<occurrence>`.
+        const textTagId = (messageId: string, occurrence: number) =>
+            `${messageId}:mc-text-v1:${"a".repeat(64)}:${"b".repeat(64)}:o${occurrence}`;
+
+        it("#when listing recent owners #then groups them under their message", () => {
+            db = makeMemoryDatabase();
+            insertTag(db, "ses-1", textTagId("msg-1", 0), "message", 10, 1);
+            insertTag(db, "ses-1", textTagId("msg-1", 1), "message", 10, 2);
+            insertTag(db, "ses-1", "msg-2:p0", "message", 10, 3);
+            insertTag(db, "ses-1", textTagId("msg-3", 0), "message", 10, 4);
+
+            expect([...getRecentTagOwnerMessageIds(db, "ses-1", 20)]).toEqual([
+                "msg-3",
+                "msg-2",
+                "msg-1",
+            ]);
+        });
+
+        it("#when their message is removed #then deletes them with it", () => {
+            db = makeMemoryDatabase();
+            insertTag(db, "ses-1", textTagId("msg-1", 0), "message", 10, 1);
+            insertTag(db, "ses-1", "msg-1:p1", "message", 10, 2);
+            insertTag(db, "ses-1", textTagId("msg-10", 0), "message", 10, 3);
+
+            expect(deleteTagsByMessageId(db, "ses-1", "msg-1")).toEqual([1, 2]);
+            expect(getTagsBySession(db, "ses-1").map((tag) => tag.tagNumber)).toEqual([3]);
         });
     });
 });

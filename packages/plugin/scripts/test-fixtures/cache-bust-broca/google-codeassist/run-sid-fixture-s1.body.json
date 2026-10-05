@@ -1,0 +1,33 @@
+{
+  "model": "gemini-fixture-flash",
+  "project": "fixture-project",
+  "request": {
+    "systemInstruction": {
+      "parts": [
+        {
+          "text": "You are a fixture agent."
+        }
+      ]
+    },
+    "tools": [
+      {
+        "functionDeclarations": [
+          {
+            "name": "glob",
+            "description": "find files"
+          }
+        ]
+      }
+    ],
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "read the repository layout"
+          }
+        ]
+      }
+    ]
+  }
+}

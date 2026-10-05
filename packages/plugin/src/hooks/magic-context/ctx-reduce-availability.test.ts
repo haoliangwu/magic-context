@@ -5,11 +5,14 @@ import {
     clearCtxReduceAvailability,
     clearTodowriteAvailability,
     permissionDisabled,
+    primeCtxReduceSpawnPermission,
     resetCtxReduceRegisteredGloballyForTest,
+    resolveCtxReduceAvailability,
     resolveCtxReduceAvailabilityFromMessages,
     resolveTodowriteAvailabilityFromMessages,
     resolveToolPermissionDenied,
     setCtxReduceRegisteredGlobally,
+    spawnAgentFromMessages,
 } from "./ctx-reduce-availability";
 
 function userMsg(tools?: Record<string, unknown>) {
@@ -210,6 +213,153 @@ describe("OpenCode todowrite permission evaluator", () => {
         await expect(
             resolveToolPermissionDenied(client, "ses-permission-overlay", "todowrite"),
         ).resolves.toBe(true);
+    });
+});
+
+/** Fake OpenCode SDK whose agent and session permissions can change between reads. */
+function permissionClient(state: {
+    agentPermission?: unknown;
+    sessionPermission?: unknown;
+    fail?: boolean;
+}) {
+    const calls = { agents: 0, sessions: 0 };
+    const client = {
+        app: {
+            agents: async () => {
+                calls.agents += 1;
+                if (state.fail) throw new Error("host unavailable");
+                return {
+                    data: [
+                        { name: "build", permission: [] },
+                        { name: "reviewer", permission: state.agentPermission ?? [] },
+                    ],
+                };
+            },
+        },
+        session: {
+            get: async () => {
+                calls.sessions += 1;
+                return { data: { permission: state.sessionPermission ?? [] } };
+            },
+        },
+    } as never;
+    return { client, calls };
+}
+
+function agentUserMsg(agent: string, tools?: Record<string, unknown>) {
+    return { info: { role: "user", agent, ...(tools !== undefined ? { tools } : {}) } };
+}
+
+describe("ctx_reduce availability (agent and session permissions before the freeze)", () => {
+    it("freezes unavailable when the spawn agent's permissions deny ctx_reduce", async () => {
+        const sessionId = "ses-agent-deny";
+        clearCtxReduceAvailability(sessionId);
+        const { client } = permissionClient({ agentPermission: { ctx_reduce: "deny" } });
+        const messages = [agentUserMsg("reviewer"), agentUserMsg("build")];
+        await primeCtxReduceSpawnPermission(client, sessionId, spawnAgentFromMessages(messages));
+        expect(resolveCtxReduceAvailabilityFromMessages(sessionId, messages)).toEqual({
+            callable: false,
+            frozen: true,
+        });
+        // The DB resolver used by the system-prompt hook reads the same frozen verdict.
+        expect(resolveCtxReduceAvailability(sessionId)).toEqual({ callable: false, frozen: true });
+    });
+
+    it("freezes unavailable when the session permission overlay denies ctx_reduce", async () => {
+        const sessionId = "ses-session-deny";
+        clearCtxReduceAvailability(sessionId);
+        const { client } = permissionClient({
+            sessionPermission: [{ permission: "ctx_reduce", pattern: "*", action: "deny" }],
+        });
+        await primeCtxReduceSpawnPermission(client, sessionId, "build");
+        expect(
+            resolveCtxReduceAvailabilityFromMessages(sessionId, [agentUserMsg("build")]),
+        ).toEqual({ callable: false, frozen: true });
+    });
+
+    it("a permission deny wins over an explicit ctx_reduce: true tools map", async () => {
+        const sessionId = "ses-deny-over-map";
+        clearCtxReduceAvailability(sessionId);
+        const { client } = permissionClient({ agentPermission: { ctx_reduce: "deny" } });
+        await primeCtxReduceSpawnPermission(client, sessionId, "reviewer");
+        expect(
+            resolveCtxReduceAvailabilityFromMessages(sessionId, [
+                agentUserMsg("reviewer", { ctx_reduce: true }),
+            ]),
+        ).toEqual({ callable: false, frozen: true });
+    });
+
+    it("keeps the fail-open callable verdict when permissions allow or the read fails", async () => {
+        const allowed = "ses-permission-allow";
+        clearCtxReduceAvailability(allowed);
+        await primeCtxReduceSpawnPermission(permissionClient({}).client, allowed, "reviewer");
+        expect(
+            resolveCtxReduceAvailabilityFromMessages(allowed, [agentUserMsg("reviewer")]),
+        ).toEqual({ callable: true, frozen: true });
+
+        const failed = "ses-permission-read-fails";
+        clearCtxReduceAvailability(failed);
+        await primeCtxReduceSpawnPermission(
+            permissionClient({ fail: true, agentPermission: { ctx_reduce: "deny" } }).client,
+            failed,
+            "reviewer",
+        );
+        expect(
+            resolveCtxReduceAvailabilityFromMessages(failed, [agentUserMsg("reviewer")]),
+        ).toEqual({
+            callable: true,
+            frozen: true,
+        });
+    });
+
+    it("a deny added after the verdict froze never flips it and is not re-read", async () => {
+        const sessionId = "ses-mid-session-deny";
+        clearCtxReduceAvailability(sessionId);
+        const state: { agentPermission?: unknown } = {};
+        const { client, calls } = permissionClient(state);
+        const messages = [agentUserMsg("reviewer")];
+        await primeCtxReduceSpawnPermission(client, sessionId, "reviewer");
+        expect(resolveCtxReduceAvailabilityFromMessages(sessionId, messages)).toEqual({
+            callable: true,
+            frozen: true,
+        });
+        const readsAtFreeze = calls.agents;
+
+        state.agentPermission = { ctx_reduce: "deny" };
+        await primeCtxReduceSpawnPermission(client, sessionId, "reviewer");
+        expect(calls.agents).toBe(readsAtFreeze);
+        expect(resolveCtxReduceAvailabilityFromMessages(sessionId, messages)).toEqual({
+            callable: true,
+            frozen: true,
+        });
+        // The live read used by the operator log does see the new deny.
+        await expect(
+            resolveToolPermissionDenied(client, sessionId, "ctx_reduce", "reviewer"),
+        ).resolves.toBe(true);
+        expect(resolveCtxReduceAvailability(sessionId)).toEqual({ callable: true, frozen: true });
+    });
+
+    it("reads permissions once for concurrent passes on the same session", async () => {
+        const sessionId = "ses-permission-concurrent";
+        clearCtxReduceAvailability(sessionId);
+        const { client, calls } = permissionClient({ agentPermission: { ctx_reduce: "deny" } });
+        await Promise.all([
+            primeCtxReduceSpawnPermission(client, sessionId, "reviewer"),
+            primeCtxReduceSpawnPermission(client, sessionId, "reviewer"),
+        ]);
+        await primeCtxReduceSpawnPermission(client, sessionId, "reviewer");
+        expect(calls.agents).toBe(1);
+    });
+
+    it("names the spawn agent from the first user message, not the latest", () => {
+        expect(
+            spawnAgentFromMessages([
+                { info: { role: "assistant" } },
+                agentUserMsg("reviewer"),
+                agentUserMsg("build"),
+            ]),
+        ).toBe("reviewer");
+        expect(spawnAgentFromMessages([userMsg()])).toBeUndefined();
     });
 });
 

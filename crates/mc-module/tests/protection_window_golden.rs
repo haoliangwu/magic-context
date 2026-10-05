@@ -50,7 +50,7 @@ fn rust_walk_matches_typescript_generated_f1_through_f9_goldens() {
                 kind: row.kind.clone(),
                 token_count: row.token_count.unwrap_or(0),
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let window = ProtectionWindow::from_persisted_rows(&rows, case.floor);

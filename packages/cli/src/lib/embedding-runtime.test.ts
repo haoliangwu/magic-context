@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import {
     __setEmbeddingRuntimeTestHooks,
     checkLocalEmbeddingRuntime,
@@ -17,7 +18,7 @@ afterEach(() => {
 });
 
 function makeRoot(): string {
-    return mkdtempSync(join(tmpdir(), "mc-embruntime-"));
+    return createTestTempDirFromPath(join(tmpdir(), "mc-embruntime-"));
 }
 
 function installWasmPackage(root: string): void {
@@ -86,7 +87,35 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
                 expect(formatLocalEmbeddingRuntimeWasmSelected(status)).toContain(
                     "native addon was not probed or loaded",
                 );
+                const warning = formatLocalEmbeddingRuntimeWasmSelected(status);
+                expect(warning).toContain("Doctor process Bun");
+                expect(warning).toContain("dedicated embedding worker");
+                expect(warning).toContain("Bun >=1.4.0");
+                expect(warning).toContain("openai-compatible");
             }
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    test("old Bun explicit native preference uses the safe worker WASM lane", () => {
+        const root = makeRoot();
+        try {
+            installWasmPackage(root);
+            __setEmbeddingRuntimeTestHooks({
+                runOnnxRuntimeNodeLoadProbeChild: () => ({
+                    stdout: JSON.stringify({ ok: true }),
+                    status: 0,
+                    signal: null,
+                }),
+            });
+            expect(
+                checkLocalEmbeddingRuntimeAt(root, "win32", "x64", "native", {
+                    isBun: true,
+                    isElectron: false,
+                    bunVersion: "1.3.14",
+                }).state,
+            ).toBe("wasm-selected");
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -100,9 +129,9 @@ describe("checkLocalEmbeddingRuntimeAt", () => {
             if (status.state === "both-broken") {
                 expect(status.nativeFailure.state).toBe("package-missing");
                 expect(status.wasmReason).toContain("onnxruntime-web");
-                expect(formatLocalEmbeddingRuntimeDoctorWarning(status)).toContain(
-                    "native runtime and WASM fallback both unavailable",
-                );
+                const warning = formatLocalEmbeddingRuntimeDoctorWarning(status);
+                expect(warning).toContain("native runtime and WASM fallback both unavailable");
+                expect(warning).toContain("HF_ENDPOINT");
             }
         } finally {
             rmSync(root, { recursive: true, force: true });
@@ -340,7 +369,7 @@ function installResolvablePlugin(
     withBinary: boolean,
     indexSource = "module.exports = {};\n",
 ): string {
-    const pluginDir = mkdtempSync(join(tmpdir(), "mc-pi-plugin-"));
+    const pluginDir = createTestTempDirFromPath(join(tmpdir(), "mc-pi-plugin-"));
     writeFileSync(
         join(pluginDir, "package.json"),
         JSON.stringify({ name: "@cortexkit/pi-magic-context", version: "0.0.0" }),

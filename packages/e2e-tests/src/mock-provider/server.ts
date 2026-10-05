@@ -7,6 +7,51 @@
  * Supports each API's SSE stream plus single-shot JSON responses for direct probes.
  */
 
+/**
+ * Gap between keep-alive `ping` events while a `streamHoldMs` answer is held.
+ * Shorter than the mock server's own idle timeout (Bun.serve closes a request
+ * that sends nothing for 10 s).
+ */
+const STREAM_PING_INTERVAL_MS = 5_000;
+
+/**
+ * Forward the first SSE event of `source` at once, send `ping` events while
+ * `holdMs` elapses, then forward the rest. The request stays open the whole time.
+ */
+function holdAfterFirstEvent(
+    source: ReadableStream<Uint8Array>,
+    holdMs: number,
+): ReadableStream<Uint8Array> {
+    const reader = source.getReader();
+    const ping = new TextEncoder().encode('event: ping\ndata: {"type":"ping"}\n\n');
+    let held = false;
+    return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            if (!held) {
+                const first = await reader.read();
+                if (first.done) {
+                    controller.close();
+                    return;
+                }
+                controller.enqueue(first.value);
+                held = true;
+                const until = Date.now() + holdMs;
+                while (Date.now() < until) {
+                    await Bun.sleep(Math.min(STREAM_PING_INTERVAL_MS, until - Date.now()));
+                    if (Date.now() < until) controller.enqueue(ping);
+                }
+                return;
+            }
+            const next = await reader.read();
+            if (next.done) controller.close();
+            else controller.enqueue(next.value);
+        },
+        cancel(reason) {
+            return reader.cancel(reason);
+        },
+    });
+}
+
 export interface MockUsage {
     input_tokens: number;
     output_tokens: number;
@@ -21,6 +66,8 @@ export interface MockResponse {
     content?: unknown[];
     /** OpenAI Responses output items. Used only for POST /responses. */
     openaiOutput?: unknown[];
+    /** Simulate the Responses API ending at the provider's output-token limit. */
+    openaiIncomplete?: boolean;
     /** Stop reason reported to the caller. */
     stop_reason?: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
     /**
@@ -30,6 +77,14 @@ export interface MockResponse {
     usage?: MockUsage;
     /** Delay before responding (simulate slow historian). */
     delayMs?: number;
+    /**
+     * Anthropic streams only: send the headers and `message_start` at once, then
+     * hold the rest of the answer this long, sending a `ping` event every
+     * `STREAM_PING_INTERVAL_MS`. Simulates a slow model that keeps its stream
+     * alive, so the host's own header and between-chunk timers (300 s each by
+     * default) never fire while the answer takes longer than that in total.
+     */
+    streamHoldMs?: number;
     /** Optional model name echoed back in the response. Defaults to request's model. */
     model?: string;
     /**
@@ -52,6 +107,8 @@ export interface MockResponse {
 
 export interface CapturedRequest {
     receivedAt: number;
+    /** Exact provider request payload, before JSON parsing. */
+    rawBody?: string;
     /** Set when the mock has finished producing the response for this request. */
     responseCompletedAt?: number;
     method: string;
@@ -177,8 +234,9 @@ export class MockProvider {
 
         if (matched) {
             let body: Record<string, unknown> = {};
+            const rawBody = await req.text();
             try {
-                body = (await req.json()) as Record<string, unknown>;
+                body = JSON.parse(rawBody) as Record<string, unknown>;
             } catch {
                 body = {};
             }
@@ -194,6 +252,7 @@ export class MockProvider {
                 path: url.pathname,
                 headers,
                 body,
+                rawBody,
             };
             this.captured.push(captured);
 
@@ -464,7 +523,11 @@ export class MockProvider {
                     },
                 });
 
-                return new Response(stream, {
+                const body =
+                    scripted.streamHoldMs && scripted.streamHoldMs > 0
+                        ? holdAfterFirstEvent(stream, scripted.streamHoldMs)
+                        : stream;
+                return new Response(body, {
                     status: 200,
                     headers: {
                         "content-type": "text/event-stream",
@@ -597,9 +660,9 @@ export class MockProvider {
             id: responseId,
             object: "response",
             created_at: Math.floor(Date.now() / 1000),
-            status: "completed",
+            status: scripted.openaiIncomplete ? "incomplete" : "completed",
             error: null,
-            incomplete_details: null,
+            incomplete_details: scripted.openaiIncomplete ? { reason: "max_output_tokens" } : null,
             instructions: null,
             max_output_tokens: null,
             model,
@@ -721,7 +784,7 @@ export class MockProvider {
                     });
                 });
                 send({
-                    type: "response.completed",
+                    type: scripted.openaiIncomplete ? "response.incomplete" : "response.completed",
                     sequence_number: sequenceNumber,
                     response: completedResponse,
                 });

@@ -91,6 +91,18 @@ test("union entry satisfies both loaders without a ./server override", () => {
     const byDirectory = resolveDirectoryHost(directory);
     expect(byDirectory.server).toContain("index.js");
     expect(byDirectory.rpc).toBeUndefined();
+    // A directory target resolves `<dir>/tui` by path and never reads the exports
+    // map, so the TUI needs the same root shim as the server entry or the v2 host
+    // silently loads no sidebar and no commands.
+    expect(pkg.files).toContain("tui.js");
+    expect(readFileSync(resolve(directory, "tui.js"), "utf8")).toBe(
+        'export { default } from "./src/tui/entry.mjs";\n',
+    );
+    // A stray tui.ts/tui.mjs beside the shipped shim resolves ahead of it: name it.
+    expect(
+        byDirectory.tui,
+        `the v2 host must resolve the shipped tui.js; a stray file is shadowing it: ${byDirectory.tui}`,
+    ).toContain("tui.js");
 });
 
 // The v2 SDK's OpenTUI peers conflict with the v1 TUI runtime. Keep v2

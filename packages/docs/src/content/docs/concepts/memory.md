@@ -57,6 +57,8 @@ Each memory tracks how many times the agent has retrieved it via `ctx_search`. M
 
 The dreamer's **classify-memories** task scores each memory on importance, scope, and shareability. Importance orders which memories survive the injection budget; scope keeps recall focused on what this project actually needs; and shareability controls whether a memory is safe to pool across workspace members. Scoring moves off the wire entirely (it only orders what survives the budget), so background re-classification never busts the prompt cache.
 
+Editing a memory's content clears its classification, so the next classify run re-scores it; until then it keeps its previous importance. The edit is re-embedded immediately, so for up to a day after an edit, search finds the new content while injection ordering still uses the old score. An edit also resets shareability to private until it is re-scored, so newly sensitive content is never shared on an old judgement.
+
 ## Workspaces
 
 A **workspace** groups multiple project repos so their project memories pool across member sessions — useful for multi-repo microservice setups where the same constraints and architecture decisions apply across services. Create a workspace in the [dashboard](/reference/dashboard/), add member projects, and choose which memory categories are shared (CONSTRAINTS only, by default). Shared visibility is read-only: member projects can read shared categories from neighbors, but only the owning project can update, archive, or merge its own memories. A malformed `share_categories` list fails closed to sharing nothing rather than accidentally sharing everything.

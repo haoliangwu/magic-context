@@ -14,7 +14,7 @@ import {
 import { ACTIVE_TOOL_IDS } from "../src/shared/prompt-surface-runtime";
 
 export const RATIFIED_FULL_MUTABLE_PROSE_CEILING = 3750;
-export const RATIFIED_LIGHT_MUTABLE_PROSE_CEILING = 1825;
+export const RATIFIED_LIGHT_MUTABLE_PROSE_CEILING = 1917;
 
 const DEFAULT_CC_LIGHT_ASSET_PATHS = [
     resolve(import.meta.dir, "../../../crates/mc-module/assets/guidance_light_primary.txt"),

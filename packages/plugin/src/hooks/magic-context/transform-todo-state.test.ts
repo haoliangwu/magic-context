@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 /**
  * Synthetic-todowrite injection tests covering all 7 branches of the
@@ -14,7 +15,7 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -38,7 +39,7 @@ import { applyTodoSynthesis } from "./transform-postprocess-phase";
 const tempDirs: string[] = [];
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -52,7 +53,7 @@ afterEach(() => {
             /* Ignore EBUSY on Windows */
         }
     tempDirs.length = 0;
-    process.env.XDG_DATA_HOME = undefined;
+    process.env.XDG_DATA_HOME = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 });
 
 const ACTIVE_TODOS_JSON = JSON.stringify([

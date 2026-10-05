@@ -29,6 +29,29 @@ describe("executeStatus", () => {
         db.close();
     });
 
+    // The claim this test carries used to live in command-handler.test.ts,
+    // reached through `/ctx-status diagnostics`. That argument is gone, but the
+    // legacy renderer is still what answers a handler consumer that supplies no
+    // shared status builder, so its queue section is pinned here instead.
+    test("lists queued drop operations with their tag numbers", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        getOrCreateSessionMeta(db, SESSION_ID);
+        db.prepare(
+            "INSERT INTO tags (session_id, message_id, type, status, byte_size, tag_number) VALUES (?, ?, ?, ?, ?, ?)",
+        ).run(SESSION_ID, "msg-10", "message", "active", 300, 10);
+        db.prepare(
+            "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at) VALUES (?, ?, 'drop', ?)",
+        ).run(SESSION_ID, 10, Date.now());
+
+        const status = executeStatus(db, SESSION_ID);
+
+        expect(status).toContain("### Queued Operations");
+        expect(status).toContain("§10§ → drop");
+        expect(status).toContain("- Drops: 1");
+        db.close();
+    });
+
     test("annotates the execute threshold when a tokens config is clamped (#241)", () => {
         const db = new Database(":memory:");
         initializeDatabase(db);

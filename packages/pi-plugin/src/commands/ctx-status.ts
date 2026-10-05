@@ -1,9 +1,11 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import type { MagicContextConfig } from "@magic-context/core/config/schema/magic-context";
 import type { getDreamTaskBacklogs } from "@magic-context/core/features/magic-context/dreamer/task-gates";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
 import type { ConfigParseFailure } from "@magic-context/core/shared/config-diagnostics";
-import { getMagicContextStorageResolution } from "@magic-context/core/shared/data-path";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import {
 	renderUserFacingFailure,
@@ -12,7 +14,6 @@ import {
 
 import {
 	buildPiStatusDetail,
-	formatPiStatusDiagnostics,
 	formatPiStatusSummary,
 	type StatusDialogDetail,
 	showStatusDialog,
@@ -22,7 +23,9 @@ import { createCtxStatusSender, resolveSessionId } from "./pi-command-utils";
 export interface RegisterCtxStatusDeps {
 	db: ContextDatabase;
 	projectIdentity: string;
-	resolveStatusDeps?: (ctx: { cwd: string }) => CtxStatusRuntimeDeps;
+	resolveStatusDeps?: (
+		ctx: Pick<ExtensionCommandContext, "cwd" | "sessionManager">,
+	) => CtxStatusRuntimeDeps;
 	resolveProject?: (ctx: { cwd: string }) => {
 		projectDir: string;
 		projectIdentity: string;
@@ -39,8 +42,12 @@ export interface RegisterCtxStatusDeps {
 		[modelKey: string]: number | undefined;
 	};
 	dreamer?: { runnable?: boolean; scheduleSummary?: string };
+	modelChainWarning?: string;
 	/** User-owned profile selected for the project, after config resolution. */
 	activeProfile?: string;
+	configGeneration?: number;
+	configAdoptedAt?: number;
+	configReloadFailure?: { path: string; message: string };
 	cacheTtlConfig?: MagicContextConfig["cache_ttl"];
 	cacheTtlConfigured?: boolean;
 	configParseFailures?: ConfigParseFailure[];
@@ -89,16 +96,16 @@ export function registerCtxStatusCommand(
 		description: "Show Magic Context status for the current Pi session",
 		handler: async (args, ctx) => {
 			const sendStatus = createCtxStatusSender(pi, ctx);
-			const mode = args.trim().toLowerCase();
-			if (mode !== "" && mode !== "diagnostics") {
+			// One view, no modes: an argument can only be a mistake now, and
+			// silently ignoring it would hide the mistake.
+			if (args.trim() !== "") {
 				sendStatus({
 					title: "/ctx-status",
-					text: "Usage: /ctx-status [diagnostics]",
+					text: "Usage: /ctx-status",
 					level: "info",
 				});
 				return;
 			}
-			const diagnostics = mode === "diagnostics";
 			const runtimeDeps = deps.resolveStatusDeps?.(ctx) ?? deps;
 			const projectIdentity =
 				runtimeDeps.resolveProject?.(ctx).projectIdentity ??
@@ -116,7 +123,9 @@ export function registerCtxStatusCommand(
 
 			try {
 				if (ctx.hasUI) {
-					await showStatusDialog(pi, ctx, currentDeps, diagnostics);
+					if (currentDeps.modelChainWarning)
+						ctx.ui.notify(currentDeps.modelChainWarning, "error");
+					await showStatusDialog(pi, ctx, currentDeps);
 					return;
 				}
 
@@ -126,21 +135,12 @@ export function registerCtxStatusCommand(
 					currentDeps,
 					sessionId,
 				);
-				const statusText = diagnostics
-					? formatPiStatusDiagnostics(statusDetail)
-					: formatPiStatusSummary(statusDetail);
+				const statusText = `${formatPiStatusSummary(statusDetail)}${currentDeps.modelChainWarning ? `\nWARNING: ${currentDeps.modelChainWarning}` : ""}`;
 				const details = buildStatusDetails(currentDeps, statusDetail);
-				const profileStatus = currentDeps.activeProfile ?? "none";
-				const storage = getMagicContextStorageResolution();
-				const deprecationNotice = currentDeps.hasDeprecatedProtectedTags
-					? '\n\n⚠️ Config: "protected_tags" is deprecated and ignored; use "protected_tokens" instead.'
-					: "";
 				sendStatus(
 					{
 						title: "/ctx-status",
-						text: diagnostics
-							? `${statusText}${deprecationNotice}\n\nActive profile: ${profileStatus}\n\nStorage: ${storage.path} (${storage.source})`
-							: statusText,
+						text: statusText,
 						level: "info",
 						rpcDisplay: "dialog",
 					},

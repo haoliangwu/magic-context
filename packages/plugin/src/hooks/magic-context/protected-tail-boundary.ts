@@ -1,4 +1,5 @@
 import { getLastCompartmentEndMessage } from "../../features/magic-context/compartment-storage";
+import { sessionDecisionCalibration } from "../../features/magic-context/session-decision-calibration";
 import {
     loadProtectedTailMeta,
     markProtectedTailPolicyV3Seeded,
@@ -11,9 +12,13 @@ import { escalationBands } from "../../shared/escalation-bands";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { deriveTriggerBudget } from "./derive-budgets";
+import { retreatPastHostUnservedRows } from "./host-served-rows";
 import {
     getCachedAbsoluteMessageCount,
     getLegacyProtectedTailStartOrdinal,
+    getRawSessionMessageOrdinalCount,
+    readRawSessionMessageIdOrdinalsForRange,
+    readRawSessionMessageRange,
     readRawSessionMessages,
 } from "./read-session-chunk";
 import { hasMeaningfulUserText } from "./read-session-formatting";
@@ -68,6 +73,7 @@ export interface ResolvedBoundaryContext {
      * from the tag store; omitted (→ all-live) when the caller has no tag store.
      */
     storedTokenTotals?: Map<string, number>;
+    calibration?: ReturnType<typeof sessionDecisionCalibration>;
 }
 
 export interface ProtectedTailBoundarySnapshot {
@@ -509,16 +515,20 @@ export function resolveProtectedTailBoundary(
     ctx: ResolvedBoundaryContext,
 ): ProtectedTailBoundarySnapshot {
     const createdAt = ctx.createdAt ?? Date.now();
-    const messages = readRawSessionMessages(ctx.sessionId);
+    const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
+    const absoluteMessageCount =
+        getCachedAbsoluteMessageCount(ctx.sessionId) ??
+        getRawSessionMessageOrdinalCount(ctx.sessionId);
+    const messages = readRawSessionMessageRange(
+        ctx.sessionId,
+        Math.max(1, offset - 1),
+        absoluteMessageCount,
+    );
     const storedTotals = ctx.storedTokenTotals;
-    // When a tail-only slice is primed, `messages` holds just the eligible tail
-    // with absolute ordinals; the index must be sized to the ABSOLUTE total so
-    // every offset-forward query matches a whole-session read. null → whole
-    // session (index uses messages.length, unchanged).
-    const absoluteMessageCount = getCachedAbsoluteMessageCount(ctx.sessionId) ?? undefined;
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
+        calibration: ctx.calibration,
         absoluteMessageCount,
         storedTotalForMessage: storedTotals
             ? (m) => {
@@ -528,7 +538,6 @@ export function resolveProtectedTailBoundary(
             : undefined,
     });
     const rawMessageCount = index.rawMessageCount;
-    const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
     const usagePercentage = clampPercentage(ctx.usage?.percentage ?? 0);
     const usageInputTokens = Math.max(0, Math.round(ctx.usage?.inputTokens ?? 0));
 
@@ -720,6 +729,10 @@ export function resolveProtectedTailBoundary(
         protectedTailStart = offset;
     }
     protectedTailStart = clampOrdinal(protectedTailStart, rawMessageCount);
+    // A user-turn snap lands the eligible end on whatever row precedes the user
+    // message. On OpenCode 2 that is often an instruction-update row, which the
+    // host never serves by id; keep such rows in the protected tail.
+    protectedTailStart = retreatPastHostUnservedRows(messages, protectedTailStart, offset);
     const perRunCap = selectPerRunCap({
         usagePercentage,
         N: scaledN,
@@ -739,11 +752,12 @@ export function resolveProtectedTailBoundary(
         capTokens: perRunCap,
         recentOpenArcCutoff,
     });
-    const rawRangeFingerprint = computeRawRangeFingerprint(
+    const eligibleEndOrdinal = retreatPastHostUnservedRows(
         messages,
-        offset,
         head.eligibleEndOrdinal,
+        offset,
     );
+    const rawRangeFingerprint = computeRawRangeFingerprint(messages, offset, eligibleEndOrdinal);
     return {
         sessionId: ctx.sessionId,
         mode: ctx.mode,
@@ -752,8 +766,8 @@ export function resolveProtectedTailBoundary(
         offsetMessageId: boundaryMessageId(index, offset),
         protectedTailStart,
         protectedTailStartMessageId: boundaryMessageId(index, protectedTailStart),
-        eligibleEndOrdinal: head.eligibleEndOrdinal,
-        eligibleEndMessageId: boundaryMessageId(index, head.eligibleEndOrdinal - 1),
+        eligibleEndOrdinal,
+        eligibleEndMessageId: boundaryMessageId(index, eligibleEndOrdinal - 1),
         rawMessageCountAtTrigger: rawMessageCount,
         rawLastMessageIdAtTrigger: boundaryMessageId(index, rawMessageCount),
         N: scaledN,
@@ -865,12 +879,14 @@ export function resolveBoundaryContext(args: {
     // the boundary indexes raw messages without re-tokenizing 60k+ messages on
     // a cold pass (the 16s→ms win). Best-effort: a store failure just falls back
     // to all-live tokenization.
+    const calibration = sessionDecisionCalibration(args.db, args.sessionId);
     let storedTokenTotals: Map<string, number> | undefined;
     try {
         storedTokenTotals = getAllStatusTagTokenTotalsFlat(
             args.db,
             args.sessionId,
             args.taggerFloor ?? 0,
+            calibration,
         ).totals;
     } catch (error) {
         sessionLog(
@@ -896,6 +912,7 @@ export function resolveBoundaryContext(args: {
         providerShapeVersion: args.providerShapeVersion ?? "opencode-v1",
         cacheNamespace: args.cacheNamespace ?? `opencode:${args.sessionId}`,
         storedTokenTotals,
+        calibration,
     };
 }
 
@@ -913,11 +930,19 @@ export function resolveWrapupProtectedTailBoundary(
 ): WrapupBoundaryPlan {
     const ctx = resolveBoundaryContext({ ...args, mode: "manual-wrapup" });
     const createdAt = ctx.createdAt ?? Date.now();
-    const messages = readRawSessionMessages(ctx.sessionId);
-    const absoluteMessageCount = getCachedAbsoluteMessageCount(ctx.sessionId) ?? undefined;
+    const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
+    const absoluteMessageCount =
+        getCachedAbsoluteMessageCount(ctx.sessionId) ??
+        getRawSessionMessageOrdinalCount(ctx.sessionId);
+    const messages = readRawSessionMessageRange(
+        ctx.sessionId,
+        Math.max(1, offset - 1),
+        absoluteMessageCount,
+    );
     const index = buildTrueRawTokenIndex(ctx.sessionId, messages, {
         providerShapeVersion: ctx.providerShapeVersion,
         cacheNamespace: ctx.cacheNamespace,
+        calibration: ctx.calibration,
         absoluteMessageCount,
         storedTotalForMessage: ctx.storedTokenTotals
             ? (m) => {
@@ -927,7 +952,6 @@ export function resolveWrapupProtectedTailBoundary(
             : undefined,
     });
     const rawMessageCount = index.rawMessageCount;
-    const offset = Math.max(1, ctx.lastCompartmentEndOrdinal + 1);
     const anchorRawMessageCount = Math.max(
         0,
         Math.min(rawMessageCount, Math.floor(args.anchorRawMessageCount ?? rawMessageCount)),
@@ -984,6 +1008,14 @@ export function resolveWrapupProtectedTailBoundary(
     }
 
     targetProtectedTailStart = clampOrdinal(targetProtectedTailStart, rawMessageCount);
+    // The user snap above makes the wrapup end on the row before a user turn,
+    // which on OpenCode 2 is often an instruction-update row the host never
+    // serves by id. Keep such rows in the kept tail so the boundary is servable.
+    targetProtectedTailStart = retreatPastHostUnservedRows(
+        messages,
+        targetProtectedTailStart,
+        offset,
+    );
     const target = deriveProtectedTailTokenTarget({
         contextLimit: ctx.contextLimit,
         executeThresholdPercentage: ctx.executeThresholdPercentage,
@@ -1009,7 +1041,11 @@ export function resolveWrapupProtectedTailBoundary(
         capTokens: perRunCap,
         recentOpenArcCutoff: targetProtectedTailStart,
     });
-    const eligibleEndOrdinal = Math.min(head.eligibleEndOrdinal, targetProtectedTailStart);
+    const eligibleEndOrdinal = retreatPastHostUnservedRows(
+        messages,
+        Math.min(head.eligibleEndOrdinal, targetProtectedTailStart),
+        offset,
+    );
     const rawRangeFingerprint = computeRawRangeFingerprint(messages, offset, eligibleEndOrdinal);
     const snapshot: ProtectedTailBoundarySnapshot = {
         sessionId: ctx.sessionId,
@@ -1074,7 +1110,7 @@ export function getRawHistoryEligibility(db: Database, sessionId: string): RawHi
     // tail slice (whole-session array or Pi provider) this is null and we use the
     // array length exactly as before.
     const absoluteCount = getCachedAbsoluteMessageCount(sessionId);
-    const rawMessageCount = absoluteCount ?? readRawSessionMessages(sessionId).length;
+    const rawMessageCount = absoluteCount ?? getRawSessionMessageOrdinalCount(sessionId);
     return {
         lastCompartmentEnd,
         offset,
@@ -1114,19 +1150,13 @@ export function validateBoundarySnapshot(args: {
             detail: `context limit changed from ${snapshot.contextLimit} to ${args.currentContextLimit}`,
         };
     }
-    const messages = readRawSessionMessages(snapshot.sessionId);
-    // Readers preserve ordinal slots for malformed rows by skipping the element
-    // but keeping later message ordinals absolute. Compare against the same
-    // gap-preserving measure the resolver used, not the compacted array length.
-    const currentRawMessageCount = messages.reduce(
-        (max, message) => Math.max(max, message.ordinal),
-        messages.length,
-    );
+    const currentRawMessageCount = getRawSessionMessageOrdinalCount(snapshot.sessionId);
     if (snapshot.rawMessageCountAtTrigger > currentRawMessageCount) {
         return { ok: false, reason: "stale_snapshot", detail: "raw message count shrank" };
     }
-    const idsByOrdinal = new Map(messages.map((message) => [message.ordinal, message.id]));
-    const idAt = (ordinal: number): string | null => idsByOrdinal.get(ordinal) ?? null;
+    const idAt = (ordinal: number): string | null =>
+        readRawSessionMessageIdOrdinalsForRange(snapshot.sessionId, ordinal, ordinal).keys().next()
+            .value ?? null;
     const checks: Array<[number, string | null, string]> = [
         [snapshot.offset, snapshot.offsetMessageId, "offset"],
         [snapshot.rawMessageCountAtTrigger, snapshot.rawLastMessageIdAtTrigger, "last"],
@@ -1170,8 +1200,13 @@ export function validateBoundarySnapshot(args: {
             detail: `last compartment moved: offset ${snapshot.offset} -> ${expectedOffset}`,
         };
     }
+    const fingerprintMessages = readRawSessionMessageRange(
+        snapshot.sessionId,
+        snapshot.offset,
+        snapshot.eligibleEndOrdinal - 1,
+    );
     const fingerprint = computeRawRangeFingerprint(
-        messages,
+        fingerprintMessages,
         snapshot.offset,
         snapshot.eligibleEndOrdinal,
     );

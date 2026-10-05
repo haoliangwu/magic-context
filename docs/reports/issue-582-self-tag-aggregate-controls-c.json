@@ -1,0 +1,186 @@
+{
+  "pooled": [
+    {
+      "variant": "A",
+      "replies": 22,
+      "textParts": 22,
+      "closed": 18,
+      "canonical": 18,
+      "correct": 18,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 18,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "B",
+      "replies": 20,
+      "textParts": 20,
+      "closed": 19,
+      "canonical": 19,
+      "correct": 19,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 19,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    }
+  ],
+  "buckets": [
+    {
+      "variant": "A",
+      "bucket": "1",
+      "textParts": 1,
+      "closed": 0,
+      "canonical": 0,
+      "correct": 0,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 0,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "A",
+      "bucket": "2–5",
+      "textParts": 4,
+      "closed": 3,
+      "canonical": 3,
+      "correct": 3,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 3,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "A",
+      "bucket": "6–20",
+      "textParts": 15,
+      "closed": 13,
+      "canonical": 13,
+      "correct": 13,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 13,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "A",
+      "bucket": ">20",
+      "textParts": 2,
+      "closed": 2,
+      "canonical": 2,
+      "correct": 2,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 2,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "B",
+      "bucket": "1",
+      "textParts": 1,
+      "closed": 1,
+      "canonical": 1,
+      "correct": 1,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 1,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "B",
+      "bucket": "2–5",
+      "textParts": 4,
+      "closed": 3,
+      "canonical": 3,
+      "correct": 3,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 3,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "B",
+      "bucket": "6–20",
+      "textParts": 15,
+      "closed": 15,
+      "canonical": 15,
+      "correct": 15,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 15,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    },
+    {
+      "variant": "B",
+      "bucket": ">20",
+      "textParts": 0,
+      "closed": 0,
+      "canonical": 0,
+      "correct": 0,
+      "wrong": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "identical": 0,
+      "proseReferences": 0,
+      "midTextNotation": 0
+    }
+  ],
+  "firstMixed": [
+    {
+      "variant": "A",
+      "scenario": "fresh",
+      "replicate": 1,
+      "session": "ses_f0c607977ffethfiBIjp63uzOE",
+      "position": 3,
+      "assigned": 6,
+      "raw": "I'll start by reading the fixture and listing the directory in parallel.",
+      "identical": false
+    },
+    {
+      "variant": "B",
+      "scenario": "fresh",
+      "replicate": 1,
+      "session": "ses_f0c601507ffeycvRH3VDfpDoWi",
+      "position": 3,
+      "assigned": 6,
+      "raw": "I'll start by reading the fixture and listing the directory in parallel.",
+      "identical": false
+    }
+  ],
+  "usage": {
+    "input": 157464,
+    "output": 1422,
+    "cacheHit": 146048,
+    "cacheMiss": 11416,
+    "reasoning": 0,
+    "reasoningUnknown": 42
+  },
+  "calls": 42,
+  "reasoning": {
+    "callsWithReasoning": 0,
+    "callsWithNotation": 0,
+    "exactReplayParts": 0,
+    "emptyReplays": 0,
+    "lengthLimits": []
+  },
+  "estimatedOffPeakUSD": 0.0030037439999999996,
+  "estimatedPeakUSD": 0.006007487999999999
+}

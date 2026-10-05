@@ -53,8 +53,8 @@ describe("native ONNX install shape", () => {
             expect(manifest.dependencies?.[ONNX_RUNTIME_WEB]).toBe(
                 "1.26.0-dev.20260416-b7804b056c",
             );
-            expect(manifest.devDependencies?.[TRANSFORMERS]).toBe("^4.1.0");
-            expect(manifest.optionalDependencies?.[ONNX_RUNTIME_NODE]).toBe("1.24.3");
+            expect(manifest.devDependencies?.[TRANSFORMERS]).toBe("^4.3.0");
+            expect(manifest.optionalDependencies?.[ONNX_RUNTIME_NODE]).toBe("1.30.0");
             expect(manifest.optionalDependencies?.[SHARP]).toBe("^0.35.0");
             expect(manifest.scripts?.build).toContain("transformers-web-entry.ts");
             expect(manifest.scripts?.build).toContain("build-transformers-node-wasm.ts");
@@ -68,7 +68,7 @@ describe("native ONNX install shape", () => {
             expect(directDependenciesLockBlock(lockBlock)).not.toContain(`"${ONNX_RUNTIME_NODE}":`);
             expect(directDependenciesLockBlock(lockBlock)).not.toContain(`"${SHARP}":`);
             expect(lockBlock).toContain(
-                `"optionalDependencies": {\n        "${ONNX_RUNTIME_NODE}": "1.24.3",\n        "${SHARP}": "^0.35.0",`,
+                `"optionalDependencies": {\n        "${ONNX_RUNTIME_NODE}": "1.30.0",\n        "${SHARP}": "^0.35.0",`,
             );
         }
     });

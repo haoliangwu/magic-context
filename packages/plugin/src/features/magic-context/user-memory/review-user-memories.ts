@@ -1,6 +1,7 @@
 import { DREAMER_REVIEWER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
 import { createChildSessionWithFence } from "../../../hooks/magic-context/child-session-spawn";
+import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import type { PluginContext } from "../../../plugin/types";
 import * as shared from "../../../shared";
 import { extractLatestAssistantText } from "../../../shared/assistant-message-extractor";
@@ -10,6 +11,7 @@ import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
+import { runHiddenSingleShotPrompt } from "../dreamer/hidden-single-shot";
 import {
     DREAMING_LEASE_KEY,
     type LeaseAcquisition,
@@ -18,7 +20,7 @@ import {
 } from "../dreamer/lease";
 import { REVIEW_USER_MEMORIES_SYSTEM_PROMPT } from "../dreamer/task-prompts";
 import { bumpProjectUserProfileVersion } from "../storage";
-import { recordChildInvocation } from "../subagent-token-capture";
+import { recordChildInvocation, type TokenTotals } from "../subagent-token-capture";
 import {
     deleteUserMemoryCandidates,
     dismissUserMemory,
@@ -30,9 +32,51 @@ import {
     updateUserMemoryContent,
 } from "./storage-user-memory";
 
+/** Verdict shape the reviewer answers with; the host applies it. */
+interface ReviewVerdict {
+    promote?: Array<{ content: string; candidate_ids: number[] }>;
+    update_existing?: Array<{
+        memory_id: number;
+        content: string;
+        candidate_ids?: number[];
+    }>;
+    dismiss_existing?: Array<{ memory_id: number; reason?: string }>;
+    consume_candidate_ids?: number[];
+}
+
+/**
+ * Read the reviewer's JSON verdict out of one assistant answer.
+ *
+ * Fail-closed against a cut-short answer: the object is taken from the first `{`
+ * to the last `}`, so a response the provider truncated mid-object has no
+ * closing brace to match and `JSON.parse` rejects it. Nothing partial is ever
+ * applied — a truncated verdict raises and the caller's model chain retries.
+ */
+function parseReviewVerdict(responseText: string | null): ReviewVerdict {
+    if (!responseText) {
+        throw new Error("User memory review returned no output.");
+    }
+
+    // Parse the JSON response — try to extract from possible markdown fencing
+    const jsonMatch =
+        responseText.match(/```(?:json)?\s*([\s\S]*?)```/) ?? responseText.match(/(\{[\s\S]*\})/);
+    if (!jsonMatch) {
+        throw new Error("User memory review returned no JSON.");
+    }
+
+    try {
+        return JSON.parse(jsonMatch[1]) as ReviewVerdict;
+    } catch {
+        throw new Error("User memory review returned invalid JSON.");
+    }
+}
+
 interface ReviewUserMemoriesArgs {
     db: Database;
-    client: PluginContext["client"];
+    /** Required by the child-session transport; a carrier host passes none. */
+    client?: PluginContext["client"];
+    /** Completion carrier for a host with no child-session tool transport. */
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
     parentSessionId: string | undefined;
     sessionDirectory: string | undefined;
     holderId: string;
@@ -107,7 +151,8 @@ ${candidateList}
 4. Do NOT promote: project-specific preferences, framework choices, one-off moods, task-local frustrations.
 5. If a candidate is semantically equivalent to an existing stable memory, mark it as already covered.
 6. If multiple candidates describe the same trait, merge them into one clean statement.
-7. If an existing stable memory should be updated based on new evidence, include the update.
+7. Phrase every promoted or updated memory as a concise, present-tense verb-first statement without a subject (for example, "Prefers concise explanations" or "Expects changes to be tested").
+8. If an existing stable memory should be updated based on new evidence, include the update and keep the same verb-first, subjectless phrasing.
 
 ### Output Format
 
@@ -140,6 +185,9 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
     const recordInvocation = (params: {
         status: "completed" | "failed";
         messages?: unknown[];
+        tokens?: TokenTotals;
+        providerId?: string;
+        modelId?: string;
         error?: unknown;
     }) => {
         if (!args.parentSessionId || invocationRecorded) return;
@@ -147,7 +195,10 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
         recordChildInvocation({
             db: args.db,
             parentSessionId: args.parentSessionId,
-            harness: "opencode",
+            harness: args.hiddenCompletionExecutor?.capabilities.harness ?? "opencode",
+            ...(params.tokens ? { tokens: params.tokens } : {}),
+            ...(params.providerId ? { providerId: params.providerId } : {}),
+            ...(params.modelId ? { modelId: params.modelId } : {}),
             // subagent: "dreamer" + task: "user memories" so the dashboard's
             // dream-run token enrichment (filters subagent='dreamer', GROUP BY
             // task) maps this invocation's tokens to the "user memories" row.
@@ -177,8 +228,50 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
     );
 
     try {
+        const remainingBudgetMs = Math.max(0, args.deadline - Date.now());
+        if (args.hiddenCompletionExecutor) {
+            // Completion-carrier host: the reviewer is a single no-tool prompt, so
+            // it runs through the hidden carrier instead of a child session with a
+            // tool loop. The carrier rejects a cut-short answer before it is parsed.
+            const run = await runHiddenSingleShotPrompt({
+                executor: args.hiddenCompletionExecutor,
+                parentSessionId: args.parentSessionId,
+                sessionDirectory: args.sessionDirectory ?? "",
+                agent: DREAMER_REVIEWER_AGENT,
+                system: REVIEW_USER_MEMORIES_SYSTEM_PROMPT,
+                prompt,
+                title: "magic-context-dream-user-memories",
+                callContext: "dreamer:user-memories",
+                model: args.model,
+                fallbackModels: args.fallbackModels,
+                language: args.language,
+                timeoutMs: remainingBudgetMs,
+                signal: abortController.signal,
+                metadata: { task: "review-user-memories" },
+                parse: parseReviewVerdict,
+            });
+            promptSettled = true;
+            recordInvocation({
+                status: "completed",
+                messages: run.completion.messages,
+                ...(run.completion.messages
+                    ? {}
+                    : {
+                          tokens: run.completion.usage,
+                          ...(run.completion.providerId
+                              ? { providerId: run.completion.providerId }
+                              : {}),
+                          ...(run.completion.modelId ? { modelId: run.completion.modelId } : {}),
+                      }),
+            });
+            return applyReviewVerdict(args, leaseKey, run.validated, result);
+        }
+        const client = args.client;
+        if (!client) {
+            throw new Error("User memory review needs a client or a completion carrier.");
+        }
         const createResponse = await createChildSessionWithFence({
-            client: args.client,
+            client,
             db: args.db,
             parentSessionId: args.parentSessionId,
             title: "magic-context-dream-user-memories",
@@ -199,9 +292,9 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
         log(`[dreamer] user-memories: child session created ${agentSessionId}`);
         const childSessionId = agentSessionId;
 
-        const remainingMs = Math.max(0, args.deadline - Date.now());
+        const remainingMs = remainingBudgetMs;
         const reviewRun = await shared.promptSyncWithValidatedOutputRetry(
-            args.client,
+            client,
             {
                 path: { id: childSessionId },
                 query: { directory: args.sessionDirectory },
@@ -218,6 +311,9 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
                 },
             },
             {
+                // Send without holding a request open for the whole run, so the
+                // deadline below is the only timer (see prompt-async-transport.ts).
+                transport: shared.createPromptAsyncTransport(client, childSessionId),
                 // The executor owns the per-task deadline (config.timeoutMinutes);
                 // honor the remaining budget, do NOT silently re-cap at 5 minutes.
                 timeoutMs: remainingMs,
@@ -225,7 +321,7 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
                 fallbackModels: args.fallbackModels,
                 callContext: "dreamer:user-memories",
                 fetchOutput: async () => {
-                    const messagesResponse = await args.client.session.messages({
+                    const messagesResponse = await client.session.messages({
                         path: { id: childSessionId },
                         query: { directory: args.sessionDirectory, limit: 50 },
                     });
@@ -233,103 +329,14 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
                         preferResponseOnMissingData: true,
                     });
                 },
-                validateOutput: (messages) => {
-                    const responseText = extractLatestAssistantText(messages);
-                    if (!responseText) {
-                        throw new Error("User memory review returned no output.");
-                    }
-
-                    // Parse the JSON response — try to extract from possible markdown fencing
-                    const jsonMatch =
-                        responseText.match(/```(?:json)?\s*([\s\S]*?)```/) ??
-                        responseText.match(/(\{[\s\S]*\})/);
-                    if (!jsonMatch) {
-                        throw new Error("User memory review returned no JSON.");
-                    }
-
-                    try {
-                        return JSON.parse(jsonMatch[1]) as {
-                            promote?: Array<{ content: string; candidate_ids: number[] }>;
-                            update_existing?: Array<{
-                                memory_id: number;
-                                content: string;
-                                candidate_ids?: number[];
-                            }>;
-                            dismiss_existing?: Array<{ memory_id: number; reason?: string }>;
-                            consume_candidate_ids?: number[];
-                        };
-                    } catch {
-                        throw new Error("User memory review returned invalid JSON.");
-                    }
-                },
+                validateOutput: (messages) =>
+                    parseReviewVerdict(extractLatestAssistantText(messages)),
             },
         );
         promptSettled = true;
 
         recordInvocation({ status: "completed", messages: reviewRun.output });
-        const parsed = reviewRun.validated;
-
-        const promotions = (parsed.promote ?? [])
-            .map((p) => ({
-                content: p.content?.trim() ?? "",
-                candidateIds: p.candidate_ids ?? [],
-            }))
-            .filter((p) => p.content.length > 0);
-        const updates = (parsed.update_existing ?? [])
-            .map((u) => ({
-                memoryId: u.memory_id,
-                content: u.content?.trim() ?? "",
-            }))
-            .filter((u) => Boolean(u.memoryId) && u.content.length > 0);
-        const dismissals = (parsed.dismiss_existing ?? []).filter((d) => Boolean(d.memory_id));
-        const consumeCandidateIds = parsed.consume_candidate_ids ?? [];
-
-        // Re-check the lease only after BEGIN IMMEDIATE has serialized writers.
-        // A lost lease throws so the executor hot-retries instead of recording
-        // completion and advancing next_due_at past unprocessed work.
-        runLeaseGuardedWrite(args.db, args.holderId, leaseKey, () => {
-            for (const promotion of promotions) {
-                insertUserMemory(args.db, promotion.content, promotion.candidateIds);
-            }
-
-            for (const update of updates) {
-                updateUserMemoryContent(args.db, update.memoryId, update.content);
-            }
-
-            for (const dismissal of dismissals) {
-                dismissUserMemory(args.db, dismissal.memory_id);
-            }
-
-            if (consumeCandidateIds.length > 0) {
-                deleteUserMemoryCandidates(args.db, consumeCandidateIds);
-            }
-
-            if (promotions.length > 0 || updates.length > 0 || dismissals.length > 0) {
-                bumpProjectUserProfileVersion(args.db);
-            }
-        });
-
-        result.promoted = promotions.length;
-        result.merged = updates.length;
-        result.dismissed = dismissals.length;
-        result.candidatesConsumed = consumeCandidateIds.length;
-
-        for (const promotion of promotions) {
-            log(`[dreamer] user-memories: promoted "${promotion.content.slice(0, 60)}..."`);
-        }
-        for (const update of updates) {
-            log(`[dreamer] user-memories: updated memory #${update.memoryId}`);
-        }
-        for (const dismissal of dismissals) {
-            log(
-                `[dreamer] user-memories: dismissed memory #${dismissal.memory_id} — ${dismissal.reason ?? "no reason"}`,
-            );
-        }
-        if (consumeCandidateIds.length > 0) {
-            log(`[dreamer] user-memories: consumed ${result.candidatesConsumed} candidate(s)`);
-        }
-
-        return result;
+        return applyReviewVerdict(args, leaseKey, reviewRun.validated, result);
     } catch (error) {
         const errorDescription = describeError(error);
         log(
@@ -345,14 +352,103 @@ If no promotions are warranted, return empty arrays. Always consume reviewed can
         throw error;
     } finally {
         heartbeat.stop();
-        await teardownChildSession({
-            client: args.client,
-            sessionId: agentSessionId,
-            sessionDirectory: args.sessionDirectory,
-            promptSettled,
-            privacySensitive: true,
-            context: "[dreamer] user-memories",
-            log,
-        });
+        // The carrier branch never opens a child session of its own — it closes
+        // its own run — so there is nothing to tear down when no client exists.
+        if (args.client) {
+            await teardownChildSession({
+                client: args.client,
+                sessionId: agentSessionId,
+                sessionDirectory: args.sessionDirectory,
+                promptSettled,
+                privacySensitive: true,
+                context: "[dreamer] user-memories",
+                log,
+            });
+        }
     }
+}
+
+/**
+ * Apply one reviewer verdict to the user-memory tables. Shared by both
+ * transports so a carrier host and a child-session host write exactly the same
+ * rows from the same answer.
+ */
+function applyReviewVerdict(
+    args: ReviewUserMemoriesArgs,
+    leaseKey: string,
+    parsed: ReviewVerdict,
+    result: ReviewResult,
+): ReviewResult {
+    const promotions = (parsed.promote ?? [])
+        .map((p) => ({
+            content: p.content?.trim() ?? "",
+            candidateIds: p.candidate_ids ?? [],
+        }))
+        .filter((p) => p.content.length > 0);
+    const updates = (parsed.update_existing ?? [])
+        .map((u) => ({
+            memoryId: u.memory_id,
+            content: u.content?.trim() ?? "",
+        }))
+        .filter((u) => Boolean(u.memoryId) && u.content.length > 0);
+    const dismissals = (parsed.dismiss_existing ?? []).filter((d) => Boolean(d.memory_id));
+    // A candidate behind a promotion or merge has been used even when the
+    // reviewer forgets to list it for consumption; leaving it in the pool lets
+    // the next review promote the same trait again.
+    const consumeCandidateIds = [
+        ...new Set([
+            ...(parsed.consume_candidate_ids ?? []),
+            ...promotions.flatMap((promotion) => promotion.candidateIds),
+            ...(parsed.update_existing ?? []).flatMap((update) =>
+                update.memory_id && update.content?.trim() ? (update.candidate_ids ?? []) : [],
+            ),
+        ]),
+    ];
+
+    // Re-check the lease only after BEGIN IMMEDIATE has serialized writers.
+    // A lost lease throws so the executor hot-retries instead of recording
+    // completion and advancing next_due_at past unprocessed work.
+    runLeaseGuardedWrite(args.db, args.holderId, leaseKey, () => {
+        for (const promotion of promotions) {
+            insertUserMemory(args.db, promotion.content, promotion.candidateIds);
+        }
+
+        for (const update of updates) {
+            updateUserMemoryContent(args.db, update.memoryId, update.content);
+        }
+
+        for (const dismissal of dismissals) {
+            dismissUserMemory(args.db, dismissal.memory_id);
+        }
+
+        if (consumeCandidateIds.length > 0) {
+            deleteUserMemoryCandidates(args.db, consumeCandidateIds);
+        }
+
+        if (promotions.length > 0 || updates.length > 0 || dismissals.length > 0) {
+            bumpProjectUserProfileVersion(args.db);
+        }
+    });
+
+    result.promoted = promotions.length;
+    result.merged = updates.length;
+    result.dismissed = dismissals.length;
+    result.candidatesConsumed = consumeCandidateIds.length;
+
+    for (const promotion of promotions) {
+        log(`[dreamer] user-memories: promoted "${promotion.content.slice(0, 60)}..."`);
+    }
+    for (const update of updates) {
+        log(`[dreamer] user-memories: updated memory #${update.memoryId}`);
+    }
+    for (const dismissal of dismissals) {
+        log(
+            `[dreamer] user-memories: dismissed memory #${dismissal.memory_id} — ${dismissal.reason ?? "no reason"}`,
+        );
+    }
+    if (consumeCandidateIds.length > 0) {
+        log(`[dreamer] user-memories: consumed ${result.candidatesConsumed} candidate(s)`);
+    }
+
+    return result;
 }

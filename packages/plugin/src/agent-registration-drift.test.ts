@@ -276,14 +276,14 @@ describe("hidden-agent registration drift guard", () => {
         expect(byId(DREAMER_CLASSIFIER_AGENT)?.maxSteps).toBe(4);
     });
 
-    test("base dreamer (curate) is ctx_memory-only and locked", () => {
+    test("base dreamer (curate) is memory-tool-only and locked", () => {
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual([...DREAMER_CURATE_ALLOWED_TOOLS]);
         expect(byId(DREAMER_AGENT)?.allowedTools).toEqual(["ctx_memory"]);
         expect(byId(DREAMER_AGENT)?.lockPermissions).toBe(true);
         expect(byId(DREAMER_AGENT)?.maxSteps).toBe(150);
     });
 
-    test("dreamer-docs inline allow-list matches canonical (file read/write/bash, no memory) and is locked", () => {
+    test("dreamer-docs inline allow-list matches read-only canonical tools and is locked", () => {
         expect(byId(DREAMER_DOCS_AGENT)?.allowedTools).toEqual([...DREAMER_DOCS_ALLOWED_TOOLS]);
         const tools = byId(DREAMER_DOCS_AGENT)?.allowedTools ?? [];
         for (const denied of ["ctx_memory", "ctx_search", "ctx_note", "task"]) {
@@ -337,11 +337,10 @@ describe("hidden-agent registration drift guard", () => {
         expect(byId(SMART_NOTE_COMPILER_AGENT)?.lockPermissions).toBe(true);
     });
 
-    test("every scoped dreamer task agent locks permissions; historian agents do not", () => {
+    test("every scoped dreamer and historian agent locks permissions", () => {
         // All dreamer task agents run unsupervised on a per-task tool budget, so a
         // user `dreamer.tools`/`permission` override must not be able to broaden
-        // them. The historian agents are not locked (they take their
-        // allow-list as-is and have no per-task scoping to protect).
+        // them. Historians likewise keep their zero-tool capability boundary.
         const lockedDreamerAgents = new Set<string>([
             DREAMER_AGENT,
             DREAMER_DOCS_AGENT,
@@ -351,6 +350,9 @@ describe("hidden-agent registration drift guard", () => {
             DREAMER_MEMORY_MAPPER_AGENT,
             DREAMER_CLASSIFIER_AGENT,
             SMART_NOTE_COMPILER_AGENT,
+            HISTORIAN_AGENT,
+            HISTORIAN_RECOMP_AGENT,
+            HISTORIAN_EDITOR_AGENT,
         ]);
         for (const reg of regs) {
             expect(reg.lockPermissions === true).toBe(lockedDreamerAgents.has(reg.id));
@@ -398,39 +400,59 @@ describe("hidden-agent registration drift guard", () => {
         expect(cfg.tools).toEqual({ aft_search: false });
     });
 
-    test("historian + editor inline allow-list matches canonical HISTORIAN_ALLOWED_TOOLS (no disallowed)", () => {
-        expect(byId(HISTORIAN_AGENT)?.allowedTools).toEqual([...HISTORIAN_ALLOWED_TOOLS]);
-        expect(byId(HISTORIAN_RECOMP_AGENT)?.allowedTools).toEqual([...HISTORIAN_ALLOWED_TOOLS]);
-        expect(byId(HISTORIAN_EDITOR_AGENT)?.allowedTools).toEqual([...HISTORIAN_ALLOWED_TOOLS]);
+    test("all historian variants have empty canonical tool lists and locked permissions", () => {
+        expect([...HISTORIAN_ALLOWED_TOOLS]).toEqual([]);
+        for (const id of [HISTORIAN_AGENT, HISTORIAN_RECOMP_AGENT, HISTORIAN_EDITOR_AGENT]) {
+            expect(byId(id)?.allowedTools).toEqual([]);
+            expect(byId(id)?.lockPermissions).toBe(true);
+        }
     });
 
-    test("historian disallowed_tools filter is applied to the inline allow-list", () => {
-        const filtered = buildHiddenAgentRegistrations({
+    test("historian user overrides cannot re-grant tools or raise the step cap", () => {
+        const regs = buildHiddenAgentRegistrations({
             dreamerPrompt: "d",
             historianPrompt: "h",
             historianEditorPrompt: "he",
-            historianDisallowed: ["aft_search"],
+            historianDisallowed: [],
+            historianOverrides: {
+                tools: { read: true, aft_search: true },
+                permission: { "*": "allow", read: "allow" },
+                steps: 40,
+                maxSteps: 40,
+                model: "mock/model",
+            },
         });
-        const hist = filtered.find((r) => r.id === HISTORIAN_AGENT);
-        expect(hist?.allowedTools).toEqual(
-            HISTORIAN_ALLOWED_TOOLS.filter((t) => t !== "aft_search"),
-        );
-        // "*" removes everything.
-        const all = buildHiddenAgentRegistrations({
-            dreamerPrompt: "d",
-            historianPrompt: "h",
-            historianEditorPrompt: "he",
-            historianDisallowed: ["*"],
-        });
-        expect(all.find((r) => r.id === HISTORIAN_AGENT)?.allowedTools).toEqual([]);
+        for (const reg of regs.filter((r) => r.id.startsWith("historian"))) {
+            const cfg = buildHiddenAgentConfig(
+                reg.prompt!,
+                reg.allowedTools,
+                reg.maxSteps,
+                reg.overrides,
+                reg.id,
+                reg.lockPermissions,
+            );
+            expect(cfg.permission).toEqual({ "*": "deny", task: "deny" });
+            const routed = denyTaskRoutingToCallerAgents(
+                { [reg.id]: cfg },
+                regs.map((r) => r.id),
+            );
+            expect((routed[reg.id].permission as { task: Record<string, string> }).task["*"]).toBe(
+                "deny",
+            );
+            expect(cfg).not.toHaveProperty("tools");
+            expect(cfg.steps).toBe(4);
+            expect(cfg.maxSteps).toBe(4);
+            expect(cfg.model).toBe("mock/model");
+        }
     });
 
     test("step caps match the documented values", () => {
         expect(byId(DREAMER_AGENT)?.maxSteps).toBe(150);
         expect(byId(DREAMER_RETROSPECTIVE_AGENT)?.maxSteps).toBe(40);
         expect(byId(SMART_NOTE_COMPILER_AGENT)?.maxSteps).toBe(8);
-        expect(byId(HISTORIAN_AGENT)?.maxSteps).toBe(40);
-        expect(byId(HISTORIAN_EDITOR_AGENT)?.maxSteps).toBe(40);
+        expect(byId(HISTORIAN_AGENT)?.maxSteps).toBe(4);
+        expect(byId(HISTORIAN_RECOMP_AGENT)?.maxSteps).toBe(4);
+        expect(byId(HISTORIAN_EDITOR_AGENT)?.maxSteps).toBe(4);
     });
 
     test("smart-note compiler uses only its own prompt", () => {

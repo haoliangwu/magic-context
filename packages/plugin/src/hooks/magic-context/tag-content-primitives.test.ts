@@ -232,3 +232,8 @@ describe("isThinkingPart", () => {
         expect(isThinkingPart("string")).toBe(false);
     });
 });
+
+it("correct leading self-tag round-trips byte-identically through OpenCode storage and replay", () => {
+    const reply = "§12§ Reading both files in parallel.\n\nThe next step follows.";
+    expect(prependTag(12, stripPersistedAssistantText(reply))).toBe(reply);
+});

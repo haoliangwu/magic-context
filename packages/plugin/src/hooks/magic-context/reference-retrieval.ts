@@ -4,19 +4,17 @@
  * The historian receives two reference blocks (replacing the old unbounded
  * `<existing_state>` compartment dump):
  *
- *   <compartment_examples_from_other_projects>  — 4 rotating cross-project SEEDS
+ *   <compartment_examples_from_other_projects>  — 3 rotating cross-project SEEDS
  *       (permanent floor). Calibration anchors for importance scoring, tier
  *       decay, paraphrase rhythm, and fact-extraction shape. Never dedup-able.
  *
- *   <session_references>                          — last 6 compartments THIS
- *       session wrote, full stored form (all tiers + importance + episode_type).
- *       Continuity + same-project format/importance calibration. RECENCY-based
- *       (no embedding at historian time — embedding K/L/M was dropped; see
- *       AUDIT E1 input-model decisions). ctx_search semantic retrieval over
- *       compartments is served by per-compartment chunk embeddings computed on
- *       publish (compartment-embedding.ts).
+ *   <session_references> — 3 importance-diverse older compartments, then the
+ *       4 most recent, each group chronological with all stored tiers.
+ *       One-compartment runs anchor on recent scores, so recent examples omit
+ *       importance. Diverse older examples retain scores and fill bands the
+ *       seeds leave uncovered or underrepresented.
  *
- * Budget: 4 seeds + up to 6 session refs = the validated 10-example budget.
+ * Budget: 3 seeds + up to 3 diverse + 4 recent = 10 calibration examples.
  * Embedding work at historian time: ZERO.
  */
 import { escapeXmlAttr, escapeXmlContent } from "../../features/magic-context/compartment-storage";
@@ -43,16 +41,17 @@ export interface ReferenceCompartment {
 }
 
 /** Permanent seed floor — never drops, even when the session is mature. */
-export const SEED_FLOOR = 4;
+export const SEED_FLOOR = 3;
 /** Recency window of this-session compartments shown for continuity/calibration. */
-export const SESSION_REF_WINDOW = 6;
+export const SESSION_REF_WINDOW = 4;
+export const SESSION_REF_DIVERSE = 3;
+export const SESSION_REF_LIMIT = SESSION_REF_WINDOW + SESSION_REF_DIVERSE;
 
 /**
  * Importance bands the 60-seed corpus is balanced across (12 per band). We pick
- * one seed from each of 4 bands per run so every run sees the full importance
- * range (anti-drift anchor) rather than 4 clustered scores. The fifth band
- * (mid) is intentionally not always represented — 4 picks across 5 bands still
- * spans low→high, which is what calibration needs.
+ * one seed from each of 3 rotating bands per run, not 3 clustered scores.
+ * Older session references preferentially fill the bands these seeds leave
+ * uncovered. Recent scores are hidden, so they do not count toward coverage.
  */
 const SEED_BANDS: ReadonlyArray<readonly [number, number]> = [
     [85, 100], // very high
@@ -97,15 +96,8 @@ function fnv1a(input: string): number {
 }
 
 /**
- * Select 4 diverse, importance-band-spanning seeds, deterministically rotated
- * by (sessionId, chunkStart) so different runs see different 4-seed combos
- * (≈15 distinct combinations before repeat across the 60-seed corpus) while a
- * given chunk always resolves to the same 4.
- *
- * Strategy: pick one seed from each of the first SEED_FLOOR bands (very-high,
- * high, mid, low-mid by default), rotating WITHIN each band by the hash so the
- * specific seed varies run to run. This guarantees band coverage on every run
- * (never 4 high-importance seeds) while still rotating the corpus.
+ * Select 3 seeds from distinct importance bands, deterministically rotating
+ * both band order and the picks within each band by (sessionId, chunkStart).
  */
 export function selectSeeds(
     sessionId: string,
@@ -117,9 +109,8 @@ export function selectSeeds(
     const picks: ReferenceSeed[] = [];
 
     // Walk bands round-robin so `count` picks spread across the importance range.
-    // With count=4 and 5 bands this covers 4 distinct bands; the rotation offset
-    // also shifts WHICH 4 bands when count<bands, so the mid band isn't always
-    // the one skipped.
+    // With count=3 and 5 bands this covers 3 distinct bands; the rotation offset
+    // also shifts which bands are represented.
     const bandOrder: number[] = [];
     for (let i = 0; i < SEED_BANDS.length; i++) {
         bandOrder.push((i + (seed % SEED_BANDS.length)) % SEED_BANDS.length);
@@ -159,15 +150,18 @@ export function renderSeedExamplesBlock(seeds: ReferenceSeed[]): string {
 /**
  * Render one this-session compartment in its full stored form for the
  * `<session_references>` block. v2 rows emit all four tiers; legacy rows (no
- * tiers) fall back to flat `content`. importance/episode_type are shown so the
- * historian calibrates against its own prior scoring.
+ * tiers) fall back to flat `content`. Keep episode_type in both groups, but
+ * show importance only on diverse examples: newest scores cause anchoring.
  */
-function renderSessionRefCompartment(c: ReferenceCompartment): string {
+export function renderSessionRefCompartment(
+    c: ReferenceCompartment,
+    showImportance: boolean,
+): string {
     const importance = c.importance ?? 50;
     const attrs =
         `start="${c.startMessage}" end="${c.endMessage}" title="${escapeXmlAttr(c.title)}"` +
         (c.episodeType ? ` episode_type="${escapeXmlAttr(c.episodeType)}"` : "") +
-        ` importance="${importance}"`;
+        (showImportance ? ` importance="${importance}"` : "");
 
     // Tier presence: a row is v2-tiered ONLY when `p1` is a non-empty string
     // (matches the compartment parser's contract + the NEEDS_UPGRADE predicate
@@ -197,21 +191,73 @@ function renderSessionRefCompartment(c: ReferenceCompartment): string {
 }
 
 /**
- * Render the continuity block from the last `SESSION_REF_WINDOW` persisted
- * compartments. `allCompartments` is the session's full ordered compartment
- * list (ascending by sequence/endMessage). Empty string when the session has
- * no prior compartments (young session — seeds carry calibration alone).
+ * Select older calibration examples against the bands of the seeds alone.
+ * Recent references carry no scores, so their bands do not count as anchors.
+ * Repeatedly pick the least-represented available band (uncovered bands first),
+ * breaking ties in the seed's rotating band order. Within a band, rotate by the
+ * same UTF-16 hash. Remove each pick so sparse histories never duplicate a row.
+ * Input is chronological; output is diverse chronological, then recent chronological.
  */
-export function renderSessionReferencesBlock(allCompartments: ReferenceCompartment[]): string {
-    allCompartments = allCompartments.filter((c) => !isNoContentCompartment(c));
-    if (allCompartments.length === 0) return "";
-    const recent = allCompartments.slice(-SESSION_REF_WINDOW);
-    const body = recent.map(renderSessionRefCompartment).join("\n\n");
+export function selectSessionReferences(
+    allCompartments: ReferenceCompartment[],
+    seeds: readonly ReferenceSeed[],
+    sessionId: string,
+    chunkStart: number,
+): ReferenceCompartment[] {
+    const eligible = allCompartments.filter((c) => !isNoContentCompartment(c));
+    const olderCount = Math.max(0, eligible.length - SESSION_REF_WINDOW);
+    const recent = eligible.slice(olderCount);
+    const bands: number[][] = SEED_BANDS.map(() => []);
+    const counts = SEED_BANDS.map(() => 0);
+    for (const c of seeds) counts[seedBandIndex(c.importance)]++;
+    for (let i = 0; i < olderCount; i++) {
+        bands[seedBandIndex(eligible[i].importance ?? 50)].push(i);
+    }
+    const hash = fnv1a(`${sessionId}:${chunkStart}`);
+    const bandOrder = SEED_BANDS.map(
+        (_, i) => (i + (hash % SEED_BANDS.length)) % SEED_BANDS.length,
+    );
+    const picks: number[] = [];
+    while (picks.length < SESSION_REF_DIVERSE) {
+        let best = -1;
+        for (const bi of bandOrder) {
+            if (bands[bi].length > 0 && (best < 0 || counts[bi] < counts[best])) best = bi;
+        }
+        if (best < 0) break;
+        const band = bands[best];
+        const [pick] = band.splice((hash + picks.length) % band.length, 1);
+        picks.push(pick);
+        counts[best]++;
+    }
+    picks.sort((a, b) => a - b);
+    return [...picks.map((i) => eligible[i]), ...recent];
+}
+
+/**
+ * Render already-selected references. Keeping a suffix drops diverse examples
+ * before recent examples, then drops the oldest recent first. Selection happens
+ * once, before fitting, so trimming cannot reshuffle calibration examples.
+ */
+export function renderSessionReferencesBlock(
+    selected: ReferenceCompartment[],
+    window: number = SESSION_REF_LIMIT,
+): string {
+    selected = selected.filter((c) => !isNoContentCompartment(c));
+    const count = Math.max(0, Math.min(SESSION_REF_LIMIT, Math.floor(window)));
+    if (selected.length === 0 || count === 0) return "";
+    // The selected list is diverse first, recent last. Determine the scored
+    // boundary before trimming so retained recent rows never acquire scores.
+    const recentStart = Math.max(0, selected.length - SESSION_REF_WINDOW);
+    const trimStart = Math.max(0, selected.length - count);
+    const body = selected
+        .slice(trimStart)
+        .map((c, i) => renderSessionRefCompartment(c, i + trimStart < recentStart))
+        .join("\n\n");
     return `<session_references>\n${body}\n</session_references>`;
 }
 
 export interface ReferenceBlocks {
-    /** `<compartment_examples_from_other_projects>` — always present (4-seed floor). */
+    /** `<compartment_examples_from_other_projects>` — always present (3-seed floor). */
     seedExamples: string;
     /** `<session_references>` — empty for a young session with no prior compartments. */
     sessionReferences: string;
@@ -230,6 +276,13 @@ export function buildReferenceBlocks(args: {
     const seeds = selectSeeds(args.sessionId, args.chunkStart);
     return {
         seedExamples: renderSeedExamplesBlock(seeds),
-        sessionReferences: renderSessionReferencesBlock(args.sessionCompartments),
+        sessionReferences: renderSessionReferencesBlock(
+            selectSessionReferences(
+                args.sessionCompartments,
+                seeds,
+                args.sessionId,
+                args.chunkStart,
+            ),
+        ),
     };
 }

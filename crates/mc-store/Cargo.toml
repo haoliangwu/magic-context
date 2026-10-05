@@ -15,10 +15,11 @@ cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
 rusqlite = { workspace = true, features = ["functions"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2 = { workspace = true }
 md5 = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tracing = "0.1"
 
 [features]
 # Public seed helpers for sibling crates' tests (mc-module composes over this store

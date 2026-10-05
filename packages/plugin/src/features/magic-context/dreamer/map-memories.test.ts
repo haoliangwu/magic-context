@@ -2,12 +2,12 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../../shared/test-temp-dir";
 import { insertMemory } from "../memory";
 import {
     getMemoryVerifications,
@@ -16,6 +16,7 @@ import {
 } from "../memory/storage-memory-verifications";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
+import { getSubagentInvocations } from "../storage-subagent-invocations";
 import { acquireLease } from "./lease";
 import {
     applyBatchMappings,
@@ -37,7 +38,7 @@ function freshDb(): Database {
 }
 
 function tempProject(): string {
-    const dir = mkdtempSync(path.join(tmpdir(), "mc-map-memories-"));
+    const dir = createTestTempDirFromPath(path.join(tmpdir(), "mc-map-memories-"));
     tempDirs.push(dir);
     mkdirSync(path.join(dir, "src"), { recursive: true });
     writeFileSync(path.join(dir, "src", "fact.ts"), "export const fact = true;", "utf8");
@@ -52,7 +53,7 @@ function mapArgs(db: Database, sessionDirectory: string, projectIdentity: string
         db,
         client: {} as never,
         projectIdentity,
-        parentSessionId: undefined,
+        parentSessionId: "ses-parent",
         sessionDirectory,
         holderId,
         leaseKey,
@@ -126,231 +127,23 @@ function successfulMapClient(onPrompt?: () => void) {
 }
 
 /** The exact timeout-class error from the shared prompt helper. */
-function timeoutMapClient(onPrompt?: () => void) {
+function timeoutMapClient(
+    onPrompt?: () => void,
+    timeoutError: () => unknown = () => new Error("prompt timed out after 99997ms"),
+) {
     return {
         session: {
             create: async () => ({ data: { id: "map-child" } }),
             prompt: async () => {
                 onPrompt?.();
-                throw new Error("prompt timed out after 99997ms");
+                throw timeoutError();
             },
+            abort: async () => ({}),
             messages: async () => ({ data: [] }),
             delete: async () => ({}),
         },
     };
 }
-
-describe("map-memories authority applier", () => {
-    test("writes through memory.set_mapping under MODULE authority without touching the mirror", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:module-map";
-            const dir = tempProject();
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "ARCHITECTURE",
-                content: "The module owns this mapped memory.",
-            });
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, 101, ?)",
-            ).run(projectIdentity, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, 101, ?, ?)",
-            ).run(projectIdentity, memory.category, memory.normalizedHash);
-            const calls: Array<{ method: string; body: unknown }> = [];
-            const args = mapArgs(db, dir, projectIdentity);
-            args.moduleRoute = {
-                moduleClient: {
-                    call: async (request) => {
-                        calls.push(request);
-                        return { accepted: [101], rejected: [] };
-                    },
-                },
-                moduleSessionId: "ses-module-map",
-                moduleProjectRoot: dir,
-                moduleContextStoreUuid: "store-fixture",
-                moduleAuthorityGeneration: 7,
-                moduleCommandId: "map-command",
-            };
-
-            expect(
-                await applyBatchMappings(
-                    args,
-                    [
-                        {
-                            id: memory.id,
-                            category: memory.category,
-                            content: memory.content,
-                            candidates: [],
-                        },
-                    ],
-                    `<mappings><memory id="${memory.id}" independent="true"/></mappings>`,
-                ),
-            ).toEqual({ mapped: 0, independent: 1 });
-            expect(calls).toHaveLength(1);
-            expect(calls[0]).toMatchObject({
-                method: "memory.set_mapping",
-                body: {
-                    arguments: {
-                        memory_project: projectIdentity,
-                        authority_generation: 7,
-                        rows: [
-                            {
-                                memory_id: 101,
-                                content_hash_at_prompt: memory.normalizedHash,
-                                mapped_files: null,
-                            },
-                        ],
-                    },
-                },
-            });
-            expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-
-    test("preserves host-rejected fallback origin through a MODULE mapping call", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:module-map-fallback";
-            const dir = tempProject();
-            execFileSync("git", ["init", "-q"], { cwd: dir });
-            execFileSync("git", ["add", "src/fact.ts"], { cwd: dir });
-            writeFileSync(
-                path.join(dir, "src", "untracked.ts"),
-                "export const draft = true;",
-                "utf8",
-            );
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "ARCHITECTURE",
-                content: "The module-owned fact references a rejected path.",
-            });
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, 102, ?)",
-            ).run(projectIdentity, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, 102, ?, ?)",
-            ).run(projectIdentity, memory.category, memory.normalizedHash);
-            const calls: Array<{ method: string; body: unknown }> = [];
-            const args = mapArgs(db, dir, projectIdentity);
-            args.moduleRoute = {
-                moduleClient: {
-                    call: async (request) => {
-                        calls.push(request);
-                        return { accepted: [102], rejected: [] };
-                    },
-                },
-                moduleSessionId: "ses-module-map-fallback",
-                moduleProjectRoot: dir,
-                moduleContextStoreUuid: "store-fixture",
-                moduleAuthorityGeneration: 8,
-                moduleCommandId: "map-fallback-command",
-            };
-
-            expect(
-                await applyBatchMappings(
-                    args,
-                    [
-                        {
-                            id: memory.id,
-                            category: memory.category,
-                            content: memory.content,
-                            candidates: [],
-                        },
-                    ],
-                    `<mappings><memory id="${memory.id}" files="src/untracked.ts,/outside-project/fact.ts"/></mappings>`,
-                ),
-            ).toEqual({ mapped: 0, independent: 1 });
-            expect(calls).toHaveLength(1);
-            expect(calls[0]).toMatchObject({
-                method: "memory.set_mapping",
-                body: {
-                    arguments: {
-                        memory_project: projectIdentity,
-                        authority_generation: 8,
-                        rows: [
-                            {
-                                memory_id: 102,
-                                content_hash_at_prompt: memory.normalizedHash,
-                                mapped_files: null,
-                                mapping_origin: "host_rejected_fallback",
-                            },
-                        ],
-                    },
-                },
-            });
-            expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
-        } finally {
-            closeQuietly(db);
-        }
-    });
-    test("overrides directive file mappings before a MODULE mapping call", async () => {
-        const db = freshDb();
-        try {
-            const projectIdentity = "git:module-map-directive";
-            const dir = tempProject();
-            const memory = insertMemory(db, {
-                projectPath: projectIdentity,
-                category: "PROJECT_RULES",
-                content: "When told to inspect a fact, run src/fact.ts first.",
-            });
-            db.prepare(
-                "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, 103, ?)",
-            ).run(projectIdentity, memory.id);
-            db.prepare(
-                "INSERT INTO mirror_live_memory_rows(module_project, module_row_id, category, normalized_hash) VALUES (?, 103, ?, ?)",
-            ).run(projectIdentity, memory.category, memory.normalizedHash);
-            const calls: Array<{ method: string; body: unknown }> = [];
-            const args = mapArgs(db, dir, projectIdentity);
-            args.moduleRoute = {
-                moduleClient: {
-                    call: async (request) => {
-                        calls.push(request);
-                        return { accepted: [103], rejected: [] };
-                    },
-                },
-                moduleSessionId: "ses-module-map-directive",
-                moduleProjectRoot: dir,
-                moduleContextStoreUuid: "store-fixture",
-                moduleAuthorityGeneration: 9,
-                moduleCommandId: "map-directive-command",
-            };
-
-            expect(
-                await applyBatchMappings(
-                    args,
-                    [
-                        {
-                            id: memory.id,
-                            category: memory.category,
-                            content: memory.content,
-                            candidates: ["src/fact.ts"],
-                        },
-                    ],
-                    `<mappings><memory id="${memory.id}" files="src/fact.ts"/></mappings>`,
-                ),
-            ).toEqual({ mapped: 0, independent: 1 });
-            expect(calls[0]).toMatchObject({
-                method: "memory.set_mapping",
-                body: {
-                    arguments: {
-                        rows: [
-                            {
-                                memory_id: 103,
-                                mapped_files: null,
-                                mapping_origin: "host_rejected_fallback",
-                            },
-                        ],
-                    },
-                },
-            });
-        } finally {
-            closeQuietly(db);
-        }
-    });
-});
 
 describe("mapMemories disposition", () => {
     test("banks a completed batch and reports the deadline remainder", async () => {
@@ -358,7 +151,7 @@ describe("mapMemories disposition", () => {
         try {
             const projectIdentity = "git:map-deadline";
             const dir = tempProject();
-            for (let index = 0; index < 81; index += 1) {
+            for (let index = 0; index < 21; index += 1) {
                 insertMemory(db, {
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
@@ -375,7 +168,7 @@ describe("mapMemories disposition", () => {
 
             expect(result).toEqual({
                 mapped: 0,
-                independent: 80,
+                independent: 20,
                 batches: 1,
                 remaining: 1,
                 complete: false,
@@ -391,12 +184,12 @@ describe("mapMemories disposition", () => {
         try {
             const projectIdentity = "git:map-floor-primary";
             const dir = tempProject();
-            // 881 memories produce 12 batches. The old even split assigned only
+            // 221 memories produce 12 batches. The old even split assigned only
             // 100 seconds (1,200,000 / 12) to each batch, below the agentic floor.
             const defaultDeadlineMs = 20 * 60 * 1000;
             expect(Math.floor(defaultDeadlineMs / 12)).toBe(100_000);
             expect(computeMapBatchSliceMs(defaultDeadlineMs, 12)).toBe(MAP_BATCH_FLOOR_MS);
-            for (let index = 0; index < 881; index += 1) {
+            for (let index = 0; index < 221; index += 1) {
                 insertMemory(db, {
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
@@ -419,13 +212,13 @@ describe("mapMemories disposition", () => {
             expect(promptCalls).toBe(1);
             expect(result).toEqual({
                 mapped: 0,
-                independent: 80,
+                independent: 20,
                 batches: 1,
-                remaining: 801,
+                remaining: 201,
                 complete: false,
                 stopReason: "deadline",
             });
-            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(801);
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(201);
         } finally {
             closeQuietly(db);
         }
@@ -436,7 +229,7 @@ describe("mapMemories disposition", () => {
         try {
             const projectIdentity = "git:map-floor-stop";
             const dir = tempProject();
-            for (let index = 0; index < 81; index += 1) {
+            for (let index = 0; index < 21; index += 1) {
                 insertMemory(db, {
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
@@ -456,7 +249,7 @@ describe("mapMemories disposition", () => {
             expect(promptCalls).toBe(1);
             expect(result).toEqual({
                 mapped: 0,
-                independent: 80,
+                independent: 20,
                 batches: 1,
                 remaining: 1,
                 complete: false,
@@ -474,7 +267,7 @@ describe("mapMemories disposition", () => {
             const projectIdentity = "git:map-timeout-breaker";
             const dir = tempProject();
             // Three batches prove the third is left unattempted by the two-timeout breaker.
-            for (let index = 0; index < 241; index += 1) {
+            for (let index = 0; index < 61; index += 1) {
                 insertMemory(db, {
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
@@ -495,9 +288,100 @@ describe("mapMemories disposition", () => {
                 mapped: 0,
                 independent: 0,
                 batches: 0,
-                remaining: 241,
+                remaining: 61,
                 complete: false,
                 stopReason: "timeout-circuit-breaker",
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("two consecutive host request timeouts also trip the starvation circuit breaker", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-host-timeout-breaker";
+            const dir = tempProject();
+            for (let index = 0; index < 61; index += 1) {
+                insertMemory(db, {
+                    projectPath: projectIdentity,
+                    category: "ARCHITECTURE",
+                    content: `Host timeout mapping fact ${index}.`,
+                    sourceSessionId: "ses",
+                });
+            }
+            const args = mapArgs(db, dir, projectIdentity);
+            let promptCalls = 0;
+            // Bun's fetch rejects with this DOMException when the host client's own
+            // request timer fires on a long synchronous prompt.
+            args.client = timeoutMapClient(
+                () => {
+                    promptCalls += 1;
+                },
+                () => new DOMException("The operation timed out.", "TimeoutError"),
+            ) as never;
+
+            const result = await mapMemories(args);
+
+            expect(promptCalls).toBe(2);
+            expect(result.stopReason).toBe("timeout-circuit-breaker");
+            expect(result.complete).toBe(false);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("a failed batch row records the child's tokens and model", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:map-failed-row-evidence";
+            const dir = tempProject();
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Evidence mapping fact.",
+                sourceSessionId: "ses",
+            });
+            const args = mapArgs(db, dir, projectIdentity);
+            args.parentSessionId = "ses-parent-map";
+            // A step-capped loop ends with prose instead of a manifest.
+            args.client = {
+                session: {
+                    create: async () => ({ data: { id: "map-child" } }),
+                    prompt: async () => ({}),
+                    messages: async () => ({
+                        data: [
+                            {
+                                info: {
+                                    role: "assistant",
+                                    providerID: "openai",
+                                    modelID: "gpt-map",
+                                    time: { created: 1, completed: 2 },
+                                    finish: "stop",
+                                    tokens: {
+                                        input: 900,
+                                        output: 120,
+                                        cache: { read: 0, write: 0 },
+                                    },
+                                },
+                                parts: [{ type: "text", text: "I mapped most of them." }],
+                            },
+                        ],
+                    }),
+                    delete: async () => ({}),
+                },
+            } as never;
+
+            await mapMemories(args);
+
+            const [row] = getSubagentInvocations(db, "ses-parent-map", { subagent: "dreamer" });
+            expect(row).toMatchObject({
+                task: "map-memories",
+                status: "failed",
+                providerId: "openai",
+                modelId: "gpt-map",
+                inputTokens: 900,
+                outputTokens: 120,
             });
         } finally {
             closeQuietly(db);
@@ -509,7 +393,7 @@ describe("mapMemories disposition", () => {
         try {
             const projectIdentity = "git:map-floor-resume";
             const dir = tempProject();
-            for (let index = 0; index < 161; index += 1) {
+            for (let index = 0; index < 41; index += 1) {
                 insertMemory(db, {
                     projectPath: projectIdentity,
                     category: "ARCHITECTURE",
@@ -523,8 +407,8 @@ describe("mapMemories disposition", () => {
             }) as never;
 
             const first = await mapMemories(args);
-            expect(first).toMatchObject({ independent: 80, batches: 1, remaining: 81 });
-            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(81);
+            expect(first).toMatchObject({ independent: 20, batches: 1, remaining: 21 });
+            expect(selectMapMemoryInputs(db, projectIdentity, dir)).toHaveLength(21);
 
             args.deadline = Date.now() + 2 * MAP_BATCH_FLOOR_MS;
             args.client = successfulMapClient() as never;
@@ -532,7 +416,7 @@ describe("mapMemories disposition", () => {
 
             expect(second).toEqual({
                 mapped: 0,
-                independent: 81,
+                independent: 21,
                 batches: 2,
                 remaining: 0,
                 complete: true,
@@ -543,13 +427,13 @@ describe("mapMemories disposition", () => {
         }
     });
 
-    test("commits a 79/80 closed subset and retries only its omitted id", async () => {
+    test("commits a 19/20 closed subset and retries only its omitted id", async () => {
         const db = freshDb();
         try {
             const projectIdentity = "git:map-omission-retry";
             const dir = tempProject();
             const memoryIds: number[] = [];
-            for (let index = 0; index < 80; index += 1) {
+            for (let index = 0; index < 20; index += 1) {
                 memoryIds.push(
                     insertMemory(db, {
                         projectPath: projectIdentity,
@@ -567,7 +451,7 @@ describe("mapMemories disposition", () => {
                     // truncated, so its returned mappings can commit immediately. Only
                     // its one absent id is present in the retry prompt.
                     expect(ids).toHaveLength(1);
-                    expect(getMemoryVerifications(db, memoryIds).size).toBe(79);
+                    expect(getMemoryVerifications(db, memoryIds).size).toBe(19);
                     expect(getMemoryVerifications(db, ids).has(ids[0] as number)).toBe(false);
                 }
                 const returnedIds = call === 1 ? ids.slice(0, -1) : ids;
@@ -583,15 +467,15 @@ describe("mapMemories disposition", () => {
             const initialPrompt = promptIds[0];
             const retryPrompt = promptIds[1];
             if (!initialPrompt || !retryPrompt) throw new Error("missing prompt fixture");
-            expect(initialPrompt).toHaveLength(80);
+            expect(initialPrompt).toHaveLength(20);
             expect([...initialPrompt].sort((a, b) => a - b)).toEqual(
                 [...memoryIds].sort((a, b) => a - b),
             );
             expect(retryPrompt).toEqual([initialPrompt[initialPrompt.length - 1]]);
-            expect(progress).toEqual([79, 80]);
+            expect(progress).toEqual([19, 20]);
             expect(result).toEqual({
                 mapped: 0,
-                independent: 80,
+                independent: 20,
                 batches: 2,
                 remaining: 0,
                 complete: true,
@@ -677,8 +561,8 @@ describe("mapMemories disposition", () => {
             // The host rejects both in-repo untracked paths and paths outside the
             // repository. The mixed manifest proves the fallback is all-rejected,
             // not a special case for only one rejection reason.
-            execFileSync("git", ["init", "-q"], { cwd: dir });
-            execFileSync("git", ["add", "src/fact.ts"], { cwd: dir });
+            execFileSync("git", ["init", "-q"], { windowsHide: true, cwd: dir });
+            execFileSync("git", ["add", "src/fact.ts"], { windowsHide: true, cwd: dir });
             writeFileSync(
                 path.join(dir, "src", "untracked.ts"),
                 "export const draft = true;",
@@ -1225,4 +1109,320 @@ describe("independent re-queue heal", () => {
             closeQuietly(db);
         }
     });
+});
+
+describe("map-memories module applier", () => {
+    test("writes through memory.set_mapping using shared context row ids", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-map";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "The module owns this mapped memory.",
+            });
+            const calls: Array<{ method: string; body: unknown }> = [];
+            const args = mapArgs(db, dir, projectIdentity);
+            args.moduleRoute = {
+                moduleClient: {
+                    call: async (request) => {
+                        calls.push(request);
+                        return { accepted: [memory.id], rejected: [] };
+                    },
+                },
+                moduleSessionId: "ses-module-map",
+                moduleProjectRoot: dir,
+                moduleCommandId: "map-command",
+            };
+
+            expect(
+                await applyBatchMappings(
+                    args,
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            candidates: [],
+                        },
+                    ],
+                    `<mappings><memory id="${memory.id}" independent="true"/></mappings>`,
+                ),
+            ).toEqual({ mapped: 0, independent: 1 });
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).toMatchObject({
+                method: "memory.set_mapping",
+                body: {
+                    arguments: {
+                        memory_project: projectIdentity,
+                        rows: [
+                            {
+                                memory_id: memory.id,
+                                content_hash_at_prompt: memory.normalizedHash,
+                                mapped_files: null,
+                            },
+                        ],
+                    },
+                },
+            });
+            expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("preserves host-rejected fallback origin through a MODULE mapping call", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-map-fallback";
+            const dir = tempProject();
+            execFileSync("git", ["init", "-q"], { windowsHide: true, cwd: dir });
+            execFileSync("git", ["add", "src/fact.ts"], { windowsHide: true, cwd: dir });
+            writeFileSync(
+                path.join(dir, "src", "untracked.ts"),
+                "export const draft = true;",
+                "utf8",
+            );
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "The module-owned fact references a rejected path.",
+            });
+            const calls: Array<{ method: string; body: unknown }> = [];
+            const args = mapArgs(db, dir, projectIdentity);
+            args.moduleRoute = {
+                moduleClient: {
+                    call: async (request) => {
+                        calls.push(request);
+                        return { accepted: [memory.id], rejected: [] };
+                    },
+                },
+                moduleSessionId: "ses-module-map-fallback",
+                moduleProjectRoot: dir,
+                moduleCommandId: "map-fallback-command",
+            };
+
+            expect(
+                await applyBatchMappings(
+                    args,
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            candidates: [],
+                        },
+                    ],
+                    `<mappings><memory id="${memory.id}" files="src/untracked.ts,/outside-project/fact.ts"/></mappings>`,
+                ),
+            ).toEqual({ mapped: 0, independent: 1 });
+            expect(calls).toHaveLength(1);
+            expect(calls[0]).toMatchObject({
+                method: "memory.set_mapping",
+                body: {
+                    arguments: {
+                        memory_project: projectIdentity,
+                        rows: [
+                            {
+                                memory_id: memory.id,
+                                content_hash_at_prompt: memory.normalizedHash,
+                                mapped_files: null,
+                                mapping_origin: "host_rejected_fallback",
+                            },
+                        ],
+                    },
+                },
+            });
+            expect(getMemoryVerifications(db, [memory.id]).size).toBe(0);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+    test("overrides directive file mappings before a MODULE mapping call", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-map-directive";
+            const dir = tempProject();
+            const memory = insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "PROJECT_RULES",
+                content: "When told to inspect a fact, run src/fact.ts first.",
+            });
+            const calls: Array<{ method: string; body: unknown }> = [];
+            const args = mapArgs(db, dir, projectIdentity);
+            args.moduleRoute = {
+                moduleClient: {
+                    call: async (request) => {
+                        calls.push(request);
+                        return { accepted: [memory.id], rejected: [] };
+                    },
+                },
+                moduleSessionId: "ses-module-map-directive",
+                moduleProjectRoot: dir,
+                moduleCommandId: "map-directive-command",
+            };
+
+            expect(
+                await applyBatchMappings(
+                    args,
+                    [
+                        {
+                            id: memory.id,
+                            category: memory.category,
+                            content: memory.content,
+                            candidates: ["src/fact.ts"],
+                        },
+                    ],
+                    `<mappings><memory id="${memory.id}" files="src/fact.ts"/></mappings>`,
+                ),
+            ).toEqual({ mapped: 0, independent: 1 });
+            expect(calls[0]).toMatchObject({
+                method: "memory.set_mapping",
+                body: {
+                    arguments: {
+                        rows: [
+                            {
+                                memory_id: memory.id,
+                                mapped_files: null,
+                                mapping_origin: "host_rejected_fallback",
+                            },
+                        ],
+                    },
+                },
+            });
+        } finally {
+            closeQuietly(db);
+        }
+    });
+});
+test("a budget-finalized mapping manifest banks its closed subset", async () => {
+    const db = freshDb();
+    try {
+        const projectIdentity = "git:budget-map";
+        const dir = tempProject();
+        const memory = insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "ARCHITECTURE",
+            content: "Budgeted mapping fact.",
+        });
+        const others = Array.from({ length: 51 }, (_, index) =>
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: `Another mapping fact ${index} for the next run.`,
+            }),
+        );
+        const covered = selectMapMemoryInputs(db, projectIdentity, dir).slice(0, 2);
+        const messages: unknown[] = [];
+        let sends = 0;
+        let aborted = false;
+        const args = mapArgs(db, dir, projectIdentity);
+        args.tokenBudget = 100;
+        args.deadline = Date.now() + MAP_BATCH_FLOOR_MS + 500;
+        args.parentSessionId = "ses-parent-map";
+        args.client = {
+            session: {
+                create: async () => ({ data: { id: "map-budget-child" } }),
+                messages: async () => ({ data: [...messages] }),
+                abort: async () => {
+                    aborted = true;
+                    return { data: true };
+                },
+                status: async () => {
+                    if (sends === 1 && !aborted) {
+                        if (messages.length === 1)
+                            messages.push({
+                                info: {
+                                    id: "step",
+                                    role: "assistant",
+                                    finish: "tool-calls",
+                                    tokens: { input: 81 },
+                                    time: { created: 1, completed: 2 },
+                                },
+                                parts: [{ type: "tool" }],
+                            });
+                        return { data: { "map-budget-child": { type: "busy" } } };
+                    }
+                    if (sends === 2 && messages.length === 3)
+                        messages.push({
+                            info: {
+                                id: "final",
+                                role: "assistant",
+                                finish: "stop",
+                                tokens: { input: 25 },
+                                time: { created: 3, completed: 4 },
+                            },
+                            parts: [
+                                {
+                                    type: "text",
+                                    text: `<mappings>${covered.map((item) => `<memory id="${item.id}" files="src/fact.ts"/>`).join("")}</mappings>`,
+                                },
+                            ],
+                        });
+                    return { data: {} };
+                },
+                promptAsync: async (request: { body: { parts: Array<{ text: string }> } }) => {
+                    sends++;
+                    messages.push({
+                        info: { id: `user-${sends}`, role: "user" },
+                        parts: request.body.parts,
+                    });
+                    return { data: undefined };
+                },
+                delete: async () => ({}),
+            },
+        } as never;
+        const result = await mapMemories(args);
+        expect(sends).toBe(2);
+        expect(result.mapped).toBe(2);
+        expect(result.remaining).toBe(50);
+        expect(result.complete).toBe(false);
+        expect(
+            selectMapMemoryInputs(db, projectIdentity, dir)
+                .map((item) => item.id)
+                .sort((a, b) => a - b),
+        ).toEqual(
+            [memory, ...others]
+                .filter((item) => !covered.some((entry) => entry.id === item.id))
+                .map((item) => item.id)
+                .sort((a, b) => a - b),
+        );
+        for (const item of covered) {
+            expect(getMemoryVerifications(db, [item.id]).get(item.id)?.files).toEqual([
+                "src/fact.ts",
+            ]);
+        }
+    } finally {
+        closeQuietly(db);
+    }
+});
+
+test("non-budget mapping rejects a 10/52 manifest without writes", async () => {
+    const db = freshDb();
+    try {
+        const project = "git:non-budget-map";
+        const dir = tempProject();
+        const items = Array.from({ length: 52 }, (_, index) =>
+            insertMemory(db, {
+                projectPath: project,
+                category: "ARCHITECTURE",
+                content: `Fact ${index}.`,
+            }),
+        );
+        const args = mapArgs(db, dir, project);
+        await expect(
+            applyBatchMappings(
+                args,
+                selectMapMemoryInputs(db, project, dir),
+                `<mappings>${items
+                    .slice(0, 10)
+                    .map((item) => `<memory id="${item.id}" files="src/fact.ts"/>`)
+                    .join("")}</mappings>`,
+            ),
+        ).rejects.toThrow("rejecting mostly-wrong manifest");
+        expect(selectMapMemoryInputs(db, project, dir)).toHaveLength(52);
+    } finally {
+        closeQuietly(db);
+    }
 });

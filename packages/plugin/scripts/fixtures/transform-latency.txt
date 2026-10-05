@@ -1,0 +1,9 @@
+[2026-09-28T18:00:00.000Z] [magic-context][ses_slow] rust pass: decision=SOFT+ served_from=transform elapsed=13000 ms module=3000 ms
+[2026-09-28T18:00:01.000Z] [magic-context][ses_timeout] rust transform failed; attempting LKG replay: module request timed out
+[2026-09-28T18:00:02.000Z] [magic-context][ses_park] mc_rust_park_transition reason=timeout
+[2026-09-28T18:00:03.000Z] [magic-context][ses_refused] raw_fallback_over_context_limit
+[2026-09-28T18:00:04.000Z] [magic-context][ses_timeout2] transport deadline expired
+[2026-09-28T18:00:05.000Z] [magic-context][ses_timeout3] state_sync timeout
+[2026-09-28T18:00:06.000Z] [magic-context][ses_refused2] EmergencyFailClosed
+[2026-09-28T18:00:07.000Z] [magic-context][ses_refused3] storage busy refusal
+[2026-09-28T18:00:08.000Z] [magic-context][ses_quiet] transform completed in 50ms

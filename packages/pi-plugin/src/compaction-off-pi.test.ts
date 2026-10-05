@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
@@ -20,6 +20,7 @@ import {
 	recordOverflowDetected,
 } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { closeQuietly } from "@magic-context/core/shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import {
 	commitPiCompactionModeRecord,
@@ -33,7 +34,7 @@ describe("Pi compaction-off mode", () => {
 	it("keeps the cached m[0] sha256 unchanged from cancelled compaction through the next context injection pass", async () => {
 		const db = createTestDb();
 		const sessionId = "ses-cancelled-native-prefix";
-		const cwd = mkdtempSync(join(tmpdir(), "pi-cancelled-m0-"));
+		const cwd = createTestTempDirFromPath(join(tmpdir(), "pi-cancelled-m0-"));
 		const ctx = { sessionManager: { getSessionId: () => sessionId } };
 		const state = {
 			sessionId,

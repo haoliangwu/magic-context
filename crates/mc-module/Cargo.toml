@@ -23,10 +23,13 @@ mc-tokenizer = { path = "../mc-tokenizer" }
 cortexkit-store-types = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-lease = { workspace = true }
+cortexkit-log = { path = "../../../commons/crates/cortexkit-log", features = ["store-paths"] }
+tracing = "0.1"
 subc-protocol = { workspace = true }
 subc-control = { workspace = true }
 subc-transport = { workspace = true }
 subc-client-rs = { workspace = true }
+subc-os = { path = "../../../subconscious/crates/subc-os" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Provider context-overflow error patterns (scheduler unit). Plain regex (no
@@ -35,6 +38,18 @@ regex = "1"
 tokio = { workspace = true }
 sha2 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# The single-store writer opens the host's context.db directly (src/host_store.rs).
+# Same pin as the workspace uses everywhere else so the Connection/Transaction types
+# unify with mc-store's and cortexkit-store's.
+rusqlite = { workspace = true }
+# The tool-provider/v1 role contract: tool.catalog and role.describe wire types,
+# schema and composition digests, and the capability-tag check. Its own
+# subc-protocol dependency is unified with the workspace's by [patch.crates-io].
+cortexkit-role-tool-provider = "=0.5.0"
+# RFC 8785 (JCS) canonical JSON for tool.catalog's answer bytes and digests: the
+# same canonicaliser the role crate uses, so floats and non-ASCII keys in a
+# caller's composition hash exactly as the runner hashes them.
+serde_jcs = "0.2"
 
 [features]
 # Joint CC rig-drive fault injection. DEFAULT OFF.
@@ -46,20 +61,28 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # path was explicitly rejected: a forgotten var in prod would silently raw-fence
 # every CC session forever). The drive builds a SEPARATE binary with
 # `--features drive-fault`; that binary's only diff vs the deploy SHA is this flag,
-# and under it MC_DRIVE_FAULT selects an arm (fingerprint_skew | omit_ck_messages)
-# so the drive can flip arms between passes without rebuilding.
+# and under it MC_DRIVE_FAULT selects an arm (fingerprint_skew | omit_ck_messages |
+# channel2_arm | transform_timeout) so a drive can select one fault without rebuilding.
 #
 # Do NOT add drive-fault to a default feature set, and do NOT add new fault arms
 # without the matching absence-proof note here and the fault-shape tests in lib.rs.
 drive-fault = []
 
 [dev-dependencies]
+cpu-time = "1"
 subc-core = { workspace = true }
-serde_json = { workspace = true, features = ["raw_value"] }
-ryu-js = "1.0.3"
 # Enable the store's seed helpers for mc-module's compose tests (populate memories +
 # mutations). The feature is gated so the writers never reach production builds.
 mc-store = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 filetime = "0.2"
+tracing-subscriber = "0.3"
 rusqlite = { workspace = true }
+# Parse the shipped-source census instead of mistaking comments for nonce readers.
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+async-trait = "0.1"
+# The role's conformance suite, run in-process against tool.catalog and
+# role.describe (src/tests/tool_catalog_conformance.rs).
+cortexkit-role-tool-provider-conformance = "=0.5.0"

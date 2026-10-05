@@ -1,4 +1,5 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 
 // Repro + regression guard for the "restart history omission" failure mode:
 //
@@ -20,7 +21,7 @@
 // m[1] keeps its raw messages in the tail until an exec pass folds it into m[1].
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -53,7 +54,7 @@ function makeDb(): Database {
 }
 
 function makeProjectDir(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-restart-omit-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-restart-omit-"));
     tempDirs.push(dir);
     return dir;
 }

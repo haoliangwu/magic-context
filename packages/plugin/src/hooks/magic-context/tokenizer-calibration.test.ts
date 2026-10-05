@@ -5,7 +5,7 @@ import {
     resolveModelCalibration,
 } from "./tokenizer-calibration";
 
-const NEUTRAL: ModelCalibration = { systemRatio: 1.0, toolsRatio: 1.0 };
+const NEUTRAL: ModelCalibration = { systemRatio: 1.0, toolsRatio: 1.0, proseRatio: 1.0 };
 
 describe("resolveModelCalibration", () => {
     it("returns neutral ratios for unknown models", () => {
@@ -25,6 +25,69 @@ describe("resolveModelCalibration", () => {
         expect(calib.toolsRatio).toBeCloseTo(1.57, 2);
     });
 
+    it("carries the 2026-09-21 count-endpoint measurements for Moonshot, Z.ai GLM 4.7 and Meta Muse", () => {
+        // Values are results.json rows (tokenizers/estimate-token-count,
+        // paas/v4/tokenizer, responses/input_tokens). The Zen-routed Muse alias
+        // and the OpenCode-Go Kimi alias mirror the same upstream model.
+        const kimi = resolveModelCalibration("moonshot", "kimi-k2.6");
+        expect(kimi.systemRatio).toBeCloseTo(0.872126, 5);
+        expect(kimi.toolsRatio).toBeCloseTo(0.863853, 5);
+        expect(kimi.proseRatio).toBeCloseTo(0.925501, 5);
+        expect(resolveModelCalibration("opencode-go", "kimi-k2.6").proseRatio).toBeCloseTo(
+            0.925501,
+            5,
+        );
+        const glm = resolveModelCalibration("zai", "glm-4.7");
+        expect(glm.systemRatio).toBeCloseTo(0.999721, 5);
+        expect(glm.toolsRatio).toBeCloseTo(1.056823, 5);
+        // glm-5* ids are deliberately absent from the table (the tokenizer endpoint
+        // reports 0 for them); they inherit GLM 4.7 through the family fallback.
+        expect(resolveModelCalibration("zai", "glm-5.1").derivedFrom).toBe("zai/glm-4.7");
+        const muse = resolveModelCalibration("meta", "muse-spark-1.3-contributor");
+        expect(muse.systemRatio).toBeCloseTo(0.865949, 5);
+        expect(muse.toolsRatio).toBeCloseTo(1.024605, 5);
+        expect(muse.proseRatio).toBeCloseTo(0.923366, 5);
+        const zen = resolveModelCalibration("opencode", "muse-spark-1.3-contributor-free");
+        expect([zen.systemRatio, zen.toolsRatio, zen.proseRatio]).toEqual([
+            muse.systemRatio,
+            muse.toolsRatio,
+            muse.proseRatio,
+        ]);
+    });
+
+    it("lets an unmeasured release inherit its nearest measured relative", () => {
+        // The week a new version ships nobody has measured it yet; its predecessor's
+        // tokenizer is the best available truth, and NEUTRAL is no tokenizer at all.
+        const fable52 = resolveModelCalibration("anthropic", "claude-fable-5-2");
+        const fable51 = resolveModelCalibration("anthropic", "claude-fable-5-1");
+        expect(fable52.derivedFrom).toBe("anthropic/claude-fable-5-1");
+        expect(fable52.proseRatio).toBe(fable51.proseRatio);
+        expect(fable51.derivedFrom).toBeUndefined();
+        // Newest version below wins over anything above.
+        expect(resolveModelCalibration("anthropic", "claude-opus-4-9").derivedFrom).toBe(
+            "anthropic/claude-opus-4-8",
+        );
+        // Variant words must match: an astra release follows astra, not plain gpt.
+        expect(resolveModelCalibration("openai", "gpt-6.1-astra").derivedFrom).toBe(
+            "openai/gpt-6-astra",
+        );
+        expect(resolveModelCalibration("openai", "gpt-7").derivedFrom).toBe("openai/gpt-5.5");
+        expect(resolveModelCalibration("google", "gemini-3.9-flash").derivedFrom).toBe(
+            "google/gemini-3.8-flash",
+        );
+        // Only above exists: the oldest above is used.
+        expect(resolveModelCalibration("anthropic", "claude-opus-4-4").derivedFrom).toBe(
+            "anthropic/claude-opus-4-5",
+        );
+        // Known providers stay provider-scoped; an unknown provider can use
+        // canonical model-family inheritance rather than remaining neutral.
+        expect(resolveModelCalibration("anthropic", "claude-muse-9")).toEqual(NEUTRAL);
+        expect(resolveModelCalibration("moonshot", "kimi-k3")).toEqual(NEUTRAL);
+        expect(resolveModelCalibration("brand-new", "claude-fable-5-2").derivedFrom).toBe(
+            "anthropic/claude-fable-5-1",
+        );
+    });
+
     it("matches Claude 4.5/4.6 family within range", () => {
         const cases = [
             ["anthropic", "claude-opus-4-5"],
@@ -40,8 +103,8 @@ describe("resolveModelCalibration", () => {
         }
     });
 
-    it("matches GPT-5.x family across all variants", () => {
-        const cases = ["gpt-5", "gpt-5.4", "gpt-5.4-codex", "gpt-5.5", "gpt-5.3-codex"];
+    it("uses legacy GPT-5.x ratios for variants without API-key measurements", () => {
+        const cases = ["gpt-5", "gpt-5.4", "gpt-5.4-codex", "gpt-5.3-codex"];
         for (const model of cases) {
             const calib = resolveModelCalibration("openai", model);
             expect(calib.systemRatio).toBe(1.0);
@@ -143,14 +206,14 @@ describe("calibrateBuckets", () => {
             profileLocal: 0,
             conversationLocal: 30_000,
             toolCallsLocal: 0,
-            calibration: { systemRatio: 2.0, toolsRatio: 1.0 },
+            calibration: { systemRatio: 2.0, toolsRatio: 1.0, proseRatio: 1.0 },
         });
         expect(out.systemTokens).toBe(20_000);
         expect(out.conversationTokens).toBe(30_000);
         expect(out.systemTokens + out.conversationTokens).toBe(50_000);
     });
 
-    it("keeps verbatim buckets at local count and absorbs residual into conversation/tool calls", () => {
+    it("keeps unmeasured prose at local count and absorbs residual into conversation/tool calls", () => {
         // System=1000, tools=500 (calibrated, neutral so no scaling).
         // Verbatim: compartments=1000, facts=500, memories=0 → all stay at local count.
         // Stable + verbatim = 3000. Residual target = 10000 - 3000 = 7000.
@@ -171,8 +234,7 @@ describe("calibrateBuckets", () => {
         // Calibrated stays at local raw count (neutral).
         expect(out.systemTokens).toBe(1_000);
         expect(out.toolDefinitionTokens).toBe(500);
-        // Verbatim must equal local input exactly. THIS is the property the
-        // user asked for: compartments, facts, memories should not drift.
+        // Unmeasured prose keeps the local input exactly (neutral calibration).
         expect(out.compartmentTokens).toBe(1_000);
         expect(out.factTokens).toBe(500);
         expect(out.memoryTokens).toBe(0);
@@ -235,7 +297,7 @@ describe("calibrateBuckets", () => {
             profileLocal: 0,
             conversationLocal: 100,
             toolCallsLocal: 0,
-            calibration: { systemRatio: 5.0, toolsRatio: 5.0 },
+            calibration: { systemRatio: 5.0, toolsRatio: 5.0, proseRatio: 1.0 },
         });
         const sum =
             out.systemTokens +
@@ -266,7 +328,7 @@ describe("calibrateBuckets", () => {
             profileLocal: 0,
             conversationLocal: 1,
             toolCallsLocal: 0,
-            calibration: { systemRatio: 1.51, toolsRatio: 1.57 },
+            calibration: { systemRatio: 1.51, toolsRatio: 1.57, proseRatio: 1.0 },
         });
         const sum =
             out.systemTokens +
@@ -310,7 +372,7 @@ describe("calibrateBuckets", () => {
             profileLocal: 0,
             conversationLocal: 0,
             toolCallsLocal: 0,
-            calibration: { systemRatio: 5.0, toolsRatio: 5.0 },
+            calibration: { systemRatio: 5.0, toolsRatio: 5.0, proseRatio: 1.0 },
         });
         const sum =
             out.systemTokens +
@@ -355,7 +417,7 @@ describe("calibrateBuckets", () => {
             profileLocal: 0,
             conversationLocal: 40_000,
             toolCallsLocal: 68_000,
-            calibration: { systemRatio: 1.51, toolsRatio: 1.57 },
+            calibration: { systemRatio: 1.51, toolsRatio: 1.57, proseRatio: 1.0 },
         });
         // Calibrated buckets.
         expect(out.systemTokens).toBe(Math.round(16_500 * 1.51));
@@ -392,7 +454,7 @@ describe("calibrateBuckets", () => {
             memoriesLocal: 10_000,
             conversationLocal: 40_000,
             toolCallsLocal: 20_000,
-            calibration: { systemRatio: 1, toolsRatio: 1 },
+            calibration: { systemRatio: 1, toolsRatio: 1, proseRatio: 1.0 },
         };
         const without = calibrateBuckets({ ...base, docsLocal: 0, profileLocal: 0 });
         const withDocs = calibrateBuckets({ ...base, docsLocal: 20_000, profileLocal: 2_000 });
@@ -416,4 +478,92 @@ describe("calibrateBuckets", () => {
             withDocs.toolCallTokens;
         expect(sum).toBe(200_000);
     });
+});
+
+describe("measured Claude 5 prose calibration", () => {
+    it("resolves measured aliases and lets unmeasured Fable 5.2 inherit 5.1", () => {
+        for (const provider of ["anthropic", "openrouter/anthropic", "github-copilot"]) {
+            for (const model of ["claude-fable-5-1", "claude-opus-5"]) {
+                expect(resolveModelCalibration(provider, model)).toMatchObject({
+                    systemRatio: 1.511497,
+                    toolsRatio: 1.551639,
+                    proseRatio: 1.571778,
+                });
+            }
+        }
+        // Unmeasured Fable 5.2 is not neutral: it inherits 5.1 until measured.
+        expect(resolveModelCalibration("anthropic", "claude-fable-5-2").derivedFrom).toBe(
+            "anthropic/claude-fable-5-1",
+        );
+        expect(resolveModelCalibration("anthropic", "claude-opus-4-8").proseRatio).toBe(1);
+    });
+
+    it("calibrates the real-session m0 shape without inflating residuals", () => {
+        const input = {
+            inputTokens: 530_000,
+            systemLocal: 9_000,
+            toolDefsLocal: 19_000,
+            compartmentsLocal: 98_000,
+            factsLocal: 0,
+            docsLocal: 36_000,
+            memoriesLocal: 15_000,
+            profileLocal: 4_000,
+            conversationLocal: 40_000,
+            toolCallsLocal: 70_000,
+            calibration: resolveModelCalibration("anthropic", "claude-fable-5-1"),
+        };
+        const out = calibrateBuckets(input);
+        expect(out).toEqual({
+            systemTokens: 13603,
+            toolDefinitionTokens: 29481,
+            compartmentTokens: 154034,
+            factTokens: 0,
+            docsTokens: 56584,
+            memoryTokens: 23577,
+            profileTokens: 6287,
+            conversationTokens: 89612,
+            toolCallTokens: 156822,
+        });
+        // References are count_tokens from one real session; local inputs are its
+        // rounded sidebar readouts, so 5% avoids false precision. Synthetic memory
+        // measured 1.79 versus 1.56 in that session: prose drift is content-dependent.
+        for (const [actual, reference] of [
+            [out.compartmentTokens, 146815],
+            [out.docsTokens, 55220],
+            [out.memoryTokens, 23462],
+            [out.profileTokens, 6075],
+        ])
+            expect(Math.abs(actual - reference) / reference).toBeLessThan(0.05);
+        expect(Object.values(out).reduce((a, b) => a + b, 0)).toBe(530_000);
+        const before = calibrateBuckets({ ...input, calibration: NEUTRAL });
+        expect(out.toolCallTokens).toBeLessThan(before.toolCallTokens - 60_000);
+    });
+
+    it("scales facts and preserves the sum through prose clamp rounding", () => {
+        const out = calibrateBuckets({
+            inputTokens: 7,
+            systemLocal: 1,
+            toolDefsLocal: 1,
+            compartmentsLocal: 1,
+            factsLocal: 1,
+            docsLocal: 1,
+            memoriesLocal: 1,
+            profileLocal: 1,
+            conversationLocal: 0,
+            toolCallsLocal: 0,
+            calibration: { systemRatio: 1, toolsRatio: 1, proseRatio: 1.5 },
+        });
+        expect(Object.values(out).reduce((a, b) => a + b, 0)).toBe(7);
+        expect(Object.values(out).every((value) => value >= 0)).toBe(true);
+    });
+});
+
+it("uses measured Responses ratios for OpenAI API models", () => {
+    for (const model of ["gpt-5.5", "gpt-6-astra"]) {
+        expect(resolveModelCalibration("openai", model)).toMatchObject({
+            systemRatio: 1.000278,
+            toolsRatio: 0.850953,
+            proseRatio: 1.000017,
+        });
+    }
 });

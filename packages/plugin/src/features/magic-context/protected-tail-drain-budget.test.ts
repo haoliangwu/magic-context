@@ -9,6 +9,7 @@ import {
     describeProtectedTailDrainBudgetSkip,
     loadProtectedTailMeta,
     reserveProtectedTailDrainTokens,
+    rollbackProtectedTailDrainReservation,
 } from "./storage-meta-persisted";
 
 const USABLE_TOKENS = 100_000;
@@ -131,5 +132,38 @@ describe("protected-tail drain budget window", () => {
 
         expect(reserve(db, "tiny-chunk", now + 1, 102).ok).toBe(true);
         expect(loadProtectedTailMeta(db, "tiny-chunk").protectedTailDrainTokens).toBe(204);
+    });
+});
+
+describe("protected-tail drain reservation rollback", () => {
+    it("does not refund a reservation into a later window", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        const firstWindowAt = Date.parse("2026-08-28T16:00:00.000Z");
+        const stale = reserve(db, "rollback-session", firstWindowAt);
+        expect(stale.ok).toBe(true);
+
+        // The first run is still in flight when a new window opens and a second
+        // run spends from it.
+        const laterAt = firstWindowAt + DRAIN_WINDOW_MS + 1_000;
+        const current = reserve(db, "rollback-session", laterAt, 5_000);
+        expect(current.ok).toBe(true);
+        expect(loadProtectedTailMeta(db, "rollback-session").protectedTailDrainTokens).toBe(5_000);
+
+        rollbackProtectedTailDrainReservation(db, stale.reservation);
+
+        expect(loadProtectedTailMeta(db, "rollback-session").protectedTailDrainTokens).toBe(5_000);
+    });
+
+    it("refunds a reservation into the window it came from", () => {
+        const db = new Database(":memory:");
+        initializeDatabase(db);
+        const at = Date.parse("2026-08-28T16:00:00.000Z");
+        const reservation = reserve(db, "rollback-session", at, 5_000);
+        reserve(db, "rollback-session", at + 1_000, 3_000);
+
+        rollbackProtectedTailDrainReservation(db, reservation.reservation);
+
+        expect(loadProtectedTailMeta(db, "rollback-session").protectedTailDrainTokens).toBe(3_000);
     });
 });

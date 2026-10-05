@@ -36,8 +36,12 @@
  * overflow. Real workflows stay well under this limit.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 import { buildMockHistorianPayload } from "../src/mock-historian";
 
 const HISTORIAN_MARKER = "the hippocampus of a long-running coding agent";
@@ -51,32 +55,36 @@ function isHistorian(body: Record<string, unknown>): boolean {
 
 function bigReplyText(turn: number, targetBytes: number): string {
     const header = `turn-${turn}-reply: `;
-    const filler = "abcdefghij0123456789".repeat(200);
-    const reps = Math.max(1, Math.floor(targetBytes / filler.length));
-    return header + filler.repeat(reps);
+    // Unique records carry real content mass without tripping OMP's repeated-cycle guard.
+    const records: string[] = [];
+    let length = header.length;
+    for (let record = 0; length < targetBytes; record++) {
+        const text = `Record ${turn}-${record}: inspected boundary ${record * 7919} and retained decision ${record * 104729}.\n`;
+        records.push(text);
+        length += text.length;
+    }
+    return (header + records.join("")).slice(0, targetBytes);
 }
 
-let h: TestHarness;
+forEachHost(import.meta.url, "short context accumulating overflow", (host) => {
+    let h: ScenarioHarness;
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        modelContextLimit: 128_000,
-        magicContextConfig: {
-            execute_threshold_percentage: 40,
-            historian: { model: "mock-anthropic/mock-sonnet" },
-            dreamer: { disable: true, model: "mock-anthropic/mock-sonnet" },
-            // This drill measures emergency pressure, not embedding startup latency.
-            memory: { auto_search: { enabled: false }, git_commit_indexing: { enabled: false } },
-            embedding: { provider: "off" },
-        },
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            modelContextLimit: 128_000,
+            magicContextConfig: {
+                execute_threshold_percentage: 40,
+                dreamer: { disable: true },
+                // This drill measures emergency pressure, not embedding startup latency.
+                memory: { auto_search: { enabled: false }, git_commit_indexing: { enabled: false } },
+                embedding: { provider: "off" },
+            },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("short context accumulating overflow", () => {
+    afterAll(async () => {
+        await h?.dispose();
+    });
     it(
         "emergency bypass keeps 128K session under 100% with slow historian",
         async () => {

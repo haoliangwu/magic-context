@@ -6,9 +6,9 @@ export type MemoryCategory =
     | "ARCHITECTURE"
     | "CONFIG_VALUES"
     // Legacy 9-cat taxonomy — retained as an accept-both bridge so the existing
-    // memory store (pre-v2 rows) keeps full ordering/TTL/rendering until the
-    // one-time recategorization migration (E3 / /ctx-session-upgrade) folds them
-    // into the 5-cat set. The historian no longer emits these.
+    // memory store (pre-v2 rows) keeps full ordering/TTL/rendering. The dreamer's
+    // curate task maps such a row into the 5-cat set when it next touches it; the
+    // historian no longer emits these.
     | "ARCHITECTURE_DECISIONS"
     | "CONSTRAINTS"
     | "CONFIG_DEFAULTS"

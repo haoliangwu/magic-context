@@ -220,7 +220,32 @@ async fn invoke_handler(
         None
     };
 
-    match dispatch::dispatch(&state.app_state, &payload.cmd, payload.args).await {
+    let outcome = if dispatch::uses_subprocess_or_network_probe(&payload.cmd) {
+        dispatch::dispatch(&state.app_state, &payload.cmd, payload.args).await
+    } else {
+        // Every other command is synchronous SQLite or file work (with a 5 s
+        // busy timeout), so it runs on the blocking pool: on a runtime worker
+        // it would stall every other request scheduled on that worker, and a
+        // few browser tabs polling at once could freeze the whole server.
+        let app_state = Arc::clone(&state.app_state);
+        let InvokeRequest { cmd, args } = payload;
+        let handle = tokio::runtime::Handle::current();
+        match tokio::task::spawn_blocking(move || {
+            handle.block_on(dispatch::dispatch(&app_state, &cmd, args))
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Command failed: {err}"),
+                )
+            }
+        }
+    };
+
+    match outcome {
         Ok(value) => Json(value).into_response(),
         Err(dispatch::DispatchError::UnknownCommand) => {
             json_error(StatusCode::NOT_FOUND, "Unknown command")
@@ -571,7 +596,6 @@ fn has_gui_display() -> bool {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
-    use std::sync::Mutex;
     use tempfile::tempdir;
     use tokio::task::JoinHandle;
 
@@ -589,9 +613,7 @@ mod tests {
     }
 
     fn state_without_db() -> AppState {
-        AppState {
-            db_path: Mutex::new(None),
-        }
+        AppState::with_resolver(|| None)
     }
 
     async fn spawn_test_server() -> TestServer {
@@ -603,6 +625,14 @@ mod tests {
     }
 
     async fn spawn_test_server_with_options(host: IpAddr, allow_remote: bool) -> TestServer {
+        spawn_test_server_with_state(state_without_db(), host, allow_remote).await
+    }
+
+    async fn spawn_test_server_with_state(
+        app_state: AppState,
+        host: IpAddr,
+        allow_remote: bool,
+    ) -> TestServer {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("test listener");
@@ -613,7 +643,7 @@ mod tests {
             allow_remote,
         };
         let token = "a".repeat(64);
-        let app = build_router(Arc::new(state_without_db()), &options, token.clone());
+        let app = build_router(Arc::new(app_state), &options, token.clone());
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("test server");
         });
@@ -748,6 +778,57 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    static SLOW_RESOLVER_ENTERED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// A database lookup that holds its thread like a SQLite call waiting on a
+    /// busy lock.
+    fn slow_resolver() -> Option<std::path::PathBuf> {
+        SLOW_RESOLVER_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        None
+    }
+
+    // `#[tokio::test]` runs on a single-threaded runtime, so a command that
+    // blocks its worker stalls the server and this test's own client with it.
+    #[tokio::test]
+    async fn a_slow_database_command_does_not_stall_other_requests() {
+        let server = spawn_test_server_with_state(
+            AppState::with_resolver(slow_resolver),
+            DEFAULT_HOST,
+            false,
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let slow = {
+            let base_url = server.base_url.clone();
+            let token = server.token.clone();
+            tokio::spawn(async move {
+                reqwest::Client::new()
+                    .post(format!("{base_url}/api/invoke"))
+                    .bearer_auth(token)
+                    .json(&json!({ "cmd": "get_projects", "args": {} }))
+                    .send()
+                    .await
+                    .expect("slow response")
+            })
+        };
+        while !SLOW_RESOLVER_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let fast = invoke(&server, json!({ "cmd": "pi_config_path", "args": {} })).await;
+        assert_eq!(fast.status(), StatusCode::OK);
+        let fast_elapsed = started.elapsed();
+        assert!(
+            fast_elapsed < std::time::Duration::from_millis(500),
+            "a request unrelated to the slow command waited {fast_elapsed:?}"
+        );
+
+        let slow = slow.await.expect("slow task");
+        assert_eq!(slow.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

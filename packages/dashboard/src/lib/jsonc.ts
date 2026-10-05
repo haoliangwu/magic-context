@@ -1,4 +1,5 @@
 import { parse, stringify } from "comment-json";
+import { applyEdits, findNodeAtLocation, modify, parseTree } from "jsonc-parser";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -89,6 +90,50 @@ export function patchDreamerTasksJsonc(
     else delete dreamer[harness];
   }
   return stringifyJsonc(root);
+}
+
+function sameJsonValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Change only differing value tokens in existing files. Structural additions
+ * and removals use the JSONC editor's comma handling; ordinary field edits do
+ * not reformat even the line containing the value. Validate before patching so
+ * a parse failure never turns into a destructive save of fallback defaults.
+ */
+export function patchConfigJsonc(text: string, next: Record<string, unknown>): string {
+  const root = parseRoot(text);
+  assertPrototypeSafe(next);
+  if (!text.trim()) return stringifyJsonc(next);
+  let patched = text;
+  const indentation = text.match(/\r?\n([\t ]+)"/)?.[1] ?? "  ";
+  const formattingOptions = {
+    insertSpaces: !indentation.includes("\t"),
+    tabSize: indentation.length,
+    eol: text.includes("\r\n") ? "\r\n" : "\n",
+  };
+  const update = (before: unknown, after: unknown, path: string[]) => {
+    if (sameJsonValue(before, after)) return;
+    if (isRecord(before) && isRecord(after)) {
+      for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+        update(before[key], after[key], [...path, key]);
+      }
+      return;
+    }
+    const tree = parseTree(patched, undefined, { allowTrailingComma: true });
+    const node = tree && findNodeAtLocation(tree, path);
+    if (node && after !== undefined) {
+      patched =
+        patched.slice(0, node.offset) +
+        JSON.stringify(after) +
+        patched.slice(node.offset + node.length);
+    } else {
+      patched = applyEdits(patched, modify(patched, path, after, { formattingOptions }));
+    }
+  };
+  update(root, next, []);
+  return patched;
 }
 
 /** Remove the project-level dreamer override while preserving the rest of the config file. */

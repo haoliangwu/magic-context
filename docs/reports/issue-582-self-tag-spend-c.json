@@ -1,0 +1,85 @@
+{
+  "phases": [
+    {
+      "phase": "live-c",
+      "requests": 132,
+      "calls": 132,
+      "input": 778124,
+      "output": 4389,
+      "cacheHit": 723968,
+      "cacheMiss": 54156,
+      "reasoning": 0
+    },
+    {
+      "phase": "supplement-c",
+      "requests": 28,
+      "calls": 28,
+      "input": 201567,
+      "output": 1067,
+      "cacheHit": 174976,
+      "cacheMiss": 26591,
+      "reasoning": 0
+    },
+    {
+      "phase": "live-d",
+      "requests": 145,
+      "calls": 145,
+      "input": 801492,
+      "output": 13146,
+      "cacheHit": 752768,
+      "cacheMiss": 48724,
+      "reasoning": 7816
+    },
+    {
+      "phase": "supplement-d",
+      "requests": 31,
+      "calls": 31,
+      "input": 250478,
+      "output": 2408,
+      "cacheHit": 222336,
+      "cacheMiss": 28142,
+      "reasoning": 1372
+    },
+    {
+      "phase": "controls-c",
+      "requests": 42,
+      "calls": 42,
+      "input": 157464,
+      "output": 1422,
+      "cacheHit": 146048,
+      "cacheMiss": 11416,
+      "reasoning": 0
+    },
+    {
+      "phase": "supplement-failed-c",
+      "requests": 26,
+      "calls": 25,
+      "input": 159673,
+      "output": 937,
+      "cacheHit": 143488,
+      "cacheMiss": 16185,
+      "reasoning": 0
+    },
+    {
+      "phase": "relay-rejected-c",
+      "requests": 1,
+      "calls": 0,
+      "input": 0,
+      "output": 0,
+      "cacheHit": 0,
+      "cacheMiss": 0,
+      "reasoning": 0
+    }
+  ],
+  "total": {
+    "requests": 405,
+    "calls": 403,
+    "input": 2348798,
+    "output": 23369,
+    "cacheHit": 2163584,
+    "cacheMiss": 185214,
+    "reasoning": 9188
+  },
+  "estimatedOffPeakUSD": 0.048294252,
+  "estimatedPeakUSD": 0.096588504
+}

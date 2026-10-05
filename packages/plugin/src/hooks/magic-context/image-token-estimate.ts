@@ -21,9 +21,9 @@ export function estimateImageTokensFromDataUrl(url: string): number {
     const header = url.slice(0, comma);
     const payload = url.slice(comma + 1);
 
-    // Only decode the first ~32 bytes of the image — enough for both PNG IHDR
-    // (bytes 16-24) and JPEG SOF markers (typically within first 256 bytes).
-    // Read up to ~512 bytes of base64 to cover edge-case JPEG marker offsets.
+    // Only decode the first 512 base64 characters (384 bytes): enough for the
+    // PNG IHDR, GIF and WebP headers. JPEG reads further on demand below,
+    // because an EXIF block before the frame header can run to 64 KiB.
     const sliceLen = Math.min(512, payload.length);
     const preview = payload.slice(0, sliceLen);
 
@@ -38,7 +38,7 @@ export function estimateImageTokensFromDataUrl(url: string): number {
         const dims = parsePngDimensions(bytes);
         if (dims) return clampImageTokens(Math.ceil((dims.w * dims.h) / IMAGE_TOKEN_DIVISOR));
     } else if (header.includes("image/jpeg") || header.includes("image/jpg")) {
-        const dims = parseJpegDimensions(bytes);
+        const dims = parseJpegDimensions(createBase64ByteReader(payload, bytes));
         if (dims) return clampImageTokens(Math.ceil((dims.w * dims.h) / IMAGE_TOKEN_DIVISOR));
     } else if (header.includes("image/webp")) {
         const dims = parseWebpDimensions(bytes);
@@ -49,6 +49,31 @@ export function estimateImageTokensFromDataUrl(url: string): number {
     }
 
     return IMAGE_FALLBACK_TOKENS;
+}
+
+/**
+ * Image tokens of a tool part's `state.attachments`: the images a tool returned next to its
+ * text output (OpenCode's `read` on a PNG, for example). The provider bills each one as an
+ * image, so it is counted from its pixel dimensions, never from its base64 length. Other
+ * attachment types stay uncounted, as they are for message file parts. Callers skip a
+ * dropped output themselves: on OpenCode 2 the drop placeholder replaces the whole result,
+ * images included.
+ */
+export function estimateToolAttachmentImageTokens(state: unknown): number {
+    if (!state || typeof state !== "object") return 0;
+    const attachments = (state as { attachments?: unknown }).attachments;
+    if (!Array.isArray(attachments)) return 0;
+    let tokens = 0;
+    for (const attachment of attachments) {
+        if (!attachment || typeof attachment !== "object") continue;
+        const { mime, url } = attachment as { mime?: unknown; url?: unknown };
+        if (typeof mime !== "string" || !mime.startsWith("image/")) continue;
+        tokens +=
+            typeof url === "string" && url.startsWith("data:")
+                ? estimateImageTokensFromDataUrl(url)
+                : IMAGE_FALLBACK_TOKENS;
+    }
+    return tokens;
 }
 
 function clampImageTokens(n: number): number {
@@ -87,22 +112,63 @@ function parsePngDimensions(b: Uint8Array): { w: number; h: number } | null {
     return { w, h };
 }
 
+// Random access into a base64 payload without decoding all of it. The first
+// window is the 512-character preview already decoded by the caller; later
+// windows are 4096 characters (3072 bytes) each and are decoded only when a
+// read lands in them. Returns undefined past the end or for an undecodable
+// window, which ends the JPEG scan and falls back to the fixed estimate.
+const READER_PREVIEW_CHARS = 512;
+const READER_PREVIEW_BYTES = 384;
+const READER_WINDOW_CHARS = 4096;
+const READER_WINDOW_BYTES = 3072;
+
+function createBase64ByteReader(
+    payload: string,
+    preview: Uint8Array,
+): (offset: number) => number | undefined {
+    const windows = new Map<number, Uint8Array | null>();
+    return (offset) => {
+        if (offset < READER_PREVIEW_BYTES) return preview[offset];
+        const index = Math.floor((offset - READER_PREVIEW_BYTES) / READER_WINDOW_BYTES);
+        let window = windows.get(index);
+        if (window === undefined) {
+            const start = READER_PREVIEW_CHARS + index * READER_WINDOW_CHARS;
+            const chars = payload.slice(start, start + READER_WINDOW_CHARS);
+            try {
+                window = chars.length > 0 ? base64Decode(chars) : null;
+            } catch {
+                window = null;
+            }
+            windows.set(index, window);
+        }
+        return window?.[offset - READER_PREVIEW_BYTES - index * READER_WINDOW_BYTES];
+    };
+}
+
+// How far into the decoded JPEG the frame header is searched for. Each APPn
+// segment is at most 64 KiB, and EXIF, XMP and ICC blocks rarely add up to more.
+const JPEG_SCAN_LIMIT_BYTES = 256 * 1024;
+
 // JPEG: scan for SOF markers (0xFFC0..0xFFC3, 0xFFC5..0xFFC7, 0xFFC9..0xFFCB, 0xFFCD..0xFFCF).
 // After marker: length (2 bytes), precision (1 byte), height (2 bytes), width (2 bytes).
-function parseJpegDimensions(b: Uint8Array): { w: number; h: number } | null {
-    if (b.length < 4 || b[0] !== 0xff || b[1] !== 0xd8) return null;
+// Segments before the frame header (APP0 JFIF, APP1 EXIF, ...) are skipped by
+// their declared length, so only the bytes at segment starts are decoded.
+function parseJpegDimensions(
+    byteAt: (offset: number) => number | undefined,
+): { w: number; h: number } | null {
+    if (byteAt(0) !== 0xff || byteAt(1) !== 0xd8 || byteAt(3) === undefined) return null;
     let i = 2;
-    while (i < b.length - 8) {
-        if (b[i] !== 0xff) {
+    while (i < JPEG_SCAN_LIMIT_BYTES && byteAt(i + 8) !== undefined) {
+        if (byteAt(i) !== 0xff) {
             i++;
             continue;
         }
-        const marker = b[i + 1];
+        const marker = byteAt(i + 1);
         if (marker === undefined) break;
         if (isSofMarker(marker)) {
             // i+2: segment length (2B), i+4: precision (1B), i+5: height (2B), i+7: width (2B)
-            const h = (b[i + 5]! << 8) | b[i + 6]!;
-            const w = (b[i + 7]! << 8) | b[i + 8]!;
+            const h = (byteAt(i + 5)! << 8) | byteAt(i + 6)!;
+            const w = (byteAt(i + 7)! << 8) | byteAt(i + 8)!;
             if (w && h) return { w, h };
             return null;
         }
@@ -111,7 +177,7 @@ function parseJpegDimensions(b: Uint8Array): { w: number; h: number } | null {
             i += 2;
             continue;
         }
-        const segLen = (b[i + 2]! << 8) | b[i + 3]!;
+        const segLen = (byteAt(i + 2)! << 8) | byteAt(i + 3)!;
         if (segLen < 2) return null;
         i += 2 + segLen;
     }

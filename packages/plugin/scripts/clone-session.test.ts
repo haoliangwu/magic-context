@@ -304,7 +304,7 @@ function makeFixture(
         "opencode",
         null,
     );
-    const toolTag = context
+    context
         .prepare(
             "INSERT INTO tags (session_id, message_id, type, status, byte_size, tag_number, harness, tool_owner_message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -312,9 +312,10 @@ function makeFixture(
     context
         .prepare("INSERT INTO source_contents (tag_id, session_id, content, created_at, harness) VALUES (?, ?, ?, ?, ?)")
         .run(Number(sourceTag.lastInsertRowid), sourceSessionId, "source text", 10, "opencode");
+    // Queued drops name their tag by per-session tag number, never by row id.
     context
         .prepare("INSERT INTO pending_ops (session_id, tag_id, operation, queued_at, harness) VALUES (?, ?, ?, ?, ?)")
-        .run(sourceSessionId, Number(toolTag.lastInsertRowid), "drop", 11, "opencode");
+        .run(sourceSessionId, 2, "drop", 11, "opencode");
     context
         .prepare(
             "INSERT INTO session_meta (session_id, harness, counter, cleared_reasoning_through_tag, tool_reclaim_watermark, stripped_placeholder_ids, compaction_marker_state, channel2_nudge_state, emergency_drain_active, cached_m0_bytes, cached_m1_bytes, nudge_anchor_message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -455,7 +456,7 @@ describe("clone-session", () => {
         const clonedPending = context
             .prepare("SELECT tag_id FROM pending_ops WHERE session_id = ?")
             .get(destinationSessionId) as { tag_id: number };
-        expect(clonedPending.tag_id).toBe(clonedTags[1].id);
+        expect(clonedPending.tag_id).toBe(2);
         const clonedCompartment = context
             .prepare("SELECT start_message_id, end_message_id, start_message, end_message FROM compartments WHERE session_id = ?")
             .get(destinationSessionId) as {

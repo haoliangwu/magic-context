@@ -1,0 +1,5 @@
+{
+  // two copies, each with its own options
+  "plugin": [["@cortexkit/opencode-magic-context@0.42.6", { "sidebar": false }]],
+  "plugins": [{ "package": "@cortexkit/opencode-magic-context@latest", "options": { "sidebar": true } }]
+}

@@ -1,7 +1,7 @@
 import type { MagicContextConfig } from "../config/schema/magic-context";
-import { resolveModelConfigValue } from "./prompt-surface";
+import { type ResolvedCacheTtl, resolveModelCacheTtl } from "./model-cache-ttl";
 
-export type CacheTtlDisplaySource = "config" | "session" | "default";
+export type CacheTtlDisplaySource = ResolvedCacheTtl["source"] | "session";
 
 export interface CacheTtlDisplay {
     value: string;
@@ -10,6 +10,7 @@ export interface CacheTtlDisplay {
 }
 
 export interface ResolveCacheTtlDisplayArgs {
+    frozen?: ResolvedCacheTtl;
     configured: MagicContextConfig["cache_ttl"];
     configuredExplicitly: boolean;
     modelKey: string | undefined;
@@ -24,6 +25,7 @@ export interface ResolveCacheTtlDisplayArgs {
  * displayed; otherwise use live config because the session value may be for another model.
  */
 export function resolveCacheTtlDisplay(args: ResolveCacheTtlDisplayArgs): CacheTtlDisplay {
+    if (args.frozen) return args.frozen;
     if (
         (args.sessionModelKey && (!args.modelKey || args.sessionModelKey === args.modelKey)) ||
         (!args.modelKey && !args.sessionModelKey && args.sessionValue !== "5m")
@@ -35,27 +37,19 @@ export function resolveCacheTtlDisplay(args: ResolveCacheTtlDisplayArgs): CacheT
         };
     }
 
-    if (typeof args.configured === "string") {
-        return {
-            value: args.configured,
-            source: args.configuredExplicitly ? "config" : "default",
-            modelKey: args.modelKey,
-        };
-    }
-
-    const matched = resolveModelConfigValue(args.configured, args.modelKey);
-    if (matched) {
-        return { value: matched.value, source: "config", modelKey: args.modelKey };
-    }
-
-    return {
-        value: args.configured.default ?? "5m",
-        source: "default",
-        modelKey: args.modelKey,
-    };
+    const resolved = resolveModelCacheTtl(args.configured, args.modelKey);
+    if (
+        resolved.source === "default" &&
+        typeof args.configured === "string" &&
+        args.configuredExplicitly
+    )
+        return { ...resolved, source: "config" };
+    return resolved;
 }
 
 export function formatCacheTtlDisplay(display: CacheTtlDisplay): string {
+    if (display.source === "OpenAI GPT-5.6+ default")
+        return `Cache TTL: ${display.value} (${display.source})`;
     if (display.source === "session") return `Cache TTL: ${display.value} (session)`;
     if (display.source === "config") {
         return `Cache TTL: ${display.value} (config for ${display.modelKey ?? "current model"})`;

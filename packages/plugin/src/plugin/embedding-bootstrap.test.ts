@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EmbeddingConfig } from "../config/schema/magic-context";
@@ -12,6 +12,7 @@ import {
 } from "../features/magic-context/memory/embedding";
 import { resolveProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 
 const tempDirs: string[] = [];
@@ -20,7 +21,7 @@ const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function tempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -36,8 +37,12 @@ function installShadowProvider(onDispose: () => void): void {
         initialize: async () => true,
         embed: async () => new Float32Array([1, 0]),
         embedBatch: async (texts: string[]) => texts.map(() => new Float32Array([1, 0])),
-        dispose: async () => {
+        // Non-async: record the flag at call time. disposeProvider is
+        // fire-and-forget, so an async body would make the assertion depend on
+        // that body running before its first await rather than on retirement.
+        dispose: () => {
             onDispose();
+            return Promise.resolve();
         },
         isLoaded: () => true,
     }));
@@ -97,6 +102,46 @@ describe("ensureProjectRegisteredFromOpenCodeDirectory", () => {
         const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
         expect(snapshot?.enabled).toBe(true);
         expect(snapshot?.runtimeFingerprint).not.toStartWith("observation:");
+    });
+
+    it("keeps repeated registration read-only and observes a changed config file", async () => {
+        const projectDir = tempDir("mc-registration-read-");
+        process.env.HOME = tempDir("mc-registration-home-");
+        const configHome = tempDir("mc-registration-config-");
+        process.env.XDG_CONFIG_HOME = configHome;
+        process.env.XDG_DATA_HOME = tempDir("mc-registration-data-");
+        writeUserConfig(configHome, {
+            embedding: {
+                provider: "openai-compatible",
+                model: "first",
+                endpoint: "http://127.0.0.1:9/v1",
+            },
+        });
+        const db = openDatabase();
+        const identity = resolveProjectIdentity(projectDir);
+        await ensureProjectRegisteredFromOpenCodeDirectory(projectDir, db);
+        const first = getProjectEmbeddingSnapshot(identity);
+        const changes = (db.prepare("SELECT total_changes() AS count").get() as { count: number })
+            .count;
+        for (let i = 0; i < 4; i++)
+            await ensureProjectRegisteredFromOpenCodeDirectory(projectDir, db);
+        expect(
+            (db.prepare("SELECT total_changes() AS count").get() as { count: number }).count,
+        ).toBe(changes);
+        expect(getProjectEmbeddingSnapshot(identity)?.runtimeFingerprint).toBe(
+            first?.runtimeFingerprint,
+        );
+        writeUserConfig(configHome, {
+            embedding: {
+                provider: "openai-compatible",
+                model: "second-longer",
+                endpoint: "http://127.0.0.1:9/v1",
+            },
+        });
+        await ensureProjectRegisteredFromOpenCodeDirectory(projectDir, db);
+        expect(getProjectEmbeddingSnapshot(identity)?.runtimeFingerprint).not.toBe(
+            first?.runtimeFingerprint,
+        );
     });
 
     it("retires a disabled shadow without removing the primary lane", async () => {

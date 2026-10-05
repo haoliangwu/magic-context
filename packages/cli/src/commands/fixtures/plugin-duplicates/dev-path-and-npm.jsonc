@@ -1,0 +1,5 @@
+{
+  // local checkout for development
+  "plugin": ["__DEV_PATH__"],
+  "plugins": ["@cortexkit/opencode-magic-context@latest"]
+}

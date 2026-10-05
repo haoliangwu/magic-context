@@ -20,16 +20,9 @@ test("v2 ctx_* descriptions are model-keyed and identical across three defer pas
 		join(plugin, "index.js"),
 		`import { appendFileSync } from "node:fs";
 export default { id: "s6-surface", async setup(context) {
-  await context.tool.transform((editor) => {
-    for (const name of ["ctx_reduce","ctx_expand","ctx_note","ctx_memory","ctx_search"]) {
-      editor.add({
-        name,
-        description: "full-" + name,
-        input: { type: "object", properties: {} },
-        async execute() { return { content: "ok" }; },
-      });
-    }
-  });
+  // Observes only. Adding stub ctx_* tools here (an earlier shape of this
+  // probe) made the host drop every ctx_* tool from the wire, so the test was
+  // measuring its own stubs through the editor fallback and never the request.
   await context.session.hook("context", async (draft) => {
     const fromDraft = Object.fromEntries(Object.entries(draft.tools ?? {}).filter(([name]) => name.startsWith("ctx_")));
     const fromEditor = {};
@@ -98,18 +91,51 @@ export default { id: "s6-surface", async setup(context) {
 		expect(sameModel.length).toBeGreaterThanOrEqual(3);
 		const hashes = sameModel.slice(0, 3).map((frame) => sha(frame.tools));
 		expect(new Set(hashes).size).toBe(1);
+
+		// The claim that matters is what the provider received, not what another
+		// plugin's hook saw: the observer above runs before Magic Context's own
+		// context hook, so its `draft.tools` read is pre-edit. The host's tool
+		// definitions must stay at their full baseline on every request and only
+		// the light model's request carries the light descriptions.
+		const wireDescriptions = (modelID: string) =>
+			host.mock
+				.requests()
+				.filter((request) => request.body.model === modelID)
+				.map((request) =>
+					Object.fromEntries(
+						(request.body.tools as Array<{ name?: string; description?: string }>)
+							.filter((tool) => typeof tool.name === "string" && tool.name.startsWith("ctx_"))
+							.map((tool) => [tool.name as string, tool.description ?? ""]),
+					),
+				);
+		const fullOnWire = wireDescriptions("mock-model");
+		expect(fullOnWire.length).toBeGreaterThanOrEqual(3);
+		const fullDescription = fullOnWire[0]?.ctx_search;
+		expect(fullDescription).toBeString();
+		expect(fullDescription).not.toBe(LIGHT_TOOL_DESCRIPTIONS.ctx_search);
+		for (const tools of fullOnWire) expect(tools.ctx_search).toBe(fullDescription);
+
 		await client.session.switchModel({
 			sessionID: session.id,
 			model: { providerID: "openai", id: "mock-light" },
 		});
 		await turn("pass-light");
-		const light = readFileSync(trace, "utf8")
-			.trim()
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => JSON.parse(line) as { model: { id: string }; tools: Record<string, { description: string }> })
-			.findLast((frame) => frame.model.id === "mock-light");
-		expect(light?.tools.ctx_search?.description).toBe(LIGHT_TOOL_DESCRIPTIONS.ctx_search);
+		const lightOnWire = wireDescriptions("mock-light");
+		expect(lightOnWire.length).toBeGreaterThanOrEqual(1);
+		for (const tools of lightOnWire)
+			expect(tools.ctx_search).toBe(LIGHT_TOOL_DESCRIPTIONS.ctx_search);
+
+		// Contamination control (issue 492 finding 4): a full-preset request AFTER
+		// the light one must still carry the full description. A persistent
+		// tool.transform registered per pass fails this arm, because the light
+		// edit becomes the host baseline every later request starts from.
+		await client.session.switchModel({
+			sessionID: session.id,
+			model: { providerID: "openai", id: "mock-model" },
+		});
+		await turn("pass-full-after-light");
+		const fullAfterLight = wireDescriptions("mock-model").at(-1);
+		expect(fullAfterLight?.ctx_search).toBe(fullDescription);
 	} finally {
 		await host.stop();
 	}

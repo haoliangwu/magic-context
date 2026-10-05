@@ -1,3 +1,5 @@
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+
 /// <reference types="bun-types" />
 // Tests exercise server-side (Desktop) notification behavior — set OPENCODE_CLIENT
 // to prevent the TUI toast path from intercepting sendIgnoredMessage calls.
@@ -5,12 +7,12 @@ process.env.OPENCODE_CLIENT = "desktop";
 
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { appendCompartments } from "../../features/magic-context/compartment-storage";
-import { ensureContextStoreUuid } from "../../features/magic-context/context-authority";
 import { writeTaskScheduleState } from "../../features/magic-context/dreamer/storage-task-schedule";
+import { ensureContextStoreUuid } from "../../features/magic-context/legacy-authority-fixture.test-support";
 import { insertMemory } from "../../features/magic-context/memory";
 import type {
     EmbeddingProvider,
@@ -27,7 +29,7 @@ import {
     _setTestProviderFactoryForProject,
     getEmbeddingCoverageStatus,
 } from "../../features/magic-context/project-embedding-registry";
-import type { Scheduler } from "../../features/magic-context/scheduler";
+import { createScheduler, type Scheduler } from "../../features/magic-context/scheduler";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
     closeDatabase,
@@ -86,7 +88,7 @@ const tempDirs: string[] = [];
 const originalXdgDataHome = process.env.XDG_DATA_HOME;
 
 function makeTempDir(prefix: string): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -154,6 +156,9 @@ function createMockDeps(promptMocks: PromptMocks = createPromptMocks()): MagicCo
     return {
         client: {
             session: {
+                list: mock(async () => ({
+                    data: [{ id: "ses-parent", title: "ordinary session" }],
+                })),
                 create: promptMocks.createSession,
                 ...(promptMocks.prompt ? { prompt: promptMocks.prompt } : {}),
                 promptAsync: promptMocks.promptAsync,
@@ -251,49 +256,64 @@ function countIndexedHookMessage(sessionId: string, messageId: string): number {
 }
 
 describe("magic-context hook", () => {
-    it("review: refusing ordinary mirror must not extend the 1.9s tool reply budget", async () => {
-        process.env.XDG_DATA_HOME = makeTempDir("hook-review-memory-budget-");
+    it("passes the selected OpenCode 1 model to per-model scheduling before any usage event", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-model-threshold-");
+        const sessionId = "ses-model-threshold";
+        const config = {
+            default: 50,
+            "opencode/mimo-v2.6-flash-free": 65,
+            "opencode/muse-spark-1.3-contributor-free": 20,
+        };
         const deps = createMockDeps();
-        deps.config = { ...deps.config, transform_mode: "rust" } as never;
-        let targeted = false;
-        let drained = false;
-        deps.rustModeModuleClient = {
-            async call() {
-                return {
-                    memory_operation: { action: "write", module_id: 9101, category: "CONSTRAINTS" },
-                };
-            },
-            async mirrorMemory() {
-                targeted = true;
-                return { row: null };
-            },
-            async mirrorPull() {
-                drained = true;
-                await new Promise((resolve) => setTimeout(resolve, 2_200));
-                throw new Error("refusing slow mirror");
-            },
-        } as never;
+        deps.config = { ...deps.config, execute_threshold_percentage: config };
+        const scheduler = createScheduler({ executeThresholdPercentage: config });
+        const shouldExecute = mock(scheduler.shouldExecute);
+        deps.scheduler = { shouldExecute };
         const hook = requireHook(createMagicContextHook(deps));
-        const started = performance.now();
-        const reply = await hook.rustToolBackends!.memory!({
-            sessionId: "review-budget",
-            projectRoot: "/tmp",
-            projectPath: "/tmp",
-            memoryProject: "/tmp",
-            action: "write",
-            category: "CONSTRAINTS",
-            content: "budget probe",
-        });
-        const elapsed = performance.now() - started;
-        expect(targeted).toBe(true);
-        expect(drained).toBe(false);
-        expect(reply).toBe(
-            "Saved memory in CONSTRAINTS. Its id will appear in <project-memory> on the next pass.",
+        await hook["chat.message"]!(
+            {
+                sessionID: sessionId,
+                model: { providerID: "opencode", modelID: "muse-spark-1.3-contributor-free" },
+            },
+            { message: {} as never, parts: [] },
         );
-        expect(reply).not.toContain("9101");
-        expect(elapsed).toBeLessThan(2_000);
+        const pass = async () =>
+            hook["experimental.chat.messages.transform"]!(
+                {},
+                {
+                    messages: [
+                        {
+                            info: { id: "u1", role: "user", sessionID: sessionId },
+                            parts: [{ type: "text", text: "hello" }],
+                        },
+                    ],
+                },
+            );
+        await pass();
+        expect(shouldExecute.mock.calls.at(-1)?.[4]).toBe(
+            "opencode/muse-spark-1.3-contributor-free",
+        );
+        updateSessionMeta(openDatabase(), sessionId, {
+            lastResponseTime: Date.now(),
+            lastInputTokens: 284_298,
+            lastContextPercentage: (284_298 / 917_504) * 100,
+            lastUsageContextLimit: 917_504,
+        });
+        await pass();
+        expect(shouldExecute.mock.results.at(-1)?.value).toBe("execute");
+        await hook["chat.message"]!(
+            {
+                sessionID: sessionId,
+                model: { providerID: "opencode", modelID: "mimo-v2.6-flash-free" },
+            },
+            { message: {} as never, parts: [] },
+        );
+        await pass();
+        expect(shouldExecute.mock.calls.at(-1)?.[4]).toBe("opencode/mimo-v2.6-flash-free");
+        expect(shouldExecute.mock.results.at(-1)?.value).toBe("defer");
     });
-    it("constructs with directory fallback when load-time identity resolution throws", () => {
+
+    it("leaves the project unbound when git fails before any durable identity is known", () => {
         process.env.XDG_DATA_HOME = makeTempDir("hook-identity-fallback-data-");
         const projectDir = makeTempDir("hook-identity-fallback-project-");
         mkdirSync(join(projectDir, ".git"));
@@ -307,7 +327,7 @@ describe("magic-context hook", () => {
         const deps = createMockDeps();
         deps.directory = projectDir;
 
-        expect(createMagicContextHook(deps)).not.toBeNull();
+        expect(createMagicContextHook(deps)).toBeNull();
     });
 
     it("constructs and resolves a project when sandbox policy denies realpath for the home directory", () => {
@@ -540,7 +560,7 @@ describe("magic-context hook", () => {
 
         try {
             await runTransform();
-            await waitUntil(() => !autoEmbedAttemptedBySession.has(sessionId));
+            await waitUntil(() => autoEmbedAttemptedBySession.has(sessionId));
 
             for (let i = 1; i <= 7; i++) {
                 appendCompartments(db, sessionId, [
@@ -575,7 +595,8 @@ describe("magic-context hook", () => {
             expect(prompts.promptAsync).not.toHaveBeenCalled();
             const calls = embedBatch.mock.calls.length;
             expect(calls).toBeGreaterThan(0);
-            // Leave new work eligible: without the latch a second transform would drain it.
+            // Appending a compartment after a completed drain allows automatic
+            // embedding to process that new compartment on the next transform.
             appendCompartments(db, sessionId, [
                 {
                     sequence: 7,
@@ -592,16 +613,107 @@ describe("magic-context hook", () => {
                 "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
             ).run(sessionId, 8, "u8", "user", "Later source text");
             await runTransform();
-            await new Promise((resolve) => setTimeout(resolve, 30));
-            expect(embedBatch.mock.calls.length).toBe(calls);
+            await waitUntil(
+                () =>
+                    getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded ===
+                    8,
+            );
+            expect(embedBatch.mock.calls.length).toBeGreaterThan(calls);
             expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
                 total: 8,
-                embedded: 7,
+                embedded: 8,
             });
             expect(userRows()).toEqual([]);
         } finally {
             clearEmbedSessionState(sessionId);
             hostDb.close();
+        }
+    });
+
+    // Issue 543: history embedding is not a memory feature. With memory off and a
+    // provider configured, the automatic drain still embeds history, posts
+    // nothing into the timeline, and leaves memory rows unembedded.
+    it("silently auto-embeds history compartments when memory is disabled", async () => {
+        process.env.XDG_DATA_HOME = makeTempDir("hook-auto-embed-memory-off-data-");
+        const projectDir = makeTempDir("hook-auto-embed-memory-off-project-");
+        mkdirSync(join(projectDir, ".cortexkit"));
+        writeFileSync(
+            join(projectDir, ".cortexkit", "magic-context.jsonc"),
+            JSON.stringify({
+                embedding: { provider: "local", model: "hook-fake-embedding-model" },
+                memory: { enabled: false },
+            }),
+        );
+        const provider = new HookFakeEmbeddingProvider();
+        _setTestProviderFactoryForProject(() => provider);
+        const prompts = createPromptMocks();
+        prompts.prompt = mock(() => {});
+        const deps = createMockDeps(prompts);
+        deps.directory = projectDir;
+        deps.config = {
+            ...deps.config,
+            memory: { enabled: false },
+        } as MagicContextDeps["config"];
+        const hook = requireHook(createMagicContextHook(deps));
+        const db = openDatabase();
+        const sessionId = "ses-hook-auto-embed-memory-off";
+        const projectIdentity = resolveProjectIdentity(projectDir);
+        recordSessionProjectIdentity(db, sessionId, projectIdentity);
+        for (let i = 1; i <= 3; i++) {
+            appendCompartments(db, sessionId, [
+                {
+                    sequence: i - 1,
+                    startMessage: i,
+                    endMessage: i,
+                    startMessageId: `u${i}`,
+                    endMessageId: `u${i}`,
+                    title: `Compartment ${i}`,
+                    content: `Content ${i}`,
+                    p1: `Content ${i}`,
+                },
+            ]);
+            db.prepare(
+                "INSERT INTO message_history_fts (session_id, message_ordinal, message_id, role, content) VALUES (?, ?, ?, ?, ?)",
+            ).run(sessionId, i, `u${i}`, "user", `Source text ${i}`);
+        }
+        insertMemory(db, {
+            projectPath: projectIdentity,
+            category: "CONSTRAINTS",
+            content: "A memory that must stay unembedded while memory is off.",
+        });
+
+        try {
+            await hook["experimental.chat.messages.transform"]!(
+                {},
+                {
+                    messages: [
+                        {
+                            info: { id: "u1", role: "user", sessionID: sessionId },
+                            parts: [{ type: "text", text: "hello" }],
+                        },
+                    ] as never,
+                },
+            );
+            const deadline = Date.now() + 3_000;
+            const embedded = () =>
+                getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session.embedded;
+            while (embedded() < 3 && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            await new Promise((resolve) => setTimeout(resolve, 30));
+
+            expect(getEmbeddingCoverageStatus(db, projectIdentity, sessionId).session).toEqual({
+                total: 3,
+                embedded: 3,
+            });
+            expect(db.prepare("SELECT COUNT(*) AS count FROM memory_embeddings").get()).toEqual({
+                count: 0,
+            });
+            expect(prompts.prompt).not.toHaveBeenCalled();
+            expect(prompts.promptAsync).not.toHaveBeenCalled();
+            expect(prompts.showToast).not.toHaveBeenCalled();
+        } finally {
+            clearEmbedSessionState(sessionId);
         }
     });
 

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { DREAMER_CLASSIFIER_AGENT } from "../../../agents/dreamer";
 import { withContentLanguageDirective } from "../../../agents/language-directive";
-import { createV1HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-historian";
+import { resolveHiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-historian";
 import {
     type HiddenCompletion,
     type HiddenCompletionExecutor,
@@ -16,7 +16,12 @@ import { describeError, getErrorMessage } from "../../../shared/error-message";
 import { log } from "../../../shared/logger";
 import type { ModelInput } from "../../../shared/model-resolution";
 import { hasShareabilitySensitiveText } from "../../../shared/redaction";
-import { modelBodyField, toModelEntry } from "../../../shared/resolve-fallbacks";
+import {
+    modelBodyField,
+    parseProviderModel,
+    toModelEntry,
+} from "../../../shared/resolve-fallbacks";
+import { formatRunTokenLog, runTokenLog } from "../../../shared/run-token-log";
 import type { Database } from "../../../shared/sqlite";
 import { renderCapabilityRefusal } from "../../../shared/user-facing-codes";
 import {
@@ -25,7 +30,12 @@ import {
     type Memory,
     setMemoryClassification,
 } from "../memory";
-import { recordChildInvocation } from "../subagent-token-capture";
+import type { SubagentInvocationStatus } from "../storage-subagent-invocations";
+import {
+    failedInvocationStatus,
+    recordChildInvocation,
+    type TokenTotals,
+} from "../subagent-token-capture";
 import {
     buildClassifyPrompt,
     CLASSIFY_SYSTEM_PROMPT,
@@ -34,9 +44,9 @@ import {
     parseClassifyManifest,
     validateClassifyManifest,
 } from "./classify-prompt";
+import { readFailedChildMessages } from "./failed-invocation-evidence";
 import { type LeaseAcquisition, runLeaseGuardedWrite, startLeaseHeartbeat } from "./lease";
 import { assertManifestCoversExactly } from "./manifest-parser";
-import { getModuleMemoryIdentities } from "./module-apply";
 import {
     DreamerProviderOutputFailureError,
     providerOutputFailureFromInvalidManifest,
@@ -70,6 +80,17 @@ const CLASSIFY_CHUNK_SIZE = 100;
 // Module-side classify awaits a full broca producer run (CLASSIFY_AWAIT_TIMEOUT is
 // 600s in the module); the transport request must outlive it plus dispatch slack.
 const CLASSIFY_MODULE_RUN_TIMEOUT_MS = 660_000;
+
+/** The `dreamer.run_task` code a module with no completion runner answers with. */
+const HOST_COMPLETION_REQUIRED = "host_completion_required";
+
+/** A classify completion this host ran, in the shape `dreamer.run_task` takes it back. */
+interface HostClassifyCompletion {
+    text: string;
+    model: string;
+    length_capped: boolean;
+    usage: { input: number; output: number; cache_read: number; cache_write: number };
+}
 
 export interface ClassifyModuleCallArgs {
     sessionId: string;
@@ -114,12 +135,10 @@ export interface ClassifyArgs {
     model?: ModelInput;
     fallbackModels?: readonly ModelInput[];
     language?: string;
-    /** Present only for rust-mode projects whose memories authority is MODULE. */
+    /** Optional Rust writer for the shared context.db rows. */
     moduleClient?: ClassifyModuleClient;
     moduleSessionId?: string;
     moduleProjectRoot?: string;
-    moduleContextStoreUuid?: string;
-    moduleAuthorityGeneration?: number;
     moduleCommandId?: string;
     onProgress?: (processed: number) => void;
 }
@@ -134,9 +153,9 @@ export interface ClassifyResult {
 }
 
 interface ClassifyCandidate {
-    /** The context.db row used for mirrored prompt content and local identity. */
+    /** The shared row used for prompt content. */
     contextMemory: Memory;
-    /** The id and hash understood by the module authority, or the TS row values. */
+    /** The shared row id and content hash used by either writer. */
     id: number;
     normalizedHash: string;
 }
@@ -145,49 +164,16 @@ function isModuleRoute(args: ClassifyArgs): boolean {
     return (
         args.moduleClient !== undefined &&
         args.moduleSessionId !== undefined &&
-        args.moduleProjectRoot !== undefined &&
-        args.moduleContextStoreUuid !== undefined &&
-        args.moduleAuthorityGeneration !== undefined
+        args.moduleProjectRoot !== undefined
     );
 }
 
-/**
- * Build the classify pool in the authority's id space. The context rows are still the
- * prompt source, but module classification must use the mirrored module id and hash.
- * The live mirror hash is preferred over recomputing it in TypeScript because it is
- * the exact value checked by memory.set_classification.
- */
 function getClassifyCandidates(args: ClassifyArgs): ClassifyCandidate[] {
-    const active = getMemoriesByProject(args.db, args.projectIdentity);
-    if (!isModuleRoute(args) || active.length === 0) {
-        return active.map((memory) => ({
-            contextMemory: memory,
-            id: memory.id,
-            normalizedHash: memory.normalizedHash,
-        }));
-    }
-
-    const mappedByContextId = getModuleMemoryIdentities(
-        args.db,
-        args.projectIdentity,
-        active.map((memory) => memory.id),
-    );
-    const candidates = active.flatMap((contextMemory) => {
-        const mapped = mappedByContextId.get(contextMemory.id);
-        return mapped
-            ? [{ contextMemory, id: mapped.moduleId, normalizedHash: mapped.normalizedHash }]
-            : [];
-    });
-    if (candidates.length !== active.length) {
-        const mappedContextIds = new Set(mappedByContextId.keys());
-        const withoutIdentity = active.filter((memory) => !mappedContextIds.has(memory.id)).length;
-        const withoutLiveHash = active.length - candidates.length - withoutIdentity;
-        log(
-            `[dreamer] classify: excluded ${active.length - candidates.length} module candidates for ${args.projectIdentity}` +
-                ` (${withoutIdentity} without mirror_identity, ${withoutLiveHash} without live module hash)`,
-        );
-    }
-    return candidates;
+    return getMemoriesByProject(args.db, args.projectIdentity).map((memory) => ({
+        contextMemory: memory,
+        id: memory.id,
+        normalizedHash: memory.normalizedHash,
+    }));
 }
 
 function toPromptMemory(candidate: ClassifyCandidate): ClassifyPromptMemory {
@@ -248,21 +234,18 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
     let stage: 2 | 3;
     let toClassify: ClassifyCandidate[];
     let anchors: ClassifyAnchorMemory[] = [];
+    const unclassifiedIds = new Set(
+        getUnclassifiedMemoryIds(
+            args.db,
+            active.map((candidate) => candidate.contextMemory.id),
+        ),
+    );
+    toClassify = active.filter((candidate) => unclassifiedIds.has(candidate.contextMemory.id));
     if (active.length <= FULL_POOL_CEILING) {
-        // Stage 2: classify the whole pool every run.
+        // An unchanged classification is already durable; only new or changed rows need a prompt.
         stage = 2;
-        toClassify = active;
     } else {
-        // Stage 3: only the new/changed (unclassified) memories, with stratified
-        // already-classified anchors for distribution calibration.
         stage = 3;
-        const unclassifiedIds = new Set(
-            getUnclassifiedMemoryIds(
-                args.db,
-                active.map((candidate) => candidate.contextMemory.id),
-            ),
-        );
-        toClassify = active.filter((candidate) => unclassifiedIds.has(candidate.contextMemory.id));
         const classified = active.filter(
             (candidate) => !unclassifiedIds.has(candidate.contextMemory.id),
         );
@@ -292,7 +275,7 @@ export async function runClassify(args: ClassifyArgs): Promise<ClassifyResult> {
         args.db,
         args.holderId,
         args.leaseKey,
-        () => abortController.abort(),
+        (reason) => abortController.abort(new Error(reason)),
         args.leaseAcquisition,
     );
 
@@ -335,9 +318,7 @@ async function classifyOneChunk(
 ): Promise<{ classified: number; changed: number }> {
     let agentSessionId: string | null = null;
     let handle: HiddenRunHandle | null = null;
-    const executor =
-        args.hiddenCompletionExecutor ??
-        createV1HiddenCompletionExecutor(args.client, args.db, args.sessionDirectory);
+    let closeExecutor: HiddenCompletionExecutor | undefined;
     let promptSettled = false;
     const startedAt = Date.now();
     const moduleRoute = isModuleRoute(args);
@@ -347,78 +328,136 @@ async function classifyOneChunk(
             memories: chunk.map(toPromptMemory),
             anchors,
         });
+        // Runs the classify prompt on this host's own carrier. The module route uses
+        // it too when the module has no completion runner of its own (under
+        // historian.runner = host) and asks the host to run the completion.
+        const runOnHostCarrier = async (system: string) => {
+            const executor = resolveHiddenCompletionExecutor(
+                args.hiddenCompletionExecutor,
+                args.client,
+                args.db,
+                args.sessionDirectory,
+                "classify-memories",
+            );
+            closeExecutor = executor;
+            handle = await executor.open({
+                parentSessionId: args.parentSessionId,
+                agent: DREAMER_CLASSIFIER_AGENT,
+                kind: "dreamer-task",
+                system,
+                model: args.model,
+                configuredModels: [
+                    ...(args.model ? [args.model] : []),
+                    ...(args.fallbackModels ?? []),
+                ],
+                timeoutMs: sliceMs,
+                title: "magic-context-dream-classify",
+                directory: args.sessionDirectory,
+                metadata: { task: "classify-memories" },
+            });
+            agentSessionId = handle.id || null;
+            if (!agentSessionId) throw new Error("Could not create classify session.");
+            // The retry callbacks close over the opened run; bind it once so the closures
+            // see the resolved handle rather than the nullable slot it was assigned to.
+            const opened = handle;
+
+            const run = await shared.promptSyncWithValidatedOutputRetry(
+                args.client,
+                {
+                    path: { id: agentSessionId },
+                    query: { directory: args.sessionDirectory },
+                    body: {
+                        agent: DREAMER_CLASSIFIER_AGENT,
+                        system,
+                        ...modelBodyField(args.model),
+                        parts: [{ type: "text", text: prompt, synthetic: true }],
+                    },
+                },
+                {
+                    transport: Object.assign(
+                        (request: import("../../../shared/model-suggestion-retry").PromptArgs) =>
+                            executor.attempt(opened, request),
+                        { childSessionId: opened.childSessionId },
+                    ),
+                    timeoutMs: sliceMs,
+                    signal,
+                    fallbackModels: args.fallbackModels,
+                    callContext: "dreamer:classify-memories",
+                    fetchOutput: () => executor.collect(opened, 50),
+                    validateOutput: (completion) => {
+                        const messages = completion.messages ?? [];
+                        const tokens = completion.tokenLog ?? runTokenLog(undefined);
+                        shared.sessionLog(
+                            args.parentSessionId ?? "dreamer",
+                            `dreamer:classify response_chars=${(completion.text ?? completion.reasoning ?? "").length} ${formatRunTokenLog(tokens)}`,
+                        );
+                        if (completion.lengthCapped) {
+                            throw new Error(
+                                completion.reasoning && !completion.text
+                                    ? `classify ran out of output budget while reasoning (length-capped at ${completion.usage.output} tokens, no text; ${formatRunTokenLog(tokens)}) — set dreamer.maxTokens or use a low-reasoning model`
+                                    : `classify returned length-capped output; ${formatRunTokenLog(tokens)}`,
+                            );
+                        }
+                        const text = completion.text;
+                        if (!text) throw new Error("classify returned no output");
+                        try {
+                            validateClassifyManifest(
+                                text,
+                                new Set(chunk.map((candidate) => candidate.id)),
+                            );
+                        } catch (error) {
+                            const providerFailure = providerOutputFailureFromInvalidManifest(
+                                messages,
+                                text,
+                            );
+                            if (providerFailure) throw providerFailure;
+                            throw error;
+                        }
+                        return text;
+                    },
+                },
+            );
+            promptSettled = true;
+            return run;
+        };
+
         if (moduleRoute) {
-            const run = await runClassifyThroughModule(args, chunk, anchors, signal);
-            recordInvocation(args, startedAt, { status: "completed" });
+            const { accounting, ...run } = await runClassifyThroughModule(
+                args,
+                chunk,
+                anchors,
+                signal,
+                async (system) => {
+                    const run = await runOnHostCarrier(system);
+                    const output = run.output;
+                    return {
+                        text: run.validated,
+                        model:
+                            output.providerId && output.modelId
+                                ? `${output.providerId}/${output.modelId}`
+                                : run.attempt.label,
+                        length_capped: output.lengthCapped === true,
+                        // A carrier that reported no usage sends zeros, as the module's
+                        // own runner reports nothing it was not given.
+                        usage: {
+                            input: output.usage?.input ?? 0,
+                            output: output.usage?.output ?? 0,
+                            cache_read: output.usage?.cacheRead ?? 0,
+                            cache_write: output.usage?.cacheWrite ?? 0,
+                        },
+                    };
+                },
+            );
+            recordInvocation(args, startedAt, {
+                status: "completed",
+                moduleAccounting: accounting,
+            });
             return run;
         }
 
-        handle = await executor.open({
-            parentSessionId: args.parentSessionId,
-            agent: DREAMER_CLASSIFIER_AGENT,
-            kind: "dreamer-task",
-            system: withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
-            model: args.model,
-            configuredModels: [...(args.model ? [args.model] : []), ...(args.fallbackModels ?? [])],
-            timeoutMs: sliceMs,
-            title: "magic-context-dream-classify",
-            directory: args.sessionDirectory,
-            metadata: { task: "classify-memories" },
-        });
-        agentSessionId = handle.id || null;
-        if (!agentSessionId) throw new Error("Could not create classify session.");
-        // The retry callbacks close over the opened run; bind it once so the closures
-        // see the resolved handle rather than the nullable slot it was assigned to.
-        const opened = handle;
-
-        const run = await shared.promptSyncWithValidatedOutputRetry(
-            args.client,
-            {
-                path: { id: agentSessionId },
-                query: { directory: args.sessionDirectory },
-                body: {
-                    agent: DREAMER_CLASSIFIER_AGENT,
-                    system: withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
-                    ...modelBodyField(args.model),
-                    parts: [{ type: "text", text: prompt, synthetic: true }],
-                },
-            },
-            {
-                transport: Object.assign(
-                    (request: import("../../../shared/model-suggestion-retry").PromptArgs) =>
-                        executor.attempt(opened, request),
-                    { childSessionId: opened.childSessionId },
-                ),
-                timeoutMs: sliceMs,
-                signal,
-                fallbackModels: args.fallbackModels,
-                callContext: "dreamer:classify-memories",
-                fetchOutput: () => executor.collect(opened, 50),
-                validateOutput: (completion) => {
-                    const messages = completion.messages ?? [];
-                    if (completion.lengthCapped) {
-                        throw new Error("classify returned length-capped output");
-                    }
-                    const text = completion.text;
-                    if (!text) throw new Error("classify returned no output");
-                    try {
-                        validateClassifyManifest(
-                            text,
-                            new Set(chunk.map((candidate) => candidate.id)),
-                        );
-                    } catch (error) {
-                        const providerFailure = providerOutputFailureFromInvalidManifest(
-                            messages,
-                            text,
-                        );
-                        if (providerFailure) throw providerFailure;
-                        throw error;
-                    }
-                    return text;
-                },
-            },
+        const run = await runOnHostCarrier(
+            withContentLanguageDirective(CLASSIFY_SYSTEM_PROMPT, args.language),
         );
-        promptSettled = true;
 
         recordInvocation(args, startedAt, {
             status: "completed",
@@ -437,7 +476,15 @@ async function classifyOneChunk(
             `[dreamer] classify chunk failed: ${desc.brief}`,
             desc.stackHead ? { stackHead: desc.stackHead } : undefined,
         );
-        recordInvocation(args, startedAt, { status: "failed", error: failure });
+        recordInvocation(args, startedAt, {
+            status: failedInvocationStatus(failure),
+            error: failure,
+            // Only an OpenCode 1 child can be read back here; other carriers own
+            // their children and report no messages.
+            messages: args.hiddenCompletionExecutor
+                ? undefined
+                : await readFailedChildMessages(args.client, agentSessionId, args.sessionDirectory),
+        });
         // A MODULE-authority failure is not safe to downgrade to the guarded
         // TypeScript child path. Surface it so the scheduler records a
         // transient failure and retries the same task instead.
@@ -452,7 +499,7 @@ async function classifyOneChunk(
             throw failure;
         return { classified: 0, changed: 0 };
     } finally {
-        await executor.close(handle, {
+        await closeExecutor?.close(handle, {
             promptSettled,
             privacySensitive: true,
             context: "[dreamer] classify",
@@ -461,15 +508,14 @@ async function classifyOneChunk(
     }
 }
 
-/** Run the module classifier and apply its manifest in module id space. The
- *  mirror-back changefeed refreshes the context rows, including classified_at;
- *  this path must not write the context rows a second time. */
+/** The module writes classification to the shared rows; the host must not apply it a second time. */
 async function runClassifyThroughModule(
     args: ClassifyArgs,
     chunk: ClassifyCandidate[],
     anchors: ClassifyAnchorMemory[],
     signal: AbortSignal,
-): Promise<{ classified: number; changed: number }> {
+    runOnHost: (system: string) => Promise<HostClassifyCompletion>,
+): Promise<{ classified: number; changed: number; accounting: ModuleClassifyAccounting }> {
     const prompt = buildClassifyPrompt({
         projectPath: args.projectIdentity,
         memories: chunk.map(toPromptMemory),
@@ -480,38 +526,54 @@ async function runClassifyThroughModule(
         .filter((entry) => entry !== undefined)
         .map((entry) => entry.model);
     const resolvedModelChain = [...new Set(modelChain)];
-    const response = await args.moduleClient?.call({
-        sessionId: args.moduleSessionId as string,
-        projectRoot: args.moduleProjectRoot as string,
-        method: "dreamer.run_task",
-        body: {
+    const commandId = `classify:${args.moduleCommandId ?? Date.now()}:${createHash("sha256")
+        .update(chunk.map((candidate) => candidate.id).join(","))
+        .digest("hex")
+        .slice(0, 24)}`;
+    const runTask = (hostCompletion?: HostClassifyCompletion) =>
+        args.moduleClient?.call({
+            sessionId: args.moduleSessionId as string,
+            projectRoot: args.moduleProjectRoot as string,
             method: "dreamer.run_task",
-            v: 1,
-            session_id: args.moduleSessionId,
-            task: "classify",
-            // Chunk membership must stay in the id for retry idempotency, but a large
-            // chunk's literal id list can exceed the module's 256-byte command-id cap,
-            // so the membership rides as a digest.
-            command_id: `classify:${args.moduleCommandId ?? Date.now()}:${createHash("sha256")
-                .update(chunk.map((candidate) => candidate.id).join(","))
-                .digest("hex")
-                .slice(0, 24)}`,
-            authority_generation: args.moduleAuthorityGeneration,
-            ...(resolvedModelChain.length > 0 ? { model_chain: resolvedModelChain } : {}),
-            payload: {
-                prompt_body: prompt,
-                items: chunk.map((candidate) => ({
-                    memory_id: candidate.id,
-                    content_hash: candidate.normalizedHash,
-                })),
+            body: {
+                method: "dreamer.run_task",
+                v: 1,
+                session_id: args.moduleSessionId,
+                task: "classify",
+                // Chunk membership must stay in the id for retry idempotency, but a large
+                // chunk's literal id list can exceed the module's 256-byte command-id cap,
+                // so the membership rides as a digest.
+                command_id: commandId,
+                // Always sent, even when empty: the module has no chain of its own and
+                // refuses a request without one, while an empty chain reports "no models".
+                model_chain: resolvedModelChain,
+                payload: {
+                    prompt_body: prompt,
+                    items: chunk.map((candidate) => ({
+                        memory_id: candidate.id,
+                        content_hash: candidate.normalizedHash,
+                    })),
+                },
+                ...(hostCompletion ? { host_completion: hostCompletion } : {}),
             },
-        },
-        signal,
-        // The module drives a full producer run (model call included) before replying,
-        // so this request carries the classify slice budget, not the transport default.
-        timeoutMs: CLASSIFY_MODULE_RUN_TIMEOUT_MS,
-    });
-    const result = (response as { result?: unknown } | null)?.result ?? response;
+            signal,
+            // Each model attempt can spend 600 seconds awaiting its provider run and
+            // another 60 seconds recovering its response. Allow every fallback to finish.
+            timeoutMs:
+                Math.max(1, resolvedModelChain.length) * CLASSIFY_MODULE_RUN_TIMEOUT_MS + 30_000,
+        });
+    const unwrap = (response: unknown) =>
+        (response as { result?: unknown } | null)?.result ?? response;
+    let result = unwrap(await runTask());
+    // Under historian.runner = host the module has no completion runner: it answers
+    // with the system prompt to use, this host runs the completion on its own carrier,
+    // and the text goes back to the module under the same command id.
+    const asked = result as { code?: unknown; system_prompt?: unknown } | null;
+    if (asked?.code === HOST_COMPLETION_REQUIRED) {
+        if (typeof asked.system_prompt !== "string")
+            throw new Error("module asked for a host classify completion without a system prompt");
+        result = unwrap(await runTask(await runOnHost(asked.system_prompt)));
+    }
     if (!result || typeof result !== "object")
         throw new Error("module returned invalid classify result");
     const manifestText = (result as { manifest_text?: unknown }).manifest_text;
@@ -519,6 +581,7 @@ async function runClassifyThroughModule(
     if ((result as { truncated?: unknown }).truncated === true) {
         throw new Error("classify returned length-capped output");
     }
+    const accounting = moduleClassifyAccounting(result as Record<string, unknown>);
     const parsed = validateClassifyManifest(
         manifestText,
         new Set(chunk.map((candidate) => candidate.id)),
@@ -550,8 +613,6 @@ async function runClassifyThroughModule(
                 name: "memory.set_classification",
                 arguments: {
                     memory_project: args.projectIdentity,
-                    context_store_uuid: args.moduleContextStoreUuid,
-                    authority_generation: args.moduleAuthorityGeneration,
                     rows,
                 },
             },
@@ -599,16 +660,65 @@ async function runClassifyThroughModule(
         throw new Error(`module rejected classification (${[...known, ...unknown].join(", ")})`);
     }
 
-    // Module ids are translated back only to identify the context rows whose
-    // mirror-back updates will satisfy the local classified_at run-gate. Do not
-    // call setMemoryClassification here: the authority feed owns that write.
+    // Validate the module's accepted ids against the submitted chunk. Its write
+    // already updated classified_at in context.db, so there is no local replay.
     const byModuleId = new Map(chunk.map((candidate) => [candidate.id, candidate]));
     const acceptedContextIds = acceptedIds.map((moduleId) => {
         const candidate = byModuleId.get(moduleId);
         if (!candidate) throw new Error(`module accepted unknown memory ${moduleId}`);
         return candidate.contextMemory.id;
     });
-    return { classified: acceptedContextIds.length, changed: acceptedContextIds.length };
+    return {
+        classified: acceptedContextIds.length,
+        changed: acceptedContextIds.length,
+        accounting,
+    };
+}
+
+/** Spend and model the module reports for a classify run, in the shape the
+ *  invocation record takes. */
+export interface ModuleClassifyAccounting {
+    tokens?: TokenTotals;
+    providerId?: string;
+    modelId?: string;
+}
+
+function nonNegativeCount(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/** Reads the `dreamer.run_task` response's `usage` (input / output / cache_read /
+ *  cache_write) and `diagnostics.model` ("provider/model"). Either may be absent:
+ *  modules that predate `usage` omit it, and the row then keeps zero tokens. */
+export function moduleClassifyAccounting(
+    result: Record<string, unknown>,
+): ModuleClassifyAccounting {
+    const accounting: ModuleClassifyAccounting = {};
+    const usage = result.usage;
+    if (usage && typeof usage === "object") {
+        const record = usage as Record<string, unknown>;
+        accounting.tokens = {
+            input: nonNegativeCount(record.input),
+            output: nonNegativeCount(record.output),
+            cacheRead: nonNegativeCount(record.cache_read),
+            cacheWrite: nonNegativeCount(record.cache_write),
+        };
+    }
+    const diagnostics = result.diagnostics;
+    const model =
+        diagnostics && typeof diagnostics === "object"
+            ? (diagnostics as Record<string, unknown>).model
+            : undefined;
+    if (typeof model === "string") {
+        const parsed = parseProviderModel(model);
+        if (parsed) {
+            accounting.providerId = parsed.providerID;
+            accounting.modelId = parsed.modelID;
+        } else if (model.trim()) {
+            accounting.modelId = model.trim();
+        }
+    }
+    return accounting;
 }
 
 export function applyClassifications(
@@ -653,10 +763,11 @@ function recordInvocation(
     args: ClassifyArgs,
     startedAt: number,
     params: {
-        status: "completed" | "failed";
+        status: SubagentInvocationStatus;
         messages?: unknown[];
         error?: unknown;
         completion?: HiddenCompletion;
+        moduleAccounting?: ModuleClassifyAccounting;
     },
 ): void {
     if (!args.parentSessionId) return;
@@ -674,6 +785,13 @@ function recordInvocation(
                   tokens: params.completion.usage,
                   providerId: params.completion.providerId,
                   modelId: params.completion.modelId,
+              }
+            : {}),
+        ...(params.moduleAccounting
+            ? {
+                  tokens: params.moduleAccounting.tokens,
+                  providerId: params.moduleAccounting.providerId,
+                  modelId: params.moduleAccounting.modelId,
               }
             : {}),
         error: params.error,

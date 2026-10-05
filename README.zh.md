@@ -235,7 +235,6 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 | `/ctx-status` | 调试视图：tags、待处理丢弃、缓存 TTL、提示状态、historian 进度、分区覆盖、历史预算 |
 | `/ctx-flush` | 立即强制执行所有排队操作，绕过缓存 TTL |
 | `/ctx-recomp` | 从原始历史重建分区（接受 `start-end` 范围）。当存储状态看起来不对时使用 |
-| `/ctx-session-upgrade` | 将此会话升级到最新历史格式：重建分区并迁移项目记忆 |
 | `/ctx-dream` | 按需运行 dreamer 维护：维护记忆、文档、smart notes，并审查 user-profile |
 
 ---

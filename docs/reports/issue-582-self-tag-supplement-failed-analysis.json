@@ -1,0 +1,194 @@
+{
+  "responseModels": [
+    "deepseek-flash"
+  ],
+  "variants": {
+    "A": {
+      "sessions": 0,
+      "sessionsStarted": 1,
+      "calls": 25,
+      "usage": {
+        "input": 346320,
+        "output": 1030,
+        "cacheHit": 321792,
+        "cacheMiss": 24528
+      },
+      "text": {
+        "rows": 20,
+        "wellFormed": 14,
+        "canonicalPrefix": 14,
+        "correct": 14,
+        "wrong": 0,
+        "untagged": 6,
+        "malformed": 0,
+        "misplaced": 0,
+        "byteIdentity": 14
+      },
+      "toolOnly": 5,
+      "toolOnlyMisplaced": 0,
+      "signedDeltas": {}
+    },
+    "B": {
+      "sessions": 0,
+      "sessionsStarted": 0,
+      "calls": 0,
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheHit": 0,
+        "cacheMiss": 0
+      },
+      "text": {
+        "rows": 0,
+        "wellFormed": 0,
+        "canonicalPrefix": 0,
+        "correct": 0,
+        "wrong": 0,
+        "untagged": 0,
+        "malformed": 0,
+        "misplaced": 0,
+        "byteIdentity": 0
+      },
+      "toolOnly": 0,
+      "toolOnlyMisplaced": 0,
+      "signedDeltas": {}
+    }
+  },
+  "sessions": [
+    {
+      "session": "ses_f0d1e6d02ffeV5XmjosnAUgtRn",
+      "variant": "A",
+      "scenario": "reduced",
+      "replicate": 1,
+      "completed": false,
+      "lastCompletedTurn": 16,
+      "replies": 25,
+      "parallelSeen": true,
+      "placeholderSeen": false,
+      "providerHookTextEqual": true,
+      "reductionTarget": 24,
+      "providerSawReductionTarget": false,
+      "reductionStatus": "active",
+      "rows": 20,
+      "wellFormed": 14,
+      "canonicalPrefix": 14,
+      "correct": 14,
+      "wrong": 0,
+      "untagged": 6,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 14
+    }
+  ],
+  "buckets": [
+    {
+      "variant": "A",
+      "bucket": "1",
+      "rows": 1,
+      "wellFormed": 0,
+      "canonicalPrefix": 0,
+      "correct": 0,
+      "wrong": 0,
+      "untagged": 1,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 0
+    },
+    {
+      "variant": "A",
+      "bucket": "2–5",
+      "rows": 3,
+      "wellFormed": 0,
+      "canonicalPrefix": 0,
+      "correct": 0,
+      "wrong": 0,
+      "untagged": 3,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 0
+    },
+    {
+      "variant": "A",
+      "bucket": "6–20",
+      "rows": 11,
+      "wellFormed": 9,
+      "canonicalPrefix": 9,
+      "correct": 9,
+      "wrong": 0,
+      "untagged": 2,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 9
+    },
+    {
+      "variant": "A",
+      "bucket": ">20",
+      "rows": 5,
+      "wellFormed": 5,
+      "canonicalPrefix": 5,
+      "correct": 5,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 5
+    },
+    {
+      "variant": "B",
+      "bucket": "1",
+      "rows": 0,
+      "wellFormed": 0,
+      "canonicalPrefix": 0,
+      "correct": 0,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 0
+    },
+    {
+      "variant": "B",
+      "bucket": "2–5",
+      "rows": 0,
+      "wellFormed": 0,
+      "canonicalPrefix": 0,
+      "correct": 0,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 0
+    },
+    {
+      "variant": "B",
+      "bucket": "6–20",
+      "rows": 0,
+      "wellFormed": 0,
+      "canonicalPrefix": 0,
+      "correct": 0,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 0
+    },
+    {
+      "variant": "B",
+      "bucket": ">20",
+      "rows": 0,
+      "wellFormed": 0,
+      "canonicalPrefix": 0,
+      "correct": 0,
+      "wrong": 0,
+      "untagged": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 0
+    }
+  ],
+  "errors": [],
+  "credentials": {
+    "copiedDeleted": true,
+    "stagedDeleted": false
+  }
+}

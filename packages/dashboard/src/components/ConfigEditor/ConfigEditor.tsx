@@ -12,10 +12,14 @@ import { jsoncErrorMessage, parseJsonc } from "../../lib/jsonc";
 import { invoke } from "../../lib/platform";
 import type { ModelCatalogs, OpencodeInstallState, ProjectConfigEntry } from "../../lib/types";
 import { configSaveBlocker } from "./config-save-guard";
+import { configDefault, configSchemaNode, defaultPlaceholder } from "./config-schema";
 import type { DreamTaskConfig, DreamTaskModelConfig } from "./DreamerTasksField";
 import DreamerTasksField from "./DreamerTasksField";
 import HarnessModelFields, { type Harness, modelCatalogForHarness } from "./HarnessModelFields";
-import PerModelField from "./PerModelField";
+import PerModelTable from "./PerModelTable";
+import { PER_MODEL_KEYS, type PerModelValues } from "./per-model-overrides";
+import { structuredConfigSaveContent } from "./structured-save";
+import "./config-editor.css";
 
 // ── JSONC helpers ───────────────────────────────────────────
 
@@ -50,11 +54,6 @@ function parseConfigContent(text: string): ParsedConfigContent {
   }
 }
 
-/** Pretty-print config as JSONC (plain JSON with 2-space indent). */
-function toJsonc(obj: Record<string, unknown>): string {
-  return JSON.stringify(obj, null, 2);
-}
-
 // ── Config field definitions ────────────────────────────────
 
 interface FieldDef {
@@ -64,7 +63,6 @@ interface FieldDef {
   options?: string[];
   description: string;
   section: string;
-  defaultValue?: boolean | number | string;
 }
 
 const FIELD_DEFS: FieldDef[] = [
@@ -106,18 +104,17 @@ const FIELD_DEFS: FieldDef[] = [
     type: "boolean",
     description:
       "Render a deterministic image of project memories that did not fit the context budget.",
-    section: "Mural",
+    section: "Memory & search",
   },
   {
     key: "mural.model",
     label: "Cue Compressor Model",
     type: "string",
     description:
-      "Model used to compress each memory into a mural cue. The mural image itself is rendered deterministically.",
-    section: "Mural",
+      "Shared across harnesses. Model used to compress each memory into a mural cue. The mural image itself is rendered deterministically.",
+    section: "Background models",
   },
-  // Thresholds
-  // cache_ttl and execute_threshold_percentage are rendered as custom PerModelField components
+  // The four context defaults and their exceptions are rendered by PerModelTable.
   // Tags & cleanup
   {
     key: "protected_tokens",
@@ -125,14 +122,15 @@ const FIELD_DEFS: FieldDef[] = [
     type: "number",
     description:
       "Absolute token floor protected from automatic reclaim (4,000–1,000,000). Leave blank to derive it from the model's usable context window. User-level only.",
-    section: "Tags & Cleanup",
+    section: "Context window",
   },
   {
     key: "clear_reasoning_age",
     label: "Clear Reasoning Age",
     type: "number",
-    description: "Tag age after which reasoning blocks are cleared.",
-    section: "Tags & Cleanup",
+    description:
+      "Reasoning blocks older than this many tags are removed whole, only on passes that already rebuild the cache.",
+    section: "Context window",
   },
   // Historian
   {
@@ -140,14 +138,14 @@ const FIELD_DEFS: FieldDef[] = [
     label: "History Budget %",
     type: "number",
     description: "Fraction of context limit reserved for rendered history (0.0–1.0).",
-    section: "Historian",
+    section: "History",
   },
   {
     key: "historian_timeout_ms",
     label: "Historian Timeout (ms)",
     type: "number",
     description: "Max wait time for a historian run before timeout.",
-    section: "Historian",
+    section: "History",
   },
   // Memory
   {
@@ -155,21 +153,21 @@ const FIELD_DEFS: FieldDef[] = [
     label: "Memory Enabled",
     type: "boolean",
     description: "Enable cross-session project memory.",
-    section: "Memory",
+    section: "Memory & search",
   },
   {
     key: "memory.injection_budget_tokens",
     label: "Injection Budget (tokens)",
     type: "number",
     description: "Max tokens for memory injection into session history.",
-    section: "Memory",
+    section: "Memory & search",
   },
   {
     key: "memory.auto_promote",
     label: "Auto Promote",
     type: "boolean",
     description: "Automatically promote session facts to project memory.",
-    section: "Memory",
+    section: "Memory & search",
   },
   {
     key: "memory.retrieval_count_promotion_threshold",
@@ -177,7 +175,7 @@ const FIELD_DEFS: FieldDef[] = [
     type: "number",
     description:
       "Minimum ctx_search retrieval count before a session fact is auto-promoted to project memory.",
-    section: "Memory",
+    section: "Memory & search",
   },
 ];
 
@@ -223,22 +221,16 @@ function setNestedValue(
 
 // ── Section icons ───────────────────────────────────────────
 
-const SECTION_ICONS: Record<string, string> = {
-  General: "⚙️",
-  Mural: "🖼️",
-  Thresholds: "⚡",
-  "Tags & Cleanup": "🏷️",
-  Historian: "📜",
-  Memory: "🧠",
-};
-
-// Fields that should use range sliders (percentage or threshold values)
-const RANGE_SLIDER_FIELDS = new Set([
-  "history_budget_percentage",
-  "clear_reasoning_age",
-  "historian_timeout_ms",
-  "memory.injection_budget_tokens",
-]);
+const CONFIG_SECTIONS = [
+  "General",
+  "Context window",
+  "History",
+  "Memory & search",
+  "Background models",
+  "Dreamer schedule",
+  "Prompt surface",
+  "Advanced",
+];
 
 // ── ConfigForm component ────────────────────────────────────
 
@@ -259,6 +251,8 @@ function ConfigForm(props: {
   scope?: "user" | "project";
 }) {
   const [showRaw, setShowRaw] = createSignal(false);
+  const [showKeys, setShowKeys] = createSignal(false);
+  const [activeSection, setActiveSection] = createSignal("General");
   const [rawEdit, setRawEdit] = createSignal<string | null>(null);
   const [formData, setFormData] = createSignal<Record<string, unknown>>({});
   const [embeddingTestResult, setEmbeddingTestResult] = createSignal<{
@@ -354,7 +348,7 @@ function ConfigForm(props: {
     }
   }
   const models = () => modelCatalogForHarness(props.modelCatalogs, "opencode");
-  const [historianHarness, setHistorianHarness] = createSignal<Harness>("opencode");
+  const [backgroundHarness, setBackgroundHarness] = createSignal<Harness>("opencode");
   const [dreamerHarness, setDreamerHarness] = createSignal<Harness>("opencode");
   const modelsForHarness = (harness: Harness) =>
     modelCatalogForHarness(props.modelCatalogs, harness);
@@ -403,16 +397,6 @@ function ConfigForm(props: {
     return !structuredSaveBlocker() && JSON.stringify(formData()) !== JSON.stringify(parsed());
   });
 
-  // Section order: Tags & Cleanup goes last (rendered after agent cards)
-  const SECTION_ORDER: Record<string, number> = {
-    General: 0,
-    Mural: 1,
-    Thresholds: 2,
-    Historian: 3,
-    Memory: 4,
-    "Tags & Cleanup": 99,
-  };
-
   const sections = createMemo(() => {
     const groups: Record<string, FieldDef[]> = {};
     for (const field of FIELD_DEFS) {
@@ -420,7 +404,7 @@ function ConfigForm(props: {
       groups[field.section].push(field);
     }
     return Object.entries(groups).sort(
-      ([a], [b]) => (SECTION_ORDER[a] ?? 50) - (SECTION_ORDER[b] ?? 50),
+      ([a], [b]) => CONFIG_SECTIONS.indexOf(a) - CONFIG_SECTIONS.indexOf(b),
     );
   });
 
@@ -432,39 +416,32 @@ function ConfigForm(props: {
     setFormData(updated);
   };
 
+  const handlePerModelChange = (patch: PerModelValues) => {
+    setFormData((previous) => ({ ...previous, ...patch }));
+  };
+  const inheritedDefault = (key: string) => (
+    <Show when={getNestedValue(formData(), key) === undefined}>
+      <span class="config-inherited">
+        Default:{" "}
+        {configDefault(key) === true
+          ? "on"
+          : configDefault(key) === false
+            ? "off"
+            : String(configDefault(key))}
+      </span>
+    </Show>
+  );
+  const booleanSetting = (key: string) => getNestedValue(formData(), key) ?? configDefault(key);
+
   const handleFormSave = () => {
     if (structuredSaveBlocker()) {
       return;
     }
 
-    // Merge form data with original to preserve unknown keys
-    const original = parsed();
-    const merged = { ...original, ...formData() };
-    // Deep merge for nested objects so we don't blow away sub-keys the form
-    // doesn't currently expose. The shallow `...formData()` above would
-    // otherwise replace the whole sub-tree. A legacy top-level `experimental`
-    // block (if any) is preserved by the shallow spread and relocated by the
-    // plugin's config migration on next load.
-    for (const key of [
-      "embedding",
-      "memory",
-      "sqlite",
-      "system_prompt_injection",
-      "caveman_text_compression",
-      "mural",
-      "prompt_surface",
-      "storage",
-      "compaction",
-      "pi",
-    ]) {
-      if (typeof formData()[key] === "object" && formData()[key] != null) {
-        merged[key] = {
-          ...((original[key] as Record<string, unknown>) ?? {}),
-          ...(formData()[key] as Record<string, unknown>),
-        };
-      }
-    }
-    props.onSave(toJsonc(merged));
+    // Patch the values into the file text rather than re-serializing the
+    // object, so the user's comments survive. The guard above has already
+    // checked that `props.content` parses.
+    props.onSave(structuredConfigSaveContent(props.content, formData()));
   };
 
   const handleRawSave = () => {
@@ -479,50 +456,16 @@ function ConfigForm(props: {
     }
   };
 
-  // Range slider helpers
-  const getRangeConfig = (
-    fieldKey: string,
-  ): { min: number; max: number; step: number; suffix: string; defaultValue: number } => {
-    switch (fieldKey) {
-      case "execute_threshold_percentage":
-        return { min: 20, max: 90, step: 1, suffix: "%", defaultValue: 65 };
-      case "history_budget_percentage":
-        return { min: 0.05, max: 0.5, step: 0.01, suffix: "", defaultValue: 0.15 };
-      case "clear_reasoning_age":
-        return { min: 10, max: 200, step: 5, suffix: "", defaultValue: 50 };
-      case "historian_timeout_ms":
-        return { min: 60000, max: 600000, step: 30000, suffix: " ms", defaultValue: 300000 };
-      case "memory.injection_budget_tokens":
-        return { min: 500, max: 20000, step: 500, suffix: " tokens", defaultValue: 4000 };
-      default:
-        return { min: 0, max: 100, step: 1, suffix: "", defaultValue: 0 };
-    }
-  };
-
   const renderField = (field: FieldDef): JSX.Element => {
     const value = () => {
       const formVal = getNestedValue(formData(), field.key);
-      return formVal !== undefined ? formVal : getNestedValue(parsed(), field.key);
-    };
-    const scalarValue = () => {
-      const v = value();
-      if (v != null && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as Record<string, unknown>;
-        return obj.default !== undefined ? obj.default : undefined;
-      }
-      return v;
-    };
-    const isObjectValue = () => {
-      const v = value();
-      return v != null && typeof v === "object" && !Array.isArray(v);
+      return formVal;
     };
     const booleanValue = () => {
       const v = value();
       if (typeof v === "boolean") return v;
-      return (field.defaultValue as boolean | undefined) ?? true;
+      return Boolean(configDefault(field.key));
     };
-    const isRangeSlider =
-      field.type === "number" && RANGE_SLIDER_FIELDS.has(field.key) && !isObjectValue();
 
     return (
       <div class="config-field">
@@ -535,11 +478,15 @@ function ConfigForm(props: {
           <label class="toggle-switch">
             <input
               type="checkbox"
+              aria-label={field.label}
               checked={booleanValue()}
               onChange={(e) => handleFieldChange(field.key, e.currentTarget.checked)}
             />
             <span class="toggle-slider" />
-            <span class="toggle-label">{booleanValue() ? "Enabled" : "Disabled"}</span>
+            <span class="toggle-label">
+              {booleanValue() ? "Enabled" : "Disabled"}
+              {inheritedDefault(field.key)}
+            </span>
           </label>
         ) : field.type === "select" ? (
           <select
@@ -549,37 +496,16 @@ function ConfigForm(props: {
           >
             <For each={field.options ?? []}>{(opt) => <option value={opt}>{opt}</option>}</For>
           </select>
-        ) : isRangeSlider ? (
-          <div class="range-slider-container">
-            <input
-              class="range-slider"
-              type="range"
-              min={getRangeConfig(field.key).min}
-              max={getRangeConfig(field.key).max}
-              step={getRangeConfig(field.key).step}
-              value={
-                scalarValue() != null
-                  ? Number(scalarValue())
-                  : getRangeConfig(field.key).defaultValue
-              }
-              onInput={(e) => handleFieldChange(field.key, Number(e.currentTarget.value))}
-            />
-            <span class="range-slider-value">
-              {scalarValue() != null
-                ? Number(scalarValue())
-                : getRangeConfig(field.key).defaultValue}
-              {getRangeConfig(field.key).suffix}
-            </span>
-          </div>
         ) : field.type === "number" ? (
           <input
             class="config-input"
             type="number"
-            min={field.key === "protected_tokens" ? 4000 : undefined}
-            max={field.key === "protected_tokens" ? 1_000_000 : undefined}
-            step={field.key === "protected_tokens" ? 1 : undefined}
+            aria-label={field.label}
+            min={configSchemaNode(field.key)?.minimum}
+            max={configSchemaNode(field.key)?.maximum}
+            step={field.key === "history_budget_percentage" ? 0.01 : 1}
             value={value() != null ? String(value()) : ""}
-            placeholder={field.key === "protected_tokens" ? "derived" : "default"}
+            placeholder={defaultPlaceholder(field.key, "Derived from model window")}
             onInput={(e) => {
               const v = e.currentTarget.value;
               handleFieldChange(field.key, v ? Number(v) : undefined);
@@ -589,8 +515,12 @@ function ConfigForm(props: {
           <input
             class="config-input"
             type="text"
+            aria-label={field.label}
             value={typeof value() === "object" ? JSON.stringify(value()) : String(value() ?? "")}
-            placeholder="default"
+            placeholder={defaultPlaceholder(
+              field.key,
+              field.key === "language" ? "No language override" : "Use built-in cue model",
+            )}
             onInput={(e) => {
               const next = e.currentTarget.value;
               handleFieldChange(
@@ -605,7 +535,7 @@ function ConfigForm(props: {
   };
 
   return (
-    <div>
+    <div class={`config-editor ${showKeys() ? "show-config-keys" : ""}`}>
       {/* Sticky Action Bar */}
       <div class="config-action-bar">
         <div class="tab-pills" style={{ margin: "0" }}>
@@ -628,6 +558,16 @@ function ConfigForm(props: {
           </button>
         </div>
         <div style={{ display: "flex", "align-items": "center", gap: "12px" }}>
+          <Show when={!showRaw()}>
+            <label class="config-keys-toggle">
+              <input
+                type="checkbox"
+                checked={showKeys()}
+                onChange={(event) => setShowKeys(event.currentTarget.checked)}
+              />{" "}
+              Show config keys
+            </label>
+          </Show>
           <Show when={saveMessage()}>
             {(message) => (
               <span
@@ -703,1430 +643,1450 @@ function ConfigForm(props: {
           </div>
         }
       >
-        <div class="config-grid">
-          <For each={sections().filter(([name]) => name !== "Tags & Cleanup")}>
-            {([sectionName, fields]) => {
-              const isFullWidth = sectionName === "Historian" || sectionName === "Memory";
-              return (
-                <>
-                  <div class={`config-card ${isFullWidth ? "full-width" : ""}`}>
-                    <div class="config-card-header">
-                      <span class="config-card-icon">{SECTION_ICONS[sectionName] || "📋"}</span>
-                      <span class="config-card-title">{sectionName}</span>
-                    </div>
-                    {sectionName === "Memory" ? (
-                      (() => {
-                        const embeddingProvider = () => {
-                          const v = getNestedValue(formData(), "embedding.provider");
-                          return (v as string) || "local";
-                        };
-                        const isRemote = () => embeddingProvider() === "openai-compatible";
-                        const localDtype = () =>
-                          String(getNestedValue(formData(), "embedding.local_dtype") ?? "fp32");
-                        return (
-                          <div class="config-card-two-col">
-                            {/* Left: Memory settings */}
-                            <div class="config-card-content">
-                              <For each={fieldsForScope(fields)}>{renderField}</For>
-                            </div>
-                            {/* Right: Embedding settings. Hidden for project
+        <div class="config-workspace">
+          <nav class="config-section-index" aria-label="Config sections">
+            <span class="config-index-eyebrow">Settings</span>
+            <For each={CONFIG_SECTIONS}>
+              {(section, index) => (
+                <button
+                  type="button"
+                  classList={{ active: activeSection() === section }}
+                  aria-current={activeSection() === section ? "page" : undefined}
+                  onClick={() => setActiveSection(section)}
+                >
+                  <span>{String(index() + 1).padStart(2, "0")}</span>
+                  {section}
+                </button>
+              )}
+            </For>
+            <p>Blank inputs inherit a default. Only restart-sensitive settings are badged.</p>
+          </nav>
+          <section class="config-section-panel" aria-label={activeSection()}>
+            <h2>{activeSection()}</h2>
+            <div class="config-grid">
+              <For each={sections()}>
+                {([sectionName, fields]) => {
+                  return (
+                    <>
+                      <div class="config-card full-width" hidden={activeSection() !== sectionName}>
+                        {sectionName === "Memory & search" ? (
+                          (() => {
+                            const embeddingProvider = () => {
+                              const v = getNestedValue(formData(), "embedding.provider");
+                              return (v as string) || "local";
+                            };
+                            const isRemote = () => embeddingProvider() === "openai-compatible";
+                            const localDtype = () =>
+                              String(getNestedValue(formData(), "embedding.local_dtype") ?? "fp32");
+                            return (
+                              <div class="config-card-two-col">
+                                {/* Left: Memory settings */}
+                                <div class="config-card-content">
+                                  <For each={fieldsForScope(fields)}>{renderField}</For>
+                                </div>
+                                {/* Right: Embedding settings. Hidden for project
                                 configs: the runtime strips embedding
                                 endpoint/provider from untrusted project config,
                                 and Test Connection on a project would be a
                                 secret-exfil vector (expands the repo's tokens +
                                 contacts its endpoint). Project memory toggles
                                 live in the left column above. */}
-                            <Show when={(props.scope ?? "user") !== "project"}>
-                              <div class="config-card-content">
-                                {/* Provider */}
-                                <div class="config-field">
-                                  <div class="config-field-header">
-                                    <span class="config-field-label">Embedding Provider</span>
-                                    <span class="config-field-key">embedding.provider</span>
-                                  </div>
-                                  <span class="config-field-desc">
-                                    Provider for memory semantic search
-                                  </span>
-                                  <div style={{ display: "flex", gap: "6px" }}>
-                                    <For each={["local", "openai-compatible", "off"] as const}>
-                                      {(opt) => (
-                                        <button
-                                          class={`btn sm ${embeddingProvider() === opt ? "primary" : ""}`}
-                                          onClick={() =>
-                                            handleFieldChange("embedding.provider", opt)
-                                          }
-                                          type="button"
-                                        >
-                                          {opt === "local"
-                                            ? "Local"
-                                            : opt === "openai-compatible"
-                                              ? "OpenAI Compatible"
-                                              : "Off"}
-                                        </button>
-                                      )}
-                                    </For>
-                                  </div>
-                                  <Show when={embeddingProvider() === "local"}>
-                                    <span
-                                      class="config-field-desc"
-                                      style={{
-                                        "margin-top": "4px",
-                                        color: "var(--text-muted)",
-                                        "font-style": "italic",
-                                      }}
-                                    >
-                                      Uses Xenova/all-MiniLM-L6-v2 locally — no configuration needed
-                                    </span>
-                                  </Show>
-                                  <Show when={embeddingProvider() === "local"}>
+                                <Show when={(props.scope ?? "user") !== "project"}>
+                                  <div class="config-card-content">
+                                    {/* Provider */}
                                     <div class="config-field">
                                       <div class="config-field-header">
-                                        <span class="config-field-label">Model dtype</span>
-                                        <span class="config-field-key">embedding.local_dtype</span>
+                                        <span class="config-field-label">Embedding Provider</span>
+                                        <span class="config-field-key">embedding.provider</span>
                                       </div>
                                       <span class="config-field-desc">
-                                        ONNX dtype for the local embedding model. The default fp32
-                                        keeps today's behavior; quantized choices use less memory.
+                                        Provider for memory semantic search
                                       </span>
-                                      <select
-                                        class="config-input"
-                                        value={localDtype()}
-                                        onChange={(e) =>
-                                          handleFieldChange(
-                                            "embedding.local_dtype",
-                                            e.currentTarget.value === "fp32"
-                                              ? undefined
-                                              : e.currentTarget.value,
-                                          )
-                                        }
-                                      >
-                                        <For
-                                          each={[
-                                            "auto",
-                                            "fp32",
-                                            "fp16",
-                                            "q8",
-                                            "int8",
-                                            "uint8",
-                                            "q4",
-                                            "bnb4",
-                                            "q4f16",
-                                            "q2",
-                                            "q2f16",
-                                            "q1",
-                                            "q1f16",
-                                          ]}
-                                        >
-                                          {(dtype) => <option value={dtype}>{dtype}</option>}
+                                      <div style={{ display: "flex", gap: "6px" }}>
+                                        <For each={["local", "openai-compatible", "off"] as const}>
+                                          {(opt) => (
+                                            <button
+                                              class={`btn sm ${embeddingProvider() === opt ? "primary" : ""}`}
+                                              onClick={() =>
+                                                handleFieldChange("embedding.provider", opt)
+                                              }
+                                              type="button"
+                                            >
+                                              {opt === "local"
+                                                ? "Local"
+                                                : opt === "openai-compatible"
+                                                  ? "OpenAI Compatible"
+                                                  : "Off"}
+                                            </button>
+                                          )}
                                         </For>
-                                      </select>
+                                      </div>
+                                      <Show when={embeddingProvider() === "local"}>
+                                        <div class="config-field">
+                                          <div class="config-field-header">
+                                            <span class="config-field-label">Model dtype</span>
+                                            <span class="config-field-key">
+                                              embedding.local_dtype
+                                            </span>
+                                          </div>
+                                          <span class="config-field-desc">
+                                            Uses Xenova/all-MiniLM-L6-v2 locally. Omitted keeps the
+                                            fp32 ONNX dtype; quantized choices use less memory.
+                                          </span>
+                                          <select
+                                            class="config-input"
+                                            value={localDtype()}
+                                            onChange={(e) =>
+                                              handleFieldChange(
+                                                "embedding.local_dtype",
+                                                e.currentTarget.value || undefined,
+                                              )
+                                            }
+                                          >
+                                            <For
+                                              each={[
+                                                "auto",
+                                                "fp32",
+                                                "fp16",
+                                                "q8",
+                                                "int8",
+                                                "uint8",
+                                                "q4",
+                                                "bnb4",
+                                                "q4f16",
+                                                "q2",
+                                                "q2f16",
+                                                "q1",
+                                                "q1f16",
+                                              ]}
+                                            >
+                                              {(dtype) => <option value={dtype}>{dtype}</option>}
+                                            </For>
+                                          </select>
+                                        </div>
+                                      </Show>
                                     </div>
-                                  </Show>
-                                </div>
 
-                                {/* Remote-only fields */}
-                                <Show when={isRemote()}>
-                                  <div class="config-field">
-                                    <div class="config-field-header">
-                                      <span class="config-field-label">Model</span>
-                                      <span class="config-field-key">embedding.model</span>
-                                    </div>
-                                    <span class="config-field-desc">
-                                      Embedding model name (e.g., text-embedding-3-small)
-                                    </span>
-                                    <input
-                                      class="config-input"
-                                      type="text"
-                                      value={String(
-                                        getNestedValue(formData(), "embedding.model") ?? "",
-                                      )}
-                                      placeholder="text-embedding-3-small"
-                                      onInput={(e) =>
-                                        handleFieldChange(
-                                          "embedding.model",
-                                          e.currentTarget.value || undefined,
-                                        )
-                                      }
-                                    />
-                                  </div>
+                                    {/* Remote-only fields */}
+                                    <Show when={isRemote()}>
+                                      <div class="config-field">
+                                        <div class="config-field-header">
+                                          <span class="config-field-label">Model</span>
+                                          <span class="config-field-key">embedding.model</span>
+                                        </div>
+                                        <span class="config-field-desc">
+                                          Embedding model name (e.g., text-embedding-3-small)
+                                        </span>
+                                        <input
+                                          class="config-input"
+                                          type="text"
+                                          value={String(
+                                            getNestedValue(formData(), "embedding.model") ?? "",
+                                          )}
+                                          placeholder="text-embedding-3-small"
+                                          onInput={(e) =>
+                                            handleFieldChange(
+                                              "embedding.model",
+                                              e.currentTarget.value || undefined,
+                                            )
+                                          }
+                                        />
+                                      </div>
 
-                                  <div class="config-field">
-                                    <div class="config-field-header">
-                                      <span class="config-field-label">Endpoint</span>
-                                      <span class="config-field-key">embedding.endpoint</span>
-                                    </div>
-                                    <span class="config-field-desc">API endpoint URL</span>
-                                    <input
-                                      class="config-input"
-                                      type="text"
-                                      value={String(
-                                        getNestedValue(formData(), "embedding.endpoint") ?? "",
-                                      )}
-                                      placeholder="https://api.openai.com/v1"
-                                      onInput={(e) =>
-                                        handleFieldChange(
-                                          "embedding.endpoint",
-                                          e.currentTarget.value || undefined,
-                                        )
-                                      }
-                                    />
-                                  </div>
+                                      <div class="config-field">
+                                        <div class="config-field-header">
+                                          <span class="config-field-label">Endpoint</span>
+                                          <span class="config-field-key">embedding.endpoint</span>
+                                        </div>
+                                        <span class="config-field-desc">API endpoint URL</span>
+                                        <input
+                                          class="config-input"
+                                          type="text"
+                                          value={String(
+                                            getNestedValue(formData(), "embedding.endpoint") ?? "",
+                                          )}
+                                          placeholder="https://api.openai.com/v1"
+                                          onInput={(e) =>
+                                            handleFieldChange(
+                                              "embedding.endpoint",
+                                              e.currentTarget.value || undefined,
+                                            )
+                                          }
+                                        />
+                                      </div>
 
-                                  <div class="config-field">
-                                    <div class="config-field-header">
-                                      <span class="config-field-label">API Key</span>
-                                      <span class="config-field-key">embedding.api_key</span>
-                                    </div>
-                                    <span class="config-field-desc">
-                                      Authentication key for the embedding API
-                                    </span>
-                                    <input
-                                      class="config-input"
-                                      type="password"
-                                      value={String(
-                                        getNestedValue(formData(), "embedding.api_key") ?? "",
-                                      )}
-                                      placeholder="sk-..."
-                                      onInput={(e) =>
-                                        handleFieldChange(
-                                          "embedding.api_key",
-                                          e.currentTarget.value || undefined,
-                                        )
-                                      }
-                                    />
-                                  </div>
+                                      <div class="config-field">
+                                        <div class="config-field-header">
+                                          <span class="config-field-label">API Key</span>
+                                          <span class="config-field-key">embedding.api_key</span>
+                                        </div>
+                                        <span class="config-field-desc">
+                                          Authentication key for the embedding API
+                                        </span>
+                                        <input
+                                          class="config-input"
+                                          type="password"
+                                          value={String(
+                                            getNestedValue(formData(), "embedding.api_key") ?? "",
+                                          )}
+                                          placeholder="sk-..."
+                                          onInput={(e) =>
+                                            handleFieldChange(
+                                              "embedding.api_key",
+                                              e.currentTarget.value || undefined,
+                                            )
+                                          }
+                                        />
+                                      </div>
 
-                                  <div>
-                                    <button
-                                      type="button"
-                                      class="btn sm"
-                                      onClick={async () => {
-                                        const endpoint = String(
-                                          getNestedValue(formData(), "embedding.endpoint") ?? "",
-                                        ).trim();
-                                        const model = String(
-                                          getNestedValue(formData(), "embedding.model") ?? "",
-                                        ).trim();
-                                        const apiKey = String(
-                                          getNestedValue(formData(), "embedding.api_key") ?? "",
-                                        ).trim();
-                                        const inputType = String(
-                                          getNestedValue(formData(), "embedding.input_type") ?? "",
-                                        ).trim();
-                                        const truncate = String(
-                                          getNestedValue(formData(), "embedding.truncate") ?? "",
-                                        ).trim();
-                                        if (!endpoint || !model) {
-                                          setEmbeddingTestResult({
-                                            ok: false,
-                                            message: "Endpoint and model are required",
-                                          });
-                                          return;
-                                        }
-                                        setEmbeddingTestResult({
-                                          ok: false,
-                                          message: "Testing...",
-                                        });
-                                        try {
-                                          // Rust returns the structured outcome directly (not
-                                          // `Result<T, String>` anymore). Any thrown error from
-                                          // `invoke` itself is a tauri infrastructure failure
-                                          // (e.g., command not registered) rather than a probe
-                                          // classification — we surface that unchanged.
-                                          const outcome = await invoke<EmbeddingProbeOutcome>(
-                                            "test_embedding_endpoint",
-                                            {
-                                              endpoint,
-                                              model,
-                                              apiKey: apiKey || null,
-                                              inputType: inputType || null,
-                                              truncate: truncate || null,
-                                              // Backend trust boundary: only "user"
-                                              // scope expands tokens + probes. The
-                                              // button is hidden for projects, but
-                                              // send the scope so the backend can
-                                              // refuse regardless.
-                                              source: props.scope ?? "user",
-                                            },
-                                          );
-                                          setEmbeddingTestResult(formatProbeOutcome(outcome));
-                                        } catch (e: unknown) {
-                                          setEmbeddingTestResult({
-                                            ok: false,
-                                            message: String(
-                                              (e as { message?: string })?.message ?? e,
-                                            ),
-                                          });
-                                        }
-                                      }}
-                                    >
-                                      ⚡ Test Connection
-                                    </button>
-                                    <Show when={embeddingTestResult()}>
-                                      <span
-                                        style={{
-                                          "margin-left": "10px",
-                                          "font-size": "12px",
-                                          color: embeddingTestResult()?.ok
-                                            ? "var(--green)"
-                                            : "var(--red)",
-                                        }}
-                                      >
-                                        {embeddingTestResult()?.message}
-                                      </span>
+                                      <div>
+                                        <button
+                                          type="button"
+                                          class="btn sm"
+                                          onClick={async () => {
+                                            const endpoint = String(
+                                              getNestedValue(formData(), "embedding.endpoint") ??
+                                                "",
+                                            ).trim();
+                                            const model = String(
+                                              getNestedValue(formData(), "embedding.model") ?? "",
+                                            ).trim();
+                                            const apiKey = String(
+                                              getNestedValue(formData(), "embedding.api_key") ?? "",
+                                            ).trim();
+                                            const inputType = String(
+                                              getNestedValue(formData(), "embedding.input_type") ??
+                                                "",
+                                            ).trim();
+                                            const truncate = String(
+                                              getNestedValue(formData(), "embedding.truncate") ??
+                                                "",
+                                            ).trim();
+                                            if (!endpoint || !model) {
+                                              setEmbeddingTestResult({
+                                                ok: false,
+                                                message: "Endpoint and model are required",
+                                              });
+                                              return;
+                                            }
+                                            setEmbeddingTestResult({
+                                              ok: false,
+                                              message: "Testing...",
+                                            });
+                                            try {
+                                              // Rust returns the structured outcome directly (not
+                                              // `Result<T, String>` anymore). Any thrown error from
+                                              // `invoke` itself is a tauri infrastructure failure
+                                              // (e.g., command not registered) rather than a probe
+                                              // classification — we surface that unchanged.
+                                              const outcome = await invoke<EmbeddingProbeOutcome>(
+                                                "test_embedding_endpoint",
+                                                {
+                                                  endpoint,
+                                                  model,
+                                                  apiKey: apiKey || null,
+                                                  inputType: inputType || null,
+                                                  truncate: truncate || null,
+                                                  // Backend trust boundary: only "user"
+                                                  // scope expands tokens + probes. The
+                                                  // button is hidden for projects, but
+                                                  // send the scope so the backend can
+                                                  // refuse regardless.
+                                                  source: props.scope ?? "user",
+                                                },
+                                              );
+                                              setEmbeddingTestResult(formatProbeOutcome(outcome));
+                                            } catch (e: unknown) {
+                                              setEmbeddingTestResult({
+                                                ok: false,
+                                                message: String(
+                                                  (e as { message?: string })?.message ?? e,
+                                                ),
+                                              });
+                                            }
+                                          }}
+                                        >
+                                          ⚡ Test Connection
+                                        </button>
+                                        <Show when={embeddingTestResult()}>
+                                          <span
+                                            style={{
+                                              "margin-left": "10px",
+                                              "font-size": "12px",
+                                              color: embeddingTestResult()?.ok
+                                                ? "var(--green)"
+                                                : "var(--red)",
+                                            }}
+                                          >
+                                            {embeddingTestResult()?.message}
+                                          </span>
+                                        </Show>
+                                      </div>
                                     </Show>
                                   </div>
                                 </Show>
                               </div>
-                            </Show>
-                          </div>
-                        );
-                      })()
-                    ) : sectionName === "Historian" ? (
-                      <div class="config-card-two-col">
-                        <Show when={isUserScope()}>
-                          <div class="config-card-content">
-                            <div class="tab-pills" style={{ "margin-bottom": "12px" }}>
-                              <button
-                                type="button"
-                                class={`tab-pill ${historianHarness() === "opencode" ? "active" : ""}`}
-                                onClick={() => setHistorianHarness("opencode")}
-                              >
-                                OpenCode
-                              </button>
-                              <button
-                                type="button"
-                                class={`tab-pill ${historianHarness() === "pi" ? "active" : ""}`}
-                                onClick={() => setHistorianHarness("pi")}
-                              >
-                                Pi
-                              </button>
-                              <button
-                                type="button"
-                                class={`tab-pill ${historianHarness() === "omp" ? "active" : ""}`}
-                                onClick={() => setHistorianHarness("omp")}
-                              >
-                                OMP
-                              </button>
-                            </div>
-                            <Show when={historianHarness() === "opencode"}>
-                              {manualModelHint()}
-                            </Show>
-                            <HarnessModelFields
-                              agent="historian"
-                              harness={historianHarness()}
-                              models={modelsForHarness(historianHarness())}
-                              value={getNestedValue(formData(), `historian.${historianHarness()}`)}
-                              onChange={(block) =>
-                                handleFieldChange(`historian.${historianHarness()}`, block)
-                              }
-                            />
-                          </div>
-                        </Show>
-                        {/* Right: Settings sliders */}
-                        <div class="config-card-content">
-                          <For each={fieldsForScope(fields)}>{renderField}</For>
-
-                          {/* Commit Cluster Trigger */}
-                          {(() => {
-                            const commitCluster = () =>
-                              (getNestedValue(formData(), "commit_cluster_trigger") as
-                                | { enabled?: boolean; min_clusters?: number }
-                                | undefined) ?? {};
-                            const enabled = () => commitCluster().enabled ?? true;
-                            const minClusters = () => commitCluster().min_clusters ?? 3;
-                            return (
-                              <>
-                                <div class="config-field">
-                                  <div class="config-field-header">
-                                    <span class="config-field-label">Commit Cluster Trigger</span>
-                                    <span class="config-field-key">
-                                      commit_cluster_trigger.enabled
-                                    </span>
-                                  </div>
-                                  <span class="config-field-desc">
-                                    Fire historian when enough git commit clusters accumulate in the
-                                    unsummarized conversation tail. A commit cluster is a distinct
-                                    work phase where the agent made git commits, separated by
-                                    meaningful user turns.
-                                  </span>
-                                  <label class="toggle-switch">
-                                    <input
-                                      type="checkbox"
-                                      checked={enabled()}
-                                      onChange={(e) =>
-                                        handleFieldChange("commit_cluster_trigger", {
-                                          ...commitCluster(),
-                                          enabled: e.currentTarget.checked,
-                                        })
-                                      }
-                                    />
-                                    <span class="toggle-slider" />
-                                    <span class="toggle-label">
-                                      {enabled() ? "Enabled" : "Disabled"}
-                                    </span>
-                                  </label>
-                                </div>
-
-                                <Show when={enabled()}>
-                                  <div class="config-field">
-                                    <div class="config-field-header">
-                                      <span class="config-field-label">Min Clusters</span>
-                                      <span class="config-field-key">
-                                        commit_cluster_trigger.min_clusters
-                                      </span>
-                                    </div>
-                                    <span class="config-field-desc">
-                                      Minimum number of commit clusters required to trigger
-                                      historian
-                                    </span>
-                                    <input
-                                      class="config-input"
-                                      type="number"
-                                      min={1}
-                                      value={minClusters()}
-                                      onInput={(e) => {
-                                        const v = e.currentTarget.value;
-                                        handleFieldChange("commit_cluster_trigger", {
-                                          ...commitCluster(),
-                                          min_clusters: v ? Math.max(1, Number(v)) : 3,
-                                        });
-                                      }}
-                                    />
-                                  </div>
-                                </Show>
-                              </>
                             );
-                          })()}
-                        </div>
-                      </div>
-                    ) : (
-                      <div class="config-card-content">
-                        <For each={fieldsForScope(fields)}>{renderField}</For>
-                      </div>
-                    )}
-                  </div>
-                  {/* Thresholds card — right of General */}
-                  {sectionName === "General" && (
-                    <div class="config-card">
-                      <div class="config-card-header">
-                        <span class="config-card-icon">⚡</span>
-                        <span class="config-card-title">Thresholds</span>
-                      </div>
-                      <div class="config-card-content">
-                        <PerModelField
-                          label="Cache TTL"
-                          configKey="cache_ttl"
-                          description="How long to wait before executing queued operations."
-                          value={
-                            getNestedValue(formData(), "cache_ttl") ??
-                            getNestedValue(parsed(), "cache_ttl")
-                          }
-                          onChange={(v) => handleFieldChange("cache_ttl", v)}
-                          models={models() ?? []}
-                          inputType="text"
-                          defaultPlaceholder="5m"
-                          textOptions={[{ value: "never", label: "Never (keep warm)" }]}
-                        />
-                        <PerModelField
-                          label="Execute Threshold %"
-                          configKey="execute_threshold_percentage"
-                          description="Context usage percentage (20–90) at which queued drops execute. The safe-window cap is 90%."
-                          value={
-                            getNestedValue(formData(), "execute_threshold_percentage") ??
-                            getNestedValue(parsed(), "execute_threshold_percentage")
-                          }
-                          onChange={(v) => handleFieldChange("execute_threshold_percentage", v)}
-                          models={models() ?? []}
-                          inputType="slider"
-                          sliderConfig={{
-                            min: 20,
-                            max: 90,
-                            step: 1,
-                            suffix: "%",
-                            defaultValue: 65,
-                          }}
-                          defaultPlaceholder="65"
-                        />
-                        <PerModelField
-                          label="Execute Threshold (tokens)"
-                          configKey="execute_threshold_tokens"
-                          description="Optional absolute-tokens threshold. When set for a model, overrides the percentage above. Per-model map only (use 'default' key for a fallback across all unlisted models). Clamped to 90% × context_limit at runtime."
-                          value={
-                            getNestedValue(formData(), "execute_threshold_tokens") ??
-                            getNestedValue(parsed(), "execute_threshold_tokens")
-                          }
-                          onChange={(v) => handleFieldChange("execute_threshold_tokens", v)}
-                          models={models() ?? []}
-                          inputType="text"
-                          alwaysObject
-                          numericText
-                          defaultPlaceholder="150000"
-                        />
-                        <Show when={isUserScope()}>
-                          <PerModelField
-                            label="Output Reserve"
-                            configKey="output_reserve"
-                            description="Reserve output tokens from the shared context window. Set 0 to disable the reservation. User-level only."
-                            value={
-                              getNestedValue(formData(), "output_reserve") ??
-                              getNestedValue(parsed(), "output_reserve")
-                            }
-                            onChange={(v) => handleFieldChange("output_reserve", v)}
-                            models={models() ?? []}
-                            inputType="text"
-                            numericText
-                            defaultPlaceholder="16384"
-                          />
-                        </Show>
-                      </div>
-                    </div>
-                  )}
-                </>
-              );
-            }}
-          </For>
+                          })()
+                        ) : sectionName === "History" ? (
+                          <div class="config-card-two-col">
+                            {/* Right: Settings sliders */}
+                            <div class="config-card-content">
+                              <For each={fieldsForScope(fields)}>{renderField}</For>
 
-          {/* Prompt surface is editable in both scopes for routing. Override text
+                              {/* Commit Cluster Trigger */}
+                              {(() => {
+                                const commitCluster = () =>
+                                  (getNestedValue(formData(), "commit_cluster_trigger") as
+                                    | { enabled?: boolean; min_clusters?: number }
+                                    | undefined) ?? {};
+                                const enabled = () =>
+                                  Boolean(booleanSetting("commit_cluster_trigger.enabled"));
+                                const minClusters = () => commitCluster().min_clusters;
+                                return (
+                                  <>
+                                    <div class="config-field">
+                                      <div class="config-field-header">
+                                        <span class="config-field-label">
+                                          Commit Cluster Trigger
+                                        </span>
+                                        <span class="config-field-key">
+                                          commit_cluster_trigger.enabled
+                                        </span>
+                                      </div>
+                                      <span class="config-field-desc">
+                                        Fire historian when enough git commit clusters accumulate in
+                                        the unsummarized conversation tail. A commit cluster is a
+                                        distinct work phase where the agent made git commits,
+                                        separated by meaningful user turns.
+                                      </span>
+                                      <label class="toggle-switch">
+                                        <input
+                                          type="checkbox"
+                                          checked={enabled()}
+                                          onChange={(e) =>
+                                            handleFieldChange("commit_cluster_trigger", {
+                                              ...commitCluster(),
+                                              enabled: e.currentTarget.checked,
+                                            })
+                                          }
+                                        />
+                                        <span class="toggle-slider" />
+                                        <span class="toggle-label">
+                                          {enabled() ? "Enabled" : "Disabled"}
+                                          {inheritedDefault("commit_cluster_trigger.enabled")}
+                                        </span>
+                                      </label>
+                                    </div>
+
+                                    <Show when={enabled()}>
+                                      <div class="config-field">
+                                        <div class="config-field-header">
+                                          <span class="config-field-label">Min Clusters</span>
+                                          <span class="config-field-key">
+                                            commit_cluster_trigger.min_clusters
+                                          </span>
+                                        </div>
+                                        <span class="config-field-desc">
+                                          Minimum number of commit clusters required to trigger
+                                          historian
+                                        </span>
+                                        <input
+                                          class="config-input"
+                                          type="number"
+                                          min={1}
+                                          value={minClusters() ?? ""}
+                                          placeholder={defaultPlaceholder(
+                                            "commit_cluster_trigger.min_clusters",
+                                          )}
+                                          onInput={(e) => {
+                                            const v = e.currentTarget.value;
+                                            handleFieldChange("commit_cluster_trigger", {
+                                              ...commitCluster(),
+                                              min_clusters: v ? Math.max(1, Number(v)) : undefined,
+                                            });
+                                          }}
+                                        />
+                                      </div>
+                                    </Show>
+                                  </>
+                                );
+                              })()}
+                            </div>
+                          </div>
+                        ) : (
+                          <div class="config-card-content">
+                            <For each={fieldsForScope(fields)}>{renderField}</For>
+                          </div>
+                        )}
+                      </div>
+                      {/* Defaults precede the context reclaim controls. */}
+                      {sectionName === "General" && (
+                        <div
+                          class="config-card full-width"
+                          hidden={activeSection() !== "Context window"}
+                        >
+                          <PerModelTable
+                            values={Object.fromEntries(
+                              PER_MODEL_KEYS.map((key) => [key, formData()[key]]),
+                            )}
+                            onChange={handlePerModelChange}
+                            models={[...new Set(Object.values(props.modelCatalogs).flat())]}
+                            userScope={isUserScope()}
+                          />
+                        </div>
+                      )}
+                    </>
+                  );
+                }}
+              </For>
+
+              {/* Prompt surface is editable in both scopes for routing. Override text
               is shown but locked for project config because the runtime removes
               those user-only fields before merging repository settings. */}
-          {(() => {
-            const promptSurface = () =>
-              (getNestedValue(formData(), "prompt_surface") as
-                | Record<string, unknown>
-                | undefined) ?? {};
-            const userScope = () => (props.scope ?? "user") === "user";
-            const [modelsDraft, setModelsDraft] = createSignal<string | undefined>();
-            const [toolsDraft, setToolsDraft] = createSignal<string | undefined>();
-            const defaultPreset = () => (promptSurface().default === "light" ? "light" : "full");
-            const modelsJson = () =>
-              JSON.stringify(
-                (promptSurface().models as Record<string, unknown> | undefined) ?? {},
-                null,
-                2,
-              );
-            const toolsJson = () =>
-              JSON.stringify(
-                (promptSurface().tool_descriptions as Record<string, unknown> | undefined) ?? {},
-                null,
-                2,
-              );
-            const modelsEditorValue = () => modelsDraft() ?? modelsJson();
-            const toolsEditorValue = () => toolsDraft() ?? toolsJson();
-            const parseObject = (text: string): Record<string, unknown> | undefined => {
-              try {
-                const value = parseJsonc(text);
-                return value && typeof value === "object" && !Array.isArray(value)
-                  ? (value as Record<string, unknown>)
-                  : undefined;
-              } catch {
-                return undefined;
-              }
-            };
-            const setPromptSurface = (patch: Record<string, unknown>) =>
-              handleFieldChange("prompt_surface", { ...promptSurface(), ...patch });
-
-            return (
-              <div class="config-card full-width">
-                <div class="config-card-header">
-                  <span class="config-card-icon">🪄</span>
-                  <span class="config-card-title">Prompt Surface</span>
-                </div>
-                <div class="config-card-content">
-                  <div
-                    class="config-field-desc"
-                    style={{ "margin-bottom": "8px", opacity: "0.85" }}
-                  >
-                    Choose the built-in full or light preset. Model routes use the literal
-                    provider/model or provider/* form and are case-sensitive; additional slashes in
-                    model IDs are preserved. Guidance and tool-description overrides are user-only.
-                  </div>
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Default preset</span>
-                      <span class="config-field-key">prompt_surface.default</span>
-                    </div>
-                    <select
-                      class="config-input"
-                      value={defaultPreset()}
-                      onChange={(e) => setPromptSurface({ default: e.currentTarget.value })}
-                    >
-                      <option value="full">full</option>
-                      <option value="light">light</option>
-                    </select>
-                  </div>
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Model routes</span>
-                      <span class="config-field-key">prompt_surface.models</span>
-                    </div>
-                    <span class="config-field-desc">
-                      JSON object of provider/model or provider/* keys to full or light. Leave empty
-                      for default routing.
-                    </span>
-                    <textarea
-                      class="code-editor"
-                      rows={4}
-                      value={modelsEditorValue()}
-                      onInput={(e) => {
-                        const value = e.currentTarget.value;
-                        setModelsDraft(value);
-                        const next = parseObject(value);
-                        if (next) {
-                          setPromptSurface({ models: next });
-                          setModelsDraft(undefined);
-                        }
-                      }}
-                    />
-                  </div>
-                  <Show when={userScope()}>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Guidance override path</span>
-                        <span class="config-field-key">prompt_surface.guidance_override_path</span>
-                      </div>
-                      <span class="config-field-desc">
-                        User-only path to a complete primary guidance section. Relative paths
-                        resolve from the user config file.
-                      </span>
-                      <input
-                        class="config-input"
-                        type="text"
-                        disabled={!userScope()}
-                        value={String(promptSurface().guidance_override_path ?? "")}
-                        placeholder={userScope() ? "path/to/guidance.md" : "user config only"}
-                        onInput={(e) =>
-                          setPromptSurface({
-                            guidance_override_path: e.currentTarget.value || undefined,
-                          })
-                        }
-                      />
-                    </div>
-                  </Show>
-                  <Show when={userScope()}>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Tool-description overrides</span>
-                        <span class="config-field-key">prompt_surface.tool_descriptions</span>
-                      </div>
-                      <span class="config-field-desc">
-                        User-only JSON object keyed by tool ID. Only top-level descriptions change;
-                        IDs, parameter schemas, and parameter descriptions remain fixed.
-                      </span>
-                      <textarea
-                        class="code-editor"
-                        rows={4}
-                        disabled={!userScope()}
-                        value={toolsEditorValue()}
-                        onInput={(e) => {
-                          const value = e.currentTarget.value;
-                          setToolsDraft(value);
-                          const next = parseObject(value);
-                          if (next) {
-                            setPromptSurface({ tool_descriptions: next });
-                            setToolsDraft(undefined);
-                          }
-                        }}
-                      />
-                    </div>
-                  </Show>
-                </div>
-              </div>
-            );
-          })()}
-
-          {/* ── Agent Configuration Cards ───────────────────────── */}
-
-          {/* Dreamer Card */}
-          <div class="config-card full-width">
-            <div class="config-card-header">
-              <span class="config-card-icon">🌙</span>
-              <span class="config-card-title">DREAMER</span>
-            </div>
-            <div class="config-card-two-col">
-              {/* Left: Enabled, Schedule, Inject Docs */}
-              <div class="config-card-content">
-                <div class="config-field">
-                  <div class="config-field-header">
-                    <span class="config-field-label">Dreamer agent enabled</span>
-                  </div>
-                  <span class="config-field-desc">
-                    Controls whether the Dreamer hidden agent is registered. To keep manual
-                    /ctx-dream but disable automatic runs, leave enabled and set Schedule to empty.
-                  </span>
-                  <label class="toggle-switch">
-                    <input
-                      type="checkbox"
-                      checked={getNestedValue(formData(), "dreamer.disable") !== true}
-                      onChange={(e) => {
-                        handleFieldChange("dreamer.disable", !e.currentTarget.checked);
-                        handleFieldChange("dreamer.enabled", undefined);
-                      }}
-                    />
-                    <span class="toggle-slider" />
-                    <span class="toggle-label">
-                      {getNestedValue(formData(), "dreamer.disable") !== true
-                        ? "Enabled"
-                        : "Disabled"}
-                    </span>
-                  </label>
-                </div>
-
-                <div class="config-field">
-                  <div class="config-field-header">
-                    <span class="config-field-label">Inject Docs</span>
-                  </div>
-                  <span class="config-field-desc">
-                    Inject ARCHITECTURE.md and STRUCTURE.md into agent context
-                  </span>
-                  <label class="toggle-switch">
-                    <input
-                      type="checkbox"
-                      checked={
-                        (getNestedValue(formData(), "dreamer.inject_docs") as boolean) ?? true
-                      }
-                      onChange={(e) =>
-                        handleFieldChange("dreamer.inject_docs", e.currentTarget.checked)
-                      }
-                    />
-                    <span class="toggle-slider" />
-                    <span class="toggle-label">
-                      {((getNestedValue(formData(), "dreamer.inject_docs") as boolean) ?? true)
-                        ? "Enabled"
-                        : "Disabled"}
-                    </span>
-                  </label>
-                </div>
-              </div>
-
-              <div class="config-card-content">
-                <div class="tab-pills" style={{ "margin-bottom": "12px" }}>
-                  <button
-                    type="button"
-                    class={`tab-pill ${dreamerHarness() === "opencode" ? "active" : ""}`}
-                    onClick={() => setDreamerHarness("opencode")}
-                  >
-                    OpenCode
-                  </button>
-                  <button
-                    type="button"
-                    class={`tab-pill ${dreamerHarness() === "pi" ? "active" : ""}`}
-                    onClick={() => setDreamerHarness("pi")}
-                  >
-                    Pi
-                  </button>
-                  <button
-                    type="button"
-                    class={`tab-pill ${dreamerHarness() === "omp" ? "active" : ""}`}
-                    onClick={() => setDreamerHarness("omp")}
-                  >
-                    OMP
-                  </button>
-                </div>
-                <Show when={dreamerHarness() === "opencode"}>{manualModelHint()}</Show>
-                <HarnessModelFields
-                  agent="dreamer"
-                  harness={dreamerHarness()}
-                  models={modelsForHarness(dreamerHarness())}
-                  value={getNestedValue(formData(), `dreamer.${dreamerHarness()}`)}
-                  onChange={(block) => handleFieldChange(`dreamer.${dreamerHarness()}`, block)}
-                />
-              </div>
-            </div>
-
-            <div class="config-field">
-              <div class="config-field-header">
-                <span class="config-field-label">Task schedules and model overrides</span>
-                <span class="config-field-key">dreamer.tasks / dreamer.{"<harness>"}.tasks</span>
-              </div>
-              <span class="config-field-desc">
-                Schedules apply once for every harness. The selected tab configures only that
-                harness's task model entries and qualifiers.
-              </span>
-              <DreamerTasksField
-                value={
-                  getNestedValue(formData(), "dreamer.tasks") as
-                    | Record<string, DreamTaskConfig>
-                    | undefined
-                }
-                onChange={(tasks) => handleFieldChange("dreamer.tasks", tasks)}
-                harness={dreamerHarness()}
-                modelTasks={
-                  getNestedValue(formData(), `dreamer.${dreamerHarness()}.tasks`) as
-                    | Record<string, DreamTaskModelConfig>
-                    | undefined
-                }
-                onModelTasksChange={(tasks) => {
-                  const path = `dreamer.${dreamerHarness()}`;
-                  const current = getNestedValue(formData(), path) as
+              {(() => {
+                const promptSurface = () =>
+                  (getNestedValue(formData(), "prompt_surface") as
                     | Record<string, unknown>
-                    | undefined;
-                  const next = { ...(current ?? {}) };
-                  if (tasks) next.tasks = tasks;
-                  else delete next.tasks;
-                  handleFieldChange(path, next);
-                }}
-                models={modelsForHarness(dreamerHarness())}
-              />
-            </div>
-          </div>
+                    | undefined) ?? {};
+                const userScope = () => (props.scope ?? "user") === "user";
+                const [modelsDraft, setModelsDraft] = createSignal<string | undefined>();
+                const [toolsDraft, setToolsDraft] = createSignal<string | undefined>();
+                const defaultPreset = () =>
+                  promptSurface().default === "light" ? "light" : "full";
+                const modelsJson = () =>
+                  JSON.stringify(
+                    (promptSurface().models as Record<string, unknown> | undefined) ?? {},
+                    null,
+                    2,
+                  );
+                const toolsJson = () =>
+                  JSON.stringify(
+                    (promptSurface().tool_descriptions as Record<string, unknown> | undefined) ??
+                      {},
+                    null,
+                    2,
+                  );
+                const modelsEditorValue = () => modelsDraft() ?? modelsJson();
+                const toolsEditorValue = () => toolsDraft() ?? toolsJson();
+                const parseObject = (text: string): Record<string, unknown> | undefined => {
+                  try {
+                    const value = parseJsonc(text);
+                    return value && typeof value === "object" && !Array.isArray(value)
+                      ? (value as Record<string, unknown>)
+                      : undefined;
+                  } catch {
+                    return undefined;
+                  }
+                };
+                const setPromptSurface = (patch: Record<string, unknown>) =>
+                  handleFieldChange("prompt_surface", { ...promptSurface(), ...patch });
 
-          {(() => {
-            const tagsFields = sections().find(([name]) => name === "Tags & Cleanup");
-            if (!tagsFields) return null;
-            return (
-              <div class="config-card">
-                <div class="config-card-header">
-                  <span class="config-card-icon">🏷️</span>
-                  <span class="config-card-title">Tags & Cleanup</span>
+                return (
+                  <div class="config-card full-width" hidden={activeSection() !== "Prompt surface"}>
+                    <div class="config-card-header">
+                      <span class="config-card-icon">🪄</span>
+                      <span class="config-card-title">Prompt Surface</span>
+                    </div>
+                    <div class="config-card-content">
+                      <div
+                        class="config-field-desc"
+                        style={{ "margin-bottom": "8px", opacity: "0.85" }}
+                      >
+                        Choose the built-in full or light preset. Model routes use the literal
+                        provider/model or provider/* form and are case-sensitive; additional slashes
+                        in model IDs are preserved. Guidance and tool-description overrides are
+                        user-only.
+                      </div>
+                      <div class="config-field">
+                        <div class="config-field-header">
+                          <span class="config-field-label">Default preset</span>
+                          <span class="config-field-key">prompt_surface.default</span>
+                        </div>
+                        <select
+                          class="config-input"
+                          value={defaultPreset()}
+                          onChange={(e) => setPromptSurface({ default: e.currentTarget.value })}
+                        >
+                          <option value="full">full</option>
+                          <option value="light">light</option>
+                        </select>
+                      </div>
+                      <div class="config-field">
+                        <div class="config-field-header">
+                          <span class="config-field-label">Model routes</span>
+                          <span class="config-field-key">prompt_surface.models</span>
+                        </div>
+                        <span class="config-field-desc">
+                          JSON object of provider/model or provider/* keys to full or light. Leave
+                          empty for default routing.
+                        </span>
+                        <textarea
+                          class="code-editor"
+                          rows={4}
+                          value={modelsEditorValue()}
+                          onInput={(e) => {
+                            const value = e.currentTarget.value;
+                            setModelsDraft(value);
+                            const next = parseObject(value);
+                            if (next) {
+                              setPromptSurface({ models: next });
+                              setModelsDraft(undefined);
+                            }
+                          }}
+                        />
+                      </div>
+                      <Show when={userScope()}>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">Guidance override path</span>
+                            <span class="config-field-key">
+                              prompt_surface.guidance_override_path
+                            </span>
+                          </div>
+                          <span class="config-field-desc">
+                            User-only path to a complete primary guidance section. Relative paths
+                            resolve from the user config file.
+                          </span>
+                          <input
+                            class="config-input"
+                            type="text"
+                            disabled={!userScope()}
+                            value={String(promptSurface().guidance_override_path ?? "")}
+                            placeholder={userScope() ? "path/to/guidance.md" : "user config only"}
+                            onInput={(e) =>
+                              setPromptSurface({
+                                guidance_override_path: e.currentTarget.value || undefined,
+                              })
+                            }
+                          />
+                        </div>
+                      </Show>
+                      <Show when={userScope()}>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">Tool-description overrides</span>
+                            <span class="config-field-key">prompt_surface.tool_descriptions</span>
+                          </div>
+                          <span class="config-field-desc">
+                            User-only JSON object keyed by tool ID. Only top-level descriptions
+                            change; IDs, parameter schemas, and parameter descriptions remain fixed.
+                          </span>
+                          <textarea
+                            class="code-editor"
+                            rows={4}
+                            disabled={!userScope()}
+                            value={toolsEditorValue()}
+                            onInput={(e) => {
+                              const value = e.currentTarget.value;
+                              setToolsDraft(value);
+                              const next = parseObject(value);
+                              if (next) {
+                                setPromptSurface({ tool_descriptions: next });
+                                setToolsDraft(undefined);
+                              }
+                            }}
+                          />
+                        </div>
+                      </Show>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Agent Configuration Cards ───────────────────────── */}
+
+              {/* Only model choices switch with the background harness tabs. */}
+              <div class="config-card full-width" hidden={activeSection() !== "Background models"}>
+                <div class="tab-pills">
+                  <For each={["opencode", "pi", "omp"] as const}>
+                    {(harness) => (
+                      <button
+                        type="button"
+                        class={`tab-pill ${backgroundHarness() === harness ? "active" : ""}`}
+                        onClick={() => setBackgroundHarness(harness)}
+                      >
+                        {harness === "opencode" ? "OpenCode" : harness === "pi" ? "Pi" : "OMP"}
+                      </button>
+                    )}
+                  </For>
                 </div>
-                <div class="config-card-content">
-                  <For each={tagsFields[1]}>{renderField}</For>
+                <Show when={backgroundHarness() === "opencode"}>{manualModelHint()}</Show>
+                <div class="config-agent-grid">
+                  <For each={["historian", "dreamer"] as const}>
+                    {(agent) => (
+                      <Show when={isUserScope() || agent === "dreamer"}>
+                        <div class="config-agent-card">
+                          <h3>{agent === "historian" ? "Historian" : "Dreamer"}</h3>
+                          <HarnessModelFields
+                            agent={agent}
+                            harness={backgroundHarness()}
+                            models={modelsForHarness(backgroundHarness())}
+                            value={getNestedValue(formData(), `${agent}.${backgroundHarness()}`)}
+                            onChange={(block) =>
+                              handleFieldChange(`${agent}.${backgroundHarness()}`, block)
+                            }
+                          />
+                        </div>
+                      </Show>
+                    )}
+                  </For>
+                </div>
+                <Show when={!isUserScope()}>
+                  <p class="config-table-note">
+                    Historian model settings are user-config only. Project Dreamer overrides remain
+                    editable.
+                  </p>
+                </Show>
+              </div>
+
+              <div class="config-card full-width" hidden={activeSection() !== "Dreamer schedule"}>
+                <div class="config-card-header">
+                  <span class="config-card-icon">🌙</span>
+                  <span class="config-card-title">DREAMER</span>
+                </div>
+                <div class="config-card-two-col">
+                  {/* Left: Enabled, Schedule, Inject Docs */}
+                  <div class="config-card-content">
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Dreamer agent enabled</span>
+                        <span class="config-field-key">dreamer.disable (inverted)</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Controls whether the Dreamer hidden agent is registered. To keep manual
+                        /ctx-dream but disable automatic runs, leave enabled and set Schedule to
+                        empty.
+                      </span>
+                      <label class="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={getNestedValue(formData(), "dreamer.disable") !== true}
+                          onChange={(e) => {
+                            handleFieldChange("dreamer.disable", !e.currentTarget.checked);
+                            handleFieldChange("dreamer.enabled", undefined);
+                          }}
+                        />
+                        <span class="toggle-slider" />
+                        <span class="toggle-label">
+                          {getNestedValue(formData(), "dreamer.disable") !== true
+                            ? "Enabled"
+                            : "Disabled"}
+                          <Show when={getNestedValue(formData(), "dreamer.disable") === undefined}>
+                            <span class="config-inherited">Default: on</span>
+                          </Show>
+                        </span>
+                      </label>
+                    </div>
+
+                    <div class="config-field">
+                      <div class="config-field-header">
+                        <span class="config-field-label">Inject Docs</span>
+                        <span class="config-field-key">dreamer.inject_docs</span>
+                      </div>
+                      <span class="config-field-desc">
+                        Inject ARCHITECTURE.md and STRUCTURE.md into agent context
+                      </span>
+                      <label class="toggle-switch">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(booleanSetting("dreamer.inject_docs"))}
+                          onChange={(e) =>
+                            handleFieldChange("dreamer.inject_docs", e.currentTarget.checked)
+                          }
+                        />
+                        <span class="toggle-slider" />
+                        <span class="toggle-label">
+                          {booleanSetting("dreamer.inject_docs") ? "Enabled" : "Disabled"}
+                          {inheritedDefault("dreamer.inject_docs")}
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div class="config-task-harness">
+                    <div class="tab-pills" style={{ "margin-bottom": "12px" }}>
+                      <button
+                        type="button"
+                        class={`tab-pill ${dreamerHarness() === "opencode" ? "active" : ""}`}
+                        onClick={() => setDreamerHarness("opencode")}
+                      >
+                        OpenCode
+                      </button>
+                      <button
+                        type="button"
+                        class={`tab-pill ${dreamerHarness() === "pi" ? "active" : ""}`}
+                        onClick={() => setDreamerHarness("pi")}
+                      >
+                        Pi
+                      </button>
+                      <button
+                        type="button"
+                        class={`tab-pill ${dreamerHarness() === "omp" ? "active" : ""}`}
+                        onClick={() => setDreamerHarness("omp")}
+                      >
+                        OMP
+                      </button>
+                    </div>
+                    <p class="config-table-note">
+                      Tabs change task model overrides only. Blank model = this harness's Dreamer
+                      model.
+                    </p>
+                  </div>
+                </div>
+
+                <div class="config-task-schedules">
+                  <div class="config-field-header">
+                    <span class="config-field-label">Task schedules and model overrides</span>
+                    <span class="config-field-key">
+                      dreamer.tasks / dreamer.{"<harness>"}.tasks
+                    </span>
+                  </div>
+                  <span class="config-field-desc">
+                    Schedules apply once for every harness. Click a task to edit cron, task
+                    qualifiers, and promotion thresholds. Off means an empty schedule, not a
+                    separate enable flag.
+                  </span>
+                  <DreamerTasksField
+                    value={
+                      getNestedValue(formData(), "dreamer.tasks") as
+                        | Record<string, DreamTaskConfig>
+                        | undefined
+                    }
+                    onChange={(tasks) => handleFieldChange("dreamer.tasks", tasks)}
+                    harness={dreamerHarness()}
+                    modelTasks={
+                      getNestedValue(formData(), `dreamer.${dreamerHarness()}.tasks`) as
+                        | Record<string, DreamTaskModelConfig>
+                        | undefined
+                    }
+                    onModelTasksChange={(tasks) => {
+                      const path = `dreamer.${dreamerHarness()}`;
+                      const current = getNestedValue(formData(), path) as
+                        | Record<string, unknown>
+                        | undefined;
+                      const next = { ...(current ?? {}) };
+                      if (tasks) next.tasks = tasks;
+                      else delete next.tasks;
+                      handleFieldChange(path, next);
+                    }}
+                    models={modelsForHarness(dreamerHarness())}
+                  />
                 </div>
               </div>
-            );
-          })()}
 
-          {/* History & Recall — features graduated out of `experimental.*` in
+              {/* History & Recall — features graduated out of `experimental.*` in
               v0.22.0. temporal_awareness is top-level; auto_search and
               git_commit_indexing live under `memory.*`; caveman is top-level.
               Full-width, rendered late. Each feature is a master toggle; child
               controls only appear when the feature is on. */}
-          {(() => {
-            // temporal_awareness — top-level boolean (default ON)
-            const temporalAwareness = () => {
-              const v = getNestedValue(formData(), "temporal_awareness");
-              return v == null ? true : Boolean(v);
-            };
+              {(() => {
+                // temporal_awareness — top-level boolean (default ON)
+                const temporalAwareness = () => Boolean(booleanSetting("temporal_awareness"));
 
-            // memory.git_commit_indexing — { enabled, since_days, max_commits }
-            const gitCommit = () =>
-              (getNestedValue(formData(), "memory.git_commit_indexing") as
-                | { enabled?: boolean; since_days?: number; max_commits?: number }
-                | undefined) ?? {};
-            const gitCommitEnabled = () => Boolean(gitCommit().enabled);
-            const gitCommitSinceDays = () => gitCommit().since_days ?? 365;
-            const gitCommitMaxCommits = () => gitCommit().max_commits ?? 2000;
-            const setGitCommit = (patch: Record<string, unknown>) =>
-              handleFieldChange("memory.git_commit_indexing", { ...gitCommit(), ...patch });
+                // memory.git_commit_indexing — { enabled, since_days, max_commits }
+                const gitCommit = () =>
+                  (getNestedValue(formData(), "memory.git_commit_indexing") as
+                    | { enabled?: boolean; since_days?: number; max_commits?: number }
+                    | undefined) ?? {};
+                const gitCommitEnabled = () =>
+                  Boolean(booleanSetting("memory.git_commit_indexing.enabled"));
+                const gitCommitSinceDays = () => gitCommit().since_days;
+                const gitCommitMaxCommits = () => gitCommit().max_commits;
+                const setGitCommit = (patch: Record<string, unknown>) =>
+                  handleFieldChange("memory.git_commit_indexing", { ...gitCommit(), ...patch });
 
-            // memory.auto_search — { enabled, score_threshold, min_prompt_chars } (default ON)
-            const autoSearch = () =>
-              (getNestedValue(formData(), "memory.auto_search") as
-                | { enabled?: boolean; score_threshold?: number; min_prompt_chars?: number }
-                | undefined) ?? {};
-            const autoSearchEnabled = () => {
-              const v = autoSearch().enabled;
-              return v == null ? true : Boolean(v);
-            };
-            const autoSearchScoreThreshold = () => autoSearch().score_threshold ?? 0.55;
-            const autoSearchMinChars = () => autoSearch().min_prompt_chars ?? 20;
-            const setAutoSearch = (patch: Record<string, unknown>) =>
-              handleFieldChange("memory.auto_search", { ...autoSearch(), ...patch });
+                // memory.auto_search — { enabled, score_threshold, min_prompt_chars } (default ON)
+                const autoSearch = () =>
+                  (getNestedValue(formData(), "memory.auto_search") as
+                    | { enabled?: boolean; score_threshold?: number; min_prompt_chars?: number }
+                    | undefined) ?? {};
+                const autoSearchEnabled = () =>
+                  Boolean(booleanSetting("memory.auto_search.enabled"));
+                const autoSearchScoreThreshold = () => autoSearch().score_threshold;
+                const autoSearchMinChars = () => autoSearch().min_prompt_chars;
+                const setAutoSearch = (patch: Record<string, unknown>) =>
+                  handleFieldChange("memory.auto_search", { ...autoSearch(), ...patch });
 
-            // caveman_text_compression — top-level { enabled, min_chars }
-            const caveman = () =>
-              (getNestedValue(formData(), "caveman_text_compression") as
-                | { enabled?: boolean; min_chars?: number }
-                | undefined) ?? {};
-            const cavemanEnabled = () => Boolean(caveman().enabled);
-            const cavemanMinChars = () => caveman().min_chars ?? 500;
-            const setCaveman = (patch: Record<string, unknown>) =>
-              handleFieldChange("caveman_text_compression", { ...caveman(), ...patch });
+                // caveman_text_compression — top-level { enabled, min_chars }
+                const caveman = () =>
+                  (getNestedValue(formData(), "caveman_text_compression") as
+                    | { enabled?: boolean; min_chars?: number }
+                    | undefined) ?? {};
+                const cavemanEnabled = () =>
+                  Boolean(booleanSetting("caveman_text_compression.enabled"));
+                const cavemanMinChars = () => caveman().min_chars;
+                const setCaveman = (patch: Record<string, unknown>) =>
+                  handleFieldChange("caveman_text_compression", { ...caveman(), ...patch });
 
-            return (
-              <div class="config-card full-width">
-                <div class="config-card-header">
-                  <span class="config-card-icon">🔮</span>
-                  <span class="config-card-title">History &amp; Recall</span>
-                </div>
-                <div class="config-card-content">
+                return (
                   <div
-                    class="config-field-desc"
-                    style={{ "margin-bottom": "8px", opacity: "0.85" }}
+                    class="config-card full-width"
+                    hidden={!["History", "Memory & search"].includes(activeSection())}
                   >
-                    Recall and history features. Temporal awareness and auto-search are on by
-                    default; the rest are opt-in.
-                  </div>
-
-                  {/* Temporal awareness */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Temporal Awareness</span>
-                      <span class="config-field-key">temporal_awareness</span>
+                    <div class="config-card-header">
+                      <span class="config-card-icon">🔮</span>
+                      <span class="config-card-title">History &amp; Recall</span>
                     </div>
-                    <span class="config-field-desc">
-                      Inject elapsed-time markers (e.g. <code>+12m</code>, <code>+3d 4h</code>)
-                      between user messages with &gt;5 min gaps, and add <code>start-date</code>/
-                      <code>end-date</code> attributes on rendered compartments. Helps the agent
-                      reason about session pacing across long-running and multi-day sessions. On by
-                      default.
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={temporalAwareness()}
-                        onChange={(e) =>
-                          handleFieldChange("temporal_awareness", e.currentTarget.checked)
-                        }
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">
-                        {temporalAwareness() ? "Enabled" : "Disabled"}
-                      </span>
-                    </label>
-                  </div>
-
-                  {/* Auto search */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Auto Search Hint</span>
-                      <span class="config-field-key">memory.auto_search.enabled</span>
-                    </div>
-                    <span class="config-field-desc">
-                      On each new user message, run <code>ctx_search</code> in the background and
-                      append a compact <code>&lt;ctx-search-hint&gt;</code> block of vague fragments
-                      when the top hit clears the score threshold. Does NOT inject full content —
-                      just nudges the agent to run <code>ctx_search</code> for the real result if
-                      relevant. Adds one embedding round-trip per new user turn. On by default.
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={autoSearchEnabled()}
-                        onChange={(e) => setAutoSearch({ enabled: e.currentTarget.checked })}
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">
-                        {autoSearchEnabled() ? "Enabled" : "Disabled"}
-                      </span>
-                    </label>
-                  </div>
-
-                  <Show when={autoSearchEnabled()}>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Score Threshold</span>
-                        <span class="config-field-key">memory.auto_search.score_threshold</span>
+                    <div class="config-card-content">
+                      {/* Temporal awareness */}
+                      <div class="config-field" hidden={activeSection() !== "History"}>
+                        <div class="config-field-header">
+                          <span class="config-field-label">Temporal Awareness</span>
+                          <span class="config-field-key">temporal_awareness</span>
+                        </div>
+                        <span class="config-field-desc">
+                          Inject elapsed-time markers (e.g. <code>+12m</code>, <code>+3d 4h</code>)
+                          between user messages with &gt;5 min gaps.
+                        </span>
+                        <details class="config-help">
+                          <summary>History rendering details</summary>
+                          <p>
+                            Add start-date/end-date attributes on rendered compartments. Helps the
+                            agent reason about session pacing across long-running and multi-day
+                            sessions. On by default.
+                          </p>
+                        </details>
+                        <label class="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={temporalAwareness()}
+                            onChange={(e) =>
+                              handleFieldChange("temporal_awareness", e.currentTarget.checked)
+                            }
+                          />
+                          <span class="toggle-slider" />
+                          <span class="toggle-label">
+                            {temporalAwareness() ? "Enabled" : "Disabled"}
+                            {inheritedDefault("temporal_awareness")}
+                          </span>
+                        </label>
                       </div>
-                      <span class="config-field-desc">
-                        Minimum top-hit score for the hint to fire. Higher = fewer but more relevant
-                        hints. Range 0.30–0.95, default 0.55.
-                      </span>
-                      <input
-                        class="config-input"
-                        type="number"
-                        min={0.3}
-                        max={0.95}
-                        step={0.05}
-                        value={autoSearchScoreThreshold()}
-                        onInput={(e) => {
-                          const v = e.currentTarget.value;
-                          setAutoSearch({
-                            score_threshold: v ? Math.max(0.3, Math.min(0.95, Number(v))) : 0.55,
-                          });
-                        }}
-                      />
-                    </div>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Min Prompt Chars</span>
-                        <span class="config-field-key">memory.auto_search.min_prompt_chars</span>
-                      </div>
-                      <span class="config-field-desc">
-                        Skip the hint when a user message is shorter than this. Avoids embedding
-                        cost on trivial replies. Range 5–500, default 20.
-                      </span>
-                      <input
-                        class="config-input"
-                        type="number"
-                        min={5}
-                        max={500}
-                        value={autoSearchMinChars()}
-                        onInput={(e) => {
-                          const v = e.currentTarget.value;
-                          setAutoSearch({
-                            min_prompt_chars: v ? Math.max(5, Math.min(500, Number(v))) : 20,
-                          });
-                        }}
-                      />
-                    </div>
-                  </Show>
 
-                  {/* Git commit indexing */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Git Commit Indexing</span>
-                      <span class="config-field-key">memory.git_commit_indexing.enabled</span>
+                      {/* Auto search */}
+                      <div class="config-field" hidden={activeSection() !== "Memory & search"}>
+                        <div class="config-field-header">
+                          <span class="config-field-label">Auto Search Hint</span>
+                          <span class="config-field-key">memory.auto_search.enabled</span>
+                        </div>
+                        <span class="config-field-desc">
+                          On each new user message, run <code>ctx_search</code> in the background
+                          and append a compact <code>&lt;ctx-search-hint&gt;</code> block of vague
+                          fragments when the top hit clears the score threshold.
+                        </span>
+                        <details class="config-help">
+                          <summary>Hint behavior</summary>
+                          <p>
+                            Does NOT inject full content — just nudges the agent to run ctx_search
+                            for the real result if relevant. Adds one embedding round-trip per new
+                            user turn. On by default.
+                          </p>
+                        </details>
+                        <label class="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={autoSearchEnabled()}
+                            onChange={(e) => setAutoSearch({ enabled: e.currentTarget.checked })}
+                          />
+                          <span class="toggle-slider" />
+                          <span class="toggle-label">
+                            {autoSearchEnabled() ? "Enabled" : "Disabled"}
+                            {inheritedDefault("memory.auto_search.enabled")}
+                          </span>
+                        </label>
+                      </div>
+
+                      <Show when={activeSection() === "Memory & search" && autoSearchEnabled()}>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">Score Threshold</span>
+                            <span class="config-field-key">memory.auto_search.score_threshold</span>
+                          </div>
+                          <span class="config-field-desc">
+                            Minimum top-hit score for the hint to fire. Higher = fewer but more
+                            relevant hints. Range 0.30–0.95.
+                          </span>
+                          <input
+                            class="config-input"
+                            type="number"
+                            min={0.3}
+                            max={0.95}
+                            step={0.05}
+                            value={autoSearchScoreThreshold() ?? ""}
+                            placeholder={defaultPlaceholder("memory.auto_search.score_threshold")}
+                            onInput={(e) => {
+                              const v = e.currentTarget.value;
+                              setAutoSearch({
+                                score_threshold: v
+                                  ? Math.max(0.3, Math.min(0.95, Number(v)))
+                                  : undefined,
+                              });
+                            }}
+                          />
+                        </div>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">Min Prompt Chars</span>
+                            <span class="config-field-key">
+                              memory.auto_search.min_prompt_chars
+                            </span>
+                          </div>
+                          <span class="config-field-desc">
+                            Skip the hint when a user message is shorter than this. Avoids embedding
+                            cost on trivial replies. Range 5–500, default 20.
+                          </span>
+                          <input
+                            class="config-input"
+                            type="number"
+                            min={5}
+                            max={500}
+                            value={autoSearchMinChars() ?? ""}
+                            placeholder={defaultPlaceholder("memory.auto_search.min_prompt_chars")}
+                            onInput={(e) => {
+                              const v = e.currentTarget.value;
+                              setAutoSearch({
+                                min_prompt_chars: v
+                                  ? Math.max(5, Math.min(500, Number(v)))
+                                  : undefined,
+                              });
+                            }}
+                          />
+                        </div>
+                      </Show>
+
+                      {/* Git commit indexing */}
+                      <div class="config-field" hidden={activeSection() !== "Memory & search"}>
+                        <div class="config-field-header">
+                          <span class="config-field-label">Git Commit Indexing</span>
+                          <span class="config-field-key">memory.git_commit_indexing.enabled</span>
+                        </div>
+                        <span class="config-field-desc">
+                          Index <code>HEAD</code> non-merge commits into <code>ctx_search</code> as
+                          a 4th source alongside memories, facts, and message history.
+                        </span>
+                        <details class="config-help">
+                          <summary>Why index commits?</summary>
+                          <p>
+                            Useful for agents recalling regressions, prior fixes, and decisions
+                            without running git log manually. Off by default.
+                          </p>
+                        </details>
+                        <label class="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={gitCommitEnabled()}
+                            onChange={(e) => setGitCommit({ enabled: e.currentTarget.checked })}
+                          />
+                          <span class="toggle-slider" />
+                          <span class="toggle-label">
+                            {gitCommitEnabled() ? "Enabled" : "Disabled"}
+                            {inheritedDefault("memory.git_commit_indexing.enabled")}
+                          </span>
+                        </label>
+                      </div>
+
+                      <Show when={activeSection() === "Memory & search" && gitCommitEnabled()}>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">History Window (days)</span>
+                            <span class="config-field-key">
+                              memory.git_commit_indexing.since_days
+                            </span>
+                          </div>
+                          <span class="config-field-desc">
+                            Days of HEAD history to index. Older commits are excluded from search.
+                            Range 7–3650, default 365.
+                          </span>
+                          <input
+                            class="config-input"
+                            type="number"
+                            min={7}
+                            max={3650}
+                            value={gitCommitSinceDays() ?? ""}
+                            placeholder={defaultPlaceholder(
+                              "memory.git_commit_indexing.since_days",
+                            )}
+                            onInput={(e) => {
+                              const v = e.currentTarget.value;
+                              setGitCommit({
+                                since_days: v ? Math.max(7, Math.min(3650, Number(v))) : undefined,
+                              });
+                            }}
+                          />
+                        </div>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">Max Commits</span>
+                            <span class="config-field-key">
+                              memory.git_commit_indexing.max_commits
+                            </span>
+                          </div>
+                          <span class="config-field-desc">
+                            Maximum commits kept per project. Oldest evicted when the cap is
+                            reached. Range 100–20000, default 2000.
+                          </span>
+                          <input
+                            class="config-input"
+                            type="number"
+                            min={100}
+                            max={20000}
+                            value={gitCommitMaxCommits() ?? ""}
+                            placeholder={defaultPlaceholder(
+                              "memory.git_commit_indexing.max_commits",
+                            )}
+                            onInput={(e) => {
+                              const v = e.currentTarget.value;
+                              setGitCommit({
+                                max_commits: v
+                                  ? Math.max(100, Math.min(20000, Number(v)))
+                                  : undefined,
+                              });
+                            }}
+                          />
+                        </div>
+                      </Show>
+
+                      {/* Caveman text compression */}
+                      <div class="config-field" hidden={activeSection() !== "History"}>
+                        <div class="config-field-header">
+                          <span class="config-field-label">Caveman Text Compression</span>
+                          <span class="config-field-key">caveman_text_compression.enabled</span>
+                        </div>
+                        <span class="config-field-desc">
+                          Age-tiered compression for long user/assistant text parts.
+                        </span>
+                        <details class="config-help">
+                          <summary>Compression policy</summary>
+                          <p>
+                            Active for primary sessions when enabled; subagents are excluded because
+                            their context is curated by the parent. Outside the protected tail,
+                            oldest 20% of eligible tags get ultra compression, next 20% full, next
+                            20% lite, newest 40% untouched. Always compresses from the original
+                            source, so depth shifts are equivalent to compressing the original text
+                            directly. Off by default.
+                          </p>
+                        </details>
+                        <label class="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={cavemanEnabled()}
+                            onChange={(e) => setCaveman({ enabled: e.currentTarget.checked })}
+                          />
+                          <span class="toggle-slider" />
+                          <span class="toggle-label">
+                            {cavemanEnabled() ? "Enabled" : "Disabled"}
+                            {inheritedDefault("caveman_text_compression.enabled")}
+                          </span>
+                        </label>
+                      </div>
+
+                      <Show when={activeSection() === "History" && cavemanEnabled()}>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">Min Chars</span>
+                            <span class="config-field-key">caveman_text_compression.min_chars</span>
+                          </div>
+                          <span class="config-field-desc">
+                            Text parts shorter than this are left untouched. Range 100–10000,
+                            default 500.
+                          </span>
+                          <input
+                            class="config-input"
+                            type="number"
+                            min={100}
+                            max={10000}
+                            step={50}
+                            value={cavemanMinChars() ?? ""}
+                            placeholder={defaultPlaceholder("caveman_text_compression.min_chars")}
+                            onInput={(e) => {
+                              const v = e.currentTarget.value;
+                              setCaveman({
+                                min_chars: v
+                                  ? Math.max(100, Math.min(10000, Number(v)))
+                                  : undefined,
+                              });
+                            }}
+                          />
+                        </div>
+                      </Show>
                     </div>
-                    <span class="config-field-desc">
-                      Index <code>HEAD</code> non-merge commits into <code>ctx_search</code> as a
-                      4th source alongside memories, facts, and message history. Useful for agents
-                      recalling regressions, prior fixes, and decisions without running{" "}
-                      <code>git log</code> manually. Off by default.
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={gitCommitEnabled()}
-                        onChange={(e) => setGitCommit({ enabled: e.currentTarget.checked })}
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">
-                        {gitCommitEnabled() ? "Enabled" : "Disabled"}
-                      </span>
-                    </label>
                   </div>
+                );
+              })()}
 
-                  <Show when={gitCommitEnabled()}>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">History Window (days)</span>
-                        <span class="config-field-key">memory.git_commit_indexing.since_days</span>
-                      </div>
-                      <span class="config-field-desc">
-                        Days of HEAD history to index. Older commits are excluded from search. Range
-                        7–3650, default 365.
-                      </span>
-                      <input
-                        class="config-input"
-                        type="number"
-                        min={7}
-                        max={3650}
-                        value={gitCommitSinceDays()}
-                        onInput={(e) => {
-                          const v = e.currentTarget.value;
-                          setGitCommit({
-                            since_days: v ? Math.max(7, Math.min(3650, Number(v))) : 365,
-                          });
-                        }}
-                      />
-                    </div>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Max Commits</span>
-                        <span class="config-field-key">memory.git_commit_indexing.max_commits</span>
-                      </div>
-                      <span class="config-field-desc">
-                        Maximum commits kept per project. Oldest evicted when the cap is reached.
-                        Range 100–20000, default 2000.
-                      </span>
-                      <input
-                        class="config-input"
-                        type="number"
-                        min={100}
-                        max={20000}
-                        value={gitCommitMaxCommits()}
-                        onInput={(e) => {
-                          const v = e.currentTarget.value;
-                          setGitCommit({
-                            max_commits: v ? Math.max(100, Math.min(20000, Number(v))) : 2000,
-                          });
-                        }}
-                      />
-                    </div>
-                  </Show>
+              {/* Advanced — power-user / debug knobs. Full-width, rendered last. */}
+              {(() => {
+                const autoUpdate = () => Boolean(booleanSetting("auto_update"));
+                const keepSubagents = () => Boolean(booleanSetting("keep_subagents"));
+                const todowrite = () =>
+                  (getNestedValue(formData(), "todowrite") as
+                    | { enabled?: boolean; overlay?: boolean }
+                    | undefined) ?? {};
+                const todowriteEnabled = () => Boolean(booleanSetting("todowrite.enabled"));
+                const todowriteOverlay = () => Boolean(booleanSetting("todowrite.overlay"));
+                const setTodowrite = (patch: Record<string, unknown>) =>
+                  handleFieldChange("todowrite", { ...todowrite(), ...patch });
+                const smartDrops = () => Boolean(booleanSetting("smart_drops"));
+                const sqlite = () =>
+                  (getNestedValue(formData(), "sqlite") as
+                    | { cache_size_mb?: number; mmap_size_mb?: number }
+                    | undefined) ?? {};
+                const sqliteCacheMb = () => sqlite().cache_size_mb;
+                const sqliteMmapMb = () => sqlite().mmap_size_mb;
+                const setSqlite = (patch: Record<string, unknown>) =>
+                  handleFieldChange("sqlite", { ...sqlite(), ...patch });
+                const systemPromptInjectionEnabled = () =>
+                  Boolean(booleanSetting("system_prompt_injection.enabled"));
+                const compactionEnabled = () => Boolean(booleanSetting("compaction.enabled"));
+                const storagePrivatePermissions = () =>
+                  Boolean(booleanSetting("storage.enforce_private_permissions"));
+                const piExtensions = () => {
+                  const value = getNestedValue(formData(), "pi.subagent_extensions");
+                  return Array.isArray(value)
+                    ? value.filter((entry): entry is string => typeof entry === "string")
+                    : [];
+                };
+                const piExtensionsText = () => piExtensions().join("\n");
 
-                  {/* Caveman text compression */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Caveman Text Compression</span>
-                      <span class="config-field-key">caveman_text_compression.enabled</span>
-                    </div>
-                    <span class="config-field-desc">
-                      Age-tiered compression for long user/assistant text parts. Active for primary
-                      sessions when enabled; subagents are excluded because their context is curated
-                      by the parent. Outside the protected tail, oldest 20% of eligible tags get
-                      ultra compression, next 20% full, next 20% lite, newest 40% untouched. Always
-                      compresses from the original source, so depth shifts are equivalent to
-                      compressing the original text directly. Off by default.
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={cavemanEnabled()}
-                        onChange={(e) => setCaveman({ enabled: e.currentTarget.checked })}
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">{cavemanEnabled() ? "Enabled" : "Disabled"}</span>
-                    </label>
-                  </div>
-
-                  <Show when={cavemanEnabled()}>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Min Chars</span>
-                        <span class="config-field-key">caveman_text_compression.min_chars</span>
-                      </div>
-                      <span class="config-field-desc">
-                        Text parts shorter than this are left untouched. Range 100–10000, default
-                        500.
-                      </span>
-                      <input
-                        class="config-input"
-                        type="number"
-                        min={100}
-                        max={10000}
-                        step={50}
-                        value={cavemanMinChars()}
-                        onInput={(e) => {
-                          const v = e.currentTarget.value;
-                          setCaveman({
-                            min_chars: v ? Math.max(100, Math.min(10000, Number(v))) : 500,
-                          });
-                        }}
-                      />
-                    </div>
-                  </Show>
-                </div>
-              </div>
-            );
-          })()}
-
-          {/* Advanced — power-user / debug knobs. Full-width, rendered last. */}
-          {(() => {
-            const autoUpdate = () => {
-              const v = getNestedValue(formData(), "auto_update");
-              return v == null ? true : Boolean(v);
-            };
-            const keepSubagents = () => Boolean(getNestedValue(formData(), "keep_subagents"));
-            const todowrite = () =>
-              (getNestedValue(formData(), "todowrite") as
-                | { enabled?: boolean; overlay?: boolean }
-                | undefined) ?? {};
-            const todowriteEnabled = () => todowrite().enabled ?? true;
-            const todowriteOverlay = () => todowrite().overlay ?? true;
-            const setTodowrite = (patch: Record<string, unknown>) =>
-              handleFieldChange("todowrite", { ...todowrite(), ...patch });
-            const smartDrops = () => Boolean(getNestedValue(formData(), "smart_drops"));
-            const sqlite = () =>
-              (getNestedValue(formData(), "sqlite") as
-                | { cache_size_mb?: number; mmap_size_mb?: number }
-                | undefined) ?? {};
-            const sqliteCacheMb = () => sqlite().cache_size_mb ?? 64;
-            const sqliteMmapMb = () => sqlite().mmap_size_mb ?? 0;
-            const setSqlite = (patch: Record<string, unknown>) =>
-              handleFieldChange("sqlite", { ...sqlite(), ...patch });
-            const systemPromptInjectionEnabled = () => {
-              const v = getNestedValue(formData(), "system_prompt_injection.enabled");
-              return v == null ? true : Boolean(v);
-            };
-            const compactionEnabled = () => {
-              const v = getNestedValue(formData(), "compaction.enabled");
-              return v == null ? true : Boolean(v);
-            };
-            const storagePrivatePermissions = () => {
-              const v = getNestedValue(formData(), "storage.enforce_private_permissions");
-              return v == null ? true : Boolean(v);
-            };
-            const piExtensions = () => {
-              const value = getNestedValue(formData(), "pi.subagent_extensions");
-              return Array.isArray(value)
-                ? value.filter((entry): entry is string => typeof entry === "string")
-                : [];
-            };
-            const piExtensionsText = () => piExtensions().join("\n");
-
-            return (
-              <div class="config-card full-width">
-                <div class="config-card-header">
-                  <span class="config-card-icon">🛠️</span>
-                  <span class="config-card-title">Advanced</span>
-                </div>
-                <div class="config-card-content">
+                return (
                   <div
-                    class="config-field-desc"
-                    style={{ "margin-bottom": "8px", opacity: "0.85" }}
+                    class="config-card full-width"
+                    hidden={
+                      !["Advanced", "Context window", "Prompt surface"].includes(activeSection())
+                    }
                   >
-                    Power-user and debug settings. Most users never need these.
-                  </div>
-
-                  <Show when={isUserScope()}>
-                    {/* Auto update */}
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Auto Update</span>
-                        <span class="config-field-key">auto_update</span>
-                      </div>
-                      <span class="config-field-desc">
-                        Automatically self-update the OpenCode plugin to the latest published
-                        version on startup. On by default. (User-config only — project configs
-                        cannot change it.)
-                      </span>
-                      <label class="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={autoUpdate()}
-                          onChange={(e) =>
-                            handleFieldChange("auto_update", e.currentTarget.checked)
-                          }
-                        />
-                        <span class="toggle-slider" />
-                        <span class="toggle-label">{autoUpdate() ? "Enabled" : "Disabled"}</span>
-                      </label>
+                    <div class="config-card-header">
+                      <span class="config-card-icon">🛠️</span>
+                      <span class="config-card-title">Advanced</span>
                     </div>
-                  </Show>
+                    <div class="config-card-content">
+                      <Show when={isUserScope()}>
+                        {/* Auto update */}
+                        <div class="config-field" hidden={activeSection() !== "Advanced"}>
+                          <div class="config-field-header">
+                            <span class="config-field-label">Auto Update</span>
+                            <span class="config-field-key">auto_update</span>
+                          </div>
+                          <span class="config-field-desc">
+                            Automatically self-update the OpenCode plugin to the latest published
+                            version on startup. On by default. (User-config only — project configs
+                            cannot change it.)
+                          </span>
+                          <label class="toggle-switch">
+                            <input
+                              type="checkbox"
+                              checked={autoUpdate()}
+                              onChange={(e) =>
+                                handleFieldChange("auto_update", e.currentTarget.checked)
+                              }
+                            />
+                            <span class="toggle-slider" />
+                            <span class="toggle-label">
+                              {autoUpdate() ? "Enabled" : "Disabled"}
+                              {inheritedDefault("auto_update")}
+                            </span>
+                          </label>
+                        </div>
+                      </Show>
 
-                  {/* Keep subagents */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Keep Subagent Sessions</span>
-                      <span class="config-field-key">keep_subagents</span>
-                    </div>
-                    <span class="config-field-desc">
-                      Retain the child sessions magic-context spawns for its own agents (historian,
-                      dreamer, memory migration, key-files, user-memory). By default these are
-                      deleted on success; enable this to keep their full transcript and token usage
-                      for debugging. Kept sessions accumulate until cleared. Off by default.
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={keepSubagents()}
-                        onChange={(e) =>
-                          handleFieldChange("keep_subagents", e.currentTarget.checked)
-                        }
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">{keepSubagents() ? "Enabled" : "Disabled"}</span>
-                    </label>
-                  </div>
-
-                  {/* Pi todowrite */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Pi Todowrite Tool</span>
-                      <span class="config-field-key">todowrite.enabled</span>
-                    </div>
-                    <span class="config-field-desc">
-                      Register Magic Context&apos;s Pi <code>todowrite</code> task-list tool.
-                      Disable this if you use another Pi todo extension. OpenCode has its own
-                      built-in todowrite, so this setting only affects Pi. Requires /reload or
-                      restart after changing.
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={todowriteEnabled()}
-                        onChange={(e) => setTodowrite({ enabled: e.currentTarget.checked })}
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">
-                        {todowriteEnabled() ? "Enabled" : "Disabled"}
-                      </span>
-                    </label>
-                  </div>
-
-                  <Show when={todowriteEnabled()}>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Pi Todo Overlay</span>
-                        <span class="config-field-key">todowrite.overlay</span>
-                      </div>
-                      <span class="config-field-desc">
-                        Show the persistent todo overlay above the editor while tasks are active.
-                        The /todos command and tool remain available when only the overlay is off.
-                      </span>
-                      <label class="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={todowriteOverlay()}
-                          onChange={(e) => setTodowrite({ overlay: e.currentTarget.checked })}
-                        />
-                        <span class="toggle-slider" />
-                        <span class="toggle-label">
-                          {todowriteOverlay() ? "Enabled" : "Disabled"}
+                      {/* Keep subagents */}
+                      <div class="config-field" hidden={activeSection() !== "Advanced"}>
+                        <div class="config-field-header">
+                          <span class="config-field-label">Keep Subagent Sessions</span>
+                          <span class="config-field-key">keep_subagents</span>
+                        </div>
+                        <span class="config-field-desc">
+                          Retain the child sessions magic-context spawns for its own agents
+                          (historian, dreamer, memory migration, key-files, user-memory).
                         </span>
-                      </label>
-                    </div>
-                  </Show>
-
-                  <Show when={isUserScope()}>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Compaction Management</span>
-                        <span class="config-field-key">compaction.enabled</span>
+                        <details class="config-help">
+                          <summary>Retention behavior</summary>
+                          <p>
+                            By default these are deleted on success; enable this to keep their full
+                            transcript and token usage for debugging. Kept sessions accumulate until
+                            cleared. Off by default.
+                          </p>
+                        </details>
+                        <label class="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={keepSubagents()}
+                            onChange={(e) =>
+                              handleFieldChange("keep_subagents", e.currentTarget.checked)
+                            }
+                          />
+                          <span class="toggle-slider" />
+                          <span class="toggle-label">
+                            {keepSubagents() ? "Enabled" : "Disabled"}
+                            {inheritedDefault("keep_subagents")}
+                          </span>
+                        </label>
                       </div>
-                      <span class="config-field-desc">
-                        Let Magic Context manage the context window. Turn this off to keep memory
-                        and search features while native compaction (or nothing) owns the window.
-                        Requires a restart and applies only to user configuration.
-                      </span>
-                      <label class="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={compactionEnabled()}
-                          onChange={(e) =>
-                            handleFieldChange("compaction.enabled", e.currentTarget.checked)
-                          }
-                        />
-                        <span class="toggle-slider" />
-                        <span class="toggle-label">
-                          {compactionEnabled() ? "Enabled" : "Disabled"}
+
+                      {/* Pi todowrite */}
+                      <div class="config-field" hidden={activeSection() !== "Advanced"}>
+                        <div class="config-field-header">
+                          <span class="config-field-label">Pi Todowrite Tool</span>
+                          <span class="config-restart-badge">Reload / restart</span>
+                          <span class="config-field-key">todowrite.enabled</span>
+                        </div>
+                        <span class="config-field-desc">
+                          Register Magic Context&apos;s Pi <code>todowrite</code> task-list tool.
+                          Disable this if you use another Pi todo extension. OpenCode has its own
+                          built-in todowrite, so this setting only affects Pi. Requires /reload or
+                          restart after changing.
                         </span>
-                      </label>
-                    </div>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Private Storage Permissions</span>
-                        <span class="config-field-key">storage.enforce_private_permissions</span>
+                        <label class="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={todowriteEnabled()}
+                            onChange={(e) => setTodowrite({ enabled: e.currentTarget.checked })}
+                          />
+                          <span class="toggle-slider" />
+                          <span class="toggle-label">
+                            {todowriteEnabled() ? "Enabled" : "Disabled"}
+                            {inheritedDefault("todowrite.enabled")}
+                          </span>
+                        </label>
                       </div>
-                      <span class="config-field-desc">
-                        Keep Magic Context directories owner-only (0700) and files owner-only
-                        (0600). Disable only when a trusted group manages permissions externally.
-                      </span>
-                      <label class="toggle-switch">
-                        <input
-                          type="checkbox"
-                          checked={storagePrivatePermissions()}
-                          onChange={(e) =>
-                            handleFieldChange(
-                              "storage.enforce_private_permissions",
-                              e.currentTarget.checked,
-                            )
-                          }
-                        />
-                        <span class="toggle-slider" />
-                        <span class="toggle-label">
-                          {storagePrivatePermissions() ? "Enabled" : "Disabled"}
+
+                      <Show when={activeSection() === "Advanced" && todowriteEnabled()}>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">Pi Todo Overlay</span>
+                            <span class="config-restart-badge">Reload / restart</span>
+                            <span class="config-field-key">todowrite.overlay</span>
+                          </div>
+                          <span class="config-field-desc">
+                            Show the persistent todo overlay above the editor while tasks are
+                            active. The /todos command and tool remain available when only the
+                            overlay is off.
+                          </span>
+                          <label class="toggle-switch">
+                            <input
+                              type="checkbox"
+                              checked={todowriteOverlay()}
+                              onChange={(e) => setTodowrite({ overlay: e.currentTarget.checked })}
+                            />
+                            <span class="toggle-slider" />
+                            <span class="toggle-label">
+                              {todowriteOverlay() ? "Enabled" : "Disabled"}
+                              {inheritedDefault("todowrite.overlay")}
+                            </span>
+                          </label>
+                        </div>
+                      </Show>
+
+                      <Show when={isUserScope()}>
+                        <div class="config-field" hidden={activeSection() !== "Context window"}>
+                          <div class="config-field-header">
+                            <span class="config-field-label">Compaction Management</span>
+                            <span class="config-restart-badge">Restart</span>
+                            <span class="config-field-key">compaction.enabled</span>
+                          </div>
+                          <span class="config-field-desc">
+                            Let Magic Context manage the context window. Turn this off to keep
+                            memory and search features while native compaction (or nothing) owns the
+                            window. Requires a restart and applies only to user configuration.
+                          </span>
+                          <label class="toggle-switch">
+                            <input
+                              type="checkbox"
+                              checked={compactionEnabled()}
+                              onChange={(e) =>
+                                handleFieldChange("compaction.enabled", e.currentTarget.checked)
+                              }
+                            />
+                            <span class="toggle-slider" />
+                            <span class="toggle-label">
+                              {compactionEnabled() ? "Enabled" : "Disabled"}
+                              {inheritedDefault("compaction.enabled")}
+                            </span>
+                          </label>
+                        </div>
+                        <div class="config-field" hidden={activeSection() !== "Advanced"}>
+                          <div class="config-field-header">
+                            <span class="config-field-label">Private Storage Permissions</span>
+                            <span class="config-field-key">
+                              storage.enforce_private_permissions
+                            </span>
+                          </div>
+                          <span class="config-field-desc">
+                            Keep Magic Context directories owner-only (0700) and files owner-only
+                            (0600). Disable only when a trusted group manages permissions
+                            externally.
+                          </span>
+                          <label class="toggle-switch">
+                            <input
+                              type="checkbox"
+                              checked={storagePrivatePermissions()}
+                              onChange={(e) =>
+                                handleFieldChange(
+                                  "storage.enforce_private_permissions",
+                                  e.currentTarget.checked,
+                                )
+                              }
+                            />
+                            <span class="toggle-slider" />
+                            <span class="toggle-label">
+                              {storagePrivatePermissions() ? "Enabled" : "Disabled"}
+                              {inheritedDefault("storage.enforce_private_permissions")}
+                            </span>
+                          </label>
+                        </div>
+                        <div class="config-field" hidden={activeSection() !== "Advanced"}>
+                          <div class="config-field-header">
+                            <span class="config-field-label">Pi Subagent Extensions</span>
+                            <span class="config-field-key">pi.subagent_extensions</span>
+                          </div>
+                          <span class="config-field-desc">
+                            Optional user-level allowlist for extensions loaded by Pi subagent
+                            children. Enter one extension path or package per line.
+                          </span>
+                          <textarea
+                            class="code-editor"
+                            rows={4}
+                            value={piExtensionsText()}
+                            placeholder="extensions/my-tools.ts"
+                            onInput={(e) => {
+                              const entries = e.currentTarget.value
+                                .split("\n")
+                                .map((entry) => entry.trim())
+                                .filter(Boolean);
+                              handleFieldChange(
+                                "pi.subagent_extensions",
+                                entries.length > 0 ? entries : undefined,
+                              );
+                            }}
+                          />
+                        </div>
+                      </Show>
+
+                      {/* Smart drops */}
+                      <div class="config-field" hidden={activeSection() !== "Context window"}>
+                        <div class="config-field-header">
+                          <span class="config-field-label">Smart Drops</span>
+                          <span class="config-field-key">smart_drops</span>
+                        </div>
+                        <span class="config-field-desc">
+                          Experimental: content-aware reclaim of provably-superseded tool output, on
+                          top of the existing auto-drop.
                         </span>
-                      </label>
-                    </div>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">Pi Subagent Extensions</span>
-                        <span class="config-field-key">pi.subagent_extensions</span>
+                        <details class="config-help">
+                          <summary>What gets reclaimed</summary>
+                          <p>
+                            Drops superseded todowrite, spent ctx_reduce, and zero-value status
+                            outputs, and compresses older edits to a file while keeping the newest.
+                            Only acts on passes already busting the cache, so it never causes a
+                            cache bust on its own. Off by default while cache stability is being
+                            proven.
+                          </p>
+                        </details>
+                        <label class="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={smartDrops()}
+                            onChange={(e) =>
+                              handleFieldChange("smart_drops", e.currentTarget.checked)
+                            }
+                          />
+                          <span class="toggle-slider" />
+                          <span class="toggle-label">
+                            {smartDrops() ? "Enabled" : "Disabled"}
+                            {inheritedDefault("smart_drops")}
+                          </span>
+                        </label>
                       </div>
-                      <span class="config-field-desc">
-                        Optional user-level allowlist for extensions loaded by Pi subagent children.
-                        Enter one extension path or package per line.
-                      </span>
-                      <textarea
-                        class="code-editor"
-                        rows={4}
-                        value={piExtensionsText()}
-                        placeholder="extensions/my-tools.ts"
-                        onInput={(e) => {
-                          const entries = e.currentTarget.value
-                            .split("\n")
-                            .map((entry) => entry.trim())
-                            .filter(Boolean);
-                          handleFieldChange(
-                            "pi.subagent_extensions",
-                            entries.length > 0 ? entries : undefined,
-                          );
-                        }}
-                      />
-                    </div>
-                  </Show>
 
-                  {/* Smart drops */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">Smart Drops</span>
-                      <span class="config-field-key">smart_drops</span>
+                      {/* System prompt injection */}
+                      <div class="config-field" hidden={activeSection() !== "Prompt surface"}>
+                        <div class="config-field-header">
+                          <span class="config-field-label">System Prompt Injection</span>
+                          <span class="config-field-key">system_prompt_injection.enabled</span>
+                        </div>
+                        <span class="config-field-desc">
+                          Inject the magic-context guidance text into the system prompt. On by
+                          default. Disabling it stops the guidance block entirely. To exclude only
+                          specific custom agents, set{" "}
+                          <code>system_prompt_injection.skip_signatures</code> (a substring list) in
+                          the raw editor.
+                        </span>
+                        <label class="toggle-switch">
+                          <input
+                            type="checkbox"
+                            checked={systemPromptInjectionEnabled()}
+                            onChange={(e) =>
+                              handleFieldChange(
+                                "system_prompt_injection.enabled",
+                                e.currentTarget.checked,
+                              )
+                            }
+                          />
+                          <span class="toggle-slider" />
+                          <span class="toggle-label">
+                            {systemPromptInjectionEnabled() ? "Enabled" : "Disabled"}
+                            {inheritedDefault("system_prompt_injection.enabled")}
+                          </span>
+                        </label>
+                      </div>
+
+                      <Show when={isUserScope() && activeSection() === "Advanced"}>
+                        {/* SQLite tuning */}
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">SQLite Cache (MB)</span>
+                            <span class="config-field-key">sqlite.cache_size_mb</span>
+                          </div>
+                          <span class="config-field-desc">
+                            Per-connection page-cache size in MB. Higher reduces disk reads on large
+                            databases at the cost of memory. Range 2–2048 MiB, default 64.
+                          </span>
+                          <input
+                            class="config-input"
+                            type="number"
+                            min={configSchemaNode("sqlite.cache_size_mb")?.minimum}
+                            max={configSchemaNode("sqlite.cache_size_mb")?.maximum}
+                            value={sqliteCacheMb() ?? ""}
+                            placeholder={defaultPlaceholder("sqlite.cache_size_mb")}
+                            onInput={(e) => {
+                              const v = e.currentTarget.value;
+                              setSqlite({
+                                cache_size_mb: v ? Number(v) : undefined,
+                              });
+                            }}
+                          />
+                        </div>
+                        <div class="config-field">
+                          <div class="config-field-header">
+                            <span class="config-field-label">SQLite mmap (MB)</span>
+                            <span class="config-field-key">sqlite.mmap_size_mb</span>
+                          </div>
+                          <span class="config-field-desc">
+                            Memory-mapped I/O size in MB. 0 disables mmap. Can speed up large reads
+                            on some filesystems. Range 0–8192 MiB, default 0.
+                          </span>
+                          <input
+                            class="config-input"
+                            type="number"
+                            min={0}
+                            max={configSchemaNode("sqlite.mmap_size_mb")?.maximum}
+                            value={sqliteMmapMb() ?? ""}
+                            placeholder={defaultPlaceholder("sqlite.mmap_size_mb")}
+                            onInput={(e) => {
+                              const v = e.currentTarget.value;
+                              setSqlite({
+                                mmap_size_mb: v ? Number(v) : undefined,
+                              });
+                            }}
+                          />
+                        </div>
+                      </Show>
                     </div>
-                    <span class="config-field-desc">
-                      Experimental: content-aware reclaim of provably-superseded tool output, on top
-                      of the existing auto-drop. Drops superseded todowrite, spent ctx_reduce, and
-                      zero-value status outputs, and compresses older edits to a file while keeping
-                      the newest. Only acts on passes already busting the cache, so it never causes
-                      a cache bust on its own. Off by default while cache stability is being proven.
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={smartDrops()}
-                        onChange={(e) => handleFieldChange("smart_drops", e.currentTarget.checked)}
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">{smartDrops() ? "Enabled" : "Disabled"}</span>
-                    </label>
                   </div>
-
-                  {/* System prompt injection */}
-                  <div class="config-field">
-                    <div class="config-field-header">
-                      <span class="config-field-label">System Prompt Injection</span>
-                      <span class="config-field-key">system_prompt_injection.enabled</span>
-                    </div>
-                    <span class="config-field-desc">
-                      Inject the magic-context guidance text into the system prompt. On by default.
-                      Disabling it stops the guidance block entirely. To exclude only specific
-                      custom agents, set <code>system_prompt_injection.skip_signatures</code> (a
-                      substring list) in the raw editor.
-                    </span>
-                    <label class="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={systemPromptInjectionEnabled()}
-                        onChange={(e) =>
-                          handleFieldChange(
-                            "system_prompt_injection.enabled",
-                            e.currentTarget.checked,
-                          )
-                        }
-                      />
-                      <span class="toggle-slider" />
-                      <span class="toggle-label">
-                        {systemPromptInjectionEnabled() ? "Enabled" : "Disabled"}
-                      </span>
-                    </label>
-                  </div>
-
-                  <Show when={isUserScope()}>
-                    {/* SQLite tuning */}
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">SQLite Cache (MB)</span>
-                        <span class="config-field-key">sqlite.cache_size_mb</span>
-                      </div>
-                      <span class="config-field-desc">
-                        Per-connection page-cache size in MB. Higher reduces disk reads on large
-                        databases at the cost of memory. Range 8–1024, default 64.
-                      </span>
-                      <input
-                        class="config-input"
-                        type="number"
-                        min={8}
-                        max={1024}
-                        value={sqliteCacheMb()}
-                        onInput={(e) => {
-                          const v = e.currentTarget.value;
-                          setSqlite({
-                            cache_size_mb: v ? Math.max(8, Math.min(1024, Number(v))) : 64,
-                          });
-                        }}
-                      />
-                    </div>
-                    <div class="config-field">
-                      <div class="config-field-header">
-                        <span class="config-field-label">SQLite mmap (MB)</span>
-                        <span class="config-field-key">sqlite.mmap_size_mb</span>
-                      </div>
-                      <span class="config-field-desc">
-                        Memory-mapped I/O size in MB. 0 disables mmap. Can speed up large reads on
-                        some filesystems. Range 0–4096, default 0.
-                      </span>
-                      <input
-                        class="config-input"
-                        type="number"
-                        min={0}
-                        max={4096}
-                        value={sqliteMmapMb()}
-                        onInput={(e) => {
-                          const v = e.currentTarget.value;
-                          setSqlite({
-                            mmap_size_mb: v ? Math.max(0, Math.min(4096, Number(v))) : 0,
-                          });
-                        }}
-                      />
-                    </div>
-                  </Show>
-                </div>
-              </div>
-            );
-          })()}
+                );
+              })()}
+            </div>
+          </section>
         </div>
       </Show>
     </div>
@@ -2218,6 +2178,9 @@ function ProjectConfigDetail(props: {
 export default function ConfigEditor(props: {
   modelCatalogs: ModelCatalogs;
   opencodeInstallState: OpencodeInstallState;
+  catalogLoading: boolean;
+  catalogError: string | null;
+  onRetryCatalogs: () => void;
 }) {
   const [configTarget, setConfigTarget] = createSignal<ConfigTarget>(loadConfigTarget());
   const [userConfig, { refetch: refetchUser }] = createResource(() => getConfig("user"));
@@ -2279,6 +2242,17 @@ export default function ConfigEditor(props: {
           </button>
         </div>
       </div>
+
+      <Show when={props.catalogLoading || props.catalogError}>
+        <div class="empty-state" role="status">
+          <span>{props.catalogLoading ? "Loading OpenCode models..." : props.catalogError}</span>
+          <Show when={!props.catalogLoading && props.catalogError}>
+            <button type="button" class="btn sm" onClick={props.onRetryCatalogs}>
+              Retry model discovery
+            </button>
+          </Show>
+        </div>
+      </Show>
 
       <div class="tab-pills">
         <button

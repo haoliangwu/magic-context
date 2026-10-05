@@ -2,10 +2,15 @@ import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import {
     captureSlot,
     dropSlot,
+    exactReusablePrefix,
     getSlot,
     type LkgEntryNote,
+    type LkgInputSnapshot,
     type LkgSlot,
     lkgContentDigest,
+    lkgContentDigestFromFields,
+    lkgContentFields,
+    memoizedLkgContentDigestFromFields,
     noteEntry,
 } from "./lkg-slot";
 import { assertOpenAiCompatAdjacency } from "./openai-compat-adjacency";
@@ -39,11 +44,7 @@ export function resolveLkgModelKeys(messages: MessageLike[]): LkgModelKeys {
         }
         const provider = info?.providerID;
         const model = info?.modelID;
-        if (
-            info?.role === "assistant" &&
-            typeof provider === "string" &&
-            typeof model === "string"
-        ) {
+        if (typeof provider === "string" && typeof model === "string") {
             return canonicalLkgModelKeys(`${provider}/${model}`, provider);
         }
     }
@@ -57,12 +58,107 @@ export interface LkgEntryProjection {
     timeCreated: number | null;
     finish: unknown;
     hasIncompleteTool: boolean;
-    /** Compute the non-enumerable digest lazily so only LKG capture or replay validation hashes message content. */
+    /** Immutable entry digest, exposed non-enumerably without retaining the live message. */
     contentDigest?: () => string | null;
 }
 
 export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
-    return messages.map((message) => {
+    return projectEntryWithDigests(messages, messages.map(lkgContentDigest));
+}
+
+/** Keep exact pristine tokens in memory: ids or rolling hashes alone cannot prove reuse. */
+export function createLkgEntryProjector(
+    options: {
+        maxBytes?: number;
+        onReuse?: (stats: { reused: number; retained: number; retainedBytes: number }) => void;
+    } = {},
+) {
+    const priors = new Map<
+        string,
+        {
+            entries: Map<string, { snapshot: LkgInputSnapshot; digest: string | null }>;
+            bytes: number;
+        }
+    >();
+    const maxBytes = options.maxBytes ?? 64 * 1024 * 1024;
+    let bytes = 0;
+    return (sessionId: string, messages: MessageLike[]): LkgEntryProjection[] => {
+        const prior = priors.get(sessionId);
+        const snapshots = messages.map((message) => ({
+            id: typeof message.info?.id === "string" ? message.info.id : "",
+            fields: lkgContentFields(message),
+        }));
+        let reused = 0;
+        // Each digest describes one complete message, not the preceding history.
+        // A changed leading entry must not force hashing thousands of unchanged
+        // successors. Still compare every typed field, including metadata.
+        const digests = snapshots.map((snapshot) => {
+            const cached = prior?.entries.get(snapshot.id);
+            if (
+                snapshot.fields &&
+                cached &&
+                exactReusablePrefix([snapshot as LkgInputSnapshot], [cached.snapshot]) === 1
+            ) {
+                reused += 1;
+                return cached.digest;
+            }
+            if (!snapshot.fields) return null;
+            // An explicit projector budget must not retain entries in the
+            // separate shared memo beyond that caller's requested bound.
+            return options.maxBytes === undefined
+                ? memoizedLkgContentDigestFromFields(snapshot.id, snapshot.fields)
+                : lkgContentDigestFromFields(snapshot.fields);
+        });
+        if (prior) {
+            bytes -= prior.bytes;
+            priors.delete(sessionId);
+        }
+        let size = 0;
+        let retainedCount = 0;
+        // Oversized history used to discard the entire reuse state every pass.
+        // Keep as many exact entries as fit; an oversized entry is always hashed.
+        const retained = new Map<string, { snapshot: LkgInputSnapshot; digest: string | null }>();
+        snapshots.forEach((snapshot, index) => {
+            const entrySize =
+                snapshot.id.length * 2 +
+                (snapshot.fields?.reduce<number>(
+                    (sum, field) => sum + 16 + (typeof field === "string" ? field.length * 2 : 0),
+                    0,
+                ) ?? 0) +
+                80 +
+                86;
+            if (!snapshot.fields || retained.has(snapshot.id) || size + entrySize > maxBytes)
+                return;
+            size += entrySize;
+            retainedCount += 1;
+            retained.set(snapshot.id, {
+                snapshot: snapshot as LkgInputSnapshot,
+                digest: digests[index] ?? null,
+            });
+        });
+        if (size <= maxBytes && retainedCount > 0) {
+            while (priors.size >= 16 || bytes + size > maxBytes) {
+                const oldest = priors.entries().next().value;
+                if (!oldest) break;
+                bytes -= oldest[1].bytes;
+                priors.delete(oldest[0]);
+            }
+            priors.set(sessionId, {
+                entries: retained,
+                bytes: size,
+            });
+            bytes += size;
+        }
+        options.onReuse?.({ reused, retained: retainedCount, retainedBytes: size });
+        return projectEntryWithDigests(messages, digests);
+    };
+}
+
+function projectEntryWithDigests(
+    messages: MessageLike[],
+    digests: readonly (string | null)[],
+): LkgEntryProjection[] {
+    return messages.map((message, index) => {
         const info = messageInfo(message);
         const time = info.time;
         const timeRecord =
@@ -105,8 +201,11 @@ export function projectLkgEntry(messages: MessageLike[]): LkgEntryProjection[] {
             finish: info.finish,
             hasIncompleteTool,
         };
+        // Tagging and heuristic edits mutate these same objects later in the pass.
+        // Replay sees pristine host inputs, so bind the capture to those entry bytes.
+        const contentDigest = digests[index] ?? null;
         Object.defineProperty(projection, "contentDigest", {
-            value: () => lkgContentDigest(message),
+            value: () => contentDigest,
             enumerable: false,
         });
         return projection;
@@ -401,9 +500,9 @@ function partIsOpenCodeStepMetadata(part: unknown): boolean {
  * completed non-provider-executed tool result materializes as user content and
  * starts a new assistant run, while OpenCode's step markers do not materialize
  * on the provider wire.
- * Each resulting assistant run may contain only one leading thinking block; a
- * later signed block would invalidate its provider signature, so recovery declines
- * the entire replay instead of attempting a rewrite.
+ * Leading signed thinking blocks are safe together only when they originate in
+ * the same assistant message. Thinking after content or from a later merged
+ * assistant message is declined rather than rewriting its signature.
  */
 export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean {
     let index = 0;
@@ -412,18 +511,23 @@ export function validateAnthropicReasoningRuns(messages: MessageLike[]): boolean
             index += 1;
             continue;
         }
-        let thinkingBlocks = 0;
+        // The run's first message is the first one that contributes provider content;
+        // an assistant holding only step markers does not reach the wire, so it cannot
+        // make a later message's leading thinking count as merged.
+        let firstMessageInRun: number | null = null;
         let sawOtherContent = false;
         while (index < messages.length && messageRole(messages[index]) === "assistant") {
             for (const part of messageParts(messages[index])) {
-                if (partIsAnthropicThinking(part)) {
-                    thinkingBlocks += 1;
-                    if (thinkingBlocks > 1 || sawOtherContent) return false;
-                } else if (partEndsAnthropicAssistantRun(part)) {
-                    thinkingBlocks = 0;
+                if (partEndsAnthropicAssistantRun(part)) {
+                    firstMessageInRun = null;
                     sawOtherContent = false;
                 } else if (!partIsOpenCodeStepMetadata(part)) {
-                    sawOtherContent = true;
+                    if (firstMessageInRun === null) firstMessageInRun = index;
+                    if (partIsAnthropicThinking(part)) {
+                        if (sawOtherContent || index !== firstMessageInRun) return false;
+                    } else {
+                        sawOtherContent = true;
+                    }
                 }
             }
             index += 1;
@@ -513,6 +617,8 @@ export function replayLkg(args: {
     providerKey: string | null;
     entry?: LkgEntryNote | null;
     skipSeamValidation?: boolean;
+    /** Reapply persisted thinking-strip decisions before validating the candidate's wire shape. */
+    prepareReplay?: (messages: MessageLike[]) => void;
 }): { ok: true; messages: MessageLike[] } | { ok: false; reason: LkgValidationFailure } {
     const slot = getSlot(args.sessionId);
     if (!slot) return { ok: false, reason: "lkg_invalidated_reshape" };
@@ -547,6 +653,8 @@ export function replayLkg(args: {
         dropSlot(args.sessionId, "lkg_seam_invalid");
         return { ok: false, reason: "lkg_seam_invalid" };
     }
+    const replayed = [...prefix, ...entry.pristineTail];
+    args.prepareReplay?.(replayed);
     if (!args.skipSeamValidation) {
         if (!validateLkgSeamBoundary(prefix, entry.pristineTail)) {
             dropSlot(args.sessionId, "lkg_unsafe_seam");
@@ -557,7 +665,6 @@ export function replayLkg(args: {
             return { ok: false, reason: "lkg_seam_invalid" };
         }
     }
-    const replayed = [...prefix, ...entry.pristineTail];
     if (
         requestedModelKeys.providerKey === "anthropic" &&
         !validateAnthropicReasoningRuns(replayed)
@@ -566,6 +673,131 @@ export function replayLkg(args: {
         return { ok: false, reason: "lkg_anthropic_reasoning_run_invalid" };
     }
     return { ok: true, messages: replayed };
+}
+
+function messageIdOf(message: unknown): string | undefined {
+    if (typeof message !== "object" || message === null) return undefined;
+    const info = (message as { info?: unknown }).info;
+    if (typeof info !== "object" || info === null) return undefined;
+    const id = (info as { id?: unknown }).id;
+    return typeof id === "string" ? id : undefined;
+}
+
+/**
+ * Where a previous process served raw messages from a frozen replay, or null when
+ * it did not: `index` is the first snapshot message the module now renders
+ * differently, and `rawRunStart` is the raw-input index where the snapshot's
+ * trailing raw run begins (the first message the freeze served raw).
+ *
+ * A frozen replay serves the snapshot's prefix followed by the raw input's newer
+ * messages, and a frozen healthy pass captures exactly that. So after a restart, a
+ * snapshot the freeze captured ends in a run of messages exactly as the host sent
+ * them, and inside that run the module now renders at least one message
+ * differently. Only that trailing run is searched.
+ *
+ * A healthy snapshot holds module output. For each message either the module
+ * renders it like the raw input (module equals raw) or it does not (snapshot
+ * differs from raw); host additions such as nudges also make the snapshot differ
+ * from raw. A healthy snapshot that is only stale (for example a database restored
+ * from an older backup) can hold a message the module has since re-rendered, but
+ * module output that differs from raw (tagged user turns) normally follows it, so
+ * it does not sit inside an all-raw trailing run. Requiring the run to reach the
+ * snapshot's end is what keeps such a snapshot from resuming a freeze.
+ *
+ * `key` must compare messages as the provider would see them; it must apply the
+ * session's persisted thinking strips to all three arrays alike, so a stripped
+ * block in the snapshot does not read as a difference.
+ */
+export function coldStartRawServedIndex(args: {
+    slotMessages: readonly unknown[];
+    rawInput: readonly unknown[];
+    moduleOutput: readonly unknown[];
+    key: (message: unknown) => string;
+}): { index: number; rawRunStart: number } | null {
+    const raw = messagesById(args.rawInput);
+    const rendered = messagesById(args.moduleOutput);
+    // Walk back from the end over messages the snapshot holds exactly as the host
+    // sent them; `runStart` is where that trailing raw run begins.
+    const rawKeys: string[] = [];
+    let runStart = args.slotMessages.length;
+    while (runStart > 0) {
+        const served = args.slotMessages[runStart - 1];
+        const id = messageIdOf(served);
+        const rawMessage = id === undefined ? undefined : raw.get(id);
+        if (rawMessage === undefined) break;
+        const rawKey = args.key(rawMessage);
+        if (args.key(served) !== rawKey) break;
+        runStart -= 1;
+        rawKeys[runStart] = rawKey;
+    }
+    for (let index = runStart; index < args.slotMessages.length; index += 1) {
+        const id = messageIdOf(args.slotMessages[index]) as string;
+        const moduleMessage = rendered.get(id);
+        if (moduleMessage !== undefined && args.key(moduleMessage) !== rawKeys[index]) {
+            const runStartId = messageIdOf(args.slotMessages[runStart]) as string;
+            const rawRunStart = args.rawInput.findIndex(
+                (message) => messageIdOf(message) === runStartId,
+            );
+            return { index, rawRunStart };
+        }
+    }
+    return null;
+}
+
+function messagesById(messages: readonly unknown[]): Map<string, unknown> {
+    const map = new Map<string, unknown>();
+    for (const message of messages) {
+        const id = messageIdOf(message);
+        if (id !== undefined) map.set(id, message);
+    }
+    return map;
+}
+
+/**
+ * The array a previous process most likely served last when it ended right after
+ * a last-known-good replay it never captured, or null when the input shows no
+ * such replay.
+ *
+ * A failure, parked or wrapper replay serves the snapshot followed by the raw
+ * input's newer messages and captures nothing, so after a restart the snapshot
+ * ends before messages the provider saw raw. A healthy pass captures through the
+ * newest real user message every time, so in a healthy session the only real user
+ * message after the snapshot's end is the newest input message. A real user
+ * message after the snapshot's end with more messages after it, which the module
+ * now renders differently from the raw input, therefore shows an uncaptured pass
+ * that served it raw (or, rarely, a healthy pass whose capture was lost), and the
+ * thinking produced after it is bound to the raw bytes.
+ *
+ * Returns the snapshot followed by the raw input after the snapshot's last
+ * message, which is what such a replay served. `key` compares messages as the
+ * provider sees them, with the session's persisted thinking strips applied.
+ */
+export function coldStartUncapturedReplay(args: {
+    slotMessages: readonly unknown[];
+    rawInput: readonly unknown[];
+    moduleOutput: readonly unknown[];
+    key: (message: unknown) => string;
+}): { lastServed: unknown[]; rawUserIndex: number } | null {
+    const lastSlotId = messageIdOf(args.slotMessages.at(-1));
+    if (lastSlotId === undefined) return null;
+    const slotEnd = args.rawInput.findIndex((message) => messageIdOf(message) === lastSlotId);
+    if (slotEnd < 0) return null;
+    const rendered = messagesById(args.moduleOutput);
+    // The newest input message is excluded: nothing has been produced against it.
+    for (let index = slotEnd + 1; index < args.rawInput.length - 1; index += 1) {
+        const rawMessage = args.rawInput[index];
+        const info = (rawMessage as { info?: { role?: unknown; synthetic?: unknown } })?.info;
+        if (info?.role !== "user" || info.synthetic === true) continue;
+        const id = messageIdOf(rawMessage);
+        const moduleMessage = id === undefined ? undefined : rendered.get(id);
+        if (moduleMessage === undefined) continue;
+        if (args.key(moduleMessage) === args.key(rawMessage)) continue;
+        return {
+            lastServed: [...args.slotMessages, ...args.rawInput.slice(slotEnd + 1)],
+            rawUserIndex: index,
+        };
+    }
+    return null;
 }
 
 export function validateLkgEntry(slot: LkgSlot, entryIds: string[]): boolean {

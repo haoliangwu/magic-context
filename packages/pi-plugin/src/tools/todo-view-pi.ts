@@ -253,10 +253,26 @@ function formatCommandLine(todo: TodoItem): string {
 	return `  ${STATUS_GLYPH[todo.status]} ${id}${todo.content}`;
 }
 
+/**
+ * Pi's TUI re-renders every transcript component on every frame (continuously
+ * while the working spinner runs), and a long session holds hundreds of todowrite
+ * results. The rows are fixed once the component exists, so render once per
+ * width; invalidate() drops the cache so a theme change still repaints.
+ */
 function lineComponent(renderLines: (width: number) => string[]): Component {
+	let cachedWidth: number | undefined;
+	let cachedLines: string[] = [];
 	return {
-		render: renderLines,
-		invalidate() {},
+		render(width: number) {
+			if (width !== cachedWidth) {
+				cachedLines = renderLines(width);
+				cachedWidth = width;
+			}
+			return cachedLines;
+		},
+		invalidate() {
+			cachedWidth = undefined;
+		},
 	};
 }
 

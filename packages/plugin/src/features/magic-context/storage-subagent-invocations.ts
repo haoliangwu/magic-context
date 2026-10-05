@@ -9,7 +9,7 @@ export type SubagentKind =
     | "user_memory_review"
     | "recomp";
 
-export type SubagentInvocationStatus = "completed" | "failed" | "aborted";
+export type SubagentInvocationStatus = "completed" | "failed" | "aborted" | "timed_out" | "empty";
 
 export interface SubagentInvocationInput {
     sessionId: string;

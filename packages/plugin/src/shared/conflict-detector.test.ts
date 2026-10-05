@@ -552,10 +552,14 @@ describe("detectConflicts", () => {
             }
         }
 
-        it("resolved auto=false + file layer that would default true → NO conflict (#309)", () => {
-            // No compaction block in any file + no env override → the file-based
-            // arm would default to auto=true and wrongly disable the plugin.
-            // The resolved arm says auto=false, which must win.
+        it("resolved auto=false outranks a file layer that says auto=true (#309)", () => {
+            // The file layer says auto=true, which on its own disables the
+            // plugin. The host's resolved config says auto=false, and the host
+            // is the authority — it can see layers the file reader cannot.
+            writeFileSync(
+                join(projectDir, "opencode.json"),
+                JSON.stringify({ compaction: { auto: true } }),
+            );
             withoutAutoCompactEnv(() => {
                 const result = detectConflicts(projectDir, {
                     compactionEnabled: true,
@@ -592,8 +596,17 @@ describe("detectConflicts", () => {
         });
 
         it("resolved arm is skipped when resolvedCompaction is absent (file-based fallback unchanged)", () => {
-            // No resolvedCompaction → the file-based check runs. With no
-            // compaction block and no env override, it defaults to auto=true.
+            // No resolvedCompaction → the file-based check runs and owns the
+            // verdict. The written block is what makes the file arm say
+            // auto=true; it used to be an absent block relying on the file
+            // arm's default-on, which issue #484 removed because an absent
+            // block cannot tell "the user wrote nothing" apart from "we read
+            // the wrong directory". The claim under test is unchanged: with no
+            // resolved value the file arm decides, and its reason is unlabeled.
+            writeFileSync(
+                join(projectDir, "opencode.json"),
+                JSON.stringify({ compaction: { auto: true } }),
+            );
             withoutAutoCompactEnv(() => {
                 const result = detectConflicts(projectDir, { compactionEnabled: true });
                 expect(result.conflicts.compactionAuto).toBe(true);
@@ -635,6 +648,166 @@ describe("detectConflicts", () => {
         });
     });
 
+    // --- OPENCODE_CONFIG_DIR is an ADDITION, not a replacement (issue #484) ---
+    //
+    // A launcher (Orca) exported OPENCODE_CONFIG_DIR to a directory holding
+    // only plugin scaffolding. OpenCode kept reading the user's real global
+    // config — `opencode debug config` showed compaction.auto=false — but the
+    // detector resolved the env directory INSTEAD of the global one, found no
+    // file, fell through to its default-on, and disabled the plugin.
+    //
+    // Verified against the opencode 1.18.30 binary and on a live host:
+    // `$XDG_CONFIG_HOME/opencode` is always read; `~/.opencode` is always
+    // scanned; `$OPENCODE_CONFIG_DIR` is appended LAST, so it wins ties but
+    // never hides the layers below it.
+    describe("OPENCODE_CONFIG_DIR is additive, not a replacement (issue #484)", () => {
+        let globalDir: string;
+        let launcherDir: string;
+
+        beforeEach(() => {
+            // These cases exercise compaction detection itself, so the suite's
+            // isolation env var has to go.
+            delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            // HOME is the temp dir and XDG_CONFIG_HOME is cleared by the suite
+            // beforeEach, so this is the same path OpenCode would compute.
+            globalDir = join(homeDir, ".config", "opencode");
+            mkdirSync(globalDir, { recursive: true });
+            // The reporter's launcher directory: plugin scaffolding, no config.
+            launcherDir = join(root, "launcher-config-dir");
+            mkdirSync(launcherDir, { recursive: true });
+            writeFileSync(
+                join(launcherDir, "package.json"),
+                JSON.stringify({ name: "launcher-scaffold", version: "1.0.0" }),
+            );
+            process.env.OPENCODE_CONFIG_DIR = launcherDir;
+        });
+
+        afterEach(() => {
+            delete process.env.OPENCODE_CONFIG;
+        });
+
+        function writeCompaction(dir: string, file: string, compaction: unknown): void {
+            mkdirSync(dir, { recursive: true });
+            writeFileSync(join(dir, file), JSON.stringify({ compaction }));
+        }
+
+        it("reporter repro: global auto=false + config-less OPENCODE_CONFIG_DIR → no conflict", () => {
+            writeCompaction(globalDir, "opencode.json", { auto: false });
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.hasConflict).toBe(false);
+            expect(result.nativeCompaction.auto).toBe(false);
+        });
+
+        it("positive control: global auto=true still reports the conflict", () => {
+            writeCompaction(globalDir, "opencode.json", { auto: true });
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(true);
+            expect(result.hasConflict).toBe(true);
+            expect(result.reasons.join("; ")).toContain("compaction.auto=true");
+        });
+
+        it("an OPENCODE_CONFIG_DIR that DOES carry auto=true outranks a global auto=false", () => {
+            writeCompaction(globalDir, "opencode.json", { auto: false });
+            writeCompaction(launcherDir, "opencode.json", { auto: true });
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(true);
+            expect(result.hasConflict).toBe(true);
+        });
+
+        it("an OPENCODE_CONFIG_DIR auto=false outranks a global auto=true", () => {
+            writeCompaction(globalDir, "opencode.json", { auto: true });
+            writeCompaction(launcherDir, "opencode.jsonc", { auto: false });
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.hasConflict).toBe(false);
+        });
+
+        it("v1 keeps global supplementary config above the project .opencode overlay", () => {
+            writeCompaction(launcherDir, "opencode.json", { auto: false });
+            writeCompaction(join(projectDir, ".opencode"), "opencode.json", { auto: true });
+            const result = detectConflicts(projectDir, {
+                compactionEnabled: true,
+                hostGeneration: "v1",
+            });
+            expect(result.nativeCompaction.auto).toBe(false);
+            expect(result.conflicts.compactionAuto).toBe(false);
+        });
+
+        it("v2 ranks the project .opencode overlay above global supplementary config", () => {
+            writeCompaction(launcherDir, "opencode.json", { auto: false });
+            writeCompaction(join(projectDir, ".opencode"), "opencode.json", { auto: true });
+            const result = detectConflicts(projectDir, {
+                compactionEnabled: true,
+                hostGeneration: "v2",
+            });
+            expect(result.nativeCompaction.auto).toBe(true);
+            expect(result.conflicts.compactionAuto).toBe(false);
+        });
+
+        it("reads the global directory's legacy config.json layer", () => {
+            writeCompaction(globalDir, "config.json", { auto: true });
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(true);
+        });
+
+        it("global opencode.jsonc overrides global opencode.json", () => {
+            writeCompaction(globalDir, "opencode.json", { auto: true });
+            writeCompaction(globalDir, "opencode.jsonc", { auto: false });
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.hasConflict).toBe(false);
+        });
+
+        it("~/.opencode outranks the global config directory", () => {
+            writeCompaction(globalDir, "opencode.json", { auto: false });
+            writeCompaction(join(homeDir, ".opencode"), "opencode.json", { auto: true });
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(true);
+        });
+
+        it("reads the $OPENCODE_CONFIG single-file override", () => {
+            const explicit = join(root, "explicit-opencode.json");
+            writeFileSync(explicit, JSON.stringify({ compaction: { auto: true } }));
+            process.env.OPENCODE_CONFIG = explicit;
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(true);
+        });
+
+        it("merges keys across layers instead of letting one file erase the other", () => {
+            writeCompaction(globalDir, "opencode.json", { auto: false });
+            writeCompaction(projectDir, "opencode.json", { prune: true });
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.nativeCompaction.auto).toBe(false);
+            expect(result.nativeCompaction.prune).toBe(true);
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.conflicts.compactionPrune).toBe(true);
+        });
+
+        it("no compaction key in any readable layer is inconclusive, never a disable", () => {
+            // Nothing anywhere. OpenCode's own default is auto=true, but we
+            // cannot tell "the user wrote nothing" from "the value lives in a
+            // layer we cannot read" (managed/enterprise config, an org layer,
+            // a file we failed to parse). Guessing the disabling direction
+            // leaves NOTHING managing the window — the unrecoverable failure
+            // issue #309 established for the resolved arm.
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.compactionAuto).toBe(false);
+            expect(result.conflicts.compactionPrune).toBe(false);
+            expect(result.hasConflict).toBe(false);
+            expect(result.nativeCompaction.auto).toBe(false);
+        });
+
+        it("still finds a conflicting plugin declared in the global config", () => {
+            writeFileSync(
+                join(globalDir, "opencode.json"),
+                JSON.stringify({ plugin: ["@tarquinen/opencode-dcp"] }),
+            );
+            const result = detectConflicts(projectDir, { compactionEnabled: true });
+            expect(result.conflicts.dcpPlugin).toBe(true);
+        });
+    });
+
     // --- resolveCompactionForBoot (the resolved-config fetch helper) ---
     describe("resolveCompactionForBoot", () => {
         it("returns the resolved compaction block from the client", async () => {
@@ -647,6 +820,40 @@ describe("detectConflicts", () => {
             };
             const result = await resolveCompactionForBoot(client);
             expect(result).toEqual({ auto: false, prune: true });
+        });
+
+        it("resolves a host block that carries only compaction.auto (issue #484)", async () => {
+            // The shape opencode 1.18.30 actually serves for the ordinary
+            // `"compaction": { "auto": false }` config: OpenCode merges only
+            // the keys the user wrote and never materialises schema defaults,
+            // so `prune` is simply absent. Requiring it here used to reject
+            // this block and hand the decision to the file arm.
+            const client = {
+                config: {
+                    get: async () => ({ data: { compaction: { auto: false } } }),
+                },
+            };
+            const result = await resolveCompactionForBoot(client);
+            expect(result).toEqual({ auto: false, prune: false });
+        });
+
+        it("resolves auto=true without prune and keeps it a conflict", async () => {
+            const client = {
+                config: {
+                    get: async () => ({ data: { compaction: { auto: true } } }),
+                },
+            };
+            const resolved = await resolveCompactionForBoot(client);
+            expect(resolved).toEqual({ auto: true, prune: false });
+            // The suite beforeEach sets OPENCODE_DISABLE_AUTOCOMPACT, which
+            // short-circuits both arms; this case is about the verdict.
+            delete process.env.OPENCODE_DISABLE_AUTOCOMPACT;
+            const result = detectConflicts(projectDir, {
+                compactionEnabled: true,
+                resolvedCompaction: resolved ?? undefined,
+            });
+            expect(result.conflicts.compactionAuto).toBe(true);
+            expect(result.reasons.join("; ")).toContain("(resolved config)");
         });
 
         it("returns null when the compaction block is absent (file-based fallback, not host defaults)", async () => {
@@ -665,7 +872,7 @@ describe("detectConflicts", () => {
             expect(result).toBeNull();
         });
 
-        it("returns null when compaction values are not explicit booleans", async () => {
+        it("returns null when compaction.auto is not an explicit boolean", async () => {
             const client = {
                 config: {
                     get: async () => ({ data: { compaction: { auto: "true", prune: null } } }),
@@ -673,6 +880,16 @@ describe("detectConflicts", () => {
             };
             const result = await resolveCompactionForBoot(client);
             expect(result).toBeNull();
+        });
+
+        it("treats a non-boolean prune as false rather than discarding an explicit auto", async () => {
+            const client = {
+                config: {
+                    get: async () => ({ data: { compaction: { auto: true, prune: "yes" } } }),
+                },
+            };
+            const result = await resolveCompactionForBoot(client);
+            expect(result).toEqual({ auto: true, prune: false });
         });
 
         it("returns null when the response data is missing entirely", async () => {

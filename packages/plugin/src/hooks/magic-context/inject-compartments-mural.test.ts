@@ -1,12 +1,18 @@
 /// <reference types="bun-types" />
 
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import {
+    buildMagicContextSection,
+    MEMORY_MURAL_BLOCK,
+    MEMORY_MURAL_GUIDANCE,
+} from "../../agents/magic-context-prompt";
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { getOrCreateSessionMeta } from "../../features/magic-context/storage-meta-session";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { injectM0M1, type M0M1State } from "./inject-compartments";
+import { injectM0M1, type M0M1State, renderM0, stripMemoryMuralBlock } from "./inject-compartments";
 import type { MessageLike } from "./tag-messages";
 
 const SESSION_ID = "ses_mural_inject";
@@ -52,6 +58,82 @@ function replaceCurrentManifest(db: Database, content = "current mural"): string
 }
 
 describe("m[0] mural image fold (on-demand render → wire)", () => {
+    it("keeps the Rust mural block byte-equal and the system prompt unchanged", () => {
+        const rust = readFileSync(
+            new URL("../../../../../crates/mc-module/src/m0_compose.rs", import.meta.url),
+            "utf8",
+        );
+        const literal = rust.match(/const MEMORY_MURAL_BLOCK: &str =\s*("[^;]+");/)![1]!;
+        expect(JSON.parse(literal)).toBe(MEMORY_MURAL_BLOCK);
+        expect(buildMagicContextSection(null, 0)).not.toContain(MEMORY_MURAL_GUIDANCE);
+    });
+
+    it("emits the legend only with an enabled vision image", () => {
+        const base = {
+            projectDocs: "",
+            userProfileBaseline: [],
+            compartments: [],
+            memories: [],
+            facts: [],
+        };
+        expect(renderM0({ ...base, mural: muralOption() })).toContain(MEMORY_MURAL_BLOCK);
+        for (const mural of [
+            undefined,
+            { ...muralOption(), enabled: false },
+            { ...muralOption(), supportsVision: false },
+            { ...muralOption(), dataUrl: "" },
+        ]) {
+            expect(renderM0({ ...base, mural })).not.toContain(MEMORY_MURAL_GUIDANCE);
+        }
+        for (const block of [
+            MEMORY_MURAL_BLOCK,
+            "<memory-mural>\nThe project memory mural image follows.\n</memory-mural>",
+        ]) {
+            expect(stripMemoryMuralBlock(`before\n\n${block}\n\nafter`)).toBe("before\n\nafter");
+        }
+    });
+
+    it("replays a pre-legend baseline unchanged until the next HARD fold", () => {
+        const db = makeDb();
+        try {
+            const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
+            const args = {
+                db,
+                sessionId: SESSION_ID,
+                state,
+                projectPath: undefined,
+                mural: muralOption(),
+                hardSignals: {
+                    systemHash: "old",
+                    modelKey: "anthropic/test-model",
+                    cacheExpired: false,
+                    lastResponseTime: 0,
+                },
+            };
+            injectM0M1({ ...args, messages: [], isCacheBustingPass: true });
+            const legacy = Buffer.from(
+                state.cachedM0Bytes!.toString("utf8").replace(`${MEMORY_MURAL_GUIDANCE}\n`, ""),
+            );
+            db.prepare("UPDATE session_meta SET cached_m0_bytes = ? WHERE session_id = ?").run(
+                legacy,
+                SESSION_ID,
+            );
+            state.cachedM0Bytes = legacy;
+            const deferred = injectM0M1({ ...args, messages: [], isCacheBustingPass: false });
+            expect(deferred.m0RematerializedThisPass).toBe(false);
+            expect(deferred.m0Bytes).toEqual(legacy);
+            const folded = injectM0M1({
+                ...args,
+                hardSignals: { ...args.hardSignals, systemHash: "next" },
+                messages: [],
+                isCacheBustingPass: false,
+            });
+            expect(folded.m0RematerializedThisPass).toBe(true);
+            expect(folded.m0Bytes?.toString("utf8")).toContain(MEMORY_MURAL_GUIDANCE);
+        } finally {
+            closeQuietly(db);
+        }
+    });
     it("folds the <memory-mural> block and image part when a mural is supplied, and replays it on defer", () => {
         const db = makeDb();
         try {
@@ -69,7 +151,7 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
             });
             expect(first.injected).toBe(true);
             // m[0] carries the mural marker block.
-            expect(first.m0Bytes?.toString("utf8")).toContain("<memory-mural>");
+            expect(first.m0Bytes?.toString("utf8")).toContain(MEMORY_MURAL_BLOCK);
             // The prepended synthetic head message carries an image file part.
             const head = hardMessages[0];
             const imagePart = head?.parts.find(
@@ -96,6 +178,70 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 (part) => (part as { type?: string }).type === "file",
             ) as { url?: string } | undefined;
             expect(deferImage?.url).toBe(FAKE_MURAL_DATA_URL);
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("lets a new mural ride the next natural HARD instead of triggering one", () => {
+        const db = makeDb();
+        try {
+            const state = getOrCreateSessionMeta(db, SESSION_ID) as unknown as M0M1State;
+            const hardSignals = (systemHash: string) => ({
+                systemHash,
+                modelKey: "anthropic/test-model",
+                cacheExpired: false,
+                lastResponseTime: 0,
+            });
+            const firstMessages: MessageLike[] = [];
+            const first = injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                messages: firstMessages,
+                state,
+                projectPath: undefined,
+                isCacheBustingPass: true,
+                muralEnabled: true,
+                mural: muralOption(FAKE_MURAL_DATA_URL, "mural-hash-a"),
+                hardSignals: hardSignals("system-a"),
+            });
+            expect(first.m0RematerializedThisPass).toBe(true);
+
+            const nextDataUrl = "data:image/png;base64,Yg==";
+            const deferMessages: MessageLike[] = [];
+            const deferred = injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                messages: deferMessages,
+                state,
+                projectPath: undefined,
+                isCacheBustingPass: false,
+                muralEnabled: true,
+                mural: muralOption(nextDataUrl, "mural-hash-b"),
+                hardSignals: hardSignals("system-a"),
+            });
+            expect(deferred.decision).toEqual({ value: false, reason: null });
+            expect(deferred.m0RematerializedThisPass).toBe(false);
+            expect(deferred.m0Bytes).toEqual(first.m0Bytes);
+            expect(imageUrl(deferMessages)).toBe(FAKE_MURAL_DATA_URL);
+            expect(state.cachedM0MuralHash).toBe("mural-hash-a");
+
+            const hardMessages: MessageLike[] = [];
+            const folded = injectM0M1({
+                db,
+                sessionId: SESSION_ID,
+                messages: hardMessages,
+                state,
+                projectPath: undefined,
+                isCacheBustingPass: false,
+                muralEnabled: true,
+                mural: muralOption(nextDataUrl, "mural-hash-b"),
+                hardSignals: hardSignals("system-b"),
+            });
+            expect(folded.decision).toMatchObject({ value: true, reason: "system_hash" });
+            expect(folded.m0RematerializedThisPass).toBe(true);
+            expect(imageUrl(hardMessages)).toBe(nextDataUrl);
+            expect(state.cachedM0MuralHash).toBe("mural-hash-b");
         } finally {
             closeQuietly(db);
         }
@@ -132,10 +278,14 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 memoryInjectionBudgetTokens: 8_000,
                 historyBudgetTokens: 60_000,
             });
-            expect(disabled.decision).toEqual({ value: true, reason: "render_config" });
+            expect(disabled.decision).toEqual({
+                value: true,
+                reason: "render_config:mural(true→false)",
+            });
             expect(disabled.m0RematerializedThisPass).toBe(true);
             expect(imageUrl(disabledMessages)).toBeUndefined();
             expect(disabled.m0Bytes?.toString("utf8")).not.toContain("<memory-mural>");
+            expect(disabled.m0Bytes?.toString("utf8")).not.toContain(MEMORY_MURAL_GUIDANCE);
 
             const deferMessages: MessageLike[] = [];
             const defer = injectM0M1({
@@ -183,7 +333,10 @@ describe("m[0] mural image fold (on-demand render → wire)", () => {
                 memoryInjectionBudgetTokens: 1_001,
                 historyBudgetTokens: 2_000,
             });
-            expect(changed.decision).toEqual({ value: true, reason: "render_config" });
+            expect(changed.decision).toEqual({
+                value: true,
+                reason: "render_config:budget(m1000-h2000→m1001-h2000)",
+            });
             expect(changed.m0RematerializedThisPass).toBe(true);
 
             const unchanged = injectM0M1({

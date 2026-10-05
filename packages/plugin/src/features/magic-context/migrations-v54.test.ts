@@ -1,15 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
-    applyMirrorPage,
     ensureContextStoreUuid,
-    getMirrorCursor,
     installAuthorityManagedMarker,
-} from "./context-authority";
+} from "./legacy-authority-fixture.test-support";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
@@ -153,7 +152,7 @@ describe("authority-managed context.db schema", () => {
     });
 
     it("rejects a raw connection that has not entered a privilege bracket", () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-authority-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-authority-"));
         tempDirs.push(dir);
         const path = join(dir, "context.db");
         const managed = freshDatabase(path);
@@ -174,7 +173,7 @@ describe("authority-managed context.db schema", () => {
     });
 
     it("does not leak privilege to a second connection during a paused bracket", () => {
-        const dir = mkdtempSync(join(tmpdir(), "mc-authority-leak-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-authority-leak-"));
         tempDirs.push(dir);
         const path = join(dir, "context.db");
         const connA = freshDatabase(path);
@@ -202,15 +201,18 @@ describe("authority-managed context.db schema", () => {
                 .run("/project", "CONSTRAINTS", "after", "hash"),
         ).toThrow(/managed by the Rust module/i);
     });
+});
 
-    it("reinstalls the latest authority triggers after replaying a legacy batch", () => {
-        const db = freshDatabase();
-        const uuid = ensureContextStoreUuid(db);
-        installAuthorityManagedMarker(db, "/project", uuid);
-        db.prepare(
-            "INSERT INTO session_projects(session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
-        ).run("session", "/project");
-        db.exec(`
+describe("module changefeed mirror", () => {});
+
+it("reinstalls the latest authority triggers after replaying a legacy batch", () => {
+    const db = freshDatabase();
+    const uuid = ensureContextStoreUuid(db);
+    installAuthorityManagedMarker(db, "/project", uuid);
+    db.prepare(
+        "INSERT INTO session_projects(session_id, harness, project_path, updated_at) VALUES (?, 'opencode', ?, 0)",
+    ).run("session", "/project");
+    db.exec(`
             DROP TRIGGER notes_authority_guard_insert;
             CREATE TRIGGER notes_authority_guard_insert
             BEFORE INSERT ON notes
@@ -221,104 +223,13 @@ describe("authority-managed context.db schema", () => {
             DELETE FROM schema_migrations WHERE version >= 61;
         `);
 
-        runMigrations(db);
+    runMigrations(db);
 
-        expect(() =>
-            db
-                .prepare(
-                    "INSERT INTO notes (type, status, content, session_id, created_at, updated_at) VALUES ('session', 'active', 'blocked after replay', ?, 0, 0)",
-                )
-                .run("session"),
-        ).toThrow(/managed by the Rust module/i);
-    });
-});
-
-describe("module changefeed mirror", () => {
-    it("keeps identities stable and removes stale vectors in the apply transaction", () => {
-        const db = freshDatabase();
-        applyMirrorPage({
-            db,
-            page: {
-                domain: "memories",
-                cursor: 0,
-                next_cursor: 1,
-                has_more: true,
-                rows: [
-                    {
-                        feed_seq: 1,
-                        domain: "memories",
-                        op: "insert",
-                        module_row_id: 41,
-                        content_hash: "hash-a",
-                        full_row_snapshot: {
-                            id: 41,
-                            project_path: "/project",
-                            category: "CONSTRAINTS",
-                            content: "one",
-                            normalized_hash: "hash-a",
-                            status: "active",
-                            scope: "project",
-                            shareable: 0,
-                            created_at: 1,
-                            updated_at: 1,
-                            first_seen_at: 1,
-                            last_seen_at: 1,
-                        },
-                    },
-                ],
-            },
-        });
-        const identity = db
+    expect(() =>
+        db
             .prepare(
-                "SELECT context_row_id FROM mirror_identity WHERE domain = 'memories' AND module_project = ? AND module_row_id = ?",
+                "INSERT INTO notes (type, status, content, session_id, created_at, updated_at) VALUES ('session', 'active', 'blocked after replay', ?, 0, 0)",
             )
-            .get("/project", 41) as { context_row_id: number };
-        db.prepare(
-            "INSERT INTO memory_embeddings(memory_id, embedding, model_id) VALUES (?, ?, ?)",
-        ).run(identity.context_row_id, Buffer.from([1]), "model");
-
-        applyMirrorPage({
-            db,
-            page: {
-                domain: "memories",
-                cursor: 1,
-                next_cursor: 2,
-                has_more: false,
-                rows: [
-                    {
-                        feed_seq: 2,
-                        domain: "memories",
-                        op: "update",
-                        module_row_id: 41,
-                        content_hash: "hash-b",
-                        full_row_snapshot: {
-                            id: 41,
-                            project_path: "/project",
-                            category: "CONSTRAINTS",
-                            content: "two",
-                            normalized_hash: "hash-b",
-                            status: "active",
-                            scope: "project",
-                            shareable: 0,
-                            created_at: 1,
-                            updated_at: 2,
-                            first_seen_at: 1,
-                            last_seen_at: 2,
-                        },
-                    },
-                ],
-            },
-        });
-        expect(getMirrorCursor(db, "memories")).toBe(2);
-        expect(
-            db.prepare("SELECT COUNT(*) AS count FROM memory_embeddings").get() as {
-                count: number;
-            },
-        ).toEqual({ count: 0 });
-        expect(
-            db
-                .prepare("SELECT id, content FROM memories WHERE id = ?")
-                .get(identity.context_row_id) as { id: number; content: string },
-        ).toEqual({ id: identity.context_row_id, content: "two" });
-    });
+            .run("session"),
+    ).toThrow(/managed by the Rust module/i);
 });

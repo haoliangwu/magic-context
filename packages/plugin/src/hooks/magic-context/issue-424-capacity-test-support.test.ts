@@ -4,6 +4,7 @@ import {
     appendCompartments,
     getCompartments,
 } from "../../features/magic-context/compartment-storage";
+import { getHistorianFailureState } from "../../features/magic-context/storage";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { validateHistorianOutput } from "./compartment-runner-validation";
@@ -138,7 +139,7 @@ export function registerIssue424CapacityTests(
         });
     }
 
-    test(`issue 467 ${harness} fits a 1.02x atomic component, publishes, and does not re-read it`, async () => {
+    test(`issue 467 ${harness} clips a raw-window-sized atomic component to the room the fixed prompt parts leave`, async () => {
         const fixture = issue424Fixture(60, 1);
         const steeringText = `${"oversize steering value\n".repeat(20_000)}OVERSIZE_STEERING_END`;
         fixture.raw.splice(3, 0, {
@@ -214,11 +215,18 @@ export function registerIssue424CapacityTests(
                 historianContextLimit,
                 maxOutputTokens,
             });
+            // The component fills the raw window on its own, so with the system
+            // prompt, references and the unknown-model fit margin added it cannot be
+            // sent whole. It used to be clipped to the raw window only, and the full
+            // prompt was then refused on every run. Clipping it to the room the fixed
+            // parts leave sends one prompt and publishes the whole range.
             expect(firstPrompts).toHaveLength(1);
-            expect(firstPrompts[0]).toContain(
-                "[… tokens truncated by Magic Context to fit the historian window …]",
+            expect(firstPrompts[0]).toContain("OVERSIZE_STEERING_END");
+            expect(firstPrompts[0]).toContain("tokens truncated by Magic Context");
+            expect(estimateTokens(firstPrompts[0] ?? "")).toBeLessThan(sourceTokens);
+            expect(getHistorianFailureState(db, sessionId).lastError ?? "").not.toMatch(
+                /producer_prompt/,
             );
-            expect(firstPrompts[0]).not.toContain(chunk.text);
             expect(
                 getCompartments(db, sessionId).map((compartment) => [
                     compartment.startMessage,
@@ -228,19 +236,6 @@ export function registerIssue424CapacityTests(
                 [1, 1],
                 [2, chunk.endIndex],
             ]);
-
-            const secondPrompts = await run({
-                db,
-                sessionId,
-                raw,
-                boundary,
-                xml,
-                holderId,
-                historianChunkTokens,
-                historianContextLimit,
-                maxOutputTokens,
-            });
-            expect(secondPrompts).toHaveLength(0);
         } finally {
             dispose();
             db.close();

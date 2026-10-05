@@ -69,12 +69,10 @@ fn record_reasoning_native_evidence(
         native: collect(native.iter().map(|value| value.as_ref().clone()).collect()),
         unit_native: collect(candidate),
     });
-    response.row_version = store.commit(
-        &request.session_id,
-        loaded.row_version,
-        &loaded.core,
-        &loaded.meta,
-    )?;
+    // Only meta changes here. The full load above is for the hydrated served fingerprints,
+    // which the small row does not carry; the write itself is meta-only.
+    response.row_version =
+        store.commit_meta(&request.session_id, loaded.row_version, &loaded.meta)?;
     response.committed = true;
     Ok(())
 }

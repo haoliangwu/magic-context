@@ -1,9 +1,10 @@
 /// <reference types="bun-types" />
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 import { loadPiConfig } from "./config";
 import { __test, formatProtectedTagsDeprecationNotice } from "./index";
 
@@ -12,7 +13,7 @@ const originalHome = process.env.HOME;
 const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 
 function makeTempRoot(prefix: string): string {
-	const path = mkdtempSync(join(tmpdir(), prefix));
+	const path = createTestTempDirFromPath(join(tmpdir(), prefix));
 	tempRoots.push(path);
 	return path;
 }

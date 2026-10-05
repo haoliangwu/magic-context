@@ -1,7 +1,8 @@
 /// <reference types="bun-types" />
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { waitForReady } from "./spawn";
@@ -21,7 +22,7 @@ function readyProviderConfig(): Response {
 }
 
 function newPluginLogPath(): string {
-    const directory = mkdtempSync(join(tmpdir(), "mc-opencode-readiness-"));
+    const directory = createTestTempDirFromPath(join(tmpdir(), "mc-opencode-readiness-"));
     tempDirs.push(directory);
     return join(directory, "magic-context.log");
 }

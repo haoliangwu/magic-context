@@ -48,6 +48,7 @@ packages/plugin/docs/animation[0-9]*/
 # release body + Discord announcement. Must use `dir/*` rather than `dir/` so
 # git descends into the directory and can re-include nested paths.
 .cortexkit/*
+.cortexkit/magic-context/
 !.cortexkit/alfonso/
 .cortexkit/alfonso/*
 !.cortexkit/alfonso/release-notes/
@@ -126,3 +127,15 @@ packages/*/.cortexkit/
 .agents/
 opencode.jsonc
 docs/mc-prompt-structure.html
+
+# Scratch trees written by the pure-replay differential harness (never source; keep the
+# watcher and the code index out of them). Every run goes under this one fixed parent so a
+# file watcher can exclude a single path.
+.pure-replay-differential/
+
+# Same shape: the issue 485 fixture generator checks the pre-fix package out here.
+# The script removes it on the way out, but an interrupted run leaves it behind.
+.issue-485-pure-*/
+
+# Build residue from a sibling toolchain (Xcode/SwiftPM), never a project artifact
+.build/

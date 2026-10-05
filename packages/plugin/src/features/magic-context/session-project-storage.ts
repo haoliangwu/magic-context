@@ -6,7 +6,29 @@ const SESSION_CHUNK_REPAIR_BATCH_SIZE = 100;
 
 const upsertSessionProjectStatements = new WeakMap<Database, PreparedStatement>();
 const repairSessionChunkProjectStatements = new WeakMap<Database, PreparedStatement>();
-const repairProjectChunkProjectStatements = new WeakMap<Database, PreparedStatement>();
+const misScopedProjectChunkStatements = new WeakMap<Database, PreparedStatement>();
+
+// Each branch starts at a project index instead of scanning every chunk.
+export const MIS_SCOPED_PROJECT_CHUNK_IDS_SQL = `
+    SELECT e.id FROM compartment_chunk_embeddings e
+    JOIN session_projects sp ON sp.session_id = e.session_id AND sp.harness = e.harness
+    WHERE e.project_path = ? AND sp.project_path <> e.project_path
+    UNION ALL
+    SELECT e.id FROM session_projects sp
+    JOIN compartment_chunk_embeddings e ON e.session_id = sp.session_id
+    WHERE sp.project_path = ? AND e.harness = sp.harness AND e.project_path <> sp.project_path`;
+
+export function hasMisScopedCompartmentChunkEmbeddingsForProject(
+    db: Database,
+    projectPath: string,
+): boolean {
+    let stmt = misScopedProjectChunkStatements.get(db);
+    if (!stmt) {
+        stmt = db.prepare(`SELECT 1 FROM (${MIS_SCOPED_PROJECT_CHUNK_IDS_SQL}) LIMIT 1`);
+        misScopedProjectChunkStatements.set(db, stmt);
+    }
+    return !!stmt.get(projectPath, projectPath);
+}
 
 function getUpsertSessionProjectStatement(db: Database): PreparedStatement {
     let stmt = upsertSessionProjectStatements.get(db);
@@ -44,33 +66,15 @@ function getRepairSessionChunkProjectStatement(db: Database): PreparedStatement 
     return stmt;
 }
 
-function getRepairProjectChunkProjectStatement(db: Database): PreparedStatement {
-    let stmt = repairProjectChunkProjectStatements.get(db);
-    if (!stmt) {
-        stmt = db.prepare(
-            `UPDATE compartment_chunk_embeddings
-             SET project_path = (
-                 SELECT sp.project_path
-                 FROM session_projects sp
-                 WHERE sp.session_id = compartment_chunk_embeddings.session_id
-                   AND sp.harness = compartment_chunk_embeddings.harness
-                 LIMIT 1
-             )
-             WHERE EXISTS (
-                 SELECT 1
-                 FROM session_projects sp
-                 WHERE sp.session_id = compartment_chunk_embeddings.session_id
-                   AND sp.harness = compartment_chunk_embeddings.harness
-                   AND sp.project_path <> compartment_chunk_embeddings.project_path
-                   AND (
-                       sp.project_path = ?
-                       OR compartment_chunk_embeddings.project_path = ?
-                   )
-             )`,
-        );
-        repairProjectChunkProjectStatements.set(db, stmt);
-    }
-    return stmt;
+export function findMisScopedCompartmentChunkEmbeddingIdsForProject(
+    db: Database,
+    projectPath: string,
+): number[] {
+    return (
+        db
+            .prepare(`SELECT id FROM (${MIS_SCOPED_PROJECT_CHUNK_IDS_SQL}) LIMIT 25`)
+            .all(projectPath, projectPath) as Array<{ id: number }>
+    ).map(({ id }) => id);
 }
 
 /**
@@ -108,20 +112,45 @@ export function recordSessionProjectIdentity(
             projectPath,
             SESSION_CHUNK_REPAIR_BATCH_SIZE,
         );
-    })();
+    }).immediate();
 }
 
 /**
- * Idempotent project-scoped heal for historical chunk rows whose stored project
- * stamp disagrees with the recorded owner. The WHERE clause is scoped to rows
- * that either currently sit under this project or truly belong to it, so normal
- * registration/backfill paths can run it cheaply without scanning unrelated
- * project partitions for every tick.
+ * Whether a project binding has been stored for this session. Bindings are
+ * stored only from a directory the host returned for the session. A session
+ * without one has only ever been rendered with the directory OpenCode was
+ * launched from, which the transform falls back to when the host gives none.
+ */
+export function hasRecordedSessionProjectIdentity(db: Database, sessionId: string): boolean {
+    const row = db
+        .prepare("SELECT 1 AS found FROM session_projects WHERE session_id = ? AND harness = ?")
+        .get(sessionId, getHarness()) as { found: number } | null;
+    return row?.found === 1;
+}
+
+/**
+ * Heal historical chunk rows whose stored project differs from their session owner
+ * when either the stored or the correct project is this project. Both
+ * partitions use indexes, and the precheck avoids a write on the common miss.
+ * Repair one slice per observation; later registrations resume the remaining rows.
  */
 export function repairMisScopedCompartmentChunkEmbeddingsForProject(
     db: Database,
     projectPath: string,
+    ids = findMisScopedCompartmentChunkEmbeddingIdsForProject(db, projectPath),
 ): number {
-    if (!projectPath) return 0;
-    return getRepairProjectChunkProjectStatement(db).run(projectPath, projectPath).changes;
+    if (!projectPath || ids.length === 0) return 0;
+    return db
+        .prepare(`UPDATE compartment_chunk_embeddings
+        SET project_path = (SELECT sp.project_path FROM session_projects sp
+            WHERE sp.session_id = compartment_chunk_embeddings.session_id
+              AND sp.harness = compartment_chunk_embeddings.harness)
+        WHERE id IN (${ids.map(() => "?").join(",")}) AND EXISTS (
+            SELECT 1 FROM session_projects sp
+            WHERE sp.session_id = compartment_chunk_embeddings.session_id
+              AND sp.harness = compartment_chunk_embeddings.harness
+              AND sp.project_path <> compartment_chunk_embeddings.project_path
+              AND (sp.project_path = ? OR compartment_chunk_embeddings.project_path = ?)
+        )`)
+        .run(...ids, projectPath, projectPath).changes;
 }

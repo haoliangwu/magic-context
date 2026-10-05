@@ -256,7 +256,26 @@ export function setJsoncValue(text: string, path: JSONPath, value: unknown): str
         return text.slice(0, node.offset) + serialized + text.slice(node.offset + node.length);
     }
 
-    return applyEdits(text, modify(text, path, value, {}));
+    return applyEdits(
+        text,
+        modify(text, path, value, { formattingOptions: documentFormatting(text) }),
+    );
+}
+
+/**
+ * The line ending and indentation a document already uses, so an inserted
+ * property is laid out like its siblings instead of being written compactly
+ * onto the previous line.
+ */
+function documentFormatting(text: string): {
+    eol: string;
+    insertSpaces: boolean;
+    tabSize: number;
+} {
+    const eol = text.includes("\r\n") ? "\r\n" : "\n";
+    const indent = /\n([ \t]+)\S/.exec(text)?.[1];
+    if (indent?.startsWith("\t")) return { eol, insertSpaces: false, tabSize: 1 };
+    return { eol, insertSpaces: true, tabSize: indent ? indent.length : 2 };
 }
 
 function removeObjectProperty(text: string, object: Node, key: string): string {

@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MagicContextRpcServer } from "../../shared/rpc-server";
 import type { SidebarSnapshot } from "../../shared/rpc-types";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     closeRpc,
     getCompartmentCount,
@@ -33,7 +34,7 @@ afterEach(() => {
 });
 
 function makeDataHome(): string {
-    const dir = mkdtempSync(join(tmpdir(), "mc-context-db-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "mc-context-db-"));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     // The shared resolver gives test isolation priority. Keep both values
@@ -120,10 +121,97 @@ describe("TUI context RPC data", () => {
         }));
         initRpcClient(directory);
 
+        // The error reaches the dialog as a named reason, never as a snapshot.
         expect(await loadStatusDetail("ses_rust", directory)).toEqual({
-            ok: false,
-            error: "Rust module status unavailable; canonical session state was not read",
+            state: "unavailable",
+            reason: {
+                kind: "rpc_error",
+                message: "Rust module status unavailable; canonical session state was not read",
+            },
+            versions: null,
         });
+    });
+
+    test("session calls go to the server of the session's directory, not the startup one", async () => {
+        // The TUI started in the home directory; the session it shows belongs
+        // to a project directory with its own Magic Context server instance.
+        const dataHome = makeDataHome();
+        const home = "/home-startup";
+        const project = "/home-startup/Pictures/project";
+        const homeServer = await startServer(dataHome, home, () => ({
+            sessionId: "ses_project",
+            disabled: true,
+        }));
+        homeServer.handle("status-detail", async () => ({
+            sessionId: "ses_project",
+            disabled: true,
+        }));
+        homeServer.handle("compartment-count", async () => ({ count: 0 }));
+        const projectServer = await startServer(
+            dataHome,
+            project,
+            () => snapshot("ses_project", 400) as unknown as Record<string, unknown>,
+        );
+        projectServer.handle("status-detail", async () => ({ error: "from the project server" }));
+        projectServer.handle("compartment-count", async () => ({ count: 72 }));
+        initRpcClient(home);
+
+        expect((await loadSidebarSnapshot("ses_project", project)).compartmentCount).toBe(2);
+        const status = await loadStatusDetail("ses_project", project);
+        expect(status.state === "unavailable" && status.reason).toEqual({
+            kind: "rpc_error",
+            message: "from the project server",
+        });
+        expect(await getCompartmentCount("ses_project", project)).toEqual({ ok: true, count: 72 });
+        // The startup directory still reaches the startup server.
+        const homeStatus = await loadStatusDetail("ses_project", home);
+        expect(homeStatus.state === "unavailable" && homeStatus.reason).toEqual({
+            kind: "not_tracked",
+            cause: "home_directory",
+        });
+    });
+
+    test("finds the session's server when the host spells its directory differently", async () => {
+        // The server files its discovery record under the directory it was
+        // started with (here through a symlink, as macOS /var is to
+        // /private/var); the TUI asks with the resolved spelling.
+        const dataHome = makeDataHome();
+        const root = realpathSync(createTestTempDirFromPath(join(tmpdir(), "mc-spelling-")));
+        tempDirs.push(root);
+        const real = join(root, "Pictures", "project");
+        mkdirSync(real, { recursive: true });
+        const link = join(root, "project-link");
+        symlinkSync(real, link);
+        await startServer(
+            dataHome,
+            `${link}/`,
+            () => snapshot("ses_spelled", 300) as unknown as Record<string, unknown>,
+        );
+        initRpcClient("/home-startup");
+        expect((await loadSidebarSnapshot("ses_spelled", real)).inputTokens).toBe(300);
+    });
+
+    test("asks every local server for the session's owner when no directory matches", async () => {
+        const dataHome = makeDataHome();
+        const home = await startServer(dataHome, "/home-startup", () => ({
+            sessionId: "ses_owned",
+            disabled: true,
+        }));
+        home.handle("session-owner", async () => ({ owner: false }));
+        const project = await startServer(
+            dataHome,
+            "/filed/under/this/spelling",
+            () => snapshot("ses_owned", 500) as unknown as Record<string, unknown>,
+        );
+        project.handle("session-owner", async (params) => ({
+            owner: params.sessionId === "ses_owned",
+        }));
+        initRpcClient("/home-startup");
+
+        // A spelling no canonical form maps to the filed one.
+        const snapshotSeen = await loadSidebarSnapshot("ses_owned", "/asked/with/another/spelling");
+        expect(snapshotSeen.inputTokens).toBe(500);
+        expect(snapshotSeen.compartmentCount).toBe(2);
     });
 
     test("distinguishes a real zero compartment count from an RPC failure", async () => {

@@ -516,6 +516,8 @@ mod tests {
     fn todowrite_tail_item(id: &str, ordinal: u64, state_json: &str) -> SelItem {
         let todos: serde_json::Value = serde_json::from_str(state_json).expect("todo state JSON");
         SelItem {
+            user_answer: false,
+            served_token_count: None,
             id: id.to_string(),
             ordinal,
             message_role: SelMessageRole::Assistant,

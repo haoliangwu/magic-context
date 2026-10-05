@@ -1,4 +1,4 @@
-import type { Database } from "../../../shared/sqlite";
+import type { Database, Statement as PreparedStatement } from "../../../shared/sqlite";
 
 export interface MuralManifestRow {
     projectPath: string;
@@ -20,6 +20,35 @@ interface RawMuralRow {
     memory_ids_json: string;
     width: number;
     height: number;
+}
+
+export interface MuralManifestIdentity {
+    contentHash: string;
+    renderedAt: number;
+}
+
+interface RawMuralIdentityRow {
+    content_hash: string;
+    rendered_at: number;
+}
+
+const muralIdentityStatements = new WeakMap<Database, PreparedStatement>();
+
+export function getMuralIdentity(db: Database, projectPath: string): MuralManifestIdentity | null {
+    try {
+        let statement = muralIdentityStatements.get(db);
+        if (!statement) {
+            statement = db.prepare(
+                "SELECT content_hash, rendered_at FROM mural_manifest WHERE project_path = ?",
+            );
+            muralIdentityStatements.set(db, statement);
+        }
+        const row = statement.get(projectPath) as RawMuralIdentityRow | undefined;
+        return row ? { contentHash: row.content_hash, renderedAt: row.rendered_at } : null;
+    } catch (error) {
+        if (String(error).includes("no such table")) return null;
+        throw error;
+    }
 }
 
 export function getMural(db: Database, projectPath: string): MuralManifestRow | null {

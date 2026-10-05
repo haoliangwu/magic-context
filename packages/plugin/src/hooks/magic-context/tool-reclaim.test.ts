@@ -1,11 +1,12 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CTX_REDUCE_KEEP } from "../../features/magic-context/reclaim-protection";
 import { closeDatabase, insertTag, openDatabase } from "../../features/magic-context/storage";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import type { TagTarget } from "./tag-messages";
 import { buildSyntheticToolReclaimOps } from "./tool-reclaim";
 
@@ -23,7 +24,7 @@ afterEach(() => {
 });
 
 function freshDb(): NonNullable<ReturnType<typeof openDatabase>> {
-    const dir = mkdtempSync(join(tmpdir(), "tool-reclaim-"));
+    const dir = createTestTempDirFromPath(join(tmpdir(), "tool-reclaim-"));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
     const db = openDatabase();

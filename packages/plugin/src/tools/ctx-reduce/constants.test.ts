@@ -10,12 +10,11 @@ describe("ctx-reduce constants", () => {
         });
 
         it("frames reduction as deferred discard, not immediate delete", () => {
-            // The contract must teach the deferred mechanic (so models don't treat
-            // it like an irreversible `rm` and hoard the call) while keeping the
-            // real caution (re-fetch is the only way back → mark only spent content).
-            expect(CTX_REDUCE_DESCRIPTION).toContain("discardable");
-            expect(CTX_REDUCE_DESCRIPTION).toContain("NOT an immediate delete");
-            expect(CTX_REDUCE_DESCRIPTION).toContain("DONE with");
+            // The contract distinguishes stamping from deletion, explains deferred
+            // clearing, and limits stamps to items no longer needed for upcoming work.
+            expect(CTX_REDUCE_DESCRIPTION).toContain("stamping QUEUES it");
+            expect(CTX_REDUCE_DESCRIPTION).toContain("Not a delete");
+            expect(CTX_REDUCE_DESCRIPTION).toContain("no longer needed for the work ahead");
             // No scarcity/rm framing that makes models over-conservative.
             expect(CTX_REDUCE_DESCRIPTION).not.toContain("gone forever");
             expect(CTX_REDUCE_DESCRIPTION).not.toContain("Remove entirely");

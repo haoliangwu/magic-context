@@ -1,11 +1,16 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDatabase, openDatabase } from "../features/magic-context/storage";
 import { runValidatedHistorianPass } from "../hooks/magic-context/compartment-runner-historian";
+import {
+    clearProducerModelObservations,
+    observeProducerModelsForTest,
+} from "../hooks/magic-context/producer-window-test-support";
 import type { PluginContext } from "../plugin/types";
 import * as logger from "../shared/logger";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 
 const valid =
     '<compartment start="1" end="2" title="Summary"><p1>Both messages preserved.</p1></compartment>';
@@ -20,7 +25,7 @@ const scenarios = [
 const golden = join(import.meta.dir, "v1-sequences.golden.json");
 
 test("v1 six lifecycle sequences are byte-identical to master", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mc-hidden-sequences-"));
+    const root = createTestTempDirFromPath(join(tmpdir(), "mc-hidden-sequences-"));
     const oldData = process.env.XDG_DATA_HOME;
     process.env.XDG_DATA_HOME = root;
     closeDatabase();
@@ -34,6 +39,7 @@ test("v1 six lifecycle sequences are byte-identical to master", async () => {
     });
     try {
         const db = openDatabase();
+        await observeProducerModelsForTest(["mock/primary", "mock/alternate"]);
         for (const scenario of scenarios) {
             events = [];
             let created = 0;
@@ -142,6 +148,7 @@ test("v1 six lifecycle sequences are byte-identical to master", async () => {
         if (process.env.MC_RECORD_V1_SEQUENCES === "1") writeFileSync(golden, bytes);
         else expect(bytes).toBe(readFileSync(golden, "utf8"));
     } finally {
+        clearProducerModelObservations();
         logging.mockRestore();
         random.mockRestore();
         clock.mockRestore();

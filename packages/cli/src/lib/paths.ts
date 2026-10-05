@@ -302,6 +302,17 @@ export function getOpenCodePluginCacheDir(): string {
     return join(xdg, "opencode", "packages");
 }
 
+/**
+ * Cache directory OpenCode 2 installs npm plugins into. OpenCode 2 keeps one
+ * slot per package spec (`npm/<name>@<spec>/`) holding numbered install
+ * generations (`<slot>/<epoch-ms>/node_modules/...`), and loads the highest
+ * generation. It shares the 1.x cache root, so the same XDG rule applies.
+ */
+export function getOpenCodeV2NpmCacheDir(): string {
+    const xdg = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
+    return join(xdg, "opencode", "npm");
+}
+
 /** True if `path` exists and is a directory. */
 export function isDir(path: string): boolean {
     try {

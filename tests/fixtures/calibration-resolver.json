@@ -1,0 +1,13 @@
+[
+  { "provider": "vertex-eu-anthropic", "model": "claude-sonnet-5", "prefix": "anthropic/claude-sonnet-5", "source": "model-id" },
+  { "provider": "my-bedrock", "model": "claude-opus-5-5", "prefix": "anthropic/claude-opus-5", "source": "model-id" },
+  { "provider": "anthropic", "model": "claude-haiku-5", "prefix": "anthropic/claude-opus-5", "source": "family-fallback" },
+  { "provider": "github-copilot", "model": "claude-fable-5-1", "prefix": "github-copilot/claude-fable-5-1", "source": "seed" },
+  { "provider": "unknown-provider", "model": "unknown-model", "prefix": null, "source": "seed" },
+  { "provider": "openai", "model": "gpt-6-sol", "prefix": "openai/gpt-6-sol", "source": "seed" },
+  { "provider": "openai", "model": "gpt-6.1-sol", "prefix": "openai/gpt-6.1-sol", "source": "seed" },
+  { "provider": "openai", "model": "gpt-6-madeup", "prefix": null, "source": "seed" },
+  { "provider": "openai", "model": "gpt-6.1-astra", "prefix": "openai/gpt-6-astra", "source": "family-fallback" },
+  { "provider": "my-bedrock", "model": "claude-haiku-5", "prefix": "anthropic/claude-opus-5", "source": "model-id" },
+  { "provider": "local", "model": "kimi-k2.6", "prefix": "opencode-go/kimi-k2.6", "source": "model-id" }
+]

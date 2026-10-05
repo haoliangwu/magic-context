@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { MURAL_FONT_GLYPHS } from "./mural-font.generated";
+import { COMPRESS_CUES_SYSTEM_PROMPT } from "./compress-cues-prompt";
+import { MURAL_FONT_GLYPHS, MURAL_FONT_REPLACEMENT_GLYPH } from "./mural-font.generated";
 import {
     MURAL_CELL_WIDTH,
     MURAL_HEIGHT,
@@ -28,6 +29,29 @@ function syntheticEntries(count: number): MuralRenderEntry[] {
 }
 
 describe("deterministic mural renderer", () => {
+    test("renders every cue grammar symbol with its own glyph, not the fallback", () => {
+        const symbols = COMPRESS_CUES_SYSTEM_PROMPT.match(/Use the symbols (.+?) when/)![1]!.split(
+            " ",
+        );
+        expect(symbols).toEqual(["→", "←", "⊘", "∵", "≺", "≻", "∅", "∀"]);
+        const images = new Set<string>();
+        const render = (cue: string) =>
+            Buffer.from(
+                renderMural([{ id: 1, category: "PROJECT_RULES", importance: 80, cue: `⊘ ${cue}` }])
+                    .png,
+            ).toString("base64");
+        const fallback = render("\uFFFD");
+        for (const symbol of symbols) {
+            expect(MURAL_FONT_GLYPHS[symbol]).toBeDefined();
+            expect(MURAL_FONT_GLYPHS[symbol]!.rows).not.toEqual(MURAL_FONT_REPLACEMENT_GLYPH.rows);
+            const image = render(symbol);
+            expect(image).not.toBe(fallback);
+            expect(images.has(image)).toBe(false);
+            images.add(image);
+        }
+        expect(MURAL_FONT_GLYPHS["⊘"]!.rows).not.toEqual(MURAL_FONT_GLYPHS["@"]!.rows);
+    });
+
     test("includes every printable ASCII glyph in the generated atlas", () => {
         for (let codepoint = 0x20; codepoint <= 0x7e; codepoint++) {
             const character = String.fromCodePoint(codepoint);

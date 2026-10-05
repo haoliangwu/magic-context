@@ -24,7 +24,6 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path, { join } from "node:path";
 import { loadPluginConfig } from "@magic-context/core/config";
-import type { AuthorityModuleClient } from "@magic-context/core/features/magic-context/context-authority";
 import { resolveProjectIdentity } from "@magic-context/core/features/magic-context/memory/project-identity";
 import {
     copyMemoriesToProject,
@@ -49,11 +48,7 @@ import {
 } from "../lib/database-access";
 import { getOpenCodeDatabasePath } from "../lib/migration-paths";
 import { promptIO } from "../lib/prompts";
-import {
-    type AuthorityProjectToVerify,
-    assertProjectsUseTsAuthority,
-    authorityDrainCommand,
-} from "./doctor-authority";
+import { assertNoUnmigratedAuthority } from "../lib/single-store-safety";
 
 type DatabaseLike = Pick<DatabaseType, "prepare" | "close" | "exec">;
 
@@ -122,7 +117,6 @@ export interface MigrateSessionResult {
 }
 
 export interface MigrateSessionSafetyModule {
-    authorityStatus: AuthorityModuleClient["authorityStatus"];
     sessionStatus(args: { sessionId: string; projectRoot: string }): Promise<unknown>;
 }
 
@@ -144,49 +138,13 @@ function isModuleCacheStatePresent(status: unknown): boolean {
     return typeof rowVersion === "number";
 }
 
-function drainCommandsForMarkers(
-    markers: ReadonlyArray<{ project_path: string }>,
-    projects: readonly AuthorityProjectToVerify[],
-): string {
-    const byProject = new Map(projects.map((project) => [project.projectPath, project]));
-    return [
-        ...new Set(
-            markers.map((marker) =>
-                authorityDrainCommand(
-                    byProject.get(marker.project_path) ?? {
-                        role: "marked",
-                        projectPath: marker.project_path,
-                        projectRoot: null,
-                    },
-                ),
-            ),
-        ),
-    ].join("; ");
-}
-
-/** Check the durable authority fences before a session move writes either database. */
+/** Check for uncopied module-owned rows before writing either database. */
 export async function assertMigrateSessionIsSafeToRehome(args: {
     plan: MigrateSessionPlan;
     contextDb: DatabaseType;
     module: MigrateSessionSafetyModule;
 }): Promise<MigrateSessionSafetyResult> {
-    const projects: AuthorityProjectToVerify[] = [
-        {
-            role: "source",
-            projectPath: args.plan.fromMcIdentity,
-            projectRoot: args.plan.currentDirectory,
-        },
-        {
-            role: "target",
-            projectPath: args.plan.toMcIdentity,
-            projectRoot: args.plan.targetDirectory,
-        },
-    ];
-    const authority = await assertProjectsUseTsAuthority({
-        db: args.contextDb,
-        projects,
-        module: args.module,
-    });
+    assertNoUnmigratedAuthority(args.contextDb);
 
     let sessionStatus: unknown;
     try {
@@ -199,18 +157,11 @@ export async function assertMigrateSessionIsSafeToRehome(args: {
         });
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (authority.markers.length === 0) {
-            return {
-                warnings: [
-                    `Module session-cache state was not checked because the module is unreachable: ${message}. No durable authority markers exist, so continuing for this pure-TypeScript installation.`,
-                ],
-            };
-        }
-        throw new Error(
-            "Migration refused: module session-cache state is unreachable while durable authority markers exist; writes remain fenced. " +
-                `Drain marked projects first: ${drainCommandsForMarkers(authority.markers, projects)}. ` +
-                `Module error: ${message}`,
-        );
+        return {
+            warnings: [
+                `Module session-cache state was not checked because the module is unreachable: ${message}. No uncopied module-owned rows remain in the context store.`,
+            ],
+        };
     }
 
     if (isModuleCacheStatePresent(sessionStatus)) {
@@ -663,7 +614,6 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
             plan,
             contextDb: contextDb as DatabaseType,
             module: {
-                authorityStatus: (request) => transport.authorityStatus(request),
                 sessionStatus: ({ sessionId: statusSessionId, projectRoot }) =>
                     transport.call({
                         sessionId: statusSessionId,
@@ -745,10 +695,16 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
             return 0;
         }
 
-        const ok = await promptIO.confirm(
-            "This edits opencode.db + context.db directly. Is OpenCode (TUI / Desktop / serve) fully stopped?",
-            false,
-        );
+        // --yes is documented as skipping this confirmation, for scripted runs.
+        const ok =
+            skipConfirm ||
+            (await promptIO.confirm(
+                "This edits opencode.db + context.db directly. Is OpenCode (TUI / Desktop / serve) fully stopped?",
+                false,
+            ));
+        if (skipConfirm) {
+            promptIO.log.warn("--yes: assuming OpenCode (TUI / Desktop / serve) is fully stopped.");
+        }
         if (!ok) {
             promptIO.log.warn("Aborted. Stop OpenCode, then re-run.");
             return 1;
@@ -766,8 +722,8 @@ export async function runMigrateSessionCli(args: string[]): Promise<number> {
         try {
             contextDb.exec("BEGIN IMMEDIATE");
             contextLocked = true;
-            await backupDatabaseSnapshot(opencodeDb as DatabaseType, ocBackup);
-            await backupDatabaseSnapshot(contextDb as DatabaseType, ctxBackup);
+            await backupDatabaseSnapshot(opencodeDb as DatabaseType, opencodeDbPath, ocBackup);
+            await backupDatabaseSnapshot(contextDb as DatabaseType, contextDbPath, ctxBackup);
         } finally {
             if (contextLocked) contextDb.exec("ROLLBACK");
             opencodeDb.exec("ROLLBACK");

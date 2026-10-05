@@ -16,7 +16,7 @@ import type { ImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
 // (importance/scope/shareable) are no longer tool actions — the verify and
 // classify dreamer tasks apply them host-side from a manifest, so the agent
 // never calls a tool for them.
-export const CTX_MEMORY_ACTIONS = ["write", "archive", "update", "merge", "get"] as const;
+export const CTX_MEMORY_ACTIONS = ["write", "update", "archive", "merge", "get"] as const;
 
 export const CTX_MEMORY_DREAMER_ACTIONS = [...CTX_MEMORY_ACTIONS, "list"] as const;
 

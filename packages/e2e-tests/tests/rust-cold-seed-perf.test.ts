@@ -2,6 +2,8 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
+import { Database } from "bun:sqlite";
+import { join } from "node:path";
 import { buildPagedModuleTransformPayloads, MODULE_PAGE_MAX_BYTES } from "../../plugin/src/hooks/magic-context/module-wire";
 import { RustTestHarness } from "../src/rust-harness";
 import { rustPrereqs } from "../src/rust-scenario-support";
@@ -18,7 +20,7 @@ const COLD_BUILD_OUTPUT_LIMIT_MS = 1_000;
 const COLD_HANDLER_LIMIT_MS = 2_500;
 const COLD_SERIALIZED_MESSAGE_LIMIT = MESSAGE_COUNT - COVERED_MESSAGE_COUNT + 2;
 
-function astroCompartments(): Record<string, unknown>[] {
+function astroCompartments() {
     return Array.from({ length: COMPARTMENT_COUNT }, (_, index) => {
         const sequence = index + 1;
         const start = Math.floor((index * COVERED_MESSAGE_COUNT) / COMPARTMENT_COUNT) + 1;
@@ -30,8 +32,10 @@ function astroCompartments(): Record<string, unknown>[] {
             sequence,
             start_message: start,
             end_message: end,
-            start_message_id: `${startMid}#0`,
-            end_message_id: `${endMid}#${endBlockIndex}`,
+            start_message_id: startMid,
+            end_message_id: endMid,
+            start_block_index: 0,
+            end_block_index: endBlockIndex,
             title: `ASTRO history ${sequence}`,
             content: `Summary of messages ${start}-${end}`,
             p1: `Summary of messages ${start}-${end}`,
@@ -158,13 +162,20 @@ describe.skipIf(!rustPrereqs.ok)("rust performance: ASTRO-shape cold seed", () =
         async () => {
             const sessionId = REPLAY_SESSION_ID ?? "ses_astro_shape_perf";
             if (!PERF_FULL_OUTPUT && !REPLAY_STORE_PATH) {
-                const seed = await h.subc.moduleRequest(sessionId, h.env.workdir, {
-                    method: "state_sync",
-                    shadow_generation: 0,
-                    expected_shadow_seq: 0,
-                    compartments: astroCompartments(),
-                });
-                expect(seed.ok).toBe(true);
+                // Compartments are shared context rows, so seed them directly in context.db.
+                const db = new Database(join(h.env.dataDir, "cortexkit", "magic-context", "context.db"));
+                try {
+                    db.transaction(() => {
+                        for (const row of astroCompartments()) {
+                            const columns = Object.keys(row);
+                            db.prepare(`INSERT INTO compartments (session_id, ${columns.join(", ")}) VALUES (?, ${columns.map(() => "?").join(", ")})`)
+                                .run(sessionId, ...Object.values(row));
+                        }
+                    })();
+                    expect(db.query("SELECT COUNT(*) AS n FROM compartments WHERE session_id=?").get(sessionId)).toEqual({ n: COMPARTMENT_COUNT });
+                } finally {
+                    db.close();
+                }
             }
 
             const payload = astroShape(sessionId);

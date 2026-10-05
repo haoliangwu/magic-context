@@ -70,6 +70,11 @@ export function createExistingTagResolver(
     let cachedAssignmentSize = -1;
     let cachedScopedAssignments: Map<string, ScopedAssignments> | null = null;
     const usedTagNumbers = new Set<number>();
+    // Content ids of parts this pass has already resolved. Each one is the live
+    // identity of a part whose tag is already decided (an exact hit, a fallback
+    // rebind, or a fresh tag allocated by the caller after a miss), so its
+    // binding must never be offered as the fallback for a later part.
+    const claimedContentIds = new Set<string>();
 
     function getScopedAssignments(): Map<string, ScopedAssignments> {
         if (!cachedScopedAssignments || cachedAssignmentSize !== assignments.size) {
@@ -83,6 +88,7 @@ export function createExistingTagResolver(
     return {
         resolve(messageId, type, currentContentId, ordinal, options) {
             const accept = options?.accept ?? (() => true);
+            claimedContentIds.add(currentContentId);
             const exactTagId = assignments.get(currentContentId);
             if (exactTagId !== undefined && accept(exactTagId)) {
                 usedTagNumbers.add(exactTagId);
@@ -90,9 +96,15 @@ export function createExistingTagResolver(
             }
 
             const fallback = getScopedAssignments().get(messageId)?.[type][ordinal];
+            // The scoped view is rebuilt whenever the assignment count changes, so a
+            // rebuild in the middle of a pass also lists tags the caller allocated
+            // earlier in this same pass, which usedTagNumbers never saw. Skipping
+            // candidates bound to a part already claimed this pass keeps a tag that
+            // is already on another part from being handed out twice.
             if (
                 !fallback ||
                 usedTagNumbers.has(fallback.tagNumber) ||
+                claimedContentIds.has(fallback.contentId) ||
                 !accept(fallback.tagNumber)
             ) {
                 return undefined;

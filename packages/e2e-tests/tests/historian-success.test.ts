@@ -1,8 +1,12 @@
 /// <reference types="bun-types" />
 
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
-import { buildMockHistorianPayload } from "../src/mock-historian";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
+import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
 import { FOLD_SKIP_REASON } from "../src/rust-scenario-support";
 
 /**
@@ -42,43 +46,20 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
     return false;
 }
 
-/** Extract the message ordinals historian was asked to process from the body. */
-function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
-    const messages = body.messages as Array<{ role: string; content: unknown }> | undefined;
-    if (!messages) return null;
-    // Historian prompt is sent as a single user message whose content holds
-    // the <new_messages> block with lines like "[3] U: ...". Extract all
-    // bracketed ordinals and return min/max.
-    for (const m of messages) {
-        const contentArr = Array.isArray(m.content) ? m.content : [];
-        for (const block of contentArr) {
-            const text = (block as { text?: string }).text;
-            if (!text || !text.includes("<new_messages>")) continue;
-            const matches = text.matchAll(/\[(\d+)\]/g);
-            const nums: number[] = [];
-            for (const mm of matches) nums.push(Number(mm[1]));
-            if (nums.length === 0) continue;
-            return { start: Math.min(...nums), end: Math.max(...nums) };
-        }
-    }
-    return null;
-}
+forEachHost(import.meta.url, "historian success path", (host) => {
+    let h: ScenarioHarness;
 
-let h: TestHarness;
-
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: {
-            execute_threshold_percentage: 40,
-        },
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: {
+                execute_threshold_percentage: 40,
+            },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("historian success path", () => {
+    afterAll(async () => {
+        await h.dispose();
+    });
     it(
         "publishes a compartment to the DB after a successful run",
         async () => {
@@ -88,7 +69,7 @@ describe("historian success path", () => {
             // actual ordinal range and return a compartment covering it.
             h.mock.addMatcher((body) => {
                 if (!isHistorianRequest(body)) return null;
-                const range = findOrdinalRange(body);
+                const range = findHistorianOrdinalRange(body);
                 if (!range) {
                     // Shouldn't happen in practice, but fall back to a safe
                     // zero-compartment empty response.

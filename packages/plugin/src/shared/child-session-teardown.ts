@@ -35,8 +35,7 @@ export interface TeardownChildSessionArgs {
  * endpoint, although its generated TypeScript body type does not yet expose time.
  */
 export async function teardownChildSession(args: TeardownChildSessionArgs): Promise<void> {
-    const { client, sessionId, sessionDirectory, promptSettled, privacySensitive, context, log } =
-        args;
+    const { client, sessionId, sessionDirectory, promptSettled, context, log } = args;
     if (!sessionId) return;
 
     const request: ChildSessionRequest = {
@@ -44,7 +43,8 @@ export async function teardownChildSession(args: TeardownChildSessionArgs): Prom
         ...(sessionDirectory ? { query: { directory: sessionDirectory } } : {}),
     };
 
-    if (promptSettled && (privacySensitive || !shouldKeepSubagents())) {
+    // Retention keeps every settled child; only unsettled children go to the age-gated sweep.
+    if (promptSettled && !shouldKeepSubagents()) {
         await client.session.delete(request).catch((error: unknown) => {
             log(`${context}: session cleanup failed: ${String(error)}`);
         });

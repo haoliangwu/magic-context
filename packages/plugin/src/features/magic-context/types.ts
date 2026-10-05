@@ -7,14 +7,25 @@ export interface TagEntry {
      * How a dropped tool tag is rendered on every replay pass (frozen at drop
      * time, re-derived deterministically from the original wire part each pass):
      *  - "full": the whole tool call is removed from the transcript.
-     *  - "truncated": skeleton; keep the tool_use call, output -> [dropped N],
-     *    every input arg value clamped to 5 chars.
+     *  - "skeleton_real": keep the tool_use call with its REAL arguments,
+     *    output -> [dropped N]. Used for small inputs dropped inside the
+     *    newest-call window and for the call whose result ends the request.
+     *  - "truncated": legacy skeleton; keep the tool_use call, output ->
+     *    [dropped N], arguments replaced by the `{"dropped": …}` marker. No
+     *    longer written by new drops; existing tags replay it until a HARD fold
+     *    converts them to "skeleton_real" or "full".
      *  - "edit_marker": like "truncated" but for an edit/write superseded by a
      *    later edit to the same file; keep the filePath verbatim and a short
      *    region-hint prefix of the diff, so the agent still sees WHICH file and
      *    region it edited. Only produced when the smart_drops config is on.
      */
-    dropMode: "full" | "truncated" | "edit_marker";
+    dropMode:
+        | "full"
+        | "truncated"
+        | "skeleton_real"
+        | "skeleton_stripped"
+        | "edit_marker"
+        | "edit_marker_stripped";
     toolName: string | null;
     inputByteSize: number;
     byteSize: number;

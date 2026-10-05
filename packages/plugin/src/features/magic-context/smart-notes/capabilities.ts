@@ -248,6 +248,7 @@ async function runGit(projectRoot: string, args: string[], signal: AbortSignal):
     throwIfAborted(signal);
     try {
         const result = await execFileAsync("git", ["-C", projectRoot, ...args], {
+            windowsHide: true,
             timeout: DEFAULT_GIT_TIMEOUT_MS,
             maxBuffer: 128 * 1024,
             signal,

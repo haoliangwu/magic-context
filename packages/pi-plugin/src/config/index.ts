@@ -15,6 +15,7 @@ import {
 	attachProtectedTokensTierOverrides,
 	constrainProjectThresholdOverrides,
 	dropInheritedEmbeddingKeyOnRedirect,
+	restoreTrustedValuesOverInvalidProjectValues,
 	stripUnsafeProjectConfigFields,
 } from "@magic-context/core/config/project-security";
 import { pruneNestedConfigLeaf } from "@magic-context/core/config/prune-config-leaf";
@@ -438,6 +439,33 @@ function parsePiConfig(
 	return { config: defaults, warnings };
 }
 
+/**
+ * Every schema issue path parsePiConfig's real parse would report for
+ * `rawConfig`, after the same pre-schema migrations (their warnings are
+ * discarded here; the real parse reports them). Empty when valid.
+ */
+function collectPiSchemaIssuePaths(
+	rawConfig: Record<string, unknown>,
+): PropertyKey[][] {
+	const scratch: string[] = [];
+	const configToMigrate = { ...stripRemovedAgentConfig(rawConfig, scratch) };
+	delete configToMigrate.protected_tags;
+	const migrated = migrateDreamerV2(
+		migrateLegacyExperimental(
+			migrateLegacyAgentEnabledInMemory(configToMigrate, scratch),
+			scratch,
+		),
+		scratch,
+	);
+	const parsed = MagicContextConfigSchema.safeParse(migrated);
+	if (parsed.success) return [];
+	return parsed.error.issues.flatMap((issue) =>
+		issue.code === "unrecognized_keys"
+			? issue.keys.map((key) => [...issue.path, key])
+			: [[...issue.path]],
+	);
+}
+
 export function loadPiConfig(
 	opts: LoadPiConfigOptions = {},
 ): LoadPiConfigResult {
@@ -515,6 +543,7 @@ function combinedOutcome(args: {
 
 export function loadPiConfigDetailed(
 	opts: LoadPiConfigOptions = {},
+	applyRuntimeGlobals = true,
 ): LoadPiConfigResultDetailed {
 	const cwd = opts.cwd ?? process.cwd();
 	const loadedFiles: LoadedConfigFile[] = [];
@@ -607,6 +636,7 @@ export function loadPiConfigDetailed(
 	);
 	let rawConfig = trustedProfiledRaw;
 	const trustedBaseConfig = parsePiConfig(trustedProfiledRaw).config;
+	let projectRestoredTopLevelKeys: string[] = [];
 	if (projectLayer) {
 		rawConfig = mergeRawConfigs(rawConfig, profileResolution.projectBase);
 		for (const warning of dropInheritedEmbeddingKeyOnRedirect(
@@ -623,6 +653,16 @@ export function loadPiConfigDetailed(
 		})) {
 			warnings.push(`[project config] ${warning}`);
 		}
+		const restoredOverProject = restoreTrustedValuesOverInvalidProjectValues({
+			mergedRaw: rawConfig,
+			trustedRaw: trustedProfiledRaw,
+			projectRaw: profileResolution.projectBase,
+			collectIssuePaths: collectPiSchemaIssuePaths,
+		});
+		for (const warning of restoredOverProject.warnings) {
+			warnings.push(`[project config] ${warning}`);
+		}
+		projectRestoredTopLevelKeys = restoredOverProject.restoredTopLevelKeys;
 	}
 
 	const hasDeprecatedProtectedTags =
@@ -632,6 +672,11 @@ export function loadPiConfigDetailed(
 	const recoveredTopLevelKeys: string[] = [];
 	const cacheTtlConfigured = Object.hasOwn(rawConfig, "cache_ttl");
 	const parsed = parsePiConfig(rawConfig, recoveredTopLevelKeys);
+	// An ignored invalid project value is still a config the user must fix, so
+	// keep reporting it as schema recovery (parity with the OpenCode loader).
+	for (const key of projectRestoredTopLevelKeys) {
+		if (!recoveredTopLevelKeys.includes(key)) recoveredTopLevelKeys.push(key);
+	}
 	attachProtectedTokensTierOverrides(parsed.config, {
 		trustedUser: trustedBaseConfig.protected_tokens,
 		project: projectLayer
@@ -640,8 +685,10 @@ export function loadPiConfigDetailed(
 	});
 	if (profileResolution.activeProfile)
 		parsed.config.profile = profileResolution.activeProfile;
-	setOutputReserveConfig(parsed.config.output_reserve);
-	setWindowOverlayPath(parsed.config.models?.window_overlay_path);
+	if (applyRuntimeGlobals) {
+		setOutputReserveConfig(parsed.config.output_reserve);
+		setWindowOverlayPath(parsed.config.models?.window_overlay_path);
+	}
 	warnings.push(
 		...parsed.warnings.map((warning) => `[merged config] ${warning}`),
 	);

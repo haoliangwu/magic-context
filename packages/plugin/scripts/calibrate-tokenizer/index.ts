@@ -1,27 +1,17 @@
 /**
  * Tokenizer calibration harness.
  *
- * Measures the token-count drift between local ai-tokenizer estimates and
- * actual provider token counts for our real production system prompt and tool
- * definitions. Hits each provider directly using OAuth/API tokens from
- * `~/.local/share/opencode/auth.json`. No OpenCode dependency.
- *
- * For each model:
- *   - Sends a SYSTEM-only request: real production system prompt + minimal user message.
- *   - Sends a TOOLS-only request: real production tools array + minimal user message.
- *   - Captures provider's reported input token count from the actual usage field.
- *   - Counts the same content locally with ai-tokenizer (raw + SDK with model calibration).
- *   - Computes drift ratios.
- *
- * Output: a per-model JSON report with system_ratio and tools_ratio that the
- * sidebar can use as static calibration multipliers.
+ * Measures local tokenizer drift using API-key count_tokens for Anthropic,
+ * with small OAuth usage probes as fallback. PROSE uses only free counts and
+ * public repository bytes plus synthetic history/memory, never private sessions.
+ * Reports baseline-subtracted SYSTEM, TOOLS, PROSE and per-section prose ratios.
  *
  * Usage:
  *   bun run packages/plugin/scripts/calibrate-tokenizer/index.ts
  *   bun run packages/plugin/scripts/calibrate-tokenizer/index.ts --only anthropic/claude-opus-4-7
  *   bun run packages/plugin/scripts/calibrate-tokenizer/index.ts --providers anthropic,openai
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import Tokenizer, { models as aiTokenizerModels } from "ai-tokenizer";
@@ -31,7 +21,17 @@ import * as claudeEncoding from "ai-tokenizer/encoding/claude";
 import * as o200kEncoding from "ai-tokenizer/encoding/o200k_base";
 import * as p50kEncoding from "ai-tokenizer/encoding/p50k_base";
 
+import { buildProseProbe } from "./prose";
+import { crossCheck } from "./cross-check";
 import { measureAnthropic } from "./providers/anthropic";
+import { type CountAdapter } from "./providers/counting";
+import { measureDeepseekOffline, OFFLINE_CAVEAT } from "./providers/deepseek";
+import { measureMeta, META_COUNT_CAVEAT } from "./providers/meta";
+import { measureGemini } from "./providers/gemini";
+import { measureXai } from "./providers/xai";
+import { measureZai } from "./providers/zai";
+import { measureKimi } from "./providers/kimi";
+import { measureOpenAI } from "./providers/openai";
 import { measureOpenAICodex } from "./providers/openai-codex";
 import { measureOpenAICompatible } from "./providers/openai-compatible";
 
@@ -39,6 +39,20 @@ interface AuthFile {
     [provider: string]:
         | { type: "oauth"; access: string; refresh?: string; expires?: number }
         | { type: "api"; key: string };
+}
+
+const FREE_ADAPTERS: Record<string, { measure: CountAdapter; method: string; env: string; file: string; offline?: boolean }> = {
+    deepseek: { measure: measureDeepseekOffline, method: "offline_hf_tokenizer", env: "", file: "", offline: true },
+    meta: { measure: measureMeta, method: "input_tokens", env: "META_API_KEY", file: "meta.key" },
+    google: { measure: measureGemini, method: "countTokens", env: "GEMINI_API_KEY", file: "gemini.key" },
+    xai: { measure: measureXai, method: "tokenize-text", env: "XAI_API_KEY", file: "xai.key" },
+    zai: { measure: measureZai, method: "paas/v4/tokenizer", env: "ZAI_API_KEY", file: "zai.key" },
+    moonshot: { measure: measureKimi, method: "tokenizers/estimate-token-count", env: "MOONSHOT_API_KEY", file: "kimi.key" },
+    openai: { measure: measureOpenAI, method: "responses/input_tokens", env: "OPENAI_API_KEY", file: "openai.key" },
+};
+
+function authProvider(test: ModelTest): string {
+    return test.label.startsWith("openai-codex/") ? "openai-codex" : test.provider;
 }
 
 interface ModelTest {
@@ -53,6 +67,11 @@ interface ModelTestSet {
 }
 
 interface MeasurementResult {
+    method: string;
+    caveat?: string;
+    proseRatio: number | null;
+    proseTokens: { local_raw: number; api: number | null };
+    proseSections: Record<string, { local_raw: number; api: number; ratio: number }>;
     label: string;
     provider: string;
     modelId: string;
@@ -179,15 +198,24 @@ async function measureOne(
     auth: AuthFile,
     systemText: string,
     toolsArray: unknown[],
+    prose: Record<string, string>,
 ): Promise<MeasurementResult> {
     const start = Date.now();
     const local = localCounts(systemText, toolsArray, test.tokenizerKey);
     let systemApi: number | null = null;
     let toolsApi: number | null = null;
     let error: string | null = null;
+    let caveat: string | undefined = test.provider === "meta" ? META_COUNT_CAVEAT : test.provider === "deepseek" ? OFFLINE_CAVEAT : undefined;
+    const adapter = FREE_ADAPTERS[authProvider(test)];
+    let method = adapter?.method ?? (test.provider === "anthropic" && auth.anthropic?.type === "api" ? "count_tokens" : "usage");
+    // biome-ignore lint/suspicious/noExplicitAny: encoding type varies
+    const tokenizer = new Tokenizer(pickEncoding(test.tokenizerKey) as any);
+    const proseLocal = tokenizer.count(Object.values(prose).join("\n\n"));
+    let proseApi: number | null = null;
+    const proseSections: MeasurementResult["proseSections"] = {};
     try {
-        const authEntry = auth[test.provider];
-        if (!authEntry) throw new Error(`No auth for provider ${test.provider}`);
+        const authEntry = auth[authProvider(test)];
+        if (!authEntry) throw new Error(`SKIP: no API key for ${test.provider}`);
 
         // Route OpenAI OAuth (ChatGPT Plus subscription) through the Codex backend
         // since `api.openai.com` requires a paid API key, while OAuth tokens work via
@@ -198,8 +226,19 @@ async function measureOne(
             authEntry.type === "oauth" &&
             !!authEntry.access;
         let measurements: { systemApi: number | null; toolsApi: number | null };
-        if (test.provider === "anthropic") {
-            measurements = await measureAnthropic(test, authEntry, systemText, toolsArray);
+        if (adapter || test.provider === "anthropic") {
+            if (adapter && authEntry.type !== "api") throw new Error("SKIP: counting requires an API key, not OAuth");
+            const measured = adapter && authEntry.type === "api"
+                ? await adapter.measure(test.modelId, authEntry.key, systemText, toolsArray, prose)
+                : await measureAnthropic(test, authEntry, systemText, toolsArray, prose);
+            measurements = measured;
+            method = measured.method;
+            if ("caveat" in measured && typeof measured.caveat === "string") caveat = measured.caveat;
+            proseApi = measured.proseApi;
+            for (const [name, api] of Object.entries(measured.sections)) {
+                const local_raw = tokenizer.count(prose[name] ?? "");
+                proseSections[name] = { local_raw, api, ratio: api / local_raw };
+            }
         } else if (useCodex) {
             const accountId = extractCodexAccountId(authEntry.access);
             measurements = await measureOpenAICodex(
@@ -219,6 +258,11 @@ async function measureOne(
 
     const durationMs = Date.now() - start;
     return {
+        method,
+        ...(caveat ? { caveat } : {}),
+        proseRatio: proseApi === null ? null : proseApi / proseLocal,
+        proseTokens: { local_raw: proseLocal, api: proseApi },
+        proseSections,
         label: test.label,
         provider: test.provider,
         modelId: test.modelId,
@@ -265,6 +309,12 @@ function parseArgs(): { only: string | null; providers: string[] | null } {
     return { only, providers };
 }
 
+function writeResults(path: string, results: MeasurementResult[]): void {
+    const previous = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as MeasurementResult[] : [];
+    const measuredLabels = new Set(results.map((row) => row.label));
+    writeFileSync(path, JSON.stringify([...previous.filter((row) => !measuredLabels.has(row.label)), ...results], null, 2), "utf8");
+}
+
 async function main(): Promise<void> {
     const { only, providers } = parseArgs();
     const here = new URL(".", import.meta.url).pathname;
@@ -275,13 +325,35 @@ async function main(): Promise<void> {
     const testSet = JSON.parse(
         readFileSync(join(here, "models.json"), "utf-8"),
     ) as ModelTestSet;
-    const auth = JSON.parse(
-        readFileSync(join(homedir(), ".local/share/opencode/auth.json"), "utf-8"),
-    ) as AuthFile;
+    const keyPath = join(homedir(), ".config/anthro.key");
+    const key = process.env.ANTHROPIC_API_KEY?.trim() || (existsSync(keyPath) ? readFileSync(keyPath, "utf8").trim() : "");
+    const oauthAccess = process.env.ANTHROPIC_OAUTH_ACCESS_TOKEN?.trim();
+    const auth: AuthFile = key
+        ? { anthropic: { type: "api", key } }
+        : oauthAccess
+          ? { anthropic: { type: "oauth", access: oauthAccess } }
+          : {};
+    const prose = buildProseProbe();
 
     let tests = testSet.tests;
-    if (only) tests = tests.filter((t) => t.label === only || t.modelId === only);
+    if (only) tests = tests.filter((t) => only.split(",").includes(t.label) || only.split(",").includes(t.modelId));
     if (providers) tests = tests.filter((t) => providers.includes(t.provider));
+    for (const test of tests) {
+        const provider = authProvider(test);
+        const adapter = FREE_ADAPTERS[provider];
+        if (!adapter) continue;
+        if (adapter.offline) {
+            auth[provider] = { type: "api", key: "" };
+            continue;
+        }
+        const path = join(homedir(), ".config", adapter.file);
+        const apiKey = process.env[adapter.env]?.trim() || (existsSync(path) ? readFileSync(path, "utf8").trim() : "");
+        if (apiKey) auth[provider] = { type: "api", key: apiKey };
+    }
+    const fallbackTests = tests.filter((test) => !FREE_ADAPTERS[authProvider(test)] && !auth[authProvider(test)]);
+    if (fallbackTests.length > 0) {
+        console.log("Missing credentials: provider fallback credentials must be supplied explicitly. PROSE is never sent through usage.");
+    }
 
     console.log(
         `Calibration harness: ${tests.length} models, system=${systemText.length} chars, tools=${toolsArray.length} (${JSON.stringify(toolsArray).length} chars)`,
@@ -291,19 +363,28 @@ async function main(): Promise<void> {
     const results: MeasurementResult[] = [];
     for (const test of tests) {
         process.stdout.write(`  ${test.label.padEnd(45, " ")} ... `);
-        const r = await measureOne(test, auth, systemText, toolsArray);
+        const r = await measureOne(test, auth, systemText, toolsArray, prose);
         if (r.error) {
-            process.stdout.write(`ERROR (${r.durationMs}ms) ${r.error.slice(0, 80)}\n`);
+            process.stdout.write(`SKIP (${r.durationMs}ms) ${r.error}\n`);
         } else {
             process.stdout.write(
                 `system=${r.systemTokens.api ?? "—"} (raw ${r.systemTokens.local_raw}, ratio ${r.systemTokens.ratio_raw ?? "—"}x), tools=${r.toolsTokens.api ?? "—"} (raw ${r.toolsTokens.local_raw}, ratio ${r.toolsTokens.ratio_raw ?? "—"}x), ${r.durationMs}ms\n`,
             );
         }
         results.push(r);
+        console.log(`method=${r.method}, proseRatio=${r.proseRatio ?? "skipped"}`, r.proseSections);
+        const check = !r.error && r.method !== "usage" ? crossCheck(test.provider, test.modelId, (r.systemTokens.api ?? 0) / r.systemTokens.local_raw, (r.toolsTokens.api ?? 0) / r.toolsTokens.local_raw) : null;
+        if (check) {
+            console.log(`Cross-check delta: system=${check.systemDelta * 100}%, tools=${check.toolsDelta * 100}%`);
+            if (check.failed) {
+                writeResults(join(here, "results.json"), results);
+                throw new Error("Cross-check exceeds 5%; stopped without changing calibration table");
+            }
+        }
     }
 
     const outPath = join(here, "results.json");
-    writeFileSync(outPath, JSON.stringify(results, null, 2), "utf-8");
+    writeResults(outPath, results);
     console.log(`\nWrote ${outPath}`);
 
     // Summary

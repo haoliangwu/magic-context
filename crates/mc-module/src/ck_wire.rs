@@ -5,6 +5,7 @@
 //! each content block to a session-stable `mid#block_index` item, and retain the original
 //! message objects so an unreduced response can pass them back without rebuilding them.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -14,6 +15,30 @@ use mc_store::BlockIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+thread_local! {
+    static UNCOMPACTED_REFERENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only reference to the former ownership model. Scope the flag to the current-thread
+/// replay so its wire clones cannot affect unrelated tests, including after a panic.
+#[cfg(test)]
+pub(crate) struct UncompactedProjectionGuard(bool);
+
+#[cfg(test)]
+impl UncompactedProjectionGuard {
+    pub(crate) fn enter() -> Self {
+        Self(UNCOMPACTED_REFERENCE.with(|flag| flag.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for UncompactedProjectionGuard {
+    fn drop(&mut self) {
+        UNCOMPACTED_REFERENCE.with(|flag| flag.set(self.0));
+    }
+}
 
 // The re-exported CK message/block serializers retain the original serde_json::Value
 // for pass-through. That must remain a Value-level replay path, not a typed-struct
@@ -60,7 +85,214 @@ pub struct FlatBlock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_kind: Option<String>,
     #[serde(skip_serializing)]
-    pub wire: Arc<CkWireBlock>,
+    pub wire: Arc<ProjectedWireBlock>,
+}
+
+impl FlatBlock {
+    /// Materialize a wire block only when a consumer needs its payload. Scalar text lives in
+    /// the canonical allocation; metadata-only consumers should use `kind_tag` instead.
+    pub fn wire(&self) -> Cow<'_, CkWireBlock> {
+        self.wire.materialize()
+    }
+
+    /// Metadata-only view: scalar text fields are empty. Never use this for rendering,
+    /// text predicates, hashing, or serialization; those require `wire` or `scalar_text`.
+    pub(crate) fn wire_shape(&self) -> &CkWireBlock {
+        &self.wire.shell
+    }
+
+    pub(crate) fn scalar_text(&self) -> Option<Cow<'_, str>> {
+        self.wire
+            .text()
+            .or_else(|| scalar_text(&self.wire.shell.kind).map(|(s, _)| Cow::Borrowed(s)))
+    }
+}
+
+/// A lossless wire shell with scalar text removed from both typed and original fields.
+/// The encoded text is a range in the very same allocation as `FlatBlock::bytes`.
+/// Complex JSON/tool arguments remain typed because consumers inspect their trees repeatedly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedWireBlock {
+    shell: CkWireBlock,
+    payload: Option<WireTextPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WireTextPayload {
+    bytes: Arc<str>,
+    range: std::ops::Range<usize>,
+    escaped: bool,
+    path: &'static str,
+}
+
+fn scalar_text(kind: &CkKind) -> Option<(&str, &'static str)> {
+    match kind {
+        CkKind::Text { text } | CkKind::Reasoning { text, .. } => Some((text, "/kind/text")),
+        CkKind::RedactedReasoning { data } => Some((data, "/kind/data")),
+        CkKind::ToolResult { output, .. } => match &output.kind {
+            CkOutputKind::Text { text } | CkOutputKind::ErrorText { text } => {
+                Some((text, "/kind/output/kind/text"))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+impl ProjectedWireBlock {
+    pub(crate) fn matches(&self, served: &CkWireBlock) -> bool {
+        let Some(payload) = &self.payload else {
+            return &self.shell == served;
+        };
+        let same_shape = match (&self.shell.kind, &served.kind) {
+            (CkKind::Text { .. }, CkKind::Text { .. })
+            | (CkKind::RedactedReasoning { .. }, CkKind::RedactedReasoning { .. }) => true,
+            (CkKind::Reasoning { signature: a, .. }, CkKind::Reasoning { signature: b, .. }) => {
+                a == b
+            }
+            (
+                CkKind::ToolResult {
+                    id: a,
+                    tool_name: an,
+                    output: ao,
+                    provider_executed: ap,
+                },
+                CkKind::ToolResult {
+                    id: b,
+                    tool_name: bn,
+                    output: bo,
+                    provider_executed: bp,
+                },
+            ) => {
+                a == b
+                    && an == bn
+                    && ap == bp
+                    && ao.kind.tag() == bo.kind.tag()
+                    && ao.provider_extras == bo.provider_extras
+            }
+            _ => false,
+        };
+        if !same_shape || self.shell.provider_extras != served.provider_extras {
+            return false;
+        }
+        let text = self.text().expect("retained scalar");
+        if scalar_text(&served.kind).map(|(s, _)| s) != Some(text.as_ref()) {
+            return false;
+        }
+        match (
+            self.shell.retained_original_json(),
+            served.retained_original_json(),
+        ) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                b.pointer(payload.path).and_then(Value::as_str) == Some(text.as_ref())
+                    && json_eq_except_text(a, b, payload.path)
+            }
+            _ => false,
+        }
+    }
+
+    fn new(block: &CkWireBlock, bytes: &Arc<str>) -> Self {
+        #[cfg(test)]
+        if UNCOMPACTED_REFERENCE.with(|flag| flag.get()) {
+            return Self {
+                shell: block.clone(),
+                payload: None,
+            };
+        }
+        let Some((text, path)) = scalar_text(&block.kind) else {
+            return Self {
+                shell: block.clone(),
+                payload: None,
+            };
+        };
+        // A caller can mutate the typed core without clearing the original. Preserve that
+        // unusual state verbatim rather than replacing the original with the typed payload.
+        if block
+            .retained_original_json()
+            .is_some_and(|v| v.pointer(path).and_then(Value::as_str) != Some(text))
+        {
+            return Self {
+                shell: block.clone(),
+                payload: None,
+            };
+        }
+        let encoded = serde_json::to_string(text).expect("wire text serializes");
+        let Some(start) = bytes.find(&encoded) else {
+            return Self {
+                shell: block.clone(),
+                payload: None,
+            };
+        };
+        let shell = block
+            .replay_validated_shell(Some(String::new()))
+            .expect("validated text shell");
+        Self {
+            shell,
+            payload: Some(WireTextPayload {
+                bytes: Arc::clone(bytes),
+                range: start + 1..start + encoded.len() - 1,
+                escaped: encoded.as_bytes().contains(&b'\\'),
+                path,
+            }),
+        }
+    }
+
+    fn text(&self) -> Option<Cow<'_, str>> {
+        let payload = self.payload.as_ref()?;
+        if payload.escaped {
+            profile_start!(_perf_parse, "rt05_escaped_text");
+            Some(Cow::Owned(
+                serde_json::from_str(
+                    &payload.bytes[payload.range.start - 1..payload.range.end + 1],
+                )
+                .expect("retained JSON string"),
+            ))
+        } else {
+            Some(Cow::Borrowed(&payload.bytes[payload.range.clone()]))
+        }
+    }
+
+    fn materialize(&self) -> Cow<'_, CkWireBlock> {
+        let Some(_) = &self.payload else {
+            return Cow::Borrowed(&self.shell);
+        };
+        let text = self.text().expect("retained scalar text");
+        Cow::Owned(
+            self.shell
+                .replay_validated_shell(Some(text.into_owned()))
+                .expect("retained scalar shell"),
+        )
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        // The payload's Arc references `FlatBlock::bytes`, already charged once there.
+        std::mem::size_of::<Self>() - std::mem::size_of::<CkWireBlock>()
+            + crate::retained_size::ck_wire_block_retained_bytes(&self.shell)
+    }
+}
+
+fn json_eq_except_text(a: &Value, b: &Value, path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    let path = path.strip_prefix('/').expect("scalar JSON pointer");
+    let (key, rest) = path
+        .find('/')
+        .map_or((path, ""), |i| (&path[..i], &path[i..]));
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return false;
+    };
+    a.len() == b.len()
+        && a.iter().all(|(k, av)| {
+            b.get(k).is_some_and(|bv| {
+                if k == key {
+                    json_eq_except_text(av, bv, rest)
+                } else {
+                    av == bv
+                }
+            })
+        })
 }
 
 impl CkItem for FlatBlock {
@@ -130,6 +362,7 @@ impl FlatProjection {
         &self,
         prefix_messages: usize,
     ) -> Option<Vec<CkIngressMessage>> {
+        profile_start!(_perf_reattach, "rt02_reattach_prefix");
         if prefix_messages > self.message_count() || self.message_meta.len() != self.message_count()
         {
             return None;
@@ -150,7 +383,7 @@ impl FlatProjection {
                         && block.ordinal == message.ordinal
                         && block.role == message.role
                         && block.block_index == block_index)
-                        .then(|| block.wire.as_ref().clone())
+                        .then(|| block.wire().into_owned())
                 })
                 .collect::<Option<Vec<_>>>()?;
             messages.push(CkIngressMessage {
@@ -171,9 +404,8 @@ impl FlatProjection {
 
     pub(crate) fn retained_bytes(&self) -> usize {
         use crate::retained_size::{
-            btree_map_allocation_bytes, ck_wire_block_retained_bytes, harness_meta_heap_bytes,
-            origin_heap_bytes, provider_extras_heap_bytes, value_retained_bytes,
-            ARC_ALLOCATION_OVERHEAD_BYTES,
+            btree_map_allocation_bytes, harness_meta_heap_bytes, origin_heap_bytes,
+            provider_extras_heap_bytes, value_retained_bytes, ARC_ALLOCATION_OVERHEAD_BYTES,
         };
         use std::mem::size_of;
 
@@ -202,10 +434,10 @@ impl FlatProjection {
                                 ARC_ALLOCATION_OVERHEAD_BYTES
                                     .saturating_add(value_retained_bytes(input))
                             }))
-                            // The cloned wire owns typed fields, its retained original block JSON,
-                            // and an `Arc` allocation independently of the canonical block string.
+                            // Charge the wire shell and its Arc, but not its reference to the
+                            // canonical allocation already charged above.
                             .saturating_add(ARC_ALLOCATION_OVERHEAD_BYTES)
-                            .saturating_add(ck_wire_block_retained_bytes(&block.wire))
+                            .saturating_add(block.wire.retained_bytes())
                     })
                     .sum::<usize>(),
             );
@@ -311,11 +543,7 @@ impl FlatProjection {
     }
 
     pub(crate) fn differential_bytes(&self) -> Vec<u8> {
-        let wires = self
-            .blocks
-            .iter()
-            .map(|block| block.wire.as_ref())
-            .collect::<Vec<_>>();
+        let wires = self.blocks.iter().map(FlatBlock::wire).collect::<Vec<_>>();
         serde_json::to_vec(&(&self.blocks, &self.identity_by_mid, wires))
             .expect("flat projection differential bytes must serialize")
     }
@@ -375,6 +603,7 @@ pub(crate) fn project_messages_incremental(
     cached: &FlatProjection,
     prefix_messages: usize,
 ) -> Result<FlatProjection, CkWireError> {
+    profile_start!(_perf_project_incremental, "rt02_incremental_projection");
     if prefix_messages == 0
         || prefix_messages > messages.len()
         || prefix_messages > cached.message_count()
@@ -625,7 +854,10 @@ fn flatten_block(
             } => (
                 Some(name.clone()),
                 extract_file_path(input),
-                Some(Arc::new(input.clone())),
+                Some({
+                    profile_start!(_perf_input_copy, "rt20_project_input_copy");
+                    Arc::new(input.clone())
+                }),
                 *provider_executed,
                 Some(id.clone()),
                 None,
@@ -646,6 +878,8 @@ fn flatten_block(
             _ => (None, None, None, false, None, None),
         };
 
+    let bytes: Arc<str> = Arc::from(bytes);
+    let wire = Arc::new(ProjectedWireBlock::new(block, &bytes));
     Ok(FlatBlock {
         id,
         mid: msg.mid.clone(),
@@ -658,12 +892,12 @@ fn flatten_block(
         tool_input,
         provider_executed,
         arc_id,
-        bytes: Arc::from(bytes),
+        bytes,
         content_hash,
         synthetic: msg.ck.meta.synthetic,
         tool_call_id,
         output_kind,
-        wire: Arc::new(block.clone()),
+        wire,
     })
 }
 
@@ -747,7 +981,7 @@ pub(crate) fn fingerprint_from_projected_wire(
     projected: Option<&FlatBlock>,
 ) -> Option<(String, usize)> {
     let flat = projected?;
-    if flat.wire.as_ref() != served {
+    if !flat.wire.matches(served) {
         return None;
     }
     Some((fingerprint_digest(&flat.content_hash), flat.bytes.len()))
@@ -803,6 +1037,74 @@ mod tests {
                 HarnessMeta::default(),
             ),
         }
+    }
+
+    #[test]
+    fn compact_projection_scalar_wire_roundtrip() {
+        for kind in [
+            serde_json::json!({"type":"text","text":"雪\n\"text\""}),
+            serde_json::json!({"type":"reasoning","text":"think\\path","signature":"signed"}),
+            serde_json::json!({"type":"redacted_reasoning","data":"secret"}),
+            serde_json::json!({"type":"tool_result","id":"c","tool_name":"work","output":{"kind":{"type":"text","text":"done\n雪"}}}),
+            serde_json::json!({"type":"tool_result","id":"c","tool_name":"work","output":{"kind":{"type":"error_text","text":"failed"}}}),
+        ] {
+            let mut kind = kind;
+            kind["future"] = serde_json::json!({"unchanged":[true,1.5]});
+            let wire: CkWireBlock = serde_json::from_value(serde_json::json!({"kind":kind,"future_block":7,"provider_extras":{"future":{"flag":true}}})).unwrap();
+            let bytes: Arc<str> = Arc::from(serde_json::to_string(&wire).unwrap());
+            let retained = ProjectedWireBlock::new(&wire, &bytes);
+            assert!(retained.payload.is_some());
+            assert_eq!(scalar_text(&retained.shell.kind).unwrap().0, "");
+            assert_eq!(retained.materialize().as_ref(), &wire);
+            assert_eq!(
+                serde_json::to_vec(retained.materialize().as_ref()).unwrap(),
+                bytes.as_bytes()
+            );
+            assert!(retained.matches(&wire));
+            assert!(Arc::ptr_eq(
+                &retained.payload.as_ref().unwrap().bytes,
+                &bytes
+            ));
+        }
+        // Typed/original mismatches are legal Rust values, although not produced by ingress
+        // deserialization. Never compact one by choosing either view over the other.
+        let mut wire: CkWireBlock =
+            serde_json::from_str(r#"{"kind":{"type":"text","text":"original"}}"#).unwrap();
+        wire.kind = CkKind::Text {
+            text: "edited".into(),
+        };
+        let bytes: Arc<str> = Arc::from(serde_json::to_string(&wire).unwrap());
+        let retained = ProjectedWireBlock::new(&wire, &bytes);
+        assert!(retained.payload.is_none());
+        assert_eq!(retained.materialize().as_ref(), &wire);
+        let bare = CkWireBlock::bare(CkKind::Text {
+            text: "bare".into(),
+        });
+        let bytes: Arc<str> = Arc::from(serde_json::to_string(&bare).unwrap());
+        let retained = ProjectedWireBlock::new(&bare, &bytes);
+        assert_eq!(retained.materialize().as_ref(), &bare);
+        assert!(retained.materialize().retained_original_json().is_none());
+    }
+
+    #[test]
+    fn compact_projection_wire_matching_includes_unknown_fields() {
+        let original = serde_json::json!({"kind":{"type":"text","text":"payload","future":1},"future_block":true});
+        let wire: CkWireBlock = serde_json::from_value(original.clone()).unwrap();
+        let bytes: Arc<str> = Arc::from(serde_json::to_string(&wire).unwrap());
+        let retained = ProjectedWireBlock::new(&wire, &bytes);
+        for pointer in ["/kind/text", "/kind/future", "/future_block"] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).unwrap() = Value::String("changed".into());
+            let changed: CkWireBlock = serde_json::from_value(changed).unwrap();
+            assert!(!retained.matches(&changed), "ignored {pointer}");
+        }
+        let mut changed = wire.clone();
+        changed.kind = CkKind::Text {
+            text: "typed change".into(),
+        };
+        assert!(!retained.matches(&changed));
+        let bare = CkWireBlock::bare(wire.kind.clone());
+        assert!(!retained.matches(&bare));
     }
 
     #[test]
@@ -896,10 +1198,10 @@ mod tests {
             serde_json::from_value(serde_json::to_value(constructed).unwrap()).unwrap();
         let projection = project_messages(&[message]).unwrap();
         let block = &projection.blocks[0];
-        let wire_json = serde_json::to_value(block.wire.as_ref()).unwrap();
+        let wire_json = serde_json::to_value(block.wire().as_ref()).unwrap();
         let CkKind::ToolCall {
             id, name, input, ..
-        } = &block.wire.kind
+        } = &block.wire_shape().kind
         else {
             panic!("fixture must project a tool call");
         };
@@ -908,6 +1210,8 @@ mod tests {
             .saturating_add(name.capacity())
             .saturating_add(manual_value_retained_bytes(input).saturating_sub(size_of::<Value>()))
             .saturating_add(manual_value_retained_bytes(&wire_json));
+        let wire_retained =
+            wire_retained + size_of::<ProjectedWireBlock>() - size_of::<CkWireBlock>();
         let block_heap = block
             .id
             .capacity()

@@ -1,13 +1,33 @@
 import type { Database } from "bun:sqlite";
 
-/** Keep child agents on the same explicitly registered mock model as their host. */
+/**
+ * The config block a host reads its agent models from.
+ *
+ * Both OpenCode generations resolve models under `opencode`: the v2 lane calls
+ * `resolveHistorianModel(config, "opencode")` like the v1 lane does, and
+ * `opencode2` is not a model harness at all. Writing an `opencode2` block put the
+ * model somewhere nothing reads, which the module reported back as
+ * `historian_no_fire=no_models` — a historian that silently never ran.
+ */
+function modelHarnessFor(host: "opencode" | "opencode2" | "pi" | "omp"): "opencode" | "pi" | "omp" {
+  return host === "opencode2" ? "opencode" : host;
+}
+
+/**
+ * Keep child agents on an explicitly registered mock model: the host's own model,
+ * or the one `agentModels` names for that agent. A caller that names a separate
+ * agent model must register it on the same mock provider as the host model.
+ */
 export function pinMockAgents(
   overrides: Record<string, unknown> = {},
-  model: string,
-  harness: "opencode" | "opencode2" | "pi" | "omp" = "opencode",
+  hostModel: string,
+  host: "opencode" | "opencode2" | "pi" | "omp" = "opencode",
+  agentModels: { historian?: string; dreamer?: string } = {},
 ): Record<string, unknown> {
+  const harness = modelHarnessFor(host);
   const result = { ...overrides };
-  for (const name of ["historian", "dreamer"]) {
+  for (const name of ["historian", "dreamer"] as const) {
+    const model = agentModels[name] ?? hostModel;
     const supplied = overrides[name];
     const agent =
       supplied && typeof supplied === "object" ? (supplied as Record<string, unknown>) : {};

@@ -5,7 +5,7 @@ import {
     legacyRpcPortFilePath,
     parseRpcPortFile,
     type RpcPortFileRecord,
-    rpcPortDir,
+    rpcPortDirsForLookup,
 } from "./rpc-utils";
 
 const MAX_RETRIES = 10;
@@ -15,17 +15,73 @@ const MAX_RERESOLVE_ATTEMPTS = 3;
 const NON_RETRYABLE_RPC_ERROR = Symbol("nonRetryableRpcError");
 type NonRetryableRpcError = Error & { [NON_RETRYABLE_RPC_ERROR]: true };
 
+/** No live RPC server was found for the client's directory, after every retry. */
+export class RpcServerNotFoundError extends Error {
+    constructor() {
+        super("Magic Context RPC server not available");
+        this.name = "RpcServerNotFoundError";
+    }
+}
+
+export interface MagicContextRpcClientOptions {
+    /** Discovery directories to read instead of the ones derived from `directory`. */
+    readonly portDirs?: readonly string[];
+    /** Port-file passes per resolution (default 10, 500 ms apart). */
+    readonly resolveAttempts?: number;
+    /** Resolutions per call before giving up (default 3). */
+    readonly reresolveAttempts?: number;
+}
+
 export class MagicContextRpcClient {
     private port: number | null = null;
     private token: string | null = null;
     private instanceId: string | null = null;
-    private portDir: string;
+    private readonly portDirs: readonly string[];
     private legacyPortFilePath: string;
     private healthChecked = false;
+    private readonly resolveAttempts: number;
+    private readonly reresolveAttempts: number;
 
-    constructor(storageDir: string, directory: string) {
-        this.portDir = rpcPortDir(storageDir, directory);
+    constructor(storageDir: string, directory: string, options: MagicContextRpcClientOptions = {}) {
+        this.portDirs = options.portDirs ?? rpcPortDirsForLookup(storageDir, directory);
         this.legacyPortFilePath = legacyRpcPortFilePath(storageDir, directory);
+        this.resolveAttempts = options.resolveAttempts ?? MAX_RETRIES;
+        this.reresolveAttempts = options.reresolveAttempts ?? MAX_RERESOLVE_ATTEMPTS;
+    }
+
+    /**
+     * Find the live server that owns `sessionId` by asking every server that
+     * has a discovery file under `storageDir`. The fallback for a session whose
+     * directory spelling matches no discovery directory: an empty sidebar is
+     * worse than one scan of the local servers. Null when none claims it.
+     */
+    static async findSessionOwner(
+        storageDir: string,
+        sessionId: string,
+    ): Promise<MagicContextRpcClient | null> {
+        const rpcRoot = join(storageDir, "rpc");
+        let projectDirs: string[];
+        try {
+            projectDirs = readdirSync(rpcRoot).map((entry) => join(rpcRoot, entry));
+        } catch {
+            return null;
+        }
+        for (const portDir of projectDirs) {
+            const candidate = new MagicContextRpcClient(storageDir, "", {
+                portDirs: [portDir],
+                resolveAttempts: 1,
+                reresolveAttempts: 1,
+            });
+            try {
+                const reply = await candidate.call<{ owner?: unknown }>("session-owner", {
+                    sessionId,
+                });
+                if (reply.owner === true) return candidate;
+            } catch {
+                // Not running, unreachable, or an older server without the method.
+            }
+        }
+        return null;
     }
 
     /** Call an RPC method. Retries port resolution if the server isn't ready yet. */
@@ -35,10 +91,10 @@ export class MagicContextRpcClient {
     ): Promise<T> {
         let lastError: unknown = null;
 
-        for (let attempt = 0; attempt < MAX_RERESOLVE_ATTEMPTS; attempt++) {
+        for (let attempt = 0; attempt < this.reresolveAttempts; attempt++) {
             const port = await this.resolvePort();
             if (!port) {
-                lastError = new Error("Magic Context RPC server not available");
+                lastError = new RpcServerNotFoundError();
                 this.reset();
                 continue;
             }
@@ -85,7 +141,7 @@ export class MagicContextRpcClient {
         if (lastError instanceof Error) {
             throw lastError;
         }
-        throw new Error("Magic Context RPC server not available");
+        throw new RpcServerNotFoundError();
     }
 
     /** Check if the RPC server is reachable. */
@@ -118,7 +174,7 @@ export class MagicContextRpcClient {
         }
     }
 
-    private async resolvePort(maxAttempts = MAX_RETRIES): Promise<number | null> {
+    private async resolvePort(maxAttempts = this.resolveAttempts): Promise<number | null> {
         if (this.port && this.healthChecked) {
             return this.port;
         }
@@ -145,17 +201,19 @@ export class MagicContextRpcClient {
     private readPortFiles(): RpcPortFileRecord[] {
         const records: RpcPortFileRecord[] = [];
 
-        try {
-            for (const entry of readdirSync(this.portDir)) {
-                if (!entry.startsWith("port-") || !entry.endsWith(".json")) continue;
-                const record = parseRpcPortFile(readFileSync(join(this.portDir, entry), "utf-8"));
-                // A denied liveness probe still leaves this as a candidate; the
-                // mandatory health check below confirms whether its RPC server is reachable.
-                if (!record || isPidAlive(record.pid) === "dead") continue;
-                records.push(record);
+        for (const portDir of this.portDirs) {
+            try {
+                for (const entry of readdirSync(portDir)) {
+                    if (!entry.startsWith("port-") || !entry.endsWith(".json")) continue;
+                    const record = parseRpcPortFile(readFileSync(join(portDir, entry), "utf-8"));
+                    // A denied liveness probe still leaves this as a candidate; the
+                    // mandatory health check below confirms whether its RPC server is reachable.
+                    if (!record || isPidAlive(record.pid) === "dead") continue;
+                    records.push(record);
+                }
+            } catch {
+                // Directory may not exist yet. Fall back to the legacy file below.
             }
-        } catch {
-            // Directory may not exist yet. Fall back to the legacy file below.
         }
 
         try {

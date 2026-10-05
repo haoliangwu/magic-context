@@ -1,5 +1,5 @@
 import { formatCacheTtlDisplay } from "./cache-ttl-display";
-import type { StatusDetail } from "./rpc-types";
+import type { RunnerStatus, StatusDetail } from "./rpc-types";
 import { renderUserFacingFailure, type UserFacingFailureKey } from "./user-facing-codes";
 
 export type StatusCompressionState = "off" | "compressing" | "ready" | "waiting";
@@ -26,7 +26,61 @@ export interface UserStatusSummary {
         indexed: number;
         total: number;
     };
+    historianRefusal?: {
+        stage: string;
+        canonicalCause: string;
+        detail: string;
+    };
+    compactionMarker?: StatusDetail["compactionMarker"];
+    historianRunner?: RunnerStatus;
+    dreamerRunner?: RunnerStatus;
     warnings: UserFacingFailureKey[];
+    hiddenVariantWarnings?: string[];
+    dreamerSkipped?: readonly string[];
+}
+
+/**
+ * The status fields the warning list is derived from. A full `StatusDetail`
+ * satisfies it; the status payload check builds one from an unchecked RPC reply
+ * so both paths derive the same warnings.
+ */
+export interface StatusWarningInput {
+    readonly lastTransformError?: string | null;
+    readonly historianFailureCount?: number;
+    readonly configParseFailures?: readonly unknown[];
+    readonly embedding?: { readonly state: string };
+    readonly loggerDiagnostics?: { readonly swallowedWriteCount?: number };
+    readonly memoryMirror?: { readonly stalled?: boolean };
+    readonly compactionMarker?: { readonly code: string | null };
+    readonly memoryAuthorityMismatch?: boolean;
+    readonly dreamerFailures?: readonly unknown[];
+    readonly dreamerTickFailure?: unknown;
+    readonly hostLimitations?: readonly UserFacingFailureKey[];
+}
+
+/** Failure codes the status surfaces print as warnings, deduplicated, in display order. */
+export function statusWarningsFromDetail(detail: StatusWarningInput): UserFacingFailureKey[] {
+    const warnings: UserFacingFailureKey[] = [];
+    if (detail.lastTransformError) warnings.push("transform_update_failed");
+    if ((detail.historianFailureCount ?? 0) > 0) warnings.push("historian_unavailable");
+    if ((detail.configParseFailures?.length ?? 0) > 0) warnings.push("configuration_warning");
+    if (detail.embedding?.state === "stopped") warnings.push("embedding_unavailable");
+    if ((detail.loggerDiagnostics?.swallowedWriteCount ?? 0) > 0) {
+        warnings.push("status_log_unavailable");
+    }
+    if (detail.memoryMirror?.stalled) warnings.push("memory_mirror_stalled");
+    if (detail.compactionMarker?.code) warnings.push("compaction_marker_missing");
+    if (detail.memoryAuthorityMismatch) warnings.push("memory_authority_mismatch");
+    if ((detail.dreamerFailures?.length ?? 0) > 0) warnings.push("dreamer_task_failing");
+    // A whole maintenance pass that never reached its work is a different
+    // problem from an individual task that keeps failing, so it gets its own
+    // warning rather than sharing that one.
+    if (detail.dreamerTickFailure) warnings.push("dreamer_tick_blocked");
+    // Host limitations are not failures of this turn, but they belong in the
+    // same list: the user needs to see that something they configured or asked
+    // for is not running here.
+    warnings.push(...(detail.hostLimitations ?? []));
+    return [...new Set(warnings)];
 }
 
 export function statusSummaryFromDetail(detail: StatusDetail): UserStatusSummary {
@@ -41,16 +95,6 @@ export function statusSummaryFromDetail(detail: StatusDetail): UserStatusSummary
               : detail.compartmentCount > 0
                 ? "ready"
                 : "waiting";
-    const warnings: UserFacingFailureKey[] = [];
-    if (detail.lastTransformError) warnings.push("transform_update_failed");
-    if ((detail.historianFailureCount ?? 0) > 0) warnings.push("historian_unavailable");
-    if ((detail.configParseFailures?.length ?? 0) > 0) warnings.push("configuration_warning");
-    if (detail.embedding?.state === "stopped") warnings.push("embedding_unavailable");
-    if ((detail.loggerDiagnostics?.swallowedWriteCount ?? 0) > 0) {
-        warnings.push("status_log_unavailable");
-    }
-    if (detail.memoryMirror?.stalled) warnings.push("memory_mirror_stalled");
-    if (detail.memoryAuthorityMismatch) warnings.push("memory_authority_mismatch");
 
     return {
         inputTokens: detail.inputTokens,
@@ -78,7 +122,13 @@ export function statusSummaryFromDetail(detail: StatusDetail): UserStatusSummary
             indexed: 0,
             total: 0,
         },
-        warnings: [...new Set(warnings)],
+        historianRefusal: detail.historianRefusal,
+        historianRunner: detail.historianRunner,
+        dreamerRunner: detail.dreamerRunner,
+        compactionMarker: detail.compactionMarker,
+        warnings: statusWarningsFromDetail(detail),
+        hiddenVariantWarnings: detail.hiddenVariantWarnings ?? [],
+        dreamerSkipped: detail.dreamerSkipped,
     };
 }
 
@@ -100,6 +150,20 @@ function compressionText(summary: UserStatusSummary): string {
         case "waiting":
             return "Waiting for enough conversation history";
     }
+}
+
+/**
+ * `host (default for harness opencode)` or `broca (configured)`, plus a note when
+ * no completion has run yet in the module's current process and the value is
+ * only what the session's route resolves to.
+ */
+export function runnerText(status: RunnerStatus): string {
+    const why =
+        status.source === "configured"
+            ? "configured"
+            : `default for harness ${status.harness || "unknown"}`;
+    const observed = status.observed === "last_completion" ? "" : " · no completion yet";
+    return `${status.runner} (${why})${observed}`;
 }
 
 function reclaimableText(summary: UserStatusSummary): string {
@@ -133,7 +197,7 @@ export function renderUserStatusSummary(
     const context = `${summary.usagePercentage.toFixed(1)}% of usable context (${formatCount(summary.inputTokens)} / ${
         summary.usableContextTokens > 0 ? formatCount(summary.usableContextTokens) : "?"
     } tokens)`;
-    const values = [
+    const values: Array<readonly [string, string]> = [
         ["Context", context],
         ["Cache lifetime", summary.cacheLifetime],
         [
@@ -149,7 +213,26 @@ export function renderUserStatusSummary(
             `${formatCount(summary.memoryCount)} memories · ${formatCount(summary.noteCount)} notes`,
         ],
         ["Search indexing", embeddingText(summary)],
-    ] as const;
+    ];
+    if (summary.historianRunner) {
+        values.push(["Historian runner", runnerText(summary.historianRunner)]);
+    }
+    if (summary.dreamerRunner) {
+        values.push(["Dreamer runner", runnerText(summary.dreamerRunner)]);
+    }
+    for (const skipped of summary.dreamerSkipped ?? []) values.push(["Dreamer skipped", skipped]);
+    if (summary.historianRefusal) {
+        values.push([
+            "Historian refusal",
+            `${summary.historianRefusal.stage} (${summary.historianRefusal.canonicalCause}) — ${summary.historianRefusal.detail}`,
+        ]);
+    }
+    if (summary.compactionMarker?.code) {
+        values.push([
+            "History boundary marker",
+            `${summary.compactionMarker.code} · ${summary.compactionMarker.attempts} attempts · last error: ${summary.compactionMarker.lastError ?? "unknown"}`,
+        ]);
+    }
     const lines =
         style === "markdown"
             ? [
@@ -158,6 +241,9 @@ export function renderUserStatusSummary(
                   ...values.map(([label, value]) => `- **${label}:** ${value}`),
               ]
             : ["Magic Context Status", ...values.map(([label, value]) => `${label}: ${value}`)];
+    for (const warning of summary.hiddenVariantWarnings ?? []) {
+        lines.push(style === "markdown" ? `- **Warning:** ${warning}` : `Warning: ${warning}`);
+    }
     for (const warning of summary.warnings) {
         lines.push(
             style === "markdown"

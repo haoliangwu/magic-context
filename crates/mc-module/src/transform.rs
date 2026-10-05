@@ -27,8 +27,8 @@ use crate::injection::{
 };
 use crate::m0_compose::{trim_memories_to_budget, trim_user_profile_to_budget};
 use crate::m1_compose::{
-    claim_and_render_notes, compose_m1_from_store, m1_revision_signal_parts_for_pass_timed,
-    M1RevisionReadTimings, M1RevisionSignal,
+    compose_m1_from_store, m1_revision_signal_parts_for_pass_timed, M1RevisionReadTimings,
+    M1RevisionSignal,
 };
 use crate::memory_render::{render_m0, workspace_source_names, M0Inputs, M1_PLACEHOLDER};
 use crate::project_docs::read_project_docs_canonical;
@@ -50,15 +50,15 @@ use crate::selection::{
 use crate::tail_hygiene::{
     channel1_refire_tokens, effective_tail_hygiene, hygiene_band,
     measure_tail_hygiene_with_pending_drops, post_reduce_grace_holds, queued_tag_numbers,
-    real_user_turn_count, refresh_tail_hygiene_baseline, HygieneBand, CHANNEL1_FLOOR_TOKENS,
-    CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
+    real_user_turn_count, refresh_tail_hygiene_baseline_calibrated, HygieneBand,
+    HygieneCalibration, CHANNEL1_FLOOR_TOKENS, CHANNEL2_FLOOR_TOKENS, CHANNEL2_SEVERITY_THRESHOLD,
 };
 use mc_core::{classify, CkItem, ClassifierInput, CoreState, FrozenUnit, PassInput, PassPlan};
 use mc_store::{
-    BlockIdentity, Channel1AppendRow, DeferredExecuteState, LineageAnchor, LineageConstituent,
-    LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError, McTagRow,
-    MemoryRevision, ModuleMeta, ModuleUsage, NoteDelivery, PassSchedulerObservation,
-    PendingAgentDrop, PendingChannel2Directive, PendingRewriteState, ServedBlockFingerprint,
+    BlockIdentity, Channel1AppendRow, DeferredExecuteState, FrozenClear, LineageAnchor,
+    LineageConstituent, LineageDescentDisposition, LineageDescentRequest, McStore, McStoreError,
+    McTagRow, MemoryRevision, ModuleMeta, ModuleUsage, PassSchedulerObservation, PendingAgentDrop,
+    PendingChannel2Directive, PendingRewriteState, SectionsCommit, ServedBlockFingerprint,
     StoredCompartment, TagCacheSummary, TagMintInput, TailHygieneBaseline, TailHygienePartKind,
     TemporalMarkInput, TemporalMarkRow, TransformCommit, TransformOverlayBatch,
     UserHintDecisionInput, UserHintRow,
@@ -81,6 +81,13 @@ use crate::ck_wire::{
     CkIngressMessage, CkWireBlock, CkWireError, CkWireMessage, FlatBlock, FlatProjection,
 };
 
+#[cfg(test)]
+#[path = "tests/perf_audit_identity.rs"]
+mod perf_audit_identity;
+#[cfg(test)]
+#[path = "tests/perf_audit_metadata.rs"]
+pub(crate) mod perf_audit_metadata;
+
 /// Max CAS retries before surfacing the conflict (the module is the single writer in
 /// the daemon case, so this rarely loops; the shared-store case re-loads and re-steps).
 const MAX_CAS_RETRIES: u32 = 8;
@@ -89,8 +96,8 @@ const MAX_CAS_RETRIES: u32 = 8;
 const BOUNDARY_DIVERGENCE_PENDING_PASS_LIMIT: u8 = 3;
 
 /// Reserved synthetic-block ids (never carried by a real conversation item).
-#[cfg(test)]
 const M0_ID: &str = "mc_m0";
+const M1_ID: &str = "mc_m1";
 /// The reserved id prefix: a non-synthetic item bearing it is a contract violation.
 const RESERVED_ID_PREFIX: &str = "mc_";
 const SYNTH_REGION_KIND: &str = "synthesized-region";
@@ -98,6 +105,9 @@ const M0_MURAL_KEY: &str = "m0-mural";
 /// Frozen-unit key prefix for a tail reduction (a reduced tool output / superseded edit).
 /// `red:<target_id>` — the target is the real tail item whose bytes are replaced.
 const RED_KEY_PREFIX: &str = "red:";
+/// Frozen Channel-1 reminders. The key encodes `(tool_call_id, owner_mid)`; `reset_rule`
+/// stores the target tool-result block id and `frozen_payload` stores the exact append bytes.
+const CHANNEL1_KEY_PREFIX: &str = "channel1:";
 /// Durable sentinel proving this session has adopted the renderer transition. It is stored in the
 /// existing cache-state row and never emitted; preserving it avoids a schema migration or hot-path
 /// state read while keeping the pass commit under the normal row-version CAS.
@@ -186,6 +196,7 @@ impl ServedMessage {
         message: CkWireMessage,
         projected_blocks: Option<&[&FlatBlock]>,
     ) -> Self {
+        profile_start!(_perf_fingerprints, "rt11_served_message_encode");
         let canonical_bytes = canonical_message_bytes(&message);
         let block_fingerprints = message
             .content
@@ -199,10 +210,7 @@ impl ServedMessage {
                         .copied()
                         .or_else(|| {
                             // Full-drop paths compact content indexes; match by wire value.
-                            blocks
-                                .iter()
-                                .copied()
-                                .find(|flat| flat.wire.as_ref() == block)
+                            blocks.iter().copied().find(|flat| flat.wire.matches(block))
                         })
                 });
                 if let Some(fp) = ck_wire::fingerprint_from_projected_wire(block, projected) {
@@ -426,6 +434,7 @@ impl SerializedOutputCache {
     }
 
     fn snapshot(&mut self, session_id: &str, revert_epoch: u64) -> SerializedOutputCacheSnapshot {
+        profile_start!(_perf_snapshot, "rt08_output_snapshot");
         if self
             .sessions
             .get(session_id)
@@ -503,7 +512,7 @@ fn log_pending_m1_delta(session_id: &str, now_ms: i64, pending_since_ms: Option<
     let mut buckets = buckets.lock().expect("m1 pending log mutex");
     if buckets.get(session_id).copied().unwrap_or(0) < bucket {
         buckets.insert(session_id.to_string(), bucket);
-        eprintln!("mc-module: pending_m1_delta=true age_ms={age_ms} session={session_id}");
+        tracing::info!("mc-module: pending_m1_delta=true age_ms={age_ms} session={session_id}");
     }
 }
 
@@ -611,8 +620,27 @@ pub struct ProducerContext<'a> {
     /// is bounded by the 3,800-second `historian::MAX_WRAPUP_REQUEST_BUDGET` and is released on
     /// every terminal path, so a damaged row delayed by this signal becomes eligible afterward.
     pub wrapup_active: bool,
+    /// Whether caveman compression may use its English word rules, from the user-level
+    /// `language` setting (`caveman_english_word_rules`). New caveman units and new user-hint
+    /// fragments read it; frozen payloads keep the bytes they were minted with.
+    pub caveman_english_word_rules: bool,
     #[cfg(test)]
     pub injected_reductions: Vec<ReductionDecision>,
+}
+
+/// Whether caveman may use its English word rules for the user-level `language` setting: yes
+/// when it is unset, "en", "en-*", or not a resolvable code (the same values that produce no
+/// language directive); no for any other language. The TypeScript twin is
+/// `cavemanWordRulesForLanguage` in packages/plugin/src/hooks/magic-context/caveman.ts.
+pub(crate) fn caveman_english_word_rules(language: Option<&str>) -> bool {
+    let code = language
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if code == "en" || code.starts_with("en-") {
+        return true;
+    }
+    crate::content_language::resolve_language_name(Some(&code)).is_none()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -675,6 +703,11 @@ pub struct TransformRequest {
     /// without forcing a fold on legacy sessions.
     #[serde(default)]
     pub system_prompt_hash: String,
+    /// Host acknowledgement that this external system identity was already adopted on
+    /// an idle-expired request (or the first system observation after bootstrap).
+    /// It can acknowledge only a system-only identity delta, never other render inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted_system_prompt_hash: Option<String>,
     /// Identity of the materializer's upgrade state, stored so a change is detected as a
     /// render-configuration change consistently with the TypeScript materializer.
     #[serde(default)]
@@ -851,6 +884,14 @@ pub struct TransformRequest {
     /// a present but empty list disables historian dispatch for this OpenCode route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub historian_model_chain: Option<Vec<String>>,
+    #[serde(default)]
+    pub historian_model_limits:
+        std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    /// Host-resolved per-attempt historian deadline; absent on older adapters.
+    #[serde(default)]
+    pub historian_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub historian_max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_trim: Option<DeclaredTrim>,
     /// Composed fake-compaction edge delivered by the lineage owner. Missing fields retain
@@ -925,9 +966,25 @@ fn claim_protected_tags_deprecation(req: &TransformRequest) -> bool {
 
 fn emit_protected_tags_deprecation_once(req: &TransformRequest) {
     if claim_protected_tags_deprecation(req) {
-        eprintln!(
+        tracing::debug!(
             "mc-module: deprecated protected_tags is ignored for session {}; use protected_tokens",
             req.session_id
+        );
+    }
+}
+
+/// Log once per session that caller drop ids were received and ignored (see
+/// `TransformRequestWire::agent_drop_ids`).
+fn emit_agent_drop_ids_ignored_once(session_id: &str, count: usize) {
+    static WARNED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let first = WARNED_SESSIONS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .expect("agent_drop_ids warning mutex")
+        .insert(session_id.to_string());
+    if first {
+        tracing::info!(
+            "mc-module: ignoring {count} agent_drop_ids for session {session_id}; ctx_reduce drops use the module's durable queue"
         );
     }
 }
@@ -966,6 +1023,9 @@ struct TransformRequestWire {
     clear_reasoning_age: u64,
     #[serde(default)]
     cache_ttl: Option<String>,
+    /// Broca's name for the cache TTL, in milliseconds. Used only when `cache_ttl` is absent.
+    #[serde(default)]
+    cache_ttl_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     effective_execute_threshold: Option<f64>,
     #[serde(default = "default_auto_search_enabled")]
@@ -1014,10 +1074,22 @@ struct TransformRequestWire {
     geometry: Option<TransformGeometry>,
     #[serde(default)]
     provider_error: Option<String>,
+    /// Broca's name for the provider overflow error body. Used only when `provider_error` is
+    /// absent.
+    #[serde(default)]
+    overflow_error_text: Option<String>,
+    /// Broca's caller-side drop list. Accepted and ignored: `ctx_reduce` calls reach this
+    /// module's facade and land in its durable drop queue, which applies drops on the next
+    /// pass allowed to change the prefix. A second, caller-held list would be another source
+    /// of truth for the same drops.
+    #[serde(default)]
+    agent_drop_ids: Vec<String>,
     #[serde(default)]
     mid_turn: bool,
     #[serde(default)]
     prev_response_completed_at_ms: Option<u64>,
+    #[serde(default)]
+    adopted_system_prompt_hash: Option<String>,
     #[serde(default)]
     request_observed_at_ms: Option<u64>,
     #[serde(default)]
@@ -1036,6 +1108,13 @@ struct TransformRequestWire {
     history_budget_tokens: Option<f64>,
     #[serde(default)]
     historian_model_chain: Option<Vec<String>>,
+    #[serde(default)]
+    historian_model_limits:
+        std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    #[serde(default)]
+    historian_timeout_ms: Option<u64>,
+    #[serde(default)]
+    historian_max_output_tokens: Option<u32>,
     #[serde(default)]
     declared_trim: Option<DeclaredTrim>,
     #[serde(default)]
@@ -1065,6 +1144,9 @@ impl<'de> Deserialize<'de> for TransformRequest {
         } else {
             wire.messages
         };
+        if !wire.agent_drop_ids.is_empty() {
+            emit_agent_drop_ids_ignored_once(&wire.session_id, wire.agent_drop_ids.len());
+        }
         let protected_tags_present = wire.protected_tags.is_some();
         let protected_tags = wire
             .protected_tags
@@ -1087,7 +1169,10 @@ impl<'de> Deserialize<'de> for TransformRequest {
             provider_id: wire.provider_id,
             model_key: wire.model_key,
             clear_reasoning_age: wire.clear_reasoning_age,
-            cache_ttl: wire.cache_ttl,
+            cache_ttl: wire.cache_ttl.or_else(|| {
+                wire.cache_ttl_ms
+                    .map(|milliseconds| milliseconds.to_string())
+            }),
             effective_execute_threshold: wire.effective_execute_threshold,
             auto_search_enabled: wire.auto_search_enabled,
             auto_search_score_threshold: wire.auto_search_score_threshold,
@@ -1110,9 +1195,10 @@ impl<'de> Deserialize<'de> for TransformRequest {
             tail_delta: wire.tail_delta,
             usage: wire.usage,
             geometry: wire.geometry,
-            provider_error: wire.provider_error,
+            provider_error: wire.provider_error.or(wire.overflow_error_text),
             mid_turn: wire.mid_turn,
             prev_response_completed_at_ms: wire.prev_response_completed_at_ms,
+            adopted_system_prompt_hash: wire.adopted_system_prompt_hash,
             request_observed_at_ms: wire.request_observed_at_ms,
             channel2_nudge_state: wire.channel2_nudge_state,
             channel2_delivered_id: wire.channel2_delivered_id,
@@ -1122,6 +1208,9 @@ impl<'de> Deserialize<'de> for TransformRequest {
             detected_context_limit_model_key: wire.detected_context_limit_model_key,
             history_budget_tokens: wire.history_budget_tokens,
             historian_model_chain: wire.historian_model_chain,
+            historian_model_limits: wire.historian_model_limits,
+            historian_timeout_ms: wire.historian_timeout_ms,
+            historian_max_output_tokens: wire.historian_max_output_tokens,
             declared_trim: wire.declared_trim,
             lineage_switched: wire.lineage_switched,
             descent_edge_id: wire.descent_edge_id,
@@ -1356,6 +1445,8 @@ pub struct TransformTimings {
     #[serde(default)]
     pub native_cache_evicted: usize,
     #[serde(default)]
+    pub native_cache_reencode_drift: usize,
+    #[serde(default)]
     pub response_encode: f64,
     #[serde(default)]
     pub response_meta_encode: f64,
@@ -1422,7 +1513,7 @@ pub fn format_pass_timing_line(
            divergence={:.1} store_commit={:.1} trigger_ms={:.1} trigger_boundary_build={:.1} trigger_eval={:.1} \
              trigger_cache_store={:.1} trigger_token_cache_hits={} trigger_tokenized_blocks={} \
              post_attach_ms={:.1} native_cache_reused_messages={} native_cache_encoded_messages={} \
-            native_cache_refused_store={} native_cache_degraded_store={} native_cache_evicted={} \
+            native_cache_refused_store={} native_cache_degraded_store={} native_cache_evicted={} native_cache_reencode_drift={} \
              response_encode={response_encode_ms:.1} response_meta_encode={:.1} response_size_account={:.1} response_splice={:.1} \
              frozen_units={} tail_units_matched={} \
            projection_blocks={} tail_messages_emitted={} build_identity_messages={} \
@@ -1509,6 +1600,7 @@ pub fn format_pass_timing_line(
         timings.native_cache_refused_store,
         timings.native_cache_degraded_store,
         timings.native_cache_evicted,
+        timings.native_cache_reencode_drift,
         timings.response_meta_encode,
         timings.response_size_account,
         timings.response_splice,
@@ -1538,6 +1630,9 @@ pub struct TransformResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub native_reasoning_keep_mids: Vec<String>,
     pub status: TransformStatus,
+    /// Reason the request requires a full sync; omitted on success and by older modules.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub need_full_sync_reason: Option<String>,
     pub served_from: ServedFrom,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_array_fingerprint: Option<String>,
@@ -1555,10 +1650,21 @@ pub struct TransformResponse {
     /// The classifier's raw cause for a HARD/SOFT decision. Unknown future causes are retained.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub materialize_reason: Option<String>,
+    /// Names the render-identity components changed by this pass. The `mur` entry represents
+    /// mural content and lets cache-bust attribution distinguish mural-only epoch changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_delta: Vec<String>,
     /// First position where the newly served block sequence differs from the previous sequence,
     /// excluding blocks added only at the end.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub first_divergence: Option<FirstDivergence>,
+    /// True on a prefix-bound OpenCode bust (Fable 5.1, Opus 5.5, Sonnet 5.5) whose only
+    /// edit before newer signed thinking is removing reasoning from a contiguous oldest
+    /// prefix. Removing thinking from the start of the history leaves every later block
+    /// valid, so the host keeps the newer blocks instead of stripping all of them. Omitted
+    /// (false) on every other pass and by older modules, which keeps the strip.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_trim_only: bool,
     /// Optional diagnostic timings. Omitted only by compatibility constructors and on old
     /// responses; normal module transform passes include this object.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1575,10 +1681,6 @@ pub struct TransformResponse {
     /// filter search results, using the module manifest rather than its TypeScript render cache.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub rendered_memory_ids: Option<Vec<i64>>,
-    /// Newest memories changefeed sequence observed while producing this response. The host
-    /// folds it into its mirror projection key so unrendered memory changes still schedule a pull.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub memory_mirror_head: Option<i64>,
     /// Exact composed edge id consumed by observed durable state. Omitted on ordinary,
     /// subagent, defer-only protocol-error, and pending-build-skew responses.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1622,10 +1724,6 @@ pub struct TransformResponse {
     /// Claude Code gateway instruction. It is response metadata and never enters `ck_messages`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub channel2_directive: Option<Channel2Directive>,
-    /// Delivery ledger rows whose note bytes were included in this bust. The host sends
-    /// the existing transform.ack/nack after applying and validating the response.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note_deliveries: Option<Vec<NoteDelivery>>,
 }
 
 impl TransformResponse {
@@ -1639,6 +1737,7 @@ impl TransformResponse {
         Self {
             native_reasoning_keep_mids: Vec::new(),
             status: TransformStatus::NeedFullSync,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
             action: "NEED_FULL_SYNC".to_string(),
@@ -1646,7 +1745,9 @@ impl TransformResponse {
             scheduler_decision: None,
             scheduler_defer_reason: None,
             materialize_reason: None,
+            identity_delta: Vec::new(),
             first_divergence: None,
+            reasoning_trim_only: false,
             timings: None,
             boundary_id: String::new(),
             reconcile_pending: false,
@@ -1656,7 +1757,6 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -1667,7 +1767,6 @@ impl TransformResponse {
             native_messages_delta: None,
             host_directives: None,
             channel2_directive: None,
-            note_deliveries: None,
         }
     }
 
@@ -1678,6 +1777,7 @@ impl TransformResponse {
         Self {
             native_reasoning_keep_mids: Vec::new(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint,
             action: "PASSTHROUGH".to_string(),
@@ -1685,7 +1785,9 @@ impl TransformResponse {
             scheduler_decision: None,
             scheduler_defer_reason: None,
             materialize_reason: None,
+            identity_delta: Vec::new(),
             first_divergence: None,
+            reasoning_trim_only: false,
             timings: None,
             boundary_id: String::new(),
             reconcile_pending: false,
@@ -1695,7 +1797,6 @@ impl TransformResponse {
             committed: false,
             coverage_ordinal: None,
             rendered_memory_ids: None,
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -1711,7 +1812,6 @@ impl TransformResponse {
             native_messages_delta: None,
             host_directives: None,
             channel2_directive: None,
-            note_deliveries: None,
         }
     }
 }
@@ -1770,6 +1870,8 @@ pub struct TransformWithProjection {
     /// Publication floor from the state accepted by this transform. Emergency follow-up uses it
     /// as the pre-wait comparison point, then performs one fresh read after asynchronous work.
     pub(crate) publication_floor_ordinal: Option<u64>,
+    /// Whether this transform pass already has a cache-busting event that can apply pending drops.
+    pub(crate) reclaim_ride_available: bool,
     pub scheduler_pass: scheduler::PassDecision,
     pub scheduler_defer_reason: Option<scheduler::SchedulerDeferReason>,
     pub scheduler_drain_latch_active: bool,
@@ -1864,6 +1966,27 @@ struct Channel1Decision {
     clear_post_reduce_grace: bool,
 }
 
+fn scale_hygiene_watermark(value: i64, tools_ratio: f64) -> i64 {
+    ((value.max(0) as f64) * tools_ratio)
+        .round()
+        .min(i64::MAX as f64) as i64
+}
+
+fn transition_hygiene_units(meta: &mut ModuleMeta, bust_permitted: bool, tools_ratio: f64) -> bool {
+    if !bust_permitted || meta.hygiene_units_version >= 2 {
+        return false;
+    }
+    meta.channel1_last_nudge_undropped =
+        scale_hygiene_watermark(meta.channel1_last_nudge_undropped, tools_ratio);
+    if let Some(baseline) = meta.tail_hygiene_baseline.as_mut() {
+        baseline.channel1_post_reduce_grace_baseline_u = baseline
+            .channel1_post_reduce_grace_baseline_u
+            .map(|value| scale_hygiene_watermark(value, tools_ratio));
+    }
+    meta.hygiene_units_version = 2;
+    true
+}
+
 #[derive(Debug, Default)]
 struct PendingOverlayDecisions {
     max_seen_ordinal: Option<u64>,
@@ -1912,10 +2035,17 @@ struct Channel1NudgeInputs<'a, 'ctx> {
     tag_rows: &'a [McTagRow],
     baseline: Option<&'a TailHygieneBaseline>,
     channel1_appends: &'a [Channel1AppendRow],
+    served_output_fingerprint: &'a [ServedBlockFingerprint],
+    may_reprice_served_target: bool,
     mutation_exempt_mid: Option<&'a str>,
     protection_cutoff: &'a TagNumberCutoffProjection,
     pending_drop_target_ids: &'a HashSet<String>,
     agent_drops_applied_this_pass: bool,
+}
+
+struct Channel1Target {
+    block_id: String,
+    unit_key: String,
 }
 
 /// Transform errors. Each leaves the durable frozen-set UNCHANGED (the CAS simply does
@@ -1940,6 +2070,8 @@ pub enum TransformError {
     /// A stored coverage range overlaps, or the live array proves a present raw message
     /// would be trimmed without being covered by any compartment. Fail loud.
     CoverageGap(String),
+    /// Internal retry: a priced pass must use the ingress synthetic classification.
+    SyntheticTreatmentBust,
     /// The lexical hint query failed before a durable decision could be written.
     Search(String),
     /// CK ingress rejected an unsupported or unpairable block before any partial projection.
@@ -1985,6 +2117,7 @@ impl std::fmt::Display for TransformError {
                 "decider re-supplied an already-frozen reduction target with different bytes"
             ),
             TransformError::CoverageGap(m) => write!(f, "{m}"),
+            TransformError::SyntheticTreatmentBust => write!(f, "synthetic treatment requires a priced retry"),
             TransformError::Search(m) => write!(f, "search: {m}"),
             TransformError::CkWire(e) => write!(f, "ck wire: {e}"),
             TransformError::DuplicateBlockId(id) => write!(f, "duplicate flattened block id: {id}"),
@@ -2117,6 +2250,7 @@ fn record_stable_pass_trace(
     ctx: &ProducerContext<'_>,
     result: &Result<TransformWithProjection, TransformError>,
 ) {
+    profile_start!(_perf_trace, "stable_pass_trace");
     if let Some(pass) = result.as_ref().ok().filter(|pass| {
         pass.response.status == TransformStatus::Ok
             && pass.response.ck_messages.is_some()
@@ -2150,6 +2284,7 @@ fn pass_scheduler_observation(
         canonical_decision: Some(pass.canonical_decision().to_string()),
         defer_reason: defer_reason.map(|reason| reason.as_str().to_string()),
         drain_latch_active,
+        identity_delta: Vec::new(),
     }
 }
 
@@ -2252,6 +2387,56 @@ fn response_marker_ttl(
         })
 }
 
+// A persisted tag proves this user row was previously served as non-synthetic. Keep
+// that treatment while replaying a cached prefix; a priced pass retries with the
+// original ingress so coverage and historian liveness see the corrected classification.
+fn previously_tagged_synthetic_rows(
+    store: &McStore,
+    req: &TransformRequest,
+) -> Result<Option<TransformRequest>, TransformError> {
+    if !req.messages.iter().any(|message| {
+        message.ck.meta.synthetic && message.ck.role == "user" && !message.ck.content.is_empty()
+    }) {
+        return Ok(None);
+    }
+    let reclassified = store
+        .load_meta(&req.session_id)?
+        .meta
+        .reclassified_synthetic_mids;
+    let candidate_blocks: Vec<String> = req
+        .messages
+        .iter()
+        .filter(|message| {
+            message.ck.meta.synthetic
+                && message.ck.role == "user"
+                && !reclassified.contains(&message.mid)
+        })
+        .flat_map(|message| {
+            (0..message.ck.content.len()).map(|index| format!("{}#{index}", message.mid))
+        })
+        .collect();
+    if candidate_blocks.is_empty() {
+        return Ok(None);
+    }
+    let tagged = store.tagged_block_ids_among(&req.session_id, &candidate_blocks)?;
+    if tagged.is_empty() {
+        return Ok(None);
+    }
+    let mut legacy = req.clone();
+    let mut changed = false;
+    for message in &mut legacy.messages {
+        if message.ck.meta.synthetic
+            && !reclassified.contains(&message.mid)
+            && (0..message.ck.content.len())
+                .any(|index| tagged.contains(&format!("{}#{index}", message.mid)))
+        {
+            message.ck.meta.synthetic = false;
+            changed = true;
+        }
+    }
+    Ok(changed.then_some(legacy))
+}
+
 fn apply_once_with_estimator_and_projection(
     store: &McStore,
     req: &TransformRequest,
@@ -2261,22 +2446,54 @@ fn apply_once_with_estimator_and_projection(
     projection_cache: Option<&ProjectionCacheInput>,
     incremental_history: bool,
 ) -> Result<TransformWithProjection, TransformError> {
+    profile_start!(perf_wrapper_prepare, "transform_wrapper_prepare");
     emit_protected_tags_deprecation_once(req);
     let mut attempt = 0;
     let mut boundary_divergence_retry = false;
+    let legacy_req = if ctx.compaction_enabled {
+        previously_tagged_synthetic_rows(store, req)?
+    } else {
+        None
+    };
+    let reclassified_on_bust: BTreeSet<String> = legacy_req
+        .as_ref()
+        .into_iter()
+        .flat_map(|legacy| legacy.messages.iter().zip(&req.messages))
+        .filter(|(legacy, ingress)| !legacy.ck.meta.synthetic && ingress.ck.meta.synthetic)
+        .map(|(_, ingress)| ingress.mid.clone())
+        .collect();
+    let mut replay_legacy_treatment = legacy_req.is_some();
+    profile_end!(perf_wrapper_prepare);
     loop {
         let mut boundary_divergence_detected = false;
+        let pass_req = if replay_legacy_treatment {
+            legacy_req.as_ref().unwrap_or(req)
+        } else {
+            req
+        };
         match apply_once(
             store,
-            req,
+            pass_req,
             ctx,
             estimate_tokens,
             output_cache,
-            projection_cache,
+            if replay_legacy_treatment {
+                None
+            } else {
+                projection_cache
+            },
             boundary_divergence_retry,
             &mut boundary_divergence_detected,
             incremental_history,
+            replay_legacy_treatment,
+            &reclassified_on_bust,
         ) {
+            Err(TransformError::SyntheticTreatmentBust | TransformError::CoverageGap(_))
+                if replay_legacy_treatment =>
+            {
+                replay_legacy_treatment = false;
+                continue;
+            }
             Err(TransformError::Store(McStoreError::CasConflict { .. }))
                 if attempt < MAX_CAS_RETRIES =>
             {
@@ -2331,7 +2548,11 @@ fn run_transform_attempt_hook(session_id: &str) {
 
 static PREFIX_PROJECTION_DIFFERENTIAL: OnceLock<bool> = OnceLock::new();
 
-fn prefix_projection_differential_enabled() -> bool {
+pub(super) fn prefix_projection_differential_enabled() -> bool {
+    #[cfg(test)]
+    if crate::tests::per_pass_differentials_disabled() {
+        return false;
+    }
     cfg!(test)
         || *PREFIX_PROJECTION_DIFFERENTIAL.get_or_init(|| {
             std::env::var("MC_PREFIX_PROJECTION_DIFFERENTIAL").as_deref() == Ok("1")
@@ -2342,12 +2563,18 @@ pub(crate) fn assert_prefix_projection_equivalent(
     incremental: &FlatProjection,
     messages: &[CkIngressMessage],
 ) -> Result<(), CkWireError> {
+    profile_start!(_perf_differential, "projection_differential");
+    profile_start!(perf_project, "projection_differential_project");
     let full = project_messages(messages)?;
+    profile_end!(perf_project);
+    profile_start!(perf_bytes, "projection_differential_bytes");
     assert_eq!(
         incremental.differential_bytes(),
         full.differential_bytes(),
         "incremental prefix projection byte drift"
     );
+    profile_end!(perf_bytes);
+    profile_start!(_perf_state, "projection_differential_state");
     assert_eq!(
         incremental, &full,
         "incremental prefix projection state drift"
@@ -2355,7 +2582,17 @@ pub(crate) fn assert_prefix_projection_equivalent(
     Ok(())
 }
 
-fn served_output_fingerprints(messages: &[ServedMessage]) -> Vec<ServedBlockFingerprint> {
+/// Fingerprint the served output, one entry per block.
+///
+/// `frame_block_stems` names the composed frames the builder actually emitted, indexed by
+/// output position (`None` where the message at that position is not a frame). Anything else that is synthetic is named from its own shape (a todo pair) or from
+/// its position among the synthetic messages. Assigning a frame id by counting synthetic
+/// messages instead would hand `mc_m0` to the first harness-authored synthetic message of a
+/// frameless output, and the host reads that id as "the frozen prefix moved".
+fn served_output_fingerprints(
+    messages: &[ServedMessage],
+    frame_block_stems: &[Option<&'static str>],
+) -> Vec<ServedBlockFingerprint> {
     let mut synthetic_index = 0usize;
     let mut fingerprints = Vec::new();
     for (message_index, message) in messages.iter().enumerate() {
@@ -2367,8 +2604,14 @@ fn served_output_fingerprints(messages: &[ServedMessage]) -> Vec<ServedBlockFing
                 Some(ck_wire::CkKind::ToolResult { id, .. }) => {
                     format!("mc_todo:{id}:result")
                 }
-                _ if synthetic_index < 2 => format!("mc_m{synthetic_index}"),
-                _ => format!("mc_synthetic:{synthetic_index}"),
+                _ => frame_block_stems
+                    .get(message_index)
+                    .copied()
+                    .flatten()
+                    .map_or_else(
+                        || format!("mc_synthetic:{synthetic_index}"),
+                        |stem| (*stem).to_string(),
+                    ),
             };
             synthetic_index = synthetic_index.saturating_add(1);
             id
@@ -2400,6 +2643,7 @@ fn served_output_fingerprints(messages: &[ServedMessage]) -> Vec<ServedBlockFing
 }
 
 fn normalize_synthetic_todo_ingress(req: &TransformRequest) -> Option<TransformRequest> {
+    profile_start!(_perf_normalize, "rt13_todo_normalize");
     let mut normalized = None;
     for (index, message) in req.messages.iter().enumerate() {
         if message.ck.meta.synthetic
@@ -2602,6 +2846,7 @@ fn lineage_protocol_passthrough(
         historian_tags: None,
         tag_numbers: BTreeMap::new(),
         publication_floor_ordinal: None,
+        reclaim_ride_available: false,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
         scheduler_defer_reason: Some(scheduler::SchedulerDeferReason::SchedulerDefer),
@@ -2669,13 +2914,7 @@ fn compose_additive_m0(
         ctx.memory_budget_tokens,
         estimate_tokens,
     );
-    let host_backed_memory_ids = serializer_profile != Some(SerializerProfile::ClaudeCodeAnthropic);
-    let mut rendered_memories = selected_memories;
-    if host_backed_memory_ids {
-        for memory in &mut rendered_memories {
-            memory.id = memory.host_row_id.unwrap_or(0);
-        }
-    }
+    let rendered_memories = selected_memories;
     let source_name_by_id = membership
         .as_ref()
         .map(|value| workspace_source_names(&rendered_memories, value))
@@ -2807,6 +3046,7 @@ fn apply_additive_only(
         m1_visibility_cutoff_ms,
         Some(&mut m1_revision_read_timings),
     )?;
+    let applied_m1_revision = m1_signal.equivalent_applied_revision(loaded.meta.m1_revision);
     let external_revision_changed = loaded.meta.initialized
         && loaded.meta.m1_external_revision != 0
         && m1_signal.external_revision != loaded.meta.m1_external_revision;
@@ -2874,11 +3114,23 @@ fn apply_additive_only(
     }
     timings.decide = elapsed_ms(decide_scheduler_started_at);
 
-    let hard_fold_requested = scheduler_outcome.idle_ttl_fired
-        || external_revision_changed
-        || project_memory_epoch_hard_due;
+    let idle_fold_due = scheduler_outcome.idle_ttl_fired
+        && ctx
+            .observed_last_response_at_ms
+            .is_some_and(|response| response > loaded.meta.expiry_cutoff_ms);
+    let system_identity_adopted = can_adopt_system_identity(
+        &loaded.meta,
+        req,
+        &content_epoch,
+        &persisted_mural_hash,
+        true,
+        scheduler_outcome.idle_ttl_fired,
+    );
+    let render_config_changed = render_config_changed && !system_identity_adopted;
+    let hard_fold_requested =
+        idle_fold_due || external_revision_changed || project_memory_epoch_hard_due;
     let ordinary_historian_veto = ctx.historian_active
-        && m1_signal.revision == loaded.meta.m1_revision
+        && m1_signal.revision == applied_m1_revision
         && scheduler_outcome.pass == scheduler::PassDecision::Execute
         && !hard_fold_requested
         && !loaded.meta.soft_refresh_pending
@@ -2890,23 +3142,37 @@ fn apply_additive_only(
         || render_config_changed
         || hard_fold_requested;
     let m1_revision_changed =
-        m1_signal.revision != loaded.meta.m1_revision || loaded.meta.soft_refresh_pending;
-    let plan = classify(&ClassifierInput {
-        initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
-        is_legacy_baseline: is_legacy_baseline(&loaded.core),
-        valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
-        cached_m1_missing: cached_m1_missing(&loaded.core),
-        render_config_changed,
-        hard_fold_requested,
-        // Compaction-off returns every raw request message, so refreshing m1 cannot trim
-        // messages at a stored coverage boundary and does not require a boundary anchor. It
-        // still requires a scheduler or config event that permits provider-visible bytes to change.
-        boundary_present: true,
-        reconcile_pending: false,
-        m1_revision_changed,
-        reductions_pending: false,
-        bust_opportunity,
-    });
+        m1_signal.revision != applied_m1_revision || loaded.meta.soft_refresh_pending;
+    // A stored frozen chunk or cache section that failed its digest (or its shape checks)
+    // decoded as empty. `classify` rejects an initialized session whose frozen list lacks its
+    // m0/m1 units, so without this override every later pass would fail and nothing would
+    // ever rewrite the chunks. Rebuild with a HARD pass instead, as `apply_once` does for
+    // compaction-on sessions. The commit below then rewrites every discarded value in full,
+    // and refuses if another writer changed the stored sections since this pass loaded them.
+    let cache_sections_discarded = loaded
+        .sections
+        .as_ref()
+        .is_some_and(mc_store::SectionsBase::any_discarded);
+    let plan = if cache_sections_discarded {
+        PassPlan::Hard
+    } else {
+        classify(&ClassifierInput {
+            initialized: loaded.meta.initialized && !loaded.meta.bootstrap_seed_fold_pending,
+            is_legacy_baseline: is_legacy_baseline(&loaded.core),
+            valid_m0m1_shape: valid_m0m1_shape(&loaded.core),
+            cached_m1_missing: cached_m1_missing(&loaded.core),
+            render_config_changed,
+            hard_fold_requested,
+            // Compaction-off returns every raw request message, so refreshing m1 cannot trim
+            // messages at a stored coverage boundary and does not require a boundary anchor. It
+            // still requires a scheduler or config event that permits provider-visible bytes to change.
+            boundary_present: true,
+            reconcile_pending: false,
+            m1_revision_changed,
+            reductions_pending: false,
+            bust_opportunity,
+        })
+    };
     if let PassPlan::Reject(message) = plan {
         return Err(TransformError::UnknownShape(message));
     }
@@ -2925,6 +3191,13 @@ fn apply_additive_only(
 
     let mut core = loaded.core.clone();
     let mut meta = loaded.meta.clone();
+    // Persist an equivalent revision written by an older digest format. This changes only
+    // stored metadata; the served bytes are decided by the plan above.
+    meta.m1_revision = applied_m1_revision;
+    if system_identity_adopted {
+        meta.last_system_prompt_hash = req.system_prompt_hash.clone();
+        meta.last_render_config = effective_render_config.clone();
+    }
     if !identity_observed && coordinator_identity {
         meta.last_provider_id = req.provider_id.clone().unwrap_or_default();
         meta.last_model_key = req.model_key.clone().unwrap_or_default();
@@ -2945,7 +3218,6 @@ fn apply_additive_only(
     let compose_started_at = Instant::now();
     let mut commit_memory_revision = None;
     let mut commit_compartment_max_seq = None;
-    let mut note_deliveries = Vec::new();
     match plan {
         PassPlan::Hard | PassPlan::MigrateHard => {
             let composition = compose_additive_m0(
@@ -2956,20 +3228,10 @@ fn apply_additive_only(
                 serializer_profile,
                 estimate_tokens,
             )?;
-            let (note_body, hard_note_deliveries) = claim_and_render_notes(
-                store,
-                ctx.note_project_path,
-                &req.session_id,
-                &format!("m1:{}:{}", m1_signal.revision, ctx.now_ms),
-                &format!("m1:{}:{}", m1_signal.revision, ctx.now_ms),
-                ctx.now_ms,
-            )?;
-            note_deliveries = hard_note_deliveries;
-            let m1_unit = if note_body.is_empty() {
-                render_m1_placeholder()
-            } else {
-                render_m1_body(&note_body)
-            };
+            // Ready smart notes are not rendered into m1: the host's deferred-notes
+            // reminder announces them and `ctx_note read` shows them, exactly as in
+            // TypeScript mode. A HARD therefore always starts m1 empty.
+            let m1_unit = render_m1_placeholder();
             let mural_unit = composition.mural.as_ref().map(render_mural_block);
             let committed_mural_hash = composition
                 .mural
@@ -3027,6 +3289,8 @@ fn apply_additive_only(
             meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
             meta.m1_user_profile_version = meta.user_profile_version;
             meta.m1_external_revision = applied_m1_signal.external_revision;
+            meta.m1_history_revision = applied_m1_signal.history_revision;
+
             meta.project_memory_epoch_pending = false;
             meta.synthetic_todo = None;
             meta.m1_pending_since_ms = None;
@@ -3051,7 +3315,6 @@ fn apply_additive_only(
                 ctx.temporal_awareness,
                 mc_tokenizer::estimate_tokens,
             )?;
-            note_deliveries = m1.note_deliveries.clone();
             let profile_rendered = m1.profile_rendered;
             meta.rendered_m1_coverage = Some(m1.rendered_coverage);
             core.step(PassInput {
@@ -3093,7 +3356,7 @@ fn apply_additive_only(
             }
         }
         PassPlan::Defer => {
-            if m1_signal.revision != loaded.meta.m1_revision {
+            if m1_signal.revision != applied_m1_revision {
                 log_pending_m1_delta(&req.session_id, ctx.now_ms, loaded.meta.m1_pending_since_ms);
             }
         }
@@ -3117,6 +3380,21 @@ fn apply_additive_only(
         .iter()
         .find(|unit| unit.key == M0_MURAL_KEY);
     let mut messages = Vec::with_capacity(req.messages.len() + 2);
+    // Broca's leading system messages go ahead of the frames, as in the full pipeline
+    // (see `place_leading_system_before_frames`).
+    let leading_systems = if serializer_profile == Some(SerializerProfile::OwnedBroca) {
+        req.messages
+            .iter()
+            .take_while(|message| message.ck.role == "system" && !message.ck.meta.synthetic)
+            .count()
+    } else {
+        0
+    };
+    messages.extend(
+        req.messages[..leading_systems]
+            .iter()
+            .map(|message| ServedMessage::from_message(message.ck.clone())),
+    );
     messages.push(ServedMessage::from_message(synthetic_m0_message(
         m0.frozen_payload.clone(),
         mural,
@@ -3125,7 +3403,7 @@ fn apply_additive_only(
         CkWireMessage::synthetic_user_text(m1.frozen_payload.clone()),
     ));
     messages.extend(
-        req.messages
+        req.messages[leading_systems..]
             .iter()
             .map(|message| ServedMessage::from_message(message.ck.clone())),
     );
@@ -3137,7 +3415,9 @@ fn apply_additive_only(
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
     }
-    let commit_required = core != loaded.core || meta != loaded.meta;
+    // A discarded section is rewritten even when the rebuild reproduces the loaded state, so
+    // the next load trusts the stored rows again.
+    let commit_required = state_changed || cache_sections_discarded;
     let store_commit_started_at = Instant::now();
     let row_version = if commit_required {
         #[cfg(test)]
@@ -3148,6 +3428,12 @@ fn apply_additive_only(
                 expected: loaded.row_version,
                 core: &core,
                 meta: &meta,
+                // This path rebuilds the frozen list from the loaded one, so an empty result
+                // is its own, not an unloaded state.
+                sections: SectionsCommit {
+                    frozen_clear: FrozenClear::Explicit,
+                    ..SectionsCommit::over(loaded.sections.as_ref())
+                },
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: commit_memory_revision.as_ref(),
@@ -3181,7 +3467,9 @@ fn apply_additive_only(
     let action = action_str(&plan, &core).to_string();
     let materialize_reason = match plan {
         PassPlan::Hard | PassPlan::MigrateHard => Some(
-            if !loaded.meta.initialized || loaded.meta.bootstrap_seed_fold_pending {
+            if cache_sections_discarded {
+                "cache_sections_discarded"
+            } else if !loaded.meta.initialized || loaded.meta.bootstrap_seed_fold_pending {
                 "first_render"
             } else if is_legacy_baseline(&loaded.core) {
                 "legacy_migration"
@@ -3189,6 +3477,10 @@ fn apply_additive_only(
                 "epoch_change"
             } else if scheduler_outcome.idle_ttl_fired {
                 "ttl_expiry"
+            } else if external_revision_changed
+                && loaded.meta.m1_history_revision != m1_signal.history_revision
+            {
+                "compartment_history_revision"
             } else if external_revision_changed || project_memory_epoch_hard_due {
                 "project_memory_epoch"
             } else if cached_m1_missing(&loaded.core) {
@@ -3198,6 +3490,7 @@ fn apply_additive_only(
             }
             .to_string(),
         ),
+        _ if scheduler_outcome.idle_ttl_fired => Some("ttl_idle".to_string()),
         PassPlan::Soft => Some("m1_delta".to_string()),
         PassPlan::Defer | PassPlan::Reject(_) => None,
     };
@@ -3205,6 +3498,7 @@ fn apply_additive_only(
         historian_tags: None,
         tag_numbers: BTreeMap::new(),
         publication_floor_ordinal: meta.publication_floor_ordinal,
+        reclaim_ride_available: false,
         projection,
         scheduler_pass: scheduler_outcome.pass,
         scheduler_defer_reason: scheduler_outcome.defer_reason,
@@ -3230,6 +3524,7 @@ fn apply_additive_only(
                 })
                 .collect(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: action.clone(),
@@ -3239,7 +3534,12 @@ fn apply_additive_only(
                 .defer_reason
                 .map(|reason| reason.as_str().to_string()),
             materialize_reason,
+            identity_delta: render_identity_delta(
+                &loaded.meta.last_render_config,
+                &meta.last_render_config,
+            ),
             first_divergence: None,
+            reasoning_trim_only: false,
             timings: Some(timings),
             boundary_id: String::new(),
             reconcile_pending: false,
@@ -3249,7 +3549,6 @@ fn apply_additive_only(
             committed: commit_required,
             coverage_ordinal: None,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
-            memory_mirror_head: None,
             lineage_switch_consumed_id: None,
             lineage_descent_disposition: None,
             cache_ttl: None,
@@ -3260,7 +3559,6 @@ fn apply_additive_only(
             native_messages_delta: None,
             host_directives: None,
             channel2_directive: None,
-            note_deliveries: (!note_deliveries.is_empty()).then_some(note_deliveries),
         },
     })
 }
@@ -3276,7 +3574,11 @@ fn apply_once(
     boundary_divergence_retry: bool,
     boundary_divergence_detected: &mut bool,
     incremental_history: bool,
+    replay_legacy_treatment: bool,
+    reclassified_on_bust: &BTreeSet<String>,
 ) -> Result<TransformWithProjection, TransformError> {
+    // Keep this span alive through local destruction, which the wall `total` omits.
+    profile_start!(_perf_apply, "apply_once");
     *boundary_divergence_detected = false;
     if !ctx.compaction_enabled {
         return apply_additive_only(store, req, ctx, estimate_tokens);
@@ -3288,6 +3590,7 @@ fn apply_once(
     // copy that marker into CK metadata, so recognize the reserved call-id namespace here too.
     // Normalizing before projection keeps the replayed pair out of selection, coverage, and output.
     let projection_started_at = Instant::now();
+    profile_start!(perf_projection, "projection");
     let normalized_req = normalize_synthetic_todo_ingress(req);
     let ingress_req = normalized_req.as_ref().unwrap_or(req);
     // Recognition uses the canonical block projection before overlays, field stripping, or
@@ -3310,11 +3613,13 @@ fn apply_once(
             .map(|blocks| (cache.prior_fingerprint.as_str(), blocks))
     });
     timings.projection = elapsed_ms(projection_started_at);
+    profile_end!(perf_projection);
     timings.projection_reused_messages = reusable_projection.map_or(0, |cache| cache.replace_from);
     timings.projection_projected_messages = ingress_req
         .messages
         .len()
         .saturating_sub(timings.projection_reused_messages);
+    profile_start!(perf_ingress_validation, "ingress_validation");
     if reusable_projection.is_some() && prefix_projection_differential_enabled() {
         assert_prefix_projection_equivalent(&initial_projection, &ingress_req.messages)?;
     }
@@ -3337,16 +3642,18 @@ fn apply_once(
                     .map(|(_, new_key, _)| new_key.as_str())
                     .unwrap_or(ingress_req.session_id.as_str())
         {
-            eprintln!(
+            tracing::error!(
                 "mc-module: lineage protocol error for {}: malformed edge {} or target mismatch",
-                ingress_req.session_id, ingress_req.descent_edge_id
+                ingress_req.session_id,
+                ingress_req.descent_edge_id
             );
             return Ok(lineage_protocol_passthrough(
                 ingress_req,
                 initial_projection,
             ));
         }
-        let initial_state = store.load(&ingress_req.session_id)?;
+        // Only the CAS token is needed here; the descent decodes what it copies itself.
+        let initial_state = store.load_meta(&ingress_req.session_id)?;
         let anchor = continuation_summary_anchor(ingress_req, &initial_projection);
         let constituents = ingress_req
             .constituents
@@ -3370,9 +3677,10 @@ fn apply_once(
             now_ms: ctx.now_ms,
         })?;
         if outcome.disposition == LineageDescentDisposition::PendingBuildSkew {
-            eprintln!(
+            tracing::debug!(
                 "mc-module: lineage descent pending build-skew for target {} edge {}",
-                ingress_req.session_id, ingress_req.descent_edge_id
+                ingress_req.session_id,
+                ingress_req.descent_edge_id
             );
             return Ok(lineage_protocol_passthrough(
                 ingress_req,
@@ -3434,20 +3742,50 @@ fn apply_once(
     let cc_u1_active = crate::cc_u1_active(serializer_profile, req.tool_present);
     let tagging_surface_requested =
         crate::tagging_surface_active(serializer_profile, req.tool_present);
+    profile_end!(perf_ingress_validation);
     let seed_or_sync_started_at = Instant::now();
+    profile_start!(perf_seed, "seed_or_sync");
     let transform_snapshot = store.load_transform_snapshot(&req.session_id)?;
     timings.seed_or_sync = elapsed_ms(seed_or_sync_started_at);
+    profile_end!(perf_seed);
     timings.store_cache_state = transform_snapshot.timings.cache_state_ms;
+    profile_start!(perf_tags, "store_tags");
     let tag_hydration_started_at = Instant::now();
     let mut tag_rows = load_cached_tags(store, &req.session_id)?;
     let hydrated_tag_count = tag_rows.len();
     timings.store_tags = elapsed_ms(tag_hydration_started_at);
+    profile_end!(perf_tags);
+    profile_start!(perf_transition_pre, "transition_pre");
     timings.store_temporal = transform_snapshot.timings.temporal_ms;
     timings.store_user_hints = transform_snapshot.timings.user_hints_ms;
     timings.store_channel1 = transform_snapshot.timings.channel1_ms;
     timings.store_overlay_frontier = transform_snapshot.timings.overlay_frontier_ms;
     let loaded = transform_snapshot.loaded;
     let overlay_frontier = transform_snapshot.overlay_frontier;
+    // A stored frozen chunk or cache section that failed its digest (or its shape checks)
+    // decoded as empty. The prefix may have been built against the lost value, so the pass
+    // rebuilds it from the messages with a HARD pass, as a lineage descent that needs
+    // materializing does, instead of failing the pass or serving from a truncated list. The
+    // commit then rewrites every discarded value in full.
+    let cache_sections_discarded = loaded
+        .sections
+        .as_ref()
+        .is_some_and(mc_store::SectionsBase::any_discarded);
+    if cache_sections_discarded {
+        lineage_state.force_hard = true;
+    }
+    // Claude Code sessions are born on a fold-only profile; tail reducers never run there, so
+    // no frozen `red:*` units should exist when the fold is the sole reclaim path. Checked
+    // here because this pass holds the frozen list; historian bookkeeping no longer loads it.
+    debug_assert!(
+        serializer_profile.is_none_or(crate::healing::tail_reclaim)
+            || !loaded
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key.starts_with("red:")),
+        "fold-only profile must not carry frozen tail reductions"
+    );
     // Legacy sessions stored the CC latch before the generic surface latch existed.
     // Treat that old true value as the generic latch so an upgrade does not repeat a fold.
     let persisted_tagging_surface_active =
@@ -3492,6 +3830,8 @@ fn apply_once(
         && !req.is_subagent
         && !detected_transition_classes.is_subset(&consumed_transition_classes);
     timings.transition_detection = elapsed_ms(transition_detection_started_at);
+    profile_end!(perf_transition_pre);
+    profile_start!(perf_lineage_validation, "lineage_validation");
     if let Some(base) = loaded.meta.ordinal_continuation_base {
         let expected_boundary = base.checked_add(1).ok_or_else(|| {
             TransformError::LineageProtocol(
@@ -3524,7 +3864,7 @@ fn apply_once(
     let mut lineage_anchor_failure = false;
     if let Err(detail) = validate_lineage_anchor(&loaded.meta, req, &projection) {
         lineage_anchor_failure = true;
-        eprintln!(
+        tracing::error!(
             "mc-module: lineage anchor validation failed closed for {}: {detail}",
             req.session_id
         );
@@ -3537,6 +3877,8 @@ fn apply_once(
     } else {
         SurfaceState::Inactive
     };
+    profile_end!(perf_lineage_validation);
+    profile_start!(perf_render_context, "render_context");
 
     // Apply every module-owned change that affects serialized bytes before activation. When tags
     // are requested, generate them during the HARD pass that records the new render configuration;
@@ -3549,6 +3891,9 @@ fn apply_once(
         tagging_surface_requested,
     )?;
     let render_identity = render_identity_base(req, &content_epoch.prompt_surface_epoch);
+    // Do not use a newer mural supplied by this request to decide whether to rebuild the
+    // persisted baseline. Use the mural already stored in the loaded baseline for that decision;
+    // if another trigger rebuilds the baseline, use and persist the request's newer mural.
     let persisted_mural_hash = frozen_mural_hash(&loaded.core).to_string();
     let stable_effective_render_config_base =
         fold_m0_content_epoch(&render_identity, &content_epoch);
@@ -3560,12 +3905,13 @@ fn apply_once(
         fold_mural_content_identity(&effective_render_config_base, &persisted_mural_hash);
     // The store namespace exists before snapshots and tags load, so tag decisions can commit
     // atomically with cache state. New and previously inactive sessions therefore emit their full
-    // requested tag surface during the HARD that changes render configuration. Subagents use the
-    // same first-render path because they do not emit a module-composed provider prefix.
+    // requested tag surface during the HARD that changes render configuration. Subagents instead
+    // select a Soft pass for a surface flip, without a module-composed prefix.
     let bootstrap_tagging_active = !loaded.meta.initialized;
     let suppress_bootstrap_reduction_tag_overlay = bootstrap_tagging_active
         && serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic);
     let tagging_active = tagging_surface_requested;
+    profile_end!(perf_render_context);
     // Previously stored overlay rows may still replay when boundary-lineage validation
     // later forces pass-through. Decisions from this request stay in memory until the
     // final cache-state compare-and-swap accepts the pass.
@@ -3573,13 +3919,17 @@ fn apply_once(
     // available on non-CC profiles is render-neutral: overlay bytes remain gated by
     // `tagging_active`, while the OpenCode host can receive the same ceiling decision.
     let tag_overlay_started_at = Instant::now();
+    profile_start!(perf_tag_numbers, "tag_overlay");
     let mut tag_numbers = tag_number_by_message(&tag_rows);
     timings.tag_overlay += elapsed_ms(tag_overlay_started_at);
-    let mut channel1_appends = if tagging_active {
+    profile_end!(perf_tag_numbers);
+    profile_start!(perf_overlay_inputs, "overlay_inputs");
+    let legacy_channel1_appends = if tagging_active {
         transform_snapshot.channel1_appends
     } else {
         Vec::new()
     };
+    let channel1_appends = channel1_append_rows(&loaded.core, &legacy_channel1_appends);
     let auto_search_active = !req.is_subagent && req.auto_search_enabled;
     let mut user_hints = if tagging_active || auto_search_active {
         transform_snapshot.user_hints
@@ -3592,6 +3942,8 @@ fn apply_once(
     } else {
         Vec::new()
     };
+    profile_end!(perf_overlay_inputs);
+    profile_start!(perf_coverage, "coverage_and_reconciliation");
 
     // Check whether the boundary is present in the live messages, or through a stored
     // trim record that matches durable coverage and the first untrimmed message. A failed
@@ -3637,9 +3989,10 @@ fn apply_once(
     if pending_rewrite_absent_shape && loaded.meta.anchor_block_id.is_none() {
         let fingerprint = absent_shape_fingerprint(&live);
         if loaded.meta.pending_rewrite.is_some() {
-            eprintln!(
+            tracing::warn!(
                 "mc-module: pending_rewrite raw pass-through for {} fingerprint {}",
-                req.session_id, fingerprint
+                req.session_id,
+                fingerprint
             );
             let passthrough_overlay = tagging_active.then(|| {
                 tag_overlay_state(
@@ -3647,6 +4000,7 @@ fn apply_once(
                     &temporal_marks,
                     &user_hints,
                     &channel1_appends,
+                    &loaded.meta.pending_tag_block_ids,
                     &loaded.meta.pending_user_hint_block_ids,
                 )
             });
@@ -3656,7 +4010,8 @@ fn apply_once(
                 passthrough_overlay.as_ref(),
                 mutation_exempt_mid,
             );
-            let served_fingerprints = served_output_fingerprints(&passthrough_messages);
+            // The raw pass-through renders live messages only — no composed frame leads it.
+            let served_fingerprints = served_output_fingerprints(&passthrough_messages, &[]);
             let first_divergence = divergence::first_divergence(
                 &loaded.meta.served_output_fingerprint,
                 &served_fingerprints,
@@ -3677,6 +4032,7 @@ fn apply_once(
                         expected: loaded.row_version,
                         core: &loaded.core,
                         meta: &next_meta,
+                        sections: SectionsCommit::over(loaded.sections.as_ref()),
                         consumed_drop_ids: &[],
                         first_applied_command_ids: &[],
                         memory_revision: None,
@@ -3705,7 +4061,7 @@ fn apply_once(
             if let Some(first_divergence) = &first_divergence {
                 let detail =
                     serde_json::to_string(first_divergence).expect("divergence is serializable");
-                eprintln!(
+                tracing::warn!(
                     "mc-module: first_divergence session={} {detail}",
                     req.session_id
                 );
@@ -3764,6 +4120,7 @@ fn apply_once(
                 &temporal_marks,
                 &user_hints,
                 &channel1_appends,
+                &meta.pending_tag_block_ids,
                 &meta.pending_user_hint_block_ids,
             )
         });
@@ -3773,7 +4130,8 @@ fn apply_once(
             passthrough_overlay.as_ref(),
             mutation_exempt_mid,
         );
-        let served_fingerprints = served_output_fingerprints(&passthrough_messages);
+        // The raw pass-through renders live messages only — no composed frame leads it.
+        let served_fingerprints = served_output_fingerprints(&passthrough_messages, &[]);
         let first_divergence = divergence::first_divergence(
             &loaded.meta.served_output_fingerprint,
             &served_fingerprints,
@@ -3791,6 +4149,7 @@ fn apply_once(
                 expected: loaded.row_version,
                 core: &core,
                 meta: &meta,
+                sections: SectionsCommit::over(loaded.sections.as_ref()),
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: None,
@@ -3816,14 +4175,16 @@ fn apply_once(
         if let Some(first_divergence) = &first_divergence {
             let detail =
                 serde_json::to_string(first_divergence).expect("divergence is serializable");
-            eprintln!(
+            tracing::warn!(
                 "mc-module: first_divergence session={} {detail}",
                 req.session_id
             );
         }
-        eprintln!(
+        tracing::warn!(
             "mc-module: armed pending_rewrite for {} fingerprint {} ambiguous={}",
-            req.session_id, fingerprint, ambiguous
+            req.session_id,
+            fingerprint,
+            ambiguous
         );
         return Ok(pending_passthrough_result(PendingPassthroughArgs {
             historian_tags: Arc::clone(&tag_rows),
@@ -3854,6 +4215,8 @@ fn apply_once(
         loaded.meta.pending_rewrite.is_some() && boundary_present;
 
     let provisional_tail_mid = provisional_tail_mid(req);
+    profile_end!(perf_coverage);
+    profile_start!(perf_identity, "identity_enforce");
     let identity_enforce_started_at = Instant::now();
     let tail_identity_re_adoptions = enforce_block_identity(
         &loaded.meta,
@@ -3864,6 +4227,7 @@ fn apply_once(
         lineage_anchor_mid,
     )?;
     timings.identity_enforce = elapsed_ms(identity_enforce_started_at);
+    profile_end!(perf_identity);
     let mut pending_overlays = PendingOverlayDecisions::default();
     // When caveman tagging is requested, compute tag rows from the persisted tag order even if
     // the provider response has no visible §N§ tags. Creating these rows does not change rendered
@@ -3897,10 +4261,13 @@ fn apply_once(
         // Deferring this refresh until the next request would split one eligible batch across
         // several provider-visible rewrites as a multi-step turn keeps minting tags.
         let tag_overlay_started_at = Instant::now();
+        profile_start!(perf_tag_numbers, "tag_overlay");
         tag_numbers = tag_number_by_message(&tag_rows);
         timings.tag_overlay += elapsed_ms(tag_overlay_started_at);
+        profile_end!(perf_tag_numbers);
     }
     let planning_started_at = Instant::now();
+    profile_start!(perf_planning, "planning");
     let pending_drops_started_at = Instant::now();
     let pending_agent_drops = store.load_pending_agent_drops(&req.session_id)?;
     let pending_drop_target_ids = pending_agent_drops
@@ -3980,14 +4347,17 @@ fn apply_once(
         }
         m1_signal = revalidated;
     }
-    // The combined revision also contains project memories, notes, and profile state. Gate the
+    // A stored revision from the older digest format that still matches the current inputs is
+    // the same applied state; comparing it raw would report pending work that renders nothing.
+    let applied_m1_revision = m1_signal.equivalent_applied_revision(loaded.meta.m1_revision);
+    // The combined revision also contains project memories and profile state. Gate the
     // healthy pending-publication window on its compartment component so unrelated churn cannot
     // suppress repair. Metadata from before that component existed falls back to the combined
     // digest, then escalates after a small number of coherent observations if it never converges.
     let compartment_revision_matches = loaded
         .meta
         .m1_compartment_seq
-        .map_or(m1_signal.revision == loaded.meta.m1_revision, |applied| {
+        .map_or(m1_signal.revision == applied_m1_revision, |applied| {
             applied == m1_signal.max_compartment_seq
         });
     // Legacy rows can borrow an active producer's publication window while their bytes lack
@@ -4039,7 +4409,7 @@ fn apply_once(
     if boundary_divergence_recut.is_some() && !active_legitimate_publication_window {
         boundary_divergence_pending_count = 0;
     }
-    let mut current_m1_digest = m1_signal.revision;
+    let current_m1_digest = m1_signal.revision;
     let compartment_seq_changed_since_meta = loaded.meta.initialized
         && m1_signal.max_compartment_seq != meta_coverage_compartment_seq(&loaded.meta);
     *boundary_divergence_detected = boundary_divergence_recut.is_some();
@@ -4047,7 +4417,7 @@ fn apply_once(
     // The next natural bust adopts the gated digest; the mismatch does not authorize a bust now.
     let memory_gate_digest_transition = !ctx.memory_enabled
         && !loaded.meta.memory_disabled
-        && current_m1_digest != loaded.meta.m1_revision;
+        && current_m1_digest != applied_m1_revision;
     let external_revision_changed = loaded.meta.initialized
         && loaded.meta.m1_external_revision != 0
         && m1_signal.external_revision != loaded.meta.m1_external_revision;
@@ -4055,7 +4425,7 @@ fn apply_once(
     let emergency_no_head_escape =
         req.emergency_recovery_armed && req.emergency_recovery_no_head_escape;
     if emergency_no_head_escape {
-        eprintln!(
+        tracing::warn!(
             "mc-module: overflow recovery arm has no eligible history boundary; suppressing forced emergency pass for {}",
             req.session_id
         );
@@ -4115,7 +4485,7 @@ fn apply_once(
         })
     {
         scheduler_outcome.drain_latch.active_since_ms = None;
-        eprintln!(
+        tracing::info!(
             "emergency disarm: trusted final-wire {} under provider limit {}",
             effective_usage.final_wire_input_tokens,
             provider_proven_limit.unwrap_or_default()
@@ -4153,6 +4523,21 @@ fn apply_once(
     // without folding; only a change from a non-empty durable value is a HARD trigger.
     let (render_config_changed, identity_observed, coordinator_identity) =
         render_config_change(&loaded.meta, req, &effective_render_config, transition_due);
+    // The provider may still be cold after an aborted prepared fold. Consume the
+    // head fold once, but leave expiry available to price work queued on the resend.
+    let idle_fold_due = scheduler_outcome.idle_ttl_fired
+        && ctx
+            .observed_last_response_at_ms
+            .is_some_and(|response| response > loaded.meta.expiry_cutoff_ms);
+    let system_identity_adopted = can_adopt_system_identity(
+        &loaded.meta,
+        req,
+        &content_epoch,
+        &persisted_mural_hash,
+        false,
+        scheduler_outcome.idle_ttl_fired,
+    );
+    let render_config_changed = render_config_changed && !system_identity_adopted;
     let reconcile_hard_due = loaded.core.reconcile_pending && !boundary_present;
     // If Claude-code coverage advances over system messages, force a HARD render so the
     // messages move into the m0 prefix before the byte-splice profile suppresses their
@@ -4189,11 +4574,31 @@ fn apply_once(
                 &projection,
                 lineage_anchor_mid,
             ));
+    // Every trigger below asks for a HARD. Whether that HARD may also price automatic
+    // reductions and the other bust-only lanes depends on whether it can re-render the
+    // served prefix byte-identically:
+    // - reasoning_exemption_repair: the repair exists to change which reasoning blocks the
+    //   tail serves, so the pass changes provider-visible bytes by construction (in the
+    //   tail, which the m0/m1 head comparison would not see). It keeps pricing.
+    // - first_fold_due: folds the session's first compartment and mints the first
+    //   boundary, so m0 and the coverage anchor change by construction. It keeps pricing.
+    // - boundary_divergence_recut: re-cuts compartments to a new boundary, so coverage and
+    //   the served tail move by construction. It keeps pricing.
+    // - system_absorb_hard_due: fires only when new compartment coverage absorbs system
+    //   messages, so m0 grows and coverage moves. It keeps pricing.
+    // - idle TTL: the provider cache is already gone (hard_fold_loses_provider_cache).
+    // - pre_snapshot_inputs_changed, external_revision_changed and
+    //   project_memory_epoch_hard_due: none of them is an m0 compose input by itself, so the
+    //   fold CAN reproduce the frozen pair exactly. They go through
+    //   hard_fold_busts_served_prefix below (marker_hard_keeps_provider_cache).
+    // Reconcile (the boundary left the live array after a revert) and lineage descent (a new
+    // host conversation epoch) are separate HARD inputs below; both serve a different
+    // message array than the cached one, so they keep pricing too.
     let hard_fold_requested = reasoning_exemption_repair
         || pre_snapshot_inputs_changed
         || first_fold_due
         || boundary_divergence_recut.is_some()
-        || scheduler_outcome.idle_ttl_fired
+        || idle_fold_due
         || system_absorb_hard_due
         || external_revision_changed
         || project_memory_epoch_hard_due;
@@ -4202,25 +4607,120 @@ fn apply_once(
     // Subagents execute a reductions-only branch, not the prefix plan. Inherited
     // HARD/reconcile advisories cannot price automatic reductions without a fold.
     let prefix_materialization_enabled = !req.is_subagent;
+    let profile_transition = !loaded.meta.last_serializer_profile.is_empty()
+        && loaded.meta.last_serializer_profile != req.serializer_profile;
+    // A known previous identity that differs from this request means the provider's
+    // cached prefix is gone whatever bytes this pass serves.
+    let identity_changed = |last: &str, current: Option<&str>| {
+        !last.is_empty() && current.is_some_and(|current| current != last)
+    };
+    let hard_fold_loses_provider_cache = scheduler_outcome.idle_ttl_fired
+        || profile_transition
+        || identity_changed(&loaded.meta.last_provider_id, req.provider_id.as_deref())
+        || identity_changed(&loaded.meta.last_model_key, req.model_key.as_deref())
+        || (!system_identity_adopted
+            && identity_changed(
+                &loaded.meta.last_system_prompt_hash,
+                Some(req.system_prompt_hash.as_str()),
+            ));
+    // A marker trigger (a project-memory epoch, an external memory revision, or changed
+    // protection-floor inputs) asks for a HARD because rendered content MAY have changed,
+    // not because the provider cache died. Such a HARD prices automatic reductions only when
+    // hard_fold_busts_served_prefix, the same predicate that gates legacy skeleton conversion
+    // in the HARD branch, says it busts the served prefix. Otherwise the provider's cached
+    // prefix survives the pass and a queued drop or heuristic riding it would originate the
+    // pass's only bust. The HARD itself still runs so its markers commit.
+    let marker_hard_keeps_provider_cache = prefix_materialization_enabled
+        && (external_revision_changed
+            || project_memory_epoch_hard_due
+            || pre_snapshot_inputs_changed)
+        && !(reasoning_exemption_repair
+            || first_fold_due
+            || boundary_divergence_recut.is_some()
+            || system_absorb_hard_due
+            || hard_fold_loses_provider_cache)
+        && loaded.meta.initialized
+        && !loaded.meta.bootstrap_seed_fold_pending
+        && !render_config_changed
+        && !reconcile_hard_due
+        && !lineage_state.force_hard
+        && !is_legacy_baseline(&loaded.core)
+        && valid_m0m1_shape(&loaded.core)
+        && !cached_m1_missing(&loaded.core)
+        && compose_hard_fold_m0(
+            store,
+            req,
+            ctx,
+            serializer_profile,
+            estimate_tokens,
+            incremental_history,
+            &mut timings.compose,
+        )
+        .is_some_and(|comp| {
+            !hard_fold_busts_served_prefix(
+                &loaded.core,
+                &comp.m0_bytes,
+                M1_PLACEHOLDER,
+                comp.mural.as_ref(),
+                loaded.meta.coverage_ordinal != comp.coverage_ordinal,
+                hard_fold_loses_provider_cache,
+            )
+        });
+    let hard_fold_prices_mutations = hard_fold_requested && !marker_hard_keeps_provider_cache;
+    if marker_hard_keeps_provider_cache {
+        tracing::info!(
+            "mc-module: [{}] marker HARD keeps the provider's cached prefix; it does not price automatic reductions",
+            req.session_id
+        );
+    }
     let force_band_active = usage_percentage
         >= scheduler::escalation_bands(ctx.execute_threshold_percentage)
             .force_materialize_percentage;
     let force_episode_available = force_band_active && !loaded.meta.has_prior_emergency_drop;
-    let supersession_ride_available = (prefix_materialization_enabled
+    // A rebuild that is not the emergency itself. It is the only thing that waives the
+    // emergency minimum: the force-band edge and the 95% backstop below permit a rewrite
+    // but do not pay for one. Both flags derive from this one expression so they cannot
+    // drift apart.
+    let independent_rebuild = (prefix_materialization_enabled
         && (!loaded.meta.initialized
             || render_config_changed
             || cached_m1_missing(&loaded.core)
-            || hard_fold_requested
+            || hard_fold_prices_mutations
             || reconcile_hard_due
             || lineage_state.force_hard
             || (scheduler_outcome.pass != scheduler::PassDecision::Defer
-                && current_m1_digest != loaded.meta.m1_revision)))
+                && current_m1_digest != applied_m1_revision)))
+        || loaded.meta.soft_refresh_pending
+        || (prefix_materialization_enabled && scheduler_outcome.idle_ttl_fired);
+    let supersession_ride_available = independent_rebuild
+        // Subagents cannot fold history. Execute is their one shared permission
+        // for queued drops and automatic cleanup, not a request to change bytes.
+        || (req.is_subagent && scheduler_outcome.pass.canonical_decision() == "execute")
         || force_episode_available
-        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95
-        || loaded.meta.soft_refresh_pending;
+        || scheduler_outcome.pass == scheduler::PassDecision::Emergency95;
     let pass_already_busting = supersession_ride_available;
+    let emergency_minimum_waived = independent_rebuild;
+    let calibration_candidate = crate::decision_calibration::DecisionCalibration::freeze_for_model(
+        req.model_key.as_deref(),
+    );
+    let frozen_calibration = loaded
+        .meta
+        .decision_calibration
+        .as_ref()
+        .and_then(crate::decision_calibration::DecisionCalibration::from_frozen);
+    let active_calibration = if pass_already_busting {
+        crate::decision_calibration::DecisionCalibration::for_model(req.model_key.as_deref())
+    } else {
+        frozen_calibration.unwrap_or_else(crate::decision_calibration::DecisionCalibration::neutral)
+    };
+    let calibration_changed = pass_already_busting
+        && loaded
+            .meta
+            .decision_calibration
+            .as_ref()
+            .is_some_and(|previous| previous != &calibration_candidate);
     if !pass_already_busting && !pending_drop_target_ids.is_empty() {
-        eprintln!("mc-module: pending drops held session={} reason=no_originating_cache_bust scheduler={:?} historian_active={}", req.session_id, scheduler_outcome.pass, ctx.historian_active);
+        tracing::info!("mc-module: pending drops held session={} reason=no_originating_cache_bust scheduler={:?} historian_active={}", req.session_id, scheduler_outcome.pass, ctx.historian_active);
     }
     // Tail reclaim gates purely on the serializer profile. Every shipping profile is a
     // full-array consumer (healing::tail_reclaim is true for all of them), so the request
@@ -4236,7 +4736,7 @@ fn apply_once(
             !loaded.meta.initialized
                 || render_config_changed
                 || reconcile_hard_due
-                || hard_fold_requested
+                || hard_fold_prices_mutations
                 || cached_m1_missing_due,
         );
     // Keep selection deferred when the producer gate blocks it.
@@ -4255,9 +4755,12 @@ fn apply_once(
                 .map(|tokens| (row.block_id.as_str(), tokens))
         })
         .collect();
+    profile_start!(perf_selection_inputs, "rt04_selection_inputs");
     let mut tail_for_selection =
         tail_sel_items(&live, loaded.meta.coverage_ordinal, &tag_tokens_by_block);
     attach_edit_input_key_orders(&mut tail_for_selection, &req.tool_input_key_orders);
+    attach_user_answer_markers(&mut tail_for_selection, &req.messages);
+    profile_end!(perf_selection_inputs);
     // Todo state is deferred work just like an m1 or reduction delta: it may ride an
     // independently scheduled bust, but it never authorizes provider-visible bytes by itself.
     // Compute only the call-id transition here; the complete pair is built after classification.
@@ -4273,7 +4776,10 @@ fn apply_once(
         req.protected_tokens_effective,
         loaded.meta.protected_tokens_effective,
         ctx.protected_tokens_floor,
-        if pass_already_busting {
+        // The floor snapshot is decision metadata, not served bytes. A marker HARD that keeps
+        // the provider cache still snapshots it (changed floor inputs raise exactly such a
+        // HARD), while the lanes that would act on the new floor stay closed until a real bust.
+        if pass_already_busting || marker_hard_keeps_provider_cache {
             FloorPass::CacheBust
         } else {
             FloorPass::Defer
@@ -4282,9 +4788,10 @@ fn apply_once(
     let protected_tokens_floor = floor_resolution.effective;
     // Pending same-pass mints are not persisted rows yet. Every consumer view below is projected
     // from this one walk over the hydrated mc_tags baseline, independent of the served array.
-    let protection_window = ProtectionWindow::from_persisted_rows(
+    let protection_window = ProtectionWindow::from_persisted_rows_calibrated(
         &tag_rows[..hydrated_tag_count],
         protected_tokens_floor,
+        active_calibration.tools_ratio,
     );
     let tag_window_protected_block_ids = protection_window.row_identities.block_ids.clone();
     let exempt_message_protected_block_ids = [mutation_exempt_mid, lineage_anchor_mid]
@@ -4338,6 +4845,7 @@ fn apply_once(
             &tail_for_selection,
             &frozen,
             &SelectionContext {
+                calibration: Some(active_calibration),
                 pass_class: selection_class,
                 current_total_input_tokens: usage_input_tokens,
                 ceiling_tokens: context_limit_tokens
@@ -4356,6 +4864,7 @@ fn apply_once(
                 first_applied_agent_drop_ids,
                 pass_already_busting,
                 supersession_ride_available,
+                emergency_minimum_waived,
                 emergency_window_yields: scheduler_outcome.pass
                     == scheduler::PassDecision::Emergency95,
                 tag_window_protected_block_ids: tag_window_protected_block_ids.clone(),
@@ -4427,6 +4936,7 @@ fn apply_once(
         loaded.meta.coverage_ordinal,
         non_tool_bust_opportunity,
         planned_age_basis,
+        ctx.caveman_english_word_rules,
     );
     let planned_reasoning_cutoff = reasoning_clear_cutoff_with_tags(
         req,
@@ -4454,7 +4964,7 @@ fn apply_once(
         hard_fold_requested,
         boundary_present,
         reconcile_pending: loaded.core.reconcile_pending,
-        m1_revision_changed: current_m1_digest != loaded.meta.m1_revision
+        m1_revision_changed: current_m1_digest != applied_m1_revision
             || loaded.meta.soft_refresh_pending
             || todo_injection_pending,
         reductions_pending: reclaim_pending_now,
@@ -4462,12 +4972,11 @@ fn apply_once(
         // published prefix work, an explicit flush, force, or actual reductions.
         bust_opportunity,
     });
-    // A todo-only delta does not need a coverage anchor: it inserts a frozen pair between the
-    // existing prefix and tail without moving the m0/m1 boundary. The generic classifier blocks
-    // boundaryless m1 deltas because they cannot splice safely, so promote only its ordinary
-    // defer result when an independent bust opportunity already exists. Reconcile defers remain
-    // untouched because they must clear or rebuild the boundary state first.
-    if todo_injection_pending
+    // Todo insertion and an expired retry's new tail reductions do not need a coverage
+    // anchor: neither moves the frozen m0/m1 boundary. The generic classifier requires
+    // an anchor for history deltas, so promote only an ordinary defer here, after the
+    // independent bust gate has priced the work. Reconcile defers remain untouched.
+    if (todo_injection_pending || (scheduler_outcome.idle_ttl_fired && reclaim_pending_now))
         && bust_opportunity
         && !loaded.core.reconcile_pending
         && matches!(plan, PassPlan::Defer)
@@ -4476,28 +4985,38 @@ fn apply_once(
     }
     timings.decide += elapsed_ms(classify_started_at);
     if req.is_subagent {
-        plan = if matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer) {
-            PassPlan::Defer
-        } else {
+        // Activating or disabling the tag surface changes the render identity itself.
+        // Spend that one intentional rewrite now, so old blocks do not acquire tags
+        // piecemeal during later defers. Ordinary late mints still wait for an
+        // independent Soft pass selected by the scheduler.
+        plan = if surface_transition
+            || !matches!(scheduler_outcome.pass, scheduler::PassDecision::Defer)
+        {
             PassPlan::Soft
+        } else {
+            PassPlan::Defer
         };
     } else if lineage_state.force_hard {
         plan = PassPlan::Hard;
     }
-    let profile_transition = !loaded.meta.last_serializer_profile.is_empty()
-        && loaded.meta.last_serializer_profile != req.serializer_profile;
+    if cache_sections_discarded {
+        plan = PassPlan::Hard;
+    }
     let mut materialize_reason = classify_materialize_reason(MaterializeReasonInputs {
         plan,
         bootstrap_due: !loaded.meta.initialized || loaded.meta.bootstrap_seed_fold_pending,
         legacy_baseline: is_legacy_baseline(&loaded.core),
         render_config_changed,
         profile_transition,
+        project_memory_epoch_due: external_revision_changed || project_memory_epoch_hard_due,
+        history_revision_due: external_revision_changed
+            && loaded.meta.m1_history_revision != m1_signal.history_revision,
         first_fold_due,
         ttl_expired: scheduler_outcome.idle_ttl_fired,
         coverage_fold_due: system_absorb_hard_due,
         reconcile_hard_due,
         coverage_delta: compartment_seq_changed_since_meta,
-        m1_delta: current_m1_digest != loaded.meta.m1_revision,
+        m1_delta: current_m1_digest != applied_m1_revision,
         explicit_flush: loaded.meta.soft_refresh_pending,
         reductions_pending: reclaim_pending_now,
     });
@@ -4506,6 +5025,9 @@ fn apply_once(
     }
     if lineage_state.force_hard {
         materialize_reason = Some("lineage_descent".to_string());
+    }
+    if cache_sections_discarded {
+        materialize_reason = Some("cache_sections_discarded".to_string());
     }
     if boundary_divergence_recut.is_some() {
         materialize_reason = Some("boundary_divergence_recut".to_string());
@@ -4519,14 +5041,45 @@ fn apply_once(
     if reasoning_exemption_repair {
         materialize_reason = Some("reasoning_exemption_repair".to_string());
     }
+    // Attribution belongs to this expired provider request, even if the head was
+    // already prepared by an aborted attempt and the materializer only replays it.
+    if scheduler_outcome.idle_ttl_fired && !matches!(plan, PassPlan::Hard | PassPlan::MigrateHard) {
+        materialize_reason = Some("ttl_idle".to_string());
+    }
 
     timings.planning = elapsed_ms(planning_started_at);
+    profile_end!(perf_planning);
     let state_clone_started_at = Instant::now();
+    profile_start!(perf_clone, "state_clone");
     let mut core = loaded.core.clone();
     log_reasoning_drop_seed_skips(&core, &live, &req.session_id);
     let mut meta = loaded.meta.clone();
+    // Persist an equivalent revision written by an older digest format. This changes only
+    // stored metadata; the served bytes are decided by the plan above.
+    meta.m1_revision = applied_m1_revision;
+    if system_identity_adopted {
+        meta.last_system_prompt_hash = req.system_prompt_hash.clone();
+        meta.last_render_config = effective_render_config.clone();
+    }
+    if pass_already_busting {
+        if calibration_changed {
+            if let Some(previous) = loaded.meta.decision_calibration.as_ref() {
+                tracing::debug!(
+                    "mc-module: [{}] calibration revision {} → {} adopted (bust={})",
+                    req.session_id,
+                    previous.revision,
+                    calibration_candidate.revision,
+                    materialize_reason.as_deref().unwrap_or("execute")
+                );
+            }
+        }
+        meta.decision_calibration = Some(calibration_candidate);
+        transition_hygiene_units(&mut meta, true, active_calibration.tools_ratio);
+    }
     timings.state_clone = elapsed_ms(state_clone_started_at);
+    profile_end!(perf_clone);
     let state_evolution_started_at = Instant::now();
+    profile_start!(perf_evolution, "state_evolution");
     meta.boundary_divergence_pending_count = boundary_divergence_pending_count;
     meta.boundary_divergence_observed_compartment_seq = if boundary_divergence_pending_count > 0 {
         boundary_divergence_observed_compartment_seq
@@ -4561,6 +5114,10 @@ fn apply_once(
         meta.emergency_drop_assessment = Some(assessment);
     }
     let mut commit_expected = loaded.row_version;
+    // Row-version steps adopted from meta-only writers since `loaded` was read. The commit
+    // checks `commit_expected == loaded.row_version + meta_only_steps`, so the chunks it
+    // diffs against `loaded.sections` cannot silently come from another commit.
+    let mut meta_only_steps = 0u64;
     if clear_pending_rewrite_on_present {
         meta.pending_rewrite = None;
         meta.pending_rewrite_trip_count = meta.pending_rewrite_trip_count.saturating_add(1);
@@ -4571,7 +5128,7 @@ fn apply_once(
                 "boundary_present_recovery",
                 true,
             ));
-            eprintln!(
+            tracing::warn!(
                 "mc-module: pending_rewrite ambiguous after boundary-present recovery for {}",
                 req.session_id
             );
@@ -4602,15 +5159,56 @@ fn apply_once(
         materialize_reason = Some("lineage_anchor_mismatch".to_string());
     }
 
+    // A marker HARD that keeps the provider's cached prefix, with no other independent ride
+    // (force, emergency, explicit flush, published m1 work, or a pending reduction) on the
+    // pass, still runs as a HARD so its markers commit, but it serves the frozen bytes. Every
+    // lane that may only ride a real bust treats it as a defer: new strip and caveman units,
+    // reasoning clearing, synthetic todo capture, first tag-surface and user-hint overlays,
+    // transition consumption, guidance date, and the hygiene/calibration adoption below.
+    let marker_hard_serves_frozen_prefix =
+        marker_hard_keeps_provider_cache && !supersession_ride_available && !reductions_pending_now;
     let is_provider_prefix_mutation_pass = matches!(
         plan,
         PassPlan::Hard | PassPlan::MigrateHard | PassPlan::Soft
-    );
+    ) && !marker_hard_serves_frozen_prefix;
+    // The reductions-only child branch preserves inherited history and accepts
+    // reduction units only. Image/system/age-reasoning strip units stay primary-only;
+    // an execute ride must not silently widen that separate replay contract.
     let is_bust_pass = !req.is_subagent && is_provider_prefix_mutation_pass;
+    if replay_legacy_treatment && is_provider_prefix_mutation_pass {
+        return Err(TransformError::SyntheticTreatmentBust);
+    }
+    if is_provider_prefix_mutation_pass {
+        meta.reclassified_synthetic_mids
+            .extend(reclassified_on_bust.iter().cloned());
+    }
+    // A defer replays previously served provider bytes even in a subagent: its tool loop
+    // has an Anthropic cached prefix too. Hold overlays first discovered on served blocks
+    // until the scheduler selects a prefix mutation pass. Use the plan, not `is_bust_pass`,
+    // because subagent execute passes are Soft even though they are not billed as a module bust.
+    let prefix_replay_must_be_preserved = !is_provider_prefix_mutation_pass;
+    if !prefix_replay_must_be_preserved {
+        meta.pending_tag_block_ids.clear();
+    } else if matches!(
+        serializer_profile,
+        Some(SerializerProfile::OpencodeAiSdk | SerializerProfile::OwnedBroca)
+    ) {
+        // Broca can serve a message the module never rendered (its last-known-good array
+        // plus the raw tail after a failed transform), so it needs the same hold.
+        let mint_end = pending_overlays
+            .tag_mint_start
+            .saturating_add(pending_overlays.tag_mint_count)
+            .min(tag_rows.len());
+        for row in &tag_rows[pending_overlays.tag_mint_start.min(mint_end)..mint_end] {
+            if overlay_target_was_served(&loaded.meta.served_output_fingerprint, &row.block_id) {
+                meta.pending_tag_block_ids.insert(row.block_id.clone());
+            }
+        }
+    }
     if !lineage_anchor_failure {
         meta.protected_tokens_effective = floor_resolution.persisted;
         if meta.protected_tokens_effective != loaded.meta.protected_tokens_effective {
-            eprintln!(
+            tracing::debug!(
                 "mc-module: protected_tokens session={} floor={} provenance={} usable_soft={}",
                 req.session_id,
                 protected_tokens_floor,
@@ -4642,7 +5240,7 @@ fn apply_once(
         )? {
             if !hint.hint_text.is_empty()
                 && user_hint_target_was_served(&loaded.meta, &hint.block_id)
-                && !is_bust_pass
+                && prefix_replay_must_be_preserved
             {
                 // A decision for a previously served block is immutable, but its first append
                 // must ride a later independent bust rather than rewriting the cached prefix.
@@ -4656,7 +5254,7 @@ fn apply_once(
             });
             pending_overlays.user_hint = Some(hint);
         }
-        if is_bust_pass {
+        if !prefix_replay_must_be_preserved {
             meta.pending_user_hint_block_ids.clear();
         }
     }
@@ -4691,7 +5289,64 @@ fn apply_once(
         Vec::new()
     };
     timings.caveman = elapsed_ms(caveman_started_at);
-    if loaded.meta.soft_refresh_pending && is_bust_pass {
+    // A prefix-bound OpenCode bust whose only edit before newer signed thinking is the
+    // oldest-prefix `reasoning_age` removal ("Remove `thinking` blocks from the start of
+    // the history" is a valid change in Anthropic's preserved-thinking table). The host
+    // then keeps the newer blocks instead of stripping them all. Each condition rules out
+    // an edit this pass could otherwise make; a pass that fails any of them, or that this
+    // list does not describe, reports false, and the host strips, the safe direction.
+    let served_tag_overlay_this_pass = {
+        let mint_end = pending_overlays
+            .tag_mint_start
+            .saturating_add(pending_overlays.tag_mint_count)
+            .min(tag_rows.len());
+        tag_rows[pending_overlays.tag_mint_start.min(mint_end)..mint_end]
+            .iter()
+            .any(|row| {
+                overlay_target_was_served(&loaded.meta.served_output_fingerprint, &row.block_id)
+            })
+    };
+    let served_user_hint_this_pass = pending_overlays.user_hint.as_ref().is_some_and(|hint| {
+        !hint.hint_text.is_empty() && user_hint_target_was_served(&loaded.meta, &hint.block_id)
+    });
+    let current_exempt_mid = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    // A bust releases the full native vector kept for an assistant that is no longer the
+    // newest, and the tag or hint overlays withheld from it then land on its text: an edit
+    // before newer thinking. Without active overlays its parts are unchanged.
+    let releases_native_reasoning_keep = (tagging_active || auto_search_active)
+        && loaded.core.frozen_units.iter().any(|unit| {
+            unit.key
+                .strip_prefix("strip:native_reasoning_keep:")
+                .is_some_and(|mid| Some(mid) != current_exempt_mid)
+        });
+    // A bust applies system-injection strips that earlier defers held back.
+    let applies_held_system_strip =
+        loaded.core.frozen_units.iter().any(|unit| {
+            unit.key.starts_with(SYSTEM_STRIP_BLOCK_PREFIX) && !unit.reset_rule.is_empty()
+        });
+    let reasoning_trim_only_candidate = is_bust_pass
+        && serializer_profile == Some(SerializerProfile::OpencodeAiSdk)
+        && is_prefix_bound_thinking_model(req.model_key.as_deref())
+        && matches!(plan, PassPlan::Soft)
+        && materialize_reason.as_deref() == Some("selection")
+        && !reductions_pending_now
+        && new_caveman_units.is_empty()
+        && new_strip_units
+            .iter()
+            .all(|unit| unit.key.starts_with("strip:reasoning_age:"))
+        && !todo_injection_pending
+        && !calibration_changed
+        && loaded.meta.pending_tag_block_ids.is_empty()
+        && loaded.meta.pending_user_hint_block_ids.is_empty()
+        && !served_tag_overlay_this_pass
+        && !served_user_hint_this_pass
+        && ctx
+            .guidance_date
+            .as_ref()
+            .is_none_or(|date| *date == loaded.meta.guidance_date)
+        && !releases_native_reasoning_keep
+        && !applies_held_system_strip;
+    if loaded.meta.soft_refresh_pending && !prefix_replay_must_be_preserved {
         meta.soft_refresh_pending = false;
     }
     if is_bust_pass {
@@ -4700,7 +5355,9 @@ fn apply_once(
         }
     }
     let mut todo_ms = 0.0;
+    profile_start!(perf_capture_clone, "rt04_capture_clone");
     let tail_for_capture = tail_for_selection.clone();
+    profile_end!(perf_capture_clone);
     if is_bust_pass && tail_reclaim_enabled {
         let todo_started_at = Instant::now();
         capture_todo_state_on_bust(
@@ -4715,7 +5372,6 @@ fn apply_once(
     let mut coverage_shrunk_on_bust = false;
     let compose_m0m1_started_at = Instant::now();
     let mut commit_memory_revision = None;
-    let mut note_deliveries: Vec<NoteDelivery> = Vec::new();
     let mut committed_mural_hash = persisted_mural_hash;
 
     if req.is_subagent {
@@ -4759,11 +5415,12 @@ fn apply_once(
                         project_path: ctx.project_path,
                         project_directory: ctx.project_directory,
                         now_ms: ctx.now_ms,
-                        history_budget_tokens: ctx.history_budget_tokens,
+                        history_budget_tokens: crate::decay_render::history_local_budget(
+                            ctx.history_budget_tokens,
+                            req.model_key.as_deref(),
+                        ),
                         covered_system_messages: &covered_system_messages,
                         memory_enabled: ctx.memory_enabled,
-                        host_backed_memory_ids: serializer_profile
-                            != Some(SerializerProfile::ClaudeCodeAnthropic),
                         memory_budget_tokens: ctx.memory_budget_tokens,
                         user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                         inject_docs: ctx.inject_docs,
@@ -4833,6 +5490,11 @@ fn apply_once(
                                 keep_through_seq,
                                 commit_expected,
                             )?;
+                            // The truncate is meta-only: it steps the version by one when it
+                            // drops compartments and not at all when there is nothing to drop.
+                            if Some(outcome.row_version) != commit_expected {
+                                meta_only_steps += 1;
+                            }
                             commit_expected = Some(outcome.row_version);
                             meta.revert_epoch = outcome.revert_epoch;
                             meta.last_recut = outcome.last_recut;
@@ -4846,7 +5508,6 @@ fn apply_once(
                                 m1_visibility_cutoff_ms,
                                 Some(&mut m1_revision_read_timings),
                             )?;
-                            current_m1_digest = m1_signal.revision;
                             let recut_compartments = store.load_compartments(&req.session_id)?;
                             let recut_coverage_bounds =
                                 coverage_bounds_from_compartments(&recut_compartments)?;
@@ -4864,11 +5525,13 @@ fn apply_once(
                                     project_path: ctx.project_path,
                                     project_directory: ctx.project_directory,
                                     now_ms: ctx.now_ms,
-                                    history_budget_tokens: ctx.history_budget_tokens,
+                                    history_budget_tokens:
+                                        crate::decay_render::history_local_budget(
+                                            ctx.history_budget_tokens,
+                                            req.model_key.as_deref(),
+                                        ),
                                     covered_system_messages: &recut_covered_system_messages,
                                     memory_enabled: ctx.memory_enabled,
-                                    host_backed_memory_ids: serializer_profile
-                                        != Some(SerializerProfile::ClaudeCodeAnthropic),
                                     memory_budget_tokens: ctx.memory_budget_tokens,
                                     user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                                     inject_docs: ctx.inject_docs,
@@ -4928,12 +5591,29 @@ fn apply_once(
                 // Keep reductions whose targets remain in the new tail; discard reductions covered
                 // by the new m0 summary or orphaned by a revert. Because apply_units cannot remove
                 // those obsolete units in place, rebuild the frozen unit set.
-                let effective = effective_reductions(
+                let mut effective = effective_reductions(
                     &core,
                     &selected_reductions,
                     suppress_bootstrap_reduction_tag_overlay,
                 );
+                if hard_fold_busts_served_prefix(
+                    &loaded.core,
+                    &comp.m0_bytes,
+                    M1_PLACEHOLDER,
+                    comp.mural.as_ref(),
+                    loaded.meta.coverage_ordinal != comp.coverage_ordinal,
+                    hard_fold_loses_provider_cache,
+                ) {
+                    convert_legacy_skeleton_units(
+                        &mut effective,
+                        &tail_for_selection,
+                        &core,
+                        &req.session_id,
+                    );
+                }
                 let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
+                let channel1_survivors =
+                    surviving_channel1_units(&core, &effective, &live, comp.coverage_ordinal);
                 let mut strip_survivors = surviving_strip_units(&core, req);
                 strip_survivors.extend(new_strip_units.clone());
                 let caveman_survivors = surviving_caveman_units(
@@ -4944,20 +5624,9 @@ fn apply_once(
                 );
                 core.frozen_units.clear();
                 core.pending_changes.clear();
-                let (note_body, hard_note_deliveries) = claim_and_render_notes(
-                    store,
-                    ctx.note_project_path,
-                    &req.session_id,
-                    &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
-                    &format!("m1:{}:{}", current_m1_digest, ctx.now_ms),
-                    ctx.now_ms,
-                )?;
-                note_deliveries = hard_note_deliveries;
-                let m1_unit = if note_body.is_empty() {
-                    render_m1_placeholder()
-                } else {
-                    render_m1_body(&note_body)
-                };
+                // Ready smart notes are delivered by the host reminder and `ctx_note read`,
+                // not through m1, so this rebuild leaves m1 empty.
+                let m1_unit = render_m1_placeholder();
                 let mural_unit = comp.mural.as_ref().map(render_mural_block);
                 committed_mural_hash = comp
                     .mural
@@ -4977,6 +5646,7 @@ fn apply_once(
                 rendered.extend(survivors);
                 rendered.extend(strip_survivors);
                 rendered.extend(caveman_survivors);
+                rendered.extend(channel1_survivors);
 
                 // A HARD re-composes m0 fully from the store, so the boundary ALWAYS reflects
                 // the current coverage — set it unconditionally (empty when no compartments,
@@ -5045,6 +5715,8 @@ fn apply_once(
                 meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                 meta.m1_user_profile_version = loaded.meta.user_profile_version;
                 meta.m1_external_revision = applied_m1_signal.external_revision;
+                meta.m1_history_revision = applied_m1_signal.history_revision;
+
                 meta.project_memory_epoch_pending = false;
                 meta.m1_pending_since_ms = None;
             }
@@ -5078,7 +5750,6 @@ fn apply_once(
                     ctx.temporal_awareness,
                     mc_tokenizer::estimate_tokens,
                 )?;
-                note_deliveries = m1.note_deliveries.clone();
                 let m0_tokens = core
                     .frozen_units
                     .iter()
@@ -5115,11 +5786,12 @@ fn apply_once(
                             project_path: ctx.project_path,
                             project_directory: ctx.project_directory,
                             now_ms: ctx.now_ms,
-                            history_budget_tokens: ctx.history_budget_tokens,
+                            history_budget_tokens: crate::decay_render::history_local_budget(
+                                ctx.history_budget_tokens,
+                                req.model_key.as_deref(),
+                            ),
                             covered_system_messages: &covered_system_messages,
                             memory_enabled: ctx.memory_enabled,
-                            host_backed_memory_ids: serializer_profile
-                                != Some(SerializerProfile::ClaudeCodeAnthropic),
                             memory_budget_tokens: ctx.memory_budget_tokens,
                             user_profile_budget_tokens: ctx.user_profile_budget_tokens,
                             inject_docs: ctx.inject_docs,
@@ -5165,12 +5837,29 @@ fn apply_once(
                         }
                     }
 
-                    let effective = effective_reductions(
+                    let mut effective = effective_reductions(
                         &core,
                         &selected_reductions,
                         suppress_bootstrap_reduction_tag_overlay,
                     );
+                    if hard_fold_busts_served_prefix(
+                        &loaded.core,
+                        &comp.m0_bytes,
+                        M1_PLACEHOLDER,
+                        comp.mural.as_ref(),
+                        loaded.meta.coverage_ordinal != comp.coverage_ordinal,
+                        hard_fold_loses_provider_cache,
+                    ) {
+                        convert_legacy_skeleton_units(
+                            &mut effective,
+                            &tail_for_selection,
+                            &core,
+                            &req.session_id,
+                        );
+                    }
                     let survivors = surviving_red_units(&effective, &live, comp.coverage_ordinal);
+                    let channel1_survivors =
+                        surviving_channel1_units(&core, &effective, &live, comp.coverage_ordinal);
                     let mut strip_survivors = surviving_strip_units(&core, req);
                     strip_survivors.extend(new_strip_units.clone());
                     let caveman_survivors = surviving_caveman_units(
@@ -5181,15 +5870,11 @@ fn apply_once(
                     );
                     core.frozen_units.clear();
                     core.pending_changes.clear();
-                    // Post-fold m1 parity with the ordinary HARD arm: everything except the
-                    // claimed notes was just folded into the recomposed m0, so rendering the
-                    // full composed body here would duplicate memories/mutations/compartments
-                    // across both layers for the rest of the epoch. Only the notes survive.
-                    let refold_m1_unit = if m1.notes_block.is_empty() {
-                        render_m1_placeholder()
-                    } else {
-                        render_m1_body(&m1.notes_block)
-                    };
+                    // Post-fold m1 parity with the ordinary HARD arm: everything m1 carried
+                    // was just folded into the recomposed m0, so rendering the composed body
+                    // here would duplicate memories/mutations/compartments across both layers
+                    // for the rest of the epoch. The post-fold m1 is therefore empty.
+                    let refold_m1_unit = render_m1_placeholder();
                     let mural_unit = comp.mural.as_ref().map(render_mural_block);
                     committed_mural_hash = comp
                         .mural
@@ -5209,6 +5894,7 @@ fn apply_once(
                     rendered.extend(survivors);
                     rendered.extend(strip_survivors);
                     rendered.extend(caveman_survivors);
+                    rendered.extend(channel1_survivors);
                     core.step(PassInput {
                         proposed: Some(mc_core::Action::Hard),
                         boundary_present: boundary_token,
@@ -5249,6 +5935,8 @@ fn apply_once(
                     meta.m1_compartment_seq = Some(applied_m1_signal.max_compartment_seq);
                     meta.m1_user_profile_version = loaded.meta.user_profile_version;
                     meta.m1_external_revision = applied_m1_signal.external_revision;
+                    meta.m1_history_revision = applied_m1_signal.history_revision;
+
                     meta.project_memory_epoch_pending = false;
                     meta.m1_pending_since_ms = None;
                     commit_memory_revision = Some(comp.memory_revision);
@@ -5352,7 +6040,7 @@ fn apply_once(
                 }
             }
             PassPlan::Defer => {
-                if current_m1_digest != loaded.meta.m1_revision {
+                if current_m1_digest != applied_m1_revision {
                     log_pending_m1_delta(
                         &req.session_id,
                         ctx.now_ms,
@@ -5364,9 +6052,7 @@ fn apply_once(
                     boundary_present: boundary_token,
                     ..Default::default()
                 });
-                if compartment_seq_changed_since_meta
-                    && current_m1_digest == loaded.meta.m1_revision
-                {
+                if compartment_seq_changed_since_meta && current_m1_digest == applied_m1_revision {
                     meta.coverage_compartment_seq = Some(m1_signal.max_compartment_seq);
                 }
             }
@@ -5478,14 +6164,20 @@ fn apply_once(
     }
     timings.todo = todo_ms;
 
+    profile_start!(perf_channel1, "evolution_channel1");
+    prune_channel1_units(&mut core, &projection, meta.coverage_ordinal);
+    let mut channel1_appends = channel1_append_rows(&core, &legacy_channel1_appends);
+    profile_end!(perf_channel1);
     let result_action = action_str(&plan, &core);
 
+    profile_start!(perf_overlay_maps, "evolution_overlay_maps");
     let mut tag_overlay = if tagging_active {
         tag_overlay_state(
             &tag_rows,
             &temporal_marks,
             &user_hints,
             &channel1_appends,
+            &meta.pending_tag_block_ids,
             &meta.pending_user_hint_block_ids,
         )
     } else if auto_search_active {
@@ -5505,8 +6197,13 @@ fn apply_once(
         TagOverlayState::default()
     };
 
+    profile_end!(perf_overlay_maps);
+    profile_start!(perf_hygiene, "evolution_hygiene");
+    profile_start!(perf_hygiene_tags, "hygiene_tag_rows");
     let hygiene_tag_rows =
         tag_rows_for_hygiene(&projection, &tag_rows, &tag_overlay, !tagging_active);
+    profile_end!(perf_hygiene_tags);
+    profile_start!(perf_hygiene_measure, "hygiene_measure");
     let hygiene_measurement = measure_tail_hygiene_with_pending_drops(
         &projection,
         &core,
@@ -5516,20 +6213,73 @@ fn apply_once(
         &protected_block_ids,
         &pending_drop_target_ids,
     );
+    profile_end!(perf_hygiene_measure);
+    profile_start!(perf_hygiene_refresh, "hygiene_refresh");
     let mut current_hygiene_baseline = if is_bust_pass {
-        let refreshed = refresh_tail_hygiene_baseline(
+        let refreshed = refresh_tail_hygiene_baseline_calibrated(
             hygiene_measurement,
             true,
-            loaded.meta.tail_hygiene_baseline.as_ref(),
+            meta.tail_hygiene_baseline.as_ref(),
             ctx.now_ms,
+            HygieneCalibration {
+                units_version: meta.hygiene_units_version.max(1),
+                tools_ratio: if meta.hygiene_units_version >= 2 {
+                    active_calibration.tools_ratio
+                } else {
+                    1.0
+                },
+                prose_ratio: if meta.hygiene_units_version >= 2 {
+                    active_calibration.prose_ratio
+                } else {
+                    1.0
+                },
+            },
         );
-        meta.tail_hygiene_baseline = Some(refreshed.clone());
-        Some(refreshed)
+        meta.tail_hygiene_baseline = Some(refreshed.baseline.clone());
+        Some(refreshed.baseline)
     } else {
-        loaded.meta.tail_hygiene_baseline.as_ref().map(|previous| {
-            refresh_tail_hygiene_baseline(hygiene_measurement, false, Some(previous), ctx.now_ms)
-        })
+        loaded
+            .meta
+            .tail_hygiene_baseline
+            .as_ref()
+            .map(|previous| {
+                refresh_tail_hygiene_baseline_calibrated(
+                    hygiene_measurement,
+                    false,
+                    Some(previous),
+                    ctx.now_ms,
+                    HygieneCalibration {
+                        units_version: meta.hygiene_units_version.max(1),
+                        tools_ratio: if meta.hygiene_units_version >= 2 {
+                            active_calibration.tools_ratio
+                        } else {
+                            1.0
+                        },
+                        prose_ratio: if meta.hygiene_units_version >= 2 {
+                            active_calibration.prose_ratio
+                        } else {
+                            1.0
+                        },
+                    },
+                )
+            })
+            .map(|refreshed| {
+                if let Some(mismatch) = refreshed.prefix_mismatch {
+                    // One line per invalidation event, not one per pass: the re-measured
+                    // baseline is persisted here so the next defer pass compares against
+                    // the prefix this pass actually froze.
+                    tracing::debug!(
+                        "mc-module: [{}] {}",
+                        req.session_id,
+                        mismatch.diagnostic_line(refreshed.baseline.baseline_generation)
+                    );
+                    meta.tail_hygiene_baseline = Some(refreshed.baseline.clone());
+                }
+                refreshed.baseline
+            })
     };
+    profile_end!(perf_hygiene_refresh);
+    profile_end!(perf_hygiene);
     let refreshed_coverage = meta.coverage_ordinal;
     rearm_channel2_after_hard_fold(
         &mut meta,
@@ -5565,7 +6315,7 @@ fn apply_once(
     }
 
     if tagging_active {
-        if let Some(row) = maybe_append_channel1_nudge(
+        if let Some((row, unit)) = maybe_append_channel1_nudge(
             Channel1NudgeInputs {
                 ctx,
                 core: &core,
@@ -5573,6 +6323,8 @@ fn apply_once(
                 tag_rows: &hygiene_tag_rows,
                 baseline: current_hygiene_baseline.as_ref(),
                 channel1_appends: &channel1_appends,
+                served_output_fingerprint: &loaded.meta.served_output_fingerprint,
+                may_reprice_served_target: is_bust_pass,
                 mutation_exempt_mid,
                 protection_cutoff: &protection_window.cutoff,
                 pending_drop_target_ids: &pending_drop_target_ids,
@@ -5583,8 +6335,8 @@ fn apply_once(
             tag_overlay
                 .channel1_by_block_id
                 .insert(row.block_id.clone(), row.reminder_text.clone());
-            pending_overlays.channel1_append = Some(row.clone());
             channel1_appends.push(row);
+            core.frozen_units.push(unit);
         }
     }
 
@@ -5601,7 +6353,9 @@ fn apply_once(
     }
 
     timings.state_evolution = elapsed_ms(state_evolution_started_at);
+    profile_end!(perf_evolution);
     let build_output_started_at = Instant::now();
+    profile_start!(perf_build, "build_output");
     let mut no_trim_meta = None;
     if lineage_anchor_failure {
         let mut output_meta = meta.clone();
@@ -5616,6 +6370,7 @@ fn apply_once(
         }
     }
     refresh_reasoning_clear_exemptions(&mut core, req, is_bust_pass, lineage_anchor_mid);
+    let frozen_units_before_reasoning_clear = core.frozen_units.len();
     core.frozen_units.extend(new_reasoning_clear_units(
         &core,
         &meta,
@@ -5629,6 +6384,8 @@ fn apply_once(
             projection: &projection,
         },
     ));
+    let minted_reasoning_clear_units =
+        core.frozen_units.len() != frozen_units_before_reasoning_clear;
     let legacy_adoption_complete =
         legacy_reasoning_adoption_complete(&loaded.meta, &core.frozen_units);
     if (is_bust_pass || legacy_adoption_complete)
@@ -5656,17 +6413,28 @@ fn apply_once(
             .retain(|unit| !unit.key.starts_with("strip:native_reasoning_keep:"));
     }
     if serializer_profile == Some(SerializerProfile::OpencodeAiSdk) && req.serve_native {
+        let mut keep_mids = Vec::new();
         if let Some(mid) = latest_assistant_reasoning_mutation_exempt_mid(&req.messages) {
             if req.messages.iter().any(|message| {
                 message.mid == mid
                     && !cleared_mids.contains(mid)
                     && message.ck.content.iter().any(is_reasoning_block)
             }) {
-                let key = format!("strip:native_reasoning_keep:{mid}");
-                if !core.frozen_units.iter().any(|unit| unit.key == key) {
-                    core.frozen_units
-                        .push(strip_unit("native_reasoning_keep", mid, ""));
-                }
+                keep_mids.push(mid.to_string());
+            }
+        }
+        if !is_provider_prefix_mutation_pass {
+            keep_mids.extend(unseen_demoted_reasoning_mids(
+                req,
+                &loaded.meta,
+                &cleared_mids,
+            ));
+        }
+        for mid in keep_mids {
+            let key = format!("strip:native_reasoning_keep:{mid}");
+            if !core.frozen_units.iter().any(|unit| unit.key == key) {
+                core.frozen_units
+                    .push(strip_unit("native_reasoning_keep", &mid, ""));
             }
         }
     }
@@ -5692,8 +6460,12 @@ fn apply_once(
         is_bust_pass,
     )?;
     if !is_bust_pass {
-        let candidates =
-            legacy_system_strip_candidates(&core, &loaded.meta, &built_output.messages);
+        let candidates = legacy_system_strip_candidates(
+            &core,
+            &loaded.meta,
+            &built_output.messages,
+            &built_output.frame_block_stems,
+        );
         if !candidates.is_empty() {
             let mut unstripped_core = core.clone();
             for unit in &mut unstripped_core.frozen_units {
@@ -5716,10 +6488,11 @@ fn apply_once(
                 None,
                 false,
             )?;
-            let original_hashes = served_output_fingerprints(&unstripped.messages)
-                .into_iter()
-                .map(|block| (block.block_id, block.content_hash))
-                .collect::<HashMap<_, _>>();
+            let original_hashes =
+                served_output_fingerprints(&unstripped.messages, &unstripped.frame_block_stems)
+                    .into_iter()
+                    .map(|block| (block.block_id, block.content_hash))
+                    .collect::<HashMap<_, _>>();
             let previous = loaded
                 .meta
                 .served_output_fingerprint
@@ -5842,7 +6615,8 @@ fn apply_once(
         )?;
     }
     #[cfg(test)]
-    if output_cache.is_some() {
+    if output_cache.is_some() && !crate::tests::per_pass_differentials_disabled() {
+        profile_start!(_perf_output_differential, "output_differential");
         let fresh = build_output_with_tags(
             &core,
             output_meta,
@@ -5891,6 +6665,7 @@ fn apply_once(
     }
     let BuiltOutput {
         messages: ck_messages,
+        frame_block_stems,
         cache_entries: output_cache_entries,
         cache_stats: output_cache_stats,
         timings: build_timings,
@@ -5901,6 +6676,7 @@ fn apply_once(
         assert_no_foreign_reduction_input_keys(ck_messages.iter().map(Deref::deref));
     }
     timings.build_output = elapsed_ms(build_output_started_at);
+    profile_end!(perf_build);
     timings.blocks_by_mid = build_timings.blocks_by_mid;
     timings.build_frozen_unit_index = build_timings.frozen_unit_index;
     timings.full_drop_tool_ids = build_timings.full_drop_tool_ids;
@@ -5920,20 +6696,37 @@ fn apply_once(
         .filter(|message| !message.meta.synthetic)
         .count();
     timings.frozen_units = core.frozen_units.len();
+    profile_start!(perf_tail_match, "tail_match_diagnostics");
     timings.tail_units_matched = frozen_units_matched_to_tail(&core, req, meta.coverage_ordinal);
+    profile_end!(perf_tail_match);
 
     let finalize_started_at = Instant::now();
+    profile_start!(perf_finalize, "finalize");
     // Compare only the served block hashes before committing the new sequence. The first pass
     // records its baseline, and append-only tail growth is intentionally not a divergence.
     let divergence_started_at = Instant::now();
-    let served_fingerprints = served_output_fingerprints(&ck_messages);
+    let served_fingerprints = served_output_fingerprints(&ck_messages, &frame_block_stems);
     let first_divergence =
         divergence::first_divergence(&loaded.meta.served_output_fingerprint, &served_fingerprints);
     timings.divergence = elapsed_ms(divergence_started_at);
-    let first_divergence_json = first_divergence
-        .as_ref()
-        .map(|value| serde_json::to_string(value).expect("divergence is serializable"));
-    let deferred_frozen_prefix_divergence = matches!(plan, PassPlan::Defer)
+    let identity_delta =
+        render_identity_delta(&loaded.meta.last_render_config, &meta.last_render_config);
+    let first_divergence_json = first_divergence.as_ref().map(|divergence| {
+        let mut record = serde_json::to_value(divergence).expect("divergence is serializable");
+        // Keep changed render-identity components with a divergent pass trace.
+        if !identity_delta.is_empty() {
+            record["identity_delta"] = serde_json::json!(identity_delta);
+            record.to_string()
+        } else {
+            serde_json::to_string(divergence).expect("divergence is serializable")
+        }
+    });
+    // A subagent serves ordinary message bytes, but never a composed m0/m1 frame. Do not pin
+    // its baseline on a stale synthetic-frame fingerprint: no frame pass will release that pin.
+    // Other deferred sessions must retain their last served frame until a prefix mutation pass.
+    let deferred_frozen_prefix_divergence = !req.is_subagent
+        && prefix_replay_must_be_preserved
+        && matches!(plan, PassPlan::Defer)
         && first_divergence.as_ref().is_some_and(|divergence| {
             matches!(
                 divergence.block_id_old.as_deref(),
@@ -6001,9 +6794,23 @@ fn apply_once(
     if state_changed {
         meta.last_committed_pass_at_ms = ctx.now_ms;
     }
-    let commit_required =
-        state_changed || !consumed_drop_ids.is_empty() || !pending_overlays.is_empty();
+    // A discarded section must be rewritten even when the rebuild reproduces the loaded state
+    // (a subagent session holds no frozen units, so its rebuilt list is as empty as the
+    // discarded one). Skipping the commit would leave the stored rows untrusted, and every
+    // later pass would go HARD again.
+    let commit_required = state_changed
+        || cache_sections_discarded
+        || !consumed_drop_ids.is_empty()
+        || !pending_overlays.is_empty();
+    let mut scheduler_observation = pass_scheduler_observation(
+        scheduler_outcome.pass,
+        scheduler_outcome.defer_reason,
+        scheduler_outcome.drain_latch.is_active(),
+        ctx.now_ms,
+    );
+    scheduler_observation.identity_delta = identity_delta.clone();
     let store_commit_started_at = Instant::now();
+    profile_start!(perf_commit, "store_commit");
     let row_version = if commit_required {
         #[cfg(test)]
         run_transform_attempt_hook(&req.session_id);
@@ -6013,18 +6820,21 @@ fn apply_once(
                 expected: commit_expected,
                 core: &core,
                 meta: &meta,
+                // The core was derived from the loaded frozen list in this pass, so an empty
+                // list here is the pass's own result (a re-mint, a retired legacy unit), never
+                // an unloaded state.
+                sections: SectionsCommit {
+                    base: loaded.sections.as_ref(),
+                    meta_only_steps,
+                    frozen_clear: FrozenClear::Explicit,
+                },
                 consumed_drop_ids: &consumed_drop_ids,
                 first_applied_command_ids: &first_applied_command_ids,
                 memory_revision: commit_memory_revision.as_ref(),
                 compartment_max_seq: is_bust_pass.then_some(m1_signal.max_compartment_seq),
                 project_root: Some(ctx.project_directory),
                 first_divergence: first_divergence_json.as_deref(),
-                scheduler_observation: Some(&pass_scheduler_observation(
-                    scheduler_outcome.pass,
-                    scheduler_outcome.defer_reason,
-                    scheduler_outcome.drain_latch.is_active(),
-                    ctx.now_ms,
-                )),
+                scheduler_observation: Some(&scheduler_observation),
                 scheduler_request_observed_at_ms: req.request_observed_at_ms,
                 scheduler_full_array_fingerprint: req.full_array_fingerprint.as_deref(),
                 scheduler_eligible_supersession_count: eligible_supersession_count,
@@ -6048,6 +6858,7 @@ fn apply_once(
         loaded.row_version.unwrap_or(0)
     };
     timings.store_commit = elapsed_ms(store_commit_started_at);
+    profile_end!(perf_commit);
     if let Some(cache) = output_cache {
         cache
             .lock()
@@ -6060,13 +6871,15 @@ fn apply_once(
             );
     }
     for re_adoption in &tail_identity_re_adoptions {
-        eprintln!(
+        tracing::debug!(
             "mc-module: identity re-adopted for tail mid {} old_hash={} new_hash={}",
-            re_adoption.mid, re_adoption.old_hash_prefix, re_adoption.new_hash_prefix
+            re_adoption.mid,
+            re_adoption.old_hash_prefix,
+            re_adoption.new_hash_prefix
         );
     }
     if let Some(divergence) = boundary_divergence_recut {
-        eprintln!(
+        tracing::warn!(
             "mc-module: boundary_divergence_recut session={} old_coverage={} new_coverage={} live_tail_allowance={}",
             req.session_id,
             divergence.old_coverage,
@@ -6076,13 +6889,13 @@ fn apply_once(
     }
     if let Some(first_divergence) = &first_divergence {
         let detail = serde_json::to_string(first_divergence).expect("divergence is serializable");
-        eprintln!(
+        tracing::warn!(
             "mc-module: first_divergence session={} {detail}",
             req.session_id
         );
     }
     if transition_due && is_bust_pass && !transition_shapes.poisoned_reasoning_arc_ids.is_empty() {
-        eprintln!(
+        tracing::debug!(
             "mc-module: frozen-reduction-heal session={} arc_ids={} pass_row={}",
             req.session_id,
             transition_shapes.poisoned_reasoning_arc_ids.join(","),
@@ -6090,7 +6903,7 @@ fn apply_once(
         );
     }
     for mid in &healed_trailing_blank_ids {
-        eprintln!(
+        tracing::debug!(
             "mc-module: trailing-blank-heal session={} mid={} reason=source_without_trailing_blank pass_row={}",
             req.session_id, mid, row_version,
         );
@@ -6098,11 +6911,14 @@ fn apply_once(
     timings.store_memories = m1_revision_read_timings.memories_ms;
     timings.store_notes = m1_revision_read_timings.notes_ms;
     timings.finalize = elapsed_ms(finalize_started_at);
+    profile_end!(perf_finalize);
     timings.total = elapsed_ms(total_started_at);
+    profile_start!(_perf_result, "apply_result_build");
     Ok(TransformWithProjection {
         historian_tags: Some(tag_rows),
         tag_numbers,
         publication_floor_ordinal: meta.publication_floor_ordinal,
+        reclaim_ride_available: pass_already_busting,
         projection,
         scheduler_pass: scheduler_outcome.pass,
         scheduler_defer_reason: scheduler_outcome.defer_reason,
@@ -6128,6 +6944,7 @@ fn apply_once(
                 })
                 .collect(),
             status: TransformStatus::Ok,
+            need_full_sync_reason: None,
             served_from: ServedFrom::Transform,
             full_array_fingerprint: req.full_array_fingerprint.clone(),
             action: result_action.clone(),
@@ -6137,7 +6954,14 @@ fn apply_once(
                 .defer_reason
                 .map(|reason| reason.as_str().to_string()),
             materialize_reason,
+            identity_delta: render_identity_delta(
+                &loaded.meta.last_render_config,
+                &meta.last_render_config,
+            ),
             first_divergence,
+            reasoning_trim_only: reasoning_trim_only_candidate
+                && !minted_reasoning_clear_units
+                && healed_trailing_blank_ids.is_empty(),
             timings: Some(timings),
             boundary_id: core.boundary_id.clone(),
             reconcile_pending: core.reconcile_pending,
@@ -6147,7 +6971,6 @@ fn apply_once(
             committed: commit_required,
             coverage_ordinal: meta.coverage_ordinal,
             rendered_memory_ids: Some(meta.rendered_memory_ids.clone()),
-            memory_mirror_head: None,
             lineage_switch_consumed_id: lineage_state.acknowledge_edge,
             lineage_descent_disposition: lineage_state.disposition.map(str::to_string),
             cache_ttl: None,
@@ -6158,7 +6981,6 @@ fn apply_once(
             native_messages_delta: None,
             host_directives: channel2_output.host_directives,
             channel2_directive: channel2_output.channel2_directive,
-            note_deliveries: (!note_deliveries.is_empty()).then_some(note_deliveries),
         },
     })
 }
@@ -6310,6 +7132,7 @@ fn identity_drift_requires_reject(
 }
 
 fn frozen_unit_targets_mid(core: &CoreState, mid: &str) -> bool {
+    profile_start!(_perf_scan, "rt15_frozen_mid_scan");
     let strip_suffix = format!(":{mid}");
     core.frozen_units.iter().any(|unit| {
         let target = unit
@@ -6318,7 +7141,9 @@ fn frozen_unit_targets_mid(core: &CoreState, mid: &str) -> bool {
             .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX));
         if target.is_some_and(|target| {
             split_block_id(target).is_some_and(|(unit_mid, _)| unit_mid == mid)
-        }) {
+        }) || (unit.key.starts_with(CHANNEL1_KEY_PREFIX)
+            && split_block_id(&unit.reset_rule).is_some_and(|(unit_mid, _)| unit_mid == mid))
+        {
             return true;
         }
         unit.key
@@ -6458,6 +7283,85 @@ fn frozen_mural_hash(core: &CoreState) -> &str {
         .unwrap_or("")
 }
 
+fn render_identity_parts(render_config: &str) -> (&str, Option<&str>, &str) {
+    if let Some(start) = render_config.rfind(";mur:") {
+        if let Some(relative_end) = render_config[start + 1..].find(']') {
+            let end = start + 1 + relative_end;
+            return (
+                &render_config[..start],
+                Some(&render_config[start + 1..end]),
+                &render_config[end..],
+            );
+        }
+    }
+    if let Some(start) = render_config.rfind("|mural:") {
+        return (
+            &render_config[..start],
+            Some(&render_config[start + 1..]),
+            "",
+        );
+    }
+    if let Some(base) = render_config.strip_suffix(']') {
+        return (base, None, "]");
+    }
+    (render_config, None, "")
+}
+
+fn render_identity_epoch_fields(
+    identity: &str,
+) -> Option<(&str, std::collections::BTreeMap<String, &str>)> {
+    let (base, suffix) = identity.split_once("|m0epoch[")?;
+    let suffix = suffix.strip_suffix(']')?;
+    let mut fields = std::collections::BTreeMap::new();
+    let mut remaining = suffix;
+    while !remaining.is_empty() {
+        let (label, rest) = remaining.split_once(':')?;
+        let (length, rest) = rest.split_once(':')?;
+        let length = length.parse::<usize>().ok()?;
+        let value = rest.get(..length)?;
+        fields.insert(label.to_string(), value);
+        remaining = rest.get(length..)?;
+        if !remaining.is_empty() {
+            remaining = remaining.strip_prefix(';')?;
+        }
+    }
+    Some((base, fields))
+}
+
+fn render_identity_delta(previous: &str, current: &str) -> Vec<String> {
+    let previous = render_identity_parts(previous);
+    let current = render_identity_parts(current);
+    let mut delta = Vec::new();
+    if previous.1 != current.1 {
+        delta.push("mur".to_string());
+    }
+    if previous.0 != current.0 || previous.2 != current.2 {
+        let previous_epoch = format!("{}{}", previous.0, previous.2);
+        let current_epoch = format!("{}{}", current.0, current.2);
+        if let (Some((old_base, old_fields)), Some((new_base, new_fields))) = (
+            render_identity_epoch_fields(&previous_epoch),
+            render_identity_epoch_fields(&current_epoch),
+        ) {
+            if old_base != new_base {
+                delta.push("base".to_string());
+            }
+            for label in old_fields.keys().chain(new_fields.keys()) {
+                if old_fields.get(label) != new_fields.get(label)
+                    && !delta.iter().any(|part| part == label)
+                {
+                    delta.push(label.clone());
+                }
+            }
+            if previous.2 != current.2 {
+                delta.push("suffix".to_string());
+            }
+        } else {
+            delta.push("other".to_string());
+        }
+    }
+    delta
+}
+
 fn render_config_base(render_config: &str) -> &str {
     render_config
         .split_once("|m0epoch[")
@@ -6466,10 +7370,15 @@ fn render_config_base(render_config: &str) -> &str {
 }
 
 /// Provider-cache facts for model identities whose effort can change without invalidating
-/// cached prompt bytes: Fable 5.1 was observed on 2026-09-02 and GPT-6 Astra on 2026-09-05.
-const VARIANT_CACHE_PRESERVING_MODELS: [(&str, &str); 2] = [
+/// cached prompt bytes: Fable 5.1 was observed on 2026-09-02, GPT-6 Astra on 2026-09-05, and
+/// Opus 5.5 on 2026-09-23. For Opus 5.5, the first request after `output_config.effort` went
+/// from `high` to absent still read the 1h-TTL message-prefix cache written only by `high`
+/// requests, and the flip back read that same prefix again. The flip itself therefore costs
+/// nothing at the provider, while a HARD on it rewrites every re-rendered message.
+const VARIANT_CACHE_PRESERVING_MODELS: [(&str, &str); 3] = [
     ("anthropic/claude-fable-5-1", "2026-09-02"),
     ("openai/gpt-6-astra", "2026-09-05"),
+    ("anthropic/claude-opus-5-5", "2026-09-23"),
 ];
 
 fn canonical_variant_model_identity(
@@ -6549,10 +7458,30 @@ fn cache_relevant_render_config<'a>(req: &'a TransformRequest) -> Cow<'a, str> {
 }
 
 fn render_identity_base(req: &TransformRequest, prompt_surface_epoch: &str) -> String {
+    render_identity_base_with_system_hash(req, prompt_surface_epoch, &req.system_prompt_hash)
+}
+
+fn render_identity_base_with_system_hash(
+    req: &TransformRequest,
+    prompt_surface_epoch: &str,
+    system_hash: &str,
+) -> String {
     let mut parts = Vec::new();
     let render_config = cache_relevant_render_config(req);
     if !render_config.is_empty() {
-        parts.push(render_config.into_owned());
+        parts.push(
+            render_config
+                .split('|')
+                .filter_map(|part| {
+                    if part == format!("system:{}", req.system_prompt_hash) {
+                        (!system_hash.is_empty()).then(|| format!("system:{system_hash}"))
+                    } else {
+                        Some(part.to_string())
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
     }
     if let Some(provider) = req.provider_id.as_deref().filter(|value| !value.is_empty()) {
         parts.push(format!("provider:{provider}"));
@@ -6560,10 +7489,49 @@ fn render_identity_base(req: &TransformRequest, prompt_surface_epoch: &str) -> S
     if let Some(model) = req.model_key.as_deref().filter(|value| !value.is_empty()) {
         parts.push(format!("model:{model}"));
     }
-    if prompt_surface_epoch.is_empty() && !req.system_prompt_hash.is_empty() {
-        parts.push(format!("system:{}", req.system_prompt_hash));
+    if prompt_surface_epoch.is_empty() && !system_hash.is_empty() {
+        parts.push(format!("system:{system_hash}"));
     }
     parts.join("|")
+}
+
+/// Acknowledgement changes metadata, not the frozen prefix. Rebuild the comparison
+/// identity with only the previous external system hash: equality proves no model,
+/// prompt-surface, serializer, workspace or renderer change is being waived.
+fn can_adopt_system_identity(
+    meta: &ModuleMeta,
+    req: &TransformRequest,
+    epoch: &M0ContentEpoch,
+    mural_hash: &str,
+    additive: bool,
+    idle_expired: bool,
+) -> bool {
+    if req.serializer_profile != "opencode-aisdk"
+        || !meta.initialized
+        || req.system_prompt_hash.is_empty()
+        || req.system_prompt_hash == meta.last_system_prompt_hash
+        || !(idle_expired
+            || req.adopted_system_prompt_hash.as_deref() == Some(req.system_prompt_hash.as_str()))
+    {
+        return false;
+    }
+    let mut previous_epoch = epoch.clone();
+    previous_epoch.prompt_surface_epoch = crate::prompt_surface::unified_content_epoch(
+        &meta.last_system_prompt_hash,
+        &prompt_surface_selection(req),
+    );
+    let base = render_identity_base_with_system_hash(
+        req,
+        &previous_epoch.prompt_surface_epoch,
+        &meta.last_system_prompt_hash,
+    );
+    let base = if additive {
+        format!("additive-only-v2|{base}")
+    } else {
+        base
+    };
+    fold_mural_content_identity(&fold_m0_content_epoch(&base, &previous_epoch), mural_hash)
+        == meta.last_render_config
 }
 
 fn m0_mural_input(
@@ -6650,6 +7618,19 @@ fn render_config_change(
         } else {
             effective_render_config != meta.last_render_config
         };
+    #[cfg(feature = "drive-fault")]
+    tracing::debug!(
+        "mc-module: render identity session={} changed={} observed={} coordinator={} transition={} tool_present={} profile={} effective={:?} persisted={:?}",
+        req.session_id,
+        changed,
+        identity_observed,
+        coordinator_identity,
+        transition_due,
+        req.tool_present,
+        req.serializer_profile,
+        effective_render_config,
+        meta.last_render_config,
+    );
     (changed, identity_observed, coordinator_identity)
 }
 
@@ -6791,7 +7772,7 @@ fn is_legacy_baseline(core: &CoreState) -> bool {
 }
 
 /// A valid current shape: EXACTLY one `m0`, EXACTLY one `m1`, and zero-or-more
-/// reduction, strip, caveman, or migration-marker replay units. An initialized state missing
+/// reduction, strip, caveman, Channel-1, or migration-marker replay units. An initialized state missing
 /// `m0`/`m1`, or carrying any other key, is an unknown shape (rejected, never cleared).
 fn cached_m1_missing(core: &CoreState) -> bool {
     let m0 = core.frozen_units.iter().filter(|u| u.key == "m0").count();
@@ -6807,6 +7788,7 @@ fn cached_m1_missing(core: &CoreState) -> bool {
             || u.key.starts_with(RED_KEY_PREFIX)
             || u.key.starts_with("strip:")
             || u.key.starts_with(CAV_KEY_PREFIX)
+            || u.key.starts_with(CHANNEL1_KEY_PREFIX)
             || matches!(
                 u.key.as_str(),
                 LEGACY_TRANSITION_CONSUMED_KEY | TRANSITION_CONSUMED_KEY
@@ -6830,6 +7812,7 @@ fn valid_m0m1_shape(core: &CoreState) -> bool {
             || u.key.starts_with(RED_KEY_PREFIX)
             || u.key.starts_with("strip:")
             || u.key.starts_with(CAV_KEY_PREFIX)
+            || u.key.starts_with(CHANNEL1_KEY_PREFIX)
             || matches!(
                 u.key.as_str(),
                 LEGACY_TRANSITION_CONSUMED_KEY | TRANSITION_CONSUMED_KEY
@@ -6901,6 +7884,7 @@ struct CavemanTagState<'a> {
     protection_cutoff: &'a TagNumberCutoffProjection,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_caveman_units(
     core: &CoreState,
     req: &TransformRequest,
@@ -6909,6 +7893,7 @@ fn new_caveman_units(
     coverage: Option<u64>,
     is_bust_pass: bool,
     age_basis_tag: u64,
+    english_word_rules: bool,
 ) -> Vec<FrozenUnit> {
     if !is_bust_pass || !req.caveman_enabled || req.is_subagent || age_basis_tag == 0 {
         return Vec::new();
@@ -6928,7 +7913,7 @@ fn new_caveman_units(
                 || !is_tail(block.ordinal, coverage)
                 || frozen_red.contains(&block.id)
                 || !matches!(block.role.as_str(), "user" | "assistant")
-                || !matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
+                || block.kind_tag != "text"
             {
                 return None;
             }
@@ -6942,7 +7927,7 @@ fn new_caveman_units(
             {
                 return None;
             }
-            let source = String::from_utf8(row.source_bytes.clone()).ok()?;
+            let source = std::str::from_utf8(&row.source_bytes).ok()?.to_owned();
             (!source.is_empty()).then_some((tag_number, block.id.clone(), source))
         })
         .collect::<Vec<_>>();
@@ -6961,18 +7946,16 @@ fn new_caveman_units(
             continue;
         }
         let level = caveman_level(target_depth).expect("nonzero caveman depth has a level");
-        let compressed = crate::caveman::compress(&source, level);
+        let compressed = crate::caveman::compress_with(&source, level, english_word_rules);
         if compressed.is_empty() {
             continue;
         }
         let payload = if let Some(existing) = existing {
-            // A deeper tier is allowed to replace bytes only when it does not grow the frozen
-            // payload. Equal-size output still advances depth, matching TS's persisted depth
-            // behavior for text with no additional removable material.
-            assert!(
-                compressed.len() <= existing.frozen_payload.len(),
-                "caveman deeper tier grew frozen payload for {block_id}"
-            );
+            // A deeper tier replaces bytes only when it shrinks the frozen payload. The rules can
+            // change after a payload froze (a release that changes caveman output), so the deeper
+            // output may also come out longer; equal or longer output keeps the frozen bytes and
+            // still advances depth, matching TS's persisted depth for text with no additional
+            // removable material.
             if compressed.len() < existing.frozen_payload.len() {
                 compressed.as_str()
             } else {
@@ -7186,6 +8169,7 @@ fn protected_tail_floor_ordinal(
     execute_threshold_percentage: f64,
     estimate_tokens: impl Fn(&str) -> usize,
 ) -> u64 {
+    profile_start!(_perf_floor, "rt16_protected_floor");
     let newest_live = live.iter().map(|block| block.ordinal).max().unwrap_or(0);
     let target =
         crate::boundary::derive_protected_tail_token_target(&crate::boundary::BoundaryContext {
@@ -7385,6 +8369,7 @@ fn frozen_red_payload<'a>(core: &'a CoreState, target: &str) -> Option<&'a str> 
 
 /// Target ids that already carry a frozen `red:*` unit.
 fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
+    profile_start!(_perf_red_targets, "rt12_red_targets");
     core.frozen_units
         .iter()
         .filter_map(|u| u.key.strip_prefix(RED_KEY_PREFIX).map(str::to_string))
@@ -7397,13 +8382,13 @@ fn frozen_red_targets(core: &CoreState) -> std::collections::HashSet<String> {
 fn log_reasoning_drop_seed_skips(core: &CoreState, live: &[&FlatBlock], session_id: &str) {
     let reasoning: HashSet<&str> = live
         .iter()
-        .filter(|block| is_reasoning_block(&block.wire))
+        .filter(|block| is_reasoning_block(block.wire_shape()))
         .map(|block| block.id())
         .collect();
     for unit in &core.frozen_units {
         if let Some(target) = unit.key.strip_prefix(RED_KEY_PREFIX) {
             if reasoning.contains(target) {
-                eprintln!(
+                tracing::warn!(
                     "mc-module: skipped drop seed targeting reasoning block {target} for session {session_id}"
                 );
             }
@@ -7416,6 +8401,10 @@ fn pending_agent_drops_applied_this_pass(
     loaded_core: &CoreState,
     final_core: &CoreState,
 ) -> bool {
+    profile_start!(_perf_pending, "rt12_pending_applied");
+    if pending.is_empty() {
+        return false;
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     pending.iter().any(|drop| {
@@ -7429,6 +8418,10 @@ fn first_applied_pending_command_ids(
     loaded_core: &CoreState,
     final_core: &CoreState,
 ) -> Vec<String> {
+    profile_start!(_perf_pending, "rt12_first_commands");
+    if pending.is_empty() {
+        return Vec::new();
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     pending
@@ -7454,6 +8447,10 @@ fn consumed_pending_drop_ids(
     projection: &FlatProjection,
     final_coverage: Option<u64>,
 ) -> Vec<i64> {
+    profile_start!(_perf_pending, "rt12_pending_consumed");
+    if pending.is_empty() {
+        return Vec::new();
+    }
     let frozen_before = frozen_red_targets(loaded_core);
     let frozen_after = frozen_red_targets(final_core);
     // Retirement must be PROVEN, not inferred from absence: the request array can be
@@ -7475,7 +8472,7 @@ fn consumed_pending_drop_ids(
     let reasoning = projection
         .blocks
         .iter()
-        .filter(|block| is_reasoning_block(&block.wire))
+        .filter(|block| is_reasoning_block(block.wire_shape()))
         .map(|block| block.id.as_str())
         .collect::<HashSet<_>>();
 
@@ -7579,7 +8576,7 @@ fn new_reduction_units(
     // Anthropic, permanently fencing the session to raw.
     let reasoning_targets: std::collections::HashSet<&str> = live
         .iter()
-        .filter(|i| is_reasoning_block(&i.wire))
+        .filter(|i| is_reasoning_block(i.wire_shape()))
         .map(|i| i.id())
         .collect();
     let mut by_target: BTreeMap<String, FrozenUnit> = BTreeMap::new();
@@ -7633,6 +8630,80 @@ fn effective_reductions(
     eff
 }
 
+/// Does this HARD fold lose the provider's cached prefix anyway? True when the fold's
+/// trigger evicts it (idle TTL, a different provider or model, a changed system prompt,
+/// a serializer profile switch), when it moves the coverage boundary (the tail starts
+/// elsewhere), or when the m0/m1/mural bytes it serves differ from the ones frozen
+/// before it. A HARD that re-renders all of these byte-identically (for example a
+/// memory epoch bump with no content change) keeps the prefix cached, so work that
+/// only rides a bust must not run on it. This is the one predicate for that decision:
+/// the HARD branch consults it before legacy skeleton conversion, and the pass planner
+/// consults it (on a pre-composed m0) before a store-marker HARD may price pending
+/// drops, heuristics, synthetic todo and other automatic reductions.
+fn hard_fold_busts_served_prefix(
+    loaded_core: &CoreState,
+    new_m0: &str,
+    new_m1: &str,
+    new_mural: Option<&crate::m0_compose::M0MuralBlock>,
+    coverage_changed: bool,
+    cache_lost: bool,
+) -> bool {
+    if cache_lost || coverage_changed {
+        return true;
+    }
+    let unit = |key: &str| loaded_core.frozen_units.iter().find(|unit| unit.key == key);
+    unit("m0").map(|unit| unit.frozen_payload.as_str()) != Some(new_m0)
+        || unit("m1").map(|unit| unit.frozen_payload.as_str()) != Some(new_m1)
+        || unit(M0_MURAL_KEY).map(|unit| (unit.frozen_payload.as_str(), unit.reset_rule.as_str()))
+            != new_mural.map(|mural| (mural.data_url.as_str(), mural.content_hash.as_str()))
+}
+
+/// Convert frozen legacy `skeleton` call units (arguments replaced by the
+/// `{"dropped": …}` marker) to the real-or-absent rule while a HARD fold rebuilds the
+/// frozen unit set. That rebuild re-serves the whole prefix anyway, so the byte change
+/// rides its cache bust; SOFT and defer passes never reach this and keep replaying the
+/// legacy bytes. The new kinds persist with the fold's state write, so later passes
+/// never re-decide them. Models copied the marker into new calls and looped on the
+/// guard's refusal, which is why it must leave the wire.
+fn convert_legacy_skeleton_units(
+    effective: &mut BTreeMap<String, (String, String, String)>,
+    items: &[SelItem],
+    core: &CoreState,
+    session_id: &str,
+) {
+    let legacy = effective
+        .iter()
+        .filter(|(_, (kind, _, _))| kind == "skeleton")
+        .map(|(target, _)| target.clone())
+        .collect::<BTreeSet<_>>();
+    if legacy.is_empty() {
+        return;
+    }
+    let removed = effective
+        .iter()
+        .filter(|(_, (kind, _, _))| kind == "drop")
+        .map(|(target, _)| target.clone())
+        .collect::<HashSet<_>>();
+    let conversions = crate::selection::legacy_skeleton_conversions(
+        items,
+        &legacy,
+        &removed,
+        &frozen_red_targets(core),
+    );
+    for (target, kind) in &conversions {
+        if let Some(entry) = effective.get_mut(target) {
+            entry.0 = (*kind).to_string();
+            entry.1 = "[dropped]".to_string();
+        }
+    }
+    if !conversions.is_empty() {
+        tracing::debug!(
+            "mc-module: [{session_id}] HARD fold converted {} legacy dropped-tool skeleton(s) to real-or-absent",
+            conversions.len()
+        );
+    }
+}
+
 /// Drop frozen `red:*` units whose target is now COVERED (ordinal at/below the new
 /// coverage). Runs on a coverage-extending SOFT, where the tail shrinks but the frozen
 /// set is otherwise kept: a reduction whose target left the tail can never be applied
@@ -7682,6 +8753,29 @@ fn surviving_red_units(
         .collect()
 }
 
+fn surviving_channel1_units(
+    core: &CoreState,
+    effective_reductions: &BTreeMap<String, (String, String, String)>,
+    live: &[&FlatBlock],
+    new_coverage: Option<u64>,
+) -> Vec<FrozenUnit> {
+    let live_ord = live
+        .iter()
+        .map(|block| (block.id(), block.ordinal()))
+        .collect::<HashMap<_, _>>();
+    core.frozen_units
+        .iter()
+        .filter(|unit| unit.key.starts_with(CHANNEL1_KEY_PREFIX))
+        .filter(|unit| !effective_reductions.contains_key(&unit.reset_rule))
+        .filter(|unit| {
+            live_ord
+                .get(unit.reset_rule.as_str())
+                .is_some_and(|ordinal| is_tail(*ordinal, new_coverage))
+        })
+        .cloned()
+        .collect()
+}
+
 // --- render helpers (the ONLY producers of frozen bytes) ---
 
 /// Build the synthetic m0 message with the optional mural immediately after its text block.
@@ -7722,6 +8816,53 @@ fn render_mural_block(mural: &crate::m0_compose::M0MuralBlock) -> FrozenUnit {
     }
 }
 
+/// Composes the m0 a HARD on this pass would render, with the same inputs the HARD
+/// branch uses, so a caller can ask hard_fold_busts_served_prefix before selection
+/// whether that fold would change the served prefix. A load or compose failure
+/// returns None, and the caller then keeps the permission every HARD had before.
+fn compose_hard_fold_m0(
+    store: &McStore,
+    req: &TransformRequest,
+    ctx: &ProducerContext<'_>,
+    serializer_profile: Option<SerializerProfile>,
+    estimate_tokens: impl Fn(&str) -> usize + Copy,
+    incremental_history: bool,
+    timings: &mut crate::m0_compose::ComposeTimings,
+) -> Option<crate::m0_compose::M0Composition> {
+    let compartments = store.load_compartments(&req.session_id).ok()?;
+    let coverage_bounds = coverage_bounds_from_compartments(&compartments).ok()?;
+    let covered_system_messages = covered_system_messages_for_coverage(
+        req,
+        coverage_bounds.map(|(_, end)| end),
+        coverage_bounds.map(|(start, _)| start),
+        serializer_profile,
+    );
+    crate::m0_compose::compose_m0_from_store_timed(
+        store,
+        &crate::m0_compose::M0ComposeInputs {
+            session_id: &req.session_id,
+            project_path: ctx.project_path,
+            project_directory: ctx.project_directory,
+            now_ms: ctx.now_ms,
+            history_budget_tokens: crate::decay_render::history_local_budget(
+                ctx.history_budget_tokens,
+                req.model_key.as_deref(),
+            ),
+            covered_system_messages: &covered_system_messages,
+            memory_enabled: ctx.memory_enabled,
+            memory_budget_tokens: ctx.memory_budget_tokens,
+            user_profile_budget_tokens: ctx.user_profile_budget_tokens,
+            inject_docs: ctx.inject_docs,
+            temporal_awareness: ctx.temporal_awareness,
+            mural: m0_mural_input(req, serializer_profile),
+        },
+        estimate_tokens,
+        incremental_history,
+        timings,
+    )
+    .ok()
+}
+
 /// The m1 placeholder unit (a HARD resets m1 to it; m1 is never fully empty).
 fn render_m1_placeholder() -> FrozenUnit {
     synth_region("m1", M1_PLACEHOLDER.to_string())
@@ -7744,7 +8885,15 @@ fn synth_region(key: &str, payload: String) -> FrozenUnit {
 }
 
 fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usize>) -> SelItem {
-    let kind = match &block.wire.kind {
+    sel_item_from_flat_with_estimator(block, tag_tokens_by_block, mc_tokenizer::estimate_tokens)
+}
+
+fn sel_item_from_flat_with_estimator(
+    block: &FlatBlock,
+    tag_tokens_by_block: &HashMap<&str, usize>,
+    estimate: impl FnOnce(&str) -> usize,
+) -> SelItem {
+    let kind = match &block.wire_shape().kind {
         ck_wire::CkKind::ToolCall { name, input, .. } => SelKind::ToolCall {
             name: name.clone(),
             input: input.clone(),
@@ -7759,6 +8908,16 @@ fn sel_item_from_flat(block: &FlatBlock, tag_tokens_by_block: &HashMap<&str, usi
         ck_wire::CkKind::Opaque(_) => SelKind::Opaque,
     };
     SelItem {
+        user_answer: false,
+        // Media and opaque carriers are excluded from calibrated floor accounting and
+        // cannot be tool reclaim candidates. Their token counts are never consumed;
+        // estimating them would repeatedly BPE-tokenize untagged image data on defers.
+        served_token_count: (!matches!(kind, SelKind::Media | SelKind::Opaque)).then(|| {
+            tag_tokens_by_block
+                .get(block.id.as_str())
+                .copied()
+                .unwrap_or_else(|| estimate(&block.bytes))
+        }),
         id: block.id.clone(),
         ordinal: block.ordinal,
         message_role: match block.role.as_str() {
@@ -8151,6 +9310,7 @@ fn pending_passthrough_result(args: PendingPassthroughArgs<'_>) -> TransformWith
         historian_tags: Some(historian_tags),
         tag_numbers,
         publication_floor_ordinal,
+        reclaim_ride_available: false,
         projection,
         scheduler_pass: scheduler::PassDecision::Defer,
         scheduler_defer_reason: Some(scheduler::SchedulerDeferReason::SchedulerDefer),
@@ -8657,7 +9817,7 @@ fn tag_mint_inputs_from(
         work.inputs.push(TagMintInput {
             block_id: block.id.clone(),
             kind: kind.as_store_kind().to_string(),
-            token_count: mc_tokenizer::estimate_tokens(source) as i64,
+            token_count: mc_tokenizer::estimate_tokens(&source) as i64,
             source_bytes: source.as_bytes().to_vec(),
         });
     }
@@ -8763,6 +9923,20 @@ fn tag_mint_frontier_cache() -> &'static Mutex<TagMintFrontierCache> {
     })
 }
 
+/// Append this pass's mints to the shared tag rows and return the index of the first mint.
+/// A pass with nothing to mint leaves the rows untouched: they are usually shared with the
+/// retained tag baseline, and requesting mutable access would copy every row to append nothing.
+fn append_minted_tag_rows(
+    tag_rows: &mut Arc<Vec<McTagRow>>,
+    tag_mints: Vec<TagMintInput>,
+    created_at_ms: i64,
+) -> usize {
+    if tag_mints.is_empty() {
+        return tag_rows.len();
+    }
+    append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mints, created_at_ms)
+}
+
 fn append_tag_mint_rows(
     tag_rows: &mut Vec<McTagRow>,
     tag_mints: Vec<TagMintInput>,
@@ -8780,7 +9954,7 @@ fn append_tag_mint_rows(
                 kind: input.kind,
                 token_count: input.token_count.max(0),
                 created_at_ms,
-                source_bytes: input.source_bytes,
+                source_bytes: input.source_bytes.into(),
             }),
     );
     start
@@ -8788,24 +9962,27 @@ fn append_tag_mint_rows(
 
 /// Return exactly the span the overlay can prefix. Mint scope and overlay scope share
 /// this predicate so every visible tag number has a renderable §N§ carrier.
-fn taggable_source(block: &FlatBlock) -> Option<(TaggableKind, &str)> {
+fn taggable_source(block: &FlatBlock) -> Option<(TaggableKind, std::borrow::Cow<'_, str>)> {
     if block.synthetic || block.role == "system" {
         return None;
     }
-    match &block.wire.kind {
-        ck_wire::CkKind::Text { text }
-            if block.role == "user" || (block.role == "assistant" && !text.trim().is_empty()) =>
-        {
-            Some((TaggableKind::Message, text))
+    match &block.wire_shape().kind {
+        ck_wire::CkKind::Text { .. } => {
+            let text = block.scalar_text()?;
+            (block.role == "user" || (block.role == "assistant" && !text.trim().is_empty()))
+                .then_some((TaggableKind::Message, text))
         }
         ck_wire::CkKind::ToolResult { output, .. } => match &output.kind {
-            ck_wire::CkOutputKind::Text { text } | ck_wire::CkOutputKind::ErrorText { text } => {
-                Some((TaggableKind::ToolResult, text))
+            ck_wire::CkOutputKind::Text { .. } | ck_wire::CkOutputKind::ErrorText { .. } => {
+                Some((TaggableKind::ToolResult, block.scalar_text()?))
             }
             ck_wire::CkOutputKind::Content { blocks }
             | ck_wire::CkOutputKind::ErrorContent { blocks } => blocks.iter().find_map(|block| {
                 if let ck_wire::ResultBlockKind::Text { text } = &block.kind {
-                    Some((TaggableKind::ToolResult, text.as_str()))
+                    Some((
+                        TaggableKind::ToolResult,
+                        std::borrow::Cow::Borrowed(text.as_str()),
+                    ))
                 } else {
                     None
                 }
@@ -8827,11 +10004,14 @@ fn tag_overlay_state(
     temporal_marks: &[TemporalMarkRow],
     user_hints: &[UserHintRow],
     appends: &[Channel1AppendRow],
+    pending_tag_block_ids: &BTreeSet<String>,
     pending_user_hint_block_ids: &BTreeSet<String>,
 ) -> TagOverlayState {
+    profile_start!(_perf_tag_maps, "rt18_tag_maps");
     TagOverlayState {
         tag_by_block_id: tag_rows
             .iter()
+            .filter(|row| !pending_tag_block_ids.contains(&row.block_id))
             .map(|row| (row.block_id.clone(), row.tag_number))
             .collect(),
         temporal_by_block_id: temporal_marks
@@ -8899,6 +10079,7 @@ fn timestamp_temporal_marks(
     mutation_exempt_mid: Option<&str>,
     lineage_anchor_mid: Option<&str>,
 ) -> Vec<TemporalMarkInput> {
+    let first_text_blocks = first_text_block_by_message(projection);
     let mut previous = None;
     let mut marks = Vec::new();
     for message in &req.messages {
@@ -8918,14 +10099,10 @@ fn timestamp_temporal_marks(
                 )
             });
             if let Some(marker_text) = marker_text {
-                if let Some(block_id) = projection.blocks.iter().find_map(|block| {
-                    (block.mid == message.mid
-                        && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
-                    .then(|| block.id.clone())
-                }) {
+                if let Some(block_id) = first_text_blocks.get(message.mid.as_str()) {
                     marks.push(TemporalMarkInput {
                         ordinal: message.ordinal,
-                        block_id,
+                        block_id: (*block_id).to_string(),
                         marker_text,
                     });
                 }
@@ -8934,6 +10111,18 @@ fn timestamp_temporal_marks(
         previous = Some(message);
     }
     marks
+}
+
+/// The id of each message's first text block, in projection order. Equivalent to searching
+/// the projection from the front for a message's first text block, built in one pass.
+fn first_text_block_by_message(projection: &FlatProjection) -> HashMap<&str, &str> {
+    let mut first = HashMap::new();
+    for block in &projection.blocks {
+        if block.kind_tag == "text" {
+            first.entry(block.mid.as_str()).or_insert(block.id.as_str());
+        }
+    }
+    first
 }
 
 fn temporal_parity_transition_needed(
@@ -9319,13 +10508,133 @@ fn eligible_authored_user_tail(req: &TransformRequest) -> Option<&CkIngressMessa
     is_authored_user_message(tail).then_some(tail)
 }
 
-fn user_hint_target_was_served(meta: &ModuleMeta, block_id: &str) -> bool {
+fn overlay_target_was_served(
+    served_output_fingerprint: &[ServedBlockFingerprint],
+    block_id: &str,
+) -> bool {
     let Some((message_id, block_index)) = split_block_id(block_id) else {
         return false;
     };
-    meta.served_output_fingerprint.iter().any(|served| {
+    served_output_fingerprint.iter().any(|served| {
         served.block_id == block_id || (block_index == 0 && served.block_id == message_id)
     })
+}
+
+/// Signed assistants that may have reached the provider without passing through a module
+/// response.
+///
+/// A keep for the newest signed assistant is normally registered on the pass where it is newest.
+/// When that pass fails, the host serves its last-known-good replay followed by the raw OpenCode
+/// tail, so the provider caches the assistant verbatim while the module never records it. On the
+/// next deferred pass it is already demoted; without a keep the module would re-encode it as a
+/// historical message (overlays applied, signed reasoning dropped) and rewrite cached bytes on a
+/// pass that is not allowed to reprice the prefix.
+///
+/// Only messages newer than the newest live ordinal of the previous module pass qualify: the
+/// module has never processed them. A message the module did process (including one that a
+/// transient subset request omitted and a later request restores) keeps its existing handling,
+/// and in a steady-state defer only the newest assistant is new, so this yields nothing extra.
+fn unseen_demoted_reasoning_mids(
+    req: &TransformRequest,
+    previous_meta: &ModuleMeta,
+    cleared_mids: &HashSet<String>,
+) -> Vec<String> {
+    if previous_meta.newest_live_block_id.is_none() {
+        return Vec::new();
+    }
+    req.messages
+        .iter()
+        .filter(|message| {
+            message.ordinal > previous_meta.newest_live_ordinal
+                && message.ck.role == "assistant"
+                && !message.ck.meta.synthetic
+                && !cleared_mids.contains(&message.mid)
+                && message.ck.content.iter().any(is_reasoning_block)
+        })
+        .map(|message| message.mid.clone())
+        .collect()
+}
+
+fn user_hint_target_was_served(meta: &ModuleMeta, block_id: &str) -> bool {
+    overlay_target_was_served(&meta.served_output_fingerprint, block_id)
+}
+
+/// Each message's text blocks in projection order, so a message's blocks are found without
+/// scanning the whole projection.
+fn text_blocks_by_message_id(projection: &FlatProjection) -> HashMap<&str, Vec<&FlatBlock>> {
+    let mut by_message = HashMap::<&str, Vec<&FlatBlock>>::new();
+    for block in &projection.blocks {
+        if block.kind_tag == "text" {
+            by_message
+                .entry(block.mid.as_str())
+                .or_default()
+                .push(block);
+        }
+    }
+    by_message
+}
+
+/// The first of a message's text blocks (in projection order) that has a tag mint time, with
+/// that time.
+fn first_minted_text_block(
+    text_blocks: Option<&Vec<&FlatBlock>>,
+    mint_by_block: &HashMap<&str, i64>,
+) -> Option<(String, i64)> {
+    text_blocks.into_iter().flatten().find_map(|block| {
+        mint_by_block
+            .get(block.id.as_str())
+            .copied()
+            .map(|created_at| (block.id.clone(), created_at))
+    })
+}
+
+/// Reconcile the canonical timestamp marks with the stored temporal rows. A mark whose block
+/// already has a row keeps that row's text unless a temporal rewrite is in progress; a mark
+/// without a row is stored only when it is past the overlay frontier or a rewrite is in
+/// progress. Every existing mark is checked regardless of its age. Returns the marks this pass
+/// decided or rewrote, in canonical order.
+fn reconcile_canonical_temporal_marks(
+    temporal_rows: &mut Vec<TemporalMarkRow>,
+    canonical_marks: Vec<TemporalMarkInput>,
+    rewrite_temporal_marks: bool,
+    frontier: Option<u64>,
+    now_ms: i64,
+    decided_temporal: &mut HashSet<String>,
+) -> Vec<TemporalMarkInput> {
+    let mut temporal_marks = Vec::new();
+    // Position of the first stored row for each block, kept current as rows are appended, so
+    // each canonical mark finds the same row a front-to-back search would.
+    let mut temporal_row_by_block = HashMap::<String, usize>::with_capacity(temporal_rows.len());
+    for (index, row) in temporal_rows.iter().enumerate() {
+        temporal_row_by_block
+            .entry(row.block_id.clone())
+            .or_insert(index);
+    }
+    for mark in canonical_marks {
+        if let Some(&index) = temporal_row_by_block.get(mark.block_id.as_str()) {
+            let existing = &mut temporal_rows[index];
+            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                existing.marker_text = mark.marker_text.clone();
+                temporal_marks.push(mark);
+            }
+            continue;
+        }
+        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+        if !rewrite_temporal_marks && !is_new {
+            continue;
+        }
+        temporal_row_by_block
+            .entry(mark.block_id.clone())
+            .or_insert(temporal_rows.len());
+        temporal_rows.push(TemporalMarkRow {
+            block_id: mark.block_id.clone(),
+            marker_text: mark.marker_text.clone(),
+            created_at: now_ms,
+        });
+        decided_temporal.insert(mark.block_id.clone());
+        temporal_marks.push(mark);
+    }
+    temporal_marks
 }
 
 fn compute_active_overlay_decisions(
@@ -9347,6 +10656,7 @@ fn compute_active_overlay_decisions(
         lineage_anchor_mid,
     } = input;
     let tag_mint_started_at = Instant::now();
+    profile_start!(perf_tag_mint, "tag_overlay");
     let tag_mint_work = if !tag_mint_enabled {
         TagMintWork::default()
     } else {
@@ -9388,10 +10698,11 @@ fn compute_active_overlay_decisions(
     let tag_mint_candidates = tag_mint_work.candidate_count;
     let tag_mint_tokenized_bytes = tag_mint_work.tokenized_bytes;
     let tag_mint_count = tag_mint_work.inputs.len();
-    let tag_mint_start =
-        append_tag_mint_rows(Arc::make_mut(tag_rows), tag_mint_work.inputs, ctx.now_ms);
+    let tag_mint_start = append_minted_tag_rows(tag_rows, tag_mint_work.inputs, ctx.now_ms);
     let tag_mint_ms = elapsed_ms(tag_mint_started_at);
+    profile_end!(perf_tag_mint);
     let temporal_started_at = Instant::now();
+    profile_start!(perf_temporal, "temporal");
 
     let mint_by_block = tag_rows
         .iter()
@@ -9410,34 +10721,20 @@ fn compute_active_overlay_decisions(
         .iter()
         .map(|row| row.block_id.clone())
         .collect::<HashSet<_>>();
-    let mut temporal_marks = Vec::new();
-    for mark in canonical_marks {
-        if let Some(existing) = temporal_rows
-            .iter_mut()
-            .find(|row| row.block_id == mark.block_id)
-        {
-            if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
-                existing.marker_text = mark.marker_text.clone();
-                temporal_marks.push(mark);
-            }
-            continue;
-        }
-        let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
-        if !rewrite_temporal_marks && !is_new {
-            continue;
-        }
-        temporal_rows.push(TemporalMarkRow {
-            block_id: mark.block_id.clone(),
-            marker_text: mark.marker_text.clone(),
-            created_at: ctx.now_ms,
-        });
-        decided_temporal.insert(mark.block_id.clone());
-        temporal_marks.push(mark);
-    }
+    let mut temporal_marks = reconcile_canonical_temporal_marks(
+        temporal_rows,
+        canonical_marks,
+        rewrite_temporal_marks,
+        frontier,
+        ctx.now_ms,
+        &mut decided_temporal,
+    );
 
     // Timestamp-free callers retain the legacy first-sight basis for the live tail. OpenCode
     // supplies immutable per-message times, so its messages are already covered above.
     let authored_tail = eligible_authored_user_tail(req);
+    // Text blocks per message in projection order, built only if some message is new.
+    let mut text_blocks_by_message: Option<HashMap<&str, Vec<&FlatBlock>>> = None;
     let mut previous_new_user_mint = None;
     for message in req.messages.iter().filter(|message| {
         !message.ck.meta.synthetic
@@ -9452,20 +10749,10 @@ fn compute_active_overlay_decisions(
             previous_new_user_mint = None;
             continue;
         }
-        let Some((block_id, current_mint)) = projection
-            .blocks
-            .iter()
-            .filter(|block| block.mid == message.mid)
-            .find_map(|block| {
-                matches!(&block.wire.kind, ck_wire::CkKind::Text { .. })
-                    .then(|| {
-                        mint_by_block
-                            .get(block.id.as_str())
-                            .copied()
-                            .map(|created_at| (block.id.clone(), created_at))
-                    })
-                    .flatten()
-            })
+        let text_blocks =
+            text_blocks_by_message.get_or_insert_with(|| text_blocks_by_message_id(projection));
+        let Some((block_id, current_mint)) =
+            first_minted_text_block(text_blocks.get(message.mid.as_str()), &mint_by_block)
         else {
             previous_new_user_mint = None;
             continue;
@@ -9530,8 +10817,7 @@ fn compute_active_overlay_decisions(
             continue;
         }
         let Some(block_id) = projection.blocks.iter().find_map(|block| {
-            (block.mid == message.mid && matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }))
-                .then_some(block.id.as_str())
+            (block.mid == message.mid && block.kind_tag == "text").then_some(block.id.as_str())
         }) else {
             break;
         };
@@ -9543,6 +10829,7 @@ fn compute_active_overlay_decisions(
     let max_seen_ordinal =
         decided_frontier.filter(|ordinal| frontier.is_none_or(|current| *ordinal > current));
     let temporal_ms = elapsed_ms(temporal_started_at);
+    profile_end!(perf_temporal);
     let rewrite_temporal_marks = rewrite_temporal_marks && !temporal_marks.is_empty();
 
     Ok(PendingOverlayDecisions {
@@ -9585,11 +10872,11 @@ fn maybe_decide_live_user_hint(
     else {
         return Ok(None);
     };
-    let Some(block) = projection.blocks.iter().find(|block| {
-        block.mid == message.mid
-            && block.role == "user"
-            && matches!(block.wire.kind, ck_wire::CkKind::Text { .. })
-    }) else {
+    let Some(block) = projection
+        .blocks
+        .iter()
+        .find(|block| block.mid == message.mid && block.role == "user" && block.kind_tag == "text")
+    else {
         return Ok(None);
     };
     if user_hint_rows.iter().any(|row| row.block_id == block.id)
@@ -9618,7 +10905,7 @@ fn maybe_decide_live_user_hint(
             req.auto_search_score_threshold,
             rendered_memory_ids,
         )?;
-        render_user_hint(&results).unwrap_or_default()
+        render_user_hint(&results, ctx.caveman_english_word_rules).unwrap_or_default()
     };
     Ok(Some(UserHintDecisionInput {
         ordinal: message.ordinal,
@@ -9627,20 +10914,47 @@ fn maybe_decide_live_user_hint(
     }))
 }
 
-fn lexical_tokens(text: &str) -> BTreeSet<String> {
+/// The distinct search terms of `text`, in order of first appearance.
+fn lexical_terms(text: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
         "and", "are", "but", "for", "from", "have", "into", "not", "that", "the", "this", "use",
         "was", "with", "you", "your",
     ];
     // Unicode normalization is intentionally out of scope. Case folding and provider text
     // token boundaries are sufficient for this conservative, non-semantic hint gate.
+    let mut seen = HashSet::new();
     text.to_lowercase()
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|token| token.chars().count() >= 3 && !STOPWORDS.contains(token))
+        .filter(|token| seen.insert(token.to_string()))
         .map(str::to_string)
-        .collect::<BTreeSet<_>>()
+        .collect()
+}
+
+/// Every distinct term of a candidate document. A document is not capped: dropping some
+/// of its words would make a query that names them miss it.
+fn lexical_tokens(text: &str) -> BTreeSet<String> {
+    lexical_terms(text).into_iter().collect()
+}
+
+/// The query terms the score is computed over, at most [`USER_HINT_TOKEN_CAP`] of them.
+/// A long prompt keeps the terms that can tell candidates apart: those found in the pool
+/// come first, rarest first, and terms no candidate contains fill any remaining places.
+/// Ties keep the prompt's own order. A prompt with no more terms than the cap keeps all
+/// of them, so its score is unchanged.
+fn select_query_tokens(
+    query_terms: Vec<String>,
+    document_frequency: &HashMap<String, usize>,
+) -> BTreeSet<String> {
+    let mut ranked = query_terms.into_iter().enumerate().collect::<Vec<_>>();
+    ranked.sort_by_key(|(position, term)| {
+        let frequency = document_frequency.get(term).copied().unwrap_or(0);
+        (frequency == 0, frequency, *position)
+    });
+    ranked
         .into_iter()
         .take(USER_HINT_TOKEN_CAP)
+        .map(|(_, term)| term)
         .collect()
 }
 
@@ -9662,8 +10976,8 @@ fn run_user_hint_lexical_search(
         recency: i64,
     }
 
-    let query_tokens = lexical_tokens(query);
-    if query_tokens.len() < USER_HINT_MIN_MATCHED_TOKENS {
+    let query_terms = lexical_terms(query);
+    if query_terms.len() < USER_HINT_MIN_MATCHED_TOKENS {
         return Ok(Vec::new());
     }
     let mut candidates = Vec::new();
@@ -9738,13 +11052,14 @@ fn run_user_hint_lexical_search(
     }
 
     let mut document_frequency = HashMap::new();
-    for token in &query_tokens {
+    for term in &query_terms {
         let count = candidates
             .iter()
-            .filter(|candidate| candidate.tokens.contains(token))
+            .filter(|candidate| candidate.tokens.contains(term))
             .count();
-        document_frequency.insert(token, count);
+        document_frequency.insert(term.clone(), count);
     }
+    let query_tokens = select_query_tokens(query_terms, &document_frequency);
     let pool_count = candidates.len();
     let pool_size = pool_count as f64;
     let total_query_weight = query_tokens
@@ -9967,6 +11282,7 @@ pub(crate) fn js_utf16_units_from_internal(text: &str) -> Vec<u16> {
 }
 
 pub(crate) fn encode_js_surrogate_markers(encoded: Vec<u8>) -> Vec<u8> {
+    profile_start!(_perf_surrogates, "rt17_surrogates");
     let Ok(text) = String::from_utf8(encoded) else {
         unreachable!("serde_json always emits UTF-8")
     };
@@ -10014,7 +11330,10 @@ pub(crate) fn utf16_prefix(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
-fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Option<String> {
+fn render_user_hint(
+    results: &[crate::memory_tool::MemorySearchResult],
+    english_word_rules: bool,
+) -> Option<String> {
     if results.is_empty() {
         return None;
     }
@@ -10022,8 +11341,11 @@ fn render_user_hint(results: &[crate::memory_tool::MemorySearchResult]) -> Optio
         .iter()
         .take(USER_HINT_RESULT_LIMIT)
         .map(|result| {
-            let fragment =
-                crate::caveman::compress(&result.snippet, crate::caveman::CavemanLevel::Ultra);
+            let fragment = crate::caveman::compress_with(
+                &result.snippet,
+                crate::caveman::CavemanLevel::Ultra,
+                english_word_rules,
+            );
             format!(
                 "- {}",
                 one_line_fragment(&fragment, USER_HINT_FRAGMENT_CHAR_CAP)
@@ -10075,7 +11397,7 @@ fn one_line_fragment(text: &str, limit: usize) -> String {
 fn maybe_append_channel1_nudge(
     input: Channel1NudgeInputs<'_, '_>,
     meta: &mut ModuleMeta,
-) -> Option<Channel1AppendRow> {
+) -> Option<(Channel1AppendRow, FrozenUnit)> {
     let active_tags = active_tags_for_nudge(
         input.core,
         meta,
@@ -10089,29 +11411,31 @@ fn maybe_append_channel1_nudge(
     }
     let current_real_user_turn_count = real_user_turn_count(input.projection);
     let decision = decide_channel1(input.baseline, meta, current_real_user_turn_count);
-    meta.channel1_last_nudge_undropped = decision.next_last_nudge;
-    meta.channel1_last_nudge_level = decision.next_last_level;
-    if decision.clear_post_reduce_grace {
-        if let Some(baseline) = meta.tail_hygiene_baseline.as_mut() {
-            baseline.channel1_post_reduce_grace_baseline_u = None;
-            baseline.channel1_post_reduce_grace_pre_level.clear();
-        }
-    }
     if !decision.fire {
+        apply_channel1_decision_state(meta, &decision);
         return None;
     }
+
     let existing_blocks = input
         .channel1_appends
         .iter()
         .map(|row| row.block_id.as_str())
         .collect::<HashSet<_>>();
-    let block_id = newest_tool_result_for_channel1(
+    let target = newest_tool_result_for_channel1(
         input.core,
         meta,
         input.projection,
         &existing_blocks,
         input.mutation_exempt_mid,
     )?;
+    if !input.may_reprice_served_target
+        && overlay_target_was_served(input.served_output_fingerprint, &target.block_id)
+    {
+        // A firing decision remains pending until a fresh result can carry it on first serve or
+        // an independently priced pass can change bytes that the provider has already cached.
+        return None;
+    }
+
     let hint = oldest_reclaimable_hint(&active_tags, input.protection_cutoff, &queued_tag_numbers);
     let reminder = build_channel1_reminder(
         decision.level,
@@ -10120,13 +11444,82 @@ fn maybe_append_channel1_nudge(
         &hint,
         decision.sticky,
     );
+    apply_channel1_decision_state(meta, &decision);
     meta.channel1_last_fire_level = decision.level.as_str().to_string();
     meta.channel1_last_fire_ordinal = current_real_user_turn_count;
-    Some(Channel1AppendRow {
-        block_id,
-        reminder_text: reminder,
+    let row = Channel1AppendRow {
+        block_id: target.block_id.clone(),
+        reminder_text: reminder.clone(),
         fired_at_ms: input.ctx.now_ms,
-    })
+    };
+    let unit = FrozenUnit {
+        key: target.unit_key,
+        kind: "channel1_append".to_string(),
+        frozen_payload: reminder,
+        durability_class: mc_core::DurabilityClass::Lineage,
+        reset_rule: target.block_id,
+    };
+    Some((row, unit))
+}
+
+fn apply_channel1_decision_state(meta: &mut ModuleMeta, decision: &Channel1Decision) {
+    meta.channel1_last_nudge_undropped = decision.next_last_nudge;
+    meta.channel1_last_nudge_level = decision.next_last_level.clone();
+    if decision.clear_post_reduce_grace {
+        if let Some(baseline) = meta.tail_hygiene_baseline.as_mut() {
+            baseline.channel1_post_reduce_grace_baseline_u = None;
+            baseline.channel1_post_reduce_grace_pre_level.clear();
+        }
+    }
+}
+
+fn channel1_append_rows(
+    core: &CoreState,
+    legacy_rows: &[Channel1AppendRow],
+) -> Vec<Channel1AppendRow> {
+    let mut by_block = legacy_rows
+        .iter()
+        .cloned()
+        .map(|row| (row.block_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    for unit in core
+        .frozen_units
+        .iter()
+        .filter(|unit| unit.key.starts_with(CHANNEL1_KEY_PREFIX))
+        .filter(|unit| !unit.reset_rule.is_empty())
+    {
+        by_block.insert(
+            unit.reset_rule.clone(),
+            Channel1AppendRow {
+                block_id: unit.reset_rule.clone(),
+                reminder_text: unit.frozen_payload.clone(),
+                fired_at_ms: 0,
+            },
+        );
+    }
+    by_block.into_values().collect()
+}
+
+fn prune_channel1_units(
+    core: &mut CoreState,
+    projection: &FlatProjection,
+    coverage_ordinal: Option<u64>,
+) {
+    let live_ord = projection
+        .blocks
+        .iter()
+        .map(|block| (block.id.as_str(), block.ordinal))
+        .collect::<HashMap<_, _>>();
+    let reduced = frozen_red_targets(core);
+    core.frozen_units.retain(|unit| {
+        if !unit.key.starts_with(CHANNEL1_KEY_PREFIX) {
+            return true;
+        }
+        !reduced.contains(&unit.reset_rule)
+            && live_ord
+                .get(unit.reset_rule.as_str())
+                .is_some_and(|ordinal| is_tail(*ordinal, coverage_ordinal))
+    });
 }
 
 fn tag_rows_for_hygiene(
@@ -10140,13 +11533,22 @@ fn tag_rows_for_hygiene(
         .iter()
         .map(|block| block.id.as_str())
         .collect::<HashSet<_>>();
+    // Hygiene reads tag identities (number, block, kind, token count), never the stored source
+    // payload, so the retained rows are copied without it.
     let mut rows = stored_rows
         .iter()
         .filter(|row| {
             !projected_ids.contains(row.block_id.as_str())
                 || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
         })
-        .cloned()
+        .map(|row| McTagRow {
+            tag_number: row.tag_number,
+            block_id: row.block_id.clone(),
+            kind: row.kind.clone(),
+            token_count: row.token_count,
+            created_at_ms: row.created_at_ms,
+            source_bytes: Default::default(),
+        })
         .collect::<Vec<_>>();
     let existing_ids = rows
         .iter()
@@ -10168,7 +11570,7 @@ fn tag_rows_for_hygiene(
             kind: kind.as_store_kind().to_string(),
             token_count: 0,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         });
     }
     if rows.is_empty() && derive_when_empty {
@@ -10187,7 +11589,7 @@ fn tag_rows_for_hygiene(
                     .to_string(),
                 token_count: 0,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
     }
@@ -10202,6 +11604,7 @@ fn active_tags_for_nudge(
     tag_rows: &[McTagRow],
     mutation_exempt_mid: Option<&str>,
 ) -> Vec<ActiveTagForNudge> {
+    profile_start!(_perf_active_tags, "rt05_active_tags");
     let tag_by_block = tag_rows
         .iter()
         .map(|row| (row.block_id.as_str(), row))
@@ -10222,7 +11625,7 @@ fn active_tags_for_nudge(
                 tag_number: row.tag_number,
                 kind: row.kind.clone(),
                 token_count: row.token_count.max(0),
-                tool_name: match &block.wire.kind {
+                tool_name: match &block.wire_shape().kind {
                     ck_wire::CkKind::ToolResult { tool_name, .. } => tool_name.clone(),
                     _ => String::new(),
                 },
@@ -10262,8 +11665,8 @@ fn active_tags_for_channel2(
         derived.push(ActiveTagForNudge {
             tag_number: next_tag,
             kind: kind.as_store_kind().to_string(),
-            token_count: mc_tokenizer::estimate_tokens(source) as i64,
-            tool_name: match &block.wire.kind {
+            token_count: mc_tokenizer::estimate_tokens(&source) as i64,
+            tool_name: match &block.wire_shape().kind {
                 ck_wire::CkKind::ToolResult { tool_name, .. } => tool_name.clone(),
                 _ => String::new(),
             },
@@ -10520,7 +11923,7 @@ fn build_channel2_reminder_text(
     let summary = format_reclaimable_output_summary(reclaimable_tool_outputs, reclaimable_tokens);
     let hint_text = format_reclaimable_hint(hint);
     format!(
-        "Routine housekeeping: {summary} are reclaimable — make a ctx_reduce pass at a natural stopping point.{hint_text}"
+        "Your next step: call ctx_reduce on the outputs you've already used ({summary}). Then continue your task.{hint_text}"
     )
 }
 
@@ -10987,10 +12390,11 @@ mod nudge_formula_tests {
         ));
         let sticky = build_channel1_reminder(Channel1Level::Firm, 70_000, 16, &[], true);
         assert!(
-            sticky.contains("Reminder: 16 spent tool outputs (~70k tokens) are still reclaimable")
+            sticky.contains("Still unstamped: 16 spent tool outputs (~70k tokens). Stamp the ones")
         );
         let escalation = build_channel1_reminder(Channel1Level::Urgent, 80_000, 16, &[], false);
-        assert!(escalation.contains("Housekeeping backlog:"));
+        assert!(escalation
+            .contains("are still unstamped. Call ctx_reduce now, before your next tool call"));
     }
 
     #[test]
@@ -11097,9 +12501,9 @@ fn newest_tool_result_for_channel1(
     projection: &FlatProjection,
     existing_blocks: &HashSet<&str>,
     mutation_exempt_mid: Option<&str>,
-) -> Option<String> {
+) -> Option<Channel1Target> {
     let frozen_targets = frozen_red_targets(core);
-    projection
+    let block = projection
         .blocks
         .iter()
         .filter(|block| {
@@ -11107,12 +12511,21 @@ fn newest_tool_result_for_channel1(
                 && taggable_kind(block).is_some()
                 && is_tail(block.ordinal, meta.coverage_ordinal)
                 && !frozen_targets.contains(block.id())
-                && !existing_blocks.contains(block.id.as_str())
                 && mutation_exempt_mid != Some(block.mid.as_str())
-                && tool_result_can_carry_channel1(&block.wire)
+                && tool_result_can_carry_channel1(block.wire_shape())
         })
-        .max_by_key(|block| (block.ordinal, block.block_index))
-        .map(|block| block.id.clone())
+        .max_by_key(|block| (block.ordinal, block.block_index))?;
+    if existing_blocks.contains(block.id.as_str()) {
+        return None;
+    }
+    let tool_call_id = block.tool_call_id.as_deref()?;
+    let owner_mid = block.arc_id.as_deref()?.split_once('#')?.0;
+    let pair = serde_json::to_string(&(tool_call_id, owner_mid))
+        .expect("Channel-1 target identity must serialize");
+    Some(Channel1Target {
+        block_id: block.id.clone(),
+        unit_key: format!("{CHANNEL1_KEY_PREFIX}{pair}"),
+    })
 }
 
 fn tool_result_can_carry_channel1(block: &CkWireBlock) -> bool {
@@ -11192,19 +12605,19 @@ fn build_channel1_reminder(
     let hint_text = format_reclaimable_hint(hint);
     if sticky {
         return format!(
-            "\n\n<system-reminder>\nReminder: {summary} are still reclaimable — ctx_reduce them at a natural stopping point.{hint_text}\n</system-reminder>"
+            "\n\n<system-reminder>\nStill unstamped: {summary}. Stamp the ones you've used with ctx_reduce now.{hint_text}\n</system-reminder>"
         );
     }
 
     let body = match level {
         Channel1Level::Gentle => format!(
-            "Housekeeping: {summary} are reclaimable — drop the ones you have already processed with ctx_reduce at a natural stopping point."
+            "Housekeeping: {summary} are reclaimable. Stamp each output with ctx_reduce as soon as you've taken what you need from it; don't wait for the task to finish."
         ),
         Channel1Level::Firm => format!(
-            "Housekeeping: {summary} are reclaimable — make a ctx_reduce pass at a natural stopping point."
+            "{summary} are reclaimable. Make a ctx_reduce pass now over the outputs you've already used, then continue."
         ),
         Channel1Level::Urgent => format!(
-            "Housekeeping backlog: {summary} are reclaimable — a ctx_reduce pass is due."
+            "{summary} are still unstamped. Call ctx_reduce now, before your next tool call, on every output you've already used."
         ),
     };
     format!("\n\n<system-reminder>\n{body}{hint_text}\n</system-reminder>")
@@ -11258,7 +12671,9 @@ fn legacy_system_strip_candidates(
     core: &CoreState,
     meta: &ModuleMeta,
     rendered: &[ServedMessage],
+    frame_block_stems: &[Option<&'static str>],
 ) -> HashSet<String> {
+    profile_start!(_perf_legacy_candidates, "rt10_legacy_candidates");
     if !core
         .frozen_units
         .iter()
@@ -11266,7 +12681,7 @@ fn legacy_system_strip_candidates(
     {
         return HashSet::new();
     }
-    let current = served_output_fingerprints(rendered)
+    let current = served_output_fingerprints(rendered, frame_block_stems)
         .into_iter()
         .map(|block| (block.block_id, block.content_hash))
         .collect::<HashMap<_, _>>();
@@ -11321,10 +12736,21 @@ fn is_ignored_block(block: &CkWireBlock) -> bool {
 }
 
 fn is_dropped_placeholder_text(text: &str) -> bool {
-    static DROPPED_PLACEHOLDERS: OnceLock<regex::Regex> = OnceLock::new();
-    DROPPED_PLACEHOLDERS
-        .get_or_init(|| regex::Regex::new(r"^(?:\s*\[dropped(?: §\d+§)?\])+\s*$").unwrap())
-        .is_match(text)
+    static MARKER_ONLY: OnceLock<regex::Regex> = OnceLock::new();
+    let trimmed = text.trim();
+    !trimmed.is_empty()
+        && MARKER_ONLY
+            .get_or_init(|| {
+                // `\d` here is Unicode, so `§٣§` (Arabic-Indic digit) counts as a
+                // marker, unlike JavaScript's ASCII `\d` in the TypeScript twin.
+                // This check runs on every pass (it picks the kept reasoning block
+                // and the replay-exempt message), so switching to ASCII digits
+                // changes served bytes mid-session and needs a TAGGER_FEATURE_EPOCH
+                // bump to ride a rebuild.
+                regex::Regex::new(r"^(?:(?:§\d+§|\[dropped(?: §\d+§)?\]|\[cleared\])\s*)+$")
+                    .unwrap()
+            })
+            .is_match(trimmed)
 }
 
 fn tag_stripped_text(text: &str) -> &str {
@@ -11395,9 +12821,52 @@ fn directive_block_end(text: &str, body_start: usize) -> usize {
     text.len()
 }
 
+/// OpenCode up to 1.17.8 wrapped a user message sent while the agent was still running in this
+/// exact reminder before plugins saw it (1.17.9 removed the wrapper). The body is the user's own
+/// words, so it is never an injection: stripping it would empty the block and drop the user's
+/// instruction for good. The trailer anchors the match, so a reminder the user's text itself
+/// contains stays inside the preserved block. Twin of `STEERING_WRAPPER_REGEX` in
+/// `packages/plugin/src/hooks/magic-context/system-injection-stripper.ts`. The historian chunk
+/// reader uses it too, so a wrapped user message is not read as noise.
+pub(crate) fn steering_wrapper_regex() -> &'static regex::Regex {
+    static STEERING_WRAPPER: OnceLock<regex::Regex> = OnceLock::new();
+    STEERING_WRAPPER.get_or_init(|| {
+        regex::Regex::new(
+            r"(?s)<system-reminder>\nThe user sent the following message:\n.*?\n\nPlease address this message and continue with your tasks\.\n</system-reminder>",
+        )
+        .unwrap()
+    })
+}
+
 /// Remove known injected regions while retaining authored text around them. A returned empty
 /// string means the caller should preserve the message/block shape with its provider sentinel.
 fn strip_system_injection(text: &str) -> Option<String> {
+    let wrappers: Vec<regex::Match<'_>> = steering_wrapper_regex().find_iter(text).collect();
+    if wrappers.is_empty() {
+        return strip_injected_regions(text);
+    }
+    // Strip only the text between wrapped user messages; keep each wrapper verbatim.
+    let mut result = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut keep_or_strip =
+        |segment: &str, result: &mut String| match strip_injected_regions(segment) {
+            Some(stripped) => {
+                result.push_str(&stripped);
+                changed = true;
+            }
+            None => result.push_str(segment),
+        };
+    let mut cursor = 0;
+    for wrapper in wrappers {
+        keep_or_strip(&text[cursor..wrapper.start()], &mut result);
+        result.push_str(wrapper.as_str());
+        cursor = wrapper.end();
+    }
+    keep_or_strip(&text[cursor..], &mut result);
+    changed.then(|| result.trim().to_string())
+}
+
+fn strip_injected_regions(text: &str) -> Option<String> {
     let has_injection = SYSTEM_INJECTION_MARKERS
         .iter()
         .any(|marker| text.contains(marker))
@@ -11446,11 +12915,22 @@ fn is_dropped_placeholder_block(block: &CkWireBlock) -> bool {
     )
 }
 
-fn has_text_or_reasoning_block(block: &CkWireBlock) -> bool {
-    matches!(
-        &block.kind,
-        ck_wire::CkKind::Text { .. } | ck_wire::CkKind::Reasoning { .. }
-    )
+fn whole_marker_or_blank_message(blocks: &[CkWireBlock]) -> bool {
+    let mut has_content = false;
+    for block in blocks {
+        if is_ignored_block(block) || is_metadata_block(block) {
+            continue;
+        }
+        let text = match &block.kind {
+            ck_wire::CkKind::Text { text } | ck_wire::CkKind::Reasoning { text, .. } => text,
+            _ => return false,
+        };
+        has_content = true;
+        if !text.trim().is_empty() && !is_dropped_placeholder_block(block) {
+            return false;
+        }
+    }
+    has_content
 }
 
 fn whole_system_injected(blocks: &[CkWireBlock]) -> bool {
@@ -11599,12 +13079,25 @@ fn new_frozen_strip_units(
     let age_cutoff = tag_age_cutoff(req, tag_numbers);
     let reasoning_mutation_exempt_mid =
         latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
-    let cc_reasoning_cutoff = if SerializerProfile::parse(&req.serializer_profile)
-        == Some(SerializerProfile::ClaudeCodeAnthropic)
-    {
+    let profile = SerializerProfile::parse(&req.serializer_profile);
+    let cc_reasoning_cutoff = if profile == Some(SerializerProfile::ClaudeCodeAnthropic) {
         reasoning_clear_cutoff
     } else {
         None
+    };
+    // OpenCode on any provider other than canonical `anthropic` removes whole old reasoning
+    // blocks through the same frozen `reasoning_age` unit. Canonical Anthropic keeps its
+    // `reasoning_clear` empty-shell lane, which its adapter filters before the wire, except
+    // on prefix-bound models: that lane skips an ineligible message instead of stopping,
+    // so they use this lane's oldest-prefix walk on every route.
+    let opencode_removal_mids = if profile == Some(SerializerProfile::OpencodeAiSdk)
+        && req.serve_native
+        && (!request_accepts_empty_content(req)
+            || is_prefix_bound_thinking_model(req.model_key.as_deref()))
+    {
+        opencode_reasoning_removal_mids(req, tag_numbers, age_cutoff, &existing_keys)
+    } else {
+        HashSet::new()
     };
     let mut units = BTreeMap::<String, FrozenUnit>::new();
     let mut has_assistant_response = false;
@@ -11657,14 +13150,14 @@ fn new_frozen_strip_units(
             // then remove whole reasoning blocks at render time. The unit is first minted only on
             // this already-busting pass and replays unchanged on defers; selection.rs continues to
             // exclude every reasoning block from ReductionDecision targets.
-            if message.ck.role == "assistant"
+            let cc_aged = message.ck.role == "assistant"
                 && reasoning_mutation_exempt_mid != Some(message.mid.as_str())
                 && cc_reasoning_cutoff.is_some_and(|cutoff| {
                     let tag = message_tag_number(message, tag_numbers);
                     tag > 0 && tag <= cutoff
                 })
-                && blocks.iter().any(is_reasoning_block)
-            {
+                && blocks.iter().any(is_reasoning_block);
+            if cc_aged || opencode_removal_mids.contains(message.mid.as_str()) {
                 let unit = strip_unit("reasoning_age", &message.mid, "");
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -11679,14 +13172,7 @@ fn new_frozen_strip_units(
                     units.insert(unit.key.clone(), unit);
                 }
             }
-            if !blocks.is_empty()
-                && blocks.iter().all(|block| {
-                    is_ignored_block(block)
-                        || is_metadata_block(block)
-                        || is_dropped_placeholder_block(block)
-                })
-                && blocks.iter().any(has_text_or_reasoning_block)
-            {
+            if whole_marker_or_blank_message(blocks) {
                 let unit = strip_unit("placeholder", &message.mid, &sentinel);
                 if !existing_keys.contains(unit.key.as_str()) {
                     units.insert(unit.key.clone(), unit);
@@ -11735,6 +13221,114 @@ fn new_frozen_strip_units(
     units.into_values().collect()
 }
 
+/// True for Claude models whose signed thinking is bound to the request prefix, on any
+/// route. Mirrors TS `isPrefixBoundThinkingModel` and its `PREFIX_BOUND_THINKING_MODELS`
+/// (Fable 5.1, Opus 5.5, Sonnet 5.5); the provider is deliberately ignored.
+pub(crate) fn is_prefix_bound_thinking_model(model_key: Option<&str>) -> bool {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let Some(key) = model_key else {
+        return false;
+    };
+    let model = key.split_once('/').map_or(key, |(_, model)| model);
+    PATTERN
+        .get_or_init(|| {
+            Regex::new(
+                r"(?i)(?:^|[-_.:/])(?:fable[-_.]?5[-_.]1|opus[-_.]?5[-_.]5|sonnet[-_.]?5[-_.]5)(?:$|[-_.:/@])",
+            )
+            .unwrap()
+        })
+        .is_match(model)
+}
+
+/// OpenCode assistant mids whose reasoning blocks are newly removed on this bust pass.
+/// Mirrors TS `selectReasoningRemovals`: tag at or below the age cutoff, a reasoning
+/// block present, not the newest assistant (nor the newest with replayable content), and
+/// some non-reasoning content left after removal.
+///
+/// On a prefix-bound model (Fable 5.1, Opus 5.5, Sonnet 5.5) only a contiguous oldest
+/// prefix is selected. Anthropic's preserved-thinking page ("What counts as an edit")
+/// lists "Remove `thinking` blocks from the start of the history, from the end, or all
+/// of them" as valid, and "Remove a `thinking` block from the middle of the history and
+/// keep later ones" as invalid for every later thinking block. The walk passes over
+/// messages already removed and stops at the first reasoning-bearing message it may not
+/// remove, so the removed set never has a gap.
+///
+/// Selects nothing when:
+/// - the provider is unresolved, since the session may be canonical Anthropic;
+/// - the route is OpenRouter, whose adapter also sends the reasoning as
+///   `reasoning_details` copied onto the tool calls. TS strips those copies; this lane
+///   does not, so it stays off rather than change bytes without shrinking the request.
+fn opencode_reasoning_removal_mids<'a>(
+    req: &'a TransformRequest,
+    tag_numbers: &BTreeMap<String, u64>,
+    age_cutoff: Option<u64>,
+    existing_keys: &HashSet<&str>,
+) -> HashSet<&'a str> {
+    let mut selected = HashSet::new();
+    let Some(cutoff) = age_cutoff.filter(|cutoff| *cutoff > 0) else {
+        return selected;
+    };
+    let provider = req
+        .provider_id
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if provider.is_empty() || provider.contains("openrouter") {
+        return selected;
+    }
+    let prefix_bound = is_prefix_bound_thinking_model(req.model_key.as_deref());
+    let newest = latest_assistant_mid(&req.messages);
+    let exempt = latest_assistant_reasoning_mutation_exempt_mid(&req.messages);
+    // `@openrouter/ai-sdk-provider` keeps copies of the reasoning as
+    // `metadata.openrouter.reasoning_details` on other parts of the message. This lane
+    // cannot strip those, so such messages are skipped whatever the provider id is.
+    let openrouter_shaped: HashSet<&str> = req
+        .native_messages
+        .iter()
+        .flatten()
+        .filter_map(|native| {
+            let id = native.get("info")?.get("id")?.as_str()?;
+            native
+                .get("parts")?
+                .as_array()?
+                .iter()
+                .any(|part| {
+                    part.pointer("/metadata/openrouter/reasoning_details")
+                        .is_some()
+                })
+                .then_some(id)
+        })
+        .collect();
+    for message in &req.messages {
+        if message.ck.meta.synthetic
+            || message.ck.role != "assistant"
+            || !message.ck.content.iter().any(is_reasoning_block)
+        {
+            continue;
+        }
+        let mid = message.mid.as_str();
+        if existing_keys.contains(format!("strip:reasoning_age:{mid}").as_str()) {
+            continue;
+        }
+        let tag = message_tag_number(message, tag_numbers);
+        let eligible = !mid.is_empty()
+            && !openrouter_shaped.contains(mid)
+            && Some(mid) != newest
+            && Some(mid) != exempt
+            && tag > 0
+            && tag <= cutoff
+            && message.ck.content.iter().any(has_meaningful_content);
+        if eligible {
+            selected.insert(mid);
+        } else if prefix_bound {
+            // A block left in place here would sit before every block removed after
+            // it: a removal from the middle.
+            break;
+        }
+    }
+    selected
+}
+
 struct ReasoningMutationPolicy {
     watermark: u64,
     exempt: bool,
@@ -11776,13 +13370,12 @@ fn apply_surface_strips(
 ) {
     replay_reasoning_clear(frozen_units, &message.mid, rebuilt);
     let sentinel = provider_sentinel_text(req);
-    let whole_strip = (!reasoning_policy.exempt)
-        .then(|| {
-            output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
-                output_message_strip_unit(frozen_units, "system_injected", &message.mid)
-            })
-        })
-        .flatten();
+    let whole_strip =
+        output_message_strip_unit(frozen_units, "placeholder", &message.mid).or_else(|| {
+            (!reasoning_policy.exempt)
+                .then(|| output_message_strip_unit(frozen_units, "system_injected", &message.mid))
+                .flatten()
+        });
     if whole_strip.is_some() {
         rebuilt.content = vec![CkWireBlock::bare(ck_wire::CkKind::Text { text: sentinel })];
         rebuilt.mark_modified();
@@ -11815,29 +13408,34 @@ fn apply_surface_strips(
             }
         }
 
-        let should_strip =
-            (request_accepts_empty_content(req) && stale_reduce && is_reduce_block(&block.wire))
-                || ((image_seed
-                    && request_accepts_empty_content(req)
-                    && image_block_is_large(&block.wire))
-                    || (request_accepts_empty_content(req)
-                        && frozen_units
-                            .red_by_block_id(block.id())
-                            .is_some_and(|unit| unit.kind == "image")))
-                || (request_accepts_empty_content(req) && is_structural_noise(&block.wire));
+        let should_strip = (request_accepts_empty_content(req)
+            && stale_reduce
+            && is_reduce_block(&message.ck.content[index]))
+            || ((image_seed
+                && request_accepts_empty_content(req)
+                && image_block_is_large(block.wire_shape()))
+                || (request_accepts_empty_content(req)
+                    && frozen_units
+                        .red_by_block_id(block.id())
+                        .is_some_and(|unit| unit.kind == "image")))
+            || (request_accepts_empty_content(req)
+                && is_structural_noise(&message.ck.content[index]));
         if should_strip {
             replace_with_sentinel(&mut rebuilt.content[index], &sentinel);
             touched = true;
             continue;
         }
-        if !reasoning_policy.exempt && message.ck.role == "assistant" && aged {
-            if let ck_wire::CkKind::Text { text } = &block.wire.kind {
-                let replacement = inline_thinking_replacement(text);
-                if replacement != *text {
-                    rebuilt.content[index].kind = ck_wire::CkKind::Text { text: replacement };
-                    rebuilt.content[index].mark_modified();
-                    touched = true;
-                }
+        if !reasoning_policy.exempt
+            && message.ck.role == "assistant"
+            && aged
+            && block.kind_tag == "text"
+        {
+            let text = block.scalar_text().expect("text payload");
+            let replacement = inline_thinking_replacement(&text);
+            if replacement != *text {
+                rebuilt.content[index].kind = ck_wire::CkKind::Text { text: replacement };
+                rebuilt.content[index].mark_modified();
+                touched = true;
             }
         }
     }
@@ -11903,7 +13501,7 @@ fn projection_reasoning_ineligible_arc_ids(projection: &FlatProjection) -> HashS
         .filter(|block| block.role == "assistant")
     {
         let message = messages.entry(block.mid.as_str()).or_default();
-        match &block.wire.kind {
+        match &block.wire_shape().kind {
             ck_wire::CkKind::Reasoning { .. } | ck_wire::CkKind::RedactedReasoning { .. } => {
                 message.has_reasoning = true;
             }
@@ -12123,7 +13721,7 @@ fn renderer_transition_shapes(
         .blocks
         .iter()
         .filter(|block| reduced_call_targets.contains(block.id.as_str()))
-        .filter(|block| matches!(&block.wire.kind, ck_wire::CkKind::ToolCall { .. }))
+        .filter(|block| block.kind_tag == "tool_call")
         .map(|block| block.id.clone())
         .collect();
     if frozen_targets.is_empty() {
@@ -12160,7 +13758,7 @@ fn renderer_transition_shapes(
             let (
                 ck_wire::CkKind::ToolCall { id: call_id, .. },
                 ck_wire::CkKind::ToolResult { id: result_id, .. },
-            ) = (&call.wire.kind, &result.wire.kind)
+            ) = (&call.wire_shape().kind, &result.wire_shape().kind)
             else {
                 return None;
             };
@@ -12169,7 +13767,7 @@ fn renderer_transition_shapes(
             }
             let rewritten_block_is_unmatched = [call, result].into_iter().any(|block| {
                 frozen_targets.contains(block.id.as_str())
-                    && !crate::codec::sidecar::has_stamped_block_identity(&block.wire)
+                    && !crate::codec::sidecar::has_stamped_block_identity(block.wire_shape())
             });
             rewritten_block_is_unmatched.then(|| call_id.clone())
         })
@@ -12265,7 +13863,7 @@ fn full_drop_tool_ids(
     // the full projection for every result; long sessions contain thousands of tool blocks.
     let mut call_kind_by_id = HashMap::new();
     for block in &projection.blocks {
-        let ck_wire::CkKind::ToolCall { id, .. } = &block.wire.kind else {
+        let ck_wire::CkKind::ToolCall { id, .. } = &block.wire_shape().kind else {
             continue;
         };
         call_kind_by_id
@@ -12276,7 +13874,7 @@ fn full_drop_tool_ids(
     let mut remove = HashSet::new();
     for block in &projection.blocks {
         let (ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. }) =
-            &block.wire.kind
+            &block.wire_shape().kind
         else {
             continue;
         };
@@ -12293,12 +13891,15 @@ fn full_drop_tool_ids(
         // A seed containing only a tool result is a complete pair, but a skeleton or edit-marker
         // tool call also carries the newest-window message. Keep that call paired with its result
         // shell so the canonical message representation is preserved.
-        if matches!(&block.wire.kind, ck_wire::CkKind::ToolCall { .. }) {
+        if block.kind_tag == "tool_call" {
             remove.insert(id.clone());
             continue;
         }
         let call_kind = call_kind_by_id.get(id.as_str()).copied().flatten();
-        if !matches!(call_kind, Some("skeleton" | "edit_marker")) {
+        if !matches!(
+            call_kind,
+            Some("skeleton" | "skeleton_real" | "edit_marker")
+        ) {
             remove.insert(id.clone());
         }
     }
@@ -12346,6 +13947,12 @@ impl<'a> FrozenUnitIndex<'a> {
                 .or_else(|| unit.key.strip_prefix(CAV_KEY_PREFIX))
                 .and_then(split_block_id)
                 .map(|(mid, _)| mid)
+                .or_else(|| {
+                    unit.key
+                        .starts_with(CHANNEL1_KEY_PREFIX)
+                        .then(|| split_block_id(&unit.reset_rule).map(|(mid, _)| mid))
+                        .flatten()
+                })
                 .or_else(|| {
                     unit.key
                         .strip_prefix("strip:")
@@ -12403,12 +14010,17 @@ impl<'a> FrozenUnitLookup<'a> {
                             .and_then(split_block_id)
                             .map(|(unit_mid, _)| unit_mid == mid)
                             .unwrap_or_else(|| {
-                                unit.key
-                                    .strip_prefix("strip:")
-                                    .and_then(|key| key.split_once(':'))
-                                    .is_some_and(|(_, target)| {
-                                        split_block_id(target).map_or(target, |(mid, _)| mid) == mid
-                                    })
+                                (unit.key.starts_with(CHANNEL1_KEY_PREFIX)
+                                    && split_block_id(&unit.reset_rule)
+                                        .is_some_and(|(unit_mid, _)| unit_mid == mid))
+                                    || unit
+                                        .key
+                                        .strip_prefix("strip:")
+                                        .and_then(|key| key.split_once(':'))
+                                        .is_some_and(|(_, target)| {
+                                            split_block_id(target).map_or(target, |(mid, _)| mid)
+                                                == mid
+                                        })
                             })
                     })
                     .collect(),
@@ -12454,6 +14066,13 @@ fn output_trailing_blank_decision(
 
 struct BuiltOutput {
     messages: Vec<ServedMessage>,
+    /// Block-id stems of the composed frames in this output, indexed by output position
+    /// (`mc_m0`, then `mc_m1`; `None` for a position that holds a caller message, such as a
+    /// Broca system message placed ahead of the frames). Empty when the output carries no
+    /// composed frame at all, which is every subagent pass. Naming the frames from what was actually emitted —
+    /// rather than from "the first synthetic message in the array" — keeps a harness-authored
+    /// synthetic prompt from inheriting a frame's block id in a frameless output.
+    frame_block_stems: Vec<Option<&'static str>>,
     cache_entries: HashMap<String, SerializedOutputCacheEntry>,
     cache_stats: SerializedOutputCacheStats,
     timings: BuildOutputTimings,
@@ -12480,6 +14099,7 @@ fn message_output_identity(
     first_assistant_in_run: bool,
     frozen_unit_scan_ms: &mut f64,
 ) -> String {
+    profile_start!(_perf_identity, "rt09_message_identity");
     let mut hasher = Sha256::new();
     digest_field(&mut hasher, message.mid.as_bytes());
     digest_field(&mut hasher, message.ck.role.as_bytes());
@@ -12527,17 +14147,8 @@ fn message_output_identity(
 
     for block in blocks {
         digest_field(&mut hasher, block.id.as_bytes());
-        for value in [
-            tag_overlay
-                .and_then(|overlay| overlay.tag_by_block_id.get(&block.id))
-                .map(ToString::to_string),
-            tag_overlay.and_then(|overlay| overlay.temporal_by_block_id.get(&block.id).cloned()),
-            tag_overlay.and_then(|overlay| overlay.user_hint_by_block_id.get(&block.id).cloned()),
-            tag_overlay.and_then(|overlay| overlay.channel1_by_block_id.get(&block.id).cloned()),
-        ] {
-            digest_field(&mut hasher, value.as_deref().unwrap_or_default().as_bytes());
-        }
-        let full_drop = match &block.wire.kind {
+        digest_overlay_identity_fields(&mut hasher, tag_overlay, &block.id);
+        let full_drop = match &block.wire_shape().kind {
             ck_wire::CkKind::ToolCall { id, .. } | ck_wire::CkKind::ToolResult { id, .. } => {
                 full_drop_ids.contains(id)
             }
@@ -12545,7 +14156,25 @@ fn message_output_identity(
         };
         digest_field(&mut hasher, &[full_drop as u8]);
     }
-    format!("{:x}", hasher.finalize())
+    crate::digest::hex(&hasher.finalize())
+}
+
+fn digest_overlay_identity_fields(
+    hasher: &mut Sha256,
+    overlay: Option<&TagOverlayState>,
+    block_id: &str,
+) {
+    let tag = overlay
+        .and_then(|overlay| overlay.tag_by_block_id.get(block_id))
+        .map(ToString::to_string);
+    digest_field(hasher, tag.as_deref().unwrap_or_default().as_bytes());
+    for value in [
+        overlay.and_then(|overlay| overlay.temporal_by_block_id.get(block_id)),
+        overlay.and_then(|overlay| overlay.user_hint_by_block_id.get(block_id)),
+        overlay.and_then(|overlay| overlay.channel1_by_block_id.get(block_id)),
+    ] {
+        digest_field(hasher, value.map_or("", String::as_str).as_bytes());
+    }
 }
 
 fn cached_output_item(
@@ -12689,7 +14318,7 @@ fn assert_no_orphaned_tool_arcs(messages: &[ServedMessage]) {
         let same_message_results = external_results(message);
         let next_message_results = messages
             .get(message_index + 1)
-            .map(&external_results)
+            .map(external_results)
             .unwrap_or_default();
         for id in calls {
             assert!(
@@ -12714,7 +14343,7 @@ fn enforce_unique_tool_use_ids(
     }
 
     for (id, message_index, block_index) in &duplicates {
-        eprintln!(
+        tracing::debug!(
             "mc-module: duplicate_tool_use_id session={} id={} message_index={} block_index={} action=drop_later",
             session_id, id, message_index, block_index
         );
@@ -12886,9 +14515,9 @@ fn assistant_has_completed_content(message: &CkIngressMessage) -> bool {
     })
 }
 
-/// OpenCode marks notice-triggered user prompts synthetic, the same flag used by stale
-/// injected history. Only the newest user owns the live request; historical synthetic rows
-/// remain excluded by the ordinary tail filters.
+/// OpenCode marks notice-triggered user prompts synthetic. The newest one owns the live
+/// request, so it is served even when it sits outside the tail the compaction boundary
+/// covers. Older ones are ordinary history and are served by the ordinary tail filters.
 pub(crate) fn is_newest_synthetic_user_prompt(
     request: &TransformRequest,
     message: &CkIngressMessage,
@@ -12899,6 +14528,31 @@ pub(crate) fn is_newest_synthetic_user_prompt(
             .messages
             .last()
             .is_some_and(|newest| newest.mid == message.mid)
+}
+
+/// True when this ingress row is one Magic Context composed itself, so removing it from the
+/// served array removes nothing the conversation owns.
+///
+/// `meta.synthetic` on its own cannot answer that. The flag is set when every part of the
+/// harness row is marked `synthetic`, and on a persisted OpenCode row that marking means
+/// "the model sees this text, the user interface does not draw it as a human turn": OpenCode
+/// serializes such a row to the model on every pass, and it is never paired with `ignored`.
+/// Plugins use it for injected prompts and notices, and Magic Context's own Channel 2 nudge
+/// arrives the same way. Those rows are written to the session database with their own id and
+/// own the assistant replies that follow them, so dropping one rewrites the cached tail and
+/// leaves two assistants adjacent for the AI SDK to merge.
+///
+/// What Magic Context actually composes is the m0/m1 head -- the two leading user rows that
+/// carry the rendered context and memory blocks -- served without an id of its own and minted
+/// under the reserved `mc_` prefix, plus the assistant and tool halves of the synthetic todo
+/// pair. That is the same structural discriminator the TypeScript lane applies in
+/// `isSyntheticHeadMessage` (id-less, user role, every part synthetic): a row carrying a
+/// persisted harness id is a real turn and stays.
+pub(crate) fn is_module_composed_row(message: &CkIngressMessage) -> bool {
+    if !message.ck.meta.synthetic {
+        return false;
+    }
+    message.ck.role != "user" || message.mid.starts_with(RESERVED_ID_PREFIX)
 }
 
 pub(crate) fn user_terminated_tail_decision(
@@ -12944,6 +14598,34 @@ pub(crate) fn user_terminated_tail_decision(
         // array untouched — refusing here kills every tool-using turn.
         UserTerminatedTailDecision::Unchanged
     }
+}
+
+/// Move the caller's leading system messages ahead of the composed m0/m1 frames.
+///
+/// Some of Broca's renderers (OpenAI chat, and Responses without the instructions field)
+/// send system messages where they sit in the array, so frames placed first would put two
+/// user messages ahead of the system prompt. The renderers that lift system messages out
+/// are indifferent to the order. Only the run of system messages directly after the frames
+/// moves; the frame stems move with their frames so fingerprints keep naming them.
+fn place_leading_system_before_frames(
+    out: &mut [ServedMessage],
+    frame_block_stems: &mut Vec<Option<&'static str>>,
+) {
+    let frames = frame_block_stems.len();
+    if frames == 0 {
+        return;
+    }
+    let leading_systems = out[frames..]
+        .iter()
+        .take_while(|message| message.role == "system" && !message.meta.synthetic)
+        .count();
+    if leading_systems == 0 {
+        return;
+    }
+    out[..frames + leading_systems].rotate_left(frames);
+    let mut stems = vec![None; leading_systems];
+    stems.append(frame_block_stems);
+    *frame_block_stems = stems;
 }
 
 fn enforce_user_terminated_tail(
@@ -13139,17 +14821,22 @@ fn heal_poisoned_trailing_blank_decisions(
         .filter(|message| message.role == "assistant")
         .filter_map(|message| message.meta.harness_id.as_deref())
         .collect::<HashSet<_>>();
+    // One index for the whole pass: looking each assistant up with a scan of every frozen
+    // unit made this quadratic in a long session. The index keeps the first unit per key,
+    // which is what the scan found.
+    let frozen = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
     let mut healed_ids = source_decisions
         .iter()
         .filter(|&(mid, (decision, _))| {
             *decision == FrozenTrailingBlankDecision::Strip
                 && newest_assistant_mid != Some(mid.as_str())
                 && visible_assistant_ids.contains(mid.as_str())
-                && frozen_trailing_blank_decision(core, mid)
+                && output_trailing_blank_decision(&frozen, mid)
                     == Some(FrozenTrailingBlankDecision::Keep)
         })
         .map(|(mid, _)| mid.clone())
         .collect::<Vec<_>>();
+    drop(frozen);
     healed_ids.sort();
     if healed_ids.is_empty() {
         return healed_ids;
@@ -13189,6 +14876,9 @@ fn refresh_trailing_blank_decisions(
 
     let newest_assistant_mid = latest_assistant_mid(&req.messages);
     let mut updates = Vec::new();
+    // One index for the whole pass (first unit per key, as a scan finds it) instead of a
+    // scan of every frozen unit per rendered assistant, which was quadratic.
+    let frozen_units = FrozenUnitLookup::Indexed(FrozenUnitIndex::new(&core.frozen_units));
     for rendered in rendered_messages {
         let Some(mid) = rendered.meta.harness_id.as_deref() else {
             continue;
@@ -13199,10 +14889,10 @@ fn refresh_trailing_blank_decisions(
         let Some(&(decision, keep_count)) = source_decisions.get(mid) else {
             continue;
         };
-        let frozen = frozen_trailing_blank_decision(core, mid);
+        let frozen = output_trailing_blank_decision(&frozen_units, mid);
         let frozen_matches = frozen == Some(decision)
             && (decision == FrozenTrailingBlankDecision::Strip
-                || frozen_trailing_blank_keep_count(core, mid) == Some(keep_count));
+                || output_trailing_blank_keep_count(&frozen_units, mid) == Some(keep_count));
         // A strip is absorbing. If a harness blank arrives after the first serve, stripping it
         // forever makes streaming, completion, and historical projections suffix-monotonic.
         // A live keep may still change count or demote to strip when its source suffix disappears.
@@ -13216,6 +14906,7 @@ fn refresh_trailing_blank_decisions(
         }
         updates.push((mid.to_string(), decision, keep_count, frozen.is_some()));
     }
+    drop(frozen_units);
 
     let newest_replay_required = updates.iter().any(|(mid, decision, _, had_frozen)| {
         newest_assistant_mid == Some(mid.as_str())
@@ -13401,6 +15092,7 @@ fn build_output_with_tags_inner(
     prefix_dirty: bool,
     use_frozen_unit_index: bool,
 ) -> Result<BuiltOutput, TransformError> {
+    profile_start!(_perf_render, "rt10_output_build");
     let build_output_started_at = Instant::now();
     let mut build_timings = BuildOutputTimings::default();
     let mut out = Vec::with_capacity(4 + req.messages.len());
@@ -13416,6 +15108,9 @@ fn build_output_with_tags_inner(
         build_timings.frozen_unit_index = elapsed_ms(frozen_unit_index_started_at);
     }
     let mut prev_assistant = false;
+    // Record each composed frame as it is emitted. A subagent never reaches this block, so
+    // its output leads with ordinary history and the list stays empty.
+    let mut frame_block_stems: Vec<Option<&'static str>> = Vec::new();
 
     if !req.is_subagent {
         if let Some(unit) = frozen_units.by_key("m0") {
@@ -13442,6 +15137,7 @@ fn build_output_with_tags_inner(
                 reused,
             );
             out.push(served);
+            frame_block_stems.push(Some(M0_ID));
         }
         if let Some(unit) = frozen_units.by_key("m1") {
             let key = "synthetic:m1".to_string();
@@ -13463,6 +15159,7 @@ fn build_output_with_tags_inner(
                 reused,
             );
             out.push(served);
+            frame_block_stems.push(Some(M1_ID));
         }
     }
 
@@ -13494,9 +15191,7 @@ fn build_output_with_tags_inner(
     let output_mids = req
         .messages
         .iter()
-        .filter(|message| {
-            !message.ck.meta.synthetic || is_newest_synthetic_user_prompt(req, message)
-        })
+        .filter(|message| !is_module_composed_row(message))
         .filter(|message| {
             is_newest_synthetic_user_prompt(req, message)
                 || is_tail(message.ordinal, output_coverage)
@@ -13553,9 +15248,11 @@ fn build_output_with_tags_inner(
         .map(|anchor| synthetic_todo_render_anchor_mid(projection, anchor));
     let mut inserted_synthetic_todo = false;
     let tail_loop_started_at = Instant::now();
-    for msg in req.messages.iter().filter(|message| {
-        !message.ck.meta.synthetic || is_newest_synthetic_user_prompt(req, message)
-    }) {
+    for msg in req
+        .messages
+        .iter()
+        .filter(|message| !is_module_composed_row(message))
+    {
         let keep_live_synthetic_prompt = is_newest_synthetic_user_prompt(req, msg);
         let keep_leading_system = serializer_profile
             != Some(SerializerProfile::ClaudeCodeAnthropic)
@@ -13639,7 +15336,7 @@ fn build_output_with_tags_inner(
                 } else {
                     blocks
                         .iter()
-                        .filter(|block| !is_reasoning_block(&block.wire))
+                        .filter(|block| !is_reasoning_block(block.wire_shape()))
                         .filter(|block| {
                             block
                                 .arc_id
@@ -13649,7 +15346,10 @@ fn build_output_with_tags_inner(
                         .filter_map(|block| {
                             frozen_units
                                 .by_key(&format!("{RED_KEY_PREFIX}{}", block.id()))
-                                .filter(|unit| unit.kind != "image")
+                                // A real-argument skeleton serves its call block exactly
+                                // as the host sent it; only its paired results carry a
+                                // reduction.
+                                .filter(|unit| unit.kind != "image" && unit.kind != "skeleton_real")
                                 .map(|unit| (block.block_index, unit))
                         })
                         .collect()
@@ -13697,7 +15397,7 @@ fn build_output_with_tags_inner(
                                     .flatten()
                             };
                             rebuilt.content[block.block_index] = reduced_block(
-                                &block.wire,
+                                &msg.ck.content[block.block_index],
                                 display_payload
                                     .as_deref()
                                     .unwrap_or(unit.frozen_payload.as_str()),
@@ -13711,7 +15411,7 @@ fn build_output_with_tags_inner(
                 {
                     for block in blocks {
                         if reduced.contains_key(&block.block_index)
-                            || is_reasoning_block(&block.wire)
+                            || is_reasoning_block(block.wire_shape())
                         {
                             continue;
                         }
@@ -13719,7 +15419,7 @@ fn build_output_with_tags_inner(
                         let Some(unit) = frozen_units.by_key(&unit_key) else {
                             continue;
                         };
-                        if !matches!(&block.wire.kind, ck_wire::CkKind::Text { .. }) {
+                        if block.kind_tag != "text" {
                             continue;
                         }
                         rebuilt.content[block.block_index].kind = ck_wire::CkKind::Text {
@@ -13747,7 +15447,7 @@ fn build_output_with_tags_inner(
                     );
                     let drop_indexes: HashSet<usize> = blocks
                         .iter()
-                        .filter(|block| match &block.wire.kind {
+                        .filter(|block| match &block.wire_shape().kind {
                             ck_wire::CkKind::ToolCall { id, .. }
                             | ck_wire::CkKind::ToolResult { id, .. } => full_drop_ids.contains(id),
                             _ => false,
@@ -13885,6 +15585,9 @@ fn build_output_with_tags_inner(
             }
         }
     }
+    if serializer_profile == Some(SerializerProfile::OwnedBroca) {
+        place_leading_system_before_frames(&mut out, &mut frame_block_stems);
+    }
     if serializer_profile == Some(SerializerProfile::ClaudeCodeAnthropic) {
         let first_tail = out
             .iter()
@@ -13904,6 +15607,7 @@ fn build_output_with_tags_inner(
     build_timings.total = elapsed_ms(build_output_started_at);
     Ok(BuiltOutput {
         messages: out,
+        frame_block_stems,
         cache_entries,
         cache_stats,
         timings: build_timings,
@@ -14057,7 +15761,10 @@ fn reasoning_clear_cutoff_with_tags(
     is_bust_pass: bool,
     tag_numbers: &BTreeMap<String, u64>,
 ) -> Option<u64> {
-    if !is_bust_pass {
+    // Prefix-bound models never take this watermark lane: it skips an ineligible message
+    // instead of stopping there, so it could remove a block from the middle and invalidate
+    // every newer one. OpenCode serves them through the `reasoning_age` oldest-prefix walk.
+    if !is_bust_pass || is_prefix_bound_thinking_model(req.model_key.as_deref()) {
         return None;
     }
     let profile_supported = match profile {
@@ -14311,6 +16018,10 @@ struct MaterializeReasonInputs {
     legacy_baseline: bool,
     render_config_changed: bool,
     profile_transition: bool,
+    /// The external revision moved (workspace, project memory epoch, or an in-place
+    /// compartment rewrite by another writer), or a pending epoch was armed.
+    project_memory_epoch_due: bool,
+    history_revision_due: bool,
     first_fold_due: bool,
     ttl_expired: bool,
     coverage_fold_due: bool,
@@ -14328,6 +16039,8 @@ fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String>
         legacy_baseline,
         render_config_changed,
         profile_transition,
+        project_memory_epoch_due,
+        history_revision_due,
         first_fold_due,
         ttl_expired,
         coverage_fold_due,
@@ -14347,6 +16060,10 @@ fn classify_materialize_reason(input: MaterializeReasonInputs) -> Option<String>
                 "profile_transition"
             } else if render_config_changed {
                 "epoch_change"
+            } else if history_revision_due {
+                "compartment_history_revision"
+            } else if project_memory_epoch_due {
+                "project_memory_epoch"
             } else if coverage_fold_due || first_fold_due {
                 "coverage_fold"
             } else if ttl_expired {
@@ -14396,6 +16113,23 @@ pub(crate) mod tests {
         NoteCasOutcome, NoteEvaluationInput, NoteWriteInput, StoredCompartment,
     };
 
+    #[test]
+    fn historian_output_cap_is_scoped_to_each_transform_request() {
+        let request = |cap| {
+            serde_json::from_value::<TransformRequest>(serde_json::json!({
+                "session_id": "historian-cap",
+                "render_config": "{}",
+                "historian_model_chain": ["test/model"],
+                "historian_max_output_tokens": cap,
+            }))
+            .expect("valid historian request")
+        };
+        let first = request(4096);
+        let second = request(8192);
+        assert_eq!(first.historian_max_output_tokens, Some(4096));
+        assert_eq!(second.historian_max_output_tokens, Some(8192));
+    }
+
     fn resolve_test_cache_ttl(
         ctx: &mut ProducerContext<'_>,
         config: &crate::config::McModuleConfig,
@@ -14404,6 +16138,31 @@ pub(crate) mod tests {
         let resolved = config.resolve_cache_ttl_with_provenance(model_key);
         ctx.cache_ttl = resolved.value;
         ctx.cache_ttl_provenance = resolved.provenance;
+    }
+
+    #[test]
+    fn hygiene_v1_watermarks_convert_once_on_first_bust() {
+        let mut meta = ModuleMeta {
+            channel1_last_nudge_undropped: 20_000,
+            tail_hygiene_baseline: Some(TailHygieneBaseline {
+                channel1_post_reduce_grace_baseline_u: Some(10_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(!transition_hygiene_units(&mut meta, false, 1.551639));
+        assert_eq!(meta.channel1_last_nudge_undropped, 20_000);
+        assert!(transition_hygiene_units(&mut meta, true, 1.551639));
+        assert_eq!(meta.channel1_last_nudge_undropped, 31_033);
+        assert_eq!(
+            meta.tail_hygiene_baseline
+                .as_ref()
+                .and_then(|baseline| baseline.channel1_post_reduce_grace_baseline_u),
+            Some(15_516)
+        );
+        assert!(!transition_hygiene_units(&mut meta, true, 1.551639));
+        assert_eq!(meta.channel1_last_nudge_undropped, 31_033);
     }
 
     #[test]
@@ -14803,7 +16562,7 @@ pub(crate) mod tests {
     use serde_json::{json, Value};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
+        McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,
@@ -14950,6 +16709,7 @@ pub(crate) mod tests {
             "native_cache_refused_store",
             "native_cache_degraded_store",
             "native_cache_evicted",
+            "native_cache_reencode_drift",
             "frozen_units",
             "tail_units_matched",
             "projection_blocks",
@@ -15083,6 +16843,295 @@ pub(crate) mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Stage profile of a large real session, rebuilt with scrubbed content.
+    ///
+    /// Inputs (all read-only copies; the live store is never opened):
+    /// - `MC_PROFILE_STORE`: a `store.db` copy (`sqlite3 -readonly <live> "VACUUM INTO ..."`).
+    ///   It is copied again into a temporary directory before anything opens it.
+    /// - `MC_PROFILE_SESSION`: the session id.
+    /// - `MC_PROFILE_IDENTITIES`: `mid|identities-json` lines exported from that copy's
+    ///   `mc_block_identities`, giving every message's block kinds in order.
+    /// - `MC_PROFILE_SHAPE`: tab-separated `mid role created_ms completed_ms` lines exported
+    ///   from the host database in host order (roles and times only, no content). A line's
+    ///   position is the message ordinal, plus the optional `MC_PROFILE_ORDINAL_OFFSET`.
+    ///
+    /// Every block keeps its real id, kind and, when tagged, its stored source length; all text
+    /// is replaced by filler. The session's real tag rows stay in the store, so tag caching,
+    /// hygiene attribution and temporal marks run at production scale. Cache state and the
+    /// session's coverage rows are cleared so the first pass bootstraps deterministically and
+    /// the whole rebuilt array is live tail. Prints stage timings per pass and a
+    /// digest of each served array, so two builds can be compared for time and bytes.
+    #[test]
+    #[ignore = "requires scrubbed real-session inputs; see the doc comment"]
+    fn real_session_stage_profile() {
+        use mc_store::{
+            CkKind, CkOutputKind, CkToolOutput, HarnessMeta, MediaBlock, MediaKind, OpaqueBlock,
+            ProviderExtras,
+        };
+        use sha2::{Digest, Sha256};
+        let env = |key: &str| std::env::var(key).unwrap_or_else(|_| panic!("{key} is required"));
+        let session = env("MC_PROFILE_SESSION");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(env("MC_PROFILE_STORE"), dir.path().join("store.db")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+            conn.execute("DELETE FROM mc_cache_state", []).unwrap();
+            // The rebuilt array cannot reproduce the host's exact ordinals, so stored coverage
+            // (compartments, roots, fingerprints, frontiers, queued drops) would claim positions
+            // the array cannot match. Clearing the session's rows except tags and the overlays
+            // keyed by block id makes the whole rebuilt array live tail, which keeps every
+            // tagged block in the projection.
+            const KEEP: [&str; 6] = [
+                "mc_tags",
+                "mc_tag_cache_generations",
+                "mc_temporal_marks",
+                "mc_user_hints",
+                "mc_channel1_appends",
+                "mc_notes",
+            ];
+            let tables = conn
+                .prepare(
+                    "SELECT m.name FROM sqlite_master m WHERE m.type = 'table' AND EXISTS \
+                     (SELECT 1 FROM pragma_table_info(m.name) WHERE name = 'session_id')",
+                )
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for table in tables
+                .iter()
+                .filter(|table| !KEEP.contains(&table.as_str()))
+            {
+                conn.execute(
+                    &format!("DELETE FROM \"{table}\" WHERE session_id = ?1"),
+                    rusqlite::params![session],
+                )
+                .unwrap();
+            }
+            conn.execute("UPDATE cortexkit_fence SET epoch=1", [])
+                .unwrap();
+        }
+        let s = store(dir.path());
+        let tag_lengths = s
+            .load_tags_for_session(&session)
+            .unwrap()
+            .into_iter()
+            .map(|tag| (tag.block_id, tag.source_bytes.len()))
+            .collect::<HashMap<_, _>>();
+        let shape = std::fs::read_to_string(env("MC_PROFILE_SHAPE")).unwrap();
+        // Host ordinals can differ from the export's row position by a constant when the host
+        // skips rows; `MC_PROFILE_ORDINAL_OFFSET` corrects that so stored anchors line up.
+        let ordinal_offset = std::env::var("MC_PROFILE_ORDINAL_OFFSET")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let shape = shape
+            .lines()
+            .enumerate()
+            .filter_map(|(position, line)| {
+                let mut fields = line.split('\t');
+                let mid = fields.next()?;
+                let role = fields.next()?;
+                let created = fields.next().and_then(|v| v.parse::<i64>().ok());
+                let completed = fields.next().and_then(|v| v.parse::<i64>().ok());
+                Some((
+                    mid.to_string(),
+                    (
+                        role.to_string(),
+                        created,
+                        completed,
+                        (position as i64 + 1 + ordinal_offset).max(1) as u64,
+                    ),
+                ))
+            })
+            .collect::<HashMap<_, _>>();
+        let filler = |len: usize| {
+            let mut text = "scrubbed ".repeat(len / 9 + 1);
+            text.truncate(len.max(1));
+            text
+        };
+        let identities = std::fs::read_to_string(env("MC_PROFILE_IDENTITIES")).unwrap();
+        let mut messages = Vec::new();
+        let mut last_created = 0;
+        for line in identities.lines() {
+            let Some((mid, json_text)) = line.split_once('|') else {
+                continue;
+            };
+            let kinds: Vec<Value> = serde_json::from_str(json_text).unwrap();
+            // Real ordinals (host order) keep stored compartments and anchors consistent.
+            let (role, created, completed, ordinal) =
+                shape.get(mid).cloned().unwrap_or_else(|| {
+                    let after = messages.last().map_or(0, |m: &CkIngressMessage| m.ordinal);
+                    ("assistant".to_string(), None, None, after + 1)
+                });
+            let mut call_id = String::new();
+            let blocks = kinds
+                .iter()
+                .enumerate()
+                .map(|(index, identity)| {
+                    let len = tag_lengths
+                        .get(&format!("{mid}#{index}"))
+                        .copied()
+                        .unwrap_or(16);
+                    let kind = match identity["kind_tag"].as_str().unwrap_or("opaque") {
+                        "text" => CkKind::Text { text: filler(len) },
+                        "reasoning" => CkKind::Reasoning {
+                            text: filler(64),
+                            signature: Some(format!("sig-{mid}-{index}")),
+                        },
+                        "redacted_reasoning" => CkKind::RedactedReasoning { data: filler(32) },
+                        "tool_call" => {
+                            call_id = format!("call_{mid}_{index}");
+                            CkKind::ToolCall {
+                                id: call_id.clone(),
+                                name: "read".to_string(),
+                                input: json!({ "path": format!("file-{index}") }),
+                                provider_executed: false,
+                            }
+                        }
+                        "tool_result" => CkKind::ToolResult {
+                            id: call_id.clone(),
+                            tool_name: "read".to_string(),
+                            output: CkToolOutput::bare(CkOutputKind::Text { text: filler(len) }),
+                            provider_executed: false,
+                        },
+                        "media" => CkKind::Media(MediaBlock {
+                            kind: MediaKind::Image,
+                            media_type: "image/png".to_string(),
+                            filename: None,
+                            source: json!({ "type": "data_base64", "data": "aGVsbG8=" }),
+                        }),
+                        _ => CkKind::Opaque(OpaqueBlock {
+                            source: json!({ "type": "harness", "harness": "opencode" }),
+                            kind: "step-start".to_string(),
+                            raw: json!({ "type": "step-start" }),
+                            arc: None,
+                        }),
+                    };
+                    CkWireBlock::bare(kind)
+                })
+                .collect::<Vec<_>>();
+            // Keep block positions (and so block ids) stable while making every arc complete:
+            // an unanswered call becomes an opaque step, an unmatched result becomes text.
+            let answered = blocks
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::ToolResult { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let called = blocks
+                .iter()
+                .filter_map(|block| match &block.kind {
+                    CkKind::ToolCall { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let blocks = blocks
+                .into_iter()
+                .map(|block| match block.kind {
+                    CkKind::ToolCall { ref id, .. } if !answered.contains(id) => {
+                        CkWireBlock::bare(CkKind::Opaque(OpaqueBlock {
+                            source: json!({ "type": "harness", "harness": "opencode" }),
+                            kind: "step-start".to_string(),
+                            raw: json!({ "type": "step-start" }),
+                            arc: None,
+                        }))
+                    }
+                    CkKind::ToolResult {
+                        ref id, ref output, ..
+                    } if !called.contains(id) => {
+                        let text = match &output.kind {
+                            CkOutputKind::Text { text } => text.clone(),
+                            _ => String::new(),
+                        };
+                        CkWireBlock::bare(CkKind::Text { text })
+                    }
+                    _ => block,
+                })
+                .collect::<Vec<_>>();
+            let mut ck = CkWireMessage::from_parts(
+                &role,
+                blocks,
+                None,
+                ProviderExtras::new(),
+                HarnessMeta::default(),
+            );
+            ck.meta.created_at_ms = created;
+            ck.meta.completed_at_ms = completed;
+            last_created = last_created.max(created.unwrap_or(0));
+            messages.push(CkIngressMessage {
+                mid: mid.to_string(),
+                ordinal,
+                ck,
+            });
+        }
+        messages.sort_by_key(|message| message.ordinal);
+        let mut request = req(&session, "profile", messages);
+        request.serializer_profile = "opencode-aisdk".into();
+        // A host with the reduce tool, so tag minting and the tag overlay are active.
+        request.tool_present = true;
+        let dir_text = dir.path().to_str().unwrap().to_string();
+        let context = pctx("git:profile", &dir_text, last_created + 60_000);
+        let mut appended = request.clone();
+        let mut next = item(
+            "msg_zzzz_profile_append",
+            appended.messages.last().map_or(1, |m| m.ordinal + 1),
+            "one more question",
+        );
+        next.ck.meta.created_at_ms = Some(last_created + 30_000);
+        appended.messages.push(next);
+        eprintln!(
+            "real-profile session={session} messages={} tags={} tag_source_bytes={}",
+            request.messages.len(),
+            tag_lengths.len(),
+            tag_lengths.values().sum::<usize>()
+        );
+        for (name, pass_request) in [
+            ("A-bootstrap", &request),
+            ("B1-replay", &request),
+            ("B2-replay", &request),
+            ("B3-replay", &request),
+            ("C-append", &appended),
+            ("D-replay", &appended),
+        ] {
+            let started = Instant::now();
+            let output = apply_once_with_estimator_and_projection(
+                &s,
+                pass_request,
+                &context,
+                mc_tokenizer::estimate_tokens,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+            let execute_ms = elapsed_ms(started);
+            let mut digest = Sha256::new();
+            for message in output.response.messages() {
+                digest.update(serde_json::to_vec(&**message).unwrap());
+            }
+            let tags = s.load_tags_for_session(&session).unwrap();
+            let timings = output.response.timings.as_ref().unwrap();
+            eprintln!(
+                "real-profile pass={name} decision={} transform_execute={execute_ms:.1} planning={:.1} state_evolution={:.1} tag_overlay={:.1} temporal={:.1} caveman={:.1} build_output={:.1} total={:.1} served_messages={} tags={} max_tag={} served_sha256={:x}",
+                output.response.decision,
+                timings.planning,
+                timings.state_evolution,
+                timings.tag_overlay,
+                timings.temporal,
+                timings.caveman,
+                timings.build_output,
+                timings.total,
+                output.response.messages().len(),
+                tags.len(),
+                tags.last().map_or(0, |tag| tag.tag_number),
+                digest.finalize()
+            );
         }
     }
 
@@ -15236,6 +17285,23 @@ pub(crate) mod tests {
     /// message AND every block; typed-constructor fixtures (`from_parts`/`bare`)
     /// don't, which is exactly how an output-overlay bug can hide from a fixture
     /// while dropping bytes on the wire.
+    fn reasoning_item(id: &str, ordinal: u64, reasoning: &str, text: &str) -> CkIngressMessage {
+        let mut message = wire_item("assistant", id, ordinal, &[text]);
+        message.ck.content.insert(
+            0,
+            serde_json::from_value(json!({
+                "kind": {
+                    "type": "reasoning",
+                    "text": reasoning,
+                    "signature": format!("{id}-signature")
+                }
+            }))
+            .unwrap(),
+        );
+        message.ck.mark_modified();
+        message
+    }
+
     fn wire_item(role: &str, id: &str, ordinal: u64, texts: &[&str]) -> CkIngressMessage {
         let content: Vec<Value> = texts
             .iter()
@@ -15560,6 +17626,523 @@ pub(crate) mod tests {
         }
     }
 
+    /// Byte-exact shape OpenCode 1.17.8 hands plugins for a user message sent mid-run.
+    fn steering_wrapped(user_text: &str) -> String {
+        format!(
+            "<system-reminder>\nThe user sent the following message:\n{user_text}\n\nPlease address this message and continue with your tasks.\n</system-reminder>"
+        )
+    }
+
+    #[test]
+    fn steering_wrapped_user_message_survives_injection_strip_on_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let wrapped = steering_wrapped("Stop and use the staging database instead.");
+        let mut messages = vec![wire_item("user", "steer", 1, &[wrapped.as_str()])];
+        messages.extend(
+            (2..=41).map(|ordinal| item(&format!("tail-{ordinal}"), ordinal, "authored tail")),
+        );
+        let request = req("steering-wrapper", "cfg0", messages);
+
+        let bust = run(&store, &request, &spine());
+        assert_eq!(bust.action, "HARD");
+        assert_eq!(tail_bytes(&bust, "steer"), wrapped);
+        let frozen = store.load("steering-wrapper").unwrap();
+        assert!(
+            !frozen
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key.contains("steer")),
+            "a wrapped user message must not freeze a strip unit"
+        );
+    }
+
+    #[test]
+    fn steering_wrapper_is_kept_while_harness_reminders_around_it_strip() {
+        let wrapped = steering_wrapped("use staging");
+        assert_eq!(strip_system_injection(&wrapped), None);
+        let nested = steering_wrapped("quote <system-reminder>x</system-reminder> then go");
+        assert_eq!(strip_system_injection(&nested), None);
+        let mixed =
+            format!("{wrapped}\n\n<system-reminder>\nPlan mode is active.\n</system-reminder>");
+        assert_eq!(
+            strip_system_injection(&mixed).as_deref(),
+            Some(wrapped.as_str())
+        );
+        assert_eq!(
+            strip_system_injection("<system-reminder>internal</system-reminder>").as_deref(),
+            Some("")
+        );
+    }
+
+    fn planning_carrier(id: &str, ordinal: u64, bytes: usize) -> CkIngressMessage {
+        let mut message = item(id, ordinal, "caption");
+        message
+            .ck
+            .content
+            .push(CkWireBlock::bare(ck_wire::CkKind::Media(
+                ck_wire::MediaBlock {
+                    kind: ck_wire::MediaKind::Image,
+                    media_type: "image/png".to_string(),
+                    filename: None,
+                    source: json!({"type": "data_base64", "data": "aB3+".repeat(bytes / 4)}),
+                },
+            )));
+        message
+    }
+
+    #[test]
+    fn planning_carrier_tokenization_cost_is_bounded() {
+        for (count, bytes) in [(1, 64), (64, 65_536)] {
+            let messages = (0..count)
+                .flat_map(|i| {
+                    [
+                        planning_carrier(&format!("carrier-{i}"), i as u64 + 1, bytes),
+                        opaque_result_carrier(&format!("opaque-{i}"), i as u64 + 1, "user"),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let projection = project_messages(&messages).unwrap();
+            let tags = projection
+                .blocks
+                .iter()
+                .filter(|block| block.kind_tag == "text")
+                .map(|block| (block.id.as_str(), 3))
+                .collect::<HashMap<_, _>>();
+            let calls = std::cell::Cell::new(0);
+            for block in &projection.blocks {
+                sel_item_from_flat_with_estimator(block, &tags, |_| {
+                    calls.set(calls.get() + 1);
+                    99
+                });
+            }
+            assert_eq!(calls.get(), 0, "carrier count={count}, bytes={bytes}");
+        }
+    }
+
+    fn payload_tag(number: i64, block_id: &str, payload: &str) -> McTagRow {
+        McTagRow {
+            tag_number: number,
+            block_id: block_id.to_string(),
+            kind: "message".to_string(),
+            token_count: number * 3,
+            created_at_ms: number * 1_000,
+            source_bytes: payload.as_bytes().into(),
+        }
+    }
+
+    /// A pass that mints nothing must leave the tag rows shared with the retained baseline, and
+    /// a pass that mints must produce exactly the rows and start index the copying append did
+    /// while sharing every earlier row's stored payload instead of copying it.
+    #[test]
+    fn tag_mint_append_shares_rows_and_payloads() {
+        let baseline = Arc::new(vec![
+            payload_tag(4, "a#0", "alpha payload"),
+            payload_tag(9, "b#0", "beta payload"),
+            payload_tag(7, "c#0", "gamma payload"),
+        ]);
+        let mut rows = Arc::clone(&baseline);
+        assert_eq!(append_minted_tag_rows(&mut rows, Vec::new(), 5), 3);
+        assert!(
+            Arc::ptr_eq(&rows, &baseline),
+            "a no-mint pass copied the rows"
+        );
+
+        let mint = || {
+            vec![TagMintInput {
+                block_id: "d#0".to_string(),
+                kind: "tool_result".to_string(),
+                token_count: -2,
+                source_bytes: b"delta".to_vec(),
+            }]
+        };
+        let start = append_minted_tag_rows(&mut rows, mint(), 5);
+        let mut copying = (*baseline).clone();
+        let copying_start = append_tag_mint_rows(&mut copying, mint(), 5);
+        assert_eq!(
+            (start, rows.as_slice()),
+            (copying_start, copying.as_slice())
+        );
+        assert_eq!(rows[3].tag_number, 10);
+        assert_eq!(baseline.len(), 3, "the retained baseline is not mutated");
+        for (row, original) in rows.iter().zip(baseline.iter()) {
+            assert!(Arc::ptr_eq(&row.source_bytes, &original.source_bytes));
+        }
+    }
+
+    /// Hygiene preparation keeps exactly the rows, order and identities the cloning version
+    /// kept, but none of their stored payload bytes.
+    #[test]
+    fn hygiene_rows_are_identity_only_and_match_cloned_rows() {
+        let projection = project_messages(&[
+            item("live-a", 1, "first"),
+            item("live-b", 2, "second"),
+            item("live-c", 3, "third"),
+        ])
+        .unwrap();
+        let stored = vec![
+            payload_tag(1, "gone#0", &"historical ".repeat(500)),
+            payload_tag(2, "live-a#0", "first"),
+            payload_tag(3, "live-b#0", "second"),
+        ];
+        let overlay = TagOverlayState {
+            // live-a keeps its stored number, live-b was renumbered, live-c is a new mint.
+            tag_by_block_id: BTreeMap::from([
+                ("live-a#0".to_string(), 2),
+                ("live-b#0".to_string(), 30),
+                ("live-c#0".to_string(), 4),
+            ]),
+            ..Default::default()
+        };
+        for derive_when_empty in [false, true] {
+            let view = tag_rows_for_hygiene(&projection, &stored, &overlay, derive_when_empty);
+            assert!(view.iter().all(|row| row.source_bytes.is_empty()));
+            let identities = |rows: &[McTagRow]| {
+                rows.iter()
+                    .map(|row| {
+                        (
+                            row.tag_number,
+                            row.block_id.clone(),
+                            row.kind.clone(),
+                            row.token_count,
+                            row.created_at_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            // The cloning version: surviving stored rows copied whole, then the same additions.
+            let projected = projection
+                .blocks
+                .iter()
+                .map(|block| block.id.as_str())
+                .collect::<HashSet<_>>();
+            let mut cloned = stored
+                .iter()
+                .filter(|row| {
+                    !projected.contains(row.block_id.as_str())
+                        || overlay.tag_by_block_id.get(&row.block_id) == Some(&row.tag_number)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            cloned.push(McTagRow {
+                tag_number: 4,
+                block_id: "live-c#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            });
+            cloned.push(McTagRow {
+                tag_number: 30,
+                block_id: "live-b#0".to_string(),
+                kind: "message".to_string(),
+                token_count: 0,
+                created_at_ms: 0,
+                source_bytes: Default::default(),
+            });
+            cloned.sort_by_key(|row| row.tag_number);
+            assert_eq!(identities(&view), identities(&cloned));
+        }
+    }
+
+    /// A timestamped conversation for the temporal differential: users with one or two text
+    /// blocks, assistants with and without completion times, gaps from seconds to days, and
+    /// one user repeated under the same id.
+    fn temporal_fixture(messages: usize) -> TransformRequest {
+        let mut created = 1_700_000_000_000i64;
+        let mut out = Vec::new();
+        for n in 0..messages {
+            let role = if n % 2 == 0 { "user" } else { "assistant" };
+            let texts: &[&str] = if n % 6 == 0 { &["a", "b"] } else { &["only"] };
+            let mid = if n == 40 {
+                "u0".to_string()
+            } else {
+                format!("u{n}")
+            };
+            let mut message = wire_item(role, &mid, n as u64 + 1, texts);
+            created += [1_000, 90_000, 4_000_000, 90_000_000, 7][n % 5];
+            message.ck.meta.created_at_ms = (n % 17 != 3).then_some(created);
+            message.ck.meta.completed_at_ms =
+                (role == "assistant" && n % 3 == 0).then_some(created + 500);
+            out.push(message);
+        }
+        req("temporal-diff", "cfg0", out)
+    }
+
+    /// `timestamp_temporal_marks` before the first-text-block index: a front-to-back
+    /// projection search per authored user. Kept only as the differential reference.
+    fn scanning_timestamp_temporal_marks(
+        req: &TransformRequest,
+        projection: &FlatProjection,
+        mutation_exempt_mid: Option<&str>,
+        lineage_anchor_mid: Option<&str>,
+    ) -> Vec<TemporalMarkInput> {
+        let mut previous = None;
+        let mut marks = Vec::new();
+        for message in &req.messages {
+            if is_authored_user_message(message)
+                && mutation_exempt_mid != Some(message.mid.as_str())
+                && lineage_anchor_mid != Some(message.mid.as_str())
+            {
+                let marker_text = previous.and_then(|prior: &CkIngressMessage| {
+                    let previous_created = prior.ck.meta.created_at_ms?;
+                    let current_created = message.ck.meta.created_at_ms?;
+                    let previous_end = prior.ck.meta.completed_at_ms.unwrap_or(previous_created);
+                    Some(
+                        current_created
+                            .checked_sub(previous_end)
+                            .and_then(temporal_gap_prefix)
+                            .unwrap_or_default(),
+                    )
+                });
+                if let Some(marker_text) = marker_text {
+                    if let Some(block_id) = projection.blocks.iter().find_map(|block| {
+                        (block.mid == message.mid && block.kind_tag == "text")
+                            .then(|| block.id.clone())
+                    }) {
+                        marks.push(TemporalMarkInput {
+                            ordinal: message.ordinal,
+                            block_id,
+                            marker_text,
+                        });
+                    }
+                }
+            }
+            previous = Some(message);
+        }
+        marks
+    }
+
+    /// The canonical-mark reconciliation before the row index: a front-to-back row search
+    /// per mark. Kept only as the differential reference.
+    fn scanning_reconcile_canonical_temporal_marks(
+        temporal_rows: &mut Vec<TemporalMarkRow>,
+        canonical_marks: Vec<TemporalMarkInput>,
+        rewrite_temporal_marks: bool,
+        frontier: Option<u64>,
+        now_ms: i64,
+        decided_temporal: &mut HashSet<String>,
+    ) -> Vec<TemporalMarkInput> {
+        let mut temporal_marks = Vec::new();
+        for mark in canonical_marks {
+            if let Some(existing) = temporal_rows
+                .iter_mut()
+                .find(|row| row.block_id == mark.block_id)
+            {
+                if rewrite_temporal_marks && existing.marker_text != mark.marker_text {
+                    existing.marker_text = mark.marker_text.clone();
+                    temporal_marks.push(mark);
+                }
+                continue;
+            }
+            let is_new = frontier.is_none_or(|frontier| mark.ordinal > frontier);
+            if !rewrite_temporal_marks && !is_new {
+                continue;
+            }
+            temporal_rows.push(TemporalMarkRow {
+                block_id: mark.block_id.clone(),
+                marker_text: mark.marker_text.clone(),
+                created_at: now_ms,
+            });
+            decided_temporal.insert(mark.block_id.clone());
+            temporal_marks.push(mark);
+        }
+        temporal_marks
+    }
+
+    /// Indexed temporal overlays must reproduce the scanning implementation exactly: the
+    /// canonical marks, the reconciled rows (including rewrites of old marks far behind the
+    /// frontier, duplicate stored rows and rows for absent blocks), the decided set, and the
+    /// timestamp-free first-minted-text-block choice for every message.
+    #[test]
+    fn indexed_temporal_overlays_match_scanning_reference() {
+        let request = temporal_fixture(240);
+        let projection = project_messages(&request.messages).unwrap();
+        for (exempt, anchor) in [(None, None), (Some("u12"), Some("u30"))] {
+            let canonical = timestamp_temporal_marks(&request, &projection, exempt, anchor);
+            assert_eq!(
+                canonical,
+                scanning_timestamp_temporal_marks(&request, &projection, exempt, anchor)
+            );
+            assert!(canonical.iter().any(|mark| !mark.marker_text.is_empty()));
+            // Stored rows: some old marks with stale text, a duplicated block, an absent block.
+            let mut stored = Vec::new();
+            for (index, mark) in canonical.iter().enumerate().filter(|(i, _)| i % 3 == 0) {
+                stored.push(TemporalMarkRow {
+                    block_id: mark.block_id.clone(),
+                    marker_text: if index % 2 == 0 {
+                        mark.marker_text.clone()
+                    } else {
+                        "stale".to_string()
+                    },
+                    created_at: index as i64,
+                });
+            }
+            stored.push(stored[0].clone());
+            stored.push(TemporalMarkRow {
+                block_id: "absent#0".to_string(),
+                marker_text: String::new(),
+                created_at: 1,
+            });
+            for rewrite in [false, true] {
+                for frontier in [None, Some(0), Some(120), Some(10_000)] {
+                    let mut rows = stored.clone();
+                    let mut decided = rows.iter().map(|row| row.block_id.clone()).collect();
+                    let marks = reconcile_canonical_temporal_marks(
+                        &mut rows,
+                        canonical.clone(),
+                        rewrite,
+                        frontier,
+                        99,
+                        &mut decided,
+                    );
+                    let mut reference_rows = stored.clone();
+                    let mut reference_decided = reference_rows
+                        .iter()
+                        .map(|row| row.block_id.clone())
+                        .collect();
+                    let reference_marks = scanning_reconcile_canonical_temporal_marks(
+                        &mut reference_rows,
+                        canonical.clone(),
+                        rewrite,
+                        frontier,
+                        99,
+                        &mut reference_decided,
+                    );
+                    let case = format!("rewrite={rewrite} frontier={frontier:?}");
+                    assert_eq!(marks, reference_marks, "{case}");
+                    assert_eq!(rows, reference_rows, "{case}");
+                    assert_eq!(decided, reference_decided, "{case}");
+                }
+            }
+        }
+        // Timestamp-free path: the first minted text block per message.
+        let minted = projection
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 4 != 1)
+            .map(|(index, block)| (block.id.as_str(), index as i64))
+            .collect::<HashMap<_, _>>();
+        let text_blocks = text_blocks_by_message_id(&projection);
+        let mut found = 0;
+        for message in &request.messages {
+            let reference = projection
+                .blocks
+                .iter()
+                .filter(|block| block.mid == message.mid)
+                .find_map(|block| {
+                    (block.kind_tag == "text")
+                        .then(|| {
+                            minted
+                                .get(block.id.as_str())
+                                .copied()
+                                .map(|created_at| (block.id.clone(), created_at))
+                        })
+                        .flatten()
+                });
+            let indexed = first_minted_text_block(text_blocks.get(message.mid.as_str()), &minted);
+            found += usize::from(indexed.is_some());
+            assert_eq!(indexed, reference, "{}", message.mid);
+        }
+        assert!(found > 100);
+    }
+
+    #[test]
+    fn planning_text_still_estimates_and_respects_tags() {
+        let projection = project_messages(&[item("text", 1, "untagged prose")]).unwrap();
+        let block = &projection.blocks[0];
+        let calls = std::cell::Cell::new(0);
+        let selected = sel_item_from_flat_with_estimator(block, &HashMap::new(), |_| {
+            calls.set(calls.get() + 1);
+            99
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(selected.served_token_count, Some(99));
+        let selected = sel_item_from_flat_with_estimator(
+            block,
+            &HashMap::from([(block.id.as_str(), 7)]),
+            |_| panic!("persisted count must win"),
+        );
+        assert_eq!(selected.served_token_count, Some(7));
+    }
+
+    #[test]
+    #[ignore = "requires CEREB_MEDIA_FIXTURE pointing to a local JSON array of data URLs"]
+    fn planning_carrier_live_payload_timing() {
+        let urls: Vec<String> = serde_json::from_slice(
+            &std::fs::read(std::env::var("CEREB_MEDIA_FIXTURE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        for count in 0..=urls.len() {
+            let messages = urls[..count]
+                .iter()
+                .enumerate()
+                .map(|(i, url)| {
+                    let mut message = planning_carrier(&format!("live-{i}"), i as u64 + 1, 0);
+                    let ck_wire::CkKind::Media(media) = &mut message.ck.content[1].kind else {
+                        unreachable!()
+                    };
+                    media.source = json!({"url": url});
+                    message
+                })
+                .collect::<Vec<_>>();
+            let projection = project_messages(&messages).unwrap();
+            let carriers = projection
+                .blocks
+                .iter()
+                .filter(|b| b.kind_tag == "media")
+                .collect::<Vec<_>>();
+            let bytes: usize = carriers.iter().map(|b| b.bytes.len()).sum();
+            let started = Instant::now();
+            for block in &carriers {
+                std::hint::black_box(mc_tokenizer::estimate_tokens(&block.bytes));
+            }
+            let before = elapsed_ms(started);
+            let started = Instant::now();
+            for block in &carriers {
+                std::hint::black_box(sel_item_from_flat(block, &HashMap::new()));
+            }
+            eprintln!(
+                "carrier timing count={count} bytes={bytes} legacy_ms={before:.3} fixed_ms={:.3}",
+                elapsed_ms(started)
+            );
+        }
+    }
+
+    #[test]
+    fn planning_carrier_replay_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut request = req(
+            "planning-carrier-replay",
+            "cfg0",
+            vec![
+                item("head", 1, "older history"),
+                planning_carrier("image-user", 2, 4096),
+            ],
+        );
+        request.serializer_profile = "opencode-aisdk".to_string();
+        let mut hashes = Vec::new();
+        for _ in 0..3 {
+            let response = run(&store, &request, &spine());
+            let bytes = serde_json::to_vec(&response.ck_messages).unwrap();
+            hashes.push(format!("{}:{:x}", response.action, Sha256::digest(&bytes)));
+        }
+        // This digest records CK response bytes with media token estimation still enabled,
+        // so removing the unused estimate must preserve bootstrap and replay output.
+        let digest = "116dd7f9afc3d7bef3de4f2520945161fa244ecb7e4134f5bc1187e377668083";
+        assert_eq!(
+            hashes,
+            [
+                format!("HARD:{digest}"),
+                format!("SOFT+:{digest}"),
+                format!("SOFT+:{digest}")
+            ]
+        );
+    }
+
     #[test]
     fn untagged_answered_image_strips_on_bust_and_replays() {
         let dir = tempfile::tempdir().unwrap();
@@ -15814,6 +18397,7 @@ pub(crate) mod tests {
             session_id: session.to_string(),
             render_config: cfg.to_string(),
             system_prompt_hash: String::new(),
+            adopted_system_prompt_hash: None,
             upgrade_state: String::new(),
             is_subagent: false,
             protected_tags: 20,
@@ -15852,6 +18436,9 @@ pub(crate) mod tests {
             detected_context_limit_model_key: None,
             history_budget_tokens: None,
             historian_model_chain: None,
+            historian_model_limits: Default::default(),
+            historian_max_output_tokens: None,
+            historian_timeout_ms: None,
             declared_trim: None,
             lineage_switched: false,
             descent_edge_id: 0,
@@ -16002,18 +18589,6 @@ pub(crate) mod tests {
         request
     }
 
-    fn acknowledge_test_host_memory(store: &McStore, project_path: &str, id: i64) {
-        store
-            .acknowledge_host_memory_ids(
-                project_path,
-                &[mc_store::HostMemoryIdentityAck {
-                    module_row_id: id,
-                    host_row_id: id,
-                }],
-            )
-            .unwrap();
-    }
-
     fn memory_input<'a>(
         project_path: &'a str,
         category: &'a str,
@@ -16061,6 +18636,7 @@ pub(crate) mod tests {
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
             historian_active: false,
             wrapup_active: false,
+            caveman_english_word_rules: true,
             injected_reductions: Vec::new(),
         }
     }
@@ -16372,14 +18948,44 @@ pub(crate) mod tests {
             "synthetic".to_string(),
         ));
 
-        let block_ids = served_output_fingerprints(&[single, multiple, synthetic])
+        let block_ids = served_output_fingerprints(&[single, multiple, synthetic], &[])
             .into_iter()
             .map(|fingerprint| fingerprint.block_id)
             .collect::<Vec<_>>();
         assert_eq!(
             block_ids,
-            ["single#0", "multiple#0", "multiple#1", "mc_m0#0"]
+            ["single#0", "multiple#0", "multiple#1", "mc_synthetic:0#0"]
         );
+    }
+
+    #[test]
+    fn served_fingerprint_frame_ids_come_from_the_emitted_frames() {
+        let m0 = ServedMessage::from_message(CkWireMessage::synthetic_user_text("m0".to_string()));
+        let m1 = ServedMessage::from_message(CkWireMessage::synthetic_user_text("m1".to_string()));
+        let trailing_prompt =
+            ServedMessage::from_message(CkWireMessage::synthetic_user_text("notice".to_string()));
+        let turn = ServedMessage::from_message(text_message("turn", "one"));
+
+        let with_frames = served_output_fingerprints(
+            &[m0, m1, turn.clone(), trailing_prompt.clone()],
+            &[Some(M0_ID), Some(M1_ID)],
+        )
+        .into_iter()
+        .map(|fingerprint| fingerprint.block_id)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            with_frames,
+            ["mc_m0#0", "mc_m1#0", "turn#0", "mc_synthetic:2#0"]
+        );
+
+        // A frameless output (every subagent pass) must not hand a frame id to the
+        // harness-authored prompt that happens to lead its synthetic messages: the host
+        // treats `mc_m0#0` as proof the frozen prefix changed and freezes its replay.
+        let frameless = served_output_fingerprints(&[turn, trailing_prompt], &[])
+            .into_iter()
+            .map(|fingerprint| fingerprint.block_id)
+            .collect::<Vec<_>>();
+        assert_eq!(frameless, ["turn#0", "mc_synthetic:0#0"]);
     }
 
     #[test]
@@ -16426,10 +19032,11 @@ pub(crate) mod tests {
             Some("inserted#0")
         );
         let trace = store.load_pass_trace(session).unwrap().unwrap();
-        let inserted_json = serde_json::to_string(inserted_divergence).unwrap();
+        let inserted_json: Value =
+            serde_json::from_str(trace.first_divergence.as_deref().unwrap()).unwrap();
         assert_eq!(
-            trace.first_divergence.as_deref(),
-            Some(inserted_json.as_str())
+            inserted_json,
+            serde_json::to_value(inserted_divergence).unwrap()
         );
 
         let removed_request = req(session, "cfg0", vec![item("a", 0, "a"), item("c", 3, "c")]);
@@ -16454,6 +19061,22 @@ pub(crate) mod tests {
         );
         assert!(last_divergence["pass_id"].is_number());
         assert!(last_divergence["timestamp_ms"].is_number());
+
+        let changed = run(
+            &store,
+            &req(session, "cfg1", vec![item("a", 0, "a"), item("c", 3, "c")]),
+            &spine(),
+        );
+        assert_eq!(changed.materialize_reason.as_deref(), Some("epoch_change"));
+        let trace = store.load_pass_trace(session).unwrap().unwrap();
+        assert_eq!(
+            trace.scheduler_history.last().unwrap().identity_delta,
+            ["base"]
+        );
+        let interesting = store
+            .load_interesting_pass_scheduler_history(session, i64::MIN, i64::MAX)
+            .unwrap();
+        assert_eq!(interesting.last().unwrap().identity_delta, ["base"]);
     }
 
     fn comparable_response(response: TransformResponse) -> Value {
@@ -16629,10 +19252,171 @@ pub(crate) mod tests {
             .iter()
             .map(|m| ServedMessage::from_message(std::ops::Deref::deref(m).clone()))
             .collect();
-        let forced_fps = served_output_fingerprints(&forced_messages);
+        // Name the leading synthetic messages the way the builder did: frames are emitted
+        // first and in order, so taking as many frame ids as there are leading synthetic
+        // messages reproduces the builder's own naming.
+        let frames = [Some(M0_ID), Some(M1_ID)]
+            .into_iter()
+            .take(
+                forced_messages
+                    .iter()
+                    .take_while(|message| message.meta.synthetic)
+                    .count(),
+            )
+            .collect::<Vec<_>>();
+        let forced_fps = served_output_fingerprints(&forced_messages, &frames);
         assert_eq!(
             forced_fps, loaded.meta.served_output_fingerprint,
             "stored divergence fingerprints must match forced re-hash of served output"
+        );
+    }
+
+    /// A subagent output carries no composed frame, so nothing in it may be named `mc_m0`
+    /// or `mc_m1`, and no pass may pin the served baseline: the host reads those ids as
+    /// "the frozen prefix changed" and replays its last-known-good array instead of the
+    /// module's output, while the module keeps re-reporting the same stale mismatch
+    /// because no later pass on a subagent can ever release the pin.
+    #[test]
+    fn subagent_tail_notice_neither_takes_a_frame_id_nor_pins_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let session = "subagent-frozen-prefix-cycle";
+
+        let subagent_req = |messages: Vec<CkIngressMessage>| {
+            let mut request = req(session, "cfg0", messages);
+            request.is_subagent = true;
+            request
+        };
+        // OpenCode marks its notice-triggered prompts synthetic. The module serves such a
+        // prompt only while it is the newest message, so the following pass drops it.
+        let notice = |ordinal: u64| {
+            let mut message = item(
+                &format!("notice{ordinal}"),
+                ordinal,
+                "<system-reminder>background task finished</system-reminder>",
+            );
+            message.ck.meta.synthetic = true;
+            message
+        };
+
+        let mut history = vec![item("a", 0, "alpha"), item("b", 1, "beta")];
+        assert!(run(&store, &subagent_req(history.clone()), &spine())
+            .first_divergence
+            .is_none());
+
+        history.push(notice(2));
+        let served_notice = run(&store, &subagent_req(history.clone()), &spine());
+        assert!(
+            served_notice
+                .messages()
+                .iter()
+                .any(|message| message.meta.synthetic),
+            "the newest synthetic prompt must reach the served array"
+        );
+        let baseline = store.load(session).unwrap().meta.served_output_fingerprint;
+        assert!(
+            baseline
+                .iter()
+                .all(|block| block.block_id != "mc_m0#0" && block.block_id != "mc_m1#0"),
+            "a frameless output must not carry a composed-frame block id: {:?}",
+            baseline
+                .iter()
+                .map(|block| block.block_id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // The notice stops being newest here, so the module drops it. That is an ordinary
+        // tail change; it must attribute once and then leave the baseline current.
+        history.push(item("c", 3, "gamma"));
+        run(&store, &subagent_req(history.clone()), &spine());
+
+        for turn in 4..24u64 {
+            history.push(item(&format!("m{turn}"), turn, "more work"));
+            let grown = run(&store, &subagent_req(history.clone()), &spine());
+            assert!(
+                grown.first_divergence.is_none(),
+                "appending a turn must not re-report a divergence (turn {turn}): {:?}",
+                grown.first_divergence
+            );
+            let replay = run(&store, &subagent_req(history.clone()), &spine());
+            assert!(replay.first_divergence.is_none());
+            assert_eq!(
+                serde_json::to_value(replay.messages()).unwrap(),
+                serde_json::to_value(grown.messages()).unwrap(),
+                "consecutive defers on identical input must serve identical bytes"
+            );
+        }
+    }
+
+    /// A subagent has a cached provider conversation but no composed m0/m1 frame. Pinning a
+    /// stale frame fingerprint there would re-report the mismatch forever; regular sessions
+    /// retain the frame pin until a prefix mutation pass.
+    #[test]
+    fn only_a_session_replaying_a_served_prefix_pins_its_baseline() {
+        let stale_frame_block = || ServedBlockFingerprint {
+            block_id: "mc_m0#0".to_string(),
+            content_hash: "stale-frame".to_string(),
+            serialized_len: 8,
+        };
+
+        let run_with_stale_frame_baseline = |session: &str, is_subagent: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let build = |messages: Vec<CkIngressMessage>| {
+                let mut request = req(session, "cfg0", messages);
+                request.is_subagent = is_subagent;
+                request
+            };
+            let history = vec![item("a", 0, "alpha"), item("b", 1, "beta")];
+            run(&store, &build(history.clone()), &spine());
+
+            // Stand in for a baseline recorded when the output still led with a frame.
+            let mut seeded = store.load(session).unwrap();
+            seeded.meta.served_output_fingerprint = vec![stale_frame_block()];
+            store
+                .commit_transform(
+                    session,
+                    TransformCommit {
+                        expected: seeded.row_version,
+                        core: &seeded.core,
+                        meta: &seeded.meta,
+                        sections: mc_store::SectionsCommit::default(),
+                        consumed_drop_ids: &[],
+                        first_applied_command_ids: &[],
+                        memory_revision: None,
+                        compartment_max_seq: None,
+                        project_root: None,
+                        first_divergence: None,
+                        scheduler_observation: None,
+                        scheduler_request_observed_at_ms: None,
+                        scheduler_full_array_fingerprint: None,
+                        scheduler_eligible_supersession_count: None,
+                        scheduler_withheld_by_tag_window: None,
+                        scheduler_withheld_by_exempt_message: None,
+                        scheduler_applied_supersession_count: None,
+                        scheduler_applied_reductions: false,
+                        overlays: TransformOverlayBatch::default(),
+                    },
+                )
+                .unwrap();
+
+            let diverged = run(&store, &build(history), &spine());
+            assert!(
+                diverged.first_divergence.is_some(),
+                "the seeded baseline must attribute a mismatch"
+            );
+            store.load(session).unwrap().meta.served_output_fingerprint
+        };
+
+        assert_ne!(
+            run_with_stale_frame_baseline("stale-frame-subagent", true),
+            vec![stale_frame_block()],
+            "a subagent must adopt its new baseline; pinning it strands the session"
+        );
+        assert_eq!(
+            run_with_stale_frame_baseline("stale-frame-primary", false),
+            vec![stale_frame_block()],
+            "a session replaying a served prefix keeps the pinned baseline"
         );
     }
 
@@ -17784,6 +20568,10 @@ pub(crate) mod tests {
             Some("bedrock"),
             Some("bedrock/anthropic.claude-fable-5-1-v1:0")
         ));
+        assert!(!variant_change_busts_provider_cache(
+            Some("anthropic"),
+            Some("anthropic/claude-opus-5-5")
+        ));
         assert!(variant_change_busts_provider_cache(
             Some("anthropic"),
             Some("anthropic/claude-opus-4-1")
@@ -17818,6 +20606,91 @@ pub(crate) mod tests {
         let after = run(&s, &request, &spine());
         assert_eq!(after.scheduler_decision.as_deref(), Some("defer"));
         assert_eq!(canonical_response_hash(&after), before_hash);
+    }
+
+    /// Mirrors a live Opus 5.5 session where the host dropped the `high` variant and later
+    /// restored it. Wire dumps showed the provider served the cached message prefix in both
+    /// directions, so the effort flip alone must not change the render identity.
+    fn opus_55_request(session: &str, render_config: &str) -> TransformRequest {
+        let mut request = req(session, render_config, vec![item("a", 1, "keep me")]);
+        request.serializer_profile = "opencode-aisdk".to_string();
+        request.provider_id = Some("anthropic".to_string());
+        request.model_key = Some("anthropic/claude-opus-5-5".to_string());
+        request.system_prompt_hash = "5364d9e7f78d5cee3aadbc8f2ce85aa7".to_string();
+        request
+    }
+
+    #[test]
+    fn opus_55_variant_flip_keeps_render_identity_and_served_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let with_variant = "provider:anthropic|model:anthropic/claude-opus-5-5|variant:high|system:5364d9e7f78d5cee3aadbc8f2ce85aa7";
+        let without_variant =
+            "provider:anthropic|model:anthropic/claude-opus-5-5|system:5364d9e7f78d5cee3aadbc8f2ce85aa7";
+        let mut request = opus_55_request("opus-variant", without_variant);
+        run(&s, &request, &spine());
+        let before = run(&s, &request, &spine());
+        assert_eq!(before.action, "SOFT+");
+        let before_hash = canonical_response_hash(&before);
+
+        request.render_config = with_variant.to_string();
+        let after = run(&s, &request, &spine());
+        assert_eq!(
+            after.action, "SOFT+",
+            "identity_delta={:?}",
+            after.identity_delta
+        );
+        assert!(after.identity_delta.is_empty());
+        assert_eq!(canonical_response_hash(&after), before_hash);
+
+        request.render_config = without_variant.to_string();
+        let back = run(&s, &request, &spine());
+        assert_eq!(
+            back.action, "SOFT+",
+            "identity_delta={:?}",
+            back.identity_delta
+        );
+        assert_eq!(canonical_response_hash(&back), before_hash);
+    }
+
+    #[test]
+    fn opus_55_system_prompt_change_still_hards_on_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = opus_55_request(
+            "opus-system",
+            "provider:anthropic|model:anthropic/claude-opus-5-5|variant:high|system:5364d9e7f78d5cee3aadbc8f2ce85aa7",
+        );
+        run(&s, &request, &spine());
+        assert_eq!(run(&s, &request, &spine()).action, "SOFT+");
+
+        request.render_config =
+            "provider:anthropic|model:anthropic/claude-opus-5-5|variant:high|system:0000000000000000000000000000beef"
+                .to_string();
+        request.system_prompt_hash = "0000000000000000000000000000beef".to_string();
+        let changed = run(&s, &request, &spine());
+        assert_eq!(changed.action, "HARD");
+        assert_eq!(changed.identity_delta, vec!["base"]);
+    }
+
+    #[test]
+    fn older_anthropic_variant_flip_still_hards_on_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = opus_55_request(
+            "opus-41-variant",
+            "provider:anthropic|model:anthropic/claude-opus-4-1|system:5364d9e7f78d5cee3aadbc8f2ce85aa7",
+        );
+        request.model_key = Some("anthropic/claude-opus-4-1".to_string());
+        run(&s, &request, &spine());
+        assert_eq!(run(&s, &request, &spine()).action, "SOFT+");
+
+        request.render_config =
+            "provider:anthropic|model:anthropic/claude-opus-4-1|variant:high|system:5364d9e7f78d5cee3aadbc8f2ce85aa7"
+                .to_string();
+        let changed = run(&s, &request, &spine());
+        assert_eq!(changed.action, "HARD");
+        assert_eq!(changed.identity_delta, vec!["base"]);
     }
 
     #[test]
@@ -17949,7 +20822,7 @@ pub(crate) mod tests {
                 kind: kind.clone(),
                 token_count: *tokens,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
         // Coalesce assistant text and its following call under the same CC message id.
@@ -17987,6 +20860,7 @@ pub(crate) mod tests {
             .block_ids;
         assert_eq!(protected.len(), 29);
         let mut ctx = SelectionContext {
+            calibration: None,
             pass_class: PassClass::EmergencyForce,
             current_total_input_tokens: 158_855.0,
             ceiling_tokens: 167_000.0 * 0.85,
@@ -18000,6 +20874,7 @@ pub(crate) mod tests {
             // The observed pass was Force85, not the scheduler's Emergency95 backstop.
             pass_already_busting: true,
             supersession_ride_available: true,
+            emergency_minimum_waived: false,
             emergency_window_yields: false,
             tag_window_protected_block_ids: protected,
             exempt_message_protected_block_ids: HashSet::new(),
@@ -18066,7 +20941,7 @@ pub(crate) mod tests {
                 kind: "tool_result".into(),
                 token_count: 10_000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             });
         }
         ctx.tag_window_protected_block_ids =
@@ -18144,7 +21019,9 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
-        let huge = "x".repeat(50_000);
+        // Large enough that the force batch clears the emergency minimum achievable
+        // reclaim; this test is about when the producer gate runs.
+        let huge = "x".repeat(100_000);
         let force_messages = vec![
             item("a", 1, "raw"),
             assistant_tool_call("force_old", 2, "force_old_call"),
@@ -18227,6 +21104,86 @@ pub(crate) mod tests {
         check_execute_only_queued_drops(false);
     }
 
+    fn check_issue_619_subagent_ride(is_subagent: bool, execute: bool, queued: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("old", 1, "spent content"),
+                    item("tail", 2, "keep tail"),
+                ],
+            ),
+            if execute { 70 } else { 20 },
+            100,
+        );
+        request.is_subagent = is_subagent;
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(
+            baseline.scheduler_decision.as_deref(),
+            Some(if execute { "execute" } else { "defer" })
+        );
+        if queued {
+            s.append_pending_agent_drops("ses", &["old#0".into()], 1)
+                .unwrap();
+        }
+        if is_subagent && execute && queued {
+            request.messages = vec![
+                item("old", 1, "spent content"),
+                assistant_tool_call("aged-call", 2, "aged-tool"),
+                tool_result("aged-result", 3, "aged-tool", &"aged output ".repeat(400)),
+                item("tail", 4, "keep tail"),
+            ];
+            let mut loaded = s.load("ses").unwrap();
+            loaded.meta.last_execute_ordinal = 3;
+            s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+        }
+        let result = transform(&s, &request, &ctx).unwrap();
+        let applies = is_subagent && execute && queued;
+        assert_eq!(
+            s.load_pending_agent_drops("ses").unwrap().len(),
+            usize::from(queued && !applies)
+        );
+        assert_eq!(result.ck_messages == baseline.ck_messages, !applies);
+        if applies {
+            assert!(
+                frozen_red_payload(&s.load("ses").unwrap().core, "aged-result#0").is_some(),
+                "queued drops and eligible age cleanup must share this execute pass"
+            );
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                transform(&s, &request, &ctx).unwrap().ck_messages,
+                result.ck_messages
+            );
+        }
+    }
+
+    #[test]
+    fn issue_619_subagent_execute_drains_queued_drops() {
+        check_issue_619_subagent_ride(true, true, true);
+    }
+
+    #[test]
+    fn issue_619_primary_execute_holds_queued_drops() {
+        check_issue_619_subagent_ride(false, true, true);
+    }
+
+    #[test]
+    fn issue_619_subagent_defer_holds_queued_drops() {
+        check_issue_619_subagent_ride(true, false, true);
+    }
+
+    #[test]
+    fn issue_619_subagent_empty_execute_is_byte_identical() {
+        check_issue_619_subagent_ride(true, true, false);
+    }
+
     #[test]
     fn execute_only_queued_drops_are_held_with_historian() {
         check_execute_only_queued_drops(true);
@@ -18306,6 +21263,518 @@ pub(crate) mod tests {
             let replay = transform(&s, &request, &ctx).unwrap();
             assert_eq!(applied.messages(), replay.messages());
         }
+    }
+
+    /// Adversarial gate reproduction: a newer todowrite call makes a synthetic todo
+    /// pending, then a store-marker HARD re-renders m0/m1 byte-identically. The
+    /// pending todo must not ride that HARD: the provider cache survives it, so a
+    /// changed synthetic pair would be the pass's only bust.
+    #[test]
+    fn adv_identical_bytes_epoch_hard_holds_pending_synthetic_todo() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let first = json!([{"content": "first", "status": "in_progress", "priority": "high"}]);
+        let second = json!([{"content": "second", "status": "in_progress", "priority": "high"}]);
+        let initial = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    todowrite_call("todo-a", 2, first),
+                    item("tail", 3, "tail text"),
+                ],
+            ),
+            10,
+            100,
+        );
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &initial, &ctx).unwrap();
+        let baseline = transform(&s, &initial, &ctx).unwrap();
+        assert_ne!(baseline.action, "HARD");
+        let frozen_pair = synthetic_todo_pair_bytes(&baseline);
+
+        let mut newer = initial.clone();
+        newer.messages.push(todowrite_call("todo-b", 4, second));
+        let defer = transform(&s, &newer, &ctx).unwrap();
+        assert_eq!(
+            synthetic_todo_pair_bytes(&defer),
+            frozen_pair,
+            "a pending todo alone never busts"
+        );
+
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.project_memory_epoch_pending = true;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let hard = transform(&s, &newer, &ctx).unwrap();
+        let hard_pair = synthetic_todo_pair_bytes(&hard);
+        let replay = transform(&s, &newer, &ctx).unwrap();
+        eprintln!(
+            "ADV_RUST_TODO action={} reason={:?} m0_identical={} m1_identical={} todo_pair_identical={} messages_identical={} replay_equals_hard={}",
+            hard.action,
+            hard.materialize_reason,
+            m0_bytes(&hard) == m0_bytes(&defer),
+            m1_bytes(&hard) == m1_bytes(&defer),
+            hard_pair == frozen_pair,
+            hard.messages() == defer.messages(),
+            replay.messages() == hard.messages(),
+        );
+        assert_eq!(hard.action, "HARD");
+        assert_eq!(m0_bytes(&hard), m0_bytes(&defer));
+        assert_eq!(m1_bytes(&hard), m1_bytes(&defer));
+        assert_eq!(
+            hard_pair, frozen_pair,
+            "an identical-bytes HARD must not carry the pending synthetic todo"
+        );
+        assert_eq!(hard.messages(), defer.messages());
+    }
+
+    #[test]
+    fn identical_bytes_epoch_hard_holds_pending_drop_and_serves_identical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![item("a", 1, "raw"), item("tail", 2, "pending drop")],
+            ),
+            10,
+            100,
+        );
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        assert_ne!(baseline.action, "HARD");
+        s.append_pending_agent_drops("ses", &["tail#0".to_string()], 1)
+            .unwrap();
+        let held = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(held.messages(), baseline.messages());
+
+        // A project-memory epoch change that alters no rendered content.
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.project_memory_epoch_pending = true;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let hard = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(hard.action, "HARD");
+        assert_eq!(m0_bytes(&hard), m0_bytes(&baseline));
+        assert_eq!(m1_bytes(&hard), m1_bytes(&baseline));
+        assert!(!s.load("ses").unwrap().meta.project_memory_epoch_pending);
+        // The fold reproduced the served pair, so the queued drop must not ride it.
+        assert_eq!(
+            s.load_pending_agent_drops("ses").unwrap().len(),
+            1,
+            "an identical-bytes HARD must not consume the queued drop"
+        );
+        assert_eq!(
+            serde_json::to_vec(&hard.ck_messages).unwrap(),
+            serde_json::to_vec(&baseline.ck_messages).unwrap()
+        );
+        let replay = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(replay.messages(), baseline.messages());
+    }
+
+    #[test]
+    fn identical_bytes_floor_input_hard_holds_pending_drop_and_snapshots_the_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses-floor", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = with_usage(
+            req(
+                "ses-floor",
+                "cfg0",
+                vec![item("a", 1, "raw"), item("tail", 2, "pending drop")],
+            ),
+            10,
+            100,
+        );
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.protected_tokens_floor = 4_000;
+        transform(&s, &request, &ctx).unwrap();
+        // Remove the persisted floor snapshot. Until one is persisted, the module remembers the
+        // last configured floor and window size in memory, and a change to them raises a HARD.
+        let mut legacy = s.load("ses-floor").unwrap();
+        legacy.meta.protected_tokens_effective = None;
+        s.commit("ses-floor", legacy.row_version, &legacy.core, &legacy.meta)
+            .unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        assert_ne!(baseline.action, "HARD");
+        s.append_pending_agent_drops("ses-floor", &["tail#0".to_string()], 1)
+            .unwrap();
+
+        ctx.protected_tokens_floor = 8_000;
+        let hard = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(hard.action, "HARD");
+        assert_eq!(
+            hard.materialize_reason.as_deref(),
+            Some("protected_tokens_inputs_changed")
+        );
+        assert_eq!(m0_bytes(&hard), m0_bytes(&baseline));
+        assert_eq!(m1_bytes(&hard), m1_bytes(&baseline));
+        // The fold reproduced the served pair: the drop is held, the wire is unchanged,
+        // and the floor snapshot (metadata only) still lands.
+        assert_eq!(s.load_pending_agent_drops("ses-floor").unwrap().len(), 1);
+        assert_eq!(hard.messages(), baseline.messages());
+        assert_eq!(
+            s.load("ses-floor").unwrap().meta.protected_tokens_effective,
+            Some(8_000)
+        );
+        let replay = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(replay.messages(), baseline.messages());
+    }
+
+    #[test]
+    fn content_changing_epoch_hard_still_drains_pending_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![item("a", 1, "raw"), item("tail", 2, "pending drop")],
+            ),
+            10,
+            100,
+        );
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        transform(&s, &request, &ctx).unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        s.append_pending_agent_drops("ses", &["tail#0".to_string()], 1)
+            .unwrap();
+        // The compartment text changes without a new sequence, so only the HARD
+        // re-render can surface it.
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "REWRITTEN SUMMARY")])
+            .unwrap();
+        let mut loaded = s.load("ses").unwrap();
+        loaded.meta.project_memory_epoch_pending = true;
+        s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+        let hard = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(hard.action, "HARD");
+        assert_ne!(m0_bytes(&hard), m0_bytes(&baseline));
+        assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
+        assert!(frozen_red_payload(&s.load("ses").unwrap().core, "tail#0").is_some());
+        let replay = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(replay.messages(), hard.messages());
+    }
+
+    fn regate_mark_epoch_pending(s: &McStore, session: &str) {
+        let mut loaded = s.load(session).unwrap();
+        loaded.meta.project_memory_epoch_pending = true;
+        s.commit(session, loaded.row_version, &loaded.core, &loaded.meta)
+            .unwrap();
+    }
+
+    fn regate_unit_keys(s: &McStore, session: &str) -> Vec<String> {
+        s.load(session)
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .map(|unit| unit.key.clone())
+            .collect()
+    }
+
+    /// Re-gate: an identical-bytes store-marker HARD runs the HARD branch, which rebuilds
+    /// the frozen-unit vector from survivors in a fixed kind order. On a session carrying
+    /// caveman and reduction units minted by the bust just before it, the rebuilt vector must
+    /// serve exactly the bytes that bust served, and the defer after it must replay them.
+    #[test]
+    fn regate_identical_marker_hard_right_after_a_minting_bust_replays_its_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let session = "regate-rich";
+        s.replace_compartments(session, &[comp(1, 1, 1, "anchor", "first coverage")])
+            .unwrap();
+        let mut messages = vec![item("anchor", 1, "covered")];
+        let boot = run(&s, &req(session, "cfg", messages.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+        messages.extend([
+            item("old-a", 2, &caveman_test_source("old-a")),
+            assistant_tool_call("call-1", 3, "t1"),
+            tool_result("res-1", 4, "t1", &"OUTPUT ".repeat(400)),
+            item("old-b", 5, &caveman_test_source("old-b")),
+            item("next", 6, "next prompt"),
+        ]);
+        let mut armed = req(session, "cfg", messages.clone());
+        armed.caveman_enabled = true;
+        armed.caveman_min_chars = 1;
+        armed.protected_tags = 0;
+        let reductions = vec![reduce("res-1", "drop", "[dropped]")];
+        let held = run(&s, &armed, &[]);
+        assert_eq!(held.action, "SOFT+");
+        s.arm_soft_refresh(session).unwrap();
+        let minting = run(&s, &armed, &reductions);
+        assert_eq!(minting.action, "SOFT");
+        let keys_after_soft = regate_unit_keys(&s, session);
+        assert!(
+            !stored_caveman_units(&s, session).is_empty(),
+            "the flush bust must mint caveman units: {keys_after_soft:?}"
+        );
+        assert!(frozen_red_payload(&s.load(session).unwrap().core, "res-1#0").is_some());
+
+        // The marker HARD comes on the very next pass.
+        regate_mark_epoch_pending(&s, session);
+        let hard = run(&s, &armed, &reductions);
+        let keys_after_hard = regate_unit_keys(&s, session);
+        let replay = run(&s, &armed, &reductions);
+        // A second marker HARD after a plain defer.
+        regate_mark_epoch_pending(&s, session);
+        let hard2 = run(&s, &armed, &reductions);
+        // A third marker HARD from a freshly opened store, as after a process restart.
+        drop(s);
+        let s = store(dir.path());
+        regate_mark_epoch_pending(&s, session);
+        let hard3 = run(&s, &armed, &reductions);
+        eprintln!(
+            "REGATE_RUST_RICH hard_action={} hard2_action={} hard3_action={} hard3_identical={} reason={:?} wire_identical={} m0_identical={} replay_identical={} hard2_identical={} units_soft={:?} units_hard={:?}",
+            hard.action,
+            hard2.action,
+            hard3.action,
+            hard3.messages() == minting.messages(),
+            hard.materialize_reason,
+            hard.messages() == minting.messages(),
+            m0_bytes(&hard) == m0_bytes(&minting),
+            replay.messages() == minting.messages(),
+            hard2.messages() == minting.messages(),
+            keys_after_soft,
+            keys_after_hard,
+        );
+        assert_eq!(hard.action, "HARD");
+        assert_eq!(hard2.action, "HARD");
+        assert_eq!(
+            serde_json::to_vec(&hard.ck_messages).unwrap(),
+            serde_json::to_vec(&minting.ck_messages).unwrap()
+        );
+        assert_eq!(hard.messages(), minting.messages());
+        assert_eq!(replay.messages(), minting.messages());
+        assert_eq!(hard2.messages(), minting.messages());
+        assert_eq!(hard3.action, "HARD");
+        assert_eq!(hard3.messages(), minting.messages());
+    }
+
+    /// Re-gate reproduction: the HARD rebuild drops frozen reductions whose target is absent
+    /// from the live array (its orphan clean-up), while defers keep them. When an identical-bytes
+    /// marker HARD lands on a pass whose array temporarily lacks the reduced message (an undo
+    /// that is later redone), the frozen drop is lost, and the redone message is served raw on
+    /// a later defer although no pass priced that change. The control (the same undo and redo
+    /// with no marker HARD) keeps the dropped bytes. Ignored so the suite stays green; run it
+    /// with `--ignored` to see the divergence.
+    #[test]
+    #[ignore = "re-gate reproduction: marker HARD orphan clean-up changes later defer bytes"]
+    fn regate_marker_hard_during_undo_keeps_the_frozen_drop_for_the_redo() {
+        let run_case = |marker_hard: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let session = "regate-undo";
+            s.replace_compartments(session, &[comp(1, 1, 1, "anchor", "first coverage")])
+                .unwrap();
+            let mut messages = vec![item("anchor", 1, "covered")];
+            run(&s, &req(session, "cfg", messages.clone()), &spine());
+            messages.extend([
+                item("old-a", 2, "older prompt"),
+                assistant_tool_call("call-1", 3, "t1"),
+                tool_result("res-1", 4, "t1", &"OUTPUT ".repeat(400)),
+                item("next", 5, "next prompt"),
+            ]);
+            let full = req(session, "cfg", messages.clone());
+            let reductions = vec![reduce("res-1", "drop", "[dropped]")];
+            run(&s, &full, &[]);
+            s.arm_soft_refresh(session).unwrap();
+            let minting = run(&s, &full, &reductions);
+            assert_eq!(minting.action, "SOFT");
+            assert!(frozen_red_payload(&s.load(session).unwrap().core, "res-1#0").is_some());
+            let before = run(&s, &full, &[]);
+            // Undo: the last three messages leave the array.
+            let undone = req(session, "cfg", messages[..2].to_vec());
+            if marker_hard {
+                regate_mark_epoch_pending(&s, session);
+            }
+            let undo_pass = run(&s, &undone, &[]);
+            let red_after_undo =
+                frozen_red_payload(&s.load(session).unwrap().core, "res-1#0").is_some();
+            // Redo: the same messages return.
+            let redo = run(&s, &full, &[]);
+            eprintln!(
+                "REGATE_RUST_UNDO marker_hard={marker_hard} undo_action={} red_kept={red_after_undo} redo_action={} redo_equals_before={}",
+                undo_pass.action,
+                redo.action,
+                redo.messages() == before.messages(),
+            );
+            (
+                undo_pass.action.clone(),
+                red_after_undo,
+                redo.messages() == before.messages(),
+            )
+        };
+        let control = run_case(false);
+        assert!(control.1 && control.2, "control: {control:?}");
+        let marker = run_case(true);
+        assert_eq!(marker.0, "HARD");
+        assert!(marker.2, "marker HARD during undo: {marker:?}");
+    }
+    /// Re-gate: with a persisted floor snapshot, a changed configured floor waits for a bust.
+    /// A store-marker HARD that keeps the provider cache now snapshots the floor. The served
+    /// bytes must not move on that pass or on the defers after it, the queued drop must stay
+    /// held, and it must land on the next genuine bust.
+    #[test]
+    fn regate_floor_moves_on_identical_marker_hard_without_moving_served_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let session = "regate-floor";
+        s.replace_compartments(session, &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let mut request = with_usage(
+            req(
+                session,
+                "cfg0",
+                vec![item("a", 1, "raw"), item("tail", 2, "pending drop")],
+            ),
+            10,
+            100,
+        );
+        request.system_prompt_hash = "sys-a".to_string();
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.protected_tokens_floor = 4_000;
+        transform(&s, &request, &ctx).unwrap();
+        let baseline = transform(&s, &request, &ctx).unwrap();
+        assert_ne!(baseline.action, "HARD");
+        assert_eq!(
+            s.load(session).unwrap().meta.protected_tokens_effective,
+            Some(4_000)
+        );
+        s.append_pending_agent_drops(session, &["tail#0".to_string()], 1)
+            .unwrap();
+        // The configured floor changes; a defer may not replace the persisted snapshot.
+        ctx.protected_tokens_floor = 8_000;
+        let defer = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(defer.messages(), baseline.messages());
+        let floor_after_defer = s.load(session).unwrap().meta.protected_tokens_effective;
+
+        regate_mark_epoch_pending(&s, session);
+        let hard = transform(&s, &request, &ctx).unwrap();
+        let floor_after_hard = s.load(session).unwrap().meta.protected_tokens_effective;
+        let drops_after_hard = s.load_pending_agent_drops(session).unwrap().len();
+        let mut grown = request.clone();
+        grown.messages.push(item("later", 3, "a later prompt"));
+        let later = transform(&s, &grown, &ctx).unwrap();
+        let later2 = transform(&s, &grown, &ctx).unwrap();
+        let prefix_len = baseline.messages().len();
+        eprintln!(
+            "REGATE_RUST_FLOOR floor_after_defer={floor_after_defer:?} floor_after_hard={floor_after_hard:?} hard_action={} wire_identical={} drops_held={} later_prefix_identical={} later_replay_identical={}",
+            hard.action,
+            hard.messages() == baseline.messages(),
+            drops_after_hard,
+            later.messages()[..prefix_len] == baseline.messages()[..],
+            later2.messages() == later.messages(),
+        );
+        assert_eq!(floor_after_defer, Some(4_000));
+        assert_eq!(hard.action, "HARD");
+        assert_eq!(floor_after_hard, Some(8_000));
+        assert_eq!(hard.messages(), baseline.messages());
+        assert_eq!(drops_after_hard, 1);
+        assert_eq!(later.messages()[..prefix_len], baseline.messages()[..]);
+        assert_eq!(later2.messages(), later.messages());
+
+        // A genuine HARD (a changed system prompt) lands the held drop.
+        let mut changed = grown.clone();
+        changed.system_prompt_hash = "sys-b".to_string();
+        let genuine = transform(&s, &changed, &ctx).unwrap();
+        eprintln!(
+            "REGATE_RUST_FLOOR_GENUINE action={} reason={:?} drops_left={} red_frozen={}",
+            genuine.action,
+            genuine.materialize_reason,
+            s.load_pending_agent_drops(session).unwrap().len(),
+            frozen_red_payload(&s.load(session).unwrap().core, "tail#0").is_some(),
+        );
+        assert_eq!(genuine.action, "HARD");
+        assert!(s.load_pending_agent_drops(session).unwrap().is_empty());
+        assert!(frozen_red_payload(&s.load(session).unwrap().core, "tail#0").is_some());
+    }
+
+    /// Re-gate: the same pending work (a queued drop and a newer todowrite) is held by an identical-bytes marker HARD and consumed by a genuine HARD (a
+    /// changed system prompt), so the non-mutation treatment is confined to the marker case.
+    #[test]
+    fn regate_genuine_hard_still_opens_every_lane_the_marker_hard_holds() {
+        let run_case = |genuine: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let session = "regate-lanes";
+            s.replace_compartments(session, &[comp(1, 1, 1, "a", "SUMMARY")])
+                .unwrap();
+            let first = json!([{"content": "first", "status": "in_progress", "priority": "high"}]);
+            let second =
+                json!([{"content": "second", "status": "in_progress", "priority": "high"}]);
+            let mut request = with_usage(
+                req(
+                    session,
+                    "cfg0",
+                    vec![
+                        item("a", 1, "raw"),
+                        todowrite_call("todo-a", 2, first),
+                        item("tail", 3, "pending drop"),
+                        item("prose", 4, &caveman_test_source("prose")),
+                    ],
+                ),
+                10,
+                100,
+            );
+            request.system_prompt_hash = "sys-a".to_string();
+            request.caveman_enabled = true;
+            request.caveman_min_chars = 1;
+            request.protected_tags = 0;
+            let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+            transform(&s, &request, &ctx).unwrap();
+            let baseline = transform(&s, &request, &ctx).unwrap();
+            assert_ne!(baseline.action, "HARD");
+            let todo_before = synthetic_todo_pair_bytes(&baseline);
+            request.messages.push(todowrite_call("todo-b", 5, second));
+            request
+                .messages
+                .push(item("prose-b", 6, &caveman_test_source("prose-b")));
+            request.messages.push(item("next", 7, "next prompt"));
+            s.append_pending_agent_drops(session, &["tail#0".to_string()], 1)
+                .unwrap();
+            let defer = transform(&s, &request, &ctx).unwrap();
+            let caveman_before = stored_caveman_units(&s, session).len();
+            assert_eq!(synthetic_todo_pair_bytes(&defer), todo_before);
+            if genuine {
+                request.system_prompt_hash = "sys-b".to_string();
+            } else {
+                regate_mark_epoch_pending(&s, session);
+            }
+            let hard = transform(&s, &request, &ctx).unwrap();
+            let loaded = s.load(session).unwrap();
+            let outcome = (
+                hard.action.clone(),
+                s.load_pending_agent_drops(session).unwrap().len(),
+                frozen_red_payload(&loaded.core, "tail#0").is_some(),
+                synthetic_todo_pair_bytes(&hard) != todo_before,
+                stored_caveman_units(&s, session).len() > caveman_before,
+                hard.messages() == defer.messages(),
+            );
+            eprintln!(
+                "REGATE_RUST_LANES genuine={genuine} action={} reason={:?} drops_left={} red_frozen={} todo_changed={} caveman_minted={} wire_identical={}",
+                outcome.0, hard.materialize_reason, outcome.1, outcome.2, outcome.3, outcome.4, outcome.5
+            );
+            outcome
+        };
+        let marker = run_case(false);
+        assert_eq!(marker, ("HARD".to_string(), 1, false, false, false, true));
+        let genuine = run_case(true);
+        // The caveman column stays false in both cases: prose-b is too young to be eligible,
+        // so this fixture does not exercise the caveman lane (the rich-state test covers the
+        // replay of already-minted caveman units).
+        assert_eq!(genuine, ("HARD".to_string(), 0, true, true, false, false));
     }
 
     #[test]
@@ -18867,6 +22336,70 @@ pub(crate) mod tests {
         assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
     }
 
+    /// At the 95% backstop with an earlier emergency drop already persisted, a selection
+    /// that reclaims less than the minimum is skipped. Neither the backstop nor the
+    /// force-band edge counts as an already-paid rewrite.
+    #[test]
+    fn emergency_backstop_skips_a_sub_minimum_selection_with_drops_already_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        bootstrap_covering_a(&s);
+        let context = smart_pctx();
+        let bash_call = |mid: &str, ordinal: u64| {
+            let mut call = assistant_tool_call(mid, ordinal, mid);
+            if let ck_wire::CkKind::ToolCall { name, .. } = &mut call.ck.content[0].kind {
+                *name = "bash".into();
+            }
+            call
+        };
+        let mut request = with_usage(
+            req(
+                "ses",
+                "cfg0",
+                vec![
+                    item("a", 1, "raw"),
+                    bash_call("early", 2),
+                    tool_result("early-result", 3, "early", &"e".repeat(20_000)),
+                    item("protected", 4, &"tail content ".repeat(30_000)),
+                    item("newest-1", 5, "tail"),
+                ],
+            ),
+            167_000,
+            167_000,
+        );
+        request.protected_tokens_effective = Some(30_000);
+        request.protected_tags = 0;
+        transform(&s, &request, &context).unwrap();
+        let first = s.load("ses").unwrap();
+        assert!(
+            first
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "red:early#0"),
+            "the first backstop pass drops the large arc: {:?}",
+            first.meta.emergency_drop_assessment
+        );
+
+        request.messages.push(bash_call("fresh", 6));
+        request
+            .messages
+            .push(tool_result("fresh-result", 7, "fresh", &"f".repeat(2_000)));
+        request = with_usage(request, 167_000, 167_000);
+        transform(&s, &request, &context).unwrap();
+        let second = s.load("ses").unwrap();
+        assert!(
+            !second
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "red:fresh#0"),
+            "a ~500-token fresh result must not be dropped at the backstop"
+        );
+        let assessment = second.meta.emergency_drop_assessment.unwrap();
+        assert!(assessment.skipped_below_minimum_reclaim, "{assessment:?}");
+    }
+
     #[test]
     fn force_episode_submargin_dip_does_not_price_second_batch() {
         for percentages in [
@@ -19147,7 +22680,9 @@ pub(crate) mod tests {
     fn subagent_emergency_sample_latch_prevents_repeat_selection() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
-        let huge = "x".repeat(50_000);
+        // Large enough that the first batch clears the emergency minimum achievable
+        // reclaim; this test is about the same-sample latch, not that minimum.
+        let huge = "x".repeat(100_000);
         let messages = vec![
             item("head", 1, "raw"),
             assistant_tool_call("old", 2, "old_call"),
@@ -19172,7 +22707,8 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         assert!(
             !first_red.is_empty(),
-            "the first emergency pass should select drops"
+            "the first emergency pass should select drops: {:?}",
+            s.load("subagent").unwrap().meta.emergency_drop_assessment
         );
         let first_bytes = serde_json::to_vec(&first.ck_messages).unwrap();
 
@@ -19287,12 +22823,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn ttl_hard_requires_in_process_observation_not_durable_anchor_alone() {
+    fn ttl_hard_requires_served_response_observation_not_durable_anchor_alone() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
         let mut loaded = s.load("ses").unwrap();
         loaded.meta.last_committed_pass_at_ms = 1;
+        // This fixture represents a reply after the last materialization.
+        loaded.meta.expiry_cutoff_ms = 0;
         s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
             .unwrap();
 
@@ -19309,19 +22847,115 @@ pub(crate) mod tests {
         assert_eq!(observed.action, "HARD");
     }
 
-    fn assert_advisory_without_prefix_materialization(reconcile: bool) {
+    #[test]
+    fn issue_610_expired_retry_replays_one_fold_and_adopts_only_the_late_system_identity() {
+        for compaction_enabled in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let mut request = with_usage(
+                req("idle-retry", "system:oct02", vec![item("a", 1, "raw")]),
+                10,
+                100,
+            );
+            request.serializer_profile = "opencode-aisdk".into();
+            request.system_prompt_hash = "oct02".into();
+            let mut ctx = pctx("git:proj", "/nonexistent-docs", 1_000);
+            ctx.compaction_enabled = compaction_enabled;
+            ctx.cache_ttl = "5m".into();
+            transform(&s, &request, &ctx).unwrap();
+            ctx.observed_last_response_at_ms = Some(1_001);
+            ctx.now_ms = 301_001;
+            assert_eq!(transform(&s, &request, &ctx).unwrap().action, "SOFT+");
+            ctx.now_ms += 1;
+            let prepared = transform(&s, &request, &ctx).unwrap();
+            assert_eq!(prepared.action, "HARD");
+            assert_eq!(prepared.materialize_reason.as_deref(), Some("ttl_expiry"));
+            let folded_at = s.load("idle-retry").unwrap().meta.expiry_cutoff_ms;
+            // Aborting leaves the last served completion unchanged.
+            ctx.now_ms += 1;
+            let retry = transform(&s, &request, &ctx).unwrap();
+            assert_eq!(retry.action, "SOFT+");
+            assert_eq!(retry.scheduler_decision.as_deref(), Some("execute"));
+            assert_eq!(retry.materialize_reason.as_deref(), Some("ttl_idle"));
+            assert_eq!(retry.ck_messages, prepared.ck_messages);
+            assert_eq!(
+                s.load("idle-retry").unwrap().meta.expiry_cutoff_ms,
+                folded_at
+            );
+            // The system hook ran after messages on that expired resend. Its
+            // durable acknowledgement reaches the module on the next tool step.
+            request.system_prompt_hash = "oct03".into();
+            request.render_config = "system:oct03".into();
+            request.adopted_system_prompt_hash = Some("oct03".into());
+            ctx.observed_last_response_at_ms = Some(ctx.now_ms);
+            ctx.now_ms += 1;
+            let next = transform(&s, &request, &ctx).unwrap();
+            assert_eq!(next.action, "SOFT+");
+            assert_eq!(next.ck_messages, retry.ck_messages);
+            let adopted = s.load("idle-retry").unwrap();
+            assert_eq!(adopted.meta.last_system_prompt_hash, "oct03");
+            assert_eq!(adopted.meta.expiry_cutoff_ms, folded_at);
+            // A warm content change has no acknowledgement and retains its fold.
+            request.system_prompt_hash = "new-instructions".into();
+            request.render_config = "system:new-instructions".into();
+            assert_eq!(transform(&s, &request, &ctx).unwrap().action, "HARD");
+            // An acknowledgement cannot suppress another changed render input.
+            request.system_prompt_hash = "oct04".into();
+            request.adopted_system_prompt_hash = Some("oct04".into());
+            request.render_config = "system:oct04|changed-tools".into();
+            assert_eq!(transform(&s, &request, &ctx).unwrap().action, "HARD");
+        }
+    }
+
+    #[test]
+    fn issue_610_still_expired_retry_prices_newly_queued_drops_without_refolding() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("idle-drop", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = with_usage(
+            req(
+                "idle-drop",
+                "cfg",
+                vec![item("a", 1, "old text"), item("tail", 2, "tail")],
+            ),
+            10,
+            100,
+        );
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 1_000);
+        transform(&s, &request, &ctx).unwrap();
+        ctx.observed_last_response_at_ms = Some(1_001);
+        ctx.now_ms = 600_000;
+        let prepared = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(prepared.action, "HARD");
+        let folded_at = s.load("idle-drop").unwrap().meta.expiry_cutoff_ms;
+        s.append_pending_agent_drops("idle-drop", &["tail#0".into()], ctx.now_ms)
+            .unwrap();
+        ctx.now_ms += 1;
+        let retry = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(retry.action, "SOFT");
+        assert_eq!(retry.materialize_reason.as_deref(), Some("ttl_idle"));
+        assert!(s.load_pending_agent_drops("idle-drop").unwrap().is_empty());
+        assert_eq!(
+            s.load("idle-drop").unwrap().meta.expiry_cutoff_ms,
+            folded_at
+        );
+        ctx.observed_last_response_at_ms = Some(ctx.now_ms);
+        ctx.now_ms += 1;
+        assert_eq!(
+            transform(&s, &request, &ctx).unwrap().ck_messages,
+            retry.ck_messages
+        );
+    }
+
+    fn assert_advisory_without_prefix_materialization(reconcile: bool, execute: bool) {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         bootstrap_covering_a(&s);
         let mut loaded = s.load("ses").unwrap();
         loaded.meta.last_execute_ordinal = 99;
-        if reconcile {
-            loaded.core.boundary_id = "missing#0".into();
-            loaded.core.reconcile_pending = true;
-        }
         s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
             .unwrap();
-        let before = loaded.core.frozen_units.clone();
         let mut owner = assistant_tool_call("owner", 2, "old");
         owner
             .ck
@@ -19349,29 +22983,107 @@ pub(crate) mod tests {
                     item("tail", 5, "continue"),
                 ],
             ),
-            75,
+            20,
             100,
         );
         // The reductions-only subagent branch never executes a prefix plan,
-        // even if it receives inherited HARD or reconcile state.
+        // even if it receives inherited HARD or reconcile state. Keep this a
+        // defer pass: subagent execute itself now authorizes reductions without
+        // relying on those advisories, so it cannot isolate the advisory gate.
         request.is_subagent = true;
         let mut context = pctx("git:proj", "/nonexistent-docs", 300_002);
+        context.cache_ttl = "never".into();
         context.observed_last_response_at_ms = Some(1);
+        let baseline = transform(&s, &request, &context).unwrap();
+        let before = s.load("ses").unwrap().core.frozen_units;
+        if reconcile {
+            let mut loaded = s.load("ses").unwrap();
+            loaded.core.boundary_id = "missing#0".into();
+            loaded.core.reconcile_pending = true;
+            s.commit("ses", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+            assert!(s.load("ses").unwrap().core.reconcile_pending);
+            assert!(!request
+                .messages
+                .iter()
+                .any(|message| format!("{}#0", message.mid) == "missing#0"));
+        } else {
+            // A render identity change is a genuine non-scheduler HARD input.
+            // Demonstrate that the same request folds in primary mode, while a
+            // reductions-only child must keep its inherited history frozen.
+            request.render_config = "cfg1".into();
+            assert_ne!(
+                request.render_config,
+                s.load("ses").unwrap().meta.last_render_config
+            );
+            let primary_dir = tempfile::tempdir().unwrap();
+            let primary_store = store(primary_dir.path());
+            bootstrap_covering_a(&primary_store);
+            let mut primary_request = request.clone();
+            primary_request.is_subagent = false;
+            assert_eq!(
+                transform(&primary_store, &primary_request, &context)
+                    .unwrap()
+                    .action,
+                "HARD"
+            );
+        }
+        if execute {
+            request.usage = with_usage(request.clone(), 75, 100).usage;
+            s.append_pending_agent_drops("ses", &["results#0".into()], 1)
+                .unwrap();
+        }
         let response = transform(&s, &request, &context).unwrap();
+        assert_eq!(
+            response.scheduler_decision.as_deref(),
+            Some(if execute { "execute" } else { "defer" })
+        );
         assert_ne!(response.action, "HARD");
         let after = s.load("ses").unwrap();
-        assert_eq!(after.core.frozen_units, before, "reconcile={reconcile}");
-        assert_eq!(after.meta.last_execute_ordinal, 99);
+        let wire = serde_json::to_string(&response.ck_messages).unwrap();
+        assert!(!wire.contains("SUMMARY"));
+        assert!(!wire.contains("<session-history>"));
+        assert_eq!(
+            after.meta.last_render_config,
+            loaded.meta.last_render_config
+        );
+        if execute {
+            assert_ne!(response.ck_messages, baseline.ck_messages);
+            assert!(!wire.contains("old output"));
+            assert!(s.load_pending_agent_drops("ses").unwrap().is_empty());
+            assert_eq!(
+                after
+                    .core
+                    .frozen_units
+                    .iter()
+                    .filter(|unit| !unit.key.starts_with("red:"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                before
+            );
+        } else {
+            assert_eq!(response.ck_messages, baseline.ck_messages);
+            assert!(wire.contains("old output"));
+            assert_eq!(after.core.frozen_units, before, "reconcile={reconcile}");
+            assert_eq!(after.meta.last_execute_ordinal, 99);
+        }
     }
 
     #[test]
     fn hard_advisory_without_prefix_materialization_cannot_price_reductions() {
-        assert_advisory_without_prefix_materialization(false);
+        assert_advisory_without_prefix_materialization(false, false);
     }
 
     #[test]
     fn reconcile_advisory_without_prefix_materialization_cannot_price_reductions() {
-        assert_advisory_without_prefix_materialization(true);
+        assert_advisory_without_prefix_materialization(true, false);
+    }
+
+    #[test]
+    fn issue_619_execute_reduces_wire_without_materializing_inherited_advisories() {
+        for reconcile in [false, true] {
+            assert_advisory_without_prefix_materialization(reconcile, true);
+        }
     }
 
     #[test]
@@ -19800,7 +23512,6 @@ pub(crate) mod tests {
         let memory_id = s
             .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", memory_id);
         let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
         let boot = run(&s, &execute_req, &spine());
         assert_eq!(boot.action, "HARD");
@@ -19827,111 +23538,231 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn review_late_host_ack_preserves_m0_across_restart() {
+    fn in_session_memory_mutations_ride_the_next_bust_and_defers_replay_them() {
+        // An update, an archive and a merge each append to context.db's
+        // memory_mutation_log and change no memory id. The mutation-log head is the only
+        // revision input that moves, so it alone must open the next execute-band pass as a
+        // SOFT carrying <memory-updates>; the defers after it replay those bytes exactly.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
-        let first = s
-            .insert_memory(memory_input("git:proj", "CONSTRAINTS", "acknowledged", 0))
+        let updated = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule one", 0))
             .unwrap();
-        let pending = s
-            .insert_memory(memory_input("git:proj", "CONSTRAINTS", "pending", 0))
+        let archived = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule two", 0))
             .unwrap();
-        s.acknowledge_host_memory_ids(
-            "git:proj",
-            &[mc_store::HostMemoryIdentityAck {
-                module_row_id: first,
-                host_row_id: 901,
-            }],
-        )
-        .unwrap();
-        let mut request = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
-        request.serializer_profile = "opencode".into();
+        let merge_target = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule three", 0))
+            .unwrap();
+        let merge_source = s
+            .insert_memory(memory_input("git:proj", "ARCHITECTURE", "rule four", 0))
+            .unwrap();
         let ctx = pctx("git:proj", "/nonexistent-docs", 0);
-        let boot = transform(&s, &request, &ctx).unwrap();
-        assert_eq!(boot.action, "HARD");
-        let frozen = m0_bytes(&boot).to_string();
-        assert!(frozen.contains("#901:"));
-        assert!(!frozen.contains(&format!("#{pending}:")));
-        let second = transform(&s, &request, &ctx).unwrap();
-        assert_ne!(second.action, "HARD");
-        assert_eq!(m0_bytes(&second), frozen);
-        s.acknowledge_host_memory_ids(
-            "git:proj",
-            &[mc_store::HostMemoryIdentityAck {
-                module_row_id: pending,
-                host_row_id: 902,
-            }],
-        )
-        .unwrap();
-        for _ in 0..3 {
-            let pass = transform(&s, &request, &ctx).unwrap();
-            assert_ne!(pass.action, "HARD", "late identity ack must not bust m0");
-            assert_eq!(m0_bytes(&pass), frozen);
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let defer_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 10, 100);
+        assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "HARD");
+        // With nothing pending, an execute-band pass does not bust.
+        assert_eq!(transform(&s, &execute_req, &ctx).unwrap().action, "SOFT+");
+
+        let archived_marker = format!("id=\"{archived}\"");
+        type Mutation<'a> = (&'a str, Box<dyn Fn(&McStore)>);
+        let mutations: [Mutation<'_>; 3] = [
+            (
+                "rule one corrected",
+                Box::new(move |s: &McStore| {
+                    s.update_memory_content("git:proj", updated, "rule one corrected", None, 1)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                archived_marker.as_str(),
+                Box::new(move |s: &McStore| {
+                    s.archive_memories("git:proj", &[archived], None, 2)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                "rules three and four",
+                Box::new(move |s: &McStore| {
+                    s.merge_memories(
+                        "git:proj",
+                        merge_target,
+                        &[merge_source],
+                        "rules three and four",
+                        3,
+                    )
+                    .unwrap()
+                    .unwrap();
+                }),
+            ),
+        ];
+        for (marker, mutate) in mutations {
+            mutate(&s);
+            let soft = transform(&s, &execute_req, &ctx).unwrap();
+            assert_eq!(soft.action, "SOFT", "{marker}");
+            let m1 = m1_bytes(&soft);
+            assert!(m1.contains("<memory-updates>"), "{marker}: {m1}");
+            assert!(m1.contains(marker), "{marker}: {m1}");
+            let served = serde_json::to_vec(&soft.ck_messages).unwrap();
+            for _ in 0..3 {
+                let deferred = transform(&s, &defer_req, &ctx).unwrap();
+                assert_eq!(deferred.action, "SOFT+", "{marker}");
+                assert_eq!(
+                    serde_json::to_vec(&deferred.ck_messages).unwrap(),
+                    served,
+                    "{marker}: a defer replays the served bytes"
+                );
+            }
         }
-        drop(s);
-        let reopened = store(dir.path());
-        assert_eq!(
-            reopened
-                .get_memory_full(pending)
-                .unwrap()
-                .unwrap()
-                .host_row_id,
-            Some(902)
-        );
-        let pass = transform(&reopened, &request, &ctx).unwrap();
-        assert_ne!(pass.action, "HARD");
-        assert_eq!(m0_bytes(&pass), frozen);
     }
 
     #[test]
-    fn project_memory_epoch_from_state_sync_is_an_eager_hard_input() {
+    fn project_memory_epoch_in_context_db_is_an_eager_hard_input() {
+        // An identity or workspace writer bumps project_state.project_memory_epoch in
+        // context.db. The next pass must rebuild m0 (a HARD naming the epoch), and the pass
+        // after it must not repeat the HARD.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
             .unwrap();
         let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
         assert_eq!(run(&s, &request, &spine()).action, "HARD");
-        let loaded = s.load("ses").unwrap();
-        s.apply_authority_state_sync(ModuleStateSyncRequest {
-            session_id: "ses",
-            project_path: "git:proj",
-            shadow_generation: loaded.meta.shadow_generation,
-            expected_shadow_seq: loaded.meta.shadow_seq,
-            seed_boundary_id: None,
-            drop_seeds: &[],
-            drop_seed_skipped: 0,
-            strip_seeds: &[],
-            strip_seed_skipped: 0,
-            reasoning_cleared_through_tag: None,
-            compartments: &[],
-            memories: &[],
-            memory_mutations: &[],
-            user_profile: &[],
-            user_profile_present: true,
-            workspace: None,
-            workspace_present: true,
-            last_todo_state: None,
-            project_memory_epoch: Some(7),
-            user_profile_version: None,
-            pending_agent_drops: &[],
-            pending_agent_drops_skipped: 0,
-            user_hint_seeds: &[],
-            auto_search_hint_skipped: 0,
-            note_nudge_anchors: None,
-            todo_synthetic_anchor: None,
-            todo_synthetic_anchor_present: false,
-            emergency_latches: None,
-            pending_compaction_marker: None,
-            deferred_execute_state: None,
-            channel2_nudge_state: None,
-            acked_watermarks: serde_json::Value::Null,
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+
+        s.set_project_memory_epoch_for_test("git:proj", 7).unwrap();
+        let after_epoch = run(&s, &request, &spine());
+        assert_eq!(after_epoch.action, "HARD");
+        assert_eq!(
+            after_epoch.materialize_reason.as_deref(),
+            Some("project_memory_epoch")
+        );
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+    }
+
+    #[test]
+    fn an_in_place_compartment_rewrite_by_another_writer_is_an_eager_hard_input() {
+        // A TypeScript recomp rewrites a session's compartments in place and appends an
+        // m0_mutation_log row; the highest compartment sequence does not move. The next
+        // module pass must still rebuild m0.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        assert_eq!(run(&s, &request, &spine()).action, "HARD");
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+
+        s.with_context_conn_for_test(|tx| {
+            tx.execute(
+                "UPDATE compartments SET content = 'REWRITTEN', p1 = 'REWRITTEN'
+                  WHERE session_id = 'ses'",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO m0_mutation_log (session_id, mutation_type, target_id, queued_at)
+                 VALUES ('ses', 'recomp_boundary_change', NULL, 1)",
+                [],
+            )?;
+            Ok(())
         })
         .unwrap();
-        assert!(s.load("ses").unwrap().meta.project_memory_epoch_pending);
-        assert_eq!(run(&s, &request, &spine()).action, "HARD");
-        assert!(!s.load("ses").unwrap().meta.project_memory_epoch_pending);
+        let after_rewrite = run(&s, &request, &spine());
+        assert_eq!(after_rewrite.action, "HARD");
+        assert_eq!(
+            after_rewrite.materialize_reason.as_deref(),
+            Some("compartment_history_revision")
+        );
+    }
+
+    #[test]
+    fn same_length_sql_repair_without_mutation_log_reloads_the_next_managed_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let request = req("ses", "cfg0", vec![item("a", 1, "raw")]);
+        let first = run(&s, &request, &spine());
+        assert!(m0_bytes(&first).contains("SUMMARY"));
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
+        let before = s.load("ses").unwrap();
+        let writer = rusqlite::Connection::open(dir.path().join("context.db")).unwrap();
+        let head: i64 = writer
+            .query_row(
+                "SELECT COALESCE(MAX(id),0) FROM m0_mutation_log WHERE session_id='ses'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        writer
+            .execute_batch(
+                "UPDATE compartments SET content='CHANGED', p1='CHANGED' WHERE session_id='ses'",
+            )
+            .unwrap();
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT COALESCE(MAX(id),0) FROM m0_mutation_log WHERE session_id='ses'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            head
+        );
+        let repaired = run(&s, &request, &spine());
+        assert_eq!(repaired.action, "HARD");
+        assert!(m0_bytes(&repaired).contains("CHANGED"));
+        assert!(!m0_bytes(&repaired).contains("SUMMARY"));
+        assert_eq!(
+            repaired.materialize_reason.as_deref(),
+            Some("compartment_history_revision")
+        );
+        let after = s.load("ses").unwrap();
+        let mut alternative_meta = before.meta;
+        // Reproduce the old generic label while keeping the same stale aggregate
+        // revision and input snapshot. Only diagnostic history tracking differs.
+        alternative_meta.m1_history_revision = after.meta.m1_history_revision;
+
+        s.commit_transform(
+            "ses",
+            TransformCommit {
+                expected: after.row_version,
+                core: &before.core,
+                meta: &alternative_meta,
+                sections: mc_store::SectionsCommit::default(),
+                consumed_drop_ids: &[],
+                first_applied_command_ids: &[],
+                memory_revision: None,
+                compartment_max_seq: None,
+                project_root: None,
+                first_divergence: None,
+                scheduler_observation: None,
+                scheduler_request_observed_at_ms: None,
+                scheduler_full_array_fingerprint: None,
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
+                scheduler_applied_reductions: false,
+                overlays: TransformOverlayBatch::default(),
+            },
+        )
+        .unwrap();
+        let generic = run(&s, &request, &spine());
+        assert_eq!(generic.action, "HARD");
+        assert_eq!(
+            generic.materialize_reason.as_deref(),
+            Some("project_memory_epoch")
+        );
+        assert_eq!(
+            serde_json::to_vec(repaired.messages()).unwrap(),
+            serde_json::to_vec(generic.messages()).unwrap(),
+            "reason labels must not change served bytes"
+        );
+        assert_ne!(run(&s, &request, &spine()).action, "HARD");
     }
 
     #[test]
@@ -20338,6 +24169,7 @@ pub(crate) mod tests {
             r#"[{"content":"State sync todo","status":"in_progress","priority":"high"}]"#;
         let loaded = s.load("todo-sync").unwrap();
         s.apply_authority_state_sync(ModuleStateSyncRequest {
+            resolved_compartment_boundaries: &[],
             session_id: "todo-sync",
             project_path: "git:proj",
             shadow_generation: loaded.meta.shadow_generation,
@@ -20348,16 +24180,7 @@ pub(crate) mod tests {
             strip_seeds: &[],
             strip_seed_skipped: 0,
             reasoning_cleared_through_tag: None,
-            compartments: &[],
-            memories: &[],
-            memory_mutations: &[],
-            user_profile: &[],
-            user_profile_present: false,
-            workspace: None,
-            workspace_present: false,
             last_todo_state: Some(state_json.to_string()),
-            project_memory_epoch: None,
-            user_profile_version: None,
             pending_agent_drops: &[],
             pending_agent_drops_skipped: 0,
             user_hint_seeds: &[],
@@ -21246,6 +25069,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn render_identity_delta_names_epoch_fields_without_exposing_values() {
+        assert_eq!(
+            render_identity_delta(
+                "cfg|m0epoch[ws:3:old;upg:0:;mem:0:]",
+                "cfg|m0epoch[ws:3:new;upg:0:;mem:0:]",
+            ),
+            vec!["ws"]
+        );
+        assert_eq!(
+            render_identity_delta(
+                "cfg|m0epoch[ws:0:;upg:0:;mem:0:]",
+                "cfg|m0epoch[ws:0:;upg:0:;mem:0:;pse:3:abc]",
+            ),
+            vec!["pse"]
+        );
+        assert_eq!(
+            render_identity_delta(
+                "old|m0epoch[ws:0:;upg:0:;mem:0:]",
+                "new|m0epoch[ws:0:;upg:0:;mem:0:]",
+            ),
+            vec!["base"]
+        );
+        assert_eq!(
+            render_identity_delta(
+                "cfg|m0epoch[ws:3:a;b;upg:0:;mem:0:]",
+                "cfg|m0epoch[ws:3:a;c;upg:0:;mem:0:]",
+            ),
+            vec!["ws"]
+        );
+    }
+
+    #[test]
     fn mural_changes_wait_for_a_natural_hard_and_then_replay_byte_identically() {
         fn request_with_mural(
             session: &str,
@@ -21263,6 +25118,14 @@ pub(crate) mod tests {
             });
             request
         }
+
+        assert_eq!(
+            render_identity_delta(
+                "cfg|m0epoch[ws:0:;mur:12:mural-hash-a]",
+                "cfg|m0epoch[ws:0:;mur:12:mural-hash-b]",
+            ),
+            vec!["mur"]
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -21311,7 +25174,15 @@ pub(crate) mod tests {
             })
         );
         let identity_a = store.load("mural-replay").unwrap().meta.last_render_config;
-        assert!(identity_a.contains("mural-hash-a"));
+        assert!(identity_a.contains("mur:12:mural-hash-a"));
+
+        let before_update = run(&store, &mural_a, &spine());
+        assert_eq!(before_update.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(&first.ck_messages).unwrap(),
+            serde_json::to_vec(&before_update.ck_messages).unwrap(),
+            "the defer before a mural update must replay the frozen prefix"
+        );
 
         let mural_b_defer = request_with_mural(
             "mural-replay",
@@ -21321,10 +25192,17 @@ pub(crate) mod tests {
         );
         let deferred = run(&store, &mural_b_defer, &spine());
         assert_eq!(deferred.action, "SOFT+");
+        assert_eq!(deferred.materialize_reason, None);
+        assert!(deferred.identity_delta.is_empty());
         assert_eq!(
-            serde_json::to_vec(&first.ck_messages).unwrap(),
+            serde_json::to_vec(&before_update.ck_messages).unwrap(),
             serde_json::to_vec(&deferred.ck_messages).unwrap(),
             "a live mural change must not self-bust the frozen m0 prefix"
+        );
+        assert_eq!(
+            store.load("mural-replay").unwrap().meta.last_render_config,
+            identity_a,
+            "a defer must not adopt the candidate mural identity"
         );
 
         let mural_b_hard = request_with_mural(
@@ -21335,9 +25213,10 @@ pub(crate) mod tests {
         );
         let folded = run(&store, &mural_b_hard, &spine());
         assert_eq!(folded.action, "HARD");
+        assert_eq!(folded.identity_delta, vec!["mur", "base"]);
         let identity_b = store.load("mural-replay").unwrap().meta.last_render_config;
         assert_ne!(identity_b, identity_a);
-        assert!(identity_b.contains("mural-hash-b"));
+        assert!(identity_b.contains("mur:12:mural-hash-b"));
         match &folded.messages()[0].content[1].kind {
             ck_wire::CkKind::Media(media) => {
                 assert_eq!(media.source["url"], json!("data:image/png;base64,Yg=="));
@@ -21839,10 +25718,126 @@ pub(crate) mod tests {
             Some("msg_02d6ec606001jEBwnJuw1OX68F")
         );
         assert_eq!(response.messages().last().unwrap().role, "user");
+        // The older notice is a persisted row with its own id, so it is ordinary history and
+        // stays on the wire. Only the position changes: it is no longer the live prompt.
         assert!(response
             .messages()
             .iter()
-            .all(|message| message.meta.harness_id.as_deref() != Some("notice-historical")));
+            .any(|message| message.meta.harness_id.as_deref() == Some("notice-historical")));
+    }
+
+    /// A persisted user row whose parts are marked `synthetic` is a real turn, not a Magic
+    /// Context injection. OpenCode sets that flag to mean "the model sees this text, the TUI
+    /// does not draw it as a human message": the row is written to the session database with
+    /// its own id, it is serialized to the model on every pass, and it owns the assistant
+    /// replies that follow it. Only Magic Context's own head rows -- composed in-process,
+    /// served without an id, every part synthetic -- may be dropped from the served array.
+    ///
+    /// Dropping a persisted row once it stopped being the newest message rewrote roughly a
+    /// thousand tokens of the cached tail on every plugin-injected prompt, and left the
+    /// assistant that answered it adjacent to the assistant before it, which the AI SDK then
+    /// merged into a single message.
+    #[test]
+    fn persisted_synthetic_user_rows_stay_served_after_they_stop_being_newest() {
+        fn served_bytes(response: &TransformResponse, harness_id: &str) -> Vec<u8> {
+            let message = response
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some(harness_id))
+                .unwrap_or_else(|| panic!("{harness_id} must stay on the served wire"));
+            serde_json::to_vec(message).unwrap()
+        }
+
+        fn harness_order(response: &TransformResponse) -> Vec<&str> {
+            response
+                .messages()
+                .iter()
+                .filter_map(|message| message.meta.harness_id.as_deref())
+                .filter(|id| id.starts_with("msg_"))
+                .collect()
+        }
+
+        fn request(messages: Vec<CkIngressMessage>) -> TransformRequest {
+            let mut request = profile_req(
+                SerializerProfile::OpencodeAiSdk,
+                "persisted-synthetic-user",
+                "cfg",
+                messages,
+            );
+            request.provider_id = Some("anthropic".to_string());
+            request
+        }
+
+        // The specimen row: a background-completion notice injected by a plugin through
+        // OpenCode's prompt path, persisted with id msg_0c431a772001Vuc0tNE4sppnvq.
+        let mut notice = wire_item(
+            "user",
+            "msg_notice",
+            3,
+            &["<system-reminder>\n[BACKGROUND BASH COMPLETED] task bash-1 finished\n</system-reminder>"],
+        );
+        notice.ck.meta.synthetic = true;
+        // Magic Context's own Channel 2 nudge reaches the session through the same OpenCode
+        // prompt path with the same part shape, so it persists as the same kind of row.
+        let mut channel2 = wire_item(
+            "user",
+            "msg_channel2",
+            5,
+            &["[SYSTEM DIRECTIVE: context ceiling reached, wrap up the current step]"],
+        );
+        channel2.ck.meta.synthetic = true;
+
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let opening = vec![
+            wire_item("user", "msg_prompt", 1, &["drive the task"]),
+            wire_item("assistant", "msg_assistant_one", 2, &["on it"]),
+        ];
+
+        let mut first_messages = opening.clone();
+        first_messages.push(notice.clone());
+        let first = run(&s, &request(first_messages), &spine());
+        let notice_bytes = served_bytes(&first, "msg_notice");
+
+        let mut second_messages = opening.clone();
+        second_messages.push(notice.clone());
+        second_messages.push(reasoning_tool_shell_message(
+            "msg_assistant_two",
+            4,
+            "call-notice-answer",
+            true,
+        ));
+        second_messages.push(channel2.clone());
+        let second = run(&s, &request(second_messages.clone()), &spine());
+        assert_eq!(
+            served_bytes(&second, "msg_notice"),
+            notice_bytes,
+            "the notice must be served byte-identically once it is no longer newest"
+        );
+        let channel2_bytes = served_bytes(&second, "msg_channel2");
+
+        let mut third_messages = second_messages;
+        third_messages.push(reasoning_tool_shell_message(
+            "msg_assistant_three",
+            6,
+            "call-channel2-answer",
+            true,
+        ));
+        let third = run(&s, &request(third_messages), &spine());
+        assert_eq!(served_bytes(&third, "msg_notice"), notice_bytes);
+        assert_eq!(served_bytes(&third, "msg_channel2"), channel2_bytes);
+        // Every persisted row keeps its place, so no two assistant rows become adjacent.
+        assert_eq!(
+            harness_order(&third),
+            vec![
+                "msg_prompt",
+                "msg_assistant_one",
+                "msg_notice",
+                "msg_assistant_two",
+                "msg_channel2",
+                "msg_assistant_three",
+            ]
+        );
     }
 
     #[test]
@@ -24514,6 +28509,171 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn marker_only_final_assistant_freezes_on_bust_and_replays_after_append() {
+        for (provider, sentinel) in [("anthropic", ""), ("openai-compatible", "[dropped]")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let session = format!("marker-only-{provider}");
+            let user = wire_item("user", "user", 1, &["continue"]);
+            let mut assistant = wire_item("assistant", "last", 2, &["§672§ [dropped §672§]"]);
+            assistant
+                .ck
+                .content
+                .push(CkWireBlock::bare(ck_wire::CkKind::Reasoning {
+                    text: "[cleared]".into(),
+                    signature: None,
+                }));
+            let mut request = req(&session, "cfg0", vec![user, assistant]);
+            request.provider_id = Some(provider.into());
+            let first = run(&store, &request, &spine());
+            assert_eq!(first.action, "HARD");
+            assert_eq!(tail_bytes(&first, "last"), sentinel);
+            assert!(store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:last"));
+            let first_wire = serde_json::to_vec(first.ck_messages.as_ref().unwrap()).unwrap();
+            request
+                .messages
+                .push(wire_item("assistant", "new", 3, &["§655§ [cleared]"]));
+            let second = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&second, "last"), sentinel);
+            assert_eq!(
+                serde_json::to_vec(
+                    &second.ck_messages.as_ref().unwrap()
+                        [..first.ck_messages.as_ref().unwrap().len()]
+                )
+                .unwrap(),
+                first_wire,
+                "the shared prefix must remain byte-identical after append"
+            );
+            assert_eq!(tail_bytes(&second, "new"), "§655§ [cleared]");
+            assert!(!store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:new"));
+        }
+    }
+
+    #[test]
+    fn blank_only_final_assistant_uses_provider_sentinel_and_replays() {
+        for (provider, sentinel) in [("anthropic", ""), ("openai-compatible", "[dropped]")] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            let session = format!("blank-only-{provider}");
+            let mut request = req(
+                &session,
+                "cfg0",
+                vec![
+                    wire_item("user", "user", 1, &["continue"]),
+                    wire_item("assistant", "last", 2, &[" \t"]),
+                ],
+            );
+            request.provider_id = Some(provider.into());
+            let first = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&first, "last"), sentinel);
+            assert!(store
+                .load(&session)
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key == "strip:placeholder:last"));
+            request
+                .messages
+                .push(wire_item("assistant", "new", 3, &["answer"]));
+            let second = run(&store, &request, &spine());
+            assert_eq!(tail_bytes(&second, "last"), sentinel);
+            assert_eq!(
+                serde_json::to_vec(
+                    &second.ck_messages.as_ref().unwrap()
+                        [..first.ck_messages.as_ref().unwrap().len()]
+                )
+                .unwrap(),
+                serde_json::to_vec(first.ck_messages.as_ref().unwrap()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn marker_only_parity_examples() {
+        let cases: Value =
+            serde_json::from_str(include_str!("../../../testdata/marker-only-parity.json"))
+                .unwrap();
+        for text in cases["positive"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            assert!(is_dropped_placeholder_text(text), "positive: {text:?}");
+        }
+        for text in cases["negative"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            if NON_ASCII_DIGIT_MARKERS.contains(&text) {
+                // Known divergence from TypeScript, pinned by
+                // marker_only_counts_non_ascii_digit_markers.
+                assert!(is_dropped_placeholder_text(text), "divergent: {text:?}");
+                continue;
+            }
+            assert!(!is_dropped_placeholder_text(text), "negative: {text:?}");
+        }
+        for parts in cases["positivePartCombinations"].as_array().unwrap() {
+            let blocks: Vec<_> = parts
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|part| {
+                    CkWireBlock::bare(ck_wire::CkKind::Text {
+                        text: part.as_str().unwrap().into(),
+                    })
+                })
+                .collect();
+            assert!(whole_marker_or_blank_message(&blocks), "parts: {parts:?}");
+        }
+    }
+
+    /// Marker-only shapes written with non-ASCII digits. The shared fixture lists
+    /// them as negatives because TypeScript's `\d` is ASCII; Rust's is Unicode.
+    const NON_ASCII_DIGIT_MARKERS: &[&str] =
+        &["\u{a7}\u{663}\u{a7}", "[dropped \u{a7}\u{663}\u{a7}]"];
+
+    #[test]
+    fn marker_only_counts_non_ascii_digit_markers() {
+        // Pins the served-byte behaviour: this check runs on every pass, so making
+        // it ASCII-only changes which reasoning block is kept and which message is
+        // replay-exempt mid-session. Change it only together with a
+        // TAGGER_FEATURE_EPOCH bump.
+        for text in NON_ASCII_DIGIT_MARKERS {
+            assert!(is_dropped_placeholder_text(text), "{text:?}");
+        }
+        assert!(is_dropped_placeholder_text("\u{a7}\u{663}\u{a7} [cleared]"));
+        assert!(!is_dropped_placeholder_text("\u{a7}\u{663}\u{a7} prose"));
+    }
+
+    #[test]
+    fn marker_only_text_and_reasoning_blocks_are_complete_markers() {
+        for kind in [
+            ck_wire::CkKind::Text {
+                text: "§672§ [dropped §672§]".into(),
+            },
+            ck_wire::CkKind::Reasoning {
+                text: "[cleared]".into(),
+                signature: None,
+            },
+        ] {
+            assert!(is_dropped_placeholder_block(&CkWireBlock::bare(kind)));
+        }
+        assert!(!is_dropped_placeholder_block(&CkWireBlock::bare(
+            ck_wire::CkKind::Text {
+                text: "see [dropped §3§] above".into(),
+            }
+        )));
+    }
+
+    #[test]
     fn dropped_assistant_shell_does_not_steal_signed_reasoning_exemption() {
         let signed = CkWireMessage::from_parts(
             "assistant",
@@ -25599,10 +29759,10 @@ pub(crate) mod tests {
                 .map(|part| part["state"]["input"].clone())
                 .collect::<Vec<_>>(),
             vec![
-                json!({ "dropped": "[dropped]" }),
-                json!({ "dropped": "[dropped]" }),
+                json!({ "path": "a.txt", "detail": "x".repeat(600) }),
+                json!({ "path": "b.txt", "detail": "y".repeat(600) }),
             ],
-            "model-visible native calls must expose only the dropped-input marker"
+            "after a HARD fold, small dropped calls expose their real arguments, never a marker"
         );
         assert!(parts.iter().all(|part| {
             part["state"]["status"] == "completed"
@@ -25632,6 +29792,7 @@ pub(crate) mod tests {
         let predicate = mc_store::HistorianPublishPredicate {
             firing_seq: 7,
             producer_run_id: "race-run".to_string(),
+            producer_attempt: 0,
             chunk_fingerprint: "race-fingerprint".to_string(),
             selected_range_identities: selected_range_identities.clone(),
             compartment_set_generation: generation,
@@ -25648,6 +29809,9 @@ pub(crate) mod tests {
             selected_range_identities,
             producer_session_id: Some("race-producer".to_string()),
             producer_run_id: Some(predicate.producer_run_id.clone()),
+            producer_attempt: predicate.producer_attempt,
+            coordinator_token: None,
+            claim_deadline_ms: None,
             fired_at_ms: Some(1),
             expected_revert_epoch: loaded.meta.revert_epoch,
             compartment_set_generation: generation,
@@ -25668,6 +29832,7 @@ pub(crate) mod tests {
             if !interleaved.replace(true) {
                 store
                     .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                        harness: None,
                         session_id: "astro-publish-race",
                         expected_row_version: Some(publish_row_version),
                         expected_revert_epoch: loaded.meta.revert_epoch,
@@ -25733,6 +29898,7 @@ pub(crate) mod tests {
         let predicate = mc_store::HistorianPublishPredicate {
             firing_seq: 8,
             producer_run_id: "between-reads-run".to_string(),
+            producer_attempt: 0,
             chunk_fingerprint: "between-reads-fingerprint".to_string(),
             selected_range_identities: selected_range_identities.clone(),
             compartment_set_generation: generation,
@@ -25749,6 +29915,9 @@ pub(crate) mod tests {
             selected_range_identities,
             producer_session_id: Some("between-reads-producer".to_string()),
             producer_run_id: Some(predicate.producer_run_id.clone()),
+            producer_attempt: predicate.producer_attempt,
+            coordinator_token: None,
+            claim_deadline_ms: None,
             fired_at_ms: Some(1),
             expected_revert_epoch: loaded.meta.revert_epoch,
             compartment_set_generation: generation,
@@ -25770,6 +29939,7 @@ pub(crate) mod tests {
             hook_ran_for_publish.store(true, Ordering::SeqCst);
             store
                 .publish_historian_chunk(mc_store::HistorianPublishRequest {
+                    harness: None,
                     session_id: "astro-torn-read",
                     expected_row_version: Some(publish_row_version),
                     expected_revert_epoch,
@@ -25812,11 +29982,13 @@ pub(crate) mod tests {
         let before = M1RevisionSignal {
             revision: 0xfeed,
             external_revision: 0xbeef,
+            history_revision: 0,
             max_compartment_seq: 47,
             max_memory_id: 9,
             max_memory_mutation_id: 3,
             note_status_version: 2,
             user_profile_version: 1,
+            legacy_note_revision: None,
         };
         let sequence_collision = M1RevisionSignal {
             max_compartment_seq: 48,
@@ -26380,7 +30552,12 @@ pub(crate) mod tests {
             .as_object_mut()
             .unwrap()
             .remove("rendered_m1_coverage");
-        let legacy: ModuleMeta = serde_json::from_value(value).unwrap();
+        let mut legacy: ModuleMeta = serde_json::from_value(value).unwrap();
+        // The round trip above only means to drop two blob keys. The row-stored fields do not
+        // survive it, and committing without them is the unhydrated shape the store refuses,
+        // so carry them across from the loaded state.
+        legacy.block_identity_by_mid = loaded.meta.block_identity_by_mid.clone();
+        legacy.served_output_fingerprint = loaded.meta.served_output_fingerprint.clone();
         store
             .commit("legacy-proof", loaded.row_version, &loaded.core, &legacy)
             .unwrap();
@@ -26614,75 +30791,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stale_full_state_sync_cannot_rewind_a_committed_divergence_recut() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = store(dir.path());
-        let request = seed_astro_divergence(&store, "astro-stale-state-sync", 2_402);
-        let recut = run(&store, &request, &spine());
-        assert_eq!(recut.action, "HARD");
-        let recut_bytes = serde_json::to_vec(&recut.ck_messages).unwrap();
-        let after_recut = store.load("astro-stale-state-sync").unwrap();
-        let compartments_after_recut = store.load_compartments("astro-stale-state-sync").unwrap();
-        let mut stale_compartments = astro_compartments()[..2].to_vec();
-        for compartment in &mut stale_compartments {
-            compartment.content = format!("STALE-TS-{}", compartment.sequence);
-            compartment.p1 = Some(compartment.content.clone());
-        }
-
-        store
-            .apply_authority_state_sync(ModuleStateSyncRequest {
-                session_id: "astro-stale-state-sync",
-                project_path: "git:proj",
-                shadow_generation: after_recut.meta.shadow_generation,
-                expected_shadow_seq: after_recut.meta.shadow_seq,
-                seed_boundary_id: Some("m425#0"),
-                drop_seeds: &[],
-                drop_seed_skipped: 0,
-                pending_agent_drops: &[],
-                pending_agent_drops_skipped: 0,
-                user_hint_seeds: &[],
-                auto_search_hint_skipped: 0,
-                note_nudge_anchors: None,
-                todo_synthetic_anchor: None,
-                todo_synthetic_anchor_present: false,
-                emergency_latches: None,
-                pending_compaction_marker: None,
-                deferred_execute_state: None,
-                channel2_nudge_state: None,
-                strip_seeds: &[],
-                strip_seed_skipped: 0,
-                reasoning_cleared_through_tag: None,
-                compartments: &stale_compartments,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
-                last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
-                acked_watermarks: Value::Null,
-            })
-            .unwrap();
-
-        let after_sync = store.load("astro-stale-state-sync").unwrap();
-        assert_eq!(after_sync.meta.coverage_ordinal, Some(2_400));
-        assert_eq!(after_sync.meta.folded_compartment_seq, 47);
-        assert_eq!(after_sync.core.boundary_id, "m2400#0");
-        assert_eq!(
-            store.load_compartments("astro-stale-state-sync").unwrap(),
-            compartments_after_recut
-        );
-        let deferred = run(&store, &request, &spine());
-        assert_eq!(deferred.action, "SOFT+");
-        assert_eq!(
-            serde_json::to_vec(&deferred.ck_messages).unwrap(),
-            recut_bytes
-        );
-    }
-
-    #[test]
     fn fired_divergence_with_absent_new_anchor_fails_loud_without_commit() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
@@ -26743,6 +30851,174 @@ pub(crate) mod tests {
             matches!(err, TransformError::CoverageGap(_)),
             "a leading gap must fail loud, not silently drop the early live item: {err:?}"
         );
+    }
+
+    #[test]
+    fn synthetic_reclassification_probe_never_reads_full_tag_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = active_opencode_req("probe", "cfg0", vec![item("plain", 1, "plain")]);
+        s.reset_tag_payload_query_count_for_test();
+        assert!(previously_tagged_synthetic_rows(&s, &request)
+            .unwrap()
+            .is_none());
+        assert_eq!(s.tag_payload_query_count_for_test(), 0);
+        request.messages[0].ck.meta.synthetic = true;
+        assert!(previously_tagged_synthetic_rows(&s, &request)
+            .unwrap()
+            .is_none());
+        assert_eq!(s.tag_payload_query_count_for_test(), 0);
+    }
+
+    #[test]
+    fn previously_tagged_synthetic_notice_keeps_priced_prefix_on_append_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut messages = vec![
+            item("first", 1, "first user"),
+            item("notice", 2, "synthetic notice"),
+            item("answer", 3, "signed thinking follows"),
+        ];
+        let mut request = active_opencode_req("synthetic-defer", "cfg0", messages.clone());
+        let priced = run(&s, &request, &spine());
+        assert_eq!(priced.action, "HARD");
+        let priced_prefix = priced.messages().to_vec();
+        assert!(serde_json::to_string(&priced_prefix).unwrap().contains("§"));
+
+        messages[1].ck.meta.synthetic = true;
+        messages.push(item("next", 4, "appended user"));
+        request.messages = messages;
+        let defer = run(&s, &request, &spine());
+        assert_eq!(defer.action, "SOFT+");
+        let shared_ck = &defer.messages()[..priced_prefix.len()];
+        assert_eq!(
+            serde_json::to_vec(shared_ck).unwrap(),
+            serde_json::to_vec(&priced_prefix).unwrap(),
+            "an appended defer must not change previously served CK bytes"
+        );
+        let native = |rows: &[ServedMessage]| {
+            let owned = rows
+                .iter()
+                .map(|row| row.deref().clone())
+                .collect::<Vec<_>>();
+            crate::codec::encode_opencode_with_session(
+                &owned,
+                &crate::codec::DecodeSidecar::new("opencode"),
+                Some("synthetic-defer"),
+                None,
+            )
+        };
+        assert_eq!(
+            serde_json::to_vec(&native(shared_ck)).unwrap(),
+            serde_json::to_vec(&native(&priced_prefix)).unwrap(),
+            "an appended defer must not change previously served native bytes"
+        );
+
+        let mut bust_request = request;
+        bust_request.render_config = "cfg1".to_string();
+        let busted = run(&s, &bust_request, &spine());
+        assert_eq!(busted.action, "HARD");
+        let notice = busted
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("notice"))
+            .unwrap();
+        assert!(notice.meta.synthetic);
+        assert!(!serde_json::to_string(notice).unwrap().contains("§2§"));
+        let busted_prefix = busted.messages().to_vec();
+        let durable = s.load("synthetic-defer").unwrap();
+        assert!(durable.meta.reclassified_synthetic_mids.contains("notice"));
+        assert!(s
+            .load_tags_for_session("synthetic-defer")
+            .unwrap()
+            .iter()
+            .any(|row| row.block_id == "notice#0"));
+        bust_request
+            .messages
+            .push(item("later", 5, "second appended user"));
+        let after_bust = run(&s, &bust_request, &spine());
+        assert_eq!(after_bust.action, "SOFT+");
+        let shared_after_bust = &after_bust.messages()[..busted_prefix.len()];
+        assert_eq!(
+            serde_json::to_vec(shared_after_bust).unwrap(),
+            serde_json::to_vec(&busted_prefix).unwrap(),
+            "the first defer after the bust must preserve the corrected CK prefix"
+        );
+        assert_eq!(
+            serde_json::to_vec(&native(shared_after_bust)).unwrap(),
+            serde_json::to_vec(&native(&busted_prefix)).unwrap(),
+            "the first defer after the bust must preserve corrected native bytes"
+        );
+        assert_eq!(
+            s.load("synthetic-defer")
+                .unwrap()
+                .meta
+                .reclassified_synthetic_mids,
+            durable.meta.reclassified_synthetic_mids
+        );
+    }
+
+    #[test]
+    fn tagged_marker_gap_heals_on_hard_without_replaying_legacy_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut messages = vec![
+            item("m1", 1, "covered one"),
+            item("notice", 2, "synthetic notice"),
+            item("m3", 3, "covered three"),
+            item("tail", 4, "signed thinking follows"),
+        ];
+        let request = active_opencode_req("ses", "cfg0", messages.clone());
+        let priced = run(&s, &request, &spine());
+        assert_eq!(priced.action, "HARD");
+        assert!(s
+            .load_tags_for_session("ses")
+            .unwrap()
+            .iter()
+            .any(|row| row.block_id == "notice#0"));
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "m1", "S1"), comp(2, 3, 3, "m3", "S2")],
+        )
+        .unwrap();
+        messages[1].ck.meta.synthetic = true;
+        let healed = run(&s, &active_opencode_req("ses", "cfg0", messages), &spine());
+        assert_eq!(healed.action, "HARD");
+        assert!(
+            healed.first_divergence.is_some(),
+            "the coverage fold must price a prefix bust"
+        );
+        assert_eq!(healed.coverage_ordinal, Some(3));
+        assert!(healed
+            .messages()
+            .iter()
+            .all(|message| message.meta.harness_id.as_deref() != Some("notice")));
+    }
+
+    #[test]
+    fn synthetic_row_between_compartments_does_not_create_a_live_coverage_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments(
+            "ses",
+            &[comp(1, 1, 1, "m1", "S1"), comp(2, 3, 3, "m3", "S2")],
+        )
+        .unwrap();
+        let mut notice = item("notice", 2, "synthetic notice");
+        notice.ck.meta.synthetic = true;
+        let messages = vec![
+            item("m1", 1, "covered one"),
+            notice,
+            item("m3", 3, "covered three"),
+            item("tail", 4, "tail"),
+        ];
+        let result = transform(
+            &s,
+            &req("ses", "cfg0", messages),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(result.action, "HARD");
     }
 
     #[test]
@@ -26880,6 +31156,209 @@ pub(crate) mod tests {
         }
     }
 
+    /// Overwrite the bytes of one stored frozen chunk, as disk corruption or a stray writer
+    /// would, without touching the digest the last codec commit recorded for it.
+    fn corrupt_frozen_chunk(dir: &std::path::Path, session: &str) {
+        let conn = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE mc_cache_frozen_chunks SET body = json_set(body, '$[0].reset_rule', 'x')
+                  WHERE session_id = ?1 AND chunk = 0",
+                [session],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the session has a first chunk to corrupt");
+    }
+
+    #[test]
+    fn corrupt_chunk_forces_hard_and_full_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let items = || vec![item("m1msg", 1, "raw"), item("t2", 2, "tail2")];
+        let bootstrap = run(&s, &req("ses", "cfg0", items()), &spine());
+        let stable = run(&s, &req("ses", "cfg0", items()), &spine());
+        assert_eq!(stable.action, "SOFT+");
+        let clean_units = s.load("ses").unwrap().core.frozen_units;
+        assert!(!clean_units.is_empty());
+
+        corrupt_frozen_chunk(dir.path(), "ses");
+        let rebuilt = run(&s, &req("ses", "cfg0", items()), &spine());
+        assert_eq!(
+            rebuilt.action, "HARD",
+            "a discarded section never serves a SOFT pass"
+        );
+        assert_eq!(
+            rebuilt.materialize_reason.as_deref(),
+            Some("cache_sections_discarded")
+        );
+        assert!(rebuilt.committed);
+        // The rebuilt frame is the one a clean build of the same messages serves.
+        assert_eq!(m0_bytes(&rebuilt), m0_bytes(&bootstrap));
+        assert_eq!(m1_bytes(&rebuilt), m1_bytes(&bootstrap));
+        assert_eq!(tail_ids(&rebuilt), tail_ids(&bootstrap));
+        // Every chunk was rewritten in full under fresh digests: the next load trusts it.
+        let reloaded = s.load("ses").unwrap();
+        assert!(!reloaded.sections.as_ref().unwrap().any_discarded());
+        assert_eq!(reloaded.core.frozen_units, clean_units);
+        let after = run(&s, &req("ses", "cfg0", items()), &spine());
+        assert_eq!(after.action, "SOFT+");
+    }
+
+    /// Subagent passes replace the classified plan with SOFT or DEFER, and they ignore
+    /// `force_hard`, so a discarded frozen list reaches HARD on a subagent only through the
+    /// explicit discard override. This pins that override.
+    ///
+    /// A subagent session holds no frozen units, so there is no chunk to corrupt. A stray
+    /// write to the frozen entry of `section_index` stands in for the corruption instead: its
+    /// digest no longer matches the (empty) stored chunks, and the load discards the list.
+    #[test]
+    fn subagent_discarded_frozen_list_forces_hard_and_full_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("sub", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        let request = || {
+            let mut request = active_opencode_req(
+                "sub",
+                "cfg0",
+                vec![item("m1msg", 1, "raw"), item("t2", 2, "tail2")],
+            );
+            request.is_subagent = true;
+            request
+        };
+        let first = run(&s, &request(), &spine());
+        assert_ne!(
+            first.action, "HARD",
+            "subagent passes do not go HARD on their own"
+        );
+        assert!(first.committed);
+
+        let conn = rusqlite::Connection::open(dir.path().join("store.db")).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE mc_cache_state
+                    SET section_index = json_set(section_index, '$.f.h', '00000000000000000000000000000000')
+                  WHERE session_id = 'sub'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        drop(conn);
+        assert!(
+            s.load("sub")
+                .unwrap()
+                .sections
+                .as_ref()
+                .unwrap()
+                .frozen
+                .discard_reason()
+                .is_some(),
+            "the edited frozen entry is discarded on load"
+        );
+
+        let rebuilt = run(&s, &request(), &spine());
+        assert_eq!(
+            rebuilt.action, "HARD",
+            "a discarded section never serves a subagent SOFT or DEFER pass"
+        );
+        assert_eq!(
+            rebuilt.materialize_reason.as_deref(),
+            Some("cache_sections_discarded")
+        );
+        assert!(rebuilt.committed);
+        // The commit rewrote the frozen entry under a fresh digest: the next load trusts it.
+        let reloaded = s.load("sub").unwrap();
+        assert!(!reloaded.sections.as_ref().unwrap().any_discarded());
+    }
+
+    /// Compaction-off sessions take their own additive pass. An empty (discarded) frozen list
+    /// on an initialized session is not a shape the classifier accepts, so this pins that the
+    /// pass rebuilds the list instead of rejecting every pass from then on.
+    #[test]
+    fn compaction_off_corrupt_chunk_rebuilds_with_hard_instead_of_rejecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = active_opencode_req(
+            "off-corrupt",
+            "cfg0",
+            vec![item("head", 1, "raw head"), item("tail", 2, "raw tail")],
+        );
+        let mut ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        ctx.compaction_enabled = false;
+
+        let bootstrap = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(bootstrap.action, "HARD");
+        assert!(bootstrap.committed);
+        let clean_units = s.load("off-corrupt").unwrap().core.frozen_units;
+        assert!(!clean_units.is_empty());
+
+        corrupt_frozen_chunk(dir.path(), "off-corrupt");
+        assert!(
+            s.load("off-corrupt")
+                .unwrap()
+                .sections
+                .as_ref()
+                .unwrap()
+                .frozen
+                .discard_reason()
+                .is_some(),
+            "the corrupted chunk is discarded on load"
+        );
+
+        ctx.now_ms = 20;
+        let rebuilt = transform(&s, &request, &ctx)
+            .expect("a discarded frozen list rebuilds instead of rejecting the pass");
+        assert_eq!(rebuilt.action, "HARD");
+        assert_eq!(
+            rebuilt.materialize_reason.as_deref(),
+            Some("cache_sections_discarded")
+        );
+        assert!(rebuilt.committed);
+        assert_eq!(
+            serde_json::to_vec(rebuilt.messages()).unwrap(),
+            serde_json::to_vec(bootstrap.messages()).unwrap(),
+            "the rebuilt frame is the one the clean bootstrap served"
+        );
+
+        // The commit rewrote the chunks under fresh digests, so the next load trusts them.
+        let reloaded = s.load("off-corrupt").unwrap();
+        let sections = reloaded.sections.as_ref().unwrap();
+        assert!(sections.frozen.intact().is_some());
+        assert!(!sections.any_discarded());
+        assert_eq!(reloaded.core.frozen_units, clean_units);
+
+        ctx.now_ms = 30;
+        let after = transform(&s, &request, &ctx).unwrap();
+        assert_eq!(after.action, "SOFT+");
+    }
+
+    #[test]
+    fn a_new_message_pass_runs_exactly_one_full_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
+            .unwrap();
+        run(
+            &s,
+            &req("ses", "cfg0", vec![item("m1msg", 1, "raw")]),
+            &spine(),
+        );
+        let mut items = vec![item("m1msg", 1, "raw")];
+        for n in 2..=4u64 {
+            items.push(item(&format!("t{n}"), n, &format!("tail{n}")));
+            let before = mc_store::cache_codec::full_decode_count();
+            let response = run(&s, &req("ses", "cfg0", items.clone()), &spine());
+            assert!(response.committed);
+            assert_eq!(
+                mc_store::cache_codec::full_decode_count() - before,
+                1,
+                "pass {n}: the transform snapshot is the pass's only full decode"
+            );
+        }
+    }
+
     #[test]
     fn public_memory_update_rides_soft_not_hard() {
         let dir = tempfile::tempdir().unwrap();
@@ -26887,7 +31366,6 @@ pub(crate) mod tests {
         let memory_id = s
             .insert_memory(memory_input("git:proj", "ARCHITECTURE", "original", 0))
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", memory_id);
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
             .unwrap();
         let before = run(
@@ -27088,7 +31566,6 @@ pub(crate) mod tests {
         // a memory is in the m0 baseline (seeded before bootstrap → in the manifest)
         s.seed_memory(5, "git:proj", "ARCHITECTURE", "original", 70)
             .unwrap();
-        acknowledge_test_host_memory(&s, "git:proj", 5);
         s.replace_compartments("ses", &[comp(1, 1, 1, "m1msg", "SUMMARY")])
             .unwrap();
         let before = run(
@@ -28409,6 +32886,16 @@ pub(crate) mod tests {
         first_block_text(msg.content.first().unwrap()).unwrap()
     }
 
+    fn frozen_channel1_units(s: &McStore, session_id: &str) -> Vec<FrozenUnit> {
+        s.load(session_id)
+            .unwrap()
+            .core
+            .frozen_units
+            .into_iter()
+            .filter(|unit| unit.key.starts_with(CHANNEL1_KEY_PREFIX))
+            .collect()
+    }
+
     /// Bootstrap a session whose m0 covers ordinal 1 (compartment ends at id "a"), so the
     /// boundary "a" is present and tail items (ordinal ≥ 2) are reducible.
     fn bootstrap_covering_a(s: &McStore) {
@@ -28428,7 +32915,6 @@ pub(crate) mod tests {
                     70,
                 )
                 .unwrap();
-                acknowledge_test_host_memory(s, "git:proj", id);
             })
             .collect()
     }
@@ -28466,7 +32952,7 @@ pub(crate) mod tests {
             let input = TagMintInput {
                 block_id: block.id.clone(),
                 kind: kind.as_store_kind().to_string(),
-                token_count: mc_tokenizer::estimate_tokens(source) as i64,
+                token_count: mc_tokenizer::estimate_tokens(&source) as i64,
                 source_bytes: source.as_bytes().to_vec(),
             };
             if !existing_tag_ids.contains(input.block_id.as_str()) {
@@ -28543,7 +33029,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn opencode_tagging_surface_leaves_whitespace_only_assistant_framing_inert() {
+    fn opencode_tagging_surface_neutralizes_whitespace_only_assistant_without_tagging() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         let request = active_opencode_req(
@@ -28554,7 +33040,7 @@ pub(crate) mod tests {
 
         let response = run(&s, &request, &spine());
 
-        assert_eq!(tail_bytes(&response, "blank-assistant"), "  \n\t");
+        assert_eq!(tail_bytes(&response, "blank-assistant"), "[dropped]");
         assert!(s
             .load_tags_for_session("opencode-whitespace-framing")
             .unwrap()
@@ -28734,6 +33220,382 @@ pub(crate) mod tests {
             serde_json::to_vec(first.messages()).unwrap(),
             serde_json::to_vec(replay.messages()).unwrap()
         );
+    }
+
+    #[test]
+    fn opencode_defer_does_not_first_tag_an_already_served_assistant() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = active_opencode_req(
+            "opencode-late-tag-defer",
+            "cfg0",
+            vec![
+                wire_item("user", "prompt", 1, &["inspect tests"]),
+                reasoning_item("target", 2, "first thought", "completed answer"),
+            ],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        request.mid_turn = true;
+
+        let first = run(&s, &request, &spine());
+        assert_eq!(first.action, "HARD");
+        assert_eq!(
+            first_block_text(
+                &first
+                    .messages()
+                    .iter()
+                    .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                    .unwrap()
+                    .content[1],
+            ),
+            Some("completed answer")
+        );
+        let served_target = first
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+            .unwrap()
+            .canonical_bytes()
+            .to_vec();
+
+        request
+            .messages
+            .push(wire_item("user", "next-prompt", 3, &["continue"]));
+        request
+            .messages
+            .push(reasoning_item("newer", 4, "next thought", "new answer"));
+        let defer = run(&s, &request, &spine());
+
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(
+            first_block_text(
+                &defer
+                    .messages()
+                    .iter()
+                    .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                    .unwrap()
+                    .content[1],
+            ),
+            Some("completed answer")
+        );
+        assert_eq!(
+            defer
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                .unwrap()
+                .canonical_bytes(),
+            served_target.as_slice(),
+            "a defer pass must not first-apply a tag to an already served message"
+        );
+        assert!(s
+            .load_tags_for_session("opencode-late-tag-defer")
+            .unwrap()
+            .iter()
+            .any(|row| row.block_id == "target#1"));
+        assert!(s
+            .load("opencode-late-tag-defer")
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .contains("target#1"));
+    }
+
+    #[test]
+    fn subagent_surface_activation_tags_served_tool_result_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = opencode_req(
+            "subagent-late-tool-result",
+            "cfg0",
+            vec![
+                wire_tool_call("call", 1, "call_result"),
+                wire_tool_result(
+                    "result",
+                    2,
+                    json!({ "kind": { "type": "text", "text": "served tool output" } }),
+                ),
+            ],
+        );
+        request.is_subagent = true;
+        let first = run(&s, &request, &spine());
+        let served = serde_json::to_vec(first.messages()).unwrap();
+        request.tool_present = true;
+        let activation = run(&s, &request, &spine());
+        assert_eq!(activation.action, "SOFT");
+        assert_ne!(serde_json::to_vec(activation.messages()).unwrap(), served);
+        assert!(serde_json::to_string(activation.messages())
+            .unwrap()
+            .contains("§1§ served tool output"));
+        assert!(s
+            .load("subagent-late-tool-result")
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .is_empty());
+        let replay = run(&s, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(replay.messages()).unwrap(),
+            serde_json::to_vec(activation.messages()).unwrap()
+        );
+    }
+
+    #[test]
+    fn subagent_defer_replays_served_bytes_and_execute_releases_late_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = active_opencode_req(
+            "subagent-late-tag",
+            "cfg0",
+            vec![
+                wire_item("user", "prompt", 1, &["inspect tests"]),
+                reasoning_item("target", 2, "first thought", "completed answer"),
+            ],
+        );
+        request.is_subagent = true;
+        request.provider_id = Some("anthropic".to_string());
+        request.mid_turn = true;
+        request = with_usage(request, 1, 100);
+
+        let first = run(&s, &request, &spine());
+        let served_prefix = serde_json::to_vec(first.messages()).unwrap();
+        let served = first
+            .messages()
+            .iter()
+            .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+            .unwrap()
+            .canonical_bytes()
+            .to_vec();
+        assert_eq!(
+            first_block_text(
+                &first
+                    .messages()
+                    .iter()
+                    .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                    .unwrap()
+                    .content[1]
+            ),
+            Some("completed answer")
+        );
+
+        for ordinal in 3..65 {
+            request.messages.push(wire_item(
+                "user",
+                &format!("history-{ordinal}"),
+                ordinal,
+                &["completed work"],
+            ));
+        }
+        request
+            .messages
+            .push(reasoning_item("newer", 65, "next thought", "new answer"));
+        let defer = run(&s, &request, &spine());
+        assert_eq!(defer.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(&defer.messages()[..first.messages().len()]).unwrap(),
+            served_prefix,
+            "the entire previously served subagent prefix must replay byte-identically"
+        );
+        assert_eq!(
+            defer
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                .unwrap()
+                .canonical_bytes(),
+            served.as_slice(),
+            "a subagent defer must replay the already-served provider bytes"
+        );
+        assert!(s
+            .load("subagent-late-tag")
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .contains("target#1"));
+
+        s.append_pending_agent_drops("subagent-late-tag", &["prompt#0".to_string()], 1)
+            .unwrap();
+        request = with_usage(request, 96, 100);
+        let execute = run(&s, &request, &spine());
+        assert_eq!(execute.action, "SOFT");
+        assert!(first_block_text(
+            &execute
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                .unwrap()
+                .content[1]
+        )
+        .is_some_and(|text| text.starts_with('§')));
+        assert!(s
+            .load("subagent-late-tag")
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .is_empty());
+        assert!(s
+            .load_pending_agent_drops("subagent-late-tag")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn opencode_busting_pass_first_tags_an_already_served_assistant() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let mut request = active_opencode_req(
+            "opencode-late-tag-bust",
+            "cfg0",
+            vec![
+                wire_item("user", "prompt", 1, &["inspect tests"]),
+                reasoning_item("target", 2, "first thought", "completed answer"),
+            ],
+        );
+        request.provider_id = Some("anthropic".to_string());
+        request.mid_turn = true;
+
+        let first = run(&s, &request, &spine());
+        assert_eq!(first.action, "HARD");
+        assert_eq!(
+            first_block_text(
+                &first
+                    .messages()
+                    .iter()
+                    .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                    .unwrap()
+                    .content[1],
+            ),
+            Some("completed answer")
+        );
+
+        request
+            .messages
+            .push(wire_item("user", "next-prompt", 3, &["continue"]));
+        request
+            .messages
+            .push(reasoning_item("newer", 4, "next thought", "new answer"));
+        request.render_config = "cfg1".to_string();
+        let bust = run(&s, &request, &spine());
+
+        assert_eq!(bust.action, "HARD");
+        assert!(first_block_text(
+            &bust
+                .messages()
+                .iter()
+                .find(|message| message.meta.harness_id.as_deref() == Some("target"))
+                .unwrap()
+                .content[1],
+        )
+        .is_some_and(|text| text.starts_with('§')));
+        assert!(s
+            .load_tags_for_session("opencode-late-tag-bust")
+            .unwrap()
+            .iter()
+            .any(|row| row.block_id == "target#1"));
+        assert!(s
+            .load("opencode-late-tag-bust")
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .is_empty());
+    }
+
+    /// A Broca session can serve a message the module never rendered: when a transform fails,
+    /// Broca sends its last-known-good array plus the raw new tail, and the provider caches
+    /// those raw bytes. If the module later records such a block as served, a tag minted for it
+    /// on a defer pass must wait for a prefix-mutation pass, exactly as on OpenCode.
+    #[test]
+    fn owned_broca_defer_holds_a_late_tag_on_a_served_block_until_a_bust() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let session = "owned-broca-late-tag";
+        let build = |messages: Vec<CkIngressMessage>, cfg: &str| {
+            let mut request = profile_req(SerializerProfile::OwnedBroca, session, cfg, messages);
+            request.tool_present = true;
+            with_usage(request, 1, 100)
+        };
+        let mut messages = vec![wire_item("user", "prompt", 1, &["inspect tests"])];
+        let first = run(&s, &build(messages.clone(), "cfg0"), &spine());
+        assert_eq!(first.action, "HARD");
+
+        // Stand in for the host having served `late` raw, outside a module response.
+        let mut seeded = s.load(session).unwrap();
+        seeded
+            .meta
+            .served_output_fingerprint
+            .push(ServedBlockFingerprint {
+                block_id: "late#0".to_string(),
+                content_hash: "raw-served".to_string(),
+                serialized_len: 4,
+            });
+        s.commit_transform(
+            session,
+            TransformCommit {
+                expected: seeded.row_version,
+                core: &seeded.core,
+                meta: &seeded.meta,
+                sections: mc_store::SectionsCommit::default(),
+                consumed_drop_ids: &[],
+                first_applied_command_ids: &[],
+                memory_revision: None,
+                compartment_max_seq: None,
+                project_root: None,
+                first_divergence: None,
+                scheduler_observation: None,
+                scheduler_request_observed_at_ms: None,
+                scheduler_full_array_fingerprint: None,
+                scheduler_eligible_supersession_count: None,
+                scheduler_withheld_by_tag_window: None,
+                scheduler_withheld_by_exempt_message: None,
+                scheduler_applied_supersession_count: None,
+                scheduler_applied_reductions: false,
+                overlays: TransformOverlayBatch::default(),
+            },
+        )
+        .unwrap();
+
+        messages.push(wire_item("assistant", "late", 2, &["served raw answer"]));
+        messages.push(wire_item("user", "fresh", 3, &["continue"]));
+        let defer = run(&s, &build(messages.clone(), "cfg0"), &spine());
+        assert_eq!(defer.action, "SOFT+");
+        let text_of = |response: &TransformResponse, mid: &str| {
+            first_block_text(
+                &response
+                    .messages()
+                    .iter()
+                    .find(|message| message.meta.harness_id.as_deref() == Some(mid))
+                    .unwrap()
+                    .content[0],
+            )
+            .unwrap()
+            .to_string()
+        };
+        assert_eq!(
+            text_of(&defer, "late"),
+            "served raw answer",
+            "a defer pass must not first-apply a tag to a block the provider already cached"
+        );
+        assert!(
+            text_of(&defer, "fresh").starts_with('§'),
+            "a block on its first send is tagged on any pass"
+        );
+        assert!(s
+            .load(session)
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .contains("late#0"));
+
+        let bust = run(&s, &build(messages, "cfg1"), &spine());
+        assert_eq!(bust.action, "HARD");
+        assert!(text_of(&bust, "late").starts_with('§'));
+        assert!(s
+            .load(session)
+            .unwrap()
+            .meta
+            .pending_tag_block_ids
+            .is_empty());
     }
 
     #[test]
@@ -29469,7 +34331,7 @@ pub(crate) mod tests {
             note_session_id: None,
             source_project_path: None,
         }];
-        let singular = render_user_hint(&single).unwrap();
+        let singular = render_user_hint(&single, true).unwrap();
         assert!(singular.contains("Your memory may contain 1 related fragment:"));
 
         let results = (1..=4)
@@ -29491,7 +34353,7 @@ pub(crate) mod tests {
                 source_project_path: None,
             })
             .collect::<Vec<_>>();
-        let hint = render_user_hint(&results).unwrap();
+        let hint = render_user_hint(&results, true).unwrap();
         let bullets = hint
             .lines()
             .filter(|line| line.starts_with("- "))
@@ -29502,59 +34364,62 @@ pub(crate) mod tests {
         assert!(hint.contains("If the fragments above seem relevant to the current request"));
         assert!(hint.chars().count() <= USER_HINT_TOTAL_CHAR_CAP + 2);
 
-        let golden = render_user_hint(&[
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 1,
-                snippet: "alpha".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-                score_hundredths: 100,
-                start_ordinal: None,
-                end_ordinal: None,
-                note_created_at_ms: None,
-                note_anchor_ordinal: None,
-                note_session_id: None,
-                source_project_path: None,
-            },
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 2,
-                snippet: "beta".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-                score_hundredths: 100,
-                start_ordinal: None,
-                end_ordinal: None,
-                note_created_at_ms: None,
-                note_anchor_ordinal: None,
-                note_session_id: None,
-                source_project_path: None,
-            },
-            crate::memory_tool::MemorySearchResult {
-                source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
-                id: 3,
-                snippet: "gamma".to_string(),
-                category: None,
-                sequence: None,
-                title: None,
-                note_status: None,
-                surface_condition: None,
-                score_hundredths: 100,
-                start_ordinal: None,
-                end_ordinal: None,
-                note_created_at_ms: None,
-                note_anchor_ordinal: None,
-                note_session_id: None,
-                source_project_path: None,
-            },
-        ])
+        let golden = render_user_hint(
+            &[
+                crate::memory_tool::MemorySearchResult {
+                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                    id: 1,
+                    snippet: "alpha".to_string(),
+                    category: None,
+                    sequence: None,
+                    title: None,
+                    note_status: None,
+                    surface_condition: None,
+                    score_hundredths: 100,
+                    start_ordinal: None,
+                    end_ordinal: None,
+                    note_created_at_ms: None,
+                    note_anchor_ordinal: None,
+                    note_session_id: None,
+                    source_project_path: None,
+                },
+                crate::memory_tool::MemorySearchResult {
+                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                    id: 2,
+                    snippet: "beta".to_string(),
+                    category: None,
+                    sequence: None,
+                    title: None,
+                    note_status: None,
+                    surface_condition: None,
+                    score_hundredths: 100,
+                    start_ordinal: None,
+                    end_ordinal: None,
+                    note_created_at_ms: None,
+                    note_anchor_ordinal: None,
+                    note_session_id: None,
+                    source_project_path: None,
+                },
+                crate::memory_tool::MemorySearchResult {
+                    source_kind: crate::memory_tool::MemorySearchSourceKind::Memory,
+                    id: 3,
+                    snippet: "gamma".to_string(),
+                    category: None,
+                    sequence: None,
+                    title: None,
+                    note_status: None,
+                    surface_condition: None,
+                    score_hundredths: 100,
+                    start_ordinal: None,
+                    end_ordinal: None,
+                    note_created_at_ms: None,
+                    note_anchor_ordinal: None,
+                    note_session_id: None,
+                    source_project_path: None,
+                },
+            ],
+            true,
+        )
         .unwrap();
         assert_eq!(
             golden,
@@ -30287,6 +35152,59 @@ pub(crate) mod tests {
         });
     }
 
+    /// A document's words are all searchable, whatever their place in the alphabet, and a
+    /// long prompt keeps the terms that tell candidates apart.
+    #[test]
+    fn lexical_hint_matches_late_alphabet_words_of_long_documents_and_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        // More than the cap of distinct words, with the discriminating one late in the
+        // alphabet: it used to fall outside the alphabetically first 24.
+        let long_memory = "amber apple banana cherry alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo \
+             lima mike november oscar papa quebec romeo sierra tango uniform victor \
+             whiskey xray yankee zulu tokenizer parity suite";
+        s.seed_memory(1, "git:proj", "CONSTRAINTS", long_memory, 50)
+            .unwrap();
+        for id in 2..=10 {
+            s.seed_memory(
+                id,
+                "git:proj",
+                "CONSTRAINTS",
+                &format!("fixture memory {id} about ordinary unrelated material"),
+                50,
+            )
+            .unwrap();
+        }
+        let hit = run_user_hint_lexical_search(
+            &s,
+            "git:proj",
+            "lexical",
+            "tokenizer parity",
+            true,
+            DEFAULT_AUTO_SEARCH_SCORE_THRESHOLD,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(hit.first().map(|result| result.id), Some(1));
+
+        // A prompt with more than the cap of distinct words keeps the terms the pool
+        // contains, however late they sort or appear.
+        let mut prompt_terms = (0..30).map(|n| format!("filler{n:02}")).collect::<Vec<_>>();
+        prompt_terms.push("tokenizer".to_string());
+        prompt_terms.push("parity".to_string());
+        let frequency = HashMap::from([
+            ("tokenizer".to_string(), 1usize),
+            ("parity".to_string(), 1usize),
+        ]);
+        let kept = select_query_tokens(prompt_terms, &frequency);
+        assert_eq!(kept.len(), USER_HINT_TOKEN_CAP);
+        assert!(
+            kept.contains("tokenizer") && kept.contains("parity"),
+            "{kept:?}"
+        );
+        assert!(kept.contains("filler00") && !kept.contains("filler29"));
+    }
+
     #[test]
     fn lexical_hint_scoring_requires_two_specific_tokens() {
         let dir = tempfile::tempdir().unwrap();
@@ -30575,7 +35493,7 @@ pub(crate) mod tests {
                     .find(|block| block.id == row.block_id)
                     .unwrap();
                 let (_, source) = taggable_source(block).expect("minted tags must be overlayable");
-                assert_eq!(row.source_bytes, source.as_bytes());
+                assert_eq!(&*row.source_bytes, source.as_bytes());
             }
             assert_eq!(tail_bytes(&response, "m1"), "§1§   user §7§");
             assert_eq!(tail_bytes(&response, "text"), "§2§   text output");
@@ -30886,7 +35804,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         let cached = load_cached_tags(&store, session).unwrap();
-        assert_eq!(cached[0].source_bytes, b"old");
+        assert_eq!(&*cached[0].source_bytes, b"old");
         let before = store.tag_cache_summary(session).unwrap();
 
         // This bypasses transform commits, so only the SQLite mutation trigger can invalidate
@@ -30903,7 +35821,7 @@ pub(crate) mod tests {
         assert_ne!(after.generation, before.generation);
 
         let refilled = load_cached_tags(&store, session).unwrap();
-        assert_eq!(refilled[0].source_bytes, b"poisoned");
+        assert_eq!(&*refilled[0].source_bytes, b"poisoned");
     }
 
     #[test]
@@ -30924,9 +35842,9 @@ pub(crate) mod tests {
         let b = load_cached_tags(&store, "tag-cache-b").unwrap();
         let a_second = load_cached_tags(&store, "tag-cache-a").unwrap();
         assert_eq!(a_first[0].block_id, "a#0");
-        assert_eq!(a_second[0].source_bytes, b"A");
+        assert_eq!(&*a_second[0].source_bytes, b"A");
         assert_eq!(b[0].block_id, "b#0");
-        assert_eq!(b[0].source_bytes, b"B");
+        assert_eq!(&*b[0].source_bytes, b"B");
     }
 
     #[test]
@@ -30993,7 +35911,193 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn channel1_hygiene_ratio_nudge_replays_and_structural_minimum_suppresses_refire() {
+    fn channel1_waits_for_first_serve_or_priced_pass_then_replays_frozen_bytes() {
+        run_active_surface_test(|| {
+            fn assistant_text(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+                CkIngressMessage {
+                    mid: mid.to_string(),
+                    ordinal,
+                    ck: CkWireMessage::from_parts(
+                        "assistant",
+                        vec![ck_wire::CkWireBlock::bare(ck_wire::CkKind::Text {
+                            text: text.to_string(),
+                        })],
+                        None,
+                        ck_wire::ProviderExtras::new(),
+                        ck_wire::HarnessMeta {
+                            harness_id: Some(mid.to_string()),
+                            ..Default::default()
+                        },
+                    ),
+                }
+            }
+
+            fn keep_next_channel1_quiet(s: &McStore, session_id: &str) {
+                let mut loaded = s.load(session_id).unwrap();
+                loaded.meta.channel1_last_nudge_level = "urgent".to_string();
+                loaded.meta.channel1_last_nudge_undropped = i64::MAX;
+                s.commit(session_id, loaded.row_version, &loaded.core, &loaded.meta)
+                    .unwrap();
+            }
+
+            fn arm_gentle_crossing(s: &McStore, session_id: &str) {
+                let mut loaded = s.load(session_id).unwrap();
+                let baseline = loaded.meta.tail_hygiene_baseline.as_mut().unwrap();
+                // This cache-delivery control seeds legacy arithmetic directly; calibrated
+                // floor behavior is covered by the dedicated Fable hygiene test.
+                baseline.hygiene_units_version = 1;
+                baseline.baseline_u = CHANNEL1_FLOOR_TOKENS - 1;
+                baseline.baseline_t = 100_000;
+                baseline.turn_delta_u = 0;
+                baseline.turn_delta_t = 0;
+                baseline.channel1_post_reduce_grace_baseline_u = None;
+                baseline.channel1_post_reduce_grace_pre_level.clear();
+                loaded.meta.channel1_last_nudge_undropped = 0;
+                loaded.meta.channel1_last_nudge_level.clear();
+                loaded.meta.channel1_last_fire_level.clear();
+                loaded.meta.channel1_last_fire_ordinal = 0;
+                s.commit(session_id, loaded.row_version, &loaded.core, &loaded.meta)
+                    .unwrap();
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let messages = vec![
+                assistant_tool_call("call1", 1, "c1"),
+                tool_result("result1", 2, "c1", "board output"),
+            ];
+            let request = with_usage(
+                active_cc_req("channel1-defer-hold", "cfg0", messages.clone()),
+                100,
+                1024,
+            );
+            run(&s, &request, &spine());
+            keep_next_channel1_quiet(&s, "channel1-defer-hold");
+            let first_serve = run(&s, &request, &spine());
+            let bare_result = tail_bytes(&first_serve, "result1").to_string();
+            assert!(!bare_result.contains("<system-reminder>"));
+            arm_gentle_crossing(&s, "channel1-defer-hold");
+
+            let mut crossed_messages = messages.clone();
+            crossed_messages.push(assistant_text("assistant-text", 3, &"word ".repeat(100)));
+            crossed_messages.push(item("next-user", 4, "continue"));
+            let crossed_request = with_usage(
+                active_cc_req("channel1-defer-hold", "cfg0", crossed_messages.clone()),
+                100,
+                1024,
+            );
+            let deferred_crossing = run(&s, &crossed_request, &spine());
+            assert_eq!(deferred_crossing.action, "SOFT+");
+            assert_eq!(
+                tail_bytes(&deferred_crossing, "result1"),
+                bare_result,
+                "a band crossing on defer cannot rewrite an already-served result"
+            );
+            assert!(!s
+                .load("channel1-defer-hold")
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .any(|unit| unit.key.starts_with("channel1:")));
+
+            crossed_messages.push(assistant_tool_call("call2", 5, "c2"));
+            crossed_messages.push(tool_result("result2", 6, "c2", "fresh output"));
+            let fresh_request = with_usage(
+                active_cc_req("channel1-defer-hold", "cfg0", crossed_messages),
+                100,
+                1024,
+            );
+            let fresh = run(&s, &fresh_request, &spine());
+            assert_eq!(fresh.action, "SOFT+");
+            assert!(tail_bytes(&fresh, "result2").contains("<system-reminder>"));
+            let fresh_units = s
+                .load("channel1-defer-hold")
+                .unwrap()
+                .core
+                .frozen_units
+                .into_iter()
+                .filter(|unit| unit.key.starts_with("channel1:"))
+                .collect::<Vec<_>>();
+            assert_eq!(fresh_units.len(), 1);
+            assert!(s
+                .load_channel1_appends("channel1-defer-hold")
+                .unwrap()
+                .is_empty());
+            assert_eq!(fresh_units[0].key, "channel1:[\"c2\",\"call2\"]");
+            assert_eq!(fresh_units[0].reset_rule, "result2#0");
+            let fresh_result = tail_bytes(&fresh, "result2");
+            let reminder_offset = fresh_result.find("\n\n<system-reminder>").unwrap();
+            assert_eq!(
+                fresh_units[0].frozen_payload,
+                fresh_result[reminder_offset..]
+            );
+
+            let priced_messages = vec![
+                assistant_tool_call("priced-call", 1, "priced-c1"),
+                tool_result("priced-result", 2, "priced-c1", "priced output"),
+            ];
+            let priced_request = with_usage(
+                active_cc_req("channel1-priced", "cfg0", priced_messages.clone()),
+                100,
+                1024,
+            );
+            let priced_first_serve = run(&s, &priced_request, &spine());
+            assert!(!tail_bytes(&priced_first_serve, "priced-result").contains("<system-reminder>"));
+            let mut priced_bust_messages = priced_messages;
+            priced_bust_messages.push(assistant_text(
+                "priced-assistant-text",
+                3,
+                &"word ".repeat(80_000),
+            ));
+            priced_bust_messages.push(item("priced-next-user", 4, "continue"));
+            let priced_bust_request = with_usage(
+                active_cc_req("channel1-priced", "cfg1", priced_bust_messages),
+                100,
+                1024,
+            );
+
+            let priced = run(&s, &priced_bust_request, &spine());
+            assert_eq!(priced.action, "HARD");
+            assert!(tail_bytes(&priced, "priced-result").contains("<system-reminder>"));
+            let priced_hash = canonical_response_hash(&priced);
+            let reminder_bytes = s
+                .load("channel1-priced")
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .find(|unit| unit.key.starts_with("channel1:"))
+                .map(|unit| unit.frozen_payload.clone())
+                .expect("priced pass must freeze exact reminder bytes");
+            assert!(tail_bytes(&priced, "priced-result").ends_with(&reminder_bytes));
+
+            for _ in 0..4 {
+                let replay = run(&s, &priced_bust_request, &spine());
+                assert_eq!(replay.action, "SOFT+");
+                assert_eq!(canonical_response_hash(&replay), priced_hash);
+                assert!(tail_bytes(&replay, "priced-result").ends_with(&reminder_bytes));
+            }
+
+            let mut loaded = s.load("channel1-priced").unwrap();
+            loaded
+                .core
+                .frozen_units
+                .push(red_unit("priced-result#0", "drop", "[dropped]"));
+            s.commit(
+                "channel1-priced",
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+            run(&s, &priced_bust_request, &spine());
+            assert!(frozen_channel1_units(&s, "channel1-priced").is_empty());
+        });
+    }
+
+    #[test]
+    fn channel1_hygiene_ratio_nudge_replays_then_refires_after_the_protection_drop() {
         run_active_surface_test(|| {
             let dir = tempfile::tempdir().unwrap();
             let s = store(dir.path());
@@ -31019,11 +36123,27 @@ pub(crate) mod tests {
             let first = run(&s, &request, &spine());
             let first_result = tail_bytes(&first, "result5").to_string();
             assert!(first_result.contains("<system-reminder>"));
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+            assert_eq!(frozen_channel1_units(&s, "nudge").len(), 1);
 
             let replay = run(&s, &request, &spine());
             assert_eq!(tail_bytes(&replay, "result5"), first_result);
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+            assert_eq!(frozen_channel1_units(&s, "nudge").len(), 1);
+            // The protection window always keeps the newest three tool arcs, and it
+            // covers them from the pass after their tags are minted. That takes
+            // reclaimable mass out of U on blocks the first pass already froze, so the
+            // baseline re-measures instead of holding, and the lower band it now
+            // measures is recorded without emitting another reminder.
+            let after_replay = s.load("nudge").unwrap();
+            let replayed_baseline = after_replay.meta.tail_hygiene_baseline.as_ref().unwrap();
+            assert_eq!(replayed_baseline.baseline_generation, 2);
+            assert!(replayed_baseline.evaluable);
+            assert!(!replayed_baseline.generation_invalidated);
+            assert_eq!(
+                effective_tail_hygiene(replayed_baseline).0 * 5,
+                effective_tail_hygiene(replayed_baseline).1 * 2,
+                "three of five arcs are protected, so U is two fifths of T"
+            );
+            assert_eq!(after_replay.meta.channel1_last_nudge_level, "firm");
 
             let mut grace_meta = s.load("nudge").unwrap();
             let grace_u =
@@ -31053,7 +36173,7 @@ pub(crate) mod tests {
                     .map(|message| message.canonical_bytes())
                     .collect::<Vec<_>>()
             );
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+            assert_eq!(frozen_channel1_units(&s, "nudge").len(), 1);
 
             let mut refire_meta = s.load("nudge").unwrap();
             let refire_baseline = refire_meta.meta.tail_hygiene_baseline.as_mut().unwrap();
@@ -31077,35 +36197,143 @@ pub(crate) mod tests {
             let mut refire_request = active_cc_req("nudge", "cfg0", refire_messages.clone());
             refire_request.protected_tags = 0;
             let refire_request = with_usage(refire_request, 900, 1024);
-            let sticky = run(&s, &refire_request, &spine());
-            let sticky_result = tail_bytes(&sticky, "result6").to_string();
+            let refired = run(&s, &refire_request, &spine());
+            let refired_result = tail_bytes(&refired, "result6").to_string();
             assert_eq!(
-                tail_bytes(&sticky, "result5"),
+                tail_bytes(&refired, "result5"),
                 first_result,
-                "the first reminder stays frozen while the structural minimum suppresses a new span"
+                "the first reminder stays frozen when a later one fires"
             );
-            assert!(
-                !sticky_result.contains("Reminder: "),
-                "the newest-three structural minimum must suppress this refire"
+            // A re-fire after the band was recorded as firm is a genuine crossing back
+            // into urgent, so it renders the full copy rather than the calm same-band one,
+            // and it lands on the newest tool result.
+            assert!(refired_result.contains("are still unstamped. Call ctx_reduce now"));
+            assert!(!refired_result.contains("Still unstamped: "));
+            assert_eq!(
+                frozen_channel1_units(&s, "nudge")
+                    .iter()
+                    .map(|unit| unit.reset_rule.clone())
+                    .collect::<Vec<_>>(),
+                vec!["result5#0".to_string(), "result6#0".to_string()]
             );
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
-            let sticky_replay = run(&s, &refire_request, &spine());
-            assert_eq!(tail_bytes(&sticky_replay, "result6"), sticky_result);
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+            let refired_replay = run(&s, &refire_request, &spine());
+            assert_eq!(tail_bytes(&refired_replay, "result6"), refired_result);
+            assert_eq!(frozen_channel1_units(&s, "nudge").len(), 2);
 
             let mut loaded = s.load("nudge").unwrap();
             loaded.meta.channel1_reduce_suppressed = true;
             s.commit("nudge", loaded.row_version, &loaded.core, &loaded.meta)
                 .unwrap();
             refire_messages.push(assistant_tool_call("call7", 13, "c7"));
-            refire_messages.push(tool_result("result7", 14, "c7", &huge));
+            // Small enough that U/T stays inside the band observed before the reduce, so
+            // post-reduce grace is what decides this pass and no escalation escapes it.
+            refire_messages.push(tool_result("result7", 14, "c7", &"word ".repeat(200)));
             let mut suppressed_request = active_cc_req("nudge", "cfg0", refire_messages);
             suppressed_request.protected_tags = 0;
             let suppressed = run(&s, &with_usage(suppressed_request, 900, 1024), &spine());
             assert!(tail_bytes(&suppressed, "result5").contains("<system-reminder>"));
-            assert!(!tail_bytes(&suppressed, "result6").contains("<system-reminder>"));
-            assert!(!tail_bytes(&suppressed, "result7").contains("<system-reminder>"));
-            assert_eq!(s.load_channel1_appends("nudge").unwrap().len(), 1);
+            assert!(tail_bytes(&suppressed, "result6").contains("<system-reminder>"));
+            assert!(
+                !tail_bytes(&suppressed, "result7").contains("<system-reminder>"),
+                "a reduce-suppressed pass adds no new span"
+            );
+            assert_eq!(frozen_channel1_units(&s, "nudge").len(), 2);
+        });
+    }
+
+    /// A reminder already served to the model is part of the provider's cached prefix, so a
+    /// release that rewords the reminder copy must keep replaying the stored bytes of every
+    /// reminder minted before it. Only reminders minted afterwards carry the new copy.
+    #[test]
+    fn channel1_reminder_served_with_superseded_copy_replays_its_bytes_after_a_copy_change() {
+        run_active_surface_test(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let s = store(dir.path());
+            let huge = "word ".repeat(40_000);
+            let mut messages = Vec::new();
+            for number in 1..=5 {
+                messages.push(assistant_tool_call(
+                    &format!("call{number}"),
+                    number * 2 - 1,
+                    &format!("c{number}"),
+                ));
+                messages.push(tool_result(
+                    &format!("result{number}"),
+                    number * 2,
+                    &format!("c{number}"),
+                    &huge,
+                ));
+            }
+            let mut request = active_cc_req("copy", "cfg0", messages.clone());
+            request.protected_tags = 0;
+            let request = with_usage(request, 900, 1024);
+            run(&s, &request, &spine());
+            run(&s, &request, &spine());
+            assert_eq!(frozen_channel1_units(&s, "copy").len(), 1);
+
+            // Stand in for the previous build: the stored unit holds the text that build
+            // minted and served, worded with the superseded copy.
+            let old_copy = "\n\n<system-reminder>\nHousekeeping: 5 spent tool outputs (~200k tokens) are reclaimable — make a ctx_reduce pass at a natural stopping point.\noldest reclaimable: §1§ tool.\n</system-reminder>";
+            let mut loaded = s.load("copy").unwrap();
+            for unit in loaded
+                .core
+                .frozen_units
+                .iter_mut()
+                .filter(|unit| unit.key.starts_with(CHANNEL1_KEY_PREFIX))
+            {
+                unit.frozen_payload = old_copy.to_string();
+            }
+            s.commit("copy", loaded.row_version, &loaded.core, &loaded.meta)
+                .unwrap();
+
+            let digest = |response: &TransformResponse| {
+                let mut hasher = Sha256::new();
+                for message in response.messages() {
+                    hasher.update(message.canonical_bytes());
+                }
+                format!("{:x}", hasher.finalize())
+            };
+            let pass_a = run(&s, &request, &spine());
+            assert!(tail_bytes(&pass_a, "result5").ends_with(old_copy));
+            let pass_b = run(&s, &request, &spine());
+            assert_eq!(
+                digest(&pass_b),
+                digest(&pass_a),
+                "a defer pass serves the superseded reminder bytes unchanged"
+            );
+            assert!(tail_bytes(&pass_b, "result5").ends_with(old_copy));
+
+            // Re-open the cadence gates the same way the refire test does, then mint a new
+            // reminder on a fresh tool result: it must use the current copy while the old
+            // one keeps its bytes.
+            let mut refire_meta = s.load("copy").unwrap();
+            let refire_baseline = refire_meta.meta.tail_hygiene_baseline.as_mut().unwrap();
+            refire_baseline.channel1_post_reduce_grace_baseline_u = None;
+            refire_baseline.channel1_post_reduce_grace_pre_level.clear();
+            refire_meta.meta.channel1_last_nudge_undropped = 0;
+            refire_meta.meta.channel1_last_fire_ordinal = u64::MAX;
+            s.commit(
+                "copy",
+                refire_meta.row_version,
+                &refire_meta.core,
+                &refire_meta.meta,
+            )
+            .unwrap();
+            let mut refire_messages = messages;
+            refire_messages.push(assistant_tool_call("call6", 11, "c6"));
+            refire_messages.push(tool_result("result6", 12, "c6", &huge.repeat(3)));
+            let mut refire_request = active_cc_req("copy", "cfg0", refire_messages);
+            refire_request.protected_tags = 0;
+            let refired = run(&s, &with_usage(refire_request, 900, 1024), &spine());
+            assert_eq!(
+                tail_bytes(&refired, "result5"),
+                tail_bytes(&pass_a, "result5")
+            );
+            let fresh = tail_bytes(&refired, "result6");
+            assert!(fresh.contains(
+                "are still unstamped. Call ctx_reduce now, before your next tool call, on every output you've already used."
+            ));
+            assert!(!fresh.contains("natural stopping point"));
         });
     }
 
@@ -31135,7 +36363,7 @@ pub(crate) mod tests {
             run(&s, &initial_request, &spine());
             let first = run(&s, &initial_request, &spine());
             assert!(tail_bytes(&first, "result4").contains("<system-reminder>"));
-            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+            assert_eq!(frozen_channel1_units(&s, "drop-grace").len(), 1);
 
             s.append_pending_agent_drops_with_command(
                 "drop-grace",
@@ -31159,7 +36387,7 @@ pub(crate) mod tests {
                 s.load_pending_agent_drops("drop-grace").unwrap(),
             );
             assert!(!tail_bytes(&applying, "result5").contains("<system-reminder>"));
-            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+            assert_eq!(frozen_channel1_units(&s, "drop-grace").len(), 1);
             assert!(after_applying
                 .meta
                 .tail_hygiene_baseline
@@ -31170,7 +36398,7 @@ pub(crate) mod tests {
             let resumed = run(&s, &applying_request, &spine());
             let resumed_result = tail_bytes(&resumed, "result5");
             assert!(!resumed_result.contains("<system-reminder>"));
-            assert_eq!(s.load_channel1_appends("drop-grace").unwrap().len(), 1);
+            assert_eq!(frozen_channel1_units(&s, "drop-grace").len(), 1);
         });
     }
 
@@ -31791,6 +37019,7 @@ pub(crate) mod tests {
                     expected: loaded.row_version,
                     core: &loaded.core,
                     meta: &loaded.meta,
+                    sections: mc_store::SectionsCommit::default(),
                     consumed_drop_ids: &[pending[0].id],
                     first_applied_command_ids: &command_ids,
                     memory_revision: None,
@@ -31878,6 +37107,7 @@ pub(crate) mod tests {
                     expected: loaded.row_version,
                     core: &loaded.core,
                     meta: &loaded.meta,
+                    sections: mc_store::SectionsCommit::default(),
                     consumed_drop_ids: &[pending_a[0].id],
                     first_applied_command_ids: &command_a,
                     memory_revision: None,
@@ -32012,7 +37242,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 1_500,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -32032,7 +37262,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 1_000,
                 created_at_ms: 0,
-                source_bytes: Vec::new(),
+                source_bytes: Default::default(),
             })
             .collect::<Vec<_>>();
         let applying_window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -32259,7 +37489,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 4_000,
                 created_at_ms: 0,
-                source_bytes: b"old source".to_vec(),
+                source_bytes: b"old source".to_vec().into(),
             },
             McTagRow {
                 tag_number: 8,
@@ -32267,7 +37497,7 @@ pub(crate) mod tests {
                 kind: "tool_result".to_string(),
                 token_count: 4_000,
                 created_at_ms: 0,
-                source_bytes: b"new source".to_vec(),
+                source_bytes: b"new source".to_vec().into(),
             },
         ];
         let window = ProtectionWindow::from_persisted_rows(&rows, 4_000);
@@ -32805,7 +38035,94 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pressure_refold_renders_ready_note_and_ack_prevents_redelivery() {
+    fn a_ready_note_is_never_injected_and_defers_replay_while_it_stays_ready() {
+        // The module renders nothing for ready smart notes: not in m1, not in the tail,
+        // not as a reminder. The host's note nudger owns surfacing them. So a ready note
+        // must not appear in any served byte, a bust with the note ready must not change
+        // anything about it, and defers must replay the served bytes exactly while it
+        // stays ready.
+        const NOTE_TEXT: &str = "ready note the module must not inject";
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let execute_req = with_usage(req("ses", "cfg0", vec![item("a", 1, "raw")]), 70, 100);
+        let boot = transform(&s, &execute_req, &ctx).unwrap();
+        assert_eq!(boot.action, "HARD");
+
+        let note = s
+            .insert_project_note(NoteWriteInput {
+                project_path: "git:proj",
+                route_project_root: None,
+                session_id: Some("ses"),
+                content: NOTE_TEXT,
+                surface_condition: Some("condition true"),
+                compiled_provider: None,
+                compiled_config: None,
+                compiled_at: None,
+                compile_status: None,
+                anchor_block_id: None,
+                anchor_ordinal: None,
+                now_ms: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            s.write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: note.status_version,
+                verdict: true,
+                compiled_check: None,
+                manifest_json: None,
+                check_hash: None,
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap(),
+            NoteCasOutcome::Applied(note) if note.status == "ready"
+        ));
+        let ready = s
+            .get_note_by_id("git:proj", "ses", note.id)
+            .unwrap()
+            .unwrap();
+
+        // A bust (explicit refresh) and a HARD (a new render config) with the note ready.
+        s.arm_soft_refresh("ses").unwrap();
+        let soft = transform(&s, &execute_req, &ctx).unwrap();
+        assert_eq!(soft.action, "SOFT");
+        let hard_req = with_usage(req("ses", "cfg1", vec![item("a", 1, "raw")]), 70, 100);
+        let hard = transform(&s, &hard_req, &ctx).unwrap();
+        assert_eq!(hard.action, "HARD");
+        let served = serde_json::to_vec(&hard.ck_messages).unwrap();
+        for response in [&boot, &soft, &hard] {
+            let bytes = serde_json::to_string(&response.ck_messages).unwrap();
+            assert!(!bytes.contains(NOTE_TEXT), "{}", response.action);
+        }
+
+        let defer_req = with_usage(req("ses", "cfg1", vec![item("a", 1, "raw")]), 10, 100);
+        for _ in 0..3 {
+            let deferred = transform(&s, &defer_req, &ctx).unwrap();
+            assert_eq!(deferred.action, "SOFT+");
+            assert_eq!(serde_json::to_vec(&deferred.ck_messages).unwrap(), served);
+        }
+        let after = s
+            .get_note_by_id("git:proj", "ses", note.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.status, "ready",
+            "serving passes must not consume the note"
+        );
+        assert_eq!(after.status_version, ready.status_version);
+    }
+
+    #[test]
+    fn pressure_refold_keeps_ready_notes_out_of_m1_and_ready() {
+        // Ready smart notes reach the agent through the host's deferred-notes reminder
+        // and `ctx_note read`, never through m1. A pressure refold with a ready note in
+        // the store must therefore leave m1 empty and must not claim the note: it stays
+        // `ready`, so the host mirror keeps announcing it.
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
         s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
@@ -32820,7 +38137,7 @@ pub(crate) mod tests {
                 project_path: "git:proj",
                 route_project_root: None,
                 session_id: Some("writer"),
-                content: "ready note survives pressure refold",
+                content: "ready note announced by the host reminder",
                 surface_condition: Some("condition true"),
                 compiled_provider: None,
                 compiled_config: None,
@@ -32860,41 +38177,237 @@ pub(crate) mod tests {
             Some("pressure_refold")
         );
         assert!(
-            m1_bytes(&pressure).contains("ready note survives pressure refold"),
-            "pressure refold must keep the claimed note model-visible"
-        );
-        // Exact-once across layers: the pressure-causing memory deltas fold into m0 and
-        // must NOT survive in the post-fold m1 (the ordinary-HARD notes-only contract).
-        assert!(
             m0_bytes(&pressure).contains("updated rule 1"),
             "folded m0 must carry the memory deltas that caused the pressure"
         );
-        assert!(
-            !m1_bytes(&pressure).contains("updated rule"),
-            "post-refold m1 must not duplicate memory deltas already folded into m0"
-        );
-        assert!(
-            !m1_bytes(&pressure).contains("<memory-updates>"),
-            "post-refold m1 must be notes-only"
-        );
-        let deliveries = pressure.note_deliveries.clone().expect("note delivery");
-        assert_eq!(deliveries.len(), 1);
+        assert!(!m1_bytes(&pressure).contains("ready note announced"));
+        assert!(!m1_bytes(&pressure).contains("<new-notes>"));
+        assert!(!m1_bytes(&pressure).contains("updated rule"));
 
         let stable = transform(
             &s,
-            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
+            &with_usage(req("ses", "cfg0", messages), 10, 100),
             &pctx("git:proj", "/nonexistent-docs", 0),
         )
         .unwrap();
         assert_eq!(stable.action, "SOFT+");
         assert_eq!(m1_bytes(&stable), m1_bytes(&pressure));
-
-        let delivery = &deliveries[0];
         assert_eq!(
-            s.ack_note_delivery("git:proj", "ses", &delivery.transform_pass_id, 3,)
-                .unwrap(),
-            1
+            s.get_note_by_id("git:proj", "writer", note.id)
+                .unwrap()
+                .expect("note")
+                .status,
+            "ready",
+            "no transform pass may claim a ready note"
         );
+    }
+
+    fn write_pending_smart_note(s: &McStore) -> mc_store::StoredNote {
+        s.insert_project_note(NoteWriteInput {
+            project_path: "git:proj",
+            route_project_root: None,
+            session_id: Some("writer"),
+            content: "smart note whose readiness is a background event",
+            surface_condition: Some("condition true"),
+            compiled_provider: None,
+            compiled_config: None,
+            compiled_at: None,
+            compile_status: None,
+            anchor_block_id: None,
+            anchor_ordinal: None,
+            now_ms: 1,
+        })
+        .unwrap()
+    }
+
+    fn mark_smart_note_ready(s: &McStore, note: &mc_store::StoredNote) {
+        assert!(matches!(
+            s.write_note_evaluation(NoteEvaluationInput {
+                project_path: "git:proj",
+                note_id: note.id,
+                source_revision: note.status_version,
+                verdict: true,
+                compiled_check: None,
+                manifest_json: None,
+                check_hash: None,
+                next_due_at: None,
+                now_ms: 2,
+            })
+            .unwrap(),
+            NoteCasOutcome::Applied(ready) if ready.status == "ready"
+        ));
+    }
+
+    #[test]
+    fn note_readiness_alone_never_opens_a_bust_at_execute_usage() {
+        // m1 renders nothing about notes, and note readiness is written by a background
+        // evaluator. At execute-band usage a changed m1 revision is enough to open a bust
+        // (queued drops and heuristics then ride it), so a note status change must not move
+        // that revision: the pass after a note becomes ready is a pure, byte-identical defer.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let note = write_pending_smart_note(&s);
+        let messages = vec![item("a", 1, "raw"), item("t2", 2, "tail")];
+        let boot = run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+
+        let execute = with_usage(req("ses", "cfg0", messages), 70, 100);
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let baseline = transform(&s, &execute, &ctx).unwrap();
+        assert_eq!(
+            baseline.action, "SOFT+",
+            "an execute-band pass with nothing pending is a defer"
+        );
+        let revision_before = s.load("ses").unwrap().meta.m1_revision;
+
+        mark_smart_note_ready(&s, &note);
+        let after = transform(&s, &execute, &ctx).unwrap();
+        assert_eq!(
+            after.action, "SOFT+",
+            "a note becoming ready must not originate a cache bust"
+        );
+        assert_eq!(
+            serde_json::to_string(after.messages()).unwrap(),
+            serde_json::to_string(baseline.messages()).unwrap(),
+            "the defer after a note status change must serve byte-identical output"
+        );
+        assert_eq!(s.load("ses").unwrap().meta.m1_revision, revision_before);
+    }
+
+    #[test]
+    fn revision_stored_with_note_status_is_adopted_on_a_defer_after_upgrade() {
+        // Older builds hashed the note status watermark into the stored m1 revision. The first
+        // pass on this build must treat that stored value as already applied: a pure defer with
+        // byte-identical output that persists the current digest, so a later note change still
+        // cannot surface as pending m1 work.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let note = write_pending_smart_note(&s);
+        mark_smart_note_ready(&s, &note);
+        let messages = vec![item("a", 1, "raw"), item("t2", 2, "tail")];
+        let boot = run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+
+        let execute = with_usage(req("ses", "cfg0", messages), 70, 100);
+        let ctx = pctx("git:proj", "/nonexistent-docs", 0);
+        let baseline = transform(&s, &execute, &ctx).unwrap();
+        assert_eq!(baseline.action, "SOFT+");
+
+        // Rewrite the stored revision into the older note-bearing digest.
+        let loaded = s.load("ses").unwrap();
+        let signal = m1_revision_signal_parts_for_pass(
+            &s,
+            "git:proj",
+            "git:proj",
+            "ses",
+            loaded.meta.user_profile_version,
+            true,
+            loaded.meta.expiry_cutoff_ms,
+        )
+        .unwrap();
+        assert_eq!(loaded.meta.m1_revision, signal.revision);
+        let legacy_revision = signal
+            .legacy_note_revision
+            .expect("a note status change makes the older digest differ");
+        assert_ne!(legacy_revision, signal.revision);
+        let mut legacy_meta = loaded.meta.clone();
+        legacy_meta.m1_revision = legacy_revision;
+        s.commit("ses", loaded.row_version, &loaded.core, &legacy_meta)
+            .unwrap();
+
+        let upgrade = transform(&s, &execute, &ctx).unwrap();
+        assert_eq!(
+            upgrade.action, "SOFT+",
+            "the older digest must not read as pending m1 work"
+        );
+        assert_eq!(
+            serde_json::to_string(upgrade.messages()).unwrap(),
+            serde_json::to_string(baseline.messages()).unwrap(),
+            "the first pass after upgrade must serve byte-identical output"
+        );
+        assert_eq!(
+            s.load("ses").unwrap().meta.m1_revision,
+            signal.revision,
+            "the defer persists the current digest"
+        );
+
+        s.dismiss_note("git:proj", "writer", note.id, None, 3)
+            .unwrap()
+            .expect("note dismissed");
+        let after_note_change = transform(&s, &execute, &ctx).unwrap();
+        assert_eq!(after_note_change.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_string(after_note_change.messages()).unwrap(),
+            serde_json::to_string(baseline.messages()).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_new_notes_m1_replays_verbatim_on_defer_and_drops_on_next_bust() {
+        // Sessions served by an older binary froze an m1 unit carrying a `<new-notes>`
+        // block. Dropping that block must not cost a cache bust of its own: unchanged
+        // passes keep serving the frozen bytes, and the block disappears on the next
+        // bust that happens for an independent reason.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        s.replace_compartments("ses", &[comp(1, 1, 1, "a", "SUMMARY")])
+            .unwrap();
+        let messages = vec![item("a", 1, "raw")];
+        let boot = run(&s, &req("ses", "cfg0", messages.clone()), &spine());
+        assert_eq!(boot.action, "HARD");
+
+        let loaded = s.load("ses").unwrap();
+        let mut core = loaded.core.clone();
+        let legacy_body =
+            "<new-notes>\n- #7: legacy delivered note\n  Condition: condition true\n</new-notes>";
+        core.frozen_units
+            .iter_mut()
+            .find(|unit| unit.key == "m1")
+            .expect("HARD froze an m1 unit")
+            .frozen_payload = legacy_body.to_string();
+        s.commit("ses", loaded.row_version, &core, &loaded.meta)
+            .unwrap();
+
+        let first = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(first.action, "SOFT+");
+        assert!(
+            m1_bytes(&first).contains("legacy delivered note"),
+            "a defer pass must serve the legacy frozen m1 verbatim"
+        );
+        let second = transform(
+            &s,
+            &with_usage(req("ses", "cfg0", messages.clone()), 10, 100),
+            &pctx("git:proj", "/nonexistent-docs", 0),
+        )
+        .unwrap();
+        assert_eq!(second.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_string(second.messages()).unwrap(),
+            serde_json::to_string(first.messages()).unwrap(),
+            "consecutive defer passes must serve byte-identical output"
+        );
+        assert_eq!(
+            s.load("ses")
+                .unwrap()
+                .core
+                .frozen_units
+                .iter()
+                .find(|unit| unit.key == "m1")
+                .unwrap()
+                .frozen_payload,
+            legacy_body,
+            "a defer pass must not rewrite the legacy frozen unit"
+        );
+
         let next_bust = transform(
             &s,
             &with_usage(req("ses", "cfg1", messages), 10, 100),
@@ -32902,8 +38415,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(next_bust.action, "HARD");
-        assert!(next_bust.note_deliveries.is_none());
-        assert!(!m1_bytes(&next_bust).contains("ready note survives pressure refold"));
+        assert!(!m1_bytes(&next_bust).contains("<new-notes>"));
+        assert!(!m1_bytes(&next_bust).contains("legacy delivered note"));
     }
 
     #[test]
@@ -33563,6 +39076,7 @@ pub(crate) mod tests {
         }];
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
+                resolved_compartment_boundaries: &[],
                 session_id: "seeded-drops",
                 project_path: "git:proj",
                 shadow_generation: 0,
@@ -33573,16 +39087,7 @@ pub(crate) mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &[],
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
                 pending_agent_drops: &[],
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
@@ -33671,7 +39176,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         }];
         let no_units = new_caveman_units(
             &CoreState::default(),
@@ -33684,6 +39189,7 @@ pub(crate) mod tests {
             None,
             false,
             1,
+            true,
         );
         assert!(no_units.is_empty(), "defer must not mint a cav unit");
 
@@ -33698,6 +39204,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         );
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].key, "cav:m1#0");
@@ -33890,7 +39397,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         }];
         let units = new_caveman_units(
             &core,
@@ -33903,6 +39410,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         );
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].reset_rule, "3");
@@ -33911,6 +39419,120 @@ pub(crate) mod tests {
             units[0].frozen_payload,
             crate::caveman::compress(&source, crate::caveman::CavemanLevel::Ultra)
         );
+    }
+
+    #[test]
+    fn caveman_english_word_rules_follow_the_shared_language_fixture() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../testdata/caveman-language-golden.json")).unwrap();
+        for language in golden["englishLanguages"].as_array().unwrap() {
+            assert!(
+                caveman_english_word_rules(language.as_str()),
+                "english: {language:?}"
+            );
+        }
+        for language in golden["nonEnglishLanguages"].as_array().unwrap() {
+            assert!(
+                !caveman_english_word_rules(language.as_str()),
+                "non-english: {language:?}"
+            );
+        }
+    }
+
+    /// Without the English word rules a new caveman unit carries only the language-neutral
+    /// output; English stays the default for every existing caller.
+    #[test]
+    fn caveman_units_without_english_word_rules_keep_the_words() {
+        let source = "Voy a revisar si quite la cache, y es muy importante. ".repeat(8);
+        let request = {
+            let mut value = req("caveman-language", "cfg", vec![item("m1", 1, &source)]);
+            value.caveman_enabled = true;
+            value.caveman_min_chars = 1;
+            value.protected_tags = 0;
+            value
+        };
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        let tags = vec![McTagRow {
+            tag_number: 1,
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 10,
+            created_at_ms: 0,
+            source_bytes: source.as_bytes().to_vec().into(),
+        }];
+        let units = new_caveman_units(
+            &CoreState::default(),
+            &request,
+            CavemanTagState {
+                rows: &tags,
+                protection_cutoff: &protection_cutoff(None),
+            },
+            &live,
+            None,
+            true,
+            1,
+            false,
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].frozen_payload, source.trim());
+    }
+
+    /// A payload frozen under earlier caveman rules can be shorter than what the current rules
+    /// produce for a deeper tier. That must keep the frozen bytes and still advance depth instead
+    /// of panicking the transform.
+    #[test]
+    fn caveman_deeper_tier_longer_than_frozen_payload_keeps_frozen_bytes() {
+        let source =
+            "I just really wanted to basically explain the implementation clearly. ".repeat(8);
+        let request = {
+            let mut value = req("caveman-regrowth", "cfg", vec![item("m1", 1, &source)]);
+            value.caveman_enabled = true;
+            value.caveman_min_chars = 1;
+            value.protected_tags = 0;
+            value
+        };
+        let projection = project_messages(&request.messages).unwrap();
+        let live = projection
+            .blocks
+            .iter()
+            .filter(|block| !block.synthetic)
+            .collect::<Vec<_>>();
+        let frozen = "older rules froze this shorter payload";
+        let ultra = crate::caveman::compress(&source, crate::caveman::CavemanLevel::Ultra);
+        assert!(ultra.len() > frozen.len());
+        let core = CoreState {
+            frozen_units: vec![caveman_unit("m1#0", 1, frozen)],
+            ..CoreState::default()
+        };
+        let tags = vec![McTagRow {
+            tag_number: 1,
+            block_id: "m1#0".to_string(),
+            kind: "message".to_string(),
+            token_count: 10,
+            created_at_ms: 0,
+            source_bytes: source.as_bytes().to_vec().into(),
+        }];
+        let units = new_caveman_units(
+            &core,
+            &request,
+            CavemanTagState {
+                rows: &tags,
+                protection_cutoff: &protection_cutoff(None),
+            },
+            &live,
+            None,
+            true,
+            1,
+            true,
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].reset_rule, "3");
+        assert_eq!(units[0].frozen_payload, frozen);
     }
 
     #[test]
@@ -33932,7 +39554,7 @@ pub(crate) mod tests {
             kind: "message".to_string(),
             token_count: 10,
             created_at_ms: 0,
-            source_bytes: source.as_bytes().to_vec(),
+            source_bytes: source.as_bytes().to_vec().into(),
         };
         assert!(new_caveman_units(
             &CoreState::default(),
@@ -33945,6 +39567,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         )
         .is_empty());
 
@@ -33972,6 +39595,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         )
         .is_empty());
 
@@ -33996,6 +39620,7 @@ pub(crate) mod tests {
             None,
             true,
             1,
+            true,
         )
         .is_empty());
     }
@@ -34284,8 +39909,13 @@ pub(crate) mod tests {
             importance: 50,
             ..Default::default()
         }];
+        // The seeded compartments are the host's rows in context.db.
+        store
+            .replace_compartments("seeded-trim", &compartments)
+            .unwrap();
         store
             .apply_authority_state_sync(ModuleStateSyncRequest {
+                resolved_compartment_boundaries: &[],
                 session_id: "seeded-trim",
                 project_path: "git:proj",
                 shadow_generation: 0,
@@ -34296,16 +39926,7 @@ pub(crate) mod tests {
                 strip_seeds: &[],
                 strip_seed_skipped: 0,
                 reasoning_cleared_through_tag: None,
-                compartments: &compartments,
-                memories: &[],
-                memory_mutations: &[],
-                user_profile: &[],
-                user_profile_present: true,
-                workspace: None,
-                workspace_present: true,
                 last_todo_state: None,
-                project_memory_epoch: None,
-                user_profile_version: None,
                 pending_agent_drops: &[],
                 pending_agent_drops_skipped: 0,
                 user_hint_seeds: &[],
@@ -34767,6 +40388,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn memory_render_epoch_takes_one_hard_then_replays_byte_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let request = active_opencode_req(
+            "memory-render-epoch",
+            "rust-mode/gfull",
+            vec![wire_item("user", "m1", 1, &["stable bytes"])],
+        );
+        run(&s, &request, &spine());
+        let mut loaded = s.load(&request.session_id).unwrap();
+        loaded.meta.last_render_config = effective_render_config_with_epochs(
+            &s,
+            &request.render_config,
+            "mre2".to_string(),
+            format!("cre{}", crate::COMPARTMENT_RENDER_FORMAT_EPOCH),
+            String::new(),
+            String::new(),
+        );
+        s.commit(
+            &request.session_id,
+            loaded.row_version,
+            &loaded.core,
+            &loaded.meta,
+        )
+        .unwrap();
+
+        let hard = run(&s, &request, &spine());
+        assert_eq!(hard.action, "HARD");
+        assert!(s
+            .load(&request.session_id)
+            .unwrap()
+            .meta
+            .last_render_config
+            .contains(&format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH)));
+
+        let replay = run(&s, &request, &spine());
+        assert_eq!(replay.action, "SOFT+");
+        assert_eq!(
+            serde_json::to_vec(hard.messages()).unwrap(),
+            serde_json::to_vec(replay.messages()).unwrap()
+        );
+    }
+
+    #[test]
     fn cc_profile_epoch_bump_takes_exactly_one_hard_when_client_config_frozen() {
         let dir = tempfile::tempdir().unwrap();
         let s = store(dir.path());
@@ -34840,17 +40505,17 @@ pub(crate) mod tests {
         let old_identity = effective_render_config_with_epochs(
             &s,
             &request.render_config,
-            "mre2".to_string(),
+            format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
             "cre2".to_string(),
-            "mpe1".to_string(),
+            "mpe2".to_string(),
             "tfe3".to_string(),
         );
         let new_identity = effective_render_config_with_epochs(
             &s,
             &request.render_config,
-            "mre2".to_string(),
+            format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH),
             "cre2".to_string(),
-            "mpe1".to_string(),
+            "mpe2".to_string(),
             "tfe4".to_string(),
         );
         assert_ne!(old_identity, new_identity);
@@ -34895,7 +40560,10 @@ pub(crate) mod tests {
             s.load(&request.session_id).unwrap().meta.last_render_config,
             new_identity
         );
-        let marker_input = first
+        // The epoch HARD re-renders m0/m1 byte-identically, so it does not lose the
+        // cached prefix and must not convert the legacy skeleton: the conversion would
+        // be the only byte change. The marker keeps replaying.
+        let served_input = first
             .messages()
             .iter()
             .flat_map(|message| message.content.iter())
@@ -34905,7 +40573,7 @@ pub(crate) mod tests {
             })
             .expect("served skeleton tool input");
         assert_eq!(
-            marker_input
+            served_input
                 .as_object()
                 .unwrap()
                 .keys()
@@ -34921,6 +40589,309 @@ pub(crate) mod tests {
             serde_json::to_vec(replay.messages()).unwrap(),
             "post-HARD defer replay must remain byte-identical"
         );
+    }
+
+    fn opencode_tool_message(
+        mid: &str,
+        ordinal: u64,
+        call_id: &str,
+        input: serde_json::Value,
+    ) -> CkIngressMessage {
+        let native_message = json!({
+            "absolute_ordinal": ordinal,
+            "info": { "id": mid, "role": "assistant" },
+            "parts": [{
+                "type": "tool",
+                "tool": "write",
+                "callID": call_id,
+                "state": {
+                    "status": "completed",
+                    "input": input,
+                    "output": format!("output of {call_id}")
+                }
+            }]
+        });
+        crate::codec::decode_opencode(&[native_message])
+            .messages
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    fn opencode_user_message(mid: &str, ordinal: u64, text: &str) -> CkIngressMessage {
+        let native_message = json!({
+            "absolute_ordinal": ordinal,
+            "info": { "id": mid, "role": "user" },
+            "parts": [{ "type": "text", "text": text }]
+        });
+        crate::codec::decode_opencode(&[native_message])
+            .messages
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    fn served_call_input(response: &TransformResponse, call_id: &str) -> Option<serde_json::Value> {
+        response
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match &block.kind {
+                ck_wire::CkKind::ToolCall { id, input, .. } if id == call_id => Some(input.clone()),
+                _ => None,
+            })
+    }
+
+    fn served_has_result(response: &TransformResponse, call_id: &str) -> bool {
+        response
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|block| matches!(&block.kind, ck_wire::CkKind::ToolResult { id, .. } if id == call_id))
+    }
+
+    #[test]
+    fn legacy_marker_skeletons_replay_on_defer_and_convert_only_on_a_prefix_changing_hard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let large = json!({ "filePath": "/tmp/a.txt", "content": "L".repeat(2000) });
+        let request = active_opencode_req(
+            "legacy-skeleton-convert",
+            "rust-mode/tf1/gfull",
+            vec![
+                opencode_user_message("start-user", 1, "start"),
+                opencode_tool_message(
+                    "small-pair",
+                    2,
+                    "small-call",
+                    json!({ "command": "ls -la" }),
+                ),
+                opencode_tool_message("large-pair", 3, "large-call", large),
+                opencode_user_message("next-user", 4, "next prompt"),
+            ],
+        );
+        s.replace_compartments(
+            &request.session_id,
+            &[comp(1, 1, 1, "start-user", "SUMMARY")],
+        )
+        .unwrap();
+        // Reach the steady state (bootstrap and first-render passes) before seeding.
+        for _ in 0..3 {
+            if run(&s, &request, &spine()).action != "HARD" {
+                break;
+            }
+        }
+
+        // Model a session that already serves two legacy marker skeletons.
+        let mut loaded = s.load(&request.session_id).unwrap();
+        loaded.core.frozen_units.extend([
+            red_unit("small-pair#0", "skeleton", "[dropped]"),
+            red_unit("small-pair#1", "drop", "[dropped]"),
+            red_unit("large-pair#0", "skeleton", "[dropped]"),
+            red_unit("large-pair#1", "drop", "[dropped]"),
+            // A session serving these skeletons has already applied every renderer
+            // transition, so their presence alone does not cause a HARD fold.
+            transition_consumed_unit(
+                &[
+                    RendererTransitionClass::PoisonedReasoning,
+                    RendererTransitionClass::UnmatchedPair,
+                    RendererTransitionClass::SplitCoverage,
+                    RendererTransitionClass::SyntheticAnchorSplit,
+                    RendererTransitionClass::ReductionEnvelope,
+                    RendererTransitionClass::TemporalParity,
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        ]);
+        s.commit(
+            &request.session_id,
+            loaded.row_version,
+            &loaded.core,
+            &loaded.meta,
+        )
+        .unwrap();
+
+        // Defer passes replay the marker byte-identically and never convert it.
+        let marker_keys = |input: Option<serde_json::Value>| {
+            input
+                .and_then(|input| {
+                    input
+                        .as_object()
+                        .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                })
+                .unwrap_or_default()
+        };
+        let defer_a = run(&s, &request, &spine());
+        let defer_b = run(&s, &request, &spine());
+        assert_ne!(defer_a.action, "HARD");
+        assert_ne!(defer_b.action, "HARD");
+        assert_eq!(
+            marker_keys(served_call_input(&defer_a, "small-call")),
+            vec!["dropped"]
+        );
+        assert_eq!(
+            marker_keys(served_call_input(&defer_a, "large-call")),
+            vec!["dropped"]
+        );
+        assert_eq!(
+            serde_json::to_vec(defer_a.messages()).unwrap(),
+            serde_json::to_vec(defer_b.messages()).unwrap()
+        );
+
+        let force_hard = |s: &McStore| {
+            let mut loaded = s.load(&request.session_id).unwrap();
+            loaded.meta.last_render_config = "stale-render-identity".to_string();
+            s.commit(
+                &request.session_id,
+                loaded.row_version,
+                &loaded.core,
+                &loaded.meta,
+            )
+            .unwrap();
+        };
+
+        // A HARD that re-renders m0/m1 byte-identically keeps the cached prefix, so it
+        // must not convert: the conversion would be the only byte change.
+        force_hard(&s);
+        let identical = run(&s, &request, &spine());
+        assert_eq!(identical.action, "HARD");
+        assert_eq!(
+            serde_json::to_vec(identical.messages()).unwrap(),
+            serde_json::to_vec(defer_a.messages()).unwrap()
+        );
+        assert_eq!(
+            marker_keys(served_call_input(&identical, "small-call")),
+            vec!["dropped"]
+        );
+
+        // A HARD that really changes m0 (a new project memory) converts them: small
+        // keeps its real arguments, large is removed.
+        s.seed_memory(1, "git:proj", "ARCHITECTURE", "a new architecture rule", 70)
+            .unwrap();
+        force_hard(&s);
+        let hard = run(&s, &request, &spine());
+        assert_eq!(hard.action, "HARD");
+        assert_ne!(
+            serde_json::to_vec(&hard.messages()[..1]).unwrap(),
+            serde_json::to_vec(&identical.messages()[..1]).unwrap(),
+            "the converting HARD must change m0"
+        );
+        assert_eq!(
+            served_call_input(&hard, "small-call"),
+            Some(json!({ "command": "ls -la" }))
+        );
+        assert!(served_has_result(&hard, "small-call"));
+        assert_eq!(served_call_input(&hard, "large-call"), None);
+        assert!(!served_has_result(&hard, "large-call"));
+        let kinds = s
+            .load(&request.session_id)
+            .unwrap()
+            .core
+            .frozen_units
+            .iter()
+            .filter_map(|unit| {
+                unit.key
+                    .strip_prefix(RED_KEY_PREFIX)
+                    .map(|target| (target.to_string(), unit.kind.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            kinds.get("small-pair#0").map(String::as_str),
+            Some("skeleton_real")
+        );
+        assert_eq!(kinds.get("large-pair#0").map(String::as_str), Some("drop"));
+
+        // The following defer pass replays the converted bytes identically.
+        let after = run(&s, &request, &spine());
+        assert_ne!(after.action, "HARD");
+        assert_eq!(
+            serde_json::to_vec(hard.messages()).unwrap(),
+            serde_json::to_vec(after.messages()).unwrap()
+        );
+    }
+
+    #[test]
+    fn real_or_absent_drops_keep_the_shared_prefix_on_the_next_defer() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let base = vec![
+            opencode_user_message("start-user", 1, "start"),
+            opencode_tool_message(
+                "small-pair",
+                2,
+                "small-call",
+                json!({ "command": "ls -la" }),
+            ),
+            opencode_tool_message(
+                "mid-pair",
+                3,
+                "mid-call",
+                json!({ "content": "m".repeat(2000) }),
+            ),
+            opencode_tool_message(
+                "end-pair",
+                4,
+                "end-call",
+                json!({ "content": "e".repeat(3000) }),
+            ),
+        ];
+        // The shapes selection freezes under the real-or-absent rule: small in the
+        // window keeps real arguments, a large input is removed, and the large call
+        // whose result ends the request keeps real arguments.
+        let decisions = with_reductions(vec![
+            reduce("small-pair#0", "skeleton_real", "[dropped]"),
+            reduce("small-pair#1", "drop", "[dropped]"),
+            reduce("mid-pair#0", "drop", "[dropped]"),
+            reduce("mid-pair#1", "drop", "[dropped]"),
+            reduce("end-pair#0", "skeleton_real", "[dropped]"),
+            reduce("end-pair#1", "drop", "[dropped]"),
+        ]);
+        s.replace_compartments(
+            "real-or-absent-prefix",
+            &[comp(1, 1, 1, "start-user", "SUMMARY")],
+        )
+        .unwrap();
+        run(
+            &s,
+            &active_opencode_req("real-or-absent-prefix", "rust-mode/tf1/gfull", base.clone()),
+            &spine(),
+        );
+        let priced = run(
+            &s,
+            &active_opencode_req("real-or-absent-prefix", "rust-mode/tf1/gfull", base.clone()),
+            &decisions,
+        );
+        assert_eq!(
+            served_call_input(&priced, "small-call"),
+            Some(json!({ "command": "ls -la" }))
+        );
+        assert_eq!(served_call_input(&priced, "mid-call"), None);
+        assert_eq!(
+            served_call_input(&priced, "end-call"),
+            Some(json!({ "content": "e".repeat(3000) }))
+        );
+        let served = serde_json::to_string(priced.messages()).unwrap();
+        assert!(
+            !served.contains("\"dropped\":"),
+            "no marker in any argument position"
+        );
+
+        let mut newer = base;
+        newer.push(opencode_user_message("newer-user", 5, "a newer message"));
+        let deferred = run(
+            &s,
+            &active_opencode_req("real-or-absent-prefix", "rust-mode/tf1/gfull", newer),
+            &decisions,
+        );
+        assert_ne!(deferred.action, "HARD");
+        let prefix = |response: &TransformResponse, count: usize| {
+            let bytes = serde_json::to_vec(&response.messages()[..count]).unwrap();
+            format!("{:x}", Sha256::digest(bytes))
+        };
+        let shared = priced.messages().len();
+        assert_eq!(deferred.messages().len(), shared + 1);
+        assert_eq!(prefix(&deferred, shared), prefix(&priced, shared));
     }
 
     #[test]
@@ -35013,7 +40984,12 @@ pub(crate) mod tests {
     #[test]
     fn tool_result_codec_profile_epochs_hard_once_then_restart_replay_identically() {
         for profile in [SerializerProfile::OpencodeAiSdk, SerializerProfile::Pi] {
-            assert_eq!(crate::profile_render_epoch(profile), 1);
+            let expected_epoch = match profile {
+                SerializerProfile::OpencodeAiSdk => 2,
+                SerializerProfile::Pi => 1,
+                _ => unreachable!(),
+            };
+            assert_eq!(crate::profile_render_epoch(profile), expected_epoch);
             let dir = tempfile::tempdir().unwrap();
             let session = format!("tool-result-epoch-{}", profile.wire_id());
             let golden: Value = serde_json::from_str(include_str!(
@@ -35101,7 +41077,7 @@ pub(crate) mod tests {
 
     #[test]
     fn global_memory_render_epoch_hards_all_profiles_once_then_stabilizes() {
-        assert_eq!(crate::MEMORY_RENDER_FORMAT_EPOCH, 2);
+        assert_eq!(crate::MEMORY_RENDER_FORMAT_EPOCH, 3);
         for profile in [
             SerializerProfile::OwnedLlmRunner,
             SerializerProfile::Pi,
@@ -35324,6 +41300,7 @@ pub(crate) mod tests {
                 expected: poisoned.row_version,
                 core: &poisoned.core,
                 meta: &poisoned.meta,
+                sections: mc_store::SectionsCommit::default(),
                 consumed_drop_ids: &[],
                 first_applied_command_ids: &[],
                 memory_revision: None,
@@ -35461,6 +41438,7 @@ pub(crate) mod tests {
             &items,
             &HashSet::new(),
             &SelectionContext {
+                calibration: None,
                 pass_class: PassClass::Execute,
                 current_total_input_tokens: 1_000.0,
                 ceiling_tokens: 2_000.0,
@@ -35473,6 +41451,7 @@ pub(crate) mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: true,
                 supersession_ride_available: false,
+                emergency_minimum_waived: false,
                 emergency_window_yields: false,
                 tag_window_protected_block_ids: HashSet::new(),
                 exempt_message_protected_block_ids: HashSet::new(),
@@ -35523,7 +41502,7 @@ pub(crate) mod tests {
             .iter()
             .find(|decision| decision.target_id.starts_with("reasoning-adjacency-left#"))
             .expect("the old tool arc must be selected");
-        assert_eq!(call.kind, "skeleton", "{decisions:?}");
+        assert_eq!(call.kind, "skeleton_real", "{decisions:?}");
 
         let result = served
             .iter()
@@ -35731,6 +41710,7 @@ pub(crate) mod tests {
             &items,
             &HashSet::new(),
             &SelectionContext {
+                calibration: None,
                 pass_class: PassClass::Execute,
                 current_total_input_tokens: 0.0,
                 ceiling_tokens: 0.0,
@@ -35743,6 +41723,7 @@ pub(crate) mod tests {
                 first_applied_agent_drop_ids: HashSet::new(),
                 pass_already_busting: false,
                 supersession_ride_available: true,
+                emergency_minimum_waived: false,
                 emergency_window_yields: false,
                 tag_window_protected_block_ids: HashSet::new(),
                 exempt_message_protected_block_ids: HashSet::new(),
@@ -36492,6 +42473,8 @@ pub(crate) mod tests {
             .find(|message| message["info"]["id"] == "pair-message")
             .expect("salted pair remains in native output");
         assert_eq!(salted_pair["parts"].as_array().unwrap().len(), 1);
+        // The salted HARD re-renders m0/m1 byte-identically, so it does not convert the
+        // legacy marker skeleton (the conversion would be the only byte change).
         assert_eq!(
             salted_pair, old_pair,
             "the transition may persist compatibility state, but native tool identity is already valid"
@@ -38270,5 +44253,63 @@ pub(crate) mod tests {
             channel2_directive_id("ses", 1),
             channel2_directive_id("other", 1)
         );
+    }
+}
+
+fn attach_user_answer_markers(items: &mut [SelItem], messages: &[CkIngressMessage]) {
+    let answer_ids: HashSet<String> = messages
+        .iter()
+        .flat_map(|message| {
+            message
+                .ck
+                .provider_extras
+                .values()
+                .filter_map(|extra| {
+                    extra
+                        .get("user_answer_block_indices")
+                        .and_then(Value::as_array)
+                })
+                .flatten()
+                .filter_map(Value::as_u64)
+                .map(|index| format!("{}#{}", message.mid, index))
+        })
+        .collect();
+    for item in items {
+        item.user_answer = answer_ids.contains(&item.id);
+    }
+}
+
+#[cfg(test)]
+mod user_answer_marker_tests {
+    use super::*;
+
+    #[test]
+    fn host_answer_sidecars_protect_selection_without_changing_block_bytes() {
+        let answered = serde_json::json!({ "info": { "id": "m", "role": "assistant" }, "parts": [{ "type": "tool", "tool": "renamed-question", "callID": "q", "state": { "status": "completed", "input": {}, "output": "answer", "metadata": { "answers": [["yes"]] } } }] });
+        let mut ordinary = answered.clone();
+        ordinary["parts"][0]["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata");
+        let decoded = crate::codec::opencode::decode_opencode(&[answered]);
+        let control = crate::codec::opencode::decode_opencode(&[ordinary]);
+        assert_eq!(
+            decoded.messages[0].ck.content,
+            control.messages[0].ck.content
+        );
+        let projection = crate::ck_wire::project_messages(&decoded.messages).unwrap();
+        let live: Vec<_> = projection.blocks.iter().collect();
+        let mut items = tail_sel_items(&live, None, &HashMap::new());
+        attach_user_answer_markers(&mut items, &decoded.messages);
+        assert!(items.iter().any(|item| item.user_answer));
+
+        let pi_entry = serde_json::json!({"type": "message", "id": "p", "message": {"role": "toolResult", "toolCallId": "q", "toolName": "ask", "content": [{"type": "text", "text": "yes"}], "details": {"selectedOptions": ["yes"]}, "isError": false, "timestamp": 1}});
+        let pi_call = serde_json::json!({"type": "message", "id": "call", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "q", "name": "ask", "arguments": {}}], "timestamp": 0}});
+        let decoded = crate::codec::pi::decode_pi(&[pi_call, pi_entry]);
+        let projection = crate::ck_wire::project_messages(&decoded.messages).unwrap();
+        let live: Vec<_> = projection.blocks.iter().collect();
+        let mut items = tail_sel_items(&live, None, &HashMap::new());
+        attach_user_answer_markers(&mut items, &decoded.messages);
+        assert!(items.iter().any(|item| item.user_answer));
     }
 }

@@ -594,17 +594,19 @@ mod tests {
 
     #[test]
     fn substitute_reports_env_tokens_without_resolving() {
-        std::env::set_var("MC_TEST_SUBST_KEY", "resolved-value");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MC_TEST_SUBST_KEY", "resolved-value");
         let raw = "prefix-{env:MC_TEST_SUBST_KEY}-suffix";
         let (out, residual) = substitute_value(raw, None);
         assert_eq!(out, raw);
         assert_eq!(residual.as_deref(), Some("{env:MC_TEST_SUBST_KEY}"));
-        std::env::remove_var("MC_TEST_SUBST_KEY");
+        env.remove("MC_TEST_SUBST_KEY");
     }
 
     #[test]
     fn substitute_reports_unresolved_env_tokens() {
-        std::env::remove_var("MC_TEST_NONEXISTENT_VAR_FOR_PROBE");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MC_TEST_NONEXISTENT_VAR_FOR_PROBE");
         let (out, residual) = substitute_value("{env:MC_TEST_NONEXISTENT_VAR_FOR_PROBE}", None);
         // Tokens are preserved so the caller can refuse to expand them.
         assert_eq!(out, "{env:MC_TEST_NONEXISTENT_VAR_FOR_PROBE}");
@@ -616,21 +618,23 @@ mod tests {
 
     #[test]
     fn substitute_trims_env_var_name_whitespace() {
-        std::env::set_var("MC_TEST_SUBST_TRIM", "trimmed");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MC_TEST_SUBST_TRIM", "trimmed");
         let raw = "{env: MC_TEST_SUBST_TRIM }";
         let (out, residual) = substitute_value(raw, None);
         assert_eq!(out, raw);
         assert_eq!(residual.as_deref(), Some(raw));
-        std::env::remove_var("MC_TEST_SUBST_TRIM");
+        env.remove("MC_TEST_SUBST_TRIM");
     }
 
     #[test]
     fn substitute_handles_empty_env_value_as_unresolved() {
-        std::env::set_var("MC_TEST_EMPTY_VAR", "");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MC_TEST_EMPTY_VAR", "");
         let (out, residual) = substitute_value("{env:MC_TEST_EMPTY_VAR}", None);
         assert_eq!(out, "{env:MC_TEST_EMPTY_VAR}");
         assert_eq!(residual.as_deref(), Some("{env:MC_TEST_EMPTY_VAR}"));
-        std::env::remove_var("MC_TEST_EMPTY_VAR");
+        env.remove("MC_TEST_EMPTY_VAR");
     }
 
     #[test]
@@ -654,14 +658,15 @@ mod tests {
 
     #[test]
     fn substitute_handles_multiple_tokens_preserving_order() {
-        std::env::set_var("MC_TEST_TOK_A", "A");
-        std::env::set_var("MC_TEST_TOK_B", "B");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MC_TEST_TOK_A", "A");
+        env.set("MC_TEST_TOK_B", "B");
         let raw = "start-{env:MC_TEST_TOK_A}-mid-{env:MC_TEST_TOK_B}-end";
         let (out, residual) = substitute_value(raw, None);
         assert_eq!(out, raw);
         assert_eq!(residual.as_deref(), Some("{env:MC_TEST_TOK_A}"));
-        std::env::remove_var("MC_TEST_TOK_A");
-        std::env::remove_var("MC_TEST_TOK_B");
+        env.remove("MC_TEST_TOK_A");
+        env.remove("MC_TEST_TOK_B");
     }
 
     #[test]
@@ -803,13 +808,14 @@ mod tests {
 
     #[test]
     fn expand_resolves_env_and_file_tokens() {
-        std::env::set_var("MC_TEST_EXPAND_KEY", "sk-resolved");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.set("MC_TEST_EXPAND_KEY", "sk-resolved");
         let dir = std::env::temp_dir();
         assert_eq!(
             expand_config_value("{env:MC_TEST_EXPAND_KEY}", &dir).ok(),
             Some("sk-resolved".to_string())
         );
-        std::env::remove_var("MC_TEST_EXPAND_KEY");
+        env.remove("MC_TEST_EXPAND_KEY");
 
         let file = dir.join("mc-expand-probe-key.txt");
         std::fs::write(&file, "  sk-from-file\n").unwrap();
@@ -824,7 +830,8 @@ mod tests {
 
     #[test]
     fn expand_reports_unresolved_env_and_missing_file() {
-        std::env::remove_var("MC_TEST_NO_SUCH_EXPAND_VAR");
+        let mut env = crate::test_env::EnvGuard::new();
+        env.remove("MC_TEST_NO_SUCH_EXPAND_VAR");
         assert!(matches!(
             expand_config_value("{env:MC_TEST_NO_SUCH_EXPAND_VAR}", &std::env::temp_dir()),
             Err(TokenExpandError::Unresolved(_))

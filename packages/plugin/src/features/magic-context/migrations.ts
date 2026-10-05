@@ -1,7 +1,11 @@
+import { isMainThread } from "node:worker_threads";
 import { extractTiersFromInner } from "../../hooks/magic-context/compartment-parser";
 import { log } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
+import { splitLkgSlotPrefixes, splitReplayDecisions } from "./migration-v94-write-split";
+import { repairOpenCode2HarnessLabels } from "./opencode2-relabel";
+import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
 import { bumpEpochsForWorkspaceMemberSet } from "./workspaces";
 
@@ -53,19 +57,17 @@ function tableExists(db: Database, name: string): boolean {
     );
 }
 
-function tableHasHarnessColumn(db: Database, name: string): boolean {
-    if (!tableExists(db, name)) return false;
-    return (db.prepare(`PRAGMA table_info(${name})`).all() as Array<{ name: string }>).some(
-        (column) => column.name === "harness",
-    );
-}
-
 /**
- * Session-scoped (and singleton cursor) tables whose `harness` column v85
- * rewrites from the OpenCode 1.x mislabel `opencode2` to `opencode`.
- * Named so a structural test can prove every DDL-declared harness table is
- * covered: a table added later without being listed goes red.
+ * Session-scoped (and singleton cursor) tables whose `harness` column the
+ * OpenCode 1.x/2.x relabel touches. Named so a structural test can prove every
+ * DDL-declared harness table is covered: a table added later without being
+ * listed goes red.
+ *
+ * The name records history — v85 rewrote every one of these to `opencode` — but
+ * the list is now consumed by v87, which decides each session's label from the
+ * OpenCode store instead of assuming one direction.
  */
+
 export const V85_OPENCODE2_RELABEL_TABLES = [
     "tags",
     "pending_ops",
@@ -91,127 +93,10 @@ export const V85_OPENCODE2_RELABEL_TABLES = [
 ] as const;
 
 /**
- * Runtime-created singleton (not part of initializeDatabase). Relabel when
- * the table exists so a live upgrade does not leave an `opencode2` cursor.
+ * Runtime-created singleton (not part of initializeDatabase), carried in the
+ * relabel set so a live upgrade sees it when it exists.
  */
 export const V85_OPTIONAL_OPENCODE2_RELABEL_TABLES = ["session_project_backfill_state"] as const;
-
-function deleteLosingOpenCode2Twin(
-    db: Database,
-    table: string,
-    joinColumns: readonly string[],
-    newerPredicate: string,
-): void {
-    if (!tableHasHarnessColumn(db, table)) return;
-    const naturalJoin = joinColumns.map((column) => `oc.${column} = o2.${column}`).join(" AND ");
-    const o2On = naturalJoin
-        ? `${naturalJoin} AND oc.harness = 'opencode'`
-        : `oc.harness = 'opencode'`;
-    const ocOn = naturalJoin
-        ? `${naturalJoin} AND o2.harness = 'opencode2'`
-        : `o2.harness = 'opencode2'`;
-    db.exec(`
-        DELETE FROM ${table}
-        WHERE rowid IN (
-            SELECT o2.rowid
-            FROM ${table} AS o2
-            JOIN ${table} AS oc
-              ON ${o2On}
-            WHERE o2.harness = 'opencode2'
-              AND NOT (${newerPredicate})
-        );
-        DELETE FROM ${table}
-        WHERE rowid IN (
-            SELECT oc.rowid
-            FROM ${table} AS oc
-            JOIN ${table} AS o2
-              ON ${ocOn}
-            WHERE oc.harness = 'opencode'
-              AND (${newerPredicate})
-        );
-    `);
-}
-
-function relabelOpenCode2HarnessRows(db: Database): void {
-    // session_projects PK(session_id, harness): keep the newer updated_at.
-    // On a tie, keep the already-correct `opencode` row.
-    deleteLosingOpenCode2Twin(
-        db,
-        "session_projects",
-        ["session_id"],
-        "o2.updated_at > oc.updated_at",
-    );
-    // primer_candidates unique includes harness: keep the newer created_at.
-    deleteLosingOpenCode2Twin(
-        db,
-        "primer_candidates",
-        ["project_path", "session_id", "source_start_message_id", "source_end_message_id"],
-        "o2.created_at > oc.created_at",
-    );
-    // transform_decisions PK(session_id, harness, message_id): keep the newer ts_ms.
-    deleteLosingOpenCode2Twin(
-        db,
-        "transform_decisions",
-        ["session_id", "message_id"],
-        "o2.ts_ms > oc.ts_ms",
-    );
-    // message_history_orphan_sweep PK(harness): keep the larger last_swept_at.
-    // NULL sorts as older than any timestamp.
-    deleteLosingOpenCode2Twin(
-        db,
-        "message_history_orphan_sweep",
-        [],
-        "COALESCE(o2.last_swept_at, -1) > COALESCE(oc.last_swept_at, -1)",
-    );
-    // session_project_backfill_state PK(harness): prefer a completed cursor
-    // over a mislabelled running lease, then the larger started_at.
-    if (tableHasHarnessColumn(db, "session_project_backfill_state")) {
-        db.exec(`
-            DELETE FROM session_project_backfill_state
-            WHERE harness = 'opencode2'
-              AND EXISTS (
-                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode'
-              )
-              AND NOT (
-                  (status = 'completed'
-                    AND (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
-                        != 'completed')
-                  OR (
-                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode')
-                      AND COALESCE(started_at, -1) > COALESCE(
-                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode'),
-                          -1
-                      )
-                  )
-              );
-            DELETE FROM session_project_backfill_state
-            WHERE harness = 'opencode'
-              AND EXISTS (
-                  SELECT 1 FROM session_project_backfill_state WHERE harness = 'opencode2'
-              )
-              AND (
-                  ((SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2') = 'completed'
-                    AND status != 'completed')
-                  OR (
-                      status = (SELECT status FROM session_project_backfill_state WHERE harness = 'opencode2')
-                      AND COALESCE(
-                          (SELECT started_at FROM session_project_backfill_state WHERE harness = 'opencode2'),
-                          -1
-                      ) > COALESCE(started_at, -1)
-                  )
-              );
-        `);
-    }
-
-    const tables = new Set<string>([
-        ...V85_OPENCODE2_RELABEL_TABLES,
-        ...V85_OPTIONAL_OPENCODE2_RELABEL_TABLES,
-    ]);
-    for (const table of tables) {
-        if (!tableHasHarnessColumn(db, table)) continue;
-        db.exec(`UPDATE ${table} SET harness = 'opencode' WHERE harness = 'opencode2'`);
-    }
-}
 
 /**
  * Heal compartments stranded by a mismatched tier closing tag (issue #246).
@@ -304,7 +189,13 @@ function authorityPrivilegeCheck(): string {
     return "COALESCE((SELECT enabled FROM context_privilege_state WHERE id = 1), 0) = 0";
 }
 
-function managedAuthorityNoteRow(row: "OLD" | "NEW"): string {
+/**
+ * SQL predicate that is true when a `notes` row belongs to a project whose notes the
+ * Rust module owns. `row` names the row being tested: `OLD`/`NEW` inside the
+ * authority triggers, or the table name when an ordinary statement must skip the
+ * rows those triggers would refuse.
+ */
+export function managedAuthorityNoteRow(row: "OLD" | "NEW" | "notes"): string {
     return `(
         EXISTS (SELECT 1 FROM authority_managed WHERE project_path = ${row}.project_path)
         OR EXISTS (SELECT 1 FROM authority_repair_pending WHERE project_path = ${row}.project_path)
@@ -3087,24 +2978,228 @@ export const MIGRATIONS: Migration[] = [
     },
     {
         version: 85,
-        description: "relabel OpenCode 1.x mis-tagged opencode2 session rows",
-        up(db: Database): void {
-            // No released Magic Context has ever run on an OpenCode 2 host against
-            // a shared context.db (the v2 lane is dev-only and hermetic). OpenCode
-            // 1.18.30 calls setup() on the published { id, server, setup } export.
-            // Ungated setup() locked the harness to "opencode2", so every
-            // session-scoped row the v1 seat wrote was mislabelled. At upgrade time
-            // every harness='opencode2' row in a shared database is that v1 mislabel.
+        description:
+            "relabel OpenCode 1.x mis-tagged opencode2 session rows (inert; superseded by v87)",
+        up(): void {
+            // INERT since v87. This migration used to rewrite EVERY harness='opencode2'
+            // row to 'opencode', on the premise that no released Magic Context had run
+            // on a real OpenCode 2 host, so such a row could only be the OpenCode 1.x
+            // mislabel (an ungated setup() on a 1.18.x seat locked the harness to
+            // "opencode2"). Early adopters broke that premise: issue #475 reported a
+            // genuine OpenCode 2.0.7 server whose 2,788 tags and 32 session_meta rows
+            // were relabelled away from the host that was still writing them, which
+            // hid every earlier drop decision from it.
             //
-            // Twin rule, per table, when a natural key already has an 'opencode' row:
-            //   session_projects: keep the newer updated_at (tie keeps opencode)
-            //   primer_candidates: keep the newer created_at (tie keeps opencode)
-            //   transform_decisions: keep the newer ts_ms (tie keeps opencode)
-            //   message_history_orphan_sweep: keep the larger last_swept_at (NULL loses)
-            //   session_project_backfill_state: prefer status='completed', else newer started_at
-            // Every other harness table has a unique key that does not include harness,
-            // so twins cannot exist and a plain UPDATE is enough.
-            relabelOpenCode2HarnessRows(db);
+            // The body is empty rather than deleted so the version keeps its place in
+            // the ledger: an install that has not reached 85 still records it and then
+            // gets the evidence-based decision from v87, and an install that already
+            // applied 85 is repaired by v87 in the direction its own OpenCode store
+            // supports. A hand-inserted schema_migrations row for 85 (the workaround
+            // in #475) is equivalent to running this no-op.
+        },
+    },
+    {
+        version: 86,
+        description: "track tag identity changes per session",
+        up(db: Database): void {
+            if (!tableExists(db, "session_meta") || !tableExists(db, "tags")) return;
+            ensureColumn(db, "session_meta", "tags_version", "INTEGER NOT NULL DEFAULT 0");
+            // Clone/import paths can write tags before session bootstrap, so a trigger-created
+            // metadata row must carry the same explicit defaults as ensureSessionMetaRow.
+            db.exec(`
+                CREATE TRIGGER IF NOT EXISTS tags_version_ai AFTER INSERT ON tags BEGIN
+                    INSERT INTO session_meta(
+                        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+                        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+                        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+                        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+                        system_prompt_hash, cleared_reasoning_through_tag
+                    ) VALUES(NEW.session_id, NEW.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+                    ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS tags_version_ad AFTER DELETE ON tags BEGIN
+                    INSERT INTO session_meta(
+                        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+                        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+                        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+                        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+                        system_prompt_hash, cleared_reasoning_through_tag
+                    ) VALUES(OLD.session_id, OLD.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+                    ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+                END;
+                CREATE TRIGGER IF NOT EXISTS tags_version_au
+                AFTER UPDATE OF session_id, message_id, tag_number, type, tool_owner_message_id, status
+                ON tags BEGIN
+                    INSERT INTO session_meta(
+                        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+                        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+                        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+                        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+                        system_prompt_hash, cleared_reasoning_through_tag
+                    ) VALUES(OLD.session_id, OLD.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0)
+                    ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+                    INSERT INTO session_meta(
+                        session_id, harness, last_response_time, cache_ttl, counter, tags_version,
+                        last_nudge_tokens, last_nudge_band, last_transform_error, is_subagent,
+                        last_context_percentage, last_input_tokens, observed_safe_input_tokens,
+                        cache_alert_sent, times_execute_threshold_reached, compartment_in_progress,
+                        system_prompt_hash, cleared_reasoning_through_tag
+                    )
+                    SELECT NEW.session_id, NEW.harness, 0, '5m', 0, 1, 0, '', '', 0, 0, 0, 0, 0, 0, 0, '', 0
+                    WHERE NEW.session_id != OLD.session_id
+                    ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
+                END;
+            `);
+        },
+    },
+    {
+        version: 87,
+        description: "repair OpenCode harness labels from host-store evidence",
+        up(db: Database): void {
+            // Issue #475. Decide each session's harness label from the OpenCode store
+            // the runtime reads — the generation that wrote the session most recently
+            // owns the label — and move rows in whichever direction that evidence
+            // points. This both guards installs that never applied v85 and repairs the
+            // ones it already rewrote. With no readable store nothing moves: the
+            // affected sessions are recorded for doctor instead of guessed at.
+            repairOpenCode2HarnessLabels(db, {
+                tables: [...V85_OPENCODE2_RELABEL_TABLES, ...V85_OPTIONAL_OPENCODE2_RELABEL_TABLES],
+            });
+        },
+    },
+    {
+        version: 88,
+        description: "record the store projection each session's coordinates were derived against",
+        up(db: Database): void {
+            // Issue 492 finding 1. Every conversational coordinate Magic Context
+            // saves (compartment endpoints, note anchors, search-index ordinals,
+            // the protected-tail floor) is a POSITION in the message list the
+            // running OpenCode host serves. OpenCode 2 converts a 1.x store into a
+            // second projection of the same conversation while keeping the 1.x
+            // tables, so the same session can be served under either projection
+            // depending on which host opens it — and the two number the messages
+            // differently. These columns give the rebase something durable to
+            // compare against and somewhere to record what it could not re-derive.
+            //
+            // coordinate_generation is NULLABLE with no default on purpose: an
+            // existing session has never recorded one, and "not recorded" must stay
+            // distinguishable from "recorded as v1".
+            if (tableExists(db, "session_meta")) {
+                ensureColumn(db, "session_meta", "coordinate_generation", "TEXT");
+                ensureColumn(db, "session_meta", "coordinate_rebase_notice", "TEXT");
+            }
+            // Existing rows are 'ok': they were written against the projection that
+            // was live at the time, and the first rebase pass decides them properly.
+            if (tableExists(db, "compartments")) {
+                ensureColumn(db, "compartments", "rebase_status", "TEXT NOT NULL DEFAULT 'ok'");
+            }
+            if (tableExists(db, "recomp_compartments")) {
+                ensureColumn(
+                    db,
+                    "recomp_compartments",
+                    "rebase_status",
+                    "TEXT NOT NULL DEFAULT 'ok'",
+                );
+            }
+        },
+    },
+    {
+        version: 89,
+        description: "persist indexed message creation times for date-bounded search",
+        up(db: Database): void {
+            if (!tableExists(db, "message_fts_rowid_map")) return;
+            ensureColumn(db, "message_fts_rowid_map", "message_time_ms", "INTEGER");
+            db.exec(`
+                CREATE INDEX IF NOT EXISTS idx_message_fts_rowid_map_session_time
+                    ON message_fts_rowid_map(session_id, message_time_ms);
+                CREATE TABLE IF NOT EXISTS message_time_backfill_state (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    cursor_session_id TEXT NOT NULL DEFAULT '',
+                    cursor_ordinal INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO message_time_backfill_state
+                    (id, cursor_session_id, cursor_ordinal, completed, updated_at)
+                VALUES (1, '', 0, 0, 0);
+            `);
+        },
+    },
+    {
+        version: 90,
+        description: "record compartment lease owner pids",
+        up(db: Database): void {
+            if (!tableExists(db, "compartment_state_lease")) return;
+            ensureColumn(db, "compartment_state_lease", "owner_pid", "INTEGER");
+        },
+    },
+    {
+        version: 91,
+        description: "per-project embedding high-water mark for memories written outside this host",
+        up(db: Database): void {
+            // Vectors are computed by host code, not by a database trigger: a memory
+            // row inserted by another writer arrives with no embedding and nothing
+            // asks for one. The Rust module writes project memories directly in
+            // single-store mode, so it records the highest memory id it wrote here
+            // and the host's ordinary backfill loop drains everything above the
+            // embedded mark. A high-water mark rather than a per-row column keeps
+            // the memories table untouched, so a row written by either writer is
+            // byte-identical.
+            //
+            // embedded_memory_id is what the host has already handed to the embedder;
+            // written_memory_id is what the other writer has produced. Equal values
+            // mean there is nothing to drain.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS memory_embedding_watermarks (
+                    project_path TEXT PRIMARY KEY,
+                    written_memory_id INTEGER NOT NULL DEFAULT 0,
+                    embedded_memory_id INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                );
+            `);
+        },
+    },
+    {
+        version: 92,
+        description: "store-level offline single-store state and canonical compartment boundaries",
+        up(db: Database): void {
+            // A summary rebuild stages retained compartments before replacing them;
+            // its staging rows must preserve the block indices as well.
+            for (const table of ["compartments", "recomp_compartments"]) {
+                if (!tableExists(db, table)) continue;
+                ensureColumn(db, table, "start_block_index", "INTEGER");
+                ensureColumn(db, table, "end_block_index", "INTEGER");
+            }
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS single_store_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    state TEXT NOT NULL CHECK (state IN ('required', 'migrated')),
+                    migrated_at INTEGER,
+                    migrated_by TEXT,
+                    backup_dir TEXT,
+                    report_json TEXT
+                );
+                INSERT OR IGNORE INTO single_store_state(id, state) VALUES (1, 'required');
+            `);
+        },
+    },
+    {
+        version: 93,
+        description: "per-session compartment history revision for shared readers",
+        up(db: Database): void {
+            installCompartmentHistoryVersions(db);
+        },
+    },
+    {
+        version: 94,
+        description:
+            "store LKG prefixes as slices and replay decisions as rows instead of growing records",
+        up(db: Database): void {
+            // The LKG slot's prefix and the replay document in session_meta grew
+            // on every pass, and SQLite rewrote each whole record every time; see
+            // migration-v94-write-split.ts.
+            splitLkgSlotPrefixes(db);
+            splitReplayDecisions(db);
         },
     },
 ];
@@ -3141,6 +3236,32 @@ function getCurrentVersion(db: Database): number {
 
 function isMigrationApplied(db: Database, version: number): boolean {
     return db.prepare("SELECT 1 FROM schema_migrations WHERE version = ?").get(version) != null;
+}
+
+/**
+ * Whether `runMigrations` would apply anything to this database. Read-only: it
+ * creates no bookkeeping table and takes no write lock, so a startup that has
+ * nothing to migrate can skip the migration worker entirely.
+ */
+export function hasPendingMigrations(db: Database): boolean {
+    const bookkeeping = db
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+        .get();
+    if (bookkeeping == null) return true;
+    const currentVersion = getCurrentVersion(db);
+    return MIGRATIONS.some(
+        (candidate) =>
+            candidate.version > currentVersion && !isMigrationApplied(db, candidate.version),
+    );
+}
+
+// Counts migration bodies applied on the process's main thread. Startup applies
+// them on a worker thread so the host keeps answering requests; a test reads this
+// to prove a startup open never fell back to running them here.
+let mainThreadMigrationBodies = 0;
+
+export function __getMainThreadMigrationBodyCountForTests(): number {
+    return mainThreadMigrationBodies;
 }
 
 /**
@@ -3223,9 +3344,10 @@ export function runMigrations(db: Database): void {
             // retryable MigrationLockBusyError classification below.
             migration = undefined;
 
-            const transactionStartedAt = performance.now();
+            let transactionStartedAt = 0;
             const applied = db
                 .transaction(() => {
+                    transactionStartedAt = performance.now();
                     currentVersion = getCurrentVersion(db);
                     // Keep the append-only version boundary for legacy databases whose
                     // bookkeeping contains only a current-version row. Within the pending
@@ -3252,6 +3374,7 @@ export function runMigrations(db: Database): void {
                         loggedPlan = true;
                     }
 
+                    if (isMainThread) mainThreadMigrationBodies += 1;
                     migration.up(db);
                     db.prepare(
                         "INSERT INTO schema_migrations (version, description, applied_at) VALUES (?, ?, ?)",
@@ -3297,8 +3420,11 @@ export function runMigrations(db: Database): void {
 
     if (touchedLegacyAuthorityBatch) {
         try {
-            const transactionStartedAt = performance.now();
-            db.transaction(() => installLatestAuthorityTriggers(db)).immediate();
+            let transactionStartedAt = 0;
+            db.transaction(() => {
+                transactionStartedAt = performance.now();
+                installLatestAuthorityTriggers(db);
+            }).immediate();
             logSlowWriteTransaction("migration-runner", transactionStartedAt);
         } catch (error) {
             throw new Error(

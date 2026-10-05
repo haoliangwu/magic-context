@@ -73,7 +73,22 @@ describe("teardownChildSession", () => {
         expect(fixture.archived).toEqual([]);
     });
 
-    test("keeps a settled ordinary child but deletes a settled privacy child under keep_subagents", async () => {
+    test("deletes a settled privacy child when keep_subagents is false", async () => {
+        const fixture = teardownFixture();
+        await teardownChildSession({
+            client: fixture.client,
+            sessionId: "settled-private",
+            promptSettled: true,
+            privacySensitive: true,
+            context: "private",
+            log: (message) => fixture.messages.push(message),
+        });
+
+        expect(fixture.deleted).toEqual(["settled-private"]);
+        expect(fixture.archived).toEqual([]);
+    });
+
+    test("keeps both settled ordinary and privacy children under keep_subagents", async () => {
         setKeepSubagents(true);
         const ordinary = teardownFixture();
         await teardownChildSession({
@@ -89,13 +104,33 @@ describe("teardownChildSession", () => {
         const privacy = teardownFixture();
         await teardownChildSession({
             client: privacy.client,
-            sessionId: "deleted-private",
+            sessionId: "kept-private",
             promptSettled: true,
             privacySensitive: true,
             context: "private",
             log: (message) => privacy.messages.push(message),
         });
-        expect(privacy.deleted).toEqual(["deleted-private"]);
+        expect(privacy.deleted).toEqual([]);
+    });
+
+    test("leaves an unsettled privacy child to the sweep regardless of keep_subagents", async () => {
+        for (const keepSubagents of [false, true]) {
+            setKeepSubagents(keepSubagents);
+            const fixture = teardownFixture();
+            const sessionId = `unsettled-private-${keepSubagents}`;
+            await teardownChildSession({
+                client: fixture.client,
+                sessionId,
+                sessionDirectory: "/repo",
+                promptSettled: false,
+                privacySensitive: true,
+                context: "private",
+                log: (message) => fixture.messages.push(message),
+            });
+
+            expect(fixture.deleted).toEqual([]);
+            expect(fixture.archived).toEqual([sessionId]);
+        }
     });
 
     test("archives an unsettled child before logging, leaves it intact, then the age gate reaps it", async () => {

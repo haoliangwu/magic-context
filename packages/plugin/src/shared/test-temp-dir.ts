@@ -39,9 +39,13 @@ export const TEST_TEMP_DIR_PREFIXES = [
     "magic-context-pi-latch-test-",
     "magic-context-pi-index-test-",
     "mc-test-temp-dir-helper-",
+    "mc-v2-surface-",
+    // Created by the NODE_ENV=test storage backstop in data-path.ts.
+    "mc-test-db-backstop-",
 ] as const;
 
-export type TestTempDirPrefix = (typeof TEST_TEMP_DIR_PREFIXES)[number];
+export type TestTempDirPrefix = string;
+const OWNED_PREFIX = "mc-test-owned-";
 
 type AfterAll = (callback: () => void) => void;
 type SweepOptions = {
@@ -52,18 +56,18 @@ type SweepOptions = {
 
 const registeredTempDirs = new Set<string>();
 let lifecycleCleanupInstalled = false;
+let exitCleanupInstalled = false;
 
 function hasRecognizedPrefix(name: string): boolean {
-    return TEST_TEMP_DIR_PREFIXES.some((prefix) => name.startsWith(prefix));
+    return (
+        name.startsWith(OWNED_PREFIX) ||
+        TEST_TEMP_DIR_PREFIXES.some((prefix) => name.startsWith(prefix))
+    );
 }
 
 function isRegisteredTempDir(directory: string): boolean {
     const resolvedDirectory = resolve(directory);
-    return (
-        registeredTempDirs.has(resolvedDirectory) &&
-        dirname(resolvedDirectory) === resolve(tmpdir()) &&
-        hasRecognizedPrefix(basename(resolvedDirectory))
-    );
+    return registeredTempDirs.has(resolvedDirectory);
 }
 
 /**
@@ -75,17 +79,36 @@ export function createTestTempDir(
     prefix: TestTempDirPrefix,
     nameSuffix = "",
 ): { dir: string; cleanup: () => void } {
-    const dir = resolve(mkdtempSync(join(tmpdir(), `${prefix}${nameSuffix}`)));
-    registeredTempDirs.add(dir);
+    const label = prefix + nameSuffix;
+    if (!label || label === "." || label === ".." || /[/\\\0]/.test(label)) {
+        throw new Error("Test temp directory labels must be single path segments");
+    }
+    const dir = createTestTempDirFromPath(join(tmpdir(), `${prefix}${nameSuffix}`));
     return { dir, cleanup: () => cleanupTestTempDir(dir) };
 }
 
-/** Removes one registered test root and forgets it even when best-effort removal fails. */
+/**
+ * Registers fixtures with an explicit parent (including ADV_ROOT and nested roots).
+ * A common namespace lets the stale sweep recognize every system-temp fixture,
+ * without maintaining a list of caller-supplied labels.
+ */
+export function createTestTempDirFromPath(prefixPath: string): string {
+    const dir = resolve(
+        mkdtempSync(join(dirname(prefixPath), `${OWNED_PREFIX}${basename(prefixPath)}`)),
+    );
+    registeredTempDirs.add(dir);
+    if (!exitCleanupInstalled) {
+        exitCleanupInstalled = true;
+        process.once("exit", cleanupRegisteredTestTempDirs);
+    }
+    return dir;
+}
+
+/** Removes one registered test root; busy roots remain registered for an exit retry. */
 export function cleanupTestTempDir(directory: string): void {
     const resolvedDirectory = resolve(directory);
     if (!isRegisteredTempDir(resolvedDirectory)) return;
 
-    registeredTempDirs.delete(resolvedDirectory);
     try {
         rmSync(resolvedDirectory, {
             recursive: true,
@@ -93,6 +116,7 @@ export function cleanupTestTempDir(directory: string): void {
             maxRetries: 10,
             retryDelay: 100,
         });
+        registeredTempDirs.delete(resolvedDirectory);
     } catch {
         // A process can still hold a file open on Windows. The next startup sweep retries it.
     }
@@ -128,7 +152,10 @@ export function installTestTempDirCleanup(afterAll: AfterAll): void {
     if (lifecycleCleanupInstalled) return;
     lifecycleCleanupInstalled = true;
     afterAll(cleanupRegisteredTestTempDirs);
-    process.once("exit", cleanupRegisteredTestTempDirs);
+    if (!exitCleanupInstalled) {
+        exitCleanupInstalled = true;
+        process.once("exit", cleanupRegisteredTestTempDirs);
+    }
 }
 
 /**

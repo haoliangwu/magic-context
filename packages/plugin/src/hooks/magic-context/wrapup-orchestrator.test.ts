@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, spyOn } from "bun:test";
 import {
     acquireCompartmentLease,
     releaseCompartmentLease,
@@ -22,6 +22,8 @@ import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { executeContextRecompWithResult, registerActiveCompartmentRun } from "./compartment-runner";
+import { runValidatedHistorianPass } from "./compartment-runner-historian";
+import type { HiddenCompletionExecutor } from "./compartment-runner-types";
 import { createLiveSessionState, type LiveSessionState } from "./live-session-state";
 import { setRawMessageProvider } from "./read-session-chunk";
 import { type ManagedWrapupContext, runManagedWrapup } from "./wrapup-orchestrator";
@@ -108,6 +110,65 @@ function baseCtx(db: Database, state = liveState()): ManagedWrapupContext {
 }
 
 describe("runManagedWrapup", () => {
+    it("runs v2 wrapup historian chunks through the supplied executor without a v1 client", async () => {
+        const db = createDb();
+        const sessionId = "ses-wrapup-v2-executor";
+        const opens: string[] = [];
+        const executor: HiddenCompletionExecutor = {
+            capabilities: { tools: false, harness: "opencode" },
+            open: async (run) => {
+                opens.push(run.kind);
+                return { id: `child-${opens.length}`, childSessionId: `child-${opens.length}` };
+            },
+            attempt: async () => {},
+            collect: async () => ({
+                text: `<output><compartment start="${1 + (opens.length - 1) * 3}" end="${1 + (opens.length - 1) * 3}" title="History"><p1>Preserved.</p1></compartment></output>`,
+                reasoning: null,
+                lengthCapped: false,
+                usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            }),
+            close: async () => {},
+        };
+        try {
+            const ctx = baseCtx(db);
+            ctx.client = undefined as never;
+            ctx.hiddenCompletionExecutor = executor;
+            ctx.runCompartmentAgentForWrapup = mock(async (deps) => {
+                const start = Math.max(1, getLastCompartmentEndMessage(db, sessionId) + 1);
+                const pass = await runValidatedHistorianPass({
+                    client: deps.client,
+                    hiddenCompletionExecutor: deps.hiddenCompletionExecutor,
+                    db,
+                    parentSessionId: sessionId,
+                    sessionDirectory: deps.directory,
+                    prompt: `Messages ${start}-${start}:\n${start}: U: preserve this`,
+                    chunk: {
+                        startIndex: start,
+                        endIndex: start,
+                        lines: [{ ordinal: start, messageId: `m-${start}` }],
+                    },
+                    priorCompartments: [],
+                    sequenceOffset: 0,
+                    dumpLabelBase: "wrapup-v2",
+                });
+                expect(pass.ok, pass.error).toBe(true);
+                appendRange(
+                    db,
+                    sessionId,
+                    start,
+                    Math.min(start + 2, deps.boundarySnapshot.eligibleEndOrdinal - 1),
+                );
+                deps.onCompartmentStatePublished?.(sessionId);
+            });
+            const result = await withProvider(sessionId, 8, () =>
+                runManagedWrapup(ctx, sessionId, { messagesToKeep: 2 }),
+            );
+            expect(result).toContain("Wrapped up 6 messages into 2 compartments");
+            expect(opens).toHaveLength(2);
+        } finally {
+            closeQuietly(db);
+        }
+    });
     it("promotes facts from every non-final wrapup window and skips only the final window", async () => {
         const db = createDb();
         try {
@@ -245,6 +306,74 @@ describe("runManagedWrapup", () => {
             expect(getWrapupInProgressState(db, sessionId)).toBeNull();
             releaseCompartmentLease(db, sessionId, foreignHolder);
         } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("marks progress failed and releases the marker when a wrapup iteration throws", async () => {
+        const db = createDb();
+        try {
+            const sessionId = "ses-wrapup-throw";
+            const state = liveState();
+            const ctx = baseCtx(db, state);
+            ctx.runCompartmentAgentForWrapup = mock(async () => {
+                throw new Error("database is locked");
+            });
+
+            await expect(
+                withProvider(sessionId, 10, () =>
+                    runManagedWrapup(ctx, sessionId, { messagesToKeep: 2 }),
+                ),
+            ).rejects.toThrow("database is locked");
+
+            expect(state.recompProgressBySession.get(sessionId)).toMatchObject({
+                kind: "wrapup",
+                phase: "failed",
+                message: "Wrapup stopped: database is locked. Run /ctx-wrapup again to continue.",
+            });
+            expect(getWrapupInProgressState(db, sessionId)).toBeNull();
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    it("clears its wait timer once the active historian run it waited for settles", async () => {
+        const db = createDb();
+        const setTimeoutSpy = spyOn(globalThis, "setTimeout");
+        const clearTimeoutSpy = spyOn(globalThis, "clearTimeout");
+        try {
+            const sessionId = "ses-wrapup-wait-timer";
+            let settleActive!: () => void;
+            registerActiveCompartmentRun(
+                sessionId,
+                new Promise<void>((resolve) => {
+                    settleActive = resolve;
+                }),
+                "other",
+            );
+            const ctx = baseCtx(db);
+            ctx.wrapupLeaseWaitTimeoutMs = 600_000;
+            ctx.runCompartmentAgentForWrapup = mock(async () => {});
+
+            const run = withProvider(sessionId, 8, () =>
+                runManagedWrapup(ctx, sessionId, { messagesToKeep: 2 }),
+            );
+            settleActive();
+            await run;
+
+            // The wait races the active run against a timer as long as the configured
+            // lease wait. Once the run wins, that timer must not stay armed for minutes.
+            const waitTimers = setTimeoutSpy.mock.calls.flatMap((call, index) =>
+                typeof call[1] === "number" && call[1] > 500_000
+                    ? [setTimeoutSpy.mock.results[index]?.value]
+                    : [],
+            );
+            expect(waitTimers.length).toBeGreaterThan(0);
+            const cleared = new Set(clearTimeoutSpy.mock.calls.map((call) => call[0]));
+            for (const timer of waitTimers) expect(cleared.has(timer)).toBe(true);
+        } finally {
+            setTimeoutSpy.mockRestore();
+            clearTimeoutSpy.mockRestore();
             closeQuietly(db);
         }
     });

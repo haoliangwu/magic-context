@@ -87,6 +87,7 @@ registerIssue423HistorianTest(
 				run: async () => ({ ok: true, assistantText: xml, durationMs: 1 }),
 			},
 			historianModel: "test/model",
+			historianContextLimit: 1_000_000,
 			historianChunkTokens: 20000,
 			boundarySnapshot: boundary,
 			compartmentLeaseHolderId: holderId,

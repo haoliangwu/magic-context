@@ -27,7 +27,7 @@ export const MAP_MEMORIES_SYSTEM_PROMPT = `You are a memory mapper for the magic
 
 A memory's BACKING FILES are the file(s) whose code the memory makes a claim about — the files you would open to check whether the memory is accurate. You do NOT judge accuracy, rewrite, or remove anything. You only LOCATE backing files.
 
-Tools (read-only): read, grep, glob, aft_search, aft_outline, aft_zoom. Each memory may come with "Likely files" already named in it and confirmed to exist — confirm those FIRST (cheap) instead of searching. Use search/grep to FIND code only when no likely files are given. Do not guess — confirm a file exists and genuinely backs the memory before listing it. Keep reads minimal: you do not need to read a whole file to confirm it backs a one-line claim.
+Tools (read-only): read, grep, glob. Request line ranges rather than full files; use offset/limit for longer files. Each memory may come with "Likely files" already named in it and confirmed to exist — confirm those FIRST (cheap) instead of searching. Use search/grep to FIND code only when no likely files are given. Do not guess — confirm a file exists and genuinely backs the memory before listing it. Keep reads minimal: you do not need to read a whole file to confirm it backs a one-line claim.
 
 For each memory decide ONE of:
 - Backing files found → the COMPLETE set of repo-relative paths whose code the memory is about.

@@ -1,12 +1,13 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetOpenCodeDbPathStateForTesting } from "../../shared/opencode-db-path";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     getRawSessionTagKeysThrough,
     type RawSessionTagKeys,
@@ -149,7 +150,7 @@ describe("compartment drop tag-key pagination", () => {
     });
 
     it("uses the nearest prior persisted owner for a result-only page", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "compartment-drop-owner-fallback-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "compartment-drop-owner-fallback-"));
         tempDirs.push(dir);
         const dbPath = join(dir, "opencode.db");
         const openCodeDb = new Database(dbPath);
@@ -234,7 +235,7 @@ describe("compartment drop tag-key pagination", () => {
     });
 
     it("yields to the event loop between pages while scanning 100k SQLite parts", async () => {
-        const dir = mkdtempSync(join(tmpdir(), "compartment-drop-responsive-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "compartment-drop-responsive-"));
         tempDirs.push(dir);
         const dbPath = join(dir, "opencode.db");
         const db = new Database(dbPath);

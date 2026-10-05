@@ -19,7 +19,8 @@
       "ratio_sdk": 1.303
     },
     "error": null,
-    "durationMs": 6183
+    "durationMs": 6183,
+    "method": "usage"
   },
   {
     "label": "openai-codex/gpt-5.4",
@@ -41,7 +42,8 @@
       "ratio_sdk": 1.303
     },
     "error": null,
-    "durationMs": 5865
+    "durationMs": 5865,
+    "method": "usage"
   },
   {
     "label": "openai-codex/gpt-5.5",
@@ -63,6 +65,1170 @@
       "ratio_sdk": 1.303
     },
     "error": null,
-    "durationMs": 5836
+    "durationMs": 5836,
+    "method": "usage"
+  },
+  {
+    "method": "count_tokens",
+    "proseRatio": 1.5717777415675411,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 96460
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 54816,
+        "ratio": 1.5404243360966698
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 37430,
+        "ratio": 1.597524541186513
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 4214,
+        "ratio": 1.7924287537218204
+      }
+    },
+    "label": "anthropic/claude-fable-5-1",
+    "provider": "anthropic",
+    "modelId": "claude-fable-5-1",
+    "tokenizerKey": "anthropic/claude-opus-4.5",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18000,
+      "api": 24716,
+      "ratio_raw": 1.511,
+      "ratio_sdk": 1.373
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 16477,
+      "api": 33233,
+      "ratio_raw": 1.552,
+      "ratio_sdk": 2.017
+    },
+    "error": null,
+    "durationMs": 1649
+  },
+  {
+    "method": "count_tokens",
+    "proseRatio": 1.5717777415675411,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 96460
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 54816,
+        "ratio": 1.5404243360966698
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 37430,
+        "ratio": 1.597524541186513
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 4214,
+        "ratio": 1.7924287537218204
+      }
+    },
+    "label": "anthropic/claude-opus-5",
+    "provider": "anthropic",
+    "modelId": "claude-opus-5",
+    "tokenizerKey": "anthropic/claude-opus-4.5",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18000,
+      "api": 24716,
+      "ratio_raw": 1.511,
+      "ratio_sdk": 1.373
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 16477,
+      "api": 33233,
+      "ratio_raw": 1.552,
+      "ratio_sdk": 2.017
+    },
+    "error": null,
+    "durationMs": 1728
+  },
+  {
+    "method": "count_tokens",
+    "proseRatio": 1.5717777415675411,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 96460
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 54816,
+        "ratio": 1.5404243360966698
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 37430,
+        "ratio": 1.597524541186513
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 4214,
+        "ratio": 1.7924287537218204
+      }
+    },
+    "label": "anthropic/claude-opus-4-7",
+    "provider": "anthropic",
+    "modelId": "claude-opus-4-7",
+    "tokenizerKey": "anthropic/claude-opus-4.5",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18000,
+      "api": 24716,
+      "ratio_raw": 1.511,
+      "ratio_sdk": 1.373
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 16477,
+      "api": 33622,
+      "ratio_raw": 1.57,
+      "ratio_sdk": 2.041
+    },
+    "error": null,
+    "durationMs": 1531
+  },
+  {
+    "method": "count_tokens",
+    "proseRatio": 1.0579762098745316,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 64928
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 37560,
+        "ratio": 1.0555009133061684
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 24716,
+        "ratio": 1.0548868971404182
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2652,
+        "ratio": 1.1280306252658443
+      }
+    },
+    "label": "anthropic/claude-sonnet-4-6",
+    "provider": "anthropic",
+    "modelId": "claude-sonnet-4-6",
+    "tokenizerKey": "anthropic/claude-sonnet-4.5",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18000,
+      "api": 16670,
+      "ratio_raw": 1.019,
+      "ratio_sdk": 0.926
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 16477,
+      "api": 24488,
+      "ratio_raw": 1.143,
+      "ratio_sdk": 1.486
+    },
+    "error": null,
+    "durationMs": 1451
+  },
+  {
+    "method": "responses/input_tokens",
+    "proseRatio": 1.0000174754906244,
+    "proseTokens": {
+      "local_raw": 57223,
+      "api": 57224
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 31411,
+        "api": 31412,
+        "ratio": 1.0000318359810259
+      },
+      "history": {
+        "local_raw": 23464,
+        "api": 23465,
+        "ratio": 1.0000426184793727
+      },
+      "memory": {
+        "local_raw": 2348,
+        "api": 2349,
+        "ratio": 1.0004258943781943
+      }
+    },
+    "label": "openai/gpt-5.5",
+    "provider": "openai",
+    "modelId": "gpt-5.5",
+    "tokenizerKey": "openai/gpt-5",
+    "systemTokens": {
+      "local_raw": 14400,
+      "local_sdk": 14416,
+      "api": 14404,
+      "ratio_raw": 1,
+      "ratio_sdk": 0.999
+    },
+    "toolsTokens": {
+      "local_raw": 20403,
+      "local_sdk": 13205,
+      "api": 17362,
+      "ratio_raw": 0.851,
+      "ratio_sdk": 1.315
+    },
+    "error": null,
+    "durationMs": 4646
+  },
+  {
+    "method": "responses/input_tokens",
+    "proseRatio": 1.0000174754906244,
+    "proseTokens": {
+      "local_raw": 57223,
+      "api": 57224
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 31411,
+        "api": 31412,
+        "ratio": 1.0000318359810259
+      },
+      "history": {
+        "local_raw": 23464,
+        "api": 23465,
+        "ratio": 1.0000426184793727
+      },
+      "memory": {
+        "local_raw": 2348,
+        "api": 2349,
+        "ratio": 1.0004258943781943
+      }
+    },
+    "label": "openai/gpt-6-astra",
+    "provider": "openai",
+    "modelId": "gpt-6-astra",
+    "tokenizerKey": "openai/gpt-5",
+    "systemTokens": {
+      "local_raw": 14400,
+      "local_sdk": 14416,
+      "api": 14404,
+      "ratio_raw": 1,
+      "ratio_sdk": 0.999
+    },
+    "toolsTokens": {
+      "local_raw": 20403,
+      "local_sdk": 13205,
+      "api": 17362,
+      "ratio_raw": 0.851,
+      "ratio_sdk": 1.315
+    },
+    "error": null,
+    "durationMs": 3150
+  },
+  {
+    "method": "paas/v4/tokenizer",
+    "proseRatio": null,
+    "proseTokens": {
+      "local_raw": 57125,
+      "api": null
+    },
+    "proseSections": {},
+    "label": "zai/glm-5.1",
+    "provider": "zai",
+    "modelId": "glm-5.1",
+    "tokenizerKey": "zai/glm-4.5",
+    "systemTokens": {
+      "local_raw": 14355,
+      "local_sdk": 14373,
+      "api": null,
+      "ratio_raw": null,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 20168,
+      "local_sdk": 14081,
+      "api": null,
+      "ratio_raw": null,
+      "ratio_sdk": null
+    },
+    "error": "/api/paas/v4/tokenizer HTTP 429 (request rejected)",
+    "durationMs": 236,
+    "errorClass": "1113 insufficient balance",
+    "errorClassSource": "independently confirmed by task owner; no retry performed"
+  },
+  {
+    "method": "tokenize-text",
+    "proseRatio": 0.8801374699872887,
+    "proseTokens": {
+      "local_raw": 63723,
+      "api": 56085
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 37810,
+        "api": 30273,
+        "ratio": 0.8006612007405448
+      },
+      "history": {
+        "local_raw": 23438,
+        "api": 23464,
+        "ratio": 1.0011093096680603
+      },
+      "memory": {
+        "local_raw": 2471,
+        "api": 2348,
+        "ratio": 0.9502225819506273
+      }
+    },
+    "label": "xai/grok-4",
+    "provider": "xai",
+    "modelId": "grok-4-latest",
+    "tokenizerKey": "xai/grok-4",
+    "systemTokens": {
+      "local_raw": 17081,
+      "local_sdk": 17773,
+      "api": 13968,
+      "ratio_raw": 0.818,
+      "ratio_sdk": 0.786
+    },
+    "toolsTokens": {
+      "local_raw": 22593,
+      "local_sdk": 16593,
+      "api": 19893,
+      "ratio_raw": 0.88,
+      "ratio_sdk": 1.199
+    },
+    "error": null,
+    "durationMs": 5625,
+    "caveat": "Raw SYSTEM text and JSON-serialized chat function tools, without hidden chat/tool prompt framing. Residual method error versus billed chat tokens is unmeasured; local TOOLS denominator retains the canonical fixture serialization."
+  },
+  {
+    "method": "tokenize-text",
+    "proseRatio": 0.8801374699872887,
+    "proseTokens": {
+      "local_raw": 63723,
+      "api": 56085
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 37810,
+        "api": 30273,
+        "ratio": 0.8006612007405448
+      },
+      "history": {
+        "local_raw": 23438,
+        "api": 23464,
+        "ratio": 1.0011093096680603
+      },
+      "memory": {
+        "local_raw": 2471,
+        "api": 2348,
+        "ratio": 0.9502225819506273
+      }
+    },
+    "label": "xai/grok-code-fast-1",
+    "provider": "xai",
+    "modelId": "grok-code-fast-1",
+    "tokenizerKey": "xai/grok-code-fast-1",
+    "systemTokens": {
+      "local_raw": 17081,
+      "local_sdk": 17409,
+      "api": 13968,
+      "ratio_raw": 0.818,
+      "ratio_sdk": 0.802
+    },
+    "toolsTokens": {
+      "local_raw": 22593,
+      "local_sdk": 16341,
+      "api": 19893,
+      "ratio_raw": 0.88,
+      "ratio_sdk": 1.217
+    },
+    "error": null,
+    "durationMs": 4315,
+    "caveat": "Raw SYSTEM text and JSON-serialized chat function tools, without hidden chat/tool prompt framing. Residual method error versus billed chat tokens is unmeasured; local TOOLS denominator retains the canonical fixture serialization."
+  },
+  {
+    "method": "countTokens",
+    "proseRatio": 1.0069089131497475,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 61794
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 34757,
+        "ratio": 0.9767317690037938
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 24463,
+        "ratio": 1.0440887750746906
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2574,
+        "ratio": 1.094853253934496
+      }
+    },
+    "label": "google/gemini-3.8-flash",
+    "provider": "google",
+    "modelId": "gemini-3.8-flash",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": 15717,
+      "ratio_raw": 0.961,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": 20722,
+      "ratio_raw": 0.968,
+      "ratio_sdk": null
+    },
+    "error": null,
+    "durationMs": 1868
+  },
+  {
+    "method": "countTokens",
+    "proseRatio": 1.0069089131497475,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 61794
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 34757,
+        "ratio": 0.9767317690037938
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 24463,
+        "ratio": 1.0440887750746906
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2574,
+        "ratio": 1.094853253934496
+      }
+    },
+    "label": "google/gemini-3.7-flash",
+    "provider": "google",
+    "modelId": "gemini-3.7-flash",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": 15717,
+      "ratio_raw": 0.961,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": 20722,
+      "ratio_raw": 0.968,
+      "ratio_sdk": null
+    },
+    "error": null,
+    "durationMs": 1380
+  },
+  {
+    "method": "countTokens",
+    "proseRatio": 1.0069089131497475,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 61794
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 34757,
+        "ratio": 0.9767317690037938
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 24463,
+        "ratio": 1.0440887750746906
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2574,
+        "ratio": 1.094853253934496
+      }
+    },
+    "label": "google/gemini-3.1-pro-preview",
+    "provider": "google",
+    "modelId": "gemini-3.1-pro-preview",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": 15717,
+      "ratio_raw": 0.961,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": 20722,
+      "ratio_raw": 0.968,
+      "ratio_sdk": null
+    },
+    "error": null,
+    "durationMs": 1523
+  },
+  {
+    "method": "countTokens",
+    "proseRatio": null,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": null
+    },
+    "proseSections": {},
+    "label": "google/gemini-2.5-pro",
+    "provider": "google",
+    "modelId": "gemini-2.5-pro",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": null,
+      "ratio_raw": null,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": null,
+      "ratio_raw": null,
+      "ratio_sdk": null
+    },
+    "error": "/v1beta/models/gemini-2.5-pro:countTokens HTTP 404 (model or endpoint unavailable)",
+    "durationMs": 130,
+    "errorClass": "404"
+  },
+  {
+    "method": "offline_hf_tokenizer",
+    "caveat": "Offline HF raw-text counts without special tokens or a provider chat template; no API model availability or billed-usage equivalence is claimed.",
+    "proseRatio": null,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": null
+    },
+    "proseSections": {},
+    "label": "deepseek/deepseek-v4-flash",
+    "provider": "deepseek",
+    "modelId": "deepseek-v4-flash",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": null,
+      "ratio_raw": null,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": null,
+      "ratio_raw": null,
+      "ratio_sdk": null
+    },
+    "error": "SKIP: transformers is not installed; use an isolated environment: python3 -m venv .venv && .venv/bin/python -m pip install transformers tokenizers; then set DEEPSEEK_TOKENIZER_PYTHON=.venv/bin/python",
+    "durationMs": 75
+  },
+  {
+    "method": "offline_hf_tokenizer",
+    "caveat": "Offline HF raw-text counts without special tokens or a provider chat template; no API model availability or billed-usage equivalence is claimed.",
+    "proseRatio": null,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": null
+    },
+    "proseSections": {},
+    "label": "deepseek/deepseek-v4-pro",
+    "provider": "deepseek",
+    "modelId": "deepseek-v4-pro",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": null,
+      "ratio_raw": null,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": null,
+      "ratio_raw": null,
+      "ratio_sdk": null
+    },
+    "error": "SKIP: transformers is not installed; use an isolated environment: python3 -m venv .venv && .venv/bin/python -m pip install transformers tokenizers; then set DEEPSEEK_TOKENIZER_PYTHON=.venv/bin/python",
+    "durationMs": 56
+  },
+  {
+    "method": "input_tokens",
+    "caveat": "Preflight rendered-context count, baseline-subtracted. Meta usage.input_tokens is cumulative across hosted-tool iterations with injected-token accounting adjustments; it is not final-context occupancy or directly comparable billing.",
+    "proseRatio": 0.9233664656998534,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 56667
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 30855,
+        "ratio": 0.8670788253477589
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 23465,
+        "ratio": 1.0014938113529663
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2349,
+        "ratio": 0.9991492981709911
+      }
+    },
+    "label": "meta/muse-spark-1.3",
+    "provider": "meta",
+    "modelId": "muse-spark-1.3",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": 14160,
+      "ratio_raw": 0.866,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": 21945,
+      "ratio_raw": 1.025,
+      "ratio_sdk": null
+    },
+    "error": null,
+    "durationMs": 5927
+  },
+  {
+    "method": "input_tokens",
+    "caveat": "Preflight rendered-context count, baseline-subtracted. Meta usage.input_tokens is cumulative across hosted-tool iterations with injected-token accounting adjustments; it is not final-context occupancy or directly comparable billing.",
+    "proseRatio": 0.9233664656998534,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 56667
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 30855,
+        "ratio": 0.8670788253477589
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 23465,
+        "ratio": 1.0014938113529663
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2349,
+        "ratio": 0.9991492981709911
+      }
+    },
+    "label": "meta/muse-spark-1.3-contributor",
+    "provider": "meta",
+    "modelId": "muse-spark-1.3-contributor",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": 14160,
+      "ratio_raw": 0.866,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": 21945,
+      "ratio_raw": 1.025,
+      "ratio_sdk": null
+    },
+    "error": null,
+    "durationMs": 7416
+  },
+  {
+    "method": "input_tokens",
+    "caveat": "Preflight rendered-context count, baseline-subtracted. Meta usage.input_tokens is cumulative across hosted-tool iterations with injected-token accounting adjustments; it is not final-context occupancy or directly comparable billing.",
+    "proseRatio": 0.9233664656998534,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 56667
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 30855,
+        "ratio": 0.8670788253477589
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 23465,
+        "ratio": 1.0014938113529663
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2349,
+        "ratio": 0.9991492981709911
+      }
+    },
+    "label": "meta/muse-spark-1.2",
+    "provider": "meta",
+    "modelId": "muse-spark-1.2",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": 14160,
+      "ratio_raw": 0.866,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": 21945,
+      "ratio_raw": 1.025,
+      "ratio_sdk": null
+    },
+    "error": null,
+    "durationMs": 6045
+  },
+  {
+    "method": "input_tokens",
+    "caveat": "Preflight rendered-context count, baseline-subtracted. Meta usage.input_tokens is cumulative across hosted-tool iterations with injected-token accounting adjustments; it is not final-context occupancy or directly comparable billing.",
+    "proseRatio": 0.9233664656998534,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 56667
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 30855,
+        "ratio": 0.8670788253477589
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 23465,
+        "ratio": 1.0014938113529663
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2349,
+        "ratio": 0.9991492981709911
+      }
+    },
+    "label": "meta/muse-spark-1.2-contributor",
+    "provider": "meta",
+    "modelId": "muse-spark-1.2-contributor",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": 14160,
+      "ratio_raw": 0.866,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": 21945,
+      "ratio_raw": 1.025,
+      "ratio_sdk": null
+    },
+    "error": null,
+    "durationMs": 5802
+  },
+  {
+    "method": "input_tokens",
+    "caveat": "Preflight rendered-context count, baseline-subtracted. Meta usage.input_tokens is cumulative across hosted-tool iterations with injected-token accounting adjustments; it is not final-context occupancy or directly comparable billing.",
+    "proseRatio": 0.9233664656998534,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 56667
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 30855,
+        "ratio": 0.8670788253477589
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 23465,
+        "ratio": 1.0014938113529663
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2349,
+        "ratio": 0.9991492981709911
+      }
+    },
+    "label": "meta/muse-spark-1.1",
+    "provider": "meta",
+    "modelId": "muse-spark-1.1",
+    "tokenizerKey": null,
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": null,
+      "api": 14160,
+      "ratio_raw": 0.866,
+      "ratio_sdk": null
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": null,
+      "api": 21945,
+      "ratio_raw": 1.025,
+      "ratio_sdk": null
+    },
+    "error": null,
+    "durationMs": 3563
+  },
+  {
+    "method": "paas/v4/tokenizer",
+    "proseRatio": 0,
+    "proseTokens": {
+      "local_raw": 57125,
+      "api": 0
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 31313,
+        "api": 0,
+        "ratio": 0
+      },
+      "history": {
+        "local_raw": 23464,
+        "api": 0,
+        "ratio": 0
+      },
+      "memory": {
+        "local_raw": 2348,
+        "api": 0,
+        "ratio": 0
+      }
+    },
+    "label": "zai/glm-5",
+    "provider": "zai",
+    "modelId": "glm-5",
+    "tokenizerKey": "zai/glm-4.5",
+    "systemTokens": {
+      "local_raw": 14355,
+      "local_sdk": 14373,
+      "api": 0,
+      "ratio_raw": 0,
+      "ratio_sdk": 0
+    },
+    "toolsTokens": {
+      "local_raw": 20168,
+      "local_sdk": 14081,
+      "api": 0,
+      "ratio_raw": 0,
+      "ratio_sdk": 0
+    },
+    "error": null,
+    "durationMs": 7425
+  },
+  {
+    "method": "paas/v4/tokenizer",
+    "proseRatio": 1.000875273522976,
+    "proseTokens": {
+      "local_raw": 57125,
+      "api": 57175
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 31313,
+        "api": 31308,
+        "ratio": 0.9998403219110273
+      },
+      "history": {
+        "local_raw": 23464,
+        "api": 23520,
+        "ratio": 1.0023866348448687
+      },
+      "memory": {
+        "local_raw": 2348,
+        "api": 2349,
+        "ratio": 1.0004258943781943
+      }
+    },
+    "label": "zai/glm-4.7",
+    "provider": "zai",
+    "modelId": "glm-4.7",
+    "tokenizerKey": "zai/glm-4.5",
+    "systemTokens": {
+      "local_raw": 14355,
+      "local_sdk": 14373,
+      "api": 14351,
+      "ratio_raw": 1,
+      "ratio_sdk": 0.998
+    },
+    "toolsTokens": {
+      "local_raw": 20168,
+      "local_sdk": 14081,
+      "api": 21314,
+      "ratio_raw": 1.057,
+      "ratio_sdk": 1.514
+    },
+    "error": null,
+    "durationMs": 4451
+  },
+  {
+    "method": "tokenizers/estimate-token-count",
+    "proseRatio": 0.9255010591494215,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 56798
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 30986,
+        "ratio": 0.8707601517493326
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 23465,
+        "ratio": 1.0014938113529663
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2349,
+        "ratio": 0.9991492981709911
+      }
+    },
+    "label": "moonshot/kimi-k2.6",
+    "provider": "moonshot",
+    "modelId": "kimi-k2.6",
+    "tokenizerKey": "moonshotai/kimi-k2-0905",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18020,
+      "api": 14261,
+      "ratio_raw": 0.872,
+      "ratio_sdk": 0.791
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 15896,
+      "api": 18502,
+      "ratio_raw": 0.864,
+      "ratio_sdk": 1.164
+    },
+    "error": null,
+    "durationMs": 2194
+  },
+  {
+    "method": "tokenizers/estimate-token-count",
+    "proseRatio": 0.9255010591494215,
+    "proseTokens": {
+      "local_raw": 61370,
+      "api": 56798
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35585,
+        "api": 30986,
+        "ratio": 0.8707601517493326
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 23465,
+        "ratio": 1.0014938113529663
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 2349,
+        "ratio": 0.9991492981709911
+      }
+    },
+    "label": "moonshot/kimi-for-coding",
+    "provider": "moonshot",
+    "modelId": "kimi-for-coding",
+    "tokenizerKey": "moonshotai/kimi-k2-0905",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18020,
+      "api": 14261,
+      "ratio_raw": 0.872,
+      "ratio_sdk": 0.791
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 15896,
+      "api": 18502,
+      "ratio_raw": 0.864,
+      "ratio_sdk": 1.164
+    },
+    "error": null,
+    "durationMs": 2106
+  },
+  {
+    "method": "count_tokens",
+    "proseRatio": 1.5718147472642001,
+    "proseTokens": {
+      "local_raw": 61408,
+      "api": 96522
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35623,
+        "api": 54878,
+        "ratio": 1.5405215731409483
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 37430,
+        "ratio": 1.597524541186513
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 4214,
+        "ratio": 1.7924287537218204
+      }
+    },
+    "label": "anthropic/claude-sonnet-5",
+    "provider": "anthropic",
+    "modelId": "claude-sonnet-5",
+    "tokenizerKey": "anthropic/claude-opus-4.5",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18000,
+      "api": 24716,
+      "ratio_raw": 1.511,
+      "ratio_sdk": 1.373
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 16477,
+      "api": 33301,
+      "ratio_raw": 1.555,
+      "ratio_sdk": 2.021
+    },
+    "error": null,
+    "durationMs": 1634
+  },
+  {
+    "method": "count_tokens",
+    "proseRatio": 1.5718147472642001,
+    "proseTokens": {
+      "local_raw": 61408,
+      "api": 96522
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 35623,
+        "api": 54878,
+        "ratio": 1.5405215731409483
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 37430,
+        "ratio": 1.597524541186513
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 4214,
+        "ratio": 1.7924287537218204
+      }
+    },
+    "label": "anthropic/claude-opus-5-5",
+    "provider": "anthropic",
+    "modelId": "claude-opus-5-5",
+    "tokenizerKey": "anthropic/claude-opus-4.5",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18000,
+      "api": 24716,
+      "ratio_raw": 1.511,
+      "ratio_sdk": 1.373
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 16477,
+      "api": 33233,
+      "ratio_raw": 1.552,
+      "ratio_sdk": 2.017
+    },
+    "error": null,
+    "durationMs": 1721
+  },
+  {
+    "method": "count_tokens",
+    "proseRatio": 1.5873616321974513,
+    "proseTokens": {
+      "local_raw": 32251,
+      "api": 51194
+    },
+    "proseSections": {
+      "docs": {
+        "local_raw": 6466,
+        "api": 9550,
+        "ratio": 1.4769563872564182
+      },
+      "history": {
+        "local_raw": 23430,
+        "api": 37430,
+        "ratio": 1.597524541186513
+      },
+      "memory": {
+        "local_raw": 2351,
+        "api": 4214,
+        "ratio": 1.7924287537218204
+      }
+    },
+    "label": "anthropic/claude-sonnet-5-5",
+    "provider": "anthropic",
+    "modelId": "claude-sonnet-5-5",
+    "tokenizerKey": "anthropic/claude-opus-4.5",
+    "systemTokens": {
+      "local_raw": 16352,
+      "local_sdk": 18000,
+      "api": 24716,
+      "ratio_raw": 1.511,
+      "ratio_sdk": 1.373
+    },
+    "toolsTokens": {
+      "local_raw": 21418,
+      "local_sdk": 16477,
+      "api": 33233,
+      "ratio_raw": 1.552,
+      "ratio_sdk": 2.017
+    },
+    "error": null,
+    "durationMs": 1624
   }
 ]

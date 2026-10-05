@@ -23,7 +23,7 @@ use mc_store::{
 
 use crate::historian_producer::{
     ErrorClass, ErrorClassification, HistorianProducer, HistorianProducerError, ProducerErrorBody,
-    ProducerOutput, RunHandle, RunState,
+    ProducerOutput, RunHandle, RunState, RunnerRefusal, RunnerRefusalStage,
 };
 use crate::historian_validate::{
     validate_historian_output, HistorianChunk, HistorianValidationError, StoredCompartmentRange,
@@ -36,74 +36,142 @@ pub const HISTORIAN_FAILURE_BACKOFF_MS: i64 = 60_000;
 const CHAIN_EXHAUSTED_PERMANENT_PREFIX: &str = "chain-exhausted-permanent:";
 const AUTH_REQUIRED_PREFIX: &str = "auth-required:";
 const UNKNOWN_ERROR_CLASS_PREFIX: &str = "unknown-error-class:";
-pub(crate) const MODEL_UNRESOLVABLE_CHAIN_EXHAUSTED_PREFIX: &str =
-    "model_unresolvable_chain_exhausted:";
-pub(crate) const MODEL_UNRESOLVABLE_PUBLISHED_PREFIX: &str = "published_with_model_unresolvable:";
+pub(crate) const RUNNER_REFUSAL_CHAIN_EXHAUSTED_PREFIX: &str =
+    "historian runner refusal chain exhausted: ";
+pub(crate) const RUNNER_REFUSAL_PUBLISHED_PREFIX: &str = "published with historian refusal: ";
+const RUNNER_REFUSAL_BACKOFF_CAP_MS: i64 = 10 * 60_000;
+
+#[derive(Debug, Clone)]
+struct TransientRunnerRefusal {
+    refusal: RunnerRefusal,
+    retry_at_ms: i64,
+    delay_ms: i64,
+}
 
 #[derive(Debug, Default)]
-struct HistorianModelUnresolvableCacheState {
+struct HistorianRunnerRefusalCacheState {
     generation: u64,
     model_chain: Vec<String>,
-    reasons: BTreeMap<String, String>,
+    durable: BTreeMap<String, RunnerRefusal>,
+    transient: BTreeMap<String, TransientRunnerRefusal>,
 }
 
-/// Models rejected by Broca's resolver for the current module/config generation. The handler
-/// shares this cache across sessions; changing the effective chain advances the generation and
-/// discards every prior refusal.
+/// Runner refusals are shared across sessions. Provider and model catalog failures remain cached
+/// until the model chain changes; credential and other resolution failures use an expiring retry
+/// for each model.
 #[derive(Debug, Default)]
-pub struct HistorianModelUnresolvableCache {
-    state: Mutex<HistorianModelUnresolvableCacheState>,
+pub struct HistorianRunnerRefusalCache {
+    state: Mutex<HistorianRunnerRefusalCacheState>,
 }
 
-impl HistorianModelUnresolvableCache {
+impl HistorianRunnerRefusalCache {
     pub(crate) fn activate_chain(&self, model_chain: &[String]) -> u64 {
-        let mut state = self.state.lock().expect("historian model cache mutex");
+        let mut state = self.state.lock().expect("historian refusal cache mutex");
         if state.model_chain != model_chain {
             state.generation = state.generation.wrapping_add(1).max(1);
             state.model_chain = model_chain.to_vec();
-            state.reasons.clear();
+            state.durable.clear();
+            state
+                .transient
+                .retain(|model, _| model_chain.iter().any(|candidate| candidate == model));
         }
         state.generation
     }
 
-    fn cached_reason(&self, generation: u64, model: &str) -> Option<String> {
-        let state = self.state.lock().expect("historian model cache mutex");
-        (state.generation == generation)
-            .then(|| state.reasons.get(model).cloned())
-            .flatten()
+    fn cached_refusal(&self, generation: u64, model: &str, now_ms: i64) -> Option<RunnerRefusal> {
+        let state = self.state.lock().expect("historian refusal cache mutex");
+        if state.generation != generation {
+            return None;
+        }
+        state.durable.get(model).cloned().or_else(|| {
+            state
+                .transient
+                .get(model)
+                .filter(|entry| now_ms < entry.retry_at_ms)
+                .map(|entry| entry.refusal.clone())
+        })
     }
 
-    pub(crate) fn cached_reasons(
+    pub(crate) fn cached_durable_refusals(
         &self,
         generation: u64,
         model_chain: &[String],
-    ) -> Vec<(String, String)> {
+    ) -> Vec<(String, RunnerRefusal)> {
+        let state = self.state.lock().expect("historian refusal cache mutex");
+        if state.generation != generation {
+            return Vec::new();
+        }
         model_chain
             .iter()
             .filter_map(|model| {
-                self.cached_reason(generation, model)
-                    .map(|reason| (model.clone(), reason))
+                state
+                    .durable
+                    .get(model)
+                    .cloned()
+                    .map(|refusal| (model.clone(), refusal))
             })
             .collect()
     }
 
-    pub(crate) fn all_models_unresolvable(&self, generation: u64, model_chain: &[String]) -> bool {
+    pub(crate) fn all_models_durably_refused(
+        &self,
+        generation: u64,
+        model_chain: &[String],
+    ) -> bool {
         !model_chain.is_empty()
-            && model_chain
-                .iter()
-                .all(|model| self.cached_reason(generation, model).is_some())
+            && self.cached_durable_refusals(generation, model_chain).len() == model_chain.len()
     }
 
-    fn record(&self, generation: u64, model: &str, reason: &str) -> bool {
-        let mut state = self.state.lock().expect("historian model cache mutex");
+    fn record_refusal(
+        &self,
+        generation: u64,
+        model: &str,
+        refusal: RunnerRefusal,
+        now_ms: i64,
+        initial_backoff_ms: i64,
+    ) -> Option<i64> {
+        let mut state = self.state.lock().expect("historian refusal cache mutex");
         if state.generation != generation {
-            return false;
+            return None;
         }
-        if state.reasons.contains_key(model) {
-            return false;
+        if refusal.stage.is_durable() {
+            state.durable.insert(model.to_string(), refusal);
+            state.transient.remove(model);
+            return None;
         }
-        state.reasons.insert(model.to_string(), reason.to_string());
-        true
+
+        let delay_ms = state
+            .transient
+            .get(model)
+            .map(|entry| entry.delay_ms.saturating_mul(2))
+            .unwrap_or_else(|| initial_backoff_ms.max(1))
+            .min(RUNNER_REFUSAL_BACKOFF_CAP_MS);
+        let retry_at_ms = now_ms.saturating_add(delay_ms);
+        state.transient.insert(
+            model.to_string(),
+            TransientRunnerRefusal {
+                refusal,
+                retry_at_ms,
+                delay_ms,
+            },
+        );
+        Some(retry_at_ms)
+    }
+
+    fn record_success(&self, model: &str) {
+        self.state
+            .lock()
+            .expect("historian refusal cache mutex")
+            .transient
+            .remove(model);
+    }
+
+    fn earliest_retry_at_ms(&self, model_chain: &[String]) -> Option<i64> {
+        let state = self.state.lock().expect("historian refusal cache mutex");
+        model_chain
+            .iter()
+            .filter_map(|model| state.transient.get(model).map(|entry| entry.retry_at_ms))
+            .min()
     }
 }
 
@@ -277,7 +345,13 @@ pub enum HistorianNoFireCause {
     EmptyFilteredChunk,
     InvalidChunkCoverage,
     NoModels,
-    ModelUnresolvable,
+    /// The request carried no model chain at all. The host resolves the chain and must
+    /// send one (possibly empty) with every request; the module does not guess.
+    ModelChainMissing,
+    CredentialUnavailable,
+    ProviderUnknown,
+    ModelUnknown,
+    RunnerResolutionFailed,
     FailureBackoff,
     ValidationRejected,
     ChainExhausted,
@@ -312,7 +386,11 @@ impl HistorianNoFireCause {
             Self::EmptyFilteredChunk => "EmptyFilteredChunk",
             Self::InvalidChunkCoverage => "InvalidChunkCoverage",
             Self::NoModels => "NoModels",
-            Self::ModelUnresolvable => "ModelUnresolvable",
+            Self::ModelChainMissing => "ModelChainMissing",
+            Self::CredentialUnavailable => "CredentialUnavailable",
+            Self::ProviderUnknown => "ProviderUnknown",
+            Self::ModelUnknown => "ModelUnknown",
+            Self::RunnerResolutionFailed => "RunnerResolutionFailed",
             Self::FailureBackoff => "FailureBackoff",
             Self::ValidationRejected => "ValidationRejected",
             Self::ChainExhausted => "ChainExhausted",
@@ -349,7 +427,11 @@ impl HistorianNoFireCause {
             Self::InvalidChunkCoverage => "invalid_chunk_coverage",
             Self::BelowProactiveFloor => "below_proactive_floor",
             Self::NoModels => "no_models",
-            Self::ModelUnresolvable => "model_unresolvable",
+            Self::ModelChainMissing => "model_chain_missing",
+            Self::CredentialUnavailable => "credential_unavailable",
+            Self::ProviderUnknown => "provider_unknown",
+            Self::ModelUnknown => "model_unknown",
+            Self::RunnerResolutionFailed => "runner_resolution_failed",
             Self::FailureBackoff => "failure_backoff",
             Self::ValidationRejected => "validation_rejected",
             Self::ChainExhausted => "chain_exhausted",
@@ -359,6 +441,15 @@ impl HistorianNoFireCause {
             Self::MissingBlockIdentity => "invalid_boundary_identity",
             Self::AssemblyFailed => "assembly_failed",
             Self::SubagentSession => "subagent_session",
+        }
+    }
+
+    pub const fn from_runner_refusal_stage(stage: RunnerRefusalStage) -> Self {
+        match stage {
+            RunnerRefusalStage::Credential => Self::CredentialUnavailable,
+            RunnerRefusalStage::Provider => Self::ProviderUnknown,
+            RunnerRefusalStage::Model => Self::ModelUnknown,
+            RunnerRefusalStage::Resolution => Self::RunnerResolutionFailed,
         }
     }
 }
@@ -472,6 +563,9 @@ pub fn fire(
         selected_range_identities,
         producer_session_id: None,
         producer_run_id: None,
+        producer_attempt: 0,
+        coordinator_token: None,
+        claim_deadline_ms: None,
         fired_at_ms: Some(fired_at_ms),
         expected_revert_epoch,
         compartment_set_generation,
@@ -494,10 +588,65 @@ pub fn producer_started(
     next.state = HistorianPhase::AwaitingProducer;
     next.producer_session_id = Some(producer_session_id);
     next.producer_run_id = Some(producer_run_id);
+    // The in-module producer holds its run for as long as it runs and cannot be
+    // taken over, so it is always attempt 0 of that run and needs no token.
+    next.producer_attempt = 0;
+    next.coordinator_token = None;
+    next.claim_deadline_ms = None;
     // A producer run is established: any failure detail or retry cooldown from a
     // prior firing is resolved.
     next.failure_backoff_at_ms = None;
     next.last_failure = None;
+    Ok(next)
+}
+
+/// `Firing -> Reclaiming`: the run is assembled and queued, but no claimant has
+/// taken it yet. The run identity exists from here on, so a claim continues this
+/// run rather than starting another.
+pub fn pending_published(
+    current: &HistorianDurableState,
+    producer_run_id: String,
+) -> Result<HistorianDurableState, HistorianStateError> {
+    require_phase(current, HistorianPhase::Firing, "pending_published")?;
+    let mut next = current.clone();
+    next.producer_run_id = Some(producer_run_id);
+    next.producer_attempt = 0;
+    next.park_for_reclaim();
+    Ok(next)
+}
+
+/// `AwaitingProducer -> Reclaiming`: the claimant's lease ran out without a
+/// terminal report. The run, its chunk and its firing sequence are kept; only the
+/// claim is dropped, so the replacement pays for one completion rather than a
+/// whole new chunk. Dropping the token is what makes the departed claimant's late
+/// report refusable in every later phase.
+pub fn lease_expired(
+    current: &HistorianDurableState,
+) -> Result<HistorianDurableState, HistorianStateError> {
+    require_phase(current, HistorianPhase::AwaitingProducer, "lease_expired")?;
+    let mut next = current.clone();
+    next.park_for_reclaim();
+    Ok(next)
+}
+
+/// `Reclaiming -> AwaitingProducer`: a claimant took the run under an attempt and
+/// token this module minted. Attempts are monotonic per run, so the pair
+/// `(run_id, attempt)` names exactly one claim for the life of the run.
+pub fn reclaimed(
+    current: &HistorianDurableState,
+    attempt: u32,
+    token: String,
+    claim_deadline_ms: i64,
+) -> Result<HistorianDurableState, HistorianStateError> {
+    require_phase(current, HistorianPhase::Reclaiming, "reclaimed")?;
+    if attempt <= current.producer_attempt {
+        return Err(HistorianStateError::InvalidTransition {
+            from: current.state.clone(),
+            event: "reclaimed",
+        });
+    }
+    let mut next = current.clone();
+    next.grant_claim(attempt, token, claim_deadline_ms);
     Ok(next)
 }
 
@@ -588,6 +737,7 @@ pub fn publish_predicate(
     Ok(HistorianPublishPredicate {
         firing_seq: state.firing_seq,
         producer_run_id,
+        producer_attempt: state.producer_attempt,
         chunk_fingerprint: state.chunk_fingerprint.clone(),
         selected_range_identities: state.selected_range_identities.clone(),
         compartment_set_generation: state.compartment_set_generation,
@@ -599,13 +749,13 @@ pub fn persist_historian_state(
     session_id: &str,
     next_state: HistorianDurableState,
 ) -> Result<u64, HistorianStateError> {
-    let loaded = store.load(session_id)?;
+    let loaded = store.load_meta(session_id)?;
     let mut meta = loaded.meta.clone();
     meta.historian = next_state;
     if meta == loaded.meta {
         return Ok(loaded.row_version.unwrap_or(0));
     }
-    Ok(store.commit(session_id, loaded.row_version, &loaded.core, &meta)?)
+    Ok(store.commit_meta(session_id, loaded.row_version, &meta)?)
 }
 
 pub trait HistorianPublicationFence: Send + Sync {
@@ -619,6 +769,11 @@ pub trait HistorianPublicationFence: Send + Sync {
 pub struct ValidatedPublishRequest<'a> {
     pub session_id: &'a str,
     pub project_path: &'a str,
+    /// The harness label the host stamps on this session's rows (`opencode`, `opencode2`,
+    /// `pi`, ...). The single-store writers stamp the same one, because it is part of
+    /// `primer_candidates`' upsert key: any other label would add a second candidate row
+    /// beside the host's instead of updating it.
+    pub harness: &'a str,
     pub expected_row_version: Option<u64>,
     pub expected_revert_epoch: u64,
     pub predicate: &'a HistorianPublishPredicate,
@@ -729,6 +884,7 @@ pub fn publish_validated_chunk(
         };
 
     let publish_request = HistorianPublishRequest {
+        harness: Some(request.harness),
         session_id: request.session_id,
         expected_row_version: request.expected_row_version,
         expected_revert_epoch: request.expected_revert_epoch,
@@ -744,12 +900,29 @@ pub fn publish_validated_chunk(
         chunk_transcript: Some(request.chunk_transcript),
         raw_chunk_messages: Some(request.raw_chunk_messages),
     };
+    let publish_started_at = std::time::Instant::now();
     let publish_result = match request.publication_fence {
         Some(fence) => fence.publish(store, publish_request),
         None => store.publish_historian_chunk(publish_request),
     };
+    let publish_elapsed_us =
+        i64::try_from(publish_started_at.elapsed().as_micros()).unwrap_or(i64::MAX);
     match publish_result {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            // How long the largest write in the system holds its transaction. Recorded
+            // only for a publish that committed, because an aborted one is not the write
+            // a concurrent reader would have been waiting behind. Failing to record it
+            // must not fail the publish: this is a measurement, not a guarantee.
+            if let Err(error) =
+                store.record_publish_duration(request.session_id, publish_elapsed_us)
+            {
+                eprintln!(
+                    "[magic-context] could not record publish duration for {}: {error}",
+                    request.session_id
+                );
+            }
+            Ok(result)
+        }
         Err(HistorianPublishError::FenceRejected { reason }) => {
             // A fence rejection is a fast local race (the caller's snapshot was
             // retired mid-round), not a producer failure: return the run to Idle
@@ -835,9 +1008,10 @@ pub enum RestartAction {
 pub fn handle_restart_load(
     store: &McStore,
     session_id: &str,
+    now_ms: i64,
     failure_backoff_at_ms: i64,
 ) -> Result<RestartAction, HistorianStateError> {
-    let loaded = store.load(session_id)?;
+    let loaded = store.load_meta(session_id)?;
     let state = loaded.meta.historian.clone();
     match state.state {
         HistorianPhase::Idle => Ok(RestartAction::Done),
@@ -859,8 +1033,33 @@ pub fn handle_restart_load(
                 chunk_fingerprint: state.chunk_fingerprint,
             })
         }
-        HistorianPhase::Firing | HistorianPhase::Validating | HistorianPhase::Publishing => {
+        // A run parked for a claimant is released rather than kept: the task that was
+        // waiting for its report died with the previous process, so keeping the
+        // session on it would hold its single-flight slot for a report nothing can
+        // accept. Releasing costs one re-assembled chunk on the next trigger and never
+        // loses durable output.
+        //
+        // On the host lane this is the second look, not the first:
+        // `adopt_historian_run_on_host` runs before this and keeps any session whose
+        // queue row is still live, so a session that reaches here either has no row
+        // or has one the adoption path already spent.
+        HistorianPhase::Firing
+        | HistorianPhase::Reclaiming
+        | HistorianPhase::Validating
+        | HistorianPhase::Publishing => {
             let firing_seq = state.firing_seq;
+            // The run's queue row is parked in the same breath: parked rows are offered
+            // to nobody, so the released run stops being advertised, while the row keeps
+            // the chunk fingerprint and prompt bytes a boot-time re-publication would
+            // otherwise have to pay to re-assemble. The claim sweep deletes it if
+            // nothing adopts it before the run's own deadline.
+            //
+            // Parking happens BEFORE the session is released so that a crash between the
+            // two leaves a row the next boot parks again, rather than one still
+            // advertised to claimants whose session no longer owns it.
+            if let Some(run_id) = state.producer_run_id.as_deref() {
+                store.park_historian_pending_run(run_id, now_ms)?;
+            }
             let next = abandon(&state, failure_backoff_at_ms);
             persist_historian_state(store, session_id, next)?;
             Ok(RestartAction::AbandonedAndRefireEligible { firing_seq })
@@ -879,7 +1078,9 @@ pub struct HistorianRunSuccess {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HistorianDriveOutcome {
     Completed(HistorianRunSuccess),
-    Busy(HistorianDurableState),
+    /// Boxed because the durable firing state is several times the size of a
+    /// success and this outcome is returned on every pass that declines.
+    Busy(Box<HistorianDurableState>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1124,10 +1325,22 @@ impl HistorianProducerDriver for HistorianProducer {
     }
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct HistorianModelLimits {
+    #[serde(default)]
+    pub context: Option<usize>,
+    #[serde(default)]
+    pub input: Option<usize>,
+    #[serde(default)]
+    pub output: Option<u32>,
+}
+
 pub struct HistorianFireRequest<'a> {
     pub store: &'a McStore,
     pub session_id: &'a str,
     pub project_path: &'a str,
+    /// The route's harness label, stamped on the rows the single-store writers produce.
+    pub harness: &'a str,
     pub project_slug: &'a str,
     /// The role-scoped historian SYSTEM prompt (HISTORIAN_SYSTEM_PROMPT). Sent via the
     /// producer's `system` field, never concatenated into `prompt`. Empty means absent.
@@ -1138,8 +1351,12 @@ pub struct HistorianFireRequest<'a> {
     pub prompt: &'a str,
     pub model_chain: &'a [String],
     pub temperature: Option<f64>,
+    pub await_timeout: Duration,
     pub producer_source_tokens: usize,
     pub historian_context_limit_tokens: Option<usize>,
+    /// Fallback windows must belong to their own model, never to the primary model.
+    pub fallback_context_limits: std::collections::BTreeMap<String, usize>,
+    pub model_limits: std::collections::BTreeMap<String, HistorianModelLimits>,
     pub max_output_tokens: u32,
     pub from_ordinal: u64,
     pub to_ordinal: u64,
@@ -1166,6 +1383,8 @@ pub struct HistorianReattachRequest<'a> {
     pub store: &'a McStore,
     pub session_id: &'a str,
     pub project_path: &'a str,
+    /// The route's harness label, stamped on the rows the single-store writers produce.
+    pub harness: &'a str,
     pub observed_chunk_fingerprint: &'a str,
     pub validation_chunk: &'a HistorianChunk,
     pub chunk_transcript: &'a str,
@@ -1175,6 +1394,11 @@ pub struct HistorianReattachRequest<'a> {
     pub prior_compartments: &'a [StoredCompartmentRange],
     pub validate_options: ValidateOptions,
     pub publication_floor_ordinal: u64,
+    /// Per-attempt wait for the reattached run, resolved from the host's
+    /// `historian_timeout_ms` with [`historian_await_timeout`] exactly as a fresh
+    /// attempt resolves it. Without it the await would fall back to the producer's own
+    /// default and ignore the configured timeout.
+    pub await_timeout: Duration,
     pub now_ms: i64,
     pub failure_backoff_at_ms: i64,
     pub completion_now_ms: fn() -> i64,
@@ -1189,9 +1413,25 @@ pub struct HistorianReattachRequest<'a> {
 /// live as template-echo and seed-regurgitation on the calibration model itself).
 pub const MC_CHILD_SESSION_PREFIX: &str = "mc-historian:";
 
-/// Wait budget for a full historian run plus its one short timeout recovery re-drain.
-pub fn completion_wait_budget() -> Duration {
-    Duration::from_secs(660)
+/// Older adapters omit the timeout. Bound untrusted wire values before using them as deadlines.
+pub fn historian_await_timeout(timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(timeout_ms.unwrap_or(600_000).clamp(60_000, 3_600_000))
+}
+
+/// Wait budget for ONE historian attempt: a full run plus its one short timeout
+/// recovery re-drain.
+pub fn completion_wait_budget(timeout: Duration) -> Duration {
+    timeout + Duration::from_secs(60)
+}
+
+/// Wait budget for a whole firing that may walk its model chain. A timed-out attempt
+/// moves on to the next model, and every attempt gets its own full per-attempt budget,
+/// so anything that joins a firing and means to see it finish must allow one
+/// [`completion_wait_budget`] per model it may try. A budget sized for one attempt
+/// would give up on a firing that is still legitimately working through fallbacks.
+pub fn firing_completion_wait_budget(timeout: Duration, chain_len: usize) -> Duration {
+    let attempts = u32::try_from(chain_len.max(1)).unwrap_or(u32::MAX);
+    completion_wait_budget(timeout).saturating_mul(attempts)
 }
 
 /// The per-attempt deadline a consumer sets, VERBATIM, for `session.wrapup` calls —
@@ -1200,17 +1440,35 @@ pub fn completion_wait_budget() -> Duration {
 /// cap: it drains chunks until the keep watermark is reached or this budget expires,
 /// so the budget itself — not a chunk count — is the ceiling (the TypeScript wrapup
 /// drain has the same uncapped-until-target shape). Derivation: one busy-join at
-/// entry (bounded by [`completion_wait_budget`], 660s) plus producer rounds each
-/// bounded by [`wrapup_round_wait_budget`] (600s); the loop re-checks the remaining
-/// budget before every round, so the wall time is one join plus as many rounds as
-/// fit under the budget. Sized for a large multi-chunk drain with margin. Bump this
-/// in the same commit as any change to those inputs and notify consumers.
+/// entry (bounded by [`firing_completion_wait_budget`] — 660s per model the joined
+/// firing may try — and always clamped to the remaining request budget) plus producer rounds each
+/// bounded by [`wrapup_round_wait_budget`] (one full firing, capped by the
+/// remaining request time). The request budget limits the total wrapup time:
+/// after joining an active firing, new rounds run only while time remains. Sized for a large multi-chunk drain with margin. If the firing or round
+/// wait budget changes, update this request budget in the same commit and
+/// notify the callers that set wrapup request deadlines.
 pub const MAX_WRAPUP_REQUEST_BUDGET: Duration = Duration::from_secs(3_800);
 
-/// Per-round wrapup wait bound. A timed-out producer keeps running under the normal
-/// historian guard so durable recovery remains identical to an incremental firing.
-pub fn wrapup_round_wait_budget() -> Duration {
-    Duration::from_secs(600)
+/// Per-round wrapup wait bound. Each model may use its full attempt plus re-drain.
+/// If a round times out, its producer continues under the historian's usual
+/// safeguards, allowing the same durable recovery as an incremental firing.
+pub fn wrapup_round_wait_budget(
+    timeout: Duration,
+    chain_len: usize,
+    remaining: Duration,
+) -> Duration {
+    firing_completion_wait_budget(timeout, chain_len).min(remaining)
+}
+
+#[cfg(test)]
+#[test]
+fn wrapup_round_wait_covers_fallbacks_and_respects_remaining_request_budget() {
+    let timeout = Duration::from_secs(600);
+    let firing = wrapup_round_wait_budget(timeout, 3, Duration::from_secs(3_800));
+    assert_eq!(firing, Duration::from_secs(1_980));
+    assert!(firing > completion_wait_budget(timeout));
+    let remaining = Duration::from_millis(7);
+    assert_eq!(wrapup_round_wait_budget(timeout, 3, remaining), remaining);
 }
 
 /// The transform-call deadline a consumer sets, VERBATIM, for requests to this module —
@@ -1219,8 +1477,8 @@ pub fn wrapup_round_wait_budget() -> Duration {
 ///
 /// Derivation: a ≥95% (Emergency95) request may legitimately block until compaction
 /// lands, and its worst case nests both emergency arms sequentially — busy-await of an
-/// active run (one `completion_wait_budget`, 660s) followed by an inline refire (a
-/// second 660s) plus transform re-runs — ≈ 1350s, rounded up with margin. A consumer
+/// active run (the 20s `TRANSFORM_HISTORIAN_FOLLOWUP_BUDGET`) followed by an
+/// inline refire (up to 660s per model) plus transform re-runs, with margin. A consumer
 /// deadline below this false-trips on legitimate work and forwards a RAW array at the
 /// exact pressure where raw risks provider context-overflow; a trip at THIS value means
 /// the module violated its own per-arm bounds (a bug), making forward-raw-and-discard
@@ -1304,6 +1562,19 @@ fn decide_producer_failure(
     now_ms: i64,
     default_failure_backoff_at_ms: i64,
 ) -> ProducerFailureDecision {
+    if matches!(err, HistorianProducerError::TimedOut) {
+        // A timed-out attempt says the model did not answer within its per-attempt
+        // budget, not that the chunk is unusable, so another model may still fold it.
+        // This matches the TypeScript historian, whose outer model loop treats a
+        // timed-out prompt as a failed attempt and moves on to the next fallback model.
+        *all_failures_permanent = false;
+        return ProducerFailureDecision {
+            try_next_model: has_eligible_model(remaining_models, auth_blocked_providers),
+            failure_backoff_at_ms: default_failure_backoff_at_ms,
+            detail_prefix: None,
+        };
+    }
+
     if let Some(classification) = err.classification() {
         // The producer owns classification. Once a class tag is present, the consumer
         // branches only on that field and its structured retry-after sibling; provider
@@ -1380,6 +1651,14 @@ fn decide_producer_failure(
     }
 }
 
+/// Whether a failed recovery re-drain after a timeout carries the run's own terminal
+/// outcome rather than just another missed deadline or transport hiccup. A classified
+/// error, an abort, or a context overflow reported by the re-drain decides the model
+/// chain on its own terms; anything else is treated as the original timeout.
+fn recovery_reports_run_outcome(err: &HistorianProducerError) -> bool {
+    err.classification().is_some() || err.has_class_field() || err.is_abort_or_overflow()
+}
+
 pub(crate) fn completion_failure_backoff_at_ms(
     started_at_ms: i64,
     configured_backoff_at_ms: i64,
@@ -1415,11 +1694,9 @@ fn record_chain_outage(next: &mut HistorianDurableState, earliest_reset_ms: Opti
         .map(|time| time.to_rfc3339())
         .unwrap_or_else(|| "unknown".into());
     let outage = format!("chain_exhausted earliest_provider_reset={reset} retry=probe; serving retained context and reductions");
-    next.last_failure = Some(format!(
-        "{}; {outage}",
-        next.last_failure.as_deref().unwrap_or("")
-    ));
-    next.last_no_fire = Some(outage);
+    let detail = next.last_failure.take().unwrap_or_default();
+    next.last_failure = Some(format!("{detail}; {outage}"));
+    next.last_no_fire = Some(format!("{outage}; {detail}"));
 }
 
 fn classified_backoff_at_ms(
@@ -1469,24 +1746,48 @@ fn prefixed_detail(prefix: Option<&str>, detail: String) -> String {
     }
 }
 
-pub(crate) fn model_unresolvable_detail(
-    failures: &[(String, String)],
+fn runner_refusal_entry(model: &str, refusal: &RunnerRefusal) -> String {
+    let received = format!("{}: {}", refusal.received_code, refusal.received_message);
+    format!(
+        "historian refusal stage={} provider={} model={} received={received:?}",
+        refusal.stage.as_str(),
+        provider_prefix(model),
+        model,
+    )
+}
+
+pub(crate) fn runner_refusal_detail(
+    failures: &[(String, RunnerRefusal)],
     chain_exhausted: bool,
 ) -> String {
-    let reasons = failures
+    let entries = failures
         .iter()
-        .map(|(model, reason)| format!("model_unresolvable:{model}: {reason}"))
+        .map(|(model, refusal)| runner_refusal_entry(model, refusal))
         .collect::<Vec<_>>()
         .join("; ");
     if chain_exhausted {
-        format!("{MODEL_UNRESOLVABLE_CHAIN_EXHAUSTED_PREFIX}{reasons}")
+        format!("{RUNNER_REFUSAL_CHAIN_EXHAUSTED_PREFIX}{entries}")
     } else {
-        reasons
+        entries
     }
 }
 
-fn detail_with_model_unresolvable(
-    failures: &[(String, String)],
+pub(crate) fn runner_refusal_stage_from_detail(detail: &str) -> Option<RunnerRefusalStage> {
+    if detail.contains("stage=credential") {
+        Some(RunnerRefusalStage::Credential)
+    } else if detail.contains("stage=provider") {
+        Some(RunnerRefusalStage::Provider)
+    } else if detail.contains("stage=model") {
+        Some(RunnerRefusalStage::Model)
+    } else if detail.contains("stage=resolution") {
+        Some(RunnerRefusalStage::Resolution)
+    } else {
+        None
+    }
+}
+
+fn detail_with_runner_refusals(
+    failures: &[(String, RunnerRefusal)],
     detail_prefix: Option<&str>,
     detail: String,
 ) -> String {
@@ -1494,51 +1795,64 @@ fn detail_with_model_unresolvable(
     if failures.is_empty() {
         detail
     } else {
-        format!("{}; {detail}", model_unresolvable_detail(failures, false))
+        format!("{}; {detail}", runner_refusal_detail(failures, false))
     }
 }
 
-fn remaining_uncached_models(
+fn remaining_available_models(
     models: &[String],
-    cache: Option<&HistorianModelUnresolvableCache>,
+    cache: Option<&HistorianRunnerRefusalCache>,
     generation: u64,
+    now_ms: i64,
 ) -> Vec<String> {
     models
         .iter()
         .filter(|model| {
             cache
-                .and_then(|cache| cache.cached_reason(generation, model))
+                .and_then(|cache| cache.cached_refusal(generation, model, now_ms))
                 .is_none()
         })
         .cloned()
         .collect()
 }
 
-fn abandon_model_unresolvable(
+fn record_runner_refusal_outage(state: &mut HistorianDurableState, retry_at_ms: Option<i64>) {
+    let Some(retry_at_ms) = retry_at_ms else {
+        record_chain_outage(state, None);
+        return;
+    };
+    let outage = format!(
+        "chain_exhausted runner_retry_at_ms={retry_at_ms} retry=backoff; serving retained context and reductions"
+    );
+    let detail = state.last_failure.take().unwrap_or_default();
+    state.last_failure = Some(format!("{detail}; {outage}"));
+    state.last_no_fire = Some(format!("{outage}; {detail}"));
+}
+
+fn abandon_runner_refusal(
     current: &HistorianDurableState,
     detail: String,
-    earliest_reset_ms: Option<i64>,
+    retry_at_ms: Option<i64>,
+    chain_exhausted: bool,
 ) -> HistorianDurableState {
     let mut next = abandon_with_detail(current, 0, Some(detail));
-    next.failure_backoff_at_ms = earliest_reset_ms;
-    if next
-        .last_failure
-        .as_deref()
-        .is_some_and(|detail| detail.contains("chain_exhausted"))
-    {
-        record_chain_outage(&mut next, earliest_reset_ms);
+    next.failure_backoff_at_ms = retry_at_ms;
+    if chain_exhausted {
+        record_runner_refusal_outage(&mut next, retry_at_ms);
     }
     next
 }
 
-fn persist_idle_model_unresolvable_detail(
+fn persist_idle_runner_refusal_detail(
     store: &McStore,
     session_id: &str,
     expected_firing_seq: Option<u64>,
     detail: String,
+    retry_at_ms: Option<i64>,
+    chain_exhausted: bool,
 ) -> Result<u64, HistorianStateError> {
     for attempt in 0..3 {
-        let loaded = store.load(session_id)?;
+        let loaded = store.load_meta(session_id)?;
         if loaded.meta.historian.state != HistorianPhase::Idle
             || expected_firing_seq
                 .is_some_and(|expected| loaded.meta.historian.firing_seq != expected)
@@ -1548,46 +1862,88 @@ fn persist_idle_model_unresolvable_detail(
         let mut meta = loaded.meta.clone();
         meta.historian.last_failure = Some(detail.clone());
         meta.historian.last_no_fire = None;
-        meta.historian.failure_backoff_at_ms = None;
-        match store.commit(session_id, loaded.row_version, &loaded.core, &meta) {
+        meta.historian.failure_backoff_at_ms = retry_at_ms;
+        if chain_exhausted {
+            record_runner_refusal_outage(&mut meta.historian, retry_at_ms);
+        }
+        match store.commit_meta(session_id, loaded.row_version, &meta) {
             Ok(row_version) => return Ok(row_version),
             Err(McStoreError::CasConflict { .. }) if attempt < 2 => continue,
             Err(error) => return Err(HistorianStateError::Store(error)),
         }
     }
-    unreachable!("the model-unresolvable CAS loop returns from every attempt")
+    unreachable!("the runner-refusal CAS loop returns from every attempt")
 }
 
 /// Provider tokenizers can count slightly above our estimator. A live historian
 /// request missed the provider wall by one token, so keep a 3% admission reserve.
 pub(crate) const PRODUCER_WINDOW_ESTIMATOR_MARGIN_PERCENT: usize = 3;
 
-pub(crate) fn producer_input_token_limit(
-    context_limit_tokens: Option<usize>,
-    max_output_tokens: u32,
-) -> Option<usize> {
-    let usable_input_tokens = context_limit_tokens?.saturating_sub(max_output_tokens as usize);
-    Some(usable_input_tokens.saturating_mul(100 - PRODUCER_WINDOW_ESTIMATOR_MARGIN_PERCENT) / 100)
+fn producer_output_reserve(window: usize, max_output_tokens: u32) -> usize {
+    (max_output_tokens as usize).min(window / 4)
 }
 
-pub(crate) fn producer_window_failure_reason(
+pub(crate) fn producer_input_token_limit_with_input(
+    context_limit_tokens: Option<usize>,
+    input_limit_tokens: Option<usize>,
+    max_output_tokens: u32,
+) -> Option<usize> {
+    let shared = context_limit_tokens
+        .map(|window| window.saturating_sub(producer_output_reserve(window, max_output_tokens)));
+    let usable = match (shared, input_limit_tokens) {
+        (Some(shared), Some(input)) => shared.min(input),
+        (Some(shared), None) => shared,
+        (None, Some(input)) => input,
+        (None, None) => return None,
+    };
+    let limit = usable.saturating_mul(100 - PRODUCER_WINDOW_ESTIMATOR_MARGIN_PERCENT) / 100;
+    (limit > 0).then_some(limit)
+}
+
+pub(crate) fn producer_window_failure_reason_with_input(
     producer_source_tokens: usize,
     context_limit_tokens: Option<usize>,
+    input_limit_tokens: Option<usize>,
     max_output_tokens: u32,
 ) -> Option<String> {
-    let context_limit_tokens = context_limit_tokens?;
     if producer_source_tokens == 0 {
         return None;
     }
-    let usable_input_tokens = context_limit_tokens.saturating_sub(max_output_tokens as usize);
-    let producer_input_limit_tokens =
-        producer_input_token_limit(Some(context_limit_tokens), max_output_tokens)?;
+    let shared = context_limit_tokens
+        .map(|window| window.saturating_sub(producer_output_reserve(window, max_output_tokens)));
+    let usable_input_tokens = shared
+        .unwrap_or(usize::MAX)
+        .min(input_limit_tokens.unwrap_or(usize::MAX));
+    let producer_input_limit_tokens = producer_input_token_limit_with_input(
+        context_limit_tokens,
+        input_limit_tokens,
+        max_output_tokens,
+    )?;
     if producer_source_tokens <= producer_input_limit_tokens {
         return None;
     }
     Some(format!(
-        "producer_source_exceeds_window producer_source_tokens={producer_source_tokens} usable_input_tokens={usable_input_tokens} producer_input_limit_tokens={producer_input_limit_tokens} context_limit_tokens={context_limit_tokens} max_output_tokens={max_output_tokens} estimator_margin=0.03"
+        "producer_source_exceeds_window producer_source_tokens={producer_source_tokens} usable_input_tokens={usable_input_tokens} producer_input_limit_tokens={producer_input_limit_tokens} context_limit_tokens={} max_output_tokens={max_output_tokens} estimator_margin=0.03",
+        context_limit_tokens.map_or("unknown".to_string(), |value| value.to_string())
     ))
+}
+
+/// Record a prompt refused before any producer run as a failure with the
+/// configured backoff. These refusals return before `fire` touches durable
+/// state, so without this the scheduler saw no failure and re-fired the same
+/// unfit prompt on every turn.
+fn record_admission_refusal(
+    request: &HistorianFireRequest<'_>,
+    reason: &str,
+) -> Result<(), HistorianDriveError> {
+    let loaded = request.store.load_meta(request.session_id)?;
+    let mut meta = loaded.meta.clone();
+    meta.historian.last_failure = Some(reason.to_string());
+    meta.historian.failure_backoff_at_ms = Some(request.failure_backoff_at_ms);
+    request
+        .store
+        .commit_meta(request.session_id, loaded.row_version, &meta)?;
+    Ok(())
 }
 
 pub async fn run_historian_firing<P>(
@@ -1603,7 +1959,7 @@ where
 pub(crate) async fn run_historian_firing_with_model_cache<P>(
     producer: &mut P,
     request: HistorianFireRequest<'_>,
-    model_unresolvable_cache: Option<&HistorianModelUnresolvableCache>,
+    runner_refusal_cache: Option<&HistorianRunnerRefusalCache>,
     model_chain_generation: u64,
 ) -> Result<HistorianDriveOutcome, HistorianDriveError>
 where
@@ -1612,22 +1968,27 @@ where
     if request.model_chain.is_empty() {
         return Err(HistorianDriveError::NoModels);
     }
-    if let Some(reason) = producer_window_failure_reason(
+    let primary_limits = request
+        .model_chain
+        .first()
+        .and_then(|model| request.model_limits.get(model));
+    let primary_input = primary_limits.and_then(|limits| limits.input);
+    let primary_context = if primary_input.is_some() {
+        primary_limits.and_then(|limits| limits.context)
+    } else {
+        request.historian_context_limit_tokens
+    };
+    if let Some(reason) = producer_window_failure_reason_with_input(
         request.producer_source_tokens,
-        request.historian_context_limit_tokens,
+        primary_context,
+        primary_input,
         request.max_output_tokens,
     ) {
-        let loaded = request.store.load(request.session_id)?;
-        let mut meta = loaded.meta.clone();
-        meta.historian.last_failure = Some(reason.clone());
-        meta.historian.failure_backoff_at_ms = Some(request.failure_backoff_at_ms);
-        request
-            .store
-            .commit(request.session_id, loaded.row_version, &loaded.core, &meta)?;
-        eprintln!(
+        tracing::warn!(
             "[mc-module][{}] historian oversize admission refused before spawn: {reason}",
             request.session_id
         );
+        record_admission_refusal(&request, &reason)?;
         return Err(HistorianDriveError::Producer(
             HistorianProducerError::context_overflow(reason),
         ));
@@ -1636,24 +1997,89 @@ where
     let mut auth_blocked_providers = Vec::new();
     let mut all_failures_permanent = true;
     let mut earliest_provider_reset_ms: Option<i64> = None;
-    let mut model_unresolvable_failures = Vec::new();
+    let mut earliest_runner_retry_ms: Option<i64> = None;
+    let initial_runner_backoff_ms = request
+        .failure_backoff_at_ms
+        .saturating_sub(request.now_ms)
+        .max(1);
+    let mut runner_refusal_failures = Vec::new();
     let mut prompt = request.prompt.to_string();
 
     for (index, model) in request.model_chain.iter().enumerate() {
         if provider_is_auth_blocked(&auth_blocked_providers, model) {
             continue;
         }
-        if let Some(reason) = model_unresolvable_cache
-            .and_then(|cache| cache.cached_reason(model_chain_generation, model))
+        if let Some(refusal) = runner_refusal_cache
+            .and_then(|cache| cache.cached_refusal(model_chain_generation, model, request.now_ms))
         {
-            model_unresolvable_failures.push((model.clone(), reason));
+            runner_refusal_failures.push((model.clone(), refusal));
             continue;
         }
         verify_chunk_fingerprint(
             request.chunk_fingerprint,
             request.observed_chunk_fingerprint,
         )?;
-        let loaded = request.store.load(request.session_id)?;
+        let seed = crate::decision_calibration::DecisionCalibration::for_model(Some(model));
+        let full_tokens = seed.provider_mass(
+            crate::decision_calibration::LocalMass {
+                system: mc_tokenizer::estimate_tokens(request.system.as_ref()) as f64,
+                prose: mc_tokenizer::estimate_tokens(&prompt) as f64,
+                tools: 0.0,
+            },
+            true,
+        );
+        let resolved = request.model_limits.get(model);
+        let legacy_window = if index == 0 {
+            request.historian_context_limit_tokens
+        } else {
+            request.fallback_context_limits.get(model).copied()
+        };
+        let current_window = resolved
+            .and_then(|limit| limit.context)
+            .or(legacy_window)
+            .or(request.historian_context_limit_tokens)
+            .map(|window| {
+                if resolved.and_then(|limit| limit.input).is_some() {
+                    window
+                } else {
+                    request
+                        .historian_context_limit_tokens
+                        .map_or(window, |cap| window.min(cap))
+                }
+            });
+        let output = resolved
+            .and_then(|limit| limit.output)
+            .unwrap_or(request.max_output_tokens);
+        let fit_limit = producer_input_token_limit_with_input(
+            current_window,
+            resolved.and_then(|limit| limit.input),
+            output,
+        );
+        if fit_limit.is_none() {
+            static UNKNOWN_WINDOWS: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashSet<String>>,
+            > = std::sync::OnceLock::new();
+            let seen = UNKNOWN_WINDOWS.get_or_init(Default::default);
+            if seen
+                .lock()
+                .expect("unknown window log mutex")
+                .insert(model.clone())
+            {
+                tracing::warn!("[mc-module] producer window unknown or inconsistent for {model}: sending unguarded");
+            }
+        }
+        if fit_limit.is_some_and(|limit| {
+            !full_tokens.is_finite() || full_tokens <= 0.0 || full_tokens > limit as f64
+        }) {
+            let reason = format!(
+                "producer_prompt_fit_refused model={model} calibrated_tokens={full_tokens} limit={fit_limit:?}"
+            );
+            record_admission_refusal(&request, &reason)?;
+            return Err(HistorianDriveError::Producer(
+                HistorianProducerError::context_overflow(reason),
+            ));
+        }
+        let loaded = request.store.load_meta(request.session_id)?;
         let mut recent_decision = request.recent_decision.clone();
         if let Some(decision) = recent_decision.as_mut() {
             decision.producer_model = Some(model.clone());
@@ -1669,14 +2095,11 @@ where
             request.now_ms,
             recent_decision,
         )? {
-            FireOutcome::Busy(state) => return Ok(HistorianDriveOutcome::Busy(state)),
+            FireOutcome::Busy(state) => return Ok(HistorianDriveOutcome::Busy(Box::new(state))),
             FireOutcome::Fired(state) => state,
         };
-        if !model_unresolvable_failures.is_empty() {
-            fired.last_failure = Some(model_unresolvable_detail(
-                &model_unresolvable_failures,
-                false,
-            ));
+        if !runner_refusal_failures.is_empty() {
+            fired.last_failure = Some(runner_refusal_detail(&runner_refusal_failures, false));
             fired.failure_backoff_at_ms = None;
         }
         persist_historian_state(request.store, request.session_id, fired.clone())?;
@@ -1696,32 +2119,59 @@ where
             )
             .await
         {
-            Ok(handle) => handle,
+            Ok(handle) => {
+                if let Some(cache) = runner_refusal_cache {
+                    cache.record_success(model);
+                }
+                handle
+            }
             Err(err) => {
-                if let Some(body) = err.model_unresolvable_open_body() {
-                    let reason = format!("{}: {}", body.code, body.message);
-                    model_unresolvable_failures.push((model.clone(), reason.clone()));
-                    if model_unresolvable_cache
-                        .is_some_and(|cache| cache.record(model_chain_generation, model, &reason))
-                    {
-                        eprintln!(
-                            "[mc-module] historian model unresolvable for generation {}: {model}: {reason}",
-                            model_chain_generation
+                if let Some(refusal) = err.runner_refusal() {
+                    let retry_at_ms = runner_refusal_cache
+                        .and_then(|cache| {
+                            cache.record_refusal(
+                                model_chain_generation,
+                                model,
+                                refusal.clone(),
+                                request.now_ms,
+                                initial_runner_backoff_ms,
+                            )
+                        })
+                        .or_else(|| {
+                            (!refusal.stage.is_durable()).then_some(request.failure_backoff_at_ms)
+                        });
+                    if let Some(retry_at_ms) = retry_at_ms {
+                        earliest_runner_retry_ms = Some(
+                            earliest_runner_retry_ms
+                                .map_or(retry_at_ms, |prior| prior.min(retry_at_ms)),
                         );
                     }
-                    let remaining = remaining_uncached_models(
+                    let entry = runner_refusal_entry(model, &refusal);
+                    runner_refusal_failures.push((model.clone(), refusal));
+                    tracing::debug!("[mc-module] {entry}");
+                    let remaining = remaining_available_models(
                         &request.model_chain[index + 1..],
-                        model_unresolvable_cache,
+                        runner_refusal_cache,
                         model_chain_generation,
+                        request.now_ms,
                     );
                     let exhausted = !has_eligible_model(&remaining, &auth_blocked_providers);
+                    let retry_at_ms = if exhausted {
+                        earliest_runner_retry_ms.or_else(|| {
+                            runner_refusal_cache
+                                .and_then(|cache| cache.earliest_retry_at_ms(request.model_chain))
+                        })
+                    } else {
+                        None
+                    };
                     persist_historian_state(
                         request.store,
                         request.session_id,
-                        abandon_model_unresolvable(
+                        abandon_runner_refusal(
                             &fired,
-                            model_unresolvable_detail(&model_unresolvable_failures, exhausted),
-                            earliest_provider_reset_ms,
+                            runner_refusal_detail(&runner_refusal_failures, exhausted),
+                            retry_at_ms,
+                            exhausted,
                         ),
                     )?;
                     producer.close().await;
@@ -1737,10 +2187,11 @@ where
                     request.failure_backoff_at_ms,
                     completed_at_ms,
                 );
-                let remaining = remaining_uncached_models(
+                let remaining = remaining_available_models(
                     &request.model_chain[index + 1..],
-                    model_unresolvable_cache,
+                    runner_refusal_cache,
                     model_chain_generation,
+                    completed_at_ms,
                 );
                 let mut decision = decide_producer_failure(
                     &err,
@@ -1770,8 +2221,8 @@ where
                         &err,
                         decision,
                         earliest_provider_reset_ms,
-                        Some(detail_with_model_unresolvable(
-                            &model_unresolvable_failures,
+                        Some(detail_with_runner_refusals(
+                            &runner_refusal_failures,
                             decision.detail_prefix,
                             format!("producer start ({model}): {err:?}"),
                         )),
@@ -1789,31 +2240,83 @@ where
             producer_started(&fired, producer_session_id.clone(), handle.run_id.clone())?;
         persist_historian_state(request.store, request.session_id, awaiting.clone())?;
 
-        let output = match producer.await_output(&handle.run_id).await {
+        let output = match producer
+            .await_output_with_timeout(&handle.run_id, request.await_timeout)
+            .await
+        {
             Ok(output) => output,
             Err(HistorianProducerError::TimedOut) => {
+                // A timed-out attempt moves on to the next model in the chain, the same
+                // rule as the TypeScript historian's outer model loop (a timed-out prompt
+                // is a failed attempt there and the fallback pass tries the next model).
+                // First re-drain this run once to salvage a result that finished just as
+                // the await gave up. If the re-drain reports the run's own terminal
+                // failure (a classified error, an abort, or a context overflow), that
+                // outcome decides the chain instead, so abort and overflow still stop it.
                 match producer.redrain_output(&handle.run_id).await {
                     Ok(output) => output,
                     Err(recovery_err) => {
                         let _ = producer.cancel(&handle.run_id).await;
-                        let detail = detail_with_model_unresolvable(
-                            &model_unresolvable_failures,
-                            None,
-                            format!(
-                                "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
-                            ),
-                        );
+                        let completed_at_ms = (request.completion_now_ms)();
                         let failure_backoff_at_ms = completion_failure_backoff_at_ms(
                             request.now_ms,
                             request.failure_backoff_at_ms,
-                            (request.completion_now_ms)(),
+                            completed_at_ms,
                         );
+                        let remaining = remaining_available_models(
+                            &request.model_chain[index + 1..],
+                            runner_refusal_cache,
+                            model_chain_generation,
+                            completed_at_ms,
+                        );
+                        let timed_out = HistorianProducerError::TimedOut;
+                        let deciding_err = if recovery_reports_run_outcome(&recovery_err) {
+                            &recovery_err
+                        } else {
+                            &timed_out
+                        };
+                        let mut decision = decide_producer_failure(
+                            deciding_err,
+                            model,
+                            &remaining,
+                            &mut auth_blocked_providers,
+                            &mut all_failures_permanent,
+                            completed_at_ms,
+                            failure_backoff_at_ms,
+                        );
+                        if let Some(reset) = deciding_err.provider_retry_at_ms(completed_at_ms) {
+                            earliest_provider_reset_ms = Some(
+                                earliest_provider_reset_ms.map_or(reset, |prior| prior.min(reset)),
+                            );
+                        }
+                        if !decision.try_next_model {
+                            if let Some(reset) =
+                                earliest_provider_reset_ms.filter(|reset| *reset > completed_at_ms)
+                            {
+                                decision.failure_backoff_at_ms = reset;
+                            }
+                        }
                         persist_historian_state(
                             request.store,
                             request.session_id,
-                            abandon_with_detail(&awaiting, failure_backoff_at_ms, Some(detail)),
+                            abandon_chain_failure(
+                                &awaiting,
+                                deciding_err,
+                                decision,
+                                earliest_provider_reset_ms,
+                                Some(detail_with_runner_refusals(
+                                    &runner_refusal_failures,
+                                    decision.detail_prefix,
+                                    format!(
+                                        "producer output ({model}): timed out; recovery re-drain also failed: {recovery_err}"
+                                    ),
+                                )),
+                            ),
                         )?;
                         producer.close().await;
+                        if decision.try_next_model {
+                            continue;
+                        }
                         return Err(HistorianDriveError::Producer(recovery_err));
                     }
                 }
@@ -1826,10 +2329,11 @@ where
                     request.failure_backoff_at_ms,
                     completed_at_ms,
                 );
-                let remaining = remaining_uncached_models(
+                let remaining = remaining_available_models(
                     &request.model_chain[index + 1..],
-                    model_unresolvable_cache,
+                    runner_refusal_cache,
                     model_chain_generation,
+                    completed_at_ms,
                 );
                 let mut decision = decide_producer_failure(
                     &err,
@@ -1859,8 +2363,8 @@ where
                         &err,
                         decision,
                         earliest_provider_reset_ms,
-                        Some(detail_with_model_unresolvable(
-                            &model_unresolvable_failures,
+                        Some(detail_with_runner_refusals(
+                            &runner_refusal_failures,
                             decision.detail_prefix,
                             format!("producer output ({model}): {err:?}"),
                         )),
@@ -1881,8 +2385,10 @@ where
             store: request.store,
             session_id: request.session_id,
             project_path: request.project_path,
+            harness: request.harness,
             awaiting,
             output: output.clone(),
+            max_output_tokens: Some(crate::historian_producer::HISTORIAN_MAX_OUTPUT_TOKENS),
             observed_chunk_fingerprint: request.observed_chunk_fingerprint,
             validation_chunk: request.validation_chunk,
             chunk_transcript: request.chunk_transcript,
@@ -1902,10 +2408,11 @@ where
             Err(HistorianDriveError::Validation(err)) => {
                 // Validation rejection is model-local output failure. Exhaust the
                 // configured fallback chain before returning the final rejection.
-                let remaining = remaining_uncached_models(
+                let remaining = remaining_available_models(
                     &request.model_chain[index + 1..],
-                    model_unresolvable_cache,
+                    runner_refusal_cache,
                     model_chain_generation,
+                    request.now_ms,
                 );
                 if has_eligible_model(&remaining, &auth_blocked_providers) {
                     prompt = crate::historian_prompt::build_historian_repair_prompt(
@@ -1920,17 +2427,19 @@ where
             }
             Err(err) => return Err(err),
         };
-        let row_version = if model_unresolvable_failures.is_empty() {
+        let row_version = if runner_refusal_failures.is_empty() {
             row_version
         } else {
-            persist_idle_model_unresolvable_detail(
+            persist_idle_runner_refusal_detail(
                 request.store,
                 request.session_id,
                 Some(fired.firing_seq),
                 format!(
-                    "{MODEL_UNRESOLVABLE_PUBLISHED_PREFIX}{}",
-                    model_unresolvable_detail(&model_unresolvable_failures, false)
+                    "{RUNNER_REFUSAL_PUBLISHED_PREFIX}{}",
+                    runner_refusal_detail(&runner_refusal_failures, false)
                 ),
+                None,
+                false,
             )?
         };
         return Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
@@ -1941,16 +2450,408 @@ where
         }));
     }
 
-    let detail = model_unresolvable_detail(&model_unresolvable_failures, true);
-    persist_idle_model_unresolvable_detail(
+    let detail = runner_refusal_detail(&runner_refusal_failures, true);
+    let retry_at_ms = earliest_runner_retry_ms.or_else(|| {
+        runner_refusal_cache.and_then(|cache| cache.earliest_retry_at_ms(request.model_chain))
+    });
+    persist_idle_runner_refusal_detail(
         request.store,
         request.session_id,
         None,
         detail.clone(),
+        retry_at_ms,
+        true,
     )?;
     Err(HistorianDriveError::Producer(HistorianProducerError::Subc(
-        ProducerErrorBody::untagged("model_unresolvable", detail),
+        ProducerErrorBody::untagged("runner_refusal_chain_exhausted", detail),
     )))
+}
+
+/// How often a claimant is expected to extend its lease, for the claim response.
+pub const HISTORIAN_HEARTBEAT_INTERVAL_MS: i64 = mc_store::HISTORIAN_HEARTBEAT_INTERVAL_MS;
+
+/// Run one firing with the completion done outside this module.
+///
+/// The shape mirrors the in-module path exactly up to the completion and exactly
+/// after it: the same admission checks, the same `fire`, the same validation and
+/// the same publish CAS. What differs is only the middle — instead of opening a
+/// route and driving a run, the assembled request is queued and this task waits
+/// for a claimant to report.
+///
+/// The model chain is passed through to the claimant rather than walked here.
+/// Fallback is the claimant's to do because only it knows which of those models
+/// it can actually reach; what comes back is one text or one failure, and the
+/// module's failure taxonomy treats that failure the same way it treats a
+/// producer error.
+pub async fn run_historian_firing_on_host(
+    ledger: &std::sync::Arc<crate::historian_host::HostRunLedger>,
+    request: HistorianFireRequest<'_>,
+    await_budget: Duration,
+) -> Result<HistorianDriveOutcome, HistorianDriveError> {
+    if request.model_chain.is_empty() {
+        return Err(HistorianDriveError::NoModels);
+    }
+    let primary_limits = request
+        .model_chain
+        .first()
+        .and_then(|model| request.model_limits.get(model));
+    let primary_input = primary_limits.and_then(|limits| limits.input);
+    let primary_context = if primary_input.is_some() {
+        primary_limits.and_then(|limits| limits.context)
+    } else {
+        request.historian_context_limit_tokens
+    };
+    if let Some(reason) = producer_window_failure_reason_with_input(
+        request.producer_source_tokens,
+        primary_context,
+        primary_input,
+        request.max_output_tokens,
+    ) {
+        let loaded = request.store.load_meta(request.session_id)?;
+        let mut meta = loaded.meta.clone();
+        meta.historian.last_failure = Some(reason.clone());
+        meta.historian.failure_backoff_at_ms = Some(request.failure_backoff_at_ms);
+        request
+            .store
+            .commit_meta(request.session_id, loaded.row_version, &meta)?;
+        eprintln!(
+            "[mc-module][{}] historian oversize admission refused before queueing: {reason}",
+            request.session_id
+        );
+        return Err(HistorianDriveError::Producer(
+            HistorianProducerError::context_overflow(reason),
+        ));
+    }
+
+    verify_chunk_fingerprint(
+        request.chunk_fingerprint,
+        request.observed_chunk_fingerprint,
+    )?;
+    let loaded = request.store.load_meta(request.session_id)?;
+    let mut recent_decision = request.recent_decision.clone();
+    if let Some(decision) = recent_decision.as_mut() {
+        // The claimant picks the model from the chain, so the decision record
+        // names the chain's head rather than claiming a model was used.
+        decision.producer_model = request.model_chain.first().cloned();
+    }
+    let fired = match fire(
+        &loaded.meta.historian,
+        request.from_ordinal,
+        request.to_ordinal,
+        request.chunk_fingerprint.to_string(),
+        request.selected_range_identities.clone(),
+        request.expected_revert_epoch,
+        request.compartment_set_generation,
+        request.now_ms,
+        recent_decision,
+    )? {
+        FireOutcome::Busy(state) => return Ok(HistorianDriveOutcome::Busy(Box::new(state))),
+        FireOutcome::Fired(state) => state,
+    };
+    persist_historian_state(request.store, request.session_id, fired.clone())?;
+
+    // The run id is the module's, minted at fire, and never the claimant's. Reusing
+    // the producer-session naming keeps one vocabulary for "this firing's run"
+    // across both runners.
+    let run_id =
+        historian_producer_session_id(request.project_slug, request.session_id, fired.firing_seq);
+    let registration = ledger.register(&run_id);
+    let queued = request
+        .store
+        .publish_pending_historian_run(&mc_store::NewHistorianPendingRun {
+            run_id: run_id.clone(),
+            session_id: request.session_id.to_string(),
+            project_path: request.project_path.to_string(),
+            firing_seq: fired.firing_seq,
+            chunk_fingerprint: request.chunk_fingerprint.to_string(),
+            system_prompt: request.system.as_ref().to_string(),
+            user_prompt: request.prompt.to_string(),
+            model_chain: request.model_chain.to_vec(),
+            await_budget_ms: await_budget.as_millis().min(i64::MAX as u128) as i64,
+            // The same per-attempt timeout the module's own lane would give each model,
+            // so the run is attempted alike whichever host claims it.
+            historian_timeout_ms: Some(
+                request.await_timeout.as_millis().min(i64::MAX as u128) as i64
+            ),
+            now_ms: request.now_ms,
+        });
+    if let Err(error) = queued {
+        let detail = format!("historian run could not be queued for a claimant: {error}");
+        persist_historian_state(
+            request.store,
+            request.session_id,
+            abandon_with_detail(&fired, request.failure_backoff_at_ms, Some(detail.clone())),
+        )?;
+        return Err(HistorianDriveError::Producer(
+            HistorianProducerError::retryable_model_failure(detail),
+        ));
+    }
+
+    let report = registration.wait(await_budget).await;
+    let _ = request.store.finish_historian_pending_run(&run_id);
+
+    let completed_at_ms = (request.completion_now_ms)();
+    let failure_backoff_at_ms = completion_failure_backoff_at_ms(
+        request.now_ms,
+        request.failure_backoff_at_ms,
+        completed_at_ms,
+    );
+    let output = match report {
+        Some(crate::historian_host::HostRunReport::Output(output)) => output,
+        Some(crate::historian_host::HostRunReport::Failed { code, message }) => {
+            abandon_current_state_with_detail(
+                request.store,
+                request.session_id,
+                failure_backoff_at_ms,
+                Some(format!("host runner reported {code}: {message}")),
+            )?;
+            return Err(HistorianDriveError::Producer(HistorianProducerError::Subc(
+                ProducerErrorBody::untagged(code, message),
+            )));
+        }
+        None => {
+            abandon_current_state_with_detail(
+                request.store,
+                request.session_id,
+                failure_backoff_at_ms,
+                Some(format!(
+                    "host runner produced no report for {run_id} within {}ms",
+                    await_budget.as_millis()
+                )),
+            )?;
+            return Err(HistorianDriveError::Producer(
+                HistorianProducerError::TimedOut,
+            ));
+        }
+    };
+
+    // Reload rather than reusing `fired`: the claim advanced the phase, the
+    // attempt and the token, and the publish predicate CASes on the attempt.
+    let claimed = request.store.load_meta(request.session_id)?.meta.historian;
+    if claimed.state != HistorianPhase::AwaitingProducer
+        || claimed.producer_run_id.as_deref() != Some(run_id.as_str())
+    {
+        return Err(HistorianDriveError::State(
+            HistorianStateError::InvalidTransition {
+                from: claimed.state.clone(),
+                event: "host_report",
+            },
+        ));
+    }
+
+    let row_version = publish_output_from_awaiting(PublishOutputRequest {
+        store: request.store,
+        session_id: request.session_id,
+        project_path: request.project_path,
+        harness: request.harness,
+        awaiting: claimed.clone(),
+        output,
+        max_output_tokens: None,
+        observed_chunk_fingerprint: request.observed_chunk_fingerprint,
+        validation_chunk: request.validation_chunk,
+        chunk_transcript: request.chunk_transcript,
+        raw_chunk_messages: request.raw_chunk_messages,
+        boundary_dates: request.boundary_dates,
+        prior_compartments: request.prior_compartments,
+        validate_options: request.validate_options,
+        created_at_ms: request.now_ms,
+        failure_started_at_ms: request.now_ms,
+        failure_backoff_at_ms: request.failure_backoff_at_ms,
+        completion_now_ms: request.completion_now_ms,
+        publication_fence: request.publication_fence,
+    })?;
+
+    Ok(HistorianDriveOutcome::Completed(HistorianRunSuccess {
+        row_version,
+        producer_session_id: run_id.clone(),
+        producer_run_id: run_id,
+        model: request
+            .model_chain
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "host".to_string()),
+    }))
+}
+
+/// What the restart path found when it met a run parked for a claimant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostRunAdoption {
+    /// This session has no queued run behind its phase, so it is not a host-lane
+    /// firing and the ordinary restart recovery applies.
+    NotParked,
+    /// A report the claimant left behind was validated and published, through the
+    /// same code an in-process report goes through.
+    Published(Box<HistorianRunSuccess>),
+    /// The claimant reported that the completion did not happen. The firing is
+    /// abandoned with that code, exactly as an in-process failure report abandons it.
+    Failed { run_id: String, code: String },
+    /// The run is still out with a claimant and has not outlived its deadline, so
+    /// the session keeps its single-flight slot and a later pass looks again.
+    /// `republished` is true when this pass put a run back on offer that a restart
+    /// had taken out of the queue.
+    StillOut {
+        run_id: String,
+        deadline_ms: i64,
+        republished: bool,
+    },
+    /// The run outlived its deadline with no report. It is released and the next
+    /// trigger may refire from a freshly assembled chunk.
+    Released { run_id: String },
+}
+
+/// Pick up a run that was queued for a claimant before this process started.
+///
+/// This is what makes host-side work survive a module restart. The claim queue is
+/// durable, so a run parked for a claimant is still there after a bounce and the
+/// claimant that holds it keeps heartbeating against the same row; what does NOT
+/// survive is the in-process firing task that would have received the report.
+/// Rather than release the run — which throws away a provider call that may
+/// already have been paid for — the parked run is kept and the next transform
+/// pass for its session looks here.
+///
+/// Publishing goes through `publish_output_from_awaiting`, the same function the
+/// in-process host report and the Broca lane both call, so a report that arrives
+/// across a restart is validated and CASed exactly like one that does not.
+///
+/// The session's slot is not held indefinitely: a parked run whose own deadline
+/// has passed is released here, which is the same bound the module applies to its
+/// own producer await.
+pub fn adopt_historian_run_on_host(
+    request: HistorianReattachRequest<'_>,
+) -> Result<HostRunAdoption, HistorianDriveError> {
+    let Some(parked) = request
+        .store
+        .load_parked_historian_run(request.session_id)?
+    else {
+        return Ok(HostRunAdoption::NotParked);
+    };
+    let run_id = parked.run_id.clone();
+    let release = |detail: String| -> Result<(), HistorianDriveError> {
+        abandon_current_state_with_detail(
+            request.store,
+            request.session_id,
+            request.failure_backoff_at_ms,
+            Some(detail),
+        )?;
+        let _ = request.store.finish_historian_pending_run(&run_id);
+        Ok(())
+    };
+
+    let report = match parked.report {
+        None if parked.deadline_ms <= request.now_ms => {
+            release(format!(
+                "host runner produced no report for {run_id} before its deadline"
+            ))?;
+            return Ok(HostRunAdoption::Released { run_id });
+        }
+        None => {
+            let republished = reoffer_parked_historian_run(request.store, &run_id, request.now_ms);
+            return Ok(HostRunAdoption::StillOut {
+                run_id,
+                deadline_ms: parked.deadline_ms,
+                republished,
+            });
+        }
+        Some(report) => report,
+    };
+
+    let output = match report {
+        mc_store::HistorianRunReport::Failed { code, message } => {
+            release(format!("host runner reported {code}: {message}"))?;
+            return Ok(HostRunAdoption::Failed { run_id, code });
+        }
+        mc_store::HistorianRunReport::Output {
+            text,
+            length_capped,
+        } => ProducerOutput {
+            text,
+            length_capped,
+            // The host report carries no token spend on this wire.
+            usage: None,
+        },
+    };
+
+    // The stored report is only publishable under the claim it was made for. The
+    // queue row stops being claimable the moment a report lands on it, so this is
+    // a guard against a state that moved on some other way (a refire, a publish
+    // that already happened) rather than against a racing claimant.
+    let awaiting = request.store.load_meta(request.session_id)?.meta.historian;
+    if awaiting.state != HistorianPhase::AwaitingProducer
+        || awaiting.producer_run_id.as_deref() != Some(run_id.as_str())
+        || awaiting.producer_attempt != parked.attempt
+    {
+        let _ = request.store.finish_historian_pending_run(&run_id);
+        return Ok(HostRunAdoption::Released { run_id });
+    }
+
+    let publish_result = publish_output_from_awaiting(PublishOutputRequest {
+        store: request.store,
+        session_id: request.session_id,
+        project_path: request.project_path,
+        harness: request.harness,
+        awaiting,
+        output,
+        max_output_tokens: None,
+        observed_chunk_fingerprint: request.observed_chunk_fingerprint,
+        validation_chunk: request.validation_chunk,
+        chunk_transcript: request.chunk_transcript,
+        raw_chunk_messages: request.raw_chunk_messages,
+        boundary_dates: request.boundary_dates,
+        prior_compartments: request.prior_compartments,
+        validate_options: request.validate_options,
+        created_at_ms: request.now_ms,
+        failure_started_at_ms: request.now_ms,
+        failure_backoff_at_ms: request.failure_backoff_at_ms,
+        completion_now_ms: request.completion_now_ms,
+        publication_fence: request.publication_fence,
+    });
+    // The queue row goes whether the publish landed or was refused: the report it
+    // carried has been spent either way, and leaving it would offer the same
+    // rejected document to the next pass forever.
+    let _ = request.store.finish_historian_pending_run(&run_id);
+    let row_version = publish_result?;
+    Ok(HostRunAdoption::Published(Box::new(HistorianRunSuccess {
+        row_version,
+        producer_session_id: run_id.clone(),
+        producer_run_id: run_id,
+        model: "host".to_string(),
+    })))
+}
+
+/// Put a run a restart took out of the queue back on offer.
+///
+/// Takes the row out and then puts it straight back, in that order. The park is
+/// what stops the run being offered while this process re-establishes the state
+/// behind it, and it is the same call the release path makes, so the phase the
+/// re-publication has to handle is written by a writer rather than assumed. It
+/// deliberately skips a row a claimant is still holding: that claimant is
+/// heartbeating against this row and paying for the completion right now, so
+/// taking its claim away would throw away a fold already in flight.
+///
+/// Re-offering the SAME row is what keeps the chunk this run already owns —
+/// minting a second run for the same range would pay to assemble it again and
+/// leave two runs racing for one publish slot.
+///
+/// It needs nothing but the run id, which is why the restart path can call it on
+/// the branch that returns before assembling a chunk. Returns whether the row is
+/// on offer because of this call.
+pub fn reoffer_parked_historian_run(store: &McStore, run_id: &str, now_ms: i64) -> bool {
+    let parked_here = store
+        .park_unclaimed_historian_run(run_id, now_ms)
+        .unwrap_or(false);
+    let republished = store
+        .republish_parked_historian_run(run_id, now_ms)
+        .unwrap_or(false);
+    debug_assert!(
+        !parked_here || republished,
+        "a row this pass parked must be the row this pass puts back"
+    );
+    if republished {
+        eprintln!(
+            "mc-module: historian run {run_id} put back on offer for a claimant after a restart"
+        );
+    }
+    republished
 }
 
 pub async fn reattach_historian_producer<P>(
@@ -1963,6 +2864,7 @@ where
     let action = handle_restart_load(
         request.store,
         request.session_id,
+        request.now_ms,
         request.failure_backoff_at_ms,
     )?;
     let RestartAction::ReattachProducer {
@@ -2010,9 +2912,12 @@ where
         }
     }
 
-    let loaded = request.store.load(request.session_id)?;
+    let loaded = request.store.load_meta(request.session_id)?;
     let awaiting = loaded.meta.historian.clone();
-    let output = match producer.await_output(&producer_run_id).await {
+    let output = match producer
+        .await_output_with_timeout(&producer_run_id, request.await_timeout)
+        .await
+    {
         Ok(output) => output,
         Err(err) => {
             let _ = producer.cancel(&producer_run_id).await;
@@ -2065,8 +2970,10 @@ where
         store: request.store,
         session_id: request.session_id,
         project_path: request.project_path,
+        harness: request.harness,
         awaiting,
         output,
+        max_output_tokens: None,
         observed_chunk_fingerprint: request.observed_chunk_fingerprint,
         validation_chunk: request.validation_chunk,
         chunk_transcript: request.chunk_transcript,
@@ -2094,8 +3001,10 @@ struct PublishOutputRequest<'a> {
     store: &'a McStore,
     session_id: &'a str,
     project_path: &'a str,
+    harness: &'a str,
     awaiting: HistorianDurableState,
     output: ProducerOutput,
+    max_output_tokens: Option<u32>,
     observed_chunk_fingerprint: &'a str,
     validation_chunk: &'a HistorianChunk,
     chunk_transcript: &'a str,
@@ -2117,8 +3026,10 @@ fn publish_output_from_awaiting(
         store,
         session_id,
         project_path,
+        harness,
         awaiting,
         output,
+        max_output_tokens,
         observed_chunk_fingerprint,
         validation_chunk,
         chunk_transcript,
@@ -2132,14 +3043,25 @@ fn publish_output_from_awaiting(
         completion_now_ms,
         publication_fence,
     } = request;
+    // The host report does not carry usage; omitted values must not look like zero spend.
+    let tokens = crate::historian_producer::producer_token_log(
+        output.usage,
+        max_output_tokens,
+        output.length_capped,
+    );
+    tracing::info!(
+        session_id,
+        response_chars = output.text.chars().count(),
+        tokens = %tokens,
+        "historian response received"
+    );
     let validating = output_received(&awaiting, &output.text)?;
     persist_historian_state(store, session_id, validating.clone())?;
 
     let validation_result = if output.length_capped {
         Err(HistorianValidationError {
             message:
-                "Historian output hit the length cap; refusing a potentially partial document."
-                    .to_string(),
+                format!("Historian output hit the length cap; refusing a potentially partial document. tokens={tokens}"),
         })
     } else {
         validate_historian_output(
@@ -2188,6 +3110,7 @@ fn publish_output_from_awaiting(
         ValidatedPublishRequest {
             session_id,
             project_path,
+            harness,
             expected_row_version: Some(publishing_row_version),
             expected_revert_epoch: publishing.expected_revert_epoch,
             predicate: &predicate,
@@ -2221,7 +3144,7 @@ fn abandon_current_state_with_detail(
     failure_backoff_at_ms: i64,
     detail: Option<String>,
 ) -> Result<(), HistorianStateError> {
-    let loaded = store.load(session_id)?;
+    let loaded = store.load_meta(session_id)?;
     persist_historian_state(
         store,
         session_id,
@@ -2305,7 +3228,7 @@ mod tests {
     use crate::transform::{transform, ProducerContext, TransformRequest};
 
     fn store(dir: &std::path::Path) -> McStore {
-        McStore::open(&StorageDescriptor {
+        McStore::open_for_test(&StorageDescriptor {
             module_id: "magic-context-test".to_string(),
             storage_namespace: "mc_cache".to_string(),
             isolation: Isolation::Module,
@@ -2352,6 +3275,7 @@ mod tests {
             session_id: "ses".to_string(),
             render_config: "cfg".to_string(),
             system_prompt_hash: String::new(),
+            adopted_system_prompt_hash: None,
             upgrade_state: String::new(),
             is_subagent: false,
             protected_tags: 20,
@@ -2390,6 +3314,9 @@ mod tests {
             detected_context_limit_model_key: None,
             history_budget_tokens: None,
             historian_model_chain: None,
+            historian_model_limits: Default::default(),
+            historian_timeout_ms: None,
+            historian_max_output_tokens: None,
             declared_trim: None,
             lineage_switched: false,
             descent_edge_id: 0,
@@ -2430,6 +3357,7 @@ mod tests {
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
             historian_active: false,
             wrapup_active: false,
+            caveman_english_word_rules: true,
             injected_reductions: Vec::new(),
         }
     }
@@ -2622,6 +3550,7 @@ mod tests {
         observed_prompts: Vec<String>,
         observed_temperatures: Vec<Option<f64>>,
         await_run_ids: Vec<String>,
+        observed_await_timeouts: Vec<Duration>,
         cancels: Vec<String>,
         closes: usize,
         on_await_output: Option<Box<dyn FnOnce() + Send>>,
@@ -2698,6 +3627,15 @@ mod tests {
                 .expect("scripted output result available")
         }
 
+        async fn await_output_with_timeout(
+            &mut self,
+            run_id: &str,
+            timeout: Duration,
+        ) -> Result<ProducerOutput, HistorianProducerError> {
+            self.observed_await_timeouts.push(timeout);
+            self.await_output(run_id).await
+        }
+
         async fn status(&mut self, _run_id: &str) -> Result<RunState, HistorianProducerError> {
             self.statuses
                 .pop_front()
@@ -2724,6 +3662,7 @@ mod tests {
         ProducerOutput {
             text,
             length_capped: false,
+            usage: None,
         }
     }
 
@@ -2765,6 +3704,10 @@ mod tests {
         assert_ne!(parent, historian_producer_session_id("proj", "84b85b9f", 3));
     }
 
+    /// The project the fixtures fire under, and the one a claimant has to present
+    /// to see the runs they queue.
+    const FIRE_PROJECT: &str = "git:proj";
+
     fn fire_request<'a>(
         store: &'a McStore,
         prompt: &'a str,
@@ -2780,15 +3723,22 @@ mod tests {
         HistorianFireRequest {
             store,
             session_id: "ses",
-            project_path: "git:proj",
+            project_path: FIRE_PROJECT,
+            harness: "opencode",
             project_slug: "proj",
             system: Cow::Borrowed("role guidance"),
             content_language: None,
             prompt,
             model_chain: models,
             temperature: None,
+            await_timeout: historian_await_timeout(None),
             producer_source_tokens: 1,
-            historian_context_limit_tokens: None,
+            historian_context_limit_tokens: Some(200_000),
+            model_limits: Default::default(),
+            fallback_context_limits: models
+                .iter()
+                .map(|model| (model.clone(), 200_000))
+                .collect(),
             max_output_tokens: 32_000,
             from_ordinal: 2,
             to_ordinal: 4,
@@ -2820,6 +3770,7 @@ mod tests {
             store,
             session_id: "ses",
             project_path: "git:proj",
+            harness: "opencode",
             observed_chunk_fingerprint: "fp",
             validation_chunk: chunk,
             chunk_transcript: "U: transcript",
@@ -2828,6 +3779,7 @@ mod tests {
             prior_compartments: prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
+            await_timeout: historian_await_timeout(None),
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
@@ -2847,6 +3799,9 @@ mod tests {
             selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("producer-session".into()),
             producer_run_id: Some("run-3".into()),
+            producer_attempt: 0,
+            coordinator_token: None,
+            claim_deadline_ms: None,
             fired_at_ms: Some(10),
             expected_revert_epoch: 0,
             compartment_set_generation: CompartmentSetGeneration::default(),
@@ -2856,6 +3811,42 @@ mod tests {
             recent_decisions: Vec::new(),
             consecutive_publish_failures: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn calibrated_full_prompt_refuses_before_producer_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["anthropic/claude-fable-5-1".to_string()];
+        let prompt = "word ".repeat(6000);
+        let mut request = fire_request(&store, &prompt, &models, &chunk, &prior);
+        request.historian_context_limit_tokens = Some(10_000);
+        request.max_output_tokens = 1000;
+        let configured_backoff = request.failure_backoff_at_ms;
+        let mut producer = ScriptedProducer::default();
+        assert!(run_historian_firing(&mut producer, request).await.is_err());
+        assert!(producer.observed_starts.is_empty());
+        let refused_state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(
+            refused_state.failure_backoff_at_ms,
+            Some(configured_backoff)
+        );
+        assert!(refused_state
+            .last_failure
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("producer_prompt_fit_refused")));
+        let mut missing = fire_request(&store, "small", &models, &chunk, &prior);
+        missing.historian_context_limit_tokens = None;
+        let mut missing_producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-unknown")))
+            .with_output(Ok(producer_output(historian_xml("unknown window"))));
+        assert!(run_historian_firing(&mut missing_producer, missing)
+            .await
+            .is_ok());
+        assert_eq!(missing_producer.observed_starts.len(), 1);
     }
 
     #[tokio::test]
@@ -2876,18 +3867,24 @@ mod tests {
         refused_request.producer_source_tokens = 20_000;
         refused_request.historian_context_limit_tokens = Some(11_000);
         refused_request.max_output_tokens = 1_000;
+        let configured_backoff = refused_request.failure_backoff_at_ms;
         let mut refused_producer = ScriptedProducer::default();
 
         assert!(run_historian_firing(&mut refused_producer, refused_request)
             .await
             .is_err());
         assert!(refused_producer.observed_starts.is_empty());
+        // A refused prompt is a failure the scheduler must back off on; without
+        // the durable record it re-fired the same prompt on every turn.
         let refused_state = refused_store.load("ses").unwrap().meta.historian;
-        assert_eq!(refused_state.failure_backoff_at_ms, Some(999));
         assert_eq!(
-            refused_state.last_failure.as_deref(),
-            Some("producer_source_exceeds_window producer_source_tokens=20000 usable_input_tokens=10000 producer_input_limit_tokens=9700 context_limit_tokens=11000 max_output_tokens=1000 estimator_margin=0.03")
+            refused_state.failure_backoff_at_ms,
+            Some(configured_backoff)
         );
+        assert!(refused_state
+            .last_failure
+            .as_deref()
+            .is_some_and(|failure| failure.starts_with("producer_source_exceeds_window")));
 
         let admitted_dir = tempfile::tempdir().unwrap();
         let admitted_store = store(admitted_dir.path());
@@ -2914,8 +3911,75 @@ mod tests {
         assert_eq!(admitted_producer.observed_starts.len(), 1);
 
         assert_eq!(
-            producer_window_failure_reason(10_000, Some(11_000), 1_000).as_deref(),
+            producer_window_failure_reason_with_input(10_000, Some(11_000), None, 1_000).as_deref(),
             Some("producer_source_exceeds_window producer_source_tokens=10000 usable_input_tokens=10000 producer_input_limit_tokens=9700 context_limit_tokens=11000 max_output_tokens=1000 estimator_margin=0.03")
+        );
+    }
+
+    #[test]
+    fn historian_input_cap_and_context_reserve_match_typescript_admission() {
+        let limits: HistorianModelLimits =
+            serde_json::from_str(r#"{"context":400000,"input":272000,"output":128000}"#).unwrap();
+        assert_eq!(limits.input, Some(272_000));
+        // Unconfigured output reserves at most a quarter of the shared window.
+        assert_eq!(
+            producer_input_token_limit_with_input(limits.context, limits.input, 128_000),
+            Some(263_840)
+        );
+        assert_eq!(
+            producer_input_token_limit_with_input(Some(400_000), None, 128_000),
+            Some(291_000)
+        );
+        assert_eq!(
+            producer_input_token_limit_with_input(Some(300_000), limits.input, 128_000),
+            Some(218_250)
+        );
+        assert_eq!(
+            producer_input_token_limit_with_input(None, limits.input, 128_000),
+            Some(263_840)
+        );
+    }
+
+    #[test]
+    fn historian_model_limits_wire_accepts_missing_input_and_ignores_extra_input_on_old_module() {
+        let old_plugin_limits: HistorianModelLimits =
+            serde_json::from_str(r#"{"context":400000,"output":128000}"#).unwrap();
+        assert_eq!(old_plugin_limits.input, None);
+        assert_eq!(
+            producer_input_token_limit_with_input(
+                old_plugin_limits.context,
+                old_plugin_limits.input,
+                128_000,
+            ),
+            Some(291_000)
+        );
+        #[derive(serde::Deserialize)]
+        struct OldModuleLimits {
+            context: usize,
+            output: u32,
+        }
+        let old_module: OldModuleLimits =
+            serde_json::from_str(r#"{"context":400000,"input":272000,"output":128000}"#).unwrap();
+        assert_eq!((old_module.context, old_module.output), (400_000, 128_000));
+    }
+
+    #[test]
+    fn small_producer_window_reserves_only_allowed_output_and_still_refuses_oversize() {
+        assert_eq!(
+            producer_input_token_limit_with_input(Some(32_000), None, 32_000),
+            Some(23_280)
+        );
+        assert!(
+            producer_window_failure_reason_with_input(1_000, Some(32_000), None, 32_000).is_none()
+        );
+        assert!(
+            producer_window_failure_reason_with_input(25_000, Some(32_000), None, 32_000)
+                .unwrap()
+                .contains("producer_input_limit_tokens=23280")
+        );
+        assert_eq!(
+            producer_input_token_limit_with_input(Some(0), None, 32_000),
+            None
         );
     }
 
@@ -3058,6 +4122,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallback_without_a_known_window_still_dispatches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".into(), "prov/model-b".into()];
+        let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+        request.fallback_context_limits.clear();
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::retryable_model_failure(
+                "primary failed",
+            )))
+            .with_start(Ok(run_handle("run-fallback-unknown")))
+            .with_output(Ok(producer_output(historian_xml(
+                "fallback with unknown window",
+            ))));
+        assert!(run_historian_firing(&mut producer, request).await.is_ok());
+        assert_eq!(producer.observed_starts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_its_resolved_window_and_output_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".into(), "prov/model-b".into()];
+        let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+        request.historian_context_limit_tokens = None;
+        request.fallback_context_limits.clear();
+        request.model_limits.insert(
+            models[1].clone(),
+            HistorianModelLimits {
+                context: Some(4),
+                input: None,
+                output: Some(4),
+            },
+        );
+        let mut producer = ScriptedProducer::default()
+            .with_start(Err(HistorianProducerError::retryable_model_failure(
+                "primary failed",
+            )))
+            .with_start(Ok(run_handle("unexpected-fallback")))
+            .with_output(Ok(producer_output(historian_xml("unexpected"))));
+        let error = run_historian_firing(&mut producer, request)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("producer_prompt_fit_refused model=prov/model-b"));
+        assert_eq!(producer.observed_starts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_fallback_window_dispatches_and_logs_once() {
+        struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = std::sync::Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || LogWriter(std::sync::Arc::clone(&writer)))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        for _ in 0..2 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            seed_prior_compartment(&store);
+            let chunk = historian_chunk();
+            let prior = prior_ranges();
+            let models = vec!["prov/model-a".into(), "prov/unknown-541".into()];
+            let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+            request.historian_context_limit_tokens = None;
+            request.fallback_context_limits.clear();
+            let mut producer = ScriptedProducer::default()
+                .with_start(Err(HistorianProducerError::retryable_model_failure(
+                    "primary failed",
+                )))
+                .with_start(Ok(run_handle("run-unknown")))
+                .with_output(Ok(producer_output(historian_xml("unknown window"))));
+            assert!(run_historian_firing(&mut producer, request).await.is_ok());
+            assert_eq!(producer.observed_starts.len(), 2);
+        }
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches(
+                "producer window unknown or inconsistent for prov/unknown-541: sending unguarded"
+            )
+            .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn fallback_retry_uses_new_session_and_overflow_short_circuits() {
         let dir = tempfile::tempdir().unwrap();
         let fallback_store = store(dir.path());
@@ -3139,28 +4305,35 @@ mod tests {
         assert_eq!(state.firing_seq, 1);
     }
 
-    fn live_model_unresolvable_open_error() -> HistorianProducerError {
+    fn live_credential_refusal() -> HistorianProducerError {
         HistorianProducerError::Subc(ProducerErrorBody::untagged(
             "open_failed",
             "open failed: run resolution failed: no apikey credential for provider 'opencode' (credential id 'apikey:opencode')",
         ))
     }
 
+    fn live_model_unknown_refusal() -> HistorianProducerError {
+        HistorianProducerError::Subc(ProducerErrorBody::untagged(
+            "open_failed",
+            "open failed: run resolution failed: unknown model 'model-a' for provider 'opencode'",
+        ))
+    }
+
     #[tokio::test]
-    async fn open_resolution_refusal_advances_and_records_skipped_model() {
+    async fn credential_refusal_advances_with_provenance_and_no_local_model_noun() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
         let models = vec!["opencode/model-a".to_string(), "google/model-b".to_string()];
-        let cache = HistorianModelUnresolvableCache::default();
+        let cache = HistorianRunnerRefusalCache::default();
         let generation = cache.activate_chain(&models);
         let mut producer = ScriptedProducer::default()
-            .with_start(Err(live_model_unresolvable_open_error()))
+            .with_start(Err(live_credential_refusal()))
             .with_start(Ok(run_handle("run-2")))
             .with_output(Ok(producer_output(historian_xml(
-                "fallback after unresolved primary",
+                "fallback after credential refusal",
             ))));
         let request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
 
@@ -3170,25 +4343,30 @@ mod tests {
                 .unwrap();
 
         let HistorianDriveOutcome::Completed(success) = outcome else {
-            panic!("expected unresolved primary to advance to fallback model");
+            panic!("expected credential-refused primary to advance to fallback model");
         };
         assert_eq!(success.model, "google/model-b");
         assert_eq!(producer.observed_starts.len(), 2);
         let state = store.load("ses").unwrap().meta.historian;
-        let detail = state.last_failure.expect("skipped model remains durable");
-        assert!(detail.contains("model_unresolvable:opencode/model-a"));
+        let detail = state
+            .last_failure
+            .expect("skipped runner refusal remains visible");
+        assert!(detail.contains(
+            "historian refusal stage=credential provider=opencode model=opencode/model-a"
+        ));
         assert!(detail.contains("no apikey credential for provider 'opencode'"));
+        assert!(!detail.contains("model_unresolvable"));
         assert_eq!(state.failure_backoff_at_ms, None);
     }
 
     #[tokio::test]
-    async fn transport_open_refusal_stays_on_primary_and_arms_backoff() {
+    async fn unmatched_open_refusal_is_resolution_stage_and_arms_backoff() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
-        let models = vec!["prov/model-a".to_string(), "other/model-b".to_string()];
+        let models = vec!["prov/model-a".to_string()];
         let mut producer = ScriptedProducer::default().with_start(Err(
             HistorianProducerError::Subc(ProducerErrorBody::untagged(
                 "open_failed",
@@ -3207,25 +4385,24 @@ mod tests {
         assert_eq!(producer.observed_starts.len(), 1);
         let state = store.load("ses").unwrap().meta.historian;
         assert_eq!(state.failure_backoff_at_ms, Some(999));
-        assert!(!state
-            .last_failure
-            .as_deref()
-            .unwrap_or_default()
-            .contains("model_unresolvable"));
+        let detail = state.last_failure.unwrap();
+        assert!(detail.contains("historian refusal stage=resolution"));
+        assert!(detail.contains("open failed: route closed before bind completed"));
+        assert!(!detail.contains("model_unresolvable"));
     }
 
     #[tokio::test]
-    async fn unresolved_chain_exhaustion_records_every_model_without_backoff() {
+    async fn runner_refusal_chain_exhaustion_lists_every_stage_and_transient_retry() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(dir.path());
         seed_prior_compartment(&store);
         let chunk = historian_chunk();
         let prior = prior_ranges();
         let models = vec!["opencode/model-a".to_string(), "google/model-b".to_string()];
-        let cache = HistorianModelUnresolvableCache::default();
+        let cache = HistorianRunnerRefusalCache::default();
         let generation = cache.activate_chain(&models);
         let mut producer = ScriptedProducer::default()
-            .with_start(Err(live_model_unresolvable_open_error()))
+            .with_start(Err(live_credential_refusal()))
             .with_start(Err(HistorianProducerError::Subc(
                 ProducerErrorBody::untagged(
                     "open_failed",
@@ -3243,16 +4420,20 @@ mod tests {
         assert_eq!(producer.observed_starts.len(), 2);
         let state = store.load("ses").unwrap().meta.historian;
         let detail = state.last_failure.expect("chain failure remains durable");
-        assert!(detail.starts_with(MODEL_UNRESOLVABLE_CHAIN_EXHAUSTED_PREFIX));
-        assert!(detail.contains("model_unresolvable:opencode/model-a"));
-        assert!(detail.contains("model_unresolvable:google/model-b"));
-        assert_eq!(state.failure_backoff_at_ms, None);
+        assert!(detail.starts_with(RUNNER_REFUSAL_CHAIN_EXHAUSTED_PREFIX));
+        assert!(detail.contains("stage=credential provider=opencode model=opencode/model-a"));
+        assert!(detail.contains("stage=model provider=google model=google/model-b"));
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        assert!(state
+            .last_no_fire
+            .as_deref()
+            .is_some_and(|value| value.contains("stage=credential")));
     }
 
     #[tokio::test]
-    async fn generation_cache_opens_unresolved_model_only_once_across_firings() {
+    async fn model_unknown_refusal_is_cached_until_the_chain_changes() {
         let models = vec!["opencode/model-a".to_string(), "google/model-b".to_string()];
-        let cache = HistorianModelUnresolvableCache::default();
+        let cache = HistorianRunnerRefusalCache::default();
         let generation = cache.activate_chain(&models);
 
         let dir_one = tempfile::tempdir().unwrap();
@@ -3261,7 +4442,7 @@ mod tests {
         let chunk_one = historian_chunk();
         let prior_one = prior_ranges();
         let mut first = ScriptedProducer::default()
-            .with_start(Err(live_model_unresolvable_open_error()))
+            .with_start(Err(live_model_unknown_refusal()))
             .with_start(Ok(run_handle("run-first-b")))
             .with_output(Ok(producer_output(historian_xml("first fallback"))));
         let first_request = fire_request(
@@ -3322,28 +4503,185 @@ mod tests {
             .last_failure
             .as_deref()
             .unwrap_or_default()
-            .contains("model_unresolvable:opencode/model-a"));
+            .contains("historian refusal stage=model provider=opencode model=opencode/model-a"));
+
+        let changed = vec!["opencode/model-a".to_string()];
+        let changed_generation = cache.activate_chain(&changed);
+        assert_ne!(changed_generation, generation);
+        assert!(cache
+            .cached_refusal(changed_generation, &changed[0], 123)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_refusal_retries_after_backoff_without_chain_change() {
+        let models = vec!["opencode/model-a".to_string()];
+        let cache = HistorianRunnerRefusalCache::default();
+        let generation = cache.activate_chain(&models);
+
+        let first_dir = tempfile::tempdir().unwrap();
+        let first_store = store(first_dir.path());
+        seed_prior_compartment(&first_store);
+        let first_chunk = historian_chunk();
+        let first_prior = prior_ranges();
+        let mut refusing = ScriptedProducer::default().with_start(Err(live_credential_refusal()));
+        run_historian_firing_with_model_cache(
+            &mut refusing,
+            fire_request(
+                &first_store,
+                "placeholder prompt",
+                &models,
+                &first_chunk,
+                &first_prior,
+            ),
+            Some(&cache),
+            generation,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refusing.observed_starts.len(), 1);
+
+        let early_dir = tempfile::tempdir().unwrap();
+        let early_store = store(early_dir.path());
+        seed_prior_compartment(&early_store);
+        let early_chunk = historian_chunk();
+        let early_prior = prior_ranges();
+        let mut early = ScriptedProducer::default();
+        let mut early_request = fire_request(
+            &early_store,
+            "placeholder prompt",
+            &models,
+            &early_chunk,
+            &early_prior,
+        );
+        early_request.now_ms = 998;
+        run_historian_firing_with_model_cache(&mut early, early_request, Some(&cache), generation)
+            .await
+            .unwrap_err();
+        assert!(early.observed_starts.is_empty());
+
+        let retry_dir = tempfile::tempdir().unwrap();
+        let retry_store = store(retry_dir.path());
+        seed_prior_compartment(&retry_store);
+        let retry_chunk = historian_chunk();
+        let retry_prior = prior_ranges();
+        let mut recovered = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-after-credential-add")))
+            .with_output(Ok(producer_output(historian_xml(
+                "credential became available",
+            ))));
+        let mut retry_request = fire_request(
+            &retry_store,
+            "placeholder prompt",
+            &models,
+            &retry_chunk,
+            &retry_prior,
+        );
+        retry_request.now_ms = 999;
+        let outcome = run_historian_firing_with_model_cache(
+            &mut recovered,
+            retry_request,
+            Some(&cache),
+            generation,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, HistorianDriveOutcome::Completed(_)));
+        assert_eq!(recovered.observed_starts.len(), 1);
+        assert_eq!(cache.activate_chain(&models), generation);
+        assert!(cache.cached_refusal(generation, &models[0], 999).is_none());
     }
 
     #[test]
-    fn model_unresolvable_cache_invalidates_when_chain_changes() {
-        let cache = HistorianModelUnresolvableCache::default();
-        let first_chain = vec!["opencode/model-a".to_string(), "google/model-b".to_string()];
-        let first_generation = cache.activate_chain(&first_chain);
-        assert!(cache.record(first_generation, &first_chain[0], "open_failed: unresolved"));
-        assert!(cache
-            .cached_reason(first_generation, &first_chain[0])
-            .is_some());
+    fn transient_runner_refusal_backoff_caps_at_ten_minutes() {
+        let models = vec!["opencode/model-a".to_string()];
+        let cache = HistorianRunnerRefusalCache::default();
+        let generation = cache.activate_chain(&models);
+        let refusal = live_credential_refusal()
+            .runner_refusal()
+            .expect("credential refusal");
+        let retries = (0..6)
+            .map(|_| {
+                cache
+                    .record_refusal(
+                        generation,
+                        &models[0],
+                        refusal.clone(),
+                        0,
+                        HISTORIAN_FAILURE_BACKOFF_MS,
+                    )
+                    .expect("transient refusal has retry")
+            })
+            .collect::<Vec<_>>();
 
-        let second_chain = vec!["anthropic/model-c".to_string()];
-        let second_generation = cache.activate_chain(&second_chain);
-        assert_ne!(second_generation, first_generation);
-        assert!(cache
-            .cached_reason(second_generation, &first_chain[0])
-            .is_none());
-        assert!(cache
-            .cached_reason(first_generation, &first_chain[0])
-            .is_none());
+        assert_eq!(
+            retries,
+            vec![60_000, 120_000, 240_000, 480_000, 600_000, 600_000]
+        );
+    }
+
+    #[test]
+    fn verbatim_credential_chain_renders_runner_provenance_without_local_model_noun() {
+        let samples = [
+            (
+                "google/antigravity-gemini-3.8-flash",
+                "open failed: run resolution failed: no apikey credential for provider 'google' (credential id 'apikey:google')",
+            ),
+            (
+                "minimax-coding-plan/MiniMax-M2.7-highspeed",
+                "open failed: run resolution failed: no apikey credential for provider 'minimax-coding-plan'",
+            ),
+            (
+                "minimax-coding-plan/MiniMax-M2.7",
+                "open failed: run resolution failed: no apikey credential for provider 'minimax-coding-plan'",
+            ),
+            (
+                "deepseek/deepseek-v4-pro",
+                "open failed: run resolution failed: no apikey credential for provider 'deepseek'",
+            ),
+        ];
+        let failures = samples
+            .iter()
+            .map(|(model, message)| {
+                let error = HistorianProducerError::Subc(ProducerErrorBody::untagged(
+                    "open_failed",
+                    *message,
+                ));
+                (
+                    (*model).to_string(),
+                    error.runner_refusal().expect("credential refusal"),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let detail = runner_refusal_detail(&failures, true);
+        assert_eq!(detail.matches("stage=credential").count(), 4);
+        for (_, message) in samples {
+            assert!(
+                detail.contains(message),
+                "received text was changed: {detail}"
+            );
+        }
+        assert!(!detail.contains("model_unresolvable"));
+    }
+
+    #[test]
+    fn runner_refusal_canonical_causes_discriminate_stages() {
+        assert_eq!(
+            [
+                RunnerRefusalStage::Credential,
+                RunnerRefusalStage::Provider,
+                RunnerRefusalStage::Model,
+                RunnerRefusalStage::Resolution,
+            ]
+            .map(RunnerRefusalStage::canonical_cause),
+            [
+                "credential_unavailable",
+                "provider_unknown",
+                "model_unknown",
+                "runner_resolution_failed",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3885,6 +5223,7 @@ mod tests {
             store: &store,
             session_id: left_lineage,
             project_path: "git:proj",
+            harness: "opencode",
             observed_chunk_fingerprint: "fp",
             validation_chunk: &chunk,
             chunk_transcript: "U: left transcript",
@@ -3893,6 +5232,7 @@ mod tests {
             prior_compartments: &prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
+            await_timeout: historian_await_timeout(None),
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
@@ -3902,6 +5242,7 @@ mod tests {
             store: &store,
             session_id: right_lineage,
             project_path: "git:proj",
+            harness: "opencode",
             observed_chunk_fingerprint: "fp",
             validation_chunk: &chunk,
             chunk_transcript: "U: right transcript",
@@ -3910,6 +5251,7 @@ mod tests {
             prior_compartments: &prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
+            await_timeout: historian_await_timeout(None),
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
@@ -4002,6 +5344,60 @@ mod tests {
         assert_eq!(c2.p1.as_deref(), Some("full replay summary"));
     }
 
+    /// A reattach after a module restart must wait the configured historian timeout,
+    /// resolved and clamped the same way as a fresh attempt, not the producer's 600 s
+    /// default.
+    #[tokio::test]
+    async fn reattach_awaits_with_the_configured_historian_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let fired = match fire(
+            &HistorianDurableState::default(),
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration {
+                max_sequence: 1,
+                count: 1,
+            },
+            1,
+            None,
+        )
+        .unwrap()
+        {
+            FireOutcome::Fired(state) => state,
+            FireOutcome::Busy(_) => unreachable!(),
+        };
+        let awaiting = producer_started(&fired, "producer-session".into(), "run-1".into()).unwrap();
+        store
+            .commit(
+                "ses",
+                None,
+                &CoreState::default(),
+                &test_meta_with_historian(awaiting),
+            )
+            .unwrap();
+        let mut producer = ScriptedProducer::default()
+            .with_status(Ok(RunState::Terminal))
+            .with_output(Ok(producer_output(historian_xml("reattached summary"))));
+        let configured = historian_await_timeout(Some(90_000));
+        assert_ne!(configured, historian_await_timeout(None));
+        let mut request = reattach_request(&store, &chunk, &prior);
+        request.await_timeout = configured;
+
+        let outcome = reattach_historian_producer(&mut producer, request)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, HistorianReattachOutcome::Published(_)));
+        assert_eq!(producer.observed_await_timeouts, vec![configured]);
+    }
+
     #[tokio::test]
     async fn reattach_missing_abandons_and_releases_single_flight() {
         let dir = tempfile::tempdir().unwrap();
@@ -4062,6 +5458,38 @@ mod tests {
             .unwrap(),
             FireOutcome::Fired(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn configured_historian_timeout_reaches_producer_await_and_completion_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let timeout = historian_await_timeout(Some(720_000));
+        let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+        request.await_timeout = timeout;
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Ok(producer_output(historian_xml("summary"))));
+        run_historian_firing(&mut producer, request).await.unwrap();
+        assert_eq!(
+            producer.observed_await_timeouts,
+            vec![Duration::from_secs(720)]
+        );
+        assert_eq!(completion_wait_budget(timeout), Duration::from_secs(780));
+        assert_eq!(historian_await_timeout(None), Duration::from_secs(600));
+        assert_eq!(
+            completion_wait_budget(historian_await_timeout(None)),
+            Duration::from_secs(660)
+        );
+        assert_eq!(historian_await_timeout(Some(0)), Duration::from_secs(60));
+        assert_eq!(
+            historian_await_timeout(Some(u64::MAX)),
+            Duration::from_secs(3600)
+        );
     }
 
     #[tokio::test]
@@ -4164,6 +5592,185 @@ mod tests {
                 && detail.contains("run-1 received terminal control unit"),
             "a replay terminal for another run id must not publish this firing: {detail}"
         );
+    }
+
+    #[tokio::test]
+    async fn producer_timeout_advances_to_next_model_and_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        let timeout = historian_await_timeout(Some(120_000));
+        let mut request = fire_request(&store, "placeholder prompt", &models, &chunk, &prior);
+        request.await_timeout = timeout;
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::TimedOut))
+            .with_output(Err(HistorianProducerError::TimedOut))
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Ok(producer_output(historian_xml("fallback after timeout"))));
+
+        let outcome = run_historian_firing(&mut producer, request).await.unwrap();
+        let HistorianDriveOutcome::Completed(success) = outcome else {
+            panic!("a timed-out primary must fall back and complete");
+        };
+        assert_eq!(success.model, "prov/model-b");
+        assert_eq!(
+            producer
+                .observed_starts
+                .iter()
+                .map(|(_, model)| model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["prov/model-a", "prov/model-b"]
+        );
+        assert_eq!(producer.await_run_ids, vec!["run-1", "run-1", "run-2"]);
+        assert_eq!(
+            producer.cancels,
+            vec!["run-1"],
+            "the timed-out run is cancelled"
+        );
+        // Each attempt keeps its own full per-attempt await budget.
+        assert_eq!(producer.observed_await_timeouts, vec![timeout, timeout]);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, None);
+        let published = store.load_compartments("ses").unwrap().pop().unwrap();
+        assert_eq!(published.p1.as_deref(), Some("fallback after timeout"));
+    }
+
+    #[tokio::test]
+    async fn producer_timeout_on_last_model_fails_with_timeout_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        seed_prior_compartment(&store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-1")))
+            .with_output(Err(HistorianProducerError::TimedOut))
+            .with_output(Err(HistorianProducerError::TimedOut))
+            .with_start(Ok(run_handle("run-2")))
+            .with_output(Err(HistorianProducerError::TimedOut))
+            .with_output(Err(HistorianProducerError::TimedOut));
+
+        let err = run_historian_firing(
+            &mut producer,
+            fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            HistorianDriveError::Producer(HistorianProducerError::TimedOut)
+        ));
+        assert_eq!(producer.observed_starts.len(), 2);
+        assert_eq!(producer.cancels, vec!["run-1", "run-2"]);
+        let state = store.load("ses").unwrap().meta.historian;
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert_eq!(state.failure_backoff_at_ms, Some(999));
+        let detail = state.last_failure.expect("failure detail recorded");
+        assert!(
+            detail.contains(
+                "producer output (prov/model-b): timed out; recovery re-drain also failed"
+            ),
+            "the exhausted chain records the last model's timeout: {detail}"
+        );
+        assert_eq!(store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn producer_timeout_abort_or_overflow_outcome_still_stops_chain() {
+        let cases: Vec<(&str, HistorianProducerError)> = vec![
+            (
+                "aborted re-drain",
+                HistorianProducerError::aborted("run aborted by host"),
+            ),
+            (
+                "untagged overflow re-drain",
+                HistorianProducerError::context_overflow("context window exceeded"),
+            ),
+            (
+                "tagged overflow re-drain",
+                HistorianProducerError::tagged_subc(
+                    "provider_error",
+                    "context window exceeded",
+                    ErrorClass::ContextOverflow,
+                    None,
+                ),
+            ),
+        ];
+        for (label, recovery_err) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            seed_prior_compartment(&store);
+            let chunk = historian_chunk();
+            let prior = prior_ranges();
+            let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+            let mut producer = ScriptedProducer::default()
+                .with_start(Ok(run_handle("run-1")))
+                .with_output(Err(HistorianProducerError::TimedOut))
+                .with_output(Err(recovery_err));
+
+            let err = run_historian_firing(
+                &mut producer,
+                fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, HistorianDriveError::Producer(_)), "{label}");
+            assert_eq!(producer.observed_starts.len(), 1, "{label} stops the chain");
+            assert_eq!(producer.cancels, vec!["run-1"], "{label}");
+        }
+
+        // An abort or overflow that ends the await directly (no timeout) also stops it.
+        for (label, output_err) in [
+            (
+                "aborted output",
+                HistorianProducerError::aborted("run aborted by host"),
+            ),
+            (
+                "overflow output",
+                HistorianProducerError::context_overflow("context window exceeded"),
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(dir.path());
+            seed_prior_compartment(&store);
+            let chunk = historian_chunk();
+            let prior = prior_ranges();
+            let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+            let mut producer = ScriptedProducer::default()
+                .with_start(Ok(run_handle("run-1")))
+                .with_output(Err(output_err));
+            let err = run_historian_firing(
+                &mut producer,
+                fire_request(&store, "placeholder prompt", &models, &chunk, &prior),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, HistorianDriveError::Producer(_)), "{label}");
+            assert_eq!(producer.observed_starts.len(), 1, "{label} stops the chain");
+        }
+    }
+
+    #[test]
+    fn firing_completion_budget_covers_every_attempt_in_the_chain() {
+        let timeout = historian_await_timeout(Some(720_000));
+        let one_attempt = completion_wait_budget(timeout);
+        // A two-model walk whose first attempt times out spends up to one full attempt
+        // budget on each model; the firing budget must cover both.
+        assert_eq!(
+            firing_completion_wait_budget(timeout, 2),
+            one_attempt * 2,
+            "a walk of two attempts must not be sized for one"
+        );
+        assert!(firing_completion_wait_budget(timeout, 2) > one_attempt);
+        assert_eq!(firing_completion_wait_budget(timeout, 1), one_attempt);
+        // An empty chain still gets one attempt's budget rather than zero.
+        assert_eq!(firing_completion_wait_budget(timeout, 0), one_attempt);
     }
 
     #[tokio::test]
@@ -4379,6 +5986,7 @@ mod tests {
             store: &store,
             session_id: "ses",
             project_path: "git:proj",
+            harness: "opencode",
             observed_chunk_fingerprint: "fp-changed",
             validation_chunk: &chunk,
             chunk_transcript: "U: transcript",
@@ -4387,6 +5995,7 @@ mod tests {
             prior_compartments: &prior,
             validate_options: validate_options(),
             publication_floor_ordinal: 4,
+            await_timeout: historian_await_timeout(None),
             now_ms: 123,
             failure_backoff_at_ms: 999,
             completion_now_ms: || 123,
@@ -4707,6 +6316,9 @@ mod tests {
             selected_range_identities: test_selected_range_identities(),
             producer_session_id: Some("ps".into()),
             producer_run_id: Some("run-1".into()),
+            producer_attempt: 0,
+            coordinator_token: None,
+            claim_deadline_ms: None,
             fired_at_ms: Some(1),
             expected_revert_epoch: 0,
             compartment_set_generation: CompartmentSetGeneration {
@@ -4734,6 +6346,7 @@ mod tests {
             ValidatedPublishRequest {
                 session_id: "ses",
                 project_path: "git:proj",
+                harness: "opencode",
                 expected_row_version: Some(rv),
                 expected_revert_epoch: 0,
                 predicate: &predicate,
@@ -4823,6 +6436,7 @@ mod tests {
                 ValidatedPublishRequest {
                     session_id,
                     project_path: "git:proj",
+                    harness: "opencode",
                     expected_row_version: Some(loaded),
                     expected_revert_epoch: 0,
                     predicate: &predicate,
@@ -4978,6 +6592,7 @@ mod tests {
             ValidatedPublishRequest {
                 session_id: "ses",
                 project_path: "git:proj",
+                harness: "opencode",
                 expected_row_version: loaded.row_version,
                 expected_revert_epoch: 0,
                 predicate: &predicate,
@@ -5067,6 +6682,7 @@ mod tests {
             ValidatedPublishRequest {
                 session_id: "ses",
                 project_path: "git:proj",
+                harness: "opencode",
                 expected_row_version: loaded.row_version,
                 expected_revert_epoch: 0,
                 predicate: &predicate,
@@ -5149,6 +6765,7 @@ mod tests {
             ValidatedPublishRequest {
                 session_id: "ses",
                 project_path: "git:proj",
+                harness: "opencode",
                 expected_row_version: fresh.row_version,
                 expected_revert_epoch: 0,
                 predicate: &predicate,
@@ -5270,7 +6887,7 @@ mod tests {
             .commit("ses", None, &CoreState::default(), &meta)
             .unwrap();
 
-        let action = handle_restart_load(&store, "ses", 500).unwrap();
+        let action = handle_restart_load(&store, "ses", 400, 500).unwrap();
         assert_eq!(
             action,
             RestartAction::ReattachProducer {
@@ -5299,6 +6916,7 @@ mod tests {
         let predicate = publish_predicate(&loaded.meta.historian).unwrap();
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: loaded.row_version,
                 expected_revert_epoch: 0,
@@ -5317,7 +6935,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            handle_restart_load(&store, "ses", 500).unwrap(),
+            handle_restart_load(&store, "ses", 400, 500).unwrap(),
             RestartAction::Done
         );
         assert_eq!(
@@ -5415,12 +7033,14 @@ mod tests {
         let predicate = HistorianPublishPredicate {
             firing_seq: 3,
             producer_run_id: "run-3".into(),
+            producer_attempt: 0,
             chunk_fingerprint: "tail-fp".into(),
             selected_range_identities,
             compartment_set_generation,
         };
         store
             .publish_historian_chunk(HistorianPublishRequest {
+                harness: None,
                 session_id: "ses",
                 expected_row_version: Some(row_version),
                 expected_revert_epoch: 0,
@@ -5455,5 +7075,609 @@ mod tests {
         assert_eq!(fire_decision.decision, HistorianDecision::Fired);
         assert!(fire_decision.completed_at_ms.is_some());
         assert_eq!(fire_decision.apply_row_version, loaded.row_version);
+    }
+
+    /// REPRODUCTION (pre-`Reclaiming`): after a claimant's lease expires there is no
+    /// transition that admits a second producer for the same run. `producer_started`
+    /// only runs from `Firing` and `fire` refuses every non-`Idle` phase, so the run
+    /// sits in `AwaitingProducer` until the 600s producer await gives up. Delete this
+    /// test when the reproduction is no longer interesting; the recovery it is missing
+    /// is asserted by `lease_expiry_then_reclaim_admits_a_second_producer`.
+    #[test]
+    fn pre_reclaim_lease_expiry_stalls_a_second_producer() {
+        let idle = HistorianDurableState::default();
+        let FireOutcome::Fired(fired) = fire(
+            &idle,
+            1,
+            4,
+            "fp-stall".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration::default(),
+            1_000,
+            None,
+        )
+        .unwrap() else {
+            panic!("a fresh idle state must fire");
+        };
+        let awaiting =
+            producer_started(&fired, "mc-historian:proj:a:1".into(), "run-1".into()).unwrap();
+        assert_eq!(awaiting.state, HistorianPhase::AwaitingProducer);
+
+        // The first claimant is gone and its lease has expired. A second claimant
+        // trying to take the same run over finds no way in.
+        let second_producer = producer_started(
+            &awaiting,
+            "mc-historian:proj:a:1".into(),
+            "run-1-again".into(),
+        );
+        let error = second_producer.expect_err("today's machine has no re-claim transition");
+        assert!(
+            matches!(
+                error,
+                HistorianStateError::InvalidTransition {
+                    from: HistorianPhase::AwaitingProducer,
+                    event: "producer_started"
+                }
+            ),
+            "expected a refused producer_started, got {error}"
+        );
+
+        // Refiring is refused too, so nothing releases the run before the await budget.
+        let refire = fire(
+            &awaiting,
+            1,
+            4,
+            "fp-stall".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration::default(),
+            2_000,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(refire, FireOutcome::Busy(_)),
+            "expected the refire to be refused as busy, got {refire:?}"
+        );
+        eprintln!(
+            "STALL REPRODUCED: phase={} producer_run_id={:?}; producer_started refused ({error}); refire=Busy",
+            awaiting.state.as_str(),
+            awaiting.producer_run_id
+        );
+    }
+
+    /// A fired run with one claimant in flight, for the re-claim transitions.
+    fn awaiting_a_claimant() -> HistorianDurableState {
+        let FireOutcome::Fired(fired) = fire(
+            &HistorianDurableState::default(),
+            1,
+            4,
+            "fp-reclaim".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration::default(),
+            1_000,
+            None,
+        )
+        .unwrap() else {
+            panic!("a fresh idle state must fire");
+        };
+        let queued = pending_published(&fired, "run-1".into()).unwrap();
+        assert_eq!(queued.state, HistorianPhase::Reclaiming);
+        reclaimed(&queued, 1, "token-one".into(), 61_000).unwrap()
+    }
+
+    #[test]
+    fn lease_expiry_then_reclaim_admits_a_second_producer() {
+        let first = awaiting_a_claimant();
+        assert_eq!(first.state, HistorianPhase::AwaitingProducer);
+        assert_eq!(first.producer_attempt, 1);
+        assert_eq!(first.coordinator_token.as_deref(), Some("token-one"));
+
+        let parked = lease_expired(&first).unwrap();
+        assert_eq!(parked.state, HistorianPhase::Reclaiming);
+        assert_eq!(
+            parked.coordinator_token, None,
+            "the departed claimant's token must stop being current"
+        );
+        assert_eq!(parked.claim_deadline_ms, None);
+        // What makes the re-claim cheap: the run, its chunk and its sequence survive.
+        assert_eq!(parked.producer_run_id.as_deref(), Some("run-1"));
+        assert_eq!(parked.chunk_fingerprint, "fp-reclaim");
+        assert_eq!(parked.firing_seq, first.firing_seq);
+        assert_eq!(
+            parked.selected_range_identities,
+            first.selected_range_identities
+        );
+
+        let second = reclaimed(&parked, 2, "token-two".into(), 121_000).unwrap();
+        assert_eq!(second.state, HistorianPhase::AwaitingProducer);
+        assert_eq!(second.producer_attempt, 2);
+        assert_eq!(second.coordinator_token.as_deref(), Some("token-two"));
+        assert_eq!(second.producer_run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn the_publish_predicate_names_the_attempt_not_just_the_run() {
+        let first = awaiting_a_claimant();
+        let second = reclaimed(&lease_expired(&first).unwrap(), 2, "token-two".into(), 2).unwrap();
+
+        let first_predicate = publish_predicate(&first).unwrap();
+        let second_predicate = publish_predicate(&second).unwrap();
+        assert_eq!(
+            first_predicate.producer_run_id,
+            second_predicate.producer_run_id
+        );
+        assert_eq!(first_predicate.producer_attempt, 1);
+        assert_eq!(second_predicate.producer_attempt, 2);
+        assert_ne!(
+            first_predicate, second_predicate,
+            "a superseded claimant must not satisfy the predicate the current one does"
+        );
+    }
+
+    #[test]
+    fn attempts_only_move_forward() {
+        let first = awaiting_a_claimant();
+        let parked = lease_expired(&first).unwrap();
+        for replayed in [0, 1] {
+            let error = reclaimed(&parked, replayed, "token-replay".into(), 2)
+                .expect_err("an attempt at or below the current one is not a new claim");
+            assert!(
+                matches!(
+                    error,
+                    HistorianStateError::InvalidTransition {
+                        event: "reclaimed",
+                        ..
+                    }
+                ),
+                "attempt {replayed}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reclaim_transitions_refuse_every_phase_they_do_not_belong_to() {
+        let first = awaiting_a_claimant();
+        // Re-claiming is only meaningful for a run with no claimant.
+        assert!(matches!(
+            reclaimed(&first, 2, "t".into(), 2),
+            Err(HistorianStateError::InvalidTransition {
+                from: HistorianPhase::AwaitingProducer,
+                event: "reclaimed"
+            })
+        ));
+        // A run already parked has no lease left to expire.
+        let parked = lease_expired(&first).unwrap();
+        assert!(matches!(
+            lease_expired(&parked),
+            Err(HistorianStateError::InvalidTransition {
+                from: HistorianPhase::Reclaiming,
+                event: "lease_expired"
+            })
+        ));
+        // The in-module producer lane keeps its own guard: it is not reachable
+        // from a parked run, and a second producer still cannot barge into an
+        // in-flight one.
+        assert!(matches!(
+            producer_started(&parked, "ps".into(), "run-2".into()),
+            Err(HistorianStateError::InvalidTransition {
+                from: HistorianPhase::Reclaiming,
+                event: "producer_started"
+            })
+        ));
+        assert!(matches!(
+            producer_started(&first, "ps".into(), "run-2".into()),
+            Err(HistorianStateError::InvalidTransition {
+                from: HistorianPhase::AwaitingProducer,
+                event: "producer_started"
+            })
+        ));
+    }
+
+    /// Stand in for a claimant: wait for the run to appear on the queue, take it,
+    /// and report `output` for it. Returns the attempt it was granted.
+    async fn claim_and_report(
+        store: &McStore,
+        ledger: &std::sync::Arc<crate::historian_host::HostRunLedger>,
+        output: &str,
+    ) -> u32 {
+        for _ in 0..200 {
+            let pending = store
+                .list_pending_historian_runs(FIRE_PROJECT, Some("ses"), 123)
+                .expect("the pending queue must be readable");
+            if let Some(run) = pending.first() {
+                let mc_store::HistorianClaimOutcome::Claimed(claim) = store
+                    .claim_historian_run(FIRE_PROJECT, &run.run_id, "install-uuid-one", 123)
+                    .expect("claiming must not fail")
+                else {
+                    panic!("the only claimant must win");
+                };
+                // The claim carries the queuing request's own per-attempt timeout, so
+                // the claimant times each model the way this module's lane would.
+                assert_eq!(
+                    claim.historian_timeout_ms,
+                    Some(historian_await_timeout(None).as_millis() as i64)
+                );
+                assert_eq!(
+                    store
+                        .authorize_historian_report(FIRE_PROJECT, &claim.run_id, &claim.token)
+                        .unwrap(),
+                    mc_store::HistorianReportOutcome::Authorized(
+                        mc_store::HistorianReportAuthorization {
+                            run_id: claim.run_id.clone(),
+                            session_id: "ses".to_string(),
+                            attempt: claim.attempt,
+                        }
+                    )
+                );
+                ledger
+                    .deliver(
+                        &claim.run_id,
+                        crate::historian_host::HostRunReport::Output(producer_output(
+                            output.to_string(),
+                        )),
+                    )
+                    .expect("the firing that queued the run is waiting for this");
+                return claim.attempt;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("the firing never queued a run for a claimant");
+    }
+
+    /// The publish-equivalence bar: one completion, two runners, same compartments.
+    ///
+    /// Feeding the SAME model output down both paths is what isolates the runner
+    /// from everything else. If the published rows differ, the difference came from
+    /// the seam rather than from the model.
+    #[tokio::test(flavor = "current_thread")]
+    async fn both_runners_publish_the_same_compartments_for_the_same_output() {
+        let output = historian_xml("one output, two runners");
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+
+        let broca_dir = tempfile::tempdir().unwrap();
+        let broca_store = store(broca_dir.path());
+        seed_prior_compartment(&broca_store);
+        let mut producer = ScriptedProducer::default()
+            .with_start(Ok(run_handle("run-broca")))
+            .with_output(Ok(producer_output(output.clone())));
+        let broca_outcome = run_historian_firing(
+            &mut producer,
+            fire_request(&broca_store, "prompt", &models, &chunk, &prior),
+        )
+        .await
+        .expect("the in-module runner publishes");
+        assert!(matches!(broca_outcome, HistorianDriveOutcome::Completed(_)));
+
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_store = store(host_dir.path());
+        seed_prior_compartment(&host_store);
+        let ledger = std::sync::Arc::new(crate::historian_host::HostRunLedger::new());
+        let request = fire_request(&host_store, "prompt", &models, &chunk, &prior);
+        let (host_outcome, attempt) = tokio::join!(
+            run_historian_firing_on_host(&ledger, request, Duration::from_secs(30)),
+            claim_and_report(&host_store, &ledger, &output),
+        );
+        let host_outcome = host_outcome.expect("the host runner publishes");
+        assert!(matches!(host_outcome, HistorianDriveOutcome::Completed(_)));
+        assert_eq!(attempt, 1, "the first claimant gets attempt 1");
+
+        let broca_compartments = broca_store.load_compartments("ses").unwrap();
+        let host_compartments = host_store.load_compartments("ses").unwrap();
+        assert_eq!(broca_compartments, host_compartments);
+        assert_eq!(broca_compartments.len(), 2, "prior plus the published fold");
+
+        // Both runners land back on Idle with the queue emptied.
+        assert_eq!(
+            host_store.historian_state("ses").unwrap().state,
+            HistorianPhase::Idle
+        );
+        assert!(host_store
+            .list_pending_historian_runs(FIRE_PROJECT, None, 123)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_run_nobody_claims_is_released_rather_than_left_in_flight() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_store = store(host_dir.path());
+        seed_prior_compartment(&host_store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let models = vec!["prov/model-a".to_string()];
+        let ledger = std::sync::Arc::new(crate::historian_host::HostRunLedger::new());
+
+        let error = run_historian_firing_on_host(
+            &ledger,
+            fire_request(&host_store, "prompt", &models, &chunk, &prior),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a run nobody reports on cannot publish");
+        assert!(
+            matches!(
+                error,
+                HistorianDriveError::Producer(HistorianProducerError::TimedOut)
+            ),
+            "{error}"
+        );
+
+        // The session is released for the next trigger rather than holding its
+        // single-flight slot, and the queue does not keep offering a run the module
+        // has stopped waiting for.
+        let state = host_store.historian_state("ses").unwrap();
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert!(state
+            .last_failure
+            .as_deref()
+            .is_some_and(|detail| detail.contains("no report")));
+        assert!(host_store
+            .list_pending_historian_runs(FIRE_PROJECT, None, 123)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Put the store in the state a module restart leaves behind: a run queued and
+    /// claimed, with no firing task in this process waiting for its report.
+    ///
+    /// Built from the same `fire` → queue → claim steps the live path takes, and
+    /// deliberately without a firing task: a task that ENDS cleans its own run out
+    /// of the queue, which is the opposite of the case under test.
+    fn claim_a_run_with_no_firing_task(host_store: &McStore) -> (String, String) {
+        seed_test_selected_range_identities(host_store);
+        let compartment_set_generation = host_store
+            .load_historian_assembly_snapshot("ses")
+            .unwrap()
+            .compartment_set_generation;
+        let loaded = host_store.load("ses").unwrap();
+        let FireOutcome::Fired(fired) = fire(
+            &loaded.meta.historian,
+            2,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            compartment_set_generation,
+            123,
+            None,
+        )
+        .expect("an idle session fires") else {
+            panic!("an idle session must fire");
+        };
+        persist_historian_state(host_store, "ses", fired.clone()).unwrap();
+        let run_id = historian_producer_session_id("proj", "ses", fired.firing_seq);
+        host_store
+            .publish_pending_historian_run(&mc_store::NewHistorianPendingRun {
+                run_id: run_id.clone(),
+                session_id: "ses".to_string(),
+                project_path: "git:proj".to_string(),
+                firing_seq: fired.firing_seq,
+                chunk_fingerprint: "fp".to_string(),
+                system_prompt: "role guidance".to_string(),
+                user_prompt: "prompt".to_string(),
+                model_chain: vec!["prov/model-a".to_string()],
+                await_budget_ms: 600_000,
+                historian_timeout_ms: None,
+                now_ms: 123,
+            })
+            .unwrap();
+        let mc_store::HistorianClaimOutcome::Claimed(claim) = host_store
+            .claim_historian_run(FIRE_PROJECT, &run_id, "install-uuid-one", 123)
+            .expect("claiming must not fail")
+        else {
+            panic!("the only claimant must win");
+        };
+        (claim.run_id, claim.token)
+    }
+
+    /// The restart decision, end to end: a report that arrives with no firing task
+    /// waiting for it is stored, and the next pass publishes it through the SAME
+    /// `publish_output_from_awaiting` an in-process report goes through.
+    #[test]
+    fn a_report_left_across_a_restart_is_published_by_the_next_pass() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_store = store(host_dir.path());
+        seed_prior_compartment(&host_store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let output = historian_xml("survived the bounce");
+
+        let (run_id, token) = claim_a_run_with_no_firing_task(&host_store);
+        // The firing task is gone but the run is not: this is what the queue row is
+        // for. Re-queue it the way the module does after a restart — nothing to do,
+        // because the row and the session's phase both survived.
+        assert_eq!(
+            host_store.historian_state("ses").unwrap().state,
+            HistorianPhase::AwaitingProducer
+        );
+
+        assert_eq!(
+            host_store
+                .record_historian_report(
+                    FIRE_PROJECT,
+                    &run_id,
+                    &token,
+                    &mc_store::HistorianRunReport::Output {
+                        text: output.clone(),
+                        length_capped: false,
+                    },
+                    123,
+                )
+                .unwrap(),
+            mc_store::HistorianRecordOutcome::Recorded
+        );
+
+        let adoption = adopt_historian_run_on_host(reattach_request(&host_store, &chunk, &prior))
+            .expect("the stored report publishes");
+        assert!(
+            matches!(adoption, HostRunAdoption::Published(_)),
+            "{adoption:?}"
+        );
+        assert_eq!(
+            host_store.load_compartments("ses").unwrap().len(),
+            2,
+            "prior plus the fold the host paid for before the restart"
+        );
+        assert_eq!(
+            host_store.historian_state("ses").unwrap().state,
+            HistorianPhase::Idle
+        );
+        assert!(
+            host_store
+                .list_pending_historian_runs(FIRE_PROJECT, None, 123)
+                .unwrap()
+                .is_empty(),
+            "a published run leaves the queue"
+        );
+    }
+
+    #[test]
+    fn a_claimants_failure_left_across_a_restart_releases_the_run() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_store = store(host_dir.path());
+        seed_prior_compartment(&host_store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+
+        let (run_id, token) = claim_a_run_with_no_firing_task(&host_store);
+        host_store
+            .record_historian_report(
+                FIRE_PROJECT,
+                &run_id,
+                &token,
+                &mc_store::HistorianRunReport::Failed {
+                    code: "chain_exhausted".to_string(),
+                    message: "every configured model refused".to_string(),
+                },
+                123,
+            )
+            .unwrap();
+
+        let adoption = adopt_historian_run_on_host(reattach_request(&host_store, &chunk, &prior))
+            .expect("a stored failure is a terminal outcome, not an error");
+        assert!(
+            matches!(&adoption, HostRunAdoption::Failed { code, .. } if code == "chain_exhausted"),
+            "{adoption:?}"
+        );
+        let state = host_store.historian_state("ses").unwrap();
+        assert_eq!(state.state, HistorianPhase::Idle);
+        assert!(state
+            .last_failure
+            .as_deref()
+            .is_some_and(|detail| detail.contains("chain_exhausted")));
+        assert_eq!(host_store.load_compartments("ses").unwrap().len(), 1);
+    }
+
+    /// The other half of the boot decision: a run kept across a restart is kept
+    /// only while it can still be answered.
+    #[test]
+    fn a_run_still_out_with_a_claimant_is_kept_until_its_deadline_and_then_released() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_store = store(host_dir.path());
+        seed_prior_compartment(&host_store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+
+        let (run_id, _token) = claim_a_run_with_no_firing_task(&host_store);
+        let deadline_ms = host_store
+            .load_parked_historian_run("ses")
+            .unwrap()
+            .expect("the run is parked")
+            .deadline_ms;
+
+        let kept = adopt_historian_run_on_host(reattach_request(&host_store, &chunk, &prior))
+            .expect("a run still out is not an error");
+        assert_eq!(
+            kept,
+            HostRunAdoption::StillOut {
+                run_id: run_id.clone(),
+                deadline_ms,
+                // Already on offer under a live claim: nothing to put back.
+                republished: false,
+            }
+        );
+        assert_eq!(
+            host_store.historian_state("ses").unwrap().state,
+            HistorianPhase::AwaitingProducer,
+            "the session keeps the slot its claimant is still working on"
+        );
+
+        let mut past_deadline = reattach_request(&host_store, &chunk, &prior);
+        past_deadline.now_ms = deadline_ms + 1;
+        let released =
+            adopt_historian_run_on_host(past_deadline).expect("an expired run is released");
+        assert_eq!(released, HostRunAdoption::Released { run_id });
+        assert_eq!(
+            host_store.historian_state("ses").unwrap().state,
+            HistorianPhase::Idle
+        );
+        assert!(host_store
+            .list_pending_historian_runs(FIRE_PROJECT, None, 123)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_session_with_no_queued_run_is_left_to_the_ordinary_restart_recovery() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_store = store(host_dir.path());
+        seed_prior_compartment(&host_store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        assert_eq!(
+            adopt_historian_run_on_host(reattach_request(&host_store, &chunk, &prior)).unwrap(),
+            HostRunAdoption::NotParked
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_host_runner_refuses_an_empty_model_chain_like_the_in_module_one() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let host_store = store(host_dir.path());
+        seed_prior_compartment(&host_store);
+        let chunk = historian_chunk();
+        let prior = prior_ranges();
+        let ledger = std::sync::Arc::new(crate::historian_host::HostRunLedger::new());
+        let error = run_historian_firing_on_host(
+            &ledger,
+            fire_request(&host_store, "prompt", &[], &chunk, &prior),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("there is nothing to send an empty chain to");
+        assert!(matches!(error, HistorianDriveError::NoModels), "{error}");
+        assert_eq!(
+            host_store.historian_state("ses").unwrap().state,
+            HistorianPhase::Idle,
+            "a refusal before firing leaves the session untouched"
+        );
+    }
+
+    #[test]
+    fn the_in_module_producer_lane_carries_no_claim() {
+        let FireOutcome::Fired(fired) = fire(
+            &HistorianDurableState::default(),
+            1,
+            4,
+            "fp".into(),
+            test_selected_range_identities(),
+            0,
+            CompartmentSetGeneration::default(),
+            1_000,
+            None,
+        )
+        .unwrap() else {
+            panic!("a fresh idle state must fire");
+        };
+        let awaiting = producer_started(&fired, "ps".into(), "run-1".into()).unwrap();
+        assert_eq!(awaiting.producer_attempt, 0);
+        assert_eq!(awaiting.coordinator_token, None);
+        assert_eq!(awaiting.claim_deadline_ms, None);
+        assert_eq!(publish_predicate(&awaiting).unwrap().producer_attempt, 0);
     }
 }

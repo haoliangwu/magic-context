@@ -1,0 +1,10 @@
+[2026-09-28T18:00:00.000Z] [magic-context] storage-busy refusal stage=messages-transform acquisition=begin-immediate: SqliteAcquisitionBusyError: database is locked
+[2026-09-28T18:00:01.000Z] [magic-context][ses_busy] lkg_replay_served
+[2026-09-28T18:00:02.000Z] [magic-context][ses_busy] lkg_replay_served
+[2026-09-28T18:00:03.000Z] [magic-context][ses_pi] TRANSIENT STORAGE FAILURE sqlite_busy: LKG replay served 4 messages instead of raw 9
+[2026-09-28T18:00:04.000Z] [magic-context][ses_pi] TRANSIENT STORAGE FAILURE sqlite_busy: LKG replay served 4 messages instead of raw 9
+[2026-09-28T18:00:05.000Z] [magic-context][ses_pi] TRANSIENT STORAGE FAILURE sqlite_busy: LKG replay served 4 messages instead of raw 9
+[2026-09-28T18:00:06.000Z] [magic-context] slow write transaction: site=smart_note_commit held=1200.0ms
+[2026-09-28T18:00:07.000Z] [magic-context] slow write transaction: site=smart_note_commit held=5100.0ms
+[2026-09-28T18:00:08.000Z] [magic-context] slow write transaction: site=lease-guarded-write:dreamer held=5000.0ms
+[2026-09-28T18:00:09.000Z] [magic-context][ses_other] lkg_replay_served

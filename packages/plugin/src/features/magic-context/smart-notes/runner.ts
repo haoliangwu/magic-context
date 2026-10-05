@@ -11,6 +11,7 @@ import {
     markCompiledCheckFalse,
     markCompiledCheckLogicFailure,
     markCompiledCheckNetworkFailure,
+    markSmartNoteCompilationFailure,
 } from "./storage";
 import { parseSmartNoteManifest } from "./types";
 import { wakePlaneStatus } from "./wake-plane";
@@ -146,12 +147,27 @@ export async function runDueCompiledSmartNoteChecks(
                     expected,
                     leaseHeld,
                     write: () => {
-                        markCompiledCheckNetworkFailure(
-                            args.db,
-                            note.id,
-                            runFinishedAt,
-                            MAX_FAILURES_BEFORE_REAUTHOR,
-                        );
+                        if (result.persistent) {
+                            markSmartNoteCompilationFailure(
+                                args.db,
+                                note.id,
+                                runFinishedAt,
+                                MAX_FAILURES_BEFORE_REAUTHOR,
+                                result.error,
+                                true,
+                                undefined,
+                                result.retryAt,
+                                result.uncheckable,
+                            );
+                        } else {
+                            markCompiledCheckNetworkFailure(
+                                args.db,
+                                note.id,
+                                runFinishedAt,
+                                MAX_FAILURES_BEFORE_REAUTHOR,
+                                result.retryAt,
+                            );
+                        }
                     },
                 });
                 if (committed) networkFailed++;

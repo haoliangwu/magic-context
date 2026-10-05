@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createTestTempDirFromPath } from "./test-temp-dir";
 
 type LoggerScenarioResult = {
     exists: boolean;
@@ -30,6 +31,8 @@ type RotationScenarioResult = {
     files: string[];
 };
 
+type RetryScenarioResult = { content: string; failed: number };
+
 type HotPathScenarioResult = {
     statCalls: number;
 };
@@ -49,6 +52,16 @@ if (!root || !loggerModuleUrl || !scenario) {
 const logPath = path.join(root, "nested", "magic-context.log");
 process.env.MAGIC_CONTEXT_LOG_PATH = logPath;
 let statCalls = 0;
+if (scenario === "retry") {
+    let attempts = 0;
+    mock.module("node:fs", () => ({
+        ...fs,
+        appendFileSync: (...args) => {
+            if (attempts++ === 0) throw new Error("injected transient write failure");
+            return fs.appendFileSync(...args);
+        },
+    }));
+}
 if (scenario === "hot-path") {
     mock.module("node:fs", () => ({
         ...fs,
@@ -61,7 +74,28 @@ if (scenario === "hot-path") {
 
 const logger = await import(loggerModuleUrl);
 
-if (scenario === "rotation") {
+if (scenario === "retry") {
+    logger.log("first buffered line");
+    logger.log("second buffered line");
+    logger.flushLogger();
+    const failed = logger.getLoggerDiagnostics().swallowedWriteCount;
+    logger.log("third buffered line");
+    logger.flushLogger();
+    console.log(JSON.stringify({ content: fs.readFileSync(logPath, "utf8"), failed }));
+} else if (scenario === "oversized") {
+    logger.log("x".repeat(2_000_000));
+    logger.flushLogger();
+    console.log(JSON.stringify({ content: fs.readFileSync(logPath, "utf8"), failed: logger.getLoggerDiagnostics().swallowedWriteCount }));
+} else if (scenario === "bounded") {
+    const failedPath = path.join(root, "unwritable-target");
+    fs.mkdirSync(failedPath);
+    process.env.MAGIC_CONTEXT_LOG_PATH = failedPath;
+    for (let i = 0; i < 100; i++) logger.log("line-" + i + "-" + "x".repeat(20_000));
+    logger.flushLogger();
+    process.env.MAGIC_CONTEXT_LOG_PATH = logPath;
+    logger.flushLogger();
+    console.log(JSON.stringify({ content: fs.readFileSync(logPath, "utf8"), failed: logger.getLoggerDiagnostics().swallowedWriteCount }));
+} else if (scenario === "rotation") {
     const maxLogBytes = 32 * 1024 * 1024;
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
     fs.writeFileSync(logPath, Buffer.alloc(maxLogBytes, "o"));
@@ -144,11 +178,19 @@ afterEach(() => {
 });
 
 async function runLoggerScenario<T>(
-    scenario: "recovery" | "diagnostics" | "rotation" | "hot-path",
+    scenario:
+        | "recovery"
+        | "diagnostics"
+        | "rotation"
+        | "hot-path"
+        | "retry"
+        | "bounded"
+        | "oversized",
 ): Promise<T> {
-    const root = mkdtempSync(path.join(os.tmpdir(), "magic-context-logger-test-"));
+    const root = createTestTempDirFromPath(path.join(os.tmpdir(), "magic-context-logger-test-"));
     scenarioRoots.push(root);
     const child = Bun.spawn({
+        windowsHide: true,
         cmd: ["bun", "--eval", loggerScenario],
         cwd: import.meta.dir,
         env: {
@@ -171,6 +213,27 @@ async function runLoggerScenario<T>(
 }
 
 describe("logger", () => {
+    test("retries the whole buffered batch after a transient append failure", async () => {
+        const result = await runLoggerScenario<RetryScenarioResult>("retry");
+        expect(result.failed).toBe(1);
+        expect(result.content).toContain("first buffered line");
+        expect(result.content).toContain("second buffered line");
+        expect(result.content).toContain("third buffered line");
+    });
+    test("reports a single oversized line even if no payload remains buffered", async () => {
+        const result = await runLoggerScenario<RetryScenarioResult>("oversized");
+        expect(result.content).toMatch(/logger dropped 1 line: buffer exceeded/);
+        expect(Buffer.byteLength(result.content)).toBeLessThan(1000);
+    });
+
+    test("bounds failed batches and reports the number of discarded lines", async () => {
+        const result = await runLoggerScenario<RetryScenarioResult>("bounded");
+        expect(result.failed).toBeGreaterThan(0);
+        expect(Buffer.byteLength(result.content)).toBeLessThan(1_100_000);
+        expect(result.content).toMatch(/logger dropped \d+ lines: buffer exceeded/);
+        expect(result.content).toContain("line-99-");
+    });
+
     test("recreates a log directory removed while the process is running", async () => {
         const result = await runLoggerScenario<LoggerScenarioResult>("recovery");
 

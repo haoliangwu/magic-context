@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { parse as parseJsonc } from "comment-json";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import type { PromptIO, PromptSpinner, SelectOption } from "../lib/prompts";
 import {
     removePiSettingsPackage,
@@ -19,7 +19,7 @@ const originalPiDir = process.env.PI_CODING_AGENT_DIR;
 const originalConfigHome = process.env.XDG_CONFIG_HOME;
 
 function makeTempRoot(): string {
-    const path = mkdtempSync(join(tmpdir(), "mc-pi-setup-"));
+    const path = createTestTempDirFromPath(join(tmpdir(), "mc-pi-setup-"));
     tempRoots.push(path);
     return path;
 }
@@ -184,6 +184,45 @@ describe("setup-pi per-harness config", () => {
         expect(config.dreamer?.opencode?.model).toBe("legacy/dreamer");
         expect(config.dreamer?.tasks?.curate?.schedule).toBe("0 3 * * *");
         expect(config.dreamer).not.toHaveProperty("model");
+    });
+});
+
+describe("setup-pi keeps magic-context.jsonc comments", () => {
+    it("retains comments when rewriting Pi choices", () => {
+        const path = join(makeTempRoot(), "magic-context.jsonc");
+        writeFileSync(
+            path,
+            `{
+  // shared historian notes
+  "historian": {
+    // OpenCode keeps its own model
+    "opencode": { "model": "oc/historian" }
+  },
+  "embedding": { "provider": "local" } // local is fine
+}
+`,
+        );
+
+        writeMagicContextConfig(path, {
+            historianModel: "new/historian",
+            dreamerEnabled: false,
+            embedding: { provider: "local", model: "Xenova/all-MiniLM-L6-v2" },
+            modelRefToCanonical: (model) => model,
+        });
+
+        const text = readFileSync(path, "utf-8");
+        for (const comment of [
+            "// shared historian notes",
+            "// OpenCode keeps its own model",
+            "// local is fine",
+        ]) {
+            expect(text).toContain(comment);
+        }
+        const config = parseJsonc(text) as {
+            historian?: { opencode?: { model?: string }; pi?: { model?: string } };
+        };
+        expect(config.historian?.pi?.model).toBe("new/historian");
+        expect(config.historian?.opencode?.model).toBe("oc/historian");
     });
 });
 

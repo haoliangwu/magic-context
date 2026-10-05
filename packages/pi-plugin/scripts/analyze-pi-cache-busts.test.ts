@@ -248,6 +248,136 @@ describe("Pi cache-bust analyzer meter", () => {
 		]);
 		expect(rows[2].rewrittenTokens).toBe(173524);
 	});
+	test("skips a zero-usage pass as a baseline and busts the next real short read", () => {
+		const pass = (sequence: number, timestamp: number, cacheRead: number, input: number) => ({
+			ledger: {
+				version: 1 as const,
+				session_id: "usage-missing-baseline",
+				pass_ts: new Date(timestamp).toISOString(),
+				sequence,
+				message_count: 2,
+				sha256: String(sequence),
+				previous_sha256: sequence === 0 ? null : String(sequence - 1),
+				first_divergence_message_index: 0,
+				block_vector_start: 0,
+				block_vectors: ["user:text(1)"],
+			},
+			usage: {
+				timestamp,
+				createdAt: new Date(timestamp).toISOString(),
+				line: sequence,
+				ordinal: sequence,
+				messageId: String(sequence),
+				input,
+				cacheRead,
+				cacheWrite: 0,
+				total: input + cacheRead,
+			},
+			intervening: [],
+		});
+		const rows = __test.analyzeJoinedPasses(
+			[pass(0, 0, 20_000, 100), pass(1, 1_000, 0, 0), pass(2, 2_000, 100, 100)],
+			{
+				decisions: [
+					{
+						timestampMs: 2_000,
+						decision: "defer",
+						materialized: false,
+						materializeReason: null,
+						emergency: false,
+						droppedTokens: 0,
+						droppedCount: 0,
+						inputTokens: 100,
+						flush: false,
+						source: "fixture",
+					},
+				],
+			},
+		);
+
+		expect(rows[1]?.verdict).toBe("UNMETERED");
+		expect(rows[1]?.divergenceClass).toBe("usage_missing");
+		expect(rows[2]?.prevTotal).toBe(20_100);
+		expect(rows[2]?.verdict).toBe("BUST");
+		expect(rows[2]?.divergenceClass).toBe("unaccounted_defer_pass");
+	});
+
+	test("classifies a zero cache read with a large prior meter as a provider full miss", () => {
+		const passes = [
+			{
+				ledger: {
+					version: 1 as const,
+					session_id: "provider-full-miss",
+					pass_ts: new Date(0).toISOString(),
+					sequence: 0,
+					message_count: 2,
+					sha256: "previous",
+					previous_sha256: null,
+					first_divergence_message_index: 0,
+					block_vector_start: 0,
+					block_vectors: ["user:text(1)"],
+				},
+				usage: {
+					timestamp: 0,
+					createdAt: new Date(0).toISOString(),
+					line: 0,
+					ordinal: 0,
+					messageId: "previous",
+					input: 100,
+					cacheRead: 20_000,
+					cacheWrite: 0,
+					total: 20_100,
+				},
+				intervening: [],
+			},
+			{
+				ledger: {
+					version: 1 as const,
+					session_id: "provider-full-miss",
+					pass_ts: new Date(1_000).toISOString(),
+					sequence: 1,
+					message_count: 2,
+					sha256: "current",
+					previous_sha256: "previous",
+					first_divergence_message_index: 0,
+					block_vector_start: 0,
+					block_vectors: ["user:text(2)"],
+				},
+				usage: {
+					timestamp: 1_000,
+					createdAt: new Date(1_000).toISOString(),
+					line: 1,
+					ordinal: 1,
+					messageId: "current",
+					input: 100,
+					cacheRead: 0,
+					cacheWrite: 0,
+					total: 100,
+				},
+				intervening: [],
+			},
+		];
+
+		const rows = __test.analyzeJoinedPasses(passes, {
+			decisions: [
+				{
+					timestampMs: 1_000,
+					decision: "defer",
+					materialized: false,
+					materializeReason: null,
+					emergency: false,
+					droppedTokens: 0,
+					droppedCount: 0,
+					inputTokens: 100,
+					flush: false,
+					source: "fixture",
+				},
+			],
+		});
+
+		expect(rows[1]?.divergenceClass).toBe("provider_full_miss");
+	});
+
 	test("detector control reports a known post-compaction collapse as BUST at the seam", () => {
 		const sessionRoot = temporaryDirectory("pi-cache-positive-session-");
 		const storageDir = temporaryDirectory("pi-cache-positive-ledger-");

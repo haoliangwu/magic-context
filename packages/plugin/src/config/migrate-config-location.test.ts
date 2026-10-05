@@ -1,15 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import {
-    existsSync,
-    mkdirSync,
-    mkdtempSync,
-    readFileSync,
-    rmSync,
-    utimesSync,
-    writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../shared/test-temp-dir";
 import {
     type LegacyConfigSource,
     migrateConfigFile,
@@ -17,7 +10,7 @@ import {
 } from "./migrate-config-location";
 
 function tmp(): string {
-    return mkdtempSync(join(tmpdir(), "mc-cfgloc-"));
+    return createTestTempDirFromPath(join(tmpdir(), "mc-cfgloc-"));
 }
 
 function src(path: string, label = "legacy"): LegacyConfigSource {

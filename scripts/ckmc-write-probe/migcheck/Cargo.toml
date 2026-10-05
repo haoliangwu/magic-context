@@ -1,0 +1,23 @@
+# A throwaway probe, deliberately outside the repository's Cargo workspace. Build it from a copy
+# outside the repository so no Cargo.lock or target directory lands here; README.md has the
+# exact commands. rusqlite 0.32.1 with `bundled` pulls in libsqlite3-sys 0.30.1, the same
+# SQLite (3.46.0) that ck-mc links.
+[package]
+name = "migcheck"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde_json = "1"
+
+[features]
+# Compare numbers by their text and keep object key order, so `verify` can also report
+# whether a migrated body is byte-identical to a serde re-serialization.
+exact = ["serde_json/arbitrary_precision", "serde_json/preserve_order"]
+
+[profile.release]
+debug = false

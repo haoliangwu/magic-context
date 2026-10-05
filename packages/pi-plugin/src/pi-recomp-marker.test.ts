@@ -141,7 +141,7 @@ describe("recomp marker command wiring stays on the deferred path", () => {
 	// context that the background commands cannot guarantee (they run
 	// DETACHED, during a cache-stable pass). They must stage + defer so the pipeline's
 	// coverage-gated drain applies the marker on the next busting pass.
-	for (const name of ["ctx-recomp.ts", "ctx-session-upgrade.ts"]) {
+	for (const name of ["ctx-recomp.ts"]) {
 		it(`${name} stages the marker and never calls the eager apply path`, () => {
 			const src = readFileSync(join(import.meta.dir, "commands", name), "utf8");
 			const codeOnly = src

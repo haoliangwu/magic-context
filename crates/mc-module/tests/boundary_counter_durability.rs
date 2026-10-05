@@ -16,7 +16,7 @@ fn descriptor(path: &std::path::Path) -> StorageDescriptor {
 #[test]
 fn competing_module_passes_keep_one_increment_and_reopen_keeps_it() {
     let directory = tempfile::tempdir().unwrap();
-    let store = McStore::open(&descriptor(directory.path())).unwrap();
+    let store = McStore::open_for_test(&descriptor(directory.path())).unwrap();
     let session = "module-counter";
     let core = CoreState::default();
     let initial = ModuleMeta::default();
@@ -49,7 +49,7 @@ fn competing_module_passes_keep_one_increment_and_reopen_keeps_it() {
     );
 
     drop(store);
-    let reopened = McStore::open(&descriptor(directory.path())).unwrap();
+    let reopened = McStore::open_for_test(&descriptor(directory.path())).unwrap();
     assert_eq!(
         reopened
             .load(session)

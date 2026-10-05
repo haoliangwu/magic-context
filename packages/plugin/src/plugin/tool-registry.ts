@@ -17,13 +17,19 @@ import type { PromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
 import { createPromptSurfaceRuntime } from "../shared/prompt-surface-runtime";
 import type { Database } from "../shared/sqlite";
 import { createCtxExpandTools } from "../tools/ctx-expand";
-import { CTX_MEMORY_ACTIONS, createCtxMemoryTools } from "../tools/ctx-memory";
+import {
+    CTX_MEMORY_ACTIONS,
+    createCtxMemoryListTools,
+    createCtxMemoryTools,
+} from "../tools/ctx-memory";
 import { createCtxNoteTools } from "../tools/ctx-note";
 import { createCtxReduceTools } from "../tools/ctx-reduce";
 import { createCtxSearchTools } from "../tools/ctx-search";
+import { parameterDescriptionsFor } from "../tools/parameter-descriptions";
 import { ensureProjectRegisteredFromOpenCodeDirectory } from "./embedding-bootstrap";
 import { normalizeToolArgSchemas } from "./normalize-tool-arg-schemas";
 import type { RustToolBackends } from "./rust-tool-backends";
+import { guardSubagentTools } from "./subagent-tool-policy";
 import type { PluginContext } from "./types";
 
 /**
@@ -58,6 +64,8 @@ export function createToolRegistry(args: {
     rustToolBackends?: RustToolBackends;
     promptSurfaceRuntime?: PromptSurfaceRuntime;
     registrationPromptSurface?: PromptSurfaceConfig;
+    includeDreamerOnlyTools?: boolean;
+    internalChildSessions?: ReadonlySet<string>;
 }): Record<string, ToolDefinition> {
     const { ctx, pluginConfig, rustToolBackends } = args;
 
@@ -144,7 +152,7 @@ export function createToolRegistry(args: {
                       ),
                   rustToolBackends,
               })),
-        ...createCtxExpandTools({ db }),
+        ...createCtxExpandTools({ db, expandTools: pluginConfig.historian?.expand_tools }),
         ...createCtxNoteTools({
             db,
             dreamerEnabled: isDreamerRunnable(pluginConfig),
@@ -170,6 +178,14 @@ export function createToolRegistry(args: {
                   rustToolBackends,
               })
             : {}),
+        ...(memoryEnabled && args.includeDreamerOnlyTools
+            ? createCtxMemoryListTools({
+                  db,
+                  resolveProjectPath,
+                  ensureProjectRegistered: ensureProjectRegisteredFromOpenCodeDirectory,
+                  rustToolBackends,
+              })
+            : {}),
     };
 
     const promptSurfaceRuntime =
@@ -177,7 +193,7 @@ export function createToolRegistry(args: {
         createPromptSurfaceRuntime({
             harness: "opencode",
             directory: ctx.directory,
-            warn: (message) => console.warn(`[magic-context] config warning: ${message}`),
+            warn: (message) => log(`[magic-context] config warning: ${message}`),
         });
     // OpenCode materializes this map once per plugin process. Resolve only the
     // registration owner's default here: model/session routes cannot safely swap
@@ -186,13 +202,31 @@ export function createToolRegistry(args: {
         args.registrationPromptSurface ?? pluginConfig.prompt_surface,
     );
     const surfacedTools = Object.fromEntries(
-        Object.entries(allTools).map(([toolId, definition]) => [
-            toolId,
-            {
-                ...definition,
-                description: registration.descriptionFor(toolId, definition.description ?? ""),
-            },
-        ]),
+        Object.entries(allTools).map(([toolId, definition]) => {
+            const parameterDescriptions = parameterDescriptionsFor(toolId, registration.preset);
+            const argsWithPresetDescriptions = parameterDescriptions
+                ? Object.fromEntries(
+                      Object.entries(definition.args).map(([name, schema]) => [
+                          name,
+                          parameterDescriptions[name]
+                              ? (
+                                    schema as typeof schema & {
+                                        describe(description: string): typeof schema;
+                                    }
+                                ).describe(parameterDescriptions[name])
+                              : schema,
+                      ]),
+                  )
+                : definition.args;
+            return [
+                toolId,
+                {
+                    ...definition,
+                    args: argsWithPresetDescriptions,
+                    description: registration.descriptionFor(toolId, definition.description ?? ""),
+                },
+            ];
+        }),
     ) as Record<string, ToolDefinition>;
 
     // Patch arg schemas so property-level .describe() text survives JSON Schema serialization.
@@ -201,5 +235,9 @@ export function createToolRegistry(args: {
         normalizeToolArgSchemas(toolDefinition);
     }
 
-    return surfacedTools;
+    return guardSubagentTools(
+        surfacedTools,
+        db,
+        (id) => args.internalChildSessions?.has(id) === true,
+    );
 }

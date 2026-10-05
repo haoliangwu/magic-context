@@ -301,7 +301,6 @@ Recall works **across sessions** (a new session inherits everything) and **acros
 | `/ctx-flush` | Force all queued operations immediately, bypassing cache TTL |
 | `/ctx-recomp` | Rebuild compartments from raw history (accepts a `start-end` range). Use when stored state seems wrong |
 | `/ctx-wrapup [messages_to_keep]` | Compact older live history while keeping the newest N messages raw; queued compaction materializes on the next model message |
-| `/ctx-session-upgrade` | Upgrade this session to the latest history format: rebuild compartments and migrate project memories |
 | `/ctx-dream` | Run dreamer maintenance on demand: maintain memory, docs, smart notes, and user-profile review |
 | `/ctx-embed` | Embedding status, or start/pause history compartment embedding (`start` \| `pause`) |
 
@@ -369,10 +368,10 @@ Magic Context also writes to a few other locations:
 | Path | What | Persistence |
 |---|---|---|
 | `~/.local/share/cortexkit/magic-context/context.db` | SQLite database — tags, compartments, memories, all durable state (XDG-equivalent on Windows) | **Must persist.** Losing it loses your memory/history. |
-| `~/.local/share/cortexkit/magic-context/models/` | Local embedding model cache (~90 MB `Xenova/all-MiniLM-L6-v2` ONNX), downloaded on first use when local embeddings are enabled | Should persist, else re-downloaded each run. Not used when `memory.enabled: false` or an `openai_compatible`/`ollama` embedding backend is configured. |
+| `~/.local/share/cortexkit/magic-context/models/` | Local embedding model cache (~90 MB `Xenova/all-MiniLM-L6-v2` ONNX), downloaded on first use when local embeddings are enabled | Should persist, else re-downloaded each run. Not used when `embedding.provider` is `"off"` or an `openai_compatible`/`ollama` embedding backend is configured. (`memory.enabled: false` does not avoid it: session history is still embedded.) |
 | `$MAGIC_CONTEXT_LOG_PATH` (default: `${TMPDIR}/opencode/magic-context/magic-context.log`, `pi/` for Pi) | Diagnostic log. Set `MAGIC_CONTEXT_LOG_PATH` to redirect it (e.g. to a persistent path in a container). | Disposable. |
 
-**Sandboxed / ephemeral environments (Docker, CI, disposable containers):** mount the `~/.local/share/cortexkit/magic-context/` directory on a persistent volume so the database and model cache survive between runs. If only the model cache is ephemeral, the model is simply re-downloaded; if the database is ephemeral, memory and history don't accumulate. To avoid the ~90 MB model download entirely, set `memory.enabled: false` or point `embedding` at a remote `openai_compatible`/`ollama` backend.
+**Sandboxed / ephemeral environments (Docker, CI, disposable containers):** mount the `~/.local/share/cortexkit/magic-context/` directory on a persistent volume so the database and model cache survive between runs. If only the model cache is ephemeral, the model is simply re-downloaded; if the database is ephemeral, memory and history don't accumulate. To avoid the ~90 MB model download entirely, set `embedding.provider: "off"` or point `embedding` at a remote `openai_compatible`/`ollama` backend.
 
 ---
 
@@ -417,13 +416,35 @@ Run a single dry pass from the repository root; each new unaccounted bust window
 bun packages/plugin/scripts/cache-bust-sentinel.ts --once
 ```
 
-Omit `--once` for the built-in one-minute loop, or invoke `--once` from cron/launchd every 1–5 minutes. The template at `packages/plugin/scripts/launchd/com.cortexkit.magic-context.cache-bust-sentinel.plist` uses a five-minute cadence, deliberately has `RunAtLoad=false`, and is not installed automatically. Replace its `__BUN_PATH__`, `__REPO_ROOT__`, and `__LOG_DIR__` placeholders before loading it. A cron equivalent is:
+Omit `--once` for the built-in one-minute loop, or invoke `--once` from cron/launchd every 1–5 minutes. The template at `packages/plugin/scripts/launchd/com.cortexkit.magic-context.cache-bust-sentinel.plist` uses a five-minute cadence, enables `--send`, deliberately has `RunAtLoad=false`, and is not installed automatically. Replace its `__BUN_PATH__`, `__REPO_ROOT__`, and `__LOG_DIR__` placeholders before loading it. A cron equivalent is:
 
 ```cron
-*/5 * * * * cd /path/to/magic-context && /path/to/bun packages/plugin/scripts/cache-bust-sentinel.ts --once >> /path/to/cache-bust-sentinel.jsonl 2>> /path/to/cache-bust-sentinel.log
+*/5 * * * * cd /path/to/magic-context && /path/to/bun packages/plugin/scripts/cache-bust-sentinel.ts --once --send >> /path/to/cache-bust-sentinel.jsonl 2>> /path/to/cache-bust-sentinel.log
 ```
 
-`--send` switches from JSON-line dry-run output to the `prefrontal` module's `wake.event_record` subc operation. Do not enable it until that operation is deployed. Known dispositions (`accepted`, `unowned_session`, `dedup`, and `superseded`) are counted and logged; malformed replies fail the run. Use `--connection-file`, `--wake-module-id`, `--state-file`, `--db`, or `--rust-store` only when the corresponding runtime location is non-default.
+`--send` switches from JSON-line dry-run output to the `prefrontal-core` module's `agent.deliver` subc operation. It sends a high-urgency registry peer message to `agent_b613e5cf2ee55b8c` from the rendered name `mc-cache-bust-sentinel` by default; the request also stamps the sender as session `health-sentinel-mc` on harness `magic-context`. Use `--wake-agent-id` or `--wake-from-agent` to select another target or rendered sender name. Delivered and queued dispositions are counted as accepted, while a repeated committed order for the same delivery id is counted as deduplicated; sender refusals are counted without retrying the delivery id, and malformed replies or idempotency conflicts fail the run. Use `--connection-file`, `--wake-module-id`, `--wake-agent-id`, `--wake-from-agent`, `--state-file`, `--db`, or `--rust-store` only when the corresponding runtime location is non-default.
+
+### Transform latency sentinel
+
+`packages/plugin/scripts/transform-latency-sentinel.ts` monitors OpenCode and Pi Magic Context logs and the dated `ck-mc` module log read-only. Every invocation consumes at most 4 MiB of **new bytes per file**; inode/size watermarks handle rotation and incomplete trailing lines are retried. Its only persistent write is `transform-latency-sentinel-state.json` in the Magic Context storage directory. Per-session alerts cover a p90 above 5 seconds over ten passes within ten minutes, any pass above 12 seconds, transport/module/state-sync timeouts, Rust park transitions, refusals, and sustained module-time climbs over at least twenty passes. Repeats of the same kind require a 50% severity increase or six hours. Alerts carry session ID, peer-roster name (when available, otherwise `session_projects` project identity), pass p50/p90/max, module and plugin medians, and load average. `loadSampledAt` records when load was sampled: historical replay cannot reconstruct historical machine load.
+
+Dry run without delivery: `bun packages/plugin/scripts/transform-latency-sentinel.ts --once`. For historical investigation use `--replay --since 2026-09-28T17:00:00Z --until 2026-09-28T18:15:00Z`; replay reads in 4 MiB chunks without writing a watermark or sending alerts. `--send` delivers one high-urgency peer message per invocation using `agent.deliver`. The five-minute launchd template at `packages/plugin/scripts/launchd/com.cortexkit.magic-context.transform-latency-sentinel.plist` uses `--once --send` and `RunAtLoad=false`; like the other sentinels it is not installed automatically. Replace `__BUN_PATH__`, `__REPO_ROOT__`, and `__LOG_DIR__` with the bun executable, repository root and log directory before bootstrapping it as a LaunchAgent. Use `--opencode-log`, `--pi-log`, `--module-log`, `--db`, `--peer-db`, `--state-file`, and `--connection-file` for non-default locations.
+
+### Dreamer and historian failure sentinel
+
+`packages/plugin/scripts/subagent-failure-sentinel.ts` reads completed `subagent_invocations` from `context.db` with a read-only SQLite connection and a three-second busy timeout. It treats `failed` and `timed_out` as failures; `empty` and `aborted` are separate counts. It reports a previously unseen (subagent, task, normalised error) class over seven days, a task with at least eight runs and a failure share of at least 25% over 24 hours, or a class whose count doubled against the preceding 24 hours. Errors have volatile IDs, numbers, durations, and paths folded into stable classes. Each five-minute run scans at most 501 new and 5,001 recent history rows (including boundary probes); incomplete history suppresses rules whose full window cannot be assessed. Its only local write is the watermark/dedup file `subagent-failure-sentinel-state.json` in the Magic Context storage directory. The watermark resumes by `(ended_at, id)`; a wake is suppressed for six hours unless its class count grows by 50%. It logs run start and summary, including rows examined and whether the scan was bounded. One wake per run lists each rule, task, class, class count, failure share, example error, newest session ID, and empty/aborted counts.
+
+A dry run uses `bun packages/plugin/scripts/subagent-failure-sentinel.ts --once`; use `--db` and `--state-file` to select a fixture database and state file. Without `--once` it loops every minute. The launchd template `packages/plugin/scripts/launchd/com.cortexkit.magic-context.subagent-failure-sentinel.plist` runs every five minutes with `--once --send`, `RunAtLoad=false`, and separate JSONL/stdout and stderr logs. `--send` uses the same high-urgency `prefrontal-core` `agent.deliver` peer message to the Magic Context head as the cache-bust sentinel. To install and activate it on macOS, run **from the repository root** (this does not happen automatically):
+
+```sh
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/cortexkit"
+sed -e "s|__BUN_PATH__|$(command -v bun)|g" \
+    -e "s|__REPO_ROOT__|$(pwd -P)|g" \
+    -e "s|__LOG_DIR__|$HOME/Library/Logs/cortexkit|g" \
+    packages/plugin/scripts/launchd/com.cortexkit.magic-context.subagent-failure-sentinel.plist \
+    > "$HOME/Library/LaunchAgents/com.cortexkit.magic-context.subagent-failure-sentinel.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.cortexkit.magic-context.subagent-failure-sentinel.plist"
+```
 
 ---
 ## Q & A
@@ -442,7 +463,7 @@ Copy the exact key `pnpm` prints in the error (it contains the `tar.gz/<hash>` o
 
 ## Contributing
 
-Bug reports and pull requests are welcome. For larger changes, open an issue first to discuss the approach. Run `bun run format` before submitting; CI rejects unformatted code.
+Bug reports and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the approved-issue and harness-coverage rules before starting.
 
 ---
 

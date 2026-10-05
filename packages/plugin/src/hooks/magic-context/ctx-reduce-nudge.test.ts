@@ -432,12 +432,12 @@ describe("reminder rendering", () => {
 
         const sticky = buildChannel1Reminder("firm", 70_000, 16, undefined, true);
         expect(sticky).toContain(
-            "Reminder: 16 spent tool outputs (~70k tokens) are still reclaimable",
+            "Still unstamped: 16 spent tool outputs (~70k tokens). Stamp the ones you've used",
         );
         const escalation = buildChannel1Reminder("urgent", 80_000, 16, undefined, false);
-        expect(escalation).toContain("Housekeeping backlog: 16 spent tool outputs (~80k tokens)");
-        expect(escalation).toContain("a ctx_reduce pass is due");
-        expect(sticky).not.toContain("a ctx_reduce pass is due");
+        expect(escalation).toContain("16 spent tool outputs (~80k tokens) are still unstamped.");
+        expect(escalation).toContain("before your next tool call");
+        expect(sticky).not.toContain("before your next tool call");
     });
 });
 

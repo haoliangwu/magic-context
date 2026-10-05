@@ -1,13 +1,17 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
-import { ensureContextStoreUuid, installAuthorityManagedMarker } from "./context-authority";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import {
+    ensureContextStoreUuid,
+    installAuthorityManagedMarker,
+} from "./legacy-authority-fixture.test-support";
 import { runMigrations } from "./migrations";
 import { initializeDatabase } from "./storage-db";
 
@@ -160,7 +164,7 @@ describe("migration v71: authority guards use the durable state-table predicate 
 
     it("lets a second, raw connection write to a guarded table without 'no such function'", () => {
         // A file-backed DB so two independent connections can open the same schema.
-        const dir = mkdtempSync(join(tmpdir(), "mc-v71-"));
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-v71-"));
         tempDirs.push(dir);
         const dbPath = join(dir, "context.db");
 

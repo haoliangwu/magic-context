@@ -186,9 +186,14 @@ function readGlyph(codepoint: number): FontGlyph {
 // not map the rest of them, so their fixed patterns are explicit rather than a
 // random or character-seeded fallback.
 const cueMarkPatterns: Record<string, FontGlyph> = {
-    "→": { rows: [0, 0, 4, 14, 31, 14, 4, 0], width: 5, advance: 5 },
-    "←": { rows: [0, 0, 4, 31, 14, 31, 4, 0], width: 5, advance: 5 },
-    "⊘": { rows: [14, 17, 21, 27, 27, 21, 17, 14], width: 5, advance: 5 },
+    "→": { rows: [0, 4, 2, 31, 2, 4, 0, 0], width: 5, advance: 5 },
+    "←": { rows: [0, 4, 8, 31, 8, 4, 0, 0], width: 5, advance: 5 },
+    "⊘": { rows: [14, 17, 19, 21, 25, 17, 14, 0], width: 5, advance: 5 },
+    "∵": { rows: [0, 10, 0, 0, 4, 0, 0, 0], width: 5, advance: 5 },
+    "≺": { rows: [0, 2, 4, 8, 4, 2, 0, 0], width: 5, advance: 5 },
+    "≻": { rows: [0, 8, 4, 2, 4, 8, 0, 0], width: 5, advance: 5 },
+    "∅": { rows: [0, 2, 14, 22, 26, 28, 8, 0], width: 5, advance: 5 },
+    "∀": { rows: [17, 17, 17, 31, 10, 10, 4, 0], width: 5, advance: 5 },
     "•": { rows: [0, 0, 4, 14, 14, 4, 0, 0], width: 5, advance: 5 },
     "▰": { rows: [31, 31, 31, 31, 31, 31, 31, 31], width: 5, advance: 5 },
     "—": { rows: [0, 0, 0, 0, 31, 31, 0, 0], width: 5, advance: 5 },
@@ -202,7 +207,7 @@ const boxDrawingHorizontal = String.fromCodePoint(0x2500);
 glyphs[boxDrawingHorizontal] = readGlyph(0x2500);
 for (const [character, glyph] of Object.entries(cueMarkPatterns)) glyphs[character] = glyph;
 
-const requiredMarks = ["→", "←", "⊘", "•", "▰", "─", "—"];
+const requiredMarks = ["→", "←", "⊘", "∵", "≺", "≻", "∅", "∀", "•", "▰", "─", "—"];
 for (const character of requiredMarks) {
     if (!glyphs[character]) throw new Error(`generate-mural-font: missing required cue mark ${character}`);
 }

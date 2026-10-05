@@ -640,7 +640,7 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
                     config::read_config(&path, "project")
                 }
                 _ => {
-                    let path = config::resolve_user_config_path();
+                    let path = config::resolve_user_config_path(&config::config_home());
                     config::read_config(&path, "user")
                 }
             };
@@ -649,7 +649,7 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         "save_config" => {
             let a: SaveConfigArgs = parse_args(args)?;
             let path = match a.source.as_str() {
-                "user" => config::resolve_user_config_path(),
+                "user" => config::resolve_user_config_path(&config::config_home()),
                 _ => {
                     return Err(DispatchError::Command(
                         "Only user config editing is supported in V1".to_string(),
@@ -660,8 +660,13 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         }
         "get_project_configs" => {
             parse_args::<NoArgs>(args)?;
-            let db_path = state.db_path.lock().ok().and_then(|guard| guard.clone());
-            json(config::discover_project_configs_with_db(db_path.as_ref()))
+            let db_path = state.get_db_path().ok();
+            json(config::discover_project_configs_with_db(
+                db_path.as_ref(),
+                &crate::db::data_home(),
+                &config::config_home(),
+                &crate::db::opencode_overrides(),
+            ))
         }
         "save_project_config" => {
             let a: SaveProjectConfigArgs = parse_args(args)?;
@@ -672,18 +677,18 @@ pub async fn dispatch(state: &AppState, cmd: &str, args: Value) -> Result<Value,
         }
         "read_pi_config" => {
             parse_args::<NoArgs>(args)?;
-            let path = config::resolve_pi_config_path();
+            let path = config::resolve_pi_config_path(&config::config_home());
             json(config::read_config(&path, "pi"))
         }
         "write_pi_config" => {
             let a: ContentArgs = parse_args(args)?;
-            let path = config::resolve_pi_config_path();
+            let path = config::resolve_pi_config_path(&config::config_home());
             json(config::write_config(&path, &a.content).map_err(DispatchError::Command)?)
         }
         "pi_config_path" => {
             parse_args::<NoArgs>(args)?;
             json(
-                config::resolve_pi_config_path()
+                config::resolve_pi_config_path(&config::config_home())
                     .to_string_lossy()
                     .to_string(),
             )
@@ -800,13 +805,10 @@ fn to_command<E: ToString>(err: E) -> DispatchError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     fn state_without_db() -> AppState {
-        AppState {
-            db_path: Mutex::new(None),
-        }
+        AppState::with_resolver(|| None)
     }
 
     #[tokio::test]

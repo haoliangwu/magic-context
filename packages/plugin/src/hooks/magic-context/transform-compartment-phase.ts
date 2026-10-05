@@ -7,6 +7,7 @@ import type { ContextUsage } from "../../features/magic-context/types";
 import type { PluginContext } from "../../plugin/types";
 import { sessionLog } from "../../shared/logger";
 import type { ModelInput } from "../../shared/model-resolution";
+import { withoutSqliteTransformPass } from "../../shared/sqlite";
 import {
     type ActiveCompartmentRun,
     getActiveCompartmentRun,
@@ -30,6 +31,45 @@ import {
 import { primeTailRawMessageCache, withRawSessionMessageCache } from "./read-session-chunk";
 import { sendStatusNotification } from "./send-session-notification";
 import type { MessageLike } from "./transform-operations";
+
+/**
+ * A transform blocks the user's turn before provider dispatch, so it may join a historian for at
+ * most one minute. The historian keeps running after this foreground budget and can publish for a
+ * later pass; the provider-sized historian timeout must never become a silent TUI wait.
+ */
+export const HISTORIAN_INLINE_JOIN_BUDGET_MS = 60_000;
+
+export function resolveHistorianInlineJoinBudget(configuredTimeoutMs?: number): number {
+    const requested = configuredTimeoutMs ?? HISTORIAN_INLINE_JOIN_BUDGET_MS;
+    return Math.max(0, Math.min(requested, HISTORIAN_INLINE_JOIN_BUDGET_MS));
+}
+
+export function historianJoinFailClosedMessage(input: {
+    timedOut: boolean;
+    budgetMs: number | null;
+    finalWireEstimate?: { tokens: number; trusted: boolean };
+    contextLimitTokens: number;
+    lastHistorianError?: string | null;
+}): string | null {
+    if (!input.timedOut) return null;
+    const estimate = input.finalWireEstimate;
+    if (
+        estimate?.trusted === true &&
+        Number.isFinite(estimate.tokens) &&
+        estimate.tokens > 0 &&
+        Number.isFinite(input.contextLimitTokens) &&
+        input.contextLimitTokens > 0 &&
+        estimate.tokens < input.contextLimitTokens
+    ) {
+        return null;
+    }
+    const budgetMs = input.budgetMs ?? HISTORIAN_INLINE_JOIN_BUDGET_MS;
+    const seconds = budgetMs / 1000;
+    const reason =
+        input.lastHistorianError?.replace(/\s+/g, " ").trim() ||
+        "background historian is still running";
+    return `historian did not complete within ${seconds} s: ${reason}`;
+}
 
 interface RunCompartmentPhaseArgs {
     hiddenCompletionExecutor?: HiddenCompletionExecutor;
@@ -69,7 +109,7 @@ interface RunCompartmentPhaseArgs {
     /** True when this pass is already safe for background compression to run. */
     safeForBackgroundCompression?: boolean;
     deferredHistoryRefreshSessions: Set<string>;
-    /** True when transform already triggered recovery/emergency historian work this pass. */
+    /** Compatibility-only input retained for older callers; urgent pressure always joins before refusal. */
     skipAwaitForThisPass?: boolean;
     /** When true, extract user behavior observations from historian output */
     experimentalUserMemories?: boolean;
@@ -77,6 +117,7 @@ interface RunCompartmentPhaseArgs {
     experimentalTemporalAwareness?: boolean;
     /** When true, run a second editor pass after historian to clean U: lines. */
     historianTwoPass?: boolean;
+    historianExpandTools?: Record<string, string | false>;
     /** Cross-session memory feature gate (`memory.enabled`). Issue #44. */
     memoryEnabled?: boolean;
     /** Auto-promotion gate (`memory.auto_promote`). Issue #44. */
@@ -146,8 +187,7 @@ export function runCompartmentPhase(
         args.canRunCompartments &&
         getActiveCompartmentRun(args.sessionId) === undefined &&
         (args.sessionMeta.compartmentInProgress ||
-            (!args.skipAwaitForThisPass &&
-                args.contextUsage.percentage >= BLOCK_UNTIL_DONE_PERCENTAGE));
+            args.contextUsage.percentage >= BLOCK_UNTIL_DONE_PERCENTAGE);
 
     if (!willReadRawHistory) {
         // No raw reads this pass — skip the prime and its cache scope entirely.
@@ -183,12 +223,16 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
     published: boolean;
     justAwaitedPublication: boolean;
     rebuiltHistoryThisPass: boolean;
+    historianJoinTimedOut: boolean;
+    historianJoinBudgetMs: number | null;
 }> {
     let pendingCompartmentInjection = args.pendingCompartmentInjection;
     let compartmentInProgress = args.sessionMeta.compartmentInProgress;
     let published = false;
     let justAwaitedPublication = false;
     let rebuiltHistoryThisPass = false;
+    let historianJoinTimedOut = false;
+    let historianJoinBudgetMs: number | null = null;
     const historianRunnable = args.historianRunnable !== false;
 
     // Compaction-off mode (issue #266): the historian/compartment phase is
@@ -211,6 +255,8 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             published,
             justAwaitedPublication,
             rebuiltHistoryThisPass,
+            historianJoinTimedOut,
+            historianJoinBudgetMs,
         };
     }
     let rawEligibility: ReturnType<typeof getRawHistoryEligibility> | null =
@@ -279,12 +325,20 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         reason: string,
     ): Promise<"completed" | "timed_out"> {
         sessionLog(args.sessionId, reason);
-        const timeoutMs = args.historianTimeoutMs ?? 120_000; // 2 minutes default
-        const timeout = new Promise<"timeout">((resolve) =>
-            setTimeout(() => resolve("timeout"), timeoutMs),
-        );
-        const result = await Promise.race([activeRun.promise.then(() => "done" as const), timeout]);
+        const timeoutMs = resolveHistorianInlineJoinBudget(args.historianTimeoutMs);
+        historianJoinBudgetMs = timeoutMs;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<"timeout">((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), timeoutMs);
+        });
+        let result: "done" | "timeout";
+        try {
+            result = await Promise.race([activeRun.promise.then(() => "done" as const), timeout]);
+        } finally {
+            if (timer !== undefined) clearTimeout(timer);
+        }
         if (result === "timeout") {
+            historianJoinTimedOut = true;
             sessionLog(
                 args.sessionId,
                 `transform: compartment await timed out after ${timeoutMs}ms — proceeding without waiting`,
@@ -363,6 +417,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 getNotificationParams: args.getNotificationParams,
                 experimentalUserMemories: args.experimentalUserMemories,
                 historianTwoPass: args.historianTwoPass,
+                historianExpandTools: args.historianExpandTools,
                 memoryEnabled: args.memoryEnabled,
                 autoPromote: args.autoPromote,
                 onCompartmentStatePublished: args.onCompartmentStatePublished,
@@ -382,7 +437,6 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
     if (
         historianRunnable &&
         args.canRunCompartments &&
-        !args.skipAwaitForThisPass &&
         args.contextUsage.percentage >= BLOCK_UNTIL_DONE_PERCENTAGE
     ) {
         let activeRun = getActiveCompartmentRun(args.sessionId);
@@ -416,6 +470,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
                 getNotificationParams: args.getNotificationParams,
                 experimentalUserMemories: args.experimentalUserMemories,
                 historianTwoPass: args.historianTwoPass,
+                historianExpandTools: args.historianExpandTools,
                 memoryEnabled: args.memoryEnabled,
                 autoPromote: args.autoPromote,
                 onCompartmentStatePublished: args.onCompartmentStatePublished,
@@ -447,11 +502,13 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
             if (args.client && !activeRun.notificationSent) {
                 activeRun.notificationSent = true;
                 const notifParams = args.getNotificationParams?.() ?? {};
-                void sendStatusNotification(
-                    args.client,
-                    args.sessionId,
-                    `⏳ Context at ${args.contextUsage.percentage.toFixed(0)}% — Magic Context is comparting history before continuing. This may take up to 2 minutes.`,
-                    notifParams,
+                void withoutSqliteTransformPass(() =>
+                    sendStatusNotification(
+                        args.client,
+                        args.sessionId,
+                        `⏳ Context at ${args.contextUsage.percentage.toFixed(0)}% — Magic Context is comparting history before continuing. This may take up to ${HISTORIAN_INLINE_JOIN_BUDGET_MS / 1000} seconds.`,
+                        notifParams,
+                    ),
                 );
             }
             const awaitResult = await awaitCompartmentRun(
@@ -483,5 +540,7 @@ async function runCompartmentPhaseImpl(args: RunCompartmentPhaseArgs): Promise<{
         published,
         justAwaitedPublication,
         rebuiltHistoryThisPass,
+        historianJoinTimedOut,
+        historianJoinBudgetMs,
     };
 }

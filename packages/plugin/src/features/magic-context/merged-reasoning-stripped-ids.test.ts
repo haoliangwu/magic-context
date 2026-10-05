@@ -12,7 +12,7 @@ import {
     getTrailingBlankDecisions,
 } from "./storage-meta-persisted";
 import { clearSession } from "./storage-meta-session";
-import { parseReplayDocument } from "./storage-replay-document";
+import { readReplayDocument } from "./storage-replay-document";
 
 describe("merged_reasoning_stripped_ids", () => {
     let db: Database;
@@ -179,10 +179,9 @@ describe("trailing_blank_decisions", () => {
             "assistant-keep",
         ]);
 
-        const row = db
-            .prepare("SELECT trailing_blank_decisions FROM session_meta WHERE session_id = ?")
-            .get(sessionId) as { trailing_blank_decisions: string };
-        const document = parseReplayDocument(row.trailing_blank_decisions);
+        // The decisions are stored as rows and the namespaces in the column, so
+        // the stored document is read through the API that joins them.
+        const document = readReplayDocument(db, sessionId);
         expect(document.trailingBlank).toEqual({
             "assistant-keep": "strip",
             "assistant-new": "keep:2",

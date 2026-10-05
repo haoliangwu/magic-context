@@ -25,10 +25,10 @@ export class StateSyncTiming {
         }
     }
 
-    log(sessionId: string): void {
+    log(sessionId: string, phase = "pass"): void {
         sessionLog(
             sessionId,
-            `transform stage: stage=rust.state_sync_detail elapsed=${(performance.now() - this.started).toFixed(3)}ms collect_ms=${this.collect.toFixed(3)} serialize_ms=${this.serialize.toFixed(3)} page_build_ms=${this.pageBuild.toFixed(3)} status_ms=${this.status.toFixed(3)} transport_ms=${this.transport.toFixed(3)} module_ack_ms=${this.moduleAck.toFixed(3)} compartments=${this.compartments} tags=${this.tags} bytes=${this.bytes} pages=${this.pages} raw_reads=${this.rawReads} raw_messages=${this.rawMessages}`,
+            `transform stage: stage=rust.state_sync_detail phase=${phase} elapsed=${(performance.now() - this.started).toFixed(3)}ms collect_ms=${this.collect.toFixed(3)} serialize_ms=${this.serialize.toFixed(3)} page_build_ms=${this.pageBuild.toFixed(3)} status_ms=${this.status.toFixed(3)} transport_ms=${this.transport.toFixed(3)} module_ack_ms=${this.moduleAck.toFixed(3)} compartments=${this.compartments} tags=${this.tags} bytes=${this.bytes} pages=${this.pages} raw_reads=${this.rawReads} raw_messages=${this.rawMessages}`,
         );
     }
 }

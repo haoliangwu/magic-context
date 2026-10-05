@@ -235,7 +235,6 @@ ctx_memory(action="write", category="ARCHITECTURE", content="Event sourcing for 
 | `/ctx-status` | มุมมอง debug: tags, pending drops, cache TTL, nudge state, ความคืบหน้า historian, coverage ของช่อง, งบประมาณประวัติ |
 | `/ctx-flush` | บังคับ operations ที่เข้าคิวทั้งหมดทันที โดยข้าม cache TTL |
 | `/ctx-recomp` | สร้างช่องใหม่จากประวัติดิบ (รับช่วง `start-end`) ใช้เมื่อสถานะที่เก็บดูผิด |
-| `/ctx-session-upgrade` | อัปเกรดเซสชันนี้เป็นรูปแบบประวัติล่าสุด: สร้างช่องใหม่และย้ายความจำโปรเจกต์ |
 | `/ctx-dream` | รันการดูแล dreamer ตามต้องการ: ดูแลความจำ docs smart notes และ user-profile review |
 
 ---

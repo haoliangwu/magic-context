@@ -197,11 +197,18 @@ const transformSolidSource = await loadTransformSolidSource();
 const runtimeExportSets = await loadRuntimeExportSets();
 const files = await listSourceFiles(sourceRoot);
 
-await rm(outputRoot, { recursive: true, force: true });
+// Regenerate in place rather than removing the output tree first. Consumers
+// read this directory live: a Parallels VM sharing the checkout caches
+// directory lookups, and an rm-then-recreate left it holding a stale negative
+// entry for `index.tsx` (ENOENT in the OpenCode 2 TUI while the file existed on
+// the host). Overwriting keeps the directory inode and every unchanged file's
+// inode; only outputs whose source is gone are removed.
+const expectedOutputs = new Set<string>();
 
 for (const sourceFile of files) {
     const relativePath = relative(sourceRoot, sourceFile);
     const outputFile = join(outputRoot, relativePath);
+    expectedOutputs.add(outputFile);
 
     if (sourceFile.endsWith(".tsx")) {
         // OpenTUI skips the Solid compile-time transform for packages loaded from
@@ -216,4 +223,13 @@ for (const sourceFile of files) {
     }
 }
 
-console.log(`build-tui: wrote ${files.length} file(s) to ${relative(pluginRoot, outputRoot)}`);
+let stale = 0;
+for (const existing of await listSourceFiles(outputRoot)) {
+    if (expectedOutputs.has(existing)) continue;
+    await rm(existing, { force: true });
+    stale += 1;
+}
+
+console.log(
+    `build-tui: wrote ${files.length} file(s) to ${relative(pluginRoot, outputRoot)}${stale ? ` (removed ${stale} stale)` : ""}`,
+);

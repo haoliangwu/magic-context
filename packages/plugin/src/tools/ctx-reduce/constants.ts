@@ -1,10 +1,6 @@
-export const CTX_REDUCE_DESCRIPTION = `Mark spent tagged content as discardable to reclaim context space. This is NOT an immediate delete. Use \u00a7N\u00a7 identifiers visible in the conversation. The \`drop\` param accepts ranges: "3-5", "1,2,9", "1-5,8".
+export const CTX_REDUCE_DESCRIPTION = `Stamp an item on your desk as no longer needed for the work ahead. Not a delete: stamping QUEUES it, the item stays fully readable until Magic Context clears stamped items in one sweep, and the newest tags are protected so stamping recent output is harmless. A cleared item goes to the archive — a recent one leaves a \`[dropped §N§]\` placeholder, an older one leaves nothing — and \`ctx_expand(tag=N)\` is the way back. So the question before stamping is not "have I finished reading this?" but "does this need to stay on my desk for what comes next?" — a file you read and will keep editing stays; the grep that found it goes.
 
-How it works:
-- Marking QUEUES content for release. It stays fully visible to you until it is actually released, which may be the next turn or many turns later. Mark spent outputs as soon as you finish with them; don't hoard the call for the end of the turn.
-- The newest tags are protected: marking one just queues it until it ages out of the recent window, so marking recent output is harmless.
-- When content is finally released it becomes a short placeholder, and re-running the tool is the only way to get it back. So mark only what you are genuinely DONE with \u2014 the test is "have I extracted what I need from this?", not "is it safe / do I have time before it drops?".
+Stamp: file reads, search results and tool outputs the work ahead no longer needs; build/test output after you acted on it; repeated or redundant dumps; data written to disk; status/log output that only confirmed what you expected; a large block pasted inside a user message once you have used it.
+Keep: user messages (never stamp one for its directive), your own conversation text, unresolved errors, raw evidence you haven't extracted yet, and outputs whose exact wording may still matter.
 
-Mark discardable once processed: large outputs you've summarized, repeated or redundant dumps, data written to disk, status/log output that only confirmed an expected state.
-Keep: user messages, unresolved errors, raw evidence you haven't extracted yet, and outputs whose exact wording may matter later.
-Never blanket-mark large ranges (e.g. "1-50") \u2014 review what each tag holds first.`;
+Look at each tag before stamping it; never blanket-stamp a range like "1-50". Many small targeted stamps beat one sweep. \`drop\` accepts "3-5", "1,2,9", "1-5,8,12-15".`;

@@ -1,13 +1,62 @@
 import { describe, expect, test } from "bun:test";
 import {
+    __resetOffThreadMigrationClockForTests,
+    beginOffThreadMigration,
+} from "../shared/off-thread-migration-clock";
+import {
     createBootBudget,
     emitBootEnteringBreadcrumb,
     formatBootPhaseDiagnostics,
+    remainingBootBudgetMs,
     runBootPhaseWithDeadline,
     runBootPhaseWithinBudget,
 } from "./boot-deadline";
 
 describe("boot phase deadline", () => {
+    test("a schema migration running off the main thread does not count against the deadline", async () => {
+        const messages: string[] = [];
+        const endMigration = beginOffThreadMigration();
+        try {
+            const result = await runBootPhaseWithDeadline(
+                "hooks",
+                () =>
+                    new Promise<string>((resolve) =>
+                        setTimeout(() => {
+                            endMigration();
+                            resolve("real hooks");
+                        }, 120),
+                    ),
+                20,
+                (message) => messages.push(message),
+            );
+
+            expect(result.status).toBe("completed");
+            expect(messages).toEqual([
+                "[magic-context] boot phase 'hooks' reached its 20ms deadline while a schema migration runs off the main thread; waiting for the migration, which does not count against the deadline",
+            ]);
+        } finally {
+            endMigration();
+            __resetOffThreadMigrationClockForTests();
+        }
+    });
+
+    test("the deadline still fires once the off-thread migration has finished", async () => {
+        const endMigration = beginOffThreadMigration();
+        setTimeout(endMigration, 40);
+        try {
+            const result = await runBootPhaseWithDeadline(
+                "hooks",
+                () => new Promise<never>(() => {}),
+                20,
+                () => {},
+            );
+            expect(result.status).toBe("timed_out");
+        } finally {
+            endMigration();
+            __resetOffThreadMigrationClockForTests();
+        }
+    });
+
     test("plugin hook initialization resolves when the boot dependency never settles", async () => {
         const startedAt = performance.now();
         const messages: string[] = [];
@@ -43,20 +92,26 @@ describe("boot phase deadline", () => {
     });
 
     test("one boot budget bounds consecutive phases by the original deadline", async () => {
-        const startedAt = performance.now();
         const messages: string[] = [];
-        const budget = createBootBudget(45);
+        // Model a first phase consuming 25ms without asking the scheduler to sleep.
+        const budget = createBootBudget(45, performance.now() - 45);
+        expect(remainingBootBudgetMs(budget, budget.startedAt + 25)).toBe(20);
+        expect(remainingBootBudgetMs(budget, budget.deadlineAt)).toBe(0);
 
-        await new Promise((resolve) => setTimeout(resolve, 25));
+        let hooksStarted = false;
         const result = await runBootPhaseWithinBudget(
             budget,
             "hooks",
-            () => new Promise<never>(() => {}),
+            () => {
+                hooksStarted = true;
+                return new Promise<never>(() => {});
+            },
             (message) => messages.push(message),
         );
 
         expect(result.status).toBe("timed_out");
-        expect(performance.now() - startedAt).toBeLessThan(60);
+        expect(result.elapsedMs).toBe(0);
+        expect(hooksStarted).toBe(false);
         expect(messages[0]).toContain("whole-server 45ms budget");
         expect(messages[0]).toContain("phase 'hooks'");
     });

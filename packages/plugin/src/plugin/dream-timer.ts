@@ -3,6 +3,7 @@ import { statSync } from "node:fs";
 import type { DreamerConfig } from "../config/schema/magic-context";
 import type { ClassifyModuleClient } from "../features/magic-context/dreamer/classify";
 import { acquireLease, releaseLease } from "../features/magic-context/dreamer/lease";
+import { logDreamerNotOwnerOnce } from "../features/magic-context/dreamer/module-apply";
 import { openOpenCodeDb } from "../features/magic-context/dreamer/open-opencode-db";
 import {
     historianOrphanStaleMs,
@@ -25,7 +26,13 @@ import type {
     DreamTaskProgress,
 } from "../features/magic-context/dreamer/task-registry";
 import { leaseKeyFor } from "../features/magic-context/dreamer/task-registry";
+import type { DreamTaskRuntimeConfig } from "../features/magic-context/dreamer/task-scheduler";
 import { runDueTasksForProject } from "../features/magic-context/dreamer/task-scheduler";
+import {
+    clearDreamerTickFailure,
+    type DreamerTickFailure,
+    recordDreamerTickFailure,
+} from "../features/magic-context/dreamer/tick-failure";
 import {
     acquireGitSweepLease,
     embedUnembeddedCommits,
@@ -40,19 +47,23 @@ import {
     embedUnembeddedMemoriesForProject,
     getProjectEmbeddingSnapshot,
 } from "../features/magic-context/memory/embedding";
+import { isUsableProjectIdentity } from "../features/magic-context/memory/project-identity";
 import { sweepOrphanedOpenCodeMessageIndexes } from "../features/magic-context/message-index";
 import {
     drainCommitBacklogForProject,
-    sweepStaleEmbeddingIdentitiesForProject,
+    drainProjectEmbeddingIdentityMaintenance,
+    drainStaleEmbeddingIdentitiesForProject,
 } from "../features/magic-context/project-embedding-registry";
 import { runDueCompiledSmartNoteChecks } from "../features/magic-context/smart-notes/runner";
 import {
     openDatabase,
     retryPendingRustSessionCleanupsForProject,
-    retryPendingSessionCleanups,
     runSqliteOptimize,
 } from "../features/magic-context/storage";
+import { retryPendingSessionCleanups } from "../features/magic-context/storage-meta-session";
+import { drainStaleLkgSlots } from "../hooks/magic-context/lkg-persist";
 import type { RawMessageProvider } from "../hooks/magic-context/read-session-chunk";
+import { projectNeedsSingleStoreMigration } from "../hooks/magic-context/single-store-refusal";
 import { getErrorMessage } from "../shared/error-message";
 import { log } from "../shared/logger";
 import type { ModelHarness } from "../shared/model-resolution";
@@ -85,6 +96,13 @@ interface ProjectRegistration {
     harness: ModelHarness;
     client: PluginContext["client"];
     dreamerConfig?: DreamerConfig;
+    validateTaskModels?: (tasks: DreamTaskRuntimeConfig[]) => DreamTaskRuntimeConfig[];
+    sampleDreamRun?: () => Partial<
+        Pick<
+            ProjectRegistration,
+            "dreamerConfig" | "mural" | "historianChildSweep" | "gitCommitIndexing"
+        >
+    >;
     language?: string;
     gitCommitIndexing?: {
         enabled: boolean;
@@ -140,6 +158,7 @@ interface ProjectRegistration {
 
 /** Singleton timer state. */
 let activeTimer: ReturnType<typeof setInterval> | null = null;
+let tickInFlight = false;
 let startupTickTimer: ReturnType<typeof setTimeout> | null = null;
 const startupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const startupJitters = new Map<string, number>();
@@ -183,6 +202,16 @@ function openTimerDatabaseOrNull(context: string): Database | null {
     }
     return db;
 }
+const refusedEmptyIdentityDirectories = new Set<string>();
+
+function logEmptyIdentityRefusalOnce(directory: string): void {
+    if (refusedEmptyIdentityDirectories.has(directory)) return;
+    refusedEmptyIdentityDirectories.add(directory);
+    log(
+        `[dreamer] not registering ${directory}: it has no project identity, so no project-scoped work runs for it`,
+    );
+}
+
 /** All projects that have called startDreamScheduleTimer in this process,
  *  keyed by directory so re-registration of the same directory is idempotent. */
 const registeredProjects = new Map<string, ProjectRegistration>();
@@ -217,6 +246,15 @@ function stopDreamScheduleTimerIfIdle(): void {
 export async function startDreamScheduleTimer(
     args: ProjectRegistration,
 ): Promise<(() => void) | undefined> {
+    // An unresolved directory (home, filesystem root) has no project identity.
+    // Every per-project stage keys its work by this identity, so a blank one
+    // would run dreamer tasks, embedding sweeps, and commit indexing for a
+    // project named "". Hosts are expected to skip registration themselves;
+    // this is the last line of defense.
+    if (!isUsableProjectIdentity(args.projectIdentity)) {
+        logEmptyIdentityRefusalOnce(args.directory);
+        return undefined;
+    }
     beginBootQuietPeriod();
     const db = openTimerDatabaseOrNull("schedule timer registration");
     if (!db) return;
@@ -291,27 +329,75 @@ export async function startDreamScheduleTimer(
 }
 
 /**
+ * The stages one tick runs, reached through this object so a test can replace a
+ * stage with a throwing one and prove that its failure stays local.
+ */
+const tickStages = {
+    runMessageHistoryMaintenance,
+    runProjectMaintenance,
+};
+
+/** Swap tick stages for a test; the returned function puts the real ones back. */
+export function _setDreamTimerStagesForTests(overrides: Partial<typeof tickStages>): () => void {
+    const original = { ...tickStages };
+    Object.assign(tickStages, overrides);
+    return () => {
+        Object.assign(tickStages, original);
+    };
+}
+
+/**
  * Single tick body. Runs global message-history maintenance once, then
  * iterates every registered project for its per-directory work.
+ *
+ * Every stage is contained on its own. One stage throwing used to end the whole
+ * tick, which meant a failure in the global maintenance stage silently stopped
+ * task scheduling for every project, on every tick, forever (issue 496).
  */
 function runTick(origin: "startup" | "interval"): void {
+    // Maintenance can outlive the interval under a busy writer or a slow task.
+    // One tick already covers every project, so do not start duplicate work.
+    if (tickInFlight) return;
+    tickInFlight = true;
     log(`[dreamer] timer tick (${origin}) — projects=${registeredProjects.size}`);
     void (async () => {
         try {
             const db = openTimerDatabaseOrNull("maintenance tick");
             if (!db) return;
-            await runMessageHistoryMaintenance(db);
+            // The first stage to fail is the one worth showing: later stages
+            // may well be failing because of it, and one clear cause beats a
+            // list the user has to triage.
+            let failure: DreamerTickFailure | null = null;
+            const noteFailure = (stage: string, error: unknown): void => {
+                failure ??= { at: Date.now(), stage, message: getErrorMessage(error) };
+            };
+
+            try {
+                await tickStages.runMessageHistoryMaintenance(db);
+            } catch (error) {
+                log("[magic-context] timer-triggered message-history maintenance failed:", error);
+                noteFailure("message-history maintenance", error);
+            }
             // Per-project work — git commit indexing, dream schedule check,
             // dream queue processing. We iterate all registered projects so
             // Desktop's "open all projects at once" workflow indexes every one,
             // not just whichever project happened to register the timer first.
             for (const reg of registeredProjects.values()) {
-                if (origin === "startup") {
-                    scheduleInitialProjectRun(reg, db);
-                } else {
-                    await runProjectMaintenance(reg, origin, db);
+                try {
+                    if (origin === "startup") {
+                        scheduleInitialProjectRun(reg, db);
+                    } else {
+                        await tickStages.runProjectMaintenance(reg, origin, db);
+                    }
+                } catch (error) {
+                    log(
+                        `[magic-context] timer-triggered maintenance failed for ${reg.projectIdentity}:`,
+                        error,
+                    );
+                    noteFailure(`project ${reg.projectIdentity}`, error);
                 }
             }
+            persistTickOutcome(db, failure);
             if (origin === "startup") return;
             // Refresh planner stats once per tick (after per-project work).
             // Self-gating: a no-op unless a table's row count drifted enough to
@@ -319,11 +405,33 @@ function runTick(origin: "startup" | "interval"): void {
             runSqliteOptimize(db);
         } catch (error) {
             log("[magic-context] timer-triggered maintenance check failed:", error);
+        } finally {
+            tickInFlight = false;
         }
     })();
 }
 
+/**
+ * Save what this tick did, so `/ctx-status` and `doctor` can tell a dreamer
+ * with nothing to do apart from a dreamer that never got to its work. Storage
+ * trouble here must not itself end the tick.
+ */
+function persistTickOutcome(db: Database, failure: DreamerTickFailure | null): void {
+    try {
+        if (failure) recordDreamerTickFailure(db, failure);
+        else clearDreamerTickFailure(db);
+    } catch (error) {
+        log("[dreamer] could not persist the outcome of this tick:", error);
+    }
+}
+
 async function runMessageHistoryMaintenance(db: Database): Promise<void> {
+    try {
+        await drainStaleLkgSlots(db);
+    } catch (error) {
+        // A busy writer should not prevent unrelated maintenance from running.
+        log("[magic-context] LKG pruning deferred:", error);
+    }
     const cleanup = retryPendingSessionCleanups(db);
     if (cleanup.cleared > 0 || cleanup.failedSessionIds.length > 0) {
         log(
@@ -379,7 +487,18 @@ function scheduleInitialProjectRun(reg: ProjectRegistration, db: Database): void
     const timer = scheduleAfterBootQuiet(() => {
         startupTimers.delete(reg.directory);
         if (registeredProjects.get(reg.directory) !== reg) return;
-        void runProjectMaintenance(reg, "startup", db);
+        // This run is detached from the tick that scheduled it, so nothing
+        // upstream catches its failure. An uncaught rejection here (for example
+        // SQLITE_BUSY in ensureRegistered) would be an unhandled rejection that
+        // can end the host process; record it like an interval tick failure.
+        tickStages.runProjectMaintenance(reg, "startup", db).catch((error: unknown) => {
+            log(`[magic-context] startup maintenance failed for ${reg.projectIdentity}:`, error);
+            persistTickOutcome(db, {
+                at: Date.now(),
+                stage: `project ${reg.projectIdentity}`,
+                message: getErrorMessage(error),
+            });
+        });
     }, startupJitterMs(reg.directory));
     startupTimers.set(reg.directory, timer);
 }
@@ -408,7 +527,8 @@ async function runProjectMaintenance(
         // Compartment-chunk backfill remains demand-driven to avoid bursty
         // requests to local embedding endpoints.
     }
-    await sweepProject(reg, origin, db);
+    const sampled = reg.sampleDreamRun?.();
+    await sweepProject(sampled ? { ...reg, ...sampled } : reg, origin, db);
 }
 
 /**
@@ -463,7 +583,8 @@ async function sweepProject(
     await reg.ensureRegistered(reg.directory, db);
     const embeddingSnapshot = getProjectEmbeddingSnapshot(reg.projectIdentity);
     const commitIndexingEnabled = gitCommitEnabled ?? embeddingSnapshot?.gitCommitEnabled === true;
-    const gc = sweepStaleEmbeddingIdentitiesForProject(db, reg.projectIdentity);
+    await drainProjectEmbeddingIdentityMaintenance(db, reg.projectIdentity);
+    const gc = await drainStaleEmbeddingIdentitiesForProject(db, reg.projectIdentity);
     const gcDeleted = gc.memoryRowsDeleted + gc.commitRowsDeleted + gc.chunkRowsDeleted;
     if (gcDeleted > 0) {
         log(
@@ -474,7 +595,7 @@ async function sweepProject(
 
     const dreamerConfig = reg.dreamerConfig;
     const dreamingEnabled = Boolean(dreamerConfig && dreamerConfig.disable !== true);
-    const runtimeConfigs =
+    const configuredTasks =
         dreamingEnabled && dreamerConfig
             ? buildDreamTaskRuntimeConfigs(
                   dreamerConfig,
@@ -483,6 +604,7 @@ async function sweepProject(
                   reg.mural?.model,
               )
             : [];
+    const runtimeConfigs = reg.validateTaskModels?.(configuredTasks) ?? configuredTasks;
     await sweepOrphanedInternalChildren(
         reg,
         runtimeConfigs
@@ -506,7 +628,11 @@ async function sweepProject(
 
     try {
         await runCompiledSmartNoteSweep(reg, db);
+    } catch (error) {
+        log(`[dreamer] compiled smart-note sweep failed for ${reg.projectIdentity}:`, error);
+    }
 
+    try {
         // Dreamer v2: per-task cron scheduling. The scheduler seeds/reads
         // task_schedule_state, evaluates each task's cron + activity gate, and
         // runs due tasks grouped by conflict-domain under keyed leases. The
@@ -542,6 +668,7 @@ async function sweepProject(
             projectIdentity: reg.projectIdentity,
             tasks: runtimeConfigs,
             executor,
+            projectMemoryEnabled: reg.memoryEnabled !== false,
         });
         if (ran > 0) {
             log(`[dreamer] timer tick (${origin}) ${reg.projectIdentity} — ran ${ran} task(s)`);
@@ -601,6 +728,10 @@ export function _resetDreamTimerForTests(): void {
 }
 
 async function runCompiledSmartNoteSweep(reg: ProjectRegistration, db: Database): Promise<void> {
+    if (projectNeedsSingleStoreMigration(db, reg.projectIdentity)) {
+        logDreamerNotOwnerOnce(reg.projectIdentity);
+        return;
+    }
     const leaseKey = leaseKeyFor("evaluate-smart-notes", reg.projectIdentity);
     const holderId = crypto.randomUUID();
     if (!acquireLease(db, holderId, leaseKey)) return;

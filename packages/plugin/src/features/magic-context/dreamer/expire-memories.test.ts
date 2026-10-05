@@ -3,7 +3,6 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { ensureContextStoreUuid } from "../context-authority";
 import { insertMemory } from "../memory";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
@@ -20,7 +19,7 @@ afterEach(() => {
 });
 
 describe("archiveExpiredMemories", () => {
-    test("routes module-owned expiry through ctx_memory and mirrors the archive status", async () => {
+    test("routes expiry using shared context ids without a mirror pull", async () => {
         db = new Database(":memory:");
         initializeDatabase(db);
         runMigrations(db);
@@ -32,67 +31,16 @@ describe("archiveExpiredMemories", () => {
             content: "A module-owned TTL memory.",
             expiresAt: now - 1,
         });
-        const contextStoreUuid = ensureContextStoreUuid(db);
-        db.prepare(
-            "INSERT INTO mirror_identity(domain, module_project, module_row_id, context_row_id) VALUES ('memories', ?, ?, ?)",
-        ).run(project, 77, memory.id);
-        db.prepare(
-            `INSERT INTO mirror_live_memory_rows(
-                module_project, module_row_id, category, normalized_hash, full_row_snapshot
-             ) VALUES (?, ?, ?, ?, ?)`,
-        ).run(
-            project,
-            77,
-            memory.category,
-            memory.normalizedHash,
-            JSON.stringify({
-                id: 77,
-                project_path: project,
-                category: memory.category,
-                content: memory.content,
-                normalized_hash: memory.normalizedHash,
-                status: "active",
-                expires_at: memory.expiresAt,
-                updated_at: memory.updatedAt,
-            }),
-        );
-        const call = mock(async () => ({ result: { ok: true } }));
-        const mirrorPull = mock(
-            async (request: {
-                domain: "memories" | "notes";
-                cursor: number;
-                limit: number;
-                projectRoot?: string;
-            }) => ({
-                page: {
-                    domain: "memories" as const,
-                    cursor: request.cursor,
-                    next_cursor: 1,
-                    has_more: false,
-                    rows: [
-                        {
-                            feed_seq: 1,
-                            domain: "memories" as const,
-                            op: "update" as const,
-                            module_row_id: 77,
-                            full_row_snapshot: {
-                                project_path: project,
-                                status: "archived",
-                                metadata_json: JSON.stringify({ archive_reason: "expired" }),
-                                updated_at: now + 1,
-                            },
-                            content_hash: memory.normalizedHash,
-                        },
-                    ],
-                },
-            }),
-        );
+        const call = mock(async () => {
+            db!
+                .prepare("UPDATE memories SET status = 'archived', metadata_json = ? WHERE id = ?")
+                .run(JSON.stringify({ archive_reason: "expired" }), memory.id);
+            return { result: { ok: true } };
+        });
         const moduleRoute: DreamerModuleRoute = {
-            moduleClient: { call, mirrorPull },
+            moduleClient: { call },
             moduleSessionId: project,
             moduleProjectRoot: project,
-            moduleContextStoreUuid: contextStoreUuid,
-            moduleAuthorityGeneration: 4,
             moduleCommandId: "curate-expiry",
         };
         const holderId = "module-expiry-holder";
@@ -120,17 +68,11 @@ describe("archiveExpiredMemories", () => {
                 arguments: {
                     action: "archive",
                     memory_project: project,
-                    ids: [77],
+                    ids: [memory.id],
                     reason: "expired",
                     command_id: "curate-expiry:expire:0",
                 },
             },
-        });
-        expect(mirrorPull).toHaveBeenCalledWith({
-            domain: "memories",
-            cursor: 0,
-            limit: 1_000,
-            projectRoot: project,
         });
         expect(
             db.prepare("SELECT status, metadata_json FROM memories WHERE id = ?").get(memory.id),

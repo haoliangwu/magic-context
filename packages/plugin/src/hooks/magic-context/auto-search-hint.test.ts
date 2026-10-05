@@ -27,6 +27,14 @@ function commit(message: string, daysAgo = 3): UnifiedSearchResult {
 }
 
 describe("buildAutoSearchHint", () => {
+    it("skips the English word rules when the user language is another language", () => {
+        const spanish = memory("Voy a revisar si quite la cache");
+        expect(buildAutoSearchHint([spanish], { wordRules: "none" })).toContain(
+            "- Voy a revisar si quite la cache",
+        );
+        expect(buildAutoSearchHint([spanish])).toContain("- Voy revisar si la cache");
+    });
+
     it("returns null for empty results", () => {
         expect(buildAutoSearchHint([])).toBeNull();
     });

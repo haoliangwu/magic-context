@@ -30,7 +30,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
-import { join, resolve as pathResolve } from "node:path";
+import { resolve as pathResolve } from 'node:path';
 import { computeNormalizedHash } from "../../plugin/src/features/magic-context/memory/normalize-hash";
 import { resolveProjectIdentity } from "../../plugin/src/features/magic-context/memory/project-identity";
 import {
@@ -41,6 +41,12 @@ import {
     mainAgentRequests,
 } from "../src/cache-analysis";
 import { TestHarness } from "../src/harness";
+import { findHistorianOrdinalRange } from '../src/mock-historian';
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 import { openTestDb } from "../src/test-db";
 import type { MockUsage } from "../src/mock-provider/server";
 
@@ -66,38 +72,11 @@ function isHistorianRequest(body: Record<string, unknown>): boolean {
     return false;
 }
 
-/**
- * Parse the [N] ordinal range from a historian prompt's <new_messages> block.
- *
- * Ordinals are matched ONLY in the exact line-anchored form the historian
- * prompt emits — `[N] U:` / `[N] A:` at the start of a line. Matching any
- * bracketed digit in the prose would pick up stray `[0]`-shaped text (e.g. a
- * prompt that literally mentions `m[0]`), producing a 0-N compartment range
- * that fails the historian's "range maps to raw session lines 1-N" validation.
- * This bit a real test run — the `[N] U:` anchor is the robust contract.
- */
-function findOrdinalRange(body: Record<string, unknown>): { start: number; end: number } | null {
-    const messages = (body.messages as Array<{ content: unknown }> | undefined) ?? [];
-    for (const m of messages) {
-        const blocks = Array.isArray(m.content) ? m.content : [];
-        for (const block of blocks) {
-            const text = (block as { text?: string }).text;
-            if (!text || !text.includes("<new_messages>")) continue;
-            const start = text.indexOf("<new_messages>");
-            const end = text.indexOf("</new_messages>");
-            const scope = end > start ? text.slice(start, end) : text.slice(start);
-            const nums = [...scope.matchAll(/^\[(\d+)\] [UA]:/gm)].map((mm) => Number(mm[1]));
-            if (nums.length > 0) return { start: Math.min(...nums), end: Math.max(...nums) };
-        }
-    }
-    return null;
-}
-
 /** Route historian requests to a valid single-compartment response covering the chunk. */
-function installHistorianMatcher(h: TestHarness): void {
+function installHistorianMatcher(h: ScenarioHarness): void {
     h.mock.addMatcher((body) => {
         if (!isHistorianRequest(body)) return null;
-        const range = findOrdinalRange(body);
+        const range = findHistorianOrdinalRange(body);
         const usage = {
             input_tokens: 500,
             output_tokens: 200,
@@ -155,29 +134,7 @@ const HISTORIAN_TRIGGER_USAGE: MockUsage = {
     cache_read_input_tokens: 0,
 };
 
-let h: TestHarness;
-
-beforeEach(async () => {
-    h = await TestHarness.create({
-        modelContextLimit: MODEL_LIMIT,
-        magicContextConfig: {
-            execute_threshold_percentage: 20,
-            protected_tags: 1,
-            dreamer: { disable: true },
-            compressor: { enabled: false },
-            memory: {
-                enabled: true,
-                auto_promote: false,
-                auto_search: { enabled: false },
-                git_commit_indexing: { enabled: false },
-            },
-        },
-    });
-});
-
-afterEach(async () => {
-    await h.dispose();
-});
+let h: ScenarioHarness;
 
 function setDefer(text: string): void {
     h.mock.setDefault({ text, usage: DEFER_USAGE });
@@ -185,11 +142,11 @@ function setDefer(text: string): void {
 
 /** Project identity the plugin resolves at runtime for the harness workdir. */
 function projectIdentity(): string {
-    return resolveProjectIdentity(realpathSync(pathResolve(h.opencode.env.workdir)));
+    return resolveProjectIdentity(h.host === "omp" ? h.workdir : realpathSync(pathResolve(h.workdir)));
 }
 
 function writeContextDb<T>(fn: (db: Database) => T): T {
-    const dbPath = join(h.opencode.env.dataDir, "cortexkit", "magic-context", "context.db");
+    const dbPath = h.contextDbPath();
     const db = openTestDb(dbPath);
     try {
         return fn(db);
@@ -241,8 +198,8 @@ function queueMemoryUpdate(targetId: number, newContent: string): void {
 
 /**
  * Bump the project memory epoch — the cross-process HARD-bust signal an external
- * (dashboard) memory mutation or a session upgrade fires. Unlike the in-session
- * supersede-delta path (B11), this MUST force a full m[0] re-materialization.
+ * (dashboard) memory mutation fires. Unlike the in-session supersede-delta path
+ * (B11), this MUST force a full m[0] re-materialization.
  */
 function bumpProjectEpoch(): void {
     writeContextDb((db) => {
@@ -330,25 +287,36 @@ function memoryIdContaining(body: Record<string, unknown>, content: string): num
     return Number(match[1]);
 }
 
-function thrownMessage(fn: () => unknown): string {
-    try {
-        fn();
-        return "";
-    } catch (error) {
-        return error instanceof Error ? error.message : String(error);
-    }
-}
 
 async function waitForRustCompartment(sessionId: string): Promise<void> {
+    if (!(h instanceof TestHarness)) {
+        throw new Error("Rust compartment wait requires the OpenCode 1 hermetic module stack");
+    }
     const stack = h.rustStack;
     if (!stack) throw new Error("Rust compartment wait requires the hermetic module stack");
     const deadline = Date.now() + 60_000;
     while (Date.now() < deadline) {
-        const status = await stack.moduleStatus(sessionId, h.opencode.env.workdir, "session.status");
+        const status = await stack.moduleStatus(sessionId, h.workdir, "session.status");
         if (Number(status.compartment_count ?? 0) > 0) return;
         await Bun.sleep(100);
     }
     throw new Error("waitForRustCompartment timed out after 60000ms");
+}
+
+async function waitForLeaseFree(sessionId: string, label: string): Promise<void> {
+    await h.waitFor(
+        () => {
+            try {
+                const lease = h.contextDb()
+                    .prepare("SELECT holder_id FROM compartment_state_lease WHERE session_id = ?")
+                    .get(sessionId) as { holder_id: string } | null;
+                return lease === null ? true : null;
+            } catch {
+                return true;
+            }
+        },
+        { timeoutMs: 60_000, label },
+    );
 }
 
 function assertNoBusts(label: string): void {
@@ -361,7 +329,30 @@ function assertNoBusts(label: string): void {
     expect({ label, busts: busts.length }).toEqual({ label, busts: 0 });
 }
 
-describe("cache invariants — replay class", () => {
+forEachHost(import.meta.url, null, (host) => {
+    beforeEach(async () => {
+        h = await createScenarioHarness(host, {
+            modelContextLimit: MODEL_LIMIT,
+            magicContextConfig: {
+                execute_threshold_percentage: 20,
+                protected_tags: 1,
+                dreamer: { disable: true },
+                compressor: { enabled: false },
+                memory: {
+                    enabled: true,
+                    auto_promote: false,
+                    auto_search: { enabled: false },
+                    git_commit_indexing: { enabled: false },
+                },
+            },
+        });
+    });
+
+    afterEach(async () => {
+        await h.dispose();
+    });
+
+    describe("cache invariants — replay class", () => {
     describe("#given a low-pressure conversation (A1)", () => {
         describe("#when several pure-defer turns grow the tail", () => {
             it("#then the cached prefix never busts across defer passes", async () => {
@@ -524,15 +515,34 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                         });
                         setDefer("B9 surface published compartment");
                         await h.sendPrompt(sessionId, "B9 turn 14: surface the published compartment.");
+                        if (h.host === "pi" || h.host === "omp") {
+                            // Pi-family publication signals materialization after
+                            // the publishing pass, so one more pass surfaces m[1].
+                            await h.sendPrompt(sessionId, "B9 turn 14b: surface deferred Pi publication.");
+                        }
                     }
 
                     //#then — TypeScript keeps the additive publication in the m[1]
                     // delta lane. Rust first consumes the pending hard transition for
                     // this newly detected renderer shape, then replays that result.
-                    const requests = mainAgentRequests(h.mock.requests());
-                    const surfaceReq = requests.at(-1);
+                    let requests = mainAgentRequests(h.mock.requests());
+                    let surfaceReq = requests.at(-1);
+                    if (h.host === "pi" || h.host === "omp") {
+                        surfaceReq = requests.find((request) =>
+                            wireValueText(extractM1(request.body))?.includes("<new-compartments>"),
+                        );
+                        for (let attempt = 0; attempt < 4 && !surfaceReq; attempt++) {
+                            await waitForLeaseFree(sessionId, "historian lease free before B9 surface execute");
+                            h.mock.setDefault({ text: `B9 surface ${attempt}`, usage: EXECUTE_USAGE });
+                            await h.sendPrompt(sessionId, `B9 turn ${15 + attempt}: execute pass to surface.`);
+                            requests = mainAgentRequests(h.mock.requests());
+                            surfaceReq = requests.find((request) =>
+                                wireValueText(extractM1(request.body))?.includes("<new-compartments>"),
+                            );
+                        }
+                    }
                     expect(surfaceReq).toBeDefined();
-                    expect(JSON.stringify(surfaceReq!.body)).toContain("B9 turn 14: surface the published compartment.");
+                    expect(JSON.stringify(surfaceReq!.body)).toContain("B9 turn");
                     const m1 = wireValueText(extractM1(surfaceReq!.body));
                     const m0 = wireValueText(extractM0(surfaceReq!.body));
                     if (RUST_MODE) {
@@ -601,18 +611,21 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                         "B10 Rust writer: save the release rule.",
                     );
 
-                    // PARITY.md assigns memory rows to module authority. Observe the
-                    // committed write through a fresh session's provider wire; a direct
-                    // TypeScript context.db insert is rejected instead of mutating m[1].
+                    // Both runtimes write the same context rows. Verify each committed
+                    // write in the context sent with a fresh Rust session's provider request.
                     const readerSessionId = await h.createSession();
                     h.mock.reset();
                     setDefer("B10 Rust reader");
                     await h.sendPrompt(readerSessionId, "B10 Rust reader: load project memory.");
                     const readerM0 = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)!;
                     expect(readerM0).toContain(freshRule);
-                    expect(thrownMessage(() => seedMemory("B10 forbidden TS-side write"))).toContain(
-                        "managed by the Rust module",
-                    );
+                    const sharedRule = "B10 shared TS-side write";
+                    seedMemory(sharedRule);
+                    const sharedReader = await h.createSession();
+                    h.mock.reset();
+                    setDefer("B10 shared-store reader");
+                    await h.sendPrompt(sharedReader, "Read the TypeScript writer's memory.");
+                    expect(extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)).toContain(sharedRule);
                     return;
                 }
                 seedMemory("B10 baseline rule: prefer the project's own tools over shell fallbacks.");
@@ -707,9 +720,15 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
                     const revisedM0 = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)!;
                     expect(revisedM0).toContain(revised);
                     expect(revisedM0).not.toContain(original);
-                    expect(
-                        thrownMessage(() => queueMemoryUpdate(rustMemoryId, "forbidden TS update")),
-                    ).toContain("managed by the Rust module");
+                    const sharedUpdate = "B11 shared TS update";
+                    queueMemoryUpdate(rustMemoryId, sharedUpdate);
+                    const sharedReader = await h.createSession();
+                    h.mock.reset();
+                    setDefer("B11 shared-store reader");
+                    await h.sendPrompt(sharedReader, "Read the TypeScript writer's update.");
+                    const sharedM0 = extractM0(mainAgentRequests(h.mock.requests()).at(-1)!.body)!;
+                    expect(sharedM0).toContain(sharedUpdate);
+                    expect(sharedM0).not.toContain(revised);
                     return;
                 }
                 const memId = seedMemory(
@@ -869,4 +888,5 @@ describe("cache invariants — m[0]/m[1] taxonomy (B class)", () => {
             }, 240_000);
         });
     });
+});
 });

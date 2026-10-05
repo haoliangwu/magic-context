@@ -51,18 +51,18 @@ export interface LiveSessionState {
      */
     sessionDirectoryBySession: Map<string, string>;
     /**
-     * Live recomp / session-upgrade progress, keyed by sessionId. Written by the
-     * RPC recomp/upgrade handlers (via the runner's `onRecompProgress` callback
-     * plus their own migration/terminal updates) and read by `buildSidebarSnapshot`
-     * so the TUI sidebar + /ctx-status can show a live progress bar. In-memory
-     * only — a process restart interrupts the recomp anyway.
+     * Live recomp progress, keyed by sessionId. Written by the recomp paths (via
+     * the runner's `onRecompProgress` callback plus their own terminal updates)
+     * and read by `buildSidebarSnapshot` so the TUI sidebar + /ctx-status can
+     * show a live progress bar. In-memory only — a process restart interrupts
+     * the recomp anyway.
      */
     recompProgressBySession: Map<string, RecompProgress>;
     /** Live Dreamer progress keyed by project identity; kept only in process memory and not read from or written to the prompt/result cache. */
     dreamerProgressByProject: Map<string, DreamTaskProgress>;
     /**
-     * Sessions that are Magic Context's OWN hidden children (historian,
-     * dreamer and memory-migration). Detected at `session.created` by
+     * Sessions that are Magic Context's OWN hidden children (historian and
+     * dreamer). Detected at `session.created` by
      * the `magic-context-` title prefix. These sessions are fully exempt from
      * the message transform AND system-prompt injection — they have their own
      * fixed agent identity/prompt, never use ctx_reduce/nudges/compartments,

@@ -29,6 +29,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { harnessOwnsOpenCodeStore } from "../../shared/harness";
 import { log } from "../../shared/logger";
 import {
     assertOpenCodeStoreGeneration,
@@ -161,6 +162,9 @@ function isOpenCodeSchemaCompatible(db: Database, dbPath: string): boolean {
 }
 
 function getWritableOpenCodeDb(): Database {
+    if (!harnessOwnsOpenCodeStore()) {
+        throw new Error("OpenCode database is not writable from a Pi-compatible process");
+    }
     const resolution = resolveOpenCodeDbPath();
     const dbPath = resolution.path;
     if (cachedWriteDb?.path === dbPath) {
@@ -283,7 +287,17 @@ export function findBoundaryUserMessage(
                         AND COALESCE(json_extract(data, '$.finish'), '') = 'stop')
                AND COALESCE(json_extract(data, '$.role'), '') = 'user'
                AND (time_created < ? OR (time_created = ? AND id <= ?))
-             ORDER BY time_created DESC, id DESC
+                AND NOT (
+                    EXISTS (SELECT 1 FROM part p
+                            WHERE p.message_id = message.id AND p.session_id = message.session_id
+                              AND COALESCE(json_extract(p.data, '$.type'), '') <> 'compaction')
+                    AND NOT EXISTS (SELECT 1 FROM part p
+                                    WHERE p.message_id = message.id AND p.session_id = message.session_id
+                                      AND COALESCE(json_extract(p.data, '$.type'), '') <> 'compaction'
+                                      AND COALESCE(json_extract(p.data, '$.synthetic'), 0) <> 1
+                                      AND COALESCE(json_extract(p.data, '$.syntheticTodoMarker'), 0) <> 1)
+                )
+              ORDER BY time_created DESC, id DESC
              LIMIT 1`,
         )
         .get(sessionId, target.timeCreated, target.timeCreated, target.id) as
@@ -474,7 +488,7 @@ export function injectCompactionMarker(
         tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
         modelID: "magic-context",
         providerID: "magic-context",
-        time: { created: boundaryTime + 1 },
+        time: { created: boundaryTime + 1, completed: boundaryTime + 1 },
     });
 
     try {
@@ -536,7 +550,7 @@ export function injectCompactionMarker(
                 boundaryTime + 1,
                 JSON.stringify({ type: "text", text: args.summaryText }),
             );
-        })();
+        }).immediate();
 
         log(
             `[magic-context] compaction-marker: injected boundary at user msg ${boundary.id} (ordinal ~${args.endOrdinal}), summary msg ${summaryMsgId}`,
@@ -551,6 +565,41 @@ export function injectCompactionMarker(
     } catch (error) {
         log(
             `[magic-context] compaction-marker: injection failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return null;
+    }
+}
+
+/**
+ * Replace an existing marker and inject its successor under one host-store
+ * write lock. Acquiring that lock before the first DELETE avoids SQLite's
+ * read-to-write upgrade path, where SQLITE_BUSY does not honor busy_timeout.
+ */
+export function replaceCompactionMarker(
+    existing: CompactionMarkerState | null,
+    args: InjectCompactionMarkerArgs,
+): CompactionMarkerState | null {
+    const db = getWritableOpenCodeDb();
+    try {
+        return db
+            .transaction(() => {
+                if (existing) {
+                    db.prepare("DELETE FROM part WHERE id = ?").run(existing.summaryPartId);
+                    db.prepare("DELETE FROM message WHERE id = ?").run(existing.summaryMessageId);
+                    db.prepare("DELETE FROM part WHERE id = ?").run(existing.compactionPartId);
+                }
+                const replacement = injectCompactionMarker(args);
+                if (!replacement) {
+                    throw new Error(
+                        `failed to inject replacement marker at ordinal ${args.endOrdinal}`,
+                    );
+                }
+                return replacement;
+            })
+            .immediate();
+    } catch (error) {
+        log(
+            `[magic-context] compaction-marker: atomic replacement failed: ${error instanceof Error ? error.message : String(error)}`,
         );
         return null;
     }
@@ -689,7 +738,7 @@ export function removeForeignCompactionMarker(
                 sessionId,
                 marker.compactionPartId,
             );
-        })();
+        }).immediate();
         return true;
     } catch (error) {
         log(
@@ -964,13 +1013,15 @@ export function removeMcOwnedCompactionMarkers(
         }
 
         // Caveat 1: compaction part + summary rows deleted TOGETHER.
-        const rows = db.transaction(() => {
-            let changed = deleteSummaries(summaryIds);
-            for (const partId of mcPartIds) {
-                changed += deletePart.run(sessionId, partId).changes;
-            }
-            return changed;
-        })();
+        const rows = db
+            .transaction(() => {
+                let changed = deleteSummaries(summaryIds);
+                for (const partId of mcPartIds) {
+                    changed += deletePart.run(sessionId, partId).changes;
+                }
+                return changed;
+            })
+            .immediate();
         if (rows > 0 || summaryIds.size > 0 || mcPartIds.length > 0) {
             removedLineages += 1;
             removedRows += rows;
@@ -989,7 +1040,7 @@ export function removeMcOwnedCompactionMarkers(
         if (survivingPartsReferenceDeletion || messageFieldReferencesDeletion) {
             retainedLineages += 1;
         } else {
-            const rows = db.transaction(() => deleteSummaries(orphanSummaryIds))();
+            const rows = db.transaction(() => deleteSummaries(orphanSummaryIds)).immediate();
             removedLineages += 1;
             removedRows += rows;
         }
@@ -1020,7 +1071,7 @@ export function removeCompactionMarker(state: CompactionMarkerState): boolean {
             db.prepare("DELETE FROM part WHERE id = ?").run(state.summaryPartId);
             db.prepare("DELETE FROM message WHERE id = ?").run(state.summaryMessageId);
             db.prepare("DELETE FROM part WHERE id = ?").run(state.compactionPartId);
-        })();
+        }).immediate();
         return true;
     } catch (error) {
         log(

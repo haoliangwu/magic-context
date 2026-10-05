@@ -37,7 +37,9 @@
       "prompt too long; exceeded (?:max )?context length",
       "too large for model with \\d+ maximum context length",
       "model_context_window_exceeded",
-      "context size has been exceeded"
+      "context size has been exceeded",
+      "prepared prompt exceeds engine max_context",
+      "prompt exceeds (?:the )?.{0,32}\\bmax_context\\b"
     ]
   },
   "parse_ttl_cases": [
@@ -476,6 +478,17 @@
       }
     },
     {
+      "label": "gemini-parenthesized",
+      "input": "The input token count (123456) exceeds the maximum number of tokens allowed (100000).",
+      "expected_message": "The input token count (123456) exceeds the maximum number of tokens allowed (100000).",
+      "expected": {
+        "is_overflow": true,
+        "reported_limit": 100000,
+        "reported_limit_provenance": "prompt_only",
+        "matched_pattern": "input token count.*exceeds the maximum"
+      }
+    },
+    {
       "label": "xai",
       "input": "the maximum prompt length is 256000 tokens but the prompt was 300000",
       "expected_message": "the maximum prompt length is 256000 tokens but the prompt was 300000",
@@ -643,6 +656,33 @@
       }
     },
     {
+      "label": "ninfer",
+      "input": "AI_APICallError: prepared prompt exceeds Engine max_context 262144",
+      "expected_message": "AI_APICallError: prepared prompt exceeds Engine max_context 262144",
+      "expected": {
+        "is_overflow": true,
+        "reported_limit": 262144,
+        "reported_limit_provenance": "unknown",
+        "matched_pattern": "prepared prompt exceeds engine max_context"
+      }
+    },
+    {
+      "label": "rate-limit",
+      "input": "Rate limit exceeded",
+      "expected_message": "Rate limit exceeded",
+      "expected": {
+        "is_overflow": false
+      }
+    },
+    {
+      "label": "auth",
+      "input": "Invalid API key",
+      "expected_message": "Invalid API key",
+      "expected": {
+        "is_overflow": false
+      }
+    },
+    {
       "label": "nested-provider-error",
       "input": {
         "error": {
@@ -708,6 +748,14 @@
       "expected": {
         "value": 32768,
         "provenance": "combined"
+      }
+    },
+    {
+      "label": "ninfer max context",
+      "message": "AI_APICallError: prepared prompt exceeds Engine max_context 262144",
+      "expected": {
+        "value": 262144,
+        "provenance": "unknown"
       }
     },
     {

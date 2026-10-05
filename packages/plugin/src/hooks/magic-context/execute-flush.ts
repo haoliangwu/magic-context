@@ -23,7 +23,7 @@ export function executeFlush(db: Database, sessionId: string): string {
                 removePendingOp(db, sessionId, op.tagId);
                 dropped++;
             }
-        })();
+        }).immediate();
 
         const parts: string[] = [];
         if (dropped > 0) parts.push(`${dropped} dropped`);

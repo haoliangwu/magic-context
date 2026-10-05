@@ -235,7 +235,6 @@ Prisjećanje radi **kroz sesije** (nova sesija nasljeđuje sve) i **kroz harness
 | `/ctx-status` | Debug prikaz: tags, pending drops, cache TTL, nudge stanje, historian napredak, pokrivenost kompartimenata, budžet historije |
 | `/ctx-flush` | Odmah forsiraj sve operacije u redu, zaobilazeći cache TTL |
 | `/ctx-recomp` | Ponovo izgradi kompartmente iz sirove historije (prima `start-end` raspon). Koristi kada pohranjeno stanje izgleda pogrešno |
-| `/ctx-session-upgrade` | Nadogradi ovu sesiju na najnoviji format historije: ponovo izgradi kompartmente i migriraj projektne memorije |
 | `/ctx-dream` | Pokreni dreamer održavanje na zahtjev: održavaj memoriju, docs, smart notes i user-profile review |
 
 ---

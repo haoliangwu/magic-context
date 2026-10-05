@@ -2119,6 +2119,18 @@ body {
   color: var(--text-muted);
 }
 
+.config-live-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
 .config-field-desc {
   font-size: 11px;
   color: var(--text-secondary);

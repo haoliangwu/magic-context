@@ -30,23 +30,26 @@
  */
 
 import { Database } from "bun:sqlite";
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { TestHarness } from "../src/harness";
+import { afterAll, beforeAll, expect, it } from "bun:test";
+import {
+    createScenarioHarness,
+    forEachHost,
+    type ScenarioHarness,
+} from "../src/scenario-hosts";
 import { openTestDb } from "../src/test-db";
 
-let h: TestHarness;
+forEachHost(import.meta.url, "tag-owner collision repro (v3.3.1 Layer C)", (host) => {
+    let h: ScenarioHarness;
 
-beforeAll(async () => {
-    h = await TestHarness.create({
-        magicContextConfig: { protected_tags: 1 },
+    beforeAll(async () => {
+        h = await createScenarioHarness(host, {
+            magicContextConfig: { protected_tags: 1 },
+        });
     });
-});
 
-afterAll(async () => {
-    await h.dispose();
-});
-
-describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
+    afterAll(async () => {
+        await h.dispose();
+    });
     it("creates a session and applies migration v10", async () => {
         h.mock.setDefault({
             text: "first response",
@@ -113,10 +116,10 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
             // `messageId == callId`), so seeding both would have
             // unique-violated.
             const insert = writable.prepare(
-                "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, 'opencode')",
+                "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, ?)",
             );
-            insert.run(sessionId, "read:32", 100, 200, "m-asst-1");
-            insert.run(sessionId, "read:32", 200, 200, "m-asst-2");
+            insert.run(sessionId, "read:32", 100, 200, "m-asst-1", h.harnessId);
+            insert.run(sessionId, "read:32", 200, 200, "m-asst-2", h.harnessId);
 
             const tags = writable
                 .prepare(
@@ -137,12 +140,12 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
             // (same-callId, same-owner) insert. This is the DB-level
             // guard that defends the runtime invariant.
             expect(() =>
-                insert.run(sessionId, "read:32", 999, 200, "m-asst-1"),
+                insert.run(sessionId, "read:32", 999, 200, "m-asst-1", h.harnessId),
             ).toThrow(/UNIQUE/i);
 
             // ...but a third row with a NEW owner is fine. Cross-turn
             // collisions remain freely resolvable.
-            insert.run(sessionId, "read:32", 300, 200, "m-asst-3");
+            insert.run(sessionId, "read:32", 300, 200, "m-asst-3", h.harnessId);
             const after = writable
                 .prepare("SELECT COUNT(*) AS n FROM tags WHERE session_id = ?")
                 .get(sessionId) as { n: number };
@@ -169,10 +172,10 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
         // pragma-less handle hits "database is locked" before it can insert.
         try {
             const insert = writable.prepare(
-                "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', NULL, 'opencode')",
+                "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, harness) VALUES (?, ?, 'tool', ?, ?, 'read', NULL, ?)",
             );
-            insert.run(sessionId, "legacy:1", 1, 100);
-            insert.run(sessionId, "legacy:1", 2, 100); // same callId, same NULL owner — must succeed
+            insert.run(sessionId, "legacy:1", 1, 100, h.harnessId);
+            insert.run(sessionId, "legacy:1", 2, 100, h.harnessId); // same callId, same NULL owner — must succeed
 
             const tags = writable
                 .prepare(
@@ -200,10 +203,10 @@ describe("tag-owner collision repro (v3.3.1 Layer C)", () => {
         // pragma-less handle hits "database is locked" before it can insert.
         try {
             const insert = writable.prepare(
-                "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, status, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, 'active', 'opencode')",
+                "INSERT INTO tags (session_id, message_id, type, tag_number, byte_size, tool_name, tool_owner_message_id, status, harness) VALUES (?, ?, 'tool', ?, ?, 'read', ?, 'active', ?)",
             );
-            insert.run(sessionId, "read:32", 1, 200, "m-asst-1");
-            insert.run(sessionId, "read:32", 2, 200, "m-asst-2");
+            insert.run(sessionId, "read:32", 1, 200, "m-asst-1", h.harnessId);
+            insert.run(sessionId, "read:32", 2, 200, "m-asst-2", h.harnessId);
 
             // Simulate a drop op fired against tag 1.
             writable

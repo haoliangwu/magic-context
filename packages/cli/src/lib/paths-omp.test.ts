@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 import { getOmpNonGlobalConfigSources, getOmpPackageDir, resolveOmpPaths } from "./paths";
 
 const KEYS = [
@@ -19,7 +20,7 @@ let root: string;
 
 beforeEach(() => {
     for (const key of KEYS) original.set(key, process.env[key]);
-    root = mkdtempSync(join(tmpdir(), "mc-omp-paths-"));
+    root = createTestTempDirFromPath(join(tmpdir(), "mc-omp-paths-"));
     process.env.HOME = root;
     for (const key of KEYS.slice(1)) delete process.env[key];
 });

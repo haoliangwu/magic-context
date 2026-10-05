@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -9,8 +9,11 @@ import {
     runMigrations,
 } from "@magic-context/core/features/magic-context/storage";
 import { computeLegacyRustDirIdentity } from "@magic-context/core/features/magic-context/v22-deferred-backfill";
+import { resolveOpenCodeDbPath } from "@magic-context/core/shared/opencode-db-path";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
+import { openExistingContextDatabase } from "../lib/database-access";
 import {
     OPENCODE_PLUGIN_ENTRY_WITH_VERSION,
     OPENCODE_PLUGIN_NAME,
@@ -18,13 +21,20 @@ import {
 import { inspectPinnedOpenCodePluginSchemaFences } from "../lib/opencode-plugin-schema-fence";
 import { runV22BackfillCommands } from "../lib/v22-backfill-commands";
 import {
+    checkConfiguredVariantCatalog,
     checkUserMemoriesDreamerCompatibility,
     collectNpmReleaseAgeWarnings,
+    compareVersions,
     describeAutoUpdateStall,
+    describeOpenCode2SessionAPIRequirement,
     describeOpenCodeDatabaseDoctorCheck,
+    findUndeclaredConfiguredVariants,
+    formatSharedDbRowCounts,
     getUserNpmrcPath,
     isPinnedOpenCodePluginSpecifier,
     migrateLegacyAgentEnabledConfigForDoctor,
+    parseOpenCodeModelCatalog,
+    resolveNpmRegistryUrl,
 } from "./doctor-opencode";
 import { clearPluginCache } from "./doctor-opencode-cache";
 
@@ -36,6 +46,216 @@ function migrate(input: Record<string, unknown>) {
     });
     return { config: input, logs, result };
 }
+
+describe("OpenCode model catalog parsing", () => {
+    it("reports configured variants absent from the matching catalog model", () => {
+        const catalog = [{ providerID: "provider", id: "model", variants: { high: {} } }];
+        expect(
+            findUndeclaredConfiguredVariants(
+                [
+                    { agent: "historian", model: "provider/model", variant: "medium" },
+                    { agent: "dreamer", model: "provider/model", variant: "high" },
+                ],
+                catalog,
+            ),
+        ).toEqual([{ agent: "historian", model: "provider/model", variant: "medium" }]);
+    });
+    it("checks real v2 model.list variant IDs for both missing and declared variants", () => {
+        // Captured from OpenCode 2.0.12 in an isolated root with a dummy API key.
+        const output = readFileSync(
+            join(import.meta.dir, "fixtures/opencode-2.0.12-model-list.json"),
+            "utf8",
+        );
+        const warnings: string[] = [];
+        const args: string[][] = [];
+        checkConfiguredVariantCatalog(
+            {
+                historian: { opencode: { model: "anthropic/claude-opus-5-5", variant: "ultra" } },
+                dreamer: { opencode: { model: "anthropic/claude-opus-5-5", variant: "high" } },
+            },
+            "v2",
+            (message) => warnings.push(message),
+            (command) => {
+                args.push(command);
+                return { stdout: output, status: 0 };
+            },
+            "/tmp/project",
+        );
+        expect(args).toEqual([["api", "model.list", "--param", "directory=/tmp/project"]]);
+        expect(warnings).toEqual([
+            "historian model anthropic/claude-opus-5-5 requests variant 'ultra', which this host does not offer. Remove the variant or choose one listed by opencode api model.list --param directory=/tmp/project.",
+        ]);
+    });
+    it("names the background service startup command when v2 cannot read a catalog", () => {
+        const warnings: string[] = [];
+        checkConfiguredVariantCatalog(
+            { dreamer: { opencode: { model: "provider/model", variant: "high" } } },
+            "v2",
+            (message) => warnings.push(message),
+            () => ({ stdout: "", status: 1 }),
+            "/tmp/project",
+        );
+        expect(warnings).toEqual([
+            "Could not verify configured hidden-agent models and variants: this OpenCode host did not provide a readable model catalog. Start the background service with opencode service start, then check opencode api model.list --param directory=/tmp/project.",
+        ]);
+    });
+    it("warns when a historian, dreamer or fallback model is not in the v2 host catalog", () => {
+        // Captured from OpenCode 2.0.12 in an isolated root with a dummy API key;
+        // only the anthropic provider is configured there.
+        const output = readFileSync(
+            join(import.meta.dir, "fixtures/opencode-2.0.12-model-list.json"),
+            "utf8",
+        );
+        const warnings: string[] = [];
+        checkConfiguredVariantCatalog(
+            {
+                // No variant anywhere: the model check must not depend on one.
+                historian: { model: "opencode-go/muse-spark-1.3-contributor" },
+                dreamer: {
+                    opencode: {
+                        model: "anthropic/claude-opus-5-5",
+                        fallback_models: ["anthropic/not-a-model"],
+                    },
+                },
+            },
+            "v2",
+            (message) => warnings.push(message),
+            () => ({ stdout: output, status: 0 }),
+            "/tmp/project",
+        );
+        expect(warnings).toEqual([
+            "historian model opencode-go/muse-spark-1.3-contributor names provider 'opencode-go', which this OpenCode host does not have. The historian cannot run on it; configure that provider in OpenCode or choose a model listed by opencode api model.list --param directory=/tmp/project.",
+            "dreamer fallback model anthropic/not-a-model is not offered by provider 'anthropic' on this OpenCode host. The dreamer cannot run on it; choose a model listed by opencode api model.list --param directory=/tmp/project.",
+        ]);
+    });
+    it("reports unknown models from the v1 verbose catalog too", () => {
+        const warnings: string[] = [];
+        checkConfiguredVariantCatalog(
+            { historian: { opencode: { model: "missing/model" } } },
+            "v1",
+            (message) => warnings.push(message),
+            () => ({
+                stdout: 'provider/model\n{\n  "id": "model",\n  "providerID": "provider",\n  "variants": {}\n}',
+                status: 0,
+            }),
+        );
+        expect(warnings).toEqual([
+            "historian model missing/model names provider 'missing', which this OpenCode host does not have. The historian cannot run on it; configure that provider in OpenCode or choose a model listed by opencode models --verbose.",
+        ]);
+    });
+    it("flags the unsupported DeepSeek dreamer name when absent from the host catalog", () => {
+        const config = {
+            historian: { opencode: { model: "deepseek/deepseek-flash" } },
+            dreamer: { opencode: { model: "deepseek/deepseek-v4-flash" } },
+        };
+        const catalog = (ids: string[]) =>
+            ids
+                .map(
+                    (id) =>
+                        `deepseek/${id}\n${JSON.stringify({ id, providerID: "deepseek", variants: {} }, null, 2)}`,
+                )
+                .join("\n");
+        const warnings: string[] = [];
+        checkConfiguredVariantCatalog(
+            config,
+            "v1",
+            (message) => warnings.push(message),
+            () => ({
+                stdout: catalog(["deepseek-flash", "deepseek-v4-pro"]),
+                status: 0,
+            }),
+        );
+        expect(warnings).toEqual([
+            "dreamer model deepseek/deepseek-v4-flash is not offered by provider 'deepseek' on this OpenCode host. The dreamer cannot run on it; choose a model listed by opencode models --verbose.",
+        ]);
+        warnings.length = 0;
+        checkConfiguredVariantCatalog(
+            config,
+            "v1",
+            (message) => warnings.push(message),
+            () => ({
+                stdout: catalog(["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"]),
+                status: 0,
+            }),
+        );
+        // Catalog validation cannot detect a provider rejection of an advertised ID.
+        expect(warnings).toEqual([]);
+    });
+
+    it("retains the v1 verbose catalog check", () => {
+        const args: string[][] = [];
+        checkConfiguredVariantCatalog(
+            { historian: { opencode: { model: "provider/model", variant: "high" } } },
+            "v1",
+            () => {},
+            (command) => {
+                args.push(command);
+                return {
+                    stdout: 'provider/model\n{\n  "id": "model",\n  "providerID": "provider",\n  "variants": { "high": {} }\n}',
+                    status: 0,
+                };
+            },
+        );
+        expect(args).toEqual([["models", "--verbose"]]);
+    });
+    it("reads model variants from verbose CLI output", () => {
+        expect(
+            parseOpenCodeModelCatalog(
+                `provider/model\n{\n  "id": "model",\n  "providerID": "provider",\n  "variants": {\n    "medium": {}\n  }\n}`,
+            ),
+        ).toEqual([{ providerID: "provider", id: "model", variants: { medium: {} } }]);
+    });
+});
+
+describe("doctor shared DB row counts", () => {
+    it("counts rows still in the write-ahead log through the read-only open", () => {
+        const dir = createTestTempDirFromPath(join(tmpdir(), "mc-doctor-wal-"));
+        const path = join(dir, "context.db");
+        const writer = new Database(path);
+        try {
+            initializeDatabase(writer);
+            runMigrations(writer);
+            // Keep every new row in the WAL, as a running plugin does between
+            // checkpoints.
+            writer.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;");
+            for (let index = 0; index < 5; index++) {
+                writer
+                    .prepare(
+                        `INSERT INTO memories
+                            (project_path, category, content, normalized_hash, first_seen_at, created_at, updated_at, last_seen_at)
+                         VALUES ('dir:6fb76e42d6dd', 'CONSTRAINTS', ?, ?, 1, 1, 1, 1)`,
+                    )
+                    .run(`content-${index}`, `hash-${index}`);
+            }
+            expect(statSync(`${path}-wal`).size).toBeGreaterThan(0);
+            const reader = openExistingContextDatabase(path, { readonly: true });
+            if (!reader) throw new Error("context DB vanished");
+            try {
+                expect(formatSharedDbRowCounts(reader)).toContain("memories=5");
+            } finally {
+                reader.close();
+            }
+        } finally {
+            writer.close();
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+    it("reports an unreadable count as n/a with its reason instead of 0", () => {
+        const db = {
+            prepare(sql: string) {
+                return {
+                    get() {
+                        if (sql.includes("memories")) throw new Error("database is locked");
+                        return { c: 3 };
+                    },
+                };
+            },
+        };
+        expect(formatSharedDbRowCounts(db)).toBe(
+            "tags=3, compartments=3, memories=n/a (database is locked), notes=3, dream_runs=3",
+        );
+    });
+});
 
 describe("OpenCode database doctor surface", () => {
     it("reports the resolved path on success and the explicit candidate on failure", () => {
@@ -53,6 +273,37 @@ describe("OpenCode database doctor surface", () => {
             message:
                 "FAIL OpenCode session database: not found (looked for /tmp/custom-opencode.db); set OPENCODE_DB if OpenCode stores it elsewhere.",
         });
+    });
+});
+
+describe("doctor OpenCode 2 database path", () => {
+    it("uses an absolute OPENCODE_DB as is, like OpenCode 2 does", () => {
+        const dataHome = createTestTempDirFromPath(join(tmpdir(), "mc-doctor-db-"));
+        try {
+            const absolute = join(dataHome, "elsewhere", "opencode.db");
+            const resolution = resolveOpenCodeDbPath("v2", {
+                dataHome,
+                env: { OPENCODE_DB: absolute },
+            });
+            expect(resolution.path).toBe(absolute);
+            expect(
+                resolveOpenCodeDbPath("v2", { dataHome, env: { OPENCODE_DB: "custom.db" } }).path,
+            ).toBe(join(dataHome, "opencode", "custom.db"));
+        } finally {
+            rmSync(dataHome, { recursive: true, force: true });
+        }
+    });
+});
+
+describe("doctor npm registry", () => {
+    it("asks the registry OpenCode installs from", () => {
+        expect(resolveNpmRegistryUrl({})).toBe("https://registry.npmjs.org");
+        expect(resolveNpmRegistryUrl({ npm_config_registry: "http://127.0.0.1:4873/" })).toBe(
+            "http://127.0.0.1:4873",
+        );
+        expect(resolveNpmRegistryUrl({ NPM_CONFIG_REGISTRY: "https://mirror.example" })).toBe(
+            "https://mirror.example",
+        );
     });
 });
 
@@ -181,7 +432,7 @@ let originalNpmUserConfig: string | undefined;
 let originalOpenCodeConfigDir: string | undefined;
 
 function makeTempDir(prefix = "mc-v22-doctor-"): string {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     return dir;
 }
@@ -282,6 +533,9 @@ function createCachedOpenCodePlugin(
     return pluginCachePath;
 }
 
+/** Probe stand-in for a machine where no OpenCode process is running. */
+const noOpenCodeRunning = () => ({ status: "free" as const });
+
 describe("doctor OpenCode plugin cache", () => {
     it("clears stale @latest cache when cached plugin is older than npm latest", async () => {
         const cacheRoot = makeTempDir("mc-opencode-cache-");
@@ -289,7 +543,10 @@ describe("doctor OpenCode plugin cache", () => {
         process.env.XDG_CACHE_HOME = cacheRoot;
         const pluginCachePath = createCachedOpenCodePlugin(cacheRoot, "0.26.0");
 
-        const result = await clearPluginCache({ latestVersion: "0.29.1" });
+        const result = await clearPluginCache(
+            { latestVersion: "0.29.1" },
+            { probe: noOpenCodeRunning },
+        );
 
         expect(result).toMatchObject({
             action: "cleared",
@@ -306,7 +563,10 @@ describe("doctor OpenCode plugin cache", () => {
         process.env.XDG_CACHE_HOME = cacheRoot;
         const pluginCachePath = createCachedOpenCodePlugin(cacheRoot, "0.29.1");
 
-        const result = await clearPluginCache({ latestVersion: "0.29.1" });
+        const result = await clearPluginCache(
+            { latestVersion: "0.29.1" },
+            { probe: noOpenCodeRunning },
+        );
 
         expect(result).toMatchObject({
             action: "up_to_date",
@@ -328,7 +588,10 @@ describe("doctor OpenCode plugin cache", () => {
             OPENCODE_PLUGIN_NAME,
         );
 
-        const result = await clearPluginCache({ latestVersion: "0.29.1" });
+        const result = await clearPluginCache(
+            { latestVersion: "0.29.1" },
+            { probe: noOpenCodeRunning },
+        );
 
         expect(result).toMatchObject({
             action: "cleared",
@@ -347,7 +610,10 @@ describe("doctor OpenCode plugin cache", () => {
         process.env.XDG_CACHE_HOME = cacheRoot;
         const pluginCachePath = createCachedOpenCodePlugin(cacheRoot, "0.29.1");
 
-        const result = await clearPluginCache({ latestVersion: null });
+        const result = await clearPluginCache(
+            { latestVersion: null },
+            { probe: noOpenCodeRunning },
+        );
 
         expect(result).toMatchObject({
             action: "check_unavailable",
@@ -365,7 +631,10 @@ describe("doctor OpenCode plugin cache", () => {
         process.env.XDG_CACHE_HOME = cacheRoot;
         const pluginCachePath = createCachedOpenCodePlugin(cacheRoot, "0.29.1");
 
-        const result = await clearPluginCache({ force: true, latestVersion: null });
+        const result = await clearPluginCache(
+            { force: true, latestVersion: null },
+            { probe: noOpenCodeRunning },
+        );
 
         expect(result).toMatchObject({
             action: "cleared",
@@ -394,6 +663,7 @@ describe("doctor OpenCode plugin cache", () => {
         const result = await clearPluginCache(
             { latestVersion: "0.29.1" },
             {
+                probe: noOpenCodeRunning,
                 remove: (path) => {
                     if (path === versionlessCachePath) {
                         throw new Error("EACCES: permission denied");
@@ -414,6 +684,52 @@ describe("doctor OpenCode plugin cache", () => {
         });
         expect(removed).toEqual([latestCachePath]);
         expect(existsSync(latestCachePath)).toBe(false);
+    });
+});
+
+describe("doctor OpenCode 1 plugin cache while OpenCode runs", () => {
+    it("leaves an outdated cache in place while an OpenCode process holds the host database", async () => {
+        const cacheRoot = makeTempDir("mc-opencode-cache-");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = cacheRoot;
+        const pluginCachePath = createCachedOpenCodePlugin(cacheRoot, "0.26.0");
+        const hostFiles = ["/host/opencode.db", "/host/opencode.db-wal"];
+        const probed: Array<{ files: string[]; directories: string[] }> = [];
+        const removed: string[] = [];
+
+        const result = await clearPluginCache(
+            { latestVersion: "0.29.1", hostFiles },
+            {
+                probe: (targets) => {
+                    probed.push(targets);
+                    return { status: "in_use", pids: [4242] };
+                },
+                remove: (path) => removed.push(path),
+            },
+        );
+
+        expect(result).toMatchObject({ action: "in_use", pids: [4242], path: pluginCachePath });
+        expect(probed).toEqual([{ files: hostFiles, directories: [pluginCachePath] }]);
+        expect(removed).toEqual([]);
+        expect(existsSync(pluginCachePath)).toBe(true);
+    });
+
+    it("leaves the cache in place when it cannot tell whether OpenCode is running", async () => {
+        const cacheRoot = makeTempDir("mc-opencode-cache-");
+        originalXdgCacheHome = process.env.XDG_CACHE_HOME;
+        process.env.XDG_CACHE_HOME = cacheRoot;
+        const pluginCachePath = createCachedOpenCodePlugin(cacheRoot, "0.26.0");
+
+        const result = await clearPluginCache(
+            { force: true, latestVersion: null, hostFiles: [] },
+            { probe: () => ({ status: "unknown", reason: "could not run lsof (ENOENT)" }) },
+        );
+
+        expect(result).toMatchObject({
+            action: "in_use_unknown",
+            reason: "could not run lsof (ENOENT)",
+        });
+        expect(existsSync(pluginCachePath)).toBe(true);
     });
 });
 
@@ -728,5 +1044,31 @@ describe("doctor v22 backfill commands", () => {
         expect(memory.project_path).toMatch(/^dir:[0-9a-f]{12}$/);
         expect(memory.project_path).not.toBe(oldIdentity);
         expect(messages.join("\n")).toContain("Re-keyed 1 row(s)");
+    });
+});
+
+it("names the installed OpenCode host and minimum native session API version", () => {
+    expect(describeOpenCode2SessionAPIRequirement("2.0.21")).toBe(
+        "OpenCode host 2.0.21; Magic Context requires OpenCode 2.0.22 or newer with session.remove and session.compact.",
+    );
+});
+
+describe("doctor CLI version comparison", () => {
+    it("ranks a prerelease below its release and above the previous release", () => {
+        expect(compareVersions("0.45.0-beta.1", "0.45.0")).toBeLessThan(0);
+        expect(compareVersions("0.45.0", "0.45.0-beta.1")).toBeGreaterThan(0);
+        expect(compareVersions("0.45.0-beta.1", "0.45.0-beta.3")).toBeLessThan(0);
+        expect(compareVersions("0.45.0-beta.1", "0.44.4")).toBeGreaterThan(0);
+    });
+
+    it("compares releases by their numeric parts", () => {
+        expect(compareVersions("0.44.4", "0.45.0")).toBeLessThan(0);
+        expect(compareVersions("0.45.0", "0.45.0")).toBe(0);
+        expect(compareVersions("1.0.0", "0.99.99")).toBeGreaterThan(0);
+    });
+
+    it("reports an unparseable version as not comparable instead of equal", () => {
+        expect(compareVersions("0.0.0-dev", "0.45.0")).toBeLessThan(0);
+        expect(compareVersions("not-a-version", "0.45.0")).toBeNull();
     });
 });

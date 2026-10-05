@@ -984,8 +984,8 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
         try {
             const first = { output: "first output" };
             await hook({ tool: "bash", sessionID: sessionId }, first);
-            expect(first.output).toContain("Housekeeping:");
-            expect(first.output).not.toContain("Reminder:");
+            expect(first.output).toContain("Make a ctx_reduce pass now");
+            expect(first.output).not.toContain("Still unstamped:");
 
             await hook({ tool: "ctx_reduce", sessionID: sessionId }, { output: "queued drops" });
             captureChannel1PostReduceGraceBaseline(db, sessionId, 60_000);
@@ -1013,8 +1013,8 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
             Object.assign(state, { baselineU: 85_000, turnDeltaT: 0 });
             const regrown = { output: "regrown" };
             await hook({ tool: "bash", sessionID: sessionId }, regrown);
-            expect(regrown.output).toContain("Reminder:");
-            expect(regrown.output).not.toContain("a ctx_reduce pass is due");
+            expect(regrown.output).toContain("Still unstamped:");
+            expect(regrown.output).not.toContain("before your next tool call");
             const evaluations = sessionLog.mock.calls
                 .filter(
                     (call) =>
@@ -1086,7 +1086,9 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
         try {
             const first = { output: "first output" };
             await hook({ tool: "bash", sessionID: sessionId }, first);
-            expect(first.output).toContain("Housekeeping: spent tool outputs (~50k tokens)");
+            expect(first.output).toContain(
+                "spent tool outputs (~50k tokens) are reclaimable. Make a ctx_reduce pass now",
+            );
             const frozenFirst = first.output;
             await hook({ tool: "bash", sessionID: sessionId }, first);
             expect(first.output).toBe(frozenFirst);
@@ -1115,17 +1117,17 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
             const sticky = { output: "five turns later" };
             await hook({ tool: "bash", sessionID: sessionId }, sticky);
             expect(sticky.output).toContain(
-                "Reminder: spent tool outputs (~110k tokens) are still reclaimable",
+                "Still unstamped: spent tool outputs (~110k tokens). Stamp the ones you've used",
             );
-            expect(sticky.output).not.toContain("a ctx_reduce pass is due");
+            expect(sticky.output).not.toContain("before your next tool call");
 
             channel1StateBySession.set(sessionId, state(120_000, 180_000, 6));
             const escalation = { output: "fourth output" };
             await hook({ tool: "bash", sessionID: sessionId }, escalation);
             expect(escalation.output).toContain(
-                "Housekeeping backlog: spent tool outputs (~120k tokens)",
+                "spent tool outputs (~120k tokens) are still unstamped. Call ctx_reduce now, before your next tool call",
             );
-            expect(escalation.output).not.toContain("Reminder: spent tool outputs");
+            expect(escalation.output).not.toContain("Still unstamped: spent tool outputs");
         } finally {
             closeQuietly(db);
         }
@@ -1163,7 +1165,7 @@ describe("createToolExecuteAfterHook Channel-1 dampening", () => {
             const output = { output: "legacy output" };
             await hook({ tool: "bash", sessionID: sessionId }, output);
             expect(output.output).toContain(
-                "Reminder: spent tool outputs (~80k tokens) are still reclaimable",
+                "Still unstamped: spent tool outputs (~80k tokens). Stamp the ones you've used",
             );
             expect(
                 db

@@ -1,7 +1,52 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import * as logger from "../../shared/logger";
 import { parseCompartmentOutput } from "./compartment-parser";
 
 describe("parseCompartmentOutput — v2 5-category facts", () => {
+    it("logs every unknown category block and counts rejected facts", () => {
+        const logged = spyOn(logger, "log").mockImplementation(() => {});
+        // Another file can module-mock the logger. Bun then reuses that mock
+        // for spyOn, including calls made before this test installed its spy.
+        logged.mockClear();
+        try {
+            const parsed = parseCompartmentOutput(`<output><facts>
+<PROJECT_RULES>\n* Keep valid fact.\n</PROJECT_RULES>
+<PROJECT_RULS>\n* Lost one\n* Lost two\n</PROJECT_RULS>
+<USER_DIRECTIVES>\n* Legacy fact\n</USER_DIRECTIVES>
+<project-ruls>\n* Lowercase typo\n</project-ruls>
+</facts></output>`);
+            expect(parsed.facts).toHaveLength(1);
+            expect(parsed.droppedFactBlocks).toBe(3);
+            expect(parsed.droppedFacts).toBe(4);
+            expect(logged.mock.calls.map(([message]) => message)).toEqual([
+                "[historian] Dropped <facts> category PROJECT_RULS (2 facts)",
+                "[historian] Dropped <facts> category USER_DIRECTIVES (1 facts)",
+                "[historian] Dropped <facts> category project-ruls (1 facts)",
+            ]);
+        } finally {
+            logged.mockRestore();
+        }
+    });
+    it("logs only fallback tags containing facts", () => {
+        const logged = spyOn(logger, "log").mockImplementation(() => {});
+        logged.mockClear();
+        try {
+            const parsed = parseCompartmentOutput(`<output>
+<PROJECT_RULS>\n* One\n* Two\n</PROJECT_RULS>
+<unprocessed_from>12</unprocessed_from>
+</output>`);
+            expect(parsed.facts).toEqual([]);
+            expect(parsed.unprocessedFrom).toBe(12);
+            expect(parsed.droppedFactBlocks).toBe(1);
+            expect(parsed.droppedFacts).toBe(2);
+            expect(logged.mock.calls.map(([message]) => message)).toEqual([
+                "[historian] Dropped <facts> category PROJECT_RULS (2 facts)",
+            ]);
+        } finally {
+            logged.mockRestore();
+        }
+    });
+
     it("parses each of the 5 world categories", () => {
         const parsed = parseCompartmentOutput(`
 <output>
@@ -428,5 +473,126 @@ the full p1 narrative
         const c = parsed.compartments[0];
         expect(c.p1).toBeUndefined();
         expect(c.content).toBe("just flat content, no tiers here");
+    });
+});
+
+describe("parseCompartmentOutput — body text and attribute robustness", () => {
+    const tiers = (p1: string) => `<p1>${p1}</p1>\n<p2>short</p2>\n<p3>shorter</p3>\n<p4/>`;
+
+    it("keeps a compartment whose title contains a raw '>'", () => {
+        const parsed = parseCompartmentOutput(`<output><compartments>
+<compartment start="1" end="2" title="Migrate store -> SQLite" episode_type="feature" importance="50">
+${tiers("moved storage")}
+</compartment>
+</compartments><meta><unprocessed_from>3</unprocessed_from></meta></output>`);
+        expect(parsed.compartments).toHaveLength(1);
+        expect(parsed.compartments[0].title).toBe("Migrate store -> SQLite");
+        expect(parsed.compartments[0].episodeType).toBe("feature");
+        expect(parsed.compartments[0].importance).toBe(50);
+    });
+
+    it("decodes each XML entity exactly once", () => {
+        const parsed = parseCompartmentOutput(`<output><compartments>
+<compartment start="1" end="2" title="A &amp;lt; B">
+${tiers("Use &amp;lt; entity &amp;amp; &lt;tag&gt;")}
+</compartment>
+</compartments>
+<primer_candidates><primer at_compartment="1">What is &amp;quot;?</primer></primer_candidates>
+</output>`);
+        expect(parsed.compartments[0].title).toBe("A &lt; B");
+        expect(parsed.compartments[0].p1).toBe("Use &lt; entity &amp; <tag>");
+        expect(parsed.primerCandidates[0].question).toBe("What is &quot;?");
+    });
+    it("keeps literal tier tags inside a tier body as text", () => {
+        const parsed = parseCompartmentOutput(`<output><compartments>
+<compartment start="1" end="2" title="Tier tags">
+<p1>Discussed <p2> tags vs <pre> and the </p1> close</p1>
+<p2>Tier tag talk</p2>
+<p3>Tags</p3>
+<p4>mentions <p1> again</p4>
+</compartment>
+</compartments></output>`);
+        const c = parsed.compartments[0];
+        expect(c.p1).toBe("Discussed <p2> tags vs <pre> and the </p1> close");
+        expect(c.p2).toBe("Tier tag talk");
+        expect(c.p3).toBe("Tags");
+        expect(c.p4).toBe("mentions <p1> again");
+    });
+
+    it("keeps literal </compartment> and side-channel tags inside a body as text", () => {
+        const parsed = parseCompartmentOutput(`<output><compartments>
+<compartment start="1" end="2" title="XML format">
+<p1>Each block ends with </compartment> and facts go in <facts> or <events>.</p1>
+<p2>Format</p2>
+<p3>Format</p3>
+<p4/>
+</compartment>
+<compartment start="3" end="4" title="Next">
+${tiers("next work")}
+</compartment>
+</compartments>
+<facts>
+<PROJECT_RULES>
+* Real fact.
+</PROJECT_RULES>
+</facts>
+<events><causal_incident at_compartment="2"><summary>Real event.</summary></causal_incident></events>
+<meta><unprocessed_from>5</unprocessed_from></meta>
+</output>`);
+        expect(parsed.compartments.map((c) => c.title)).toEqual(["XML format", "Next"]);
+        expect(parsed.compartments[0].p1).toBe(
+            "Each block ends with </compartment> and facts go in <facts> or <events>.",
+        );
+        expect(parsed.facts).toEqual([{ category: "PROJECT_RULES", content: "Real fact." }]);
+        expect(parsed.events).toEqual([
+            { kind: "causal_incident", atCompartment: 2, fields: { summary: "Real event." } },
+        ]);
+        expect(parsed.unprocessedFrom).toBe(5);
+    });
+
+    it("remaps event and primer anchors when compartments are emitted out of order", () => {
+        const parsed = parseCompartmentOutput(`<output><compartments>
+<compartment start="3" end="4" title="Later">
+${tiers("later work")}
+</compartment>
+<compartment start="1" end="2" title="Earlier">
+${tiers("earlier work")}
+</compartment>
+</compartments>
+<events><causal_incident at_compartment="1"><summary>About later.</summary></causal_incident>
+<trajectory_correction at_compartment="2"><summary>About earlier.</summary></trajectory_correction>
+<causal_incident at_compartment="7"><summary>Out of range.</summary></causal_incident></events>
+<primer_candidates><primer at_compartment="1">How does the later work fit?</primer></primer_candidates>
+</output>`);
+        expect(parsed.compartments.map((c) => c.title)).toEqual(["Earlier", "Later"]);
+        expect(parsed.events.map((e) => [e.fields.summary, e.atCompartment])).toEqual([
+            ["About later.", 2],
+            ["About earlier.", 1],
+            ["Out of range.", 7],
+        ]);
+        expect(parsed.primerCandidates).toEqual([
+            { question: "How does the later work fit?", originCompartmentIndex: 2 },
+        ]);
+    });
+});
+
+describe("parseCompartmentOutput — side channels are read outside compartment bodies", () => {
+    it("ignores side-channel markup quoted inside a compartment body", () => {
+        const parsed = parseCompartmentOutput(`<output><compartments>
+<compartment start="1" end="2" title="Format docs">
+<p1>The example was <events><causal_incident at_compartment="1"><summary>Fake.</summary></causal_incident></events> and <unprocessed_from>9</unprocessed_from> and <primer_candidates><primer at_compartment="1">Fake?</primer></primer_candidates>.</p1>
+<p2>Format</p2>
+<p3>Format</p3>
+<p4/>
+</compartment>
+</compartments>
+<events><causal_incident at_compartment="1"><summary>Real.</summary></causal_incident></events>
+<primer_candidates><primer at_compartment="1">Real?</primer></primer_candidates>
+<meta><unprocessed_from>3</unprocessed_from></meta>
+</output>`);
+        expect(parsed.compartments[0].p1).toContain("<unprocessed_from>9</unprocessed_from>");
+        expect(parsed.events.map((e) => e.fields.summary)).toEqual(["Real."]);
+        expect(parsed.primerCandidates.map((p) => p.question)).toEqual(["Real?"]);
+        expect(parsed.unprocessedFrom).toBe(3);
     });
 });

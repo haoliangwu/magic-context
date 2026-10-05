@@ -1,11 +1,13 @@
 /// <reference types="bun-types" />
 
 import { beforeEach, describe, expect, it, mock } from "bun:test";
+import markerParity from "../../../../../testdata/marker-only-parity.json";
 import {
     clearOldReasoning,
     findLatestAssistantReasoningMutationExemptMessage,
     findMergedReasoningStripCandidateIds,
     findMergedReasoningStripDecisions,
+    isMarkerOnlyText,
     replayStrippedInlineThinking,
     stripClearedReasoning,
     stripDroppedPlaceholderMessages,
@@ -525,6 +527,61 @@ describe("strip-content", () => {
     });
 
     describe("stripDroppedPlaceholderMessages (sentinel-based)", () => {
+        it("classifies the shared marker-only parity examples", () => {
+            for (const text of markerParity.positive) expect(isMarkerOnlyText(text)).toBe(true);
+            for (const text of markerParity.negative) expect(isMarkerOnlyText(text)).toBe(false);
+        });
+
+        it("neutralizes the shared blank and marker part combinations", () => {
+            for (const parts of markerParity.positivePartCombinations) {
+                const assistant = message(
+                    "mixed",
+                    "assistant",
+                    parts.map((text) => ({ type: "text", text })),
+                );
+                expect(
+                    stripDroppedPlaceholderMessages([assistant], "openai-compatible").sentineledIds,
+                ).toEqual(["mixed"]);
+                expect(assistant.parts).toEqual([WHOLE_MESSAGE_SENTINEL]);
+            }
+        });
+
+        it("neutralizes only marker-only non-metadata parts and keeps tools and users", () => {
+            const assistant = message("a", "assistant", [
+                { type: "text", text: "§672§ [dropped §672§]" },
+                { type: "reasoning", text: "[cleared]" },
+                { type: "step-start" },
+            ]);
+            const tool = message("t", "assistant", [
+                { type: "text", text: "[cleared]" },
+                { type: "tool", name: "run" },
+            ]);
+            const user = message("u", "user", [{ type: "text", text: "§655§ [cleared]" }]);
+            expect(stripDroppedPlaceholderMessages([assistant, tool, user]).sentineledIds).toEqual([
+                "a",
+            ]);
+            expect(assistant.parts).toEqual([WHOLE_MESSAGE_SENTINEL]);
+            expect(tool.parts).toHaveLength(2);
+            expect(user.parts).toHaveLength(1);
+        });
+
+        for (const [providerID, sentinel] of [
+            ["anthropic", SENTINEL],
+            ["openai-compatible", WHOLE_MESSAGE_SENTINEL],
+        ] as const) {
+            it(`keeps the final marker-only assistant as a provider-safe shell for ${providerID}`, () => {
+                const messages = [
+                    message("u", "user", [{ type: "text", text: "continue" }]),
+                    message("last", "assistant", [{ type: "text", text: "§655§ [cleared]" }]),
+                ];
+                expect(stripDroppedPlaceholderMessages(messages, providerID).sentineledIds).toEqual(
+                    ["last"],
+                );
+                expect(messages).toHaveLength(2);
+                expect(messages.at(-1)?.parts).toEqual([sentinel]);
+            });
+        }
+
         describe("#given a user message whose only text is a dropped placeholder", () => {
             it("#then it keeps the user message shell UNCHANGED (turn boundary preserved)", () => {
                 const user = message("m-u", "user", [{ type: "text", text: "[dropped §5§]" }]);

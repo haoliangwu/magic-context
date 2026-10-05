@@ -90,6 +90,48 @@ describe("todowrite tool rendering", () => {
 			renderCall({ todos } as never, identityTheme, {} as never).render(80)[0],
 		).toContain("Todos — 3 active");
 	});
+	it("formats a result's rows once per width instead of on every frame", async () => {
+		const tool = createTodowriteTool();
+		const todos = [
+			{ id: "a", content: "Plan", status: "pending", priority: "high" },
+			{ id: "b", content: "Build", status: "in_progress", priority: "medium" },
+		];
+		const result = await tool.execute(
+			"call-memo",
+			{ todos } as never,
+			undefined,
+			undefined,
+			{} as never,
+		);
+		let themeCalls = 0;
+		const countingTheme = {
+			...(identityTheme as Record<string, unknown>),
+			fg: (_color: string, text: string) => {
+				themeCalls += 1;
+				return text;
+			},
+		} as never;
+		const renderResult = tool.renderResult;
+		if (!renderResult) throw new Error("todowrite renderResult missing");
+		const component = renderResult(
+			result,
+			{ expanded: false, isPartial: false },
+			countingTheme,
+			{} as never,
+		);
+		const first = component.render(120);
+		const afterFirst = themeCalls;
+		expect(afterFirst).toBeGreaterThan(0);
+		for (let frame = 0; frame < 50; frame += 1) component.render(120);
+		expect(themeCalls).toBe(afterFirst);
+		expect(component.render(120)).toEqual(first);
+		component.render(60);
+		expect(themeCalls).toBeGreaterThan(afterFirst);
+		const afterResize = themeCalls;
+		component.invalidate();
+		component.render(60);
+		expect(themeCalls).toBeGreaterThan(afterResize);
+	});
 	it("uses cached todos when the transcript component was created with empty args", () => {
 		const tool = createTodowriteTool();
 		const renderCall = tool.renderCall;

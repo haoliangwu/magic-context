@@ -114,11 +114,17 @@ fn load_pre_fix_reasoning_fixture(dir: &std::path::Path) -> (McStore, TransformR
     request.messages =
         crate::codec::decode_opencode(request.native_messages.as_ref().unwrap()).messages;
     let db = store(dir);
-    // The captured database predates the tool-result codec epoch. Advance only that
-    // identity component so these fixtures continue to isolate reasoning replay behavior.
+    // The captured database predates the tool-result codec and memory-render epochs.
+    // Advance those identity components so these fixtures continue to isolate reasoning
+    // replay behavior rather than pricing unrelated renderer upgrades.
     let mut loaded = db.load(&request.session_id).unwrap();
     let profile_epoch = crate::profile_render_epoch(SerializerProfile::OpencodeAiSdk);
     let profile_component = format!("mpe{profile_epoch}");
+    let current_memory_epoch = format!("mre{}", crate::MEMORY_RENDER_FORMAT_EPOCH);
+    loaded.meta.last_render_config = loaded
+        .meta
+        .last_render_config
+        .replace("mre:4:mre2", &format!("mre:4:{current_memory_epoch}"));
     let tagger_delimiter = ";tfe:";
     assert!(!loaded.meta.last_render_config.contains(";mpe:"));
     assert!(loaded.meta.last_render_config.contains(tagger_delimiter));
@@ -130,6 +136,21 @@ fn load_pre_fix_reasoning_fixture(dir: &std::path::Path) -> (McStore, TransformR
         ),
         1,
     );
+    // The captured external revision predates the single-store move, which folds two more
+    // inputs into it. Recompute it so the fixture does not price that as a baseline change.
+    if loaded.meta.m1_external_revision != 0 {
+        loaded.meta.m1_external_revision = crate::m1_compose::m1_revision_signal_parts_for_pass(
+            &db,
+            "git:fixture",
+            "git:fixture",
+            &request.session_id,
+            loaded.meta.user_profile_version,
+            true,
+            loaded.meta.expiry_cutoff_ms,
+        )
+        .unwrap()
+        .external_revision;
+    }
     db.commit(
         &request.session_id,
         loaded.row_version,

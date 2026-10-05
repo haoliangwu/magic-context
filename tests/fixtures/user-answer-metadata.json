@@ -1,0 +1,15 @@
+[
+  { "metadata": { "answers": [["yes"]] }, "protected": true },
+  { "metadata": { "answers": [] }, "protected": true },
+  { "metadata": { "answer": "yes", "wasCustom": false }, "protected": true },
+  { "metadata": { "answer": null }, "protected": false },
+  { "metadata": { "answers": [{ "id": "q", "value": "yes" }], "cancelled": false }, "protected": true },
+  { "metadata": { "selectedOptions": ["yes"] }, "protected": true },
+  { "metadata": { "customInput": "yes" }, "protected": true },
+  { "metadata": { "results": [{ "selectedOptions": ["yes"] }] }, "protected": true },
+  { "metadata": { "truncated": false }, "protected": false },
+  { "metadata": { "answers": "not an answer array" }, "protected": false },
+  { "metadata": { "userAnswer": true }, "protected": true },
+  { "metadata": { "userAnswer": false }, "protected": false },
+  { "metadata": null, "protected": false }
+]

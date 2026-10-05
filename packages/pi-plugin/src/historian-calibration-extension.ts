@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { readHostSystemPrompt } from "./host-system-prompt";
+import { promptFingerprint } from "./subagent-telemetry";
 
 export const HISTORIAN_TEMPERATURE_ENV = "MAGIC_CONTEXT_HISTORIAN_TEMPERATURE";
 export const HISTORIAN_MAX_OUTPUT_TOKENS_ENV =
@@ -72,6 +75,21 @@ export function calibrateHistorianProviderPayload(
 }
 
 export default function historianCalibrationExtension(pi: ExtensionAPI): void {
+	const intendedPath = process.env.MAGIC_CONTEXT_SUBAGENT_PROMPT_FILE;
+	if (intendedPath) {
+		const intended = readFileSync(intendedPath, "utf8");
+		// context runs after ALL before_agent_start handlers have composed the prompt.
+		// Unlike before_provider_request it also runs for custom provider extensions.
+		pi.on("context", (_event, ctx) => {
+			const effective = readHostSystemPrompt(ctx);
+			if (effective === undefined) return;
+			process.stdout.write(
+				`${JSON.stringify({ type: "mc_system_prompt", ...promptFingerprint(effective), containsIntended: effective.includes(intended) })}\n`,
+			);
+		});
+	}
+	// Dreamer loads this entry for observation, not historian sampling calibration.
+	if (process.env.MAGIC_CONTEXT_SUBAGENT_PROVENANCE_ONLY === "1") return;
 	const temperature = finiteNumber(process.env[HISTORIAN_TEMPERATURE_ENV]);
 	const maxOutputTokens = finiteNumber(
 		process.env[HISTORIAN_MAX_OUTPUT_TOKENS_ENV],

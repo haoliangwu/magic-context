@@ -28,7 +28,14 @@ import {
 
 export interface PromotePrimersArgs {
     db: Database;
-    client: PluginContext["client"];
+    /**
+     * Unused by promotion itself. Primer promotion clusters candidate rows that
+     * are already in the database and writes the result back, so it makes no
+     * model call and needs no completion transport. The field stays optional so a
+     * caller that has a client can keep passing it without the absence of one
+     * being read as "this task cannot run here".
+     */
+    client?: PluginContext["client"];
     projectIdentity: string;
     sessionDirectory: string;
     holderId: string;
@@ -108,7 +115,7 @@ function pruneExpiredPrimerCandidatesForProject(
     const stmt = db.prepare("DELETE FROM primer_candidates WHERE id = ? AND project_path = ?");
     db.transaction(() => {
         for (const id of toDelete) stmt.run(id, projectIdentity);
-    })();
+    }).immediate();
     return toDelete.length;
 }
 

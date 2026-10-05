@@ -2,7 +2,7 @@ import { getMemoriesByProject } from "../../features/magic-context/memory/storag
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { extractM0Block } from "./decay-render";
 import { renderMemoryBlockV2, trimMemoriesToBudgetV2 } from "./inject-compartments";
-import { estimateTokens } from "./read-session-formatting";
+import { estimateFixedPromptTokens as estimateTokens } from "./read-session-formatting";
 
 /**
  * Per-block token attribution for the synthetic m[0] message, shared by BOTH
@@ -40,6 +40,12 @@ export function computeM0BlockTokens(
     sessionId: string,
     args: {
         m0Text: string;
+        /**
+         * Persisted m[1] delta. Compartments published since the last m[0] fold
+         * are served there, in a `<new-compartments>` block, until the next
+         * fold moves them into m[0]'s `<session-history>`.
+         */
+        m1Text?: string;
         projectIdentity: string | undefined;
         injectionBudgetTokens: number | undefined;
         memoryBlockCount: number;
@@ -49,6 +55,7 @@ export function computeM0BlockTokens(
 ): M0BlockTokens {
     const {
         m0Text,
+        m1Text,
         projectIdentity,
         injectionBudgetTokens,
         memoryBlockCount,
@@ -82,8 +89,13 @@ export function computeM0BlockTokens(
         // count instead of estimating from mirrored raw-history p1 rows.
         compartmentTokens = compartmentTokensOverride;
     } else if (historyBlock) {
-        // Real decayed render, counted exactly from the cached wire block.
+        // Real decayed render, counted exactly from the cached wire block, plus
+        // any compartments still riding in m[1]. Counting m[0] alone pins the
+        // bucket at the empty wrapper's size for a session whose compartments
+        // were all published after its first m[0] render.
         compartmentTokens = estimateTokens(historyBlock);
+        const newCompartmentsBlock = m1Text ? extractM0Block(m1Text, "new-compartments") : null;
+        if (newCompartmentsBlock) compartmentTokens += estimateTokens(newCompartmentsBlock);
     } else {
         // No materialized m[0] yet (brand-new / pre-first-materialization).
         // Fall back to the Σp1 estimate so the bucket isn't blank on a cold

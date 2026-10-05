@@ -1,0 +1,404 @@
+{
+	"baselineRef": "60360073^1",
+	"baselineCommit": "59d2ef9c3b293b491adb39971cfd598439b98022",
+	"baselineSubject": "Merge post-477 follow-ups: tool-owner backfill gates on the v1 message/part tables it reads (capability gate shape from PR 486, DGVY) instead of a store-generation assert; doctor boundary table selection combines host generation with store schema (pre-migration window reads message, migrated Desktop prefers populated session_message, known v1 reads message on downgrade) (issue 489)",
+	"generatedBy": "packages/pi-plugin/scripts/generate-issue-485-pre-fix-fixture.ts",
+	"passes": [
+		{
+			"pass": 0,
+			"sha256": "41a05bbd255f9737780bee967187d339d15ff3b7a902cc6c58a1b1b35d954166",
+			"tools": [],
+			"prompt": "",
+			"served": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history></session-history>"
+						}
+					],
+					"timestamp": -1
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history-since>(no new content since last materialization)</session-history-since>"
+						}
+					],
+					"timestamp": 0
+				},
+				{
+					"role": "user",
+					"content": "§1§ old",
+					"timestamp": 1
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "text",
+							"text": "§2§ answer"
+						}
+					],
+					"api": "test-api",
+					"provider": "test-provider",
+					"model": "test-model",
+					"usage": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 0,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0
+						}
+					},
+					"stopReason": "stop",
+					"timestamp": 2
+				},
+				{
+					"role": "user",
+					"content": "§3§ tail",
+					"timestamp": 3
+				}
+			]
+		},
+		{
+			"pass": 1,
+			"sha256": "41a05bbd255f9737780bee967187d339d15ff3b7a902cc6c58a1b1b35d954166",
+			"tools": [],
+			"prompt": "",
+			"served": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history></session-history>"
+						}
+					],
+					"timestamp": -1
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history-since>(no new content since last materialization)</session-history-since>"
+						}
+					],
+					"timestamp": 0
+				},
+				{
+					"role": "user",
+					"content": "§1§ old",
+					"timestamp": 1
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "text",
+							"text": "§2§ answer"
+						}
+					],
+					"api": "test-api",
+					"provider": "test-provider",
+					"model": "test-model",
+					"usage": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 0,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0
+						}
+					},
+					"stopReason": "stop",
+					"timestamp": 2
+				},
+				{
+					"role": "user",
+					"content": "§3§ tail",
+					"timestamp": 3
+				}
+			]
+		},
+		{
+			"pass": 2,
+			"sha256": "41a05bbd255f9737780bee967187d339d15ff3b7a902cc6c58a1b1b35d954166",
+			"tools": [],
+			"prompt": "",
+			"served": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history></session-history>"
+						}
+					],
+					"timestamp": -1
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history-since>(no new content since last materialization)</session-history-since>"
+						}
+					],
+					"timestamp": 0
+				},
+				{
+					"role": "user",
+					"content": "§1§ old",
+					"timestamp": 1
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "text",
+							"text": "§2§ answer"
+						}
+					],
+					"api": "test-api",
+					"provider": "test-provider",
+					"model": "test-model",
+					"usage": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 0,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0
+						}
+					},
+					"stopReason": "stop",
+					"timestamp": 2
+				},
+				{
+					"role": "user",
+					"content": "§3§ tail",
+					"timestamp": 3
+				}
+			]
+		},
+		{
+			"pass": 3,
+			"sha256": "41a05bbd255f9737780bee967187d339d15ff3b7a902cc6c58a1b1b35d954166",
+			"tools": [],
+			"prompt": "",
+			"served": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history></session-history>"
+						}
+					],
+					"timestamp": -1
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history-since>(no new content since last materialization)</session-history-since>"
+						}
+					],
+					"timestamp": 0
+				},
+				{
+					"role": "user",
+					"content": "§1§ old",
+					"timestamp": 1
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "text",
+							"text": "§2§ answer"
+						}
+					],
+					"api": "test-api",
+					"provider": "test-provider",
+					"model": "test-model",
+					"usage": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 0,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0
+						}
+					},
+					"stopReason": "stop",
+					"timestamp": 2
+				},
+				{
+					"role": "user",
+					"content": "§3§ tail",
+					"timestamp": 3
+				}
+			]
+		},
+		{
+			"pass": 4,
+			"sha256": "41a05bbd255f9737780bee967187d339d15ff3b7a902cc6c58a1b1b35d954166",
+			"tools": [],
+			"prompt": "",
+			"served": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history></session-history>"
+						}
+					],
+					"timestamp": -1
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history-since>(no new content since last materialization)</session-history-since>"
+						}
+					],
+					"timestamp": 0
+				},
+				{
+					"role": "user",
+					"content": "§1§ old",
+					"timestamp": 1
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "text",
+							"text": "§2§ answer"
+						}
+					],
+					"api": "test-api",
+					"provider": "test-provider",
+					"model": "test-model",
+					"usage": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 0,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0
+						}
+					},
+					"stopReason": "stop",
+					"timestamp": 2
+				},
+				{
+					"role": "user",
+					"content": "§3§ tail",
+					"timestamp": 3
+				}
+			]
+		},
+		{
+			"pass": 5,
+			"sha256": "41a05bbd255f9737780bee967187d339d15ff3b7a902cc6c58a1b1b35d954166",
+			"tools": [],
+			"prompt": "",
+			"served": [
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history></session-history>"
+						}
+					],
+					"timestamp": -1
+				},
+				{
+					"role": "user",
+					"content": [
+						{
+							"type": "text",
+							"text": "<session-history-since>(no new content since last materialization)</session-history-since>"
+						}
+					],
+					"timestamp": 0
+				},
+				{
+					"role": "user",
+					"content": "§1§ old",
+					"timestamp": 1
+				},
+				{
+					"role": "assistant",
+					"content": [
+						{
+							"type": "text",
+							"text": "§2§ answer"
+						}
+					],
+					"api": "test-api",
+					"provider": "test-provider",
+					"model": "test-model",
+					"usage": {
+						"input": 0,
+						"output": 0,
+						"cacheRead": 0,
+						"cacheWrite": 0,
+						"totalTokens": 0,
+						"cost": {
+							"input": 0,
+							"output": 0,
+							"cacheRead": 0,
+							"cacheWrite": 0,
+							"total": 0
+						}
+					},
+					"stopReason": "stop",
+					"timestamp": 2
+				},
+				{
+					"role": "user",
+					"content": "§3§ tail",
+					"timestamp": 3
+				}
+			]
+		}
+	]
+}

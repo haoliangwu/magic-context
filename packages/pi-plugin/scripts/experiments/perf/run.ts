@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type {
@@ -30,6 +31,8 @@ type PerfLane =
 
 interface RunnerOptions {
 	fixture?: string;
+	database?: string;
+	wireOutput?: string;
 	messages: number;
 	step: number;
 	points?: number[];
@@ -47,11 +50,13 @@ export interface PerfPassReport {
 	outputHash: string;
 	tagRows: number;
 	tagRowsHash: string;
+	stages: ReturnType<ReturnType<typeof createTimingCollector>["samples"]>;
 	phases: PhaseTotals;
 	db: DatabaseTiming;
 	serializationMs: number;
 	deferredDrainMs: number;
 	deferredDb: DatabaseTiming;
+	dbQueries: ReturnType<ReturnType<typeof createDatabaseTimer>["queries"]>;
 }
 
 export interface PerfRunReport {
@@ -118,6 +123,13 @@ async function main(): Promise<void> {
 
 	setHarness("pi");
 	const dbPath = join(dataDir, "context.db");
+	if (options.database) {
+		const seed = resolve(options.database);
+		for (const suffix of ["", "-wal", "-shm"]) {
+			if (existsSync(`${seed}${suffix}`))
+				execFileSync("cp", ["-c", `${seed}${suffix}`, `${dbPath}${suffix}`]);
+		}
+	}
 	const rawDb = new Database(dbPath);
 	initializeDatabase(rawDb);
 	runMigrations(rawDb);
@@ -162,7 +174,11 @@ async function main(): Promise<void> {
 			: undefined,
 		autoSearch:
 			options.lane === "auto-search-sticky"
-				? { enabled: true, minPromptChars: Number.MAX_SAFE_INTEGER }
+				? {
+						enabled: true,
+						minPromptChars: Number.MAX_SAFE_INTEGER,
+						scoreThreshold: 0.55,
+					}
 				: undefined,
 	});
 	const handler = handlers.get("context");
@@ -198,16 +214,21 @@ async function main(): Promise<void> {
 							: 0.25;
 			const context = fakeContext(
 				fixture.sessionId,
-				fixture.cwd,
+				options.database ? dataDir : fixture.cwd,
 				pass.branchEntries,
 				usagePercentage,
 			);
-			const event = { messages: pass.messages };
+			const event = { messages: structuredClone(pass.messages) };
 			const inputMessageCount = event.messages.length;
 			const result = (await handler(event, context)) as
 				| { messages?: unknown[] }
 				| undefined;
 			const output = result?.messages ?? event.messages;
+			if (options.wireOutput)
+				writeFileSync(
+					`${resolve(options.wireOutput)}-${index + 1}.json`,
+					JSON.stringify(output),
+				);
 			const transformError = rawDb
 				.prepare(
 					"SELECT last_transform_error AS error FROM session_meta WHERE session_id = ?",
@@ -238,17 +259,19 @@ async function main(): Promise<void> {
 				outputHash: canonicalHash(output),
 				tagRows: tagRows.length,
 				tagRowsHash: canonicalHash(tagRows),
+				stages: timings.samples(),
 				phases: summarizePhases(timings.samples(), dbSnapshot),
 				db: dbSnapshot,
 				serializationMs,
 				deferredDrainMs,
 				deferredDb,
+				dbQueries: dbTimer.queries(),
 			});
 		}
 	} finally {
 		restoreObserver();
 		clearContextHandlerSession(fixture.sessionId);
-		rawDb.close(false);
+		rawDb.close();
 		rmSync(dataDir, { recursive: true, force: true });
 	}
 
@@ -351,6 +374,12 @@ function parseOptions(args: readonly string[]): RunnerOptions {
 		const value = args[index + 1];
 		if (arg === "--fixture" && value) {
 			options.fixture = value;
+			index += 1;
+		} else if (arg === "--database" && value) {
+			options.database = value;
+			index += 1;
+		} else if (arg === "--wire-output" && value) {
+			options.wireOutput = value;
 			index += 1;
 		} else if (arg === "--messages" && value) {
 			options.messages = positiveInteger(value, arg);

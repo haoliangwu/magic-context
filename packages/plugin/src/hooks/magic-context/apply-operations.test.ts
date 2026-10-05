@@ -1,7 +1,7 @@
 /// <reference types="bun-types" />
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,7 @@ import {
     queuePendingOp,
 } from "../../features/magic-context/storage";
 import { createTagger } from "../../features/magic-context/tagger";
+import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import { applyPendingOperations } from "./apply-operations";
 import { type MessageLike, tagMessages } from "./tag-messages";
 
@@ -33,7 +34,7 @@ afterEach(() => {
 });
 
 function useTempDataHome(prefix: string): void {
-    const dir = mkdtempSync(join(tmpdir(), prefix));
+    const dir = createTestTempDirFromPath(join(tmpdir(), prefix));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
 }
@@ -86,6 +87,50 @@ describe("applyPendingOperations with protection window set form", () => {
         expect(getTagById(db!, SES, tag1)?.status).toBe("dropped");
         // Tag 2 was protected by the window (skipped)
         expect(getTagById(db!, SES, tag2)?.status).toBe("active");
+    });
+
+    it("reports why a selected synthetic batch cannot mutate the visible payload", () => {
+        useTempDataHome("apply-noop-reason-");
+        const db = openDatabase();
+        expect(db).toBeTruthy();
+        insertTag(db!, SES, "call-protected", "tool", 4_000, 1);
+
+        let diagnostics:
+            | { total: number; mutated: number; reasons: Record<string, number> }
+            | undefined;
+        const mutated = applyPendingOperations(
+            SES,
+            db!,
+            new Map([
+                [
+                    1,
+                    {
+                        canDrop: () => true,
+                        truncate: () => "truncated" as const,
+                        drop: () => "removed" as const,
+                        setContent: () => true,
+                    },
+                ],
+            ]),
+            new Set([1]),
+            undefined,
+            undefined,
+            [{ id: 0, sessionId: SES, tagId: 1, operation: "drop", queuedAt: 0 }],
+            new Set(),
+            undefined,
+            (batch) => {
+                diagnostics = batch;
+            },
+        );
+
+        expect(mutated).toBe(false);
+        expect(diagnostics).toEqual({
+            source: "synthetic",
+            total: 1,
+            mutated: 0,
+            persistedWithoutMutation: 0,
+            reasons: { protected: 1 },
+        });
     });
 
     it("declares and enforces empty-window behavior: empty set protects zero tool tags, but non-tool tags are never automatic reclaim targets", () => {

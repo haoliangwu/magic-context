@@ -29,24 +29,116 @@ export const CANONICAL_DREAM_TASKS = [
 
 export type DreamTaskName = (typeof CANONICAL_DREAM_TASKS)[number];
 
-export const DREAM_TASK_CAPABILITIES: Record<DreamTaskName, { requiresTools: boolean }> = {
+/** Prompt-token ceilings informed by docs/reports/dreamer-token-usage.md.
+ * Completed Gemini run usage predicts 20-memory mapping/verification batches
+ * at about 70% of their allowance
+ * (docs/reports/verify-token-budget-2026-09-30.md); curate and other tasks retain
+ * their separate allowances. */
+export const DREAM_TOOL_LOOP_TOKEN_BUDGETS = {
+    "map-memories": 2_500_000,
+    verify: 2_500_000,
+    "verify-broad": 3_000_000,
+    curate: 1_500_000,
+    retrospective: 300_000,
+    "maintain-docs": 1_600_000,
+    "refresh-primers": 350_000,
+} as const;
+
+/**
+ * How a Dreamer task reaches its result, which is what decides whether a host
+ * without a tool loop can run it:
+ *  - "tool-loop": the task drives an agent that must call tools between model
+ *    turns (reading files, searching, writing memories through `ctx_memory`).
+ *  - "single-shot": one or more no-tool completions whose entire answer is the
+ *    returned text. Any transport that can deliver a prompt and return text runs
+ *    these, including a hidden completion carrier.
+ *  - "host-only": no model call at all. The task is database work done in this
+ *    process, so it needs no completion transport whatsoever.
+ */
+export type DreamTaskTransport = "tool-loop" | "single-shot" | "host-only";
+
+export interface DreamTaskCapability {
+    /** True only when the task cannot finish without a tool loop. */
+    requiresTools: boolean;
+    transport: DreamTaskTransport;
+    /**
+     * What the tool loop is needed FOR, as one clause a user can read. Present
+     * only on tool-loop tasks, where it becomes the named per-task reason shown
+     * when a host refuses the task instead of a single anonymous "filtered" list.
+     */
+    toolLoopPurpose?: string;
+}
+
+export const DREAM_TASK_CAPABILITIES: Record<DreamTaskName, DreamTaskCapability> = {
     // A single manifest is not a tool-free task: mapping and verification need
     // read-only tools to inspect backing code before they can change memory state.
-    "map-memories": { requiresTools: true },
-    verify: { requiresTools: true },
-    "verify-broad": { requiresTools: true },
-    curate: { requiresTools: true },
+    "map-memories": {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only file tools to locate the code each memory describes",
+    },
+    verify: {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only file tools to re-check each memory against the code",
+    },
+    "verify-broad": {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only file tools to re-check each memory against the code",
+    },
+    curate: {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs the ctx_memory tool to apply its merge and archive decisions",
+    },
     // mural/compress-cues.ts is a zero-tool transform; its child transport
     // still needs substitution before the generate executor can dispatch it.
-    "compress-cues": { requiresTools: false },
-    "classify-memories": { requiresTools: false },
-    retrospective: { requiresTools: true },
-    "maintain-docs": { requiresTools: true },
-    "evaluate-smart-notes": { requiresTools: true },
-    "review-user-memories": { requiresTools: true },
-    "promote-primers": { requiresTools: true },
-    "refresh-primers": { requiresTools: true },
+    "compress-cues": { requiresTools: false, transport: "single-shot" },
+    "classify-memories": { requiresTools: false, transport: "single-shot" },
+    retrospective: {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs search tools to investigate the friction it finds in past sessions",
+    },
+    "maintain-docs": {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only file tools to investigate documentation corrections",
+    },
+    // The evaluator is a no-tool compiler plus a no-tool confirmation prompt; the
+    // generated check runs in the local capability sandbox, never as model tools.
+    "evaluate-smart-notes": { requiresTools: false, transport: "single-shot" },
+    // The reviewer reads candidate text and answers with JSON; the host applies it.
+    "review-user-memories": { requiresTools: false, transport: "single-shot" },
+    // Promotion clusters existing candidates and writes rows. It calls no model.
+    "promote-primers": { requiresTools: false, transport: "host-only" },
+    "refresh-primers": {
+        requiresTools: true,
+        transport: "tool-loop",
+        toolLoopPurpose: "needs read-only investigation tools to answer each standing question",
+    },
 };
+
+/** Tasks a host without a tool loop cannot run, in canonical order. */
+export function toolLoopDreamTasks(): DreamTaskName[] {
+    return CANONICAL_DREAM_TASKS.filter((task) => DREAM_TASK_CAPABILITIES[task].requiresTools);
+}
+
+/**
+ * One line per refused task, naming the task, the stable code and what the tool
+ * loop is needed for. A user reading /ctx-dream or /ctx-status output should be
+ * able to tell which specific task is unavailable and why, rather than seeing a
+ * single anonymous "unsupported" list.
+ */
+export function formatUnsupportedDreamTasks(tasks: readonly DreamTaskName[], code: string): string {
+    return tasks
+        .map((task) => {
+            const purpose = DREAM_TASK_CAPABILITIES[task].toolLoopPurpose;
+            return `- ${task}: unavailable on this host (${code})${purpose ? ` — ${purpose}` : ""}`;
+        })
+        .join("\n");
+}
 
 /** Cheap, read-only work counts for one Dreamer task. */
 export interface DreamTaskBacklog {
@@ -74,6 +166,53 @@ export function formatDreamTaskBacklogs(
                 return `- curate: ${backlog.category} (${backlog.pending})`;
             }
             return `- ${task}: ${backlog?.pending ?? 0} pending / ${backlog?.total ?? 0} total`;
+        })
+        .join("\n");
+}
+
+/** One dreamer task whose last scheduled run failed. */
+export interface DreamTaskFailureState {
+    task: string;
+    /** The scheduler's recorded failure text. */
+    error: string;
+    /** Epoch ms of the last run that SUCCEEDED, or null if none ever has. A failed run
+     *  never advances `last_run_at`, so this says how long the task has been stuck, not
+     *  when it last failed — the scheduler keeps no failure timestamp. */
+    lastSucceededAt: number | null;
+    /** Consecutive retries queued so far; reset once the retry cap pushes the task to
+     *  its next cron slot, so a long-running failure oscillates rather than climbs. */
+    retryCount: number;
+}
+
+/** How much of a scheduler failure message a status line carries before eliding. */
+const FAILURE_TEXT_BUDGET = 180;
+
+function sinceLabel(lastSucceededAt: number | null, now: number): string {
+    if (lastSucceededAt === null || lastSucceededAt <= 0) return "never succeeded";
+    const hours = Math.max(0, Math.floor((now - lastSucceededAt) / 3_600_000));
+    if (hours < 1) return "last succeeded under an hour ago";
+    if (hours < 48) return `last succeeded ${hours}h ago`;
+    return `last succeeded ${Math.floor(hours / 24)}d ago`;
+}
+
+/**
+ * One line per failing task, shared by the status surfaces.
+ *
+ * The elapsed time is measured from the last SUCCESS, not the last failure: a failed
+ * run deliberately does not advance `last_run_at`, so that is the only timestamp the
+ * scheduler keeps and "stuck since" is what a reader needs anyway.
+ */
+export function formatDreamTaskFailures(
+    failures: readonly DreamTaskFailureState[],
+    now: number = Date.now(),
+): string {
+    return failures
+        .map((failure) => {
+            const error =
+                failure.error.length > FAILURE_TEXT_BUDGET
+                    ? `${failure.error.slice(0, FAILURE_TEXT_BUDGET)}…`
+                    : failure.error;
+            return `- ${failure.task}: failing (${sinceLabel(failure.lastSucceededAt, now)}) — ${error}`;
         })
         .join("\n");
 }

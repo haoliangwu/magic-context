@@ -120,3 +120,21 @@ export function createScheduler(config: SchedulerConfig): Scheduler {
         },
     };
 }
+
+/** The idle clock is the last served response, not the last prepared request. */
+export function computeHardCacheExpired(
+    cacheTtl: string,
+    lastResponseTime: number,
+    now: number,
+    onInvalid?: (error: unknown) => void,
+): boolean {
+    let ttlMs: number;
+    try {
+        ttlMs = parseCacheTtl(cacheTtl);
+    } catch (error) {
+        onInvalid?.(error);
+        ttlMs = 5 * 60 * 1000;
+    }
+    // Strict > matches the scheduler and Rust; "never" parses as Infinity.
+    return lastResponseTime > 0 && now - lastResponseTime > ttlMs;
+}

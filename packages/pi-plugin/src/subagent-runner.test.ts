@@ -11,7 +11,6 @@ import { EventEmitter } from "node:events";
 import {
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
@@ -32,6 +31,7 @@ import {
 import { getSubagentInvocations } from "@magic-context/core/features/magic-context/storage-subagent-invocations";
 import * as loggerModule from "@magic-context/core/shared/logger";
 import type { SubagentRunOptions } from "@magic-context/core/shared/subagent-runner";
+import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
 
 import { __setPiHarnessKindForTesting } from "./pi-harness-kind";
 import { __test, PiSubagentRunner } from "./subagent-runner";
@@ -66,6 +66,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	__setPiHarnessKindForTesting(undefined);
+	__test.resetHostToolState();
 	closeDatabase();
 	__resetSchemaFenceStateForTests();
 });
@@ -161,6 +162,7 @@ function runnerWith(
 		platform,
 		extraArgs,
 		subagentExtensions,
+		getHostToolNames,
 	}: {
 		piBinary?: string;
 		invocation?: {
@@ -172,6 +174,7 @@ function runnerWith(
 		platform?: NodeJS.Platform;
 		extraArgs?: readonly string[];
 		subagentExtensions?: readonly string[];
+		getHostToolNames?: () => readonly string[] | undefined;
 	} = {},
 ) {
 	const remainingChildren = Array.isArray(childOrChildren)
@@ -189,6 +192,7 @@ function runnerWith(
 		platform,
 		extraArgs,
 		subagentExtensions,
+		getHostToolNames,
 		spawnImpl: spawnImpl as never,
 	});
 	return { runner, spawnImpl };
@@ -219,7 +223,7 @@ function nextTick() {
 }
 
 function writePiCliFixture(bin: string, useBinShim = false) {
-	const root = mkdtempSync(join(tmpdir(), "mc-pi-cli-layout-"));
+	const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-cli-layout-"));
 	const packageRoot = join(
 		root,
 		"node_modules",
@@ -250,7 +254,7 @@ function writePiCliFixture(bin: string, useBinShim = false) {
 // without a standalone `pi` on PATH still spawns its own CLI instead of the
 // bare `pi` fallback (which ENOENTs).
 function writeOmpCliFixture(bin: string, useBinShim = false) {
-	const root = mkdtempSync(join(tmpdir(), "mc-omp-cli-layout-"));
+	const root = createTestTempDirFromPath(join(tmpdir(), "mc-omp-cli-layout-"));
 	const packageRoot = join(
 		root,
 		"node_modules",
@@ -452,7 +456,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("still resolves a string bin (no object map)", () => {
-		const root = mkdtempSync(join(tmpdir(), "mc-pi-string-bin-"));
+		const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-string-bin-"));
 		const packageRoot = join(
 			root,
 			"node_modules",
@@ -486,7 +490,7 @@ describe("subagent-runner pure helpers", () => {
 	});
 
 	it("falls through to the bare pi fallback when the manifest has neither bin.pi nor bin.omp", () => {
-		const root = mkdtempSync(join(tmpdir(), "mc-pi-no-bin-"));
+		const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-no-bin-"));
 		const packageRoot = join(
 			root,
 			"node_modules",
@@ -592,8 +596,7 @@ describe("subagent-runner pure helpers", () => {
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
-			"--tools",
-			"read,grep,find,ls,aft_search",
+			"--no-tools",
 			"--system-prompt",
 			TEST_SYSTEM_PROMPT_PATH,
 			"--model",
@@ -606,7 +609,7 @@ describe("subagent-runner pure helpers", () => {
 		]);
 	});
 
-	it("loads the provider calibration extension only for historian requests", () => {
+	it("loads the calibration and provenance extension for historian and dreamer requests", () => {
 		const historian = buildArgsForTest(
 			{ ...baseOptions, agent: "magic-context-historian" },
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
@@ -618,7 +621,7 @@ describe("subagent-runner pure helpers", () => {
 			{ ...baseOptions, agent: "dreamer" },
 			{ historianCalibrationEntryPath: "/tmp/historian-calibration.js" },
 		);
-		expect(dreamer).not.toContain("/tmp/historian-calibration.js");
+		expect(dreamer).toContain("/tmp/historian-calibration.js");
 	});
 
 	it("passes the active entry thinking level through Pi's --thinking flag", () => {
@@ -715,7 +718,9 @@ describe("subagent-runner pure helpers", () => {
 
 	it("uses PI_CODING_AGENT_DIR only for a positively identified OMP host", () => {
 		__setPiHarnessKindForTesting("omp");
-		const root = mkdtempSync(join(homedir(), ".mc-omp-host-test-"));
+		const root = createTestTempDirFromPath(
+			join(homedir(), ".mc-omp-host-test-"),
+		);
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		const previousPackageDir = process.env.PI_PACKAGE_DIR;
 		writeFileSync(
@@ -746,7 +751,9 @@ describe("subagent-runner pure helpers", () => {
 
 	it("uses the OMP default agent dir when PI_CODING_AGENT_DIR is unset", () => {
 		__setPiHarnessKindForTesting("omp");
-		const root = mkdtempSync(join(homedir(), ".mc-omp-default-host-test-"));
+		const root = createTestTempDirFromPath(
+			join(homedir(), ".mc-omp-default-host-test-"),
+		);
 		const previous = {
 			agentDir: process.env.PI_CODING_AGENT_DIR,
 			packageDir: process.env.PI_PACKAGE_DIR,
@@ -790,7 +797,9 @@ describe("subagent-runner pure helpers", () => {
 
 	it("gives a named OMP profile precedence over a stale agent-dir override", () => {
 		__setPiHarnessKindForTesting("omp");
-		const root = mkdtempSync(join(homedir(), ".mc-omp-profile-host-test-"));
+		const root = createTestTempDirFromPath(
+			join(homedir(), ".mc-omp-profile-host-test-"),
+		);
 		const previous = {
 			agentDir: process.env.PI_CODING_AGENT_DIR,
 			packageDir: process.env.PI_PACKAGE_DIR,
@@ -850,13 +859,15 @@ describe("subagent-runner pure helpers", () => {
 
 		expect(args).toContain("--no-context-files");
 		expect(args.indexOf("--no-context-files")).toBeLessThan(
-			args.indexOf("--tools"),
+			args.indexOf("--no-tools"),
 		);
 	});
 
 	it("emits only OMP-supported startup flags and tool names on an OMP host", () => {
 		__setPiHarnessKindForTesting("omp");
-		const root = mkdtempSync(join(homedir(), ".mc-omp-argv-test-"));
+		const root = createTestTempDirFromPath(
+			join(homedir(), ".mc-omp-argv-test-"),
+		);
 		const previousPackageDir = process.env.PI_PACKAGE_DIR;
 		writeFileSync(
 			join(root, "package.json"),
@@ -871,9 +882,7 @@ describe("subagent-runner pure helpers", () => {
 			expect(historianArgs).toContain("--no-rules");
 			expect(historianArgs).not.toContain("--no-prompt-templates");
 			expect(historianArgs).not.toContain("--no-context-files");
-			expect(historianArgs).toEqual(
-				expect.arrayContaining(["--tools", "read,grep,glob"]),
-			);
+			expect(historianArgs).toEqual(expect.arrayContaining(["--no-tools"]));
 
 			const dreamerArgs = buildArgsForTest({
 				...baseOptions,
@@ -966,14 +975,19 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--no-tools");
 	});
 
-	it("locks historian to an explicit read-only allow-list", () => {
-		const historianArgs = buildArgsForTest({
-			...baseOptions,
-			agent: "historian",
-		});
-		expect(historianArgs).toEqual(
-			expect.arrayContaining(["--tools", "read,grep,find,ls,aft_search"]),
-		);
+	it("locks every historian variant to zero tools even with discovered extensions", () => {
+		for (const agent of [
+			"magic-context-historian",
+			"historian",
+			"historian-recomp",
+			"historian-editor",
+		]) {
+			const args = buildArgsForTest({ ...baseOptions, agent });
+			expect(args).toContain("--no-tools");
+			expect(args).not.toContain("--tools");
+			expect(args).not.toContain("--no-extensions");
+			expect(__test.STRICT_TOOL_ALLOWLIST.get(agent)).toEqual([]);
+		}
 	});
 
 	it("translates every strict Pi allow-list into valid OMP built-ins", () => {
@@ -1002,7 +1016,34 @@ describe("subagent-runner pure helpers", () => {
 		}
 	});
 
-	it("locks base dreamer (curate) to --tools ctx_memory, stripping all built-ins", () => {
+	it("intersects OMP built-ins with the host registry when grep or glob is disabled", () => {
+		const readOnlyTools = ["read", "grep", "find", "ls"];
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, true, ["read", "glob"]),
+		).toEqual(["read", "glob"]);
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, true, ["read", "grep"]),
+		).toEqual(["read", "grep"]);
+		expect(
+			__test.resolveHostToolAllowlist(readOnlyTools, false, [
+				"read",
+				"find",
+				"ls",
+			]),
+		).toEqual(["read", "find", "ls"]);
+		expect(__test.resolveHostToolAllowlist(readOnlyTools, true, [])).toEqual(
+			[],
+		);
+
+		const args = buildArgsForTest(
+			{ ...baseOptions, agent: "dreamer-memory-mapper" },
+			{ targetHarness: "omp", hostToolNames: [] },
+		);
+		expect(args).toContain("--no-tools");
+		expect(args).not.toContain("--tools");
+	});
+
+	it("locks base dreamer (curate) to the two memory tools, stripping all built-ins", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer",
@@ -1010,9 +1051,9 @@ describe("subagent-runner pure helpers", () => {
 		});
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
-		expect(args[idx + 1]).toBe("ctx_memory");
+		expect(args[idx + 1]).toBe("ctx_memory,ctx_memory_list");
 		expect(args).not.toContain("--no-tools");
-		// No codebase/shell built-ins survive the allow-list. (ctx_memory itself is
+		// No codebase/shell built-ins survive the allow-list. (The memory tools are
 		// registered by the lean extension when a real bundle path is present; in
 		// this dev/test env SUBAGENT_ENTRY_PATH is undefined so --extension and the
 		// dreamer-actions flag are absent — the strict allow-list is independent.)
@@ -1030,7 +1071,7 @@ describe("subagent-runner pure helpers", () => {
 		}
 	});
 
-	it("locks magic-context-dreamer (Pi facade default) to --tools ctx_memory only", () => {
+	it("locks magic-context-dreamer (Pi facade default) to the two memory tools", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "magic-context-dreamer",
@@ -1038,7 +1079,7 @@ describe("subagent-runner pure helpers", () => {
 		});
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
-		expect(args[idx + 1]).toBe("ctx_memory");
+		expect(args[idx + 1]).toBe("ctx_memory,ctx_memory_list");
 		expect(args).not.toContain("--no-tools");
 		const toolList = args[idx + 1];
 		for (const denied of [
@@ -1077,7 +1118,7 @@ describe("subagent-runner pure helpers", () => {
 		expect(args).not.toContain("--tools");
 	});
 
-	it("locks dreamer-docs to file tools plus optional AFT read tools, with no ctx_memory and no extension", () => {
+	it("locks dreamer-docs to read-only file tools and optional AFT reads", () => {
 		const args = buildArgsForTest({
 			...baseOptions,
 			agent: "dreamer-docs",
@@ -1086,11 +1127,10 @@ describe("subagent-runner pure helpers", () => {
 		const idx = args.indexOf("--tools");
 		expect(idx).toBeGreaterThan(-1);
 		expect(args[idx + 1]).toBe(
-			"read,grep,find,ls,bash,write,edit,aft_outline,aft_zoom,aft_search",
+			"read,grep,find,ls,aft_outline,aft_zoom,aft_search",
 		);
 		expect(args).not.toContain("--no-tools");
-		// Edits docs, never the memory store: no ctx_memory, and the lean extension
-		// (which would register it) is not loaded for this agent.
+		// No shell, writing, memory tools or extension are available.
 		expect(args[idx + 1]).not.toContain("ctx_memory");
 		expect(args).not.toContain("--magic-context-dreamer-actions");
 	});
@@ -1152,9 +1192,7 @@ describe("subagent-runner pure helpers", () => {
 			"historian-editor",
 		]) {
 			const tools = toolListFor(agent);
-			expect(tools).toContain("aft_search");
-			expect(tools).not.toContain("aft_outline");
-			expect(tools).not.toContain("aft_zoom");
+			expect(tools).toEqual([]);
 		}
 
 		for (const agent of [
@@ -1267,7 +1305,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const { runner } = runnerWith(child, {
 			invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
 		});
-		const testDataDir = mkdtempSync(join(tmpdir(), "mc-pi-accounting-"));
+		const testDataDir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-accounting-"),
+		);
 		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 		const previousXdgDataHome = process.env.XDG_DATA_HOME;
 		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
@@ -1348,7 +1388,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const { runner } = runnerWith(child, {
 			invocation: { command: "omp", prefixArgs: [], targetHarness: "omp" },
 		});
-		const testDataDir = mkdtempSync(join(tmpdir(), "mc-pi-accounting-empty-"));
+		const testDataDir = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-accounting-empty-"),
+		);
 		const previousTestDataDir = process.env.MAGIC_CONTEXT_TEST_DATA_DIR;
 		const previousXdgDataHome = process.env.XDG_DATA_HOME;
 		process.env.MAGIC_CONTEXT_TEST_DATA_DIR = testDataDir;
@@ -1651,6 +1693,30 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		});
 	});
 
+	it("keeps a multibyte stderr character intact when it spans two chunks", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const progressChunks: string[] = [];
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			onProgress: (event) => {
+				if (event.type === "stderr") progressChunks.push(event.chunk);
+			},
+		});
+		// "é" is 0xC3 0xA9 in UTF-8; a pipe may deliver the two bytes apart.
+		const bytes = Buffer.from("café — failed\n", "utf8");
+		child.stderr.write(bytes.subarray(0, 4));
+		child.stderr.write(bytes.subarray(4));
+		child.emitClose(1);
+
+		const result = await resultPromise;
+
+		expect(result.ok).toBe(false);
+		expect(result.meta?.stderr).toBe("café — failed\n");
+		expect(progressChunks.join("")).toBe("café — failed\n");
+	});
+
 	it("preserves an explicit zero historian temperature in the child environment", async () => {
 		const child = createMockChild();
 		const { runner, spawnImpl } = runnerWith(child, { piBinary: "custom-pi" });
@@ -1725,7 +1791,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		// Default resolution must NOT spawn a bare "pi" (which ENOENTs on Windows
 		// because npm installs a pi.cmd shim, not a literal pi). It re-invokes the
 		// exact host CLI: process.execPath + process.argv[1], with no shell.
-		const root = mkdtempSync(join(tmpdir(), "mc-pi-cli-"));
+		const root = createTestTempDirFromPath(join(tmpdir(), "mc-pi-cli-"));
 		const distDir = join(
 			root,
 			"node_modules",
@@ -1893,12 +1959,13 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		const child = createMockChild();
 		const { runner } = runnerWith(child);
 
-		const resultPromise = runner.run(baseOptions);
+		const resultPromise = runner.run({ ...baseOptions, maxOutputTokens: 32 });
 		child.writeStdoutLine(
 			agentEnd([
 				{
 					role: "assistant",
 					content: [{ type: "text", text: "partial" }],
+					usage: { input: 5, output: 32, cacheRead: 0, cacheWrite: 1 },
 					stopReason: "length",
 				},
 			]),
@@ -1908,7 +1975,8 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(await resultPromise).toEqual({
 			ok: false,
 			reason: "truncated",
-			error: 'pi assistant stopped with reason "length"',
+			error:
+				'pi assistant stopped with reason "length"; tokens={"input":5,"output":32,"reasoning":null,"cache_read":0,"cache_write":1,"max_tokens":32,"finish_reason":"length"}',
 			durationMs: expect.any(Number),
 			meta: { stderr: undefined },
 		});
@@ -3020,8 +3088,7 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
-			"--tools",
-			"read,grep,find,ls,aft_search",
+			"--no-tools",
 			"--system-prompt",
 			expect.stringMatching(/system-prompt\.txt$/),
 			"--model",
@@ -3147,6 +3214,66 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 		expect(spawnImpl.mock.calls[1]?.[1]).toEqual(
 			expect.arrayContaining(["--model", "openai-codex/fallback"]),
 		);
+	});
+
+	it("applies the host tool intersection to fallback child invocations", async () => {
+		const first = createMockChild();
+		const second = createMockChild();
+		let spawnCount = 0;
+		const spawnImpl = mock(() => {
+			spawnCount += 1;
+			return (spawnCount === 1 ? first : second) as never;
+		});
+		const runner = new PiSubagentRunner({
+			invocation: {
+				command: "omp-test",
+				prefixArgs: [],
+				targetHarness: "omp",
+			},
+			getHostToolNames: () => ["read", "glob"],
+			spawnImpl: spawnImpl as never,
+		});
+
+		const resultPromise = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			model: "anthropic/primary",
+			fallbackModels: ["openai/fallback"],
+		});
+		first.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "primary failed" }],
+					stopReason: "error",
+				},
+			]),
+		);
+		first.emitClose(0);
+		await nextTick();
+		second.writeStdoutLine(
+			agentEnd([
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "fallback succeeded" }],
+					stopReason: "stop",
+				},
+			]),
+		);
+		second.emitClose(0);
+
+		expect(await resultPromise).toMatchObject({
+			ok: true,
+			assistantText: "fallback succeeded",
+		});
+		expect(spawnImpl).toHaveBeenCalledTimes(2);
+		for (const [, argv] of spawnImpl.mock.calls) {
+			const args = argv as string[];
+			const toolsIndex = args.indexOf("--tools");
+			expect(toolsIndex).toBeGreaterThanOrEqual(0);
+			expect(args[toolsIndex + 1]).toBe("read,glob");
+			expect(args[toolsIndex + 1]).not.toContain("grep");
+		}
 	});
 
 	it("retries fallback models after empty assistant text", async () => {
@@ -3278,7 +3405,9 @@ describe("PiSubagentRunner spawn lifecycle", () => {
 
 describe("Pi subagent schema-fence probe", () => {
 	it("does not spawn a Pi child when the shared database is newer than this build", async () => {
-		const dataHome = mkdtempSync(join(tmpdir(), "mc-pi-fence-probe-"));
+		const dataHome = createTestTempDirFromPath(
+			join(tmpdir(), "mc-pi-fence-probe-"),
+		);
 		try {
 			process.env.MAGIC_CONTEXT_TEST_DATA_DIR = dataHome;
 			process.env.XDG_DATA_HOME = dataHome;
@@ -3314,5 +3443,361 @@ describe("Pi subagent schema-fence probe", () => {
 			else process.env.XDG_DATA_HOME = originalXdgDataHome;
 			rmSync(dataHome, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("child observability", () => {
+	it("warns once for replaced prompts and never for identical prompts", async () => {
+		const { createHash } = await import("node:crypto");
+		const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+		try {
+			for (const changed of [false, true]) {
+				log.mockClear();
+				const child = createMockChild();
+				const { runner } = runnerWith(child);
+				const run = runner.run(baseOptions);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				const text = changed ? "another persona" : baseOptions.systemPrompt;
+				const event = {
+					type: "mc_system_prompt",
+					bytes: Buffer.byteLength(text),
+					sha256: createHash("sha256").update(text).digest("hex"),
+					containsIntended: !changed,
+				};
+				child.writeStdoutLine(event);
+				child.writeStdoutLine(event);
+				child.writeStdoutLine({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						content: [{ type: "text", text: "done" }],
+					},
+				});
+				child.emitClose();
+				await run;
+				const warnings = log.mock.calls.filter((args) =>
+					String(args[1]).startsWith("subagent_system_prompt_replaced "),
+				);
+				expect(warnings.length).toBe(changed ? 1 : 0);
+			}
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it("logs exact step, tool output byte and prompt token counts without terminal duplication", async () => {
+		const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+		try {
+			const child = createMockChild();
+			const { runner } = runnerWith(child);
+			const run = runner.run(baseOptions);
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			const messages = [
+				{
+					role: "assistant",
+					stopReason: "toolUse",
+					usage: { input: 10, cacheRead: 20, cacheWrite: 5 },
+					content: [
+						{ type: "toolCall", id: "a", name: "read" },
+						{ type: "toolCall", id: "b", name: "read" },
+					],
+				},
+				{
+					role: "assistant",
+					stopReason: "stop",
+					usage: { input: 7, cacheRead: 40 },
+					content: [{ type: "text", text: "done" }],
+				},
+			];
+			child.writeStdoutLine({ type: "message_end", message: messages[0] });
+			for (const id of ["a", "b"])
+				child.writeStdoutLine({
+					type: "tool_execution_end",
+					toolCallId: id,
+					toolName: "read",
+					result: { content: [{ type: "text", text: "é" }] },
+				});
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolCallId: "a",
+					content: [{ type: "text", text: "é" }],
+				},
+			});
+			child.writeStdoutLine({ type: "message_end", message: messages[1] });
+			child.writeStdoutLine({ type: "agent_end", messages });
+			child.emitClose();
+			await run;
+			const lines = log.mock.calls.filter((args) =>
+				String(args[1]).startsWith("subagent_telemetry "),
+			);
+			expect(lines).toHaveLength(1);
+			const summary = JSON.parse(
+				String(lines[0]?.[1]).slice("subagent_telemetry ".length),
+			);
+			expect(summary.steps).toBe(2);
+			expect(summary.tools).toEqual({ read: { calls: 2, outputBytes: 4 } });
+			expect(summary.promptTokens).toEqual({ first: 35, last: 47, max: 47 });
+		} finally {
+			log.mockRestore();
+		}
+	});
+
+	it("aborts over-cap streams with step_limit", async () => {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const run = runner.run({ ...baseOptions, agent: "dreamer-classifier" });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		for (let n = 0; n < 5; n++)
+			child.writeStdoutLine({
+				type: "message_end",
+				message: { role: "assistant", stopReason: "toolUse", content: [] },
+			});
+		const killed = child.killed;
+		child.emitClose();
+		const result = await run;
+		expect(result.ok).toBe(false);
+		expect(!result.ok && result.reason).toBe("step_limit");
+		expect(killed).toBe(true);
+	});
+});
+
+it("accepts provenance redirected to chunked stderr by Pi's output guard", async () => {
+	const { promptFingerprint } = await import("./subagent-telemetry");
+	const log = spyOn(loggerModule, "sessionLog").mockImplementation(() => {});
+	try {
+		const child = createMockChild();
+		const { runner } = runnerWith(child);
+		const run = runner.run(baseOptions);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const line = `${JSON.stringify({
+			type: "mc_system_prompt",
+			...promptFingerprint("replacement"),
+			containsIntended: false,
+		})}\n`;
+		child.writeStderr(line.slice(0, 10));
+		child.writeStderr(line.slice(10));
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "text", text: "done" }],
+			},
+		});
+		child.emitClose();
+		await run;
+		expect(
+			log.mock.calls.filter((args) =>
+				String(args[1]).startsWith("subagent_system_prompt_replaced "),
+			),
+		).toHaveLength(1);
+	} finally {
+		log.mockRestore();
+	}
+});
+
+describe("Pi dreamer prompt-token budget", () => {
+	it("hard-stops at soft limit when the lean tool guard is unavailable", async () => {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation: { command: "pi-test", prefixArgs: [], targetHarness: "pi" },
+		});
+		const run = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			tokenBudget: 100,
+		});
+		for (let i = 0; i < 100 && spawnImpl.mock.calls.length === 0; i++)
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		expect(spawnImpl.mock.calls[0]?.[1]).toContain("json");
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		expect(await run).toMatchObject({
+			ok: false,
+			reason: "token_budget",
+			meta: { tokenBudget: { finalizeFired: false } },
+		});
+		expect(child.stdinText).not.toContain("dreamer-finalize");
+	});
+	const invocation = {
+		command: "pi-test",
+		prefixArgs: [],
+		targetHarness: "pi" as const,
+	};
+	async function started(tokenBudget = 100) {
+		const child = createMockChild();
+		const { runner, spawnImpl } = runnerWith(child, {
+			invocation,
+			subagentExtensions: ["subagent-entry.js"],
+		});
+		const run = runner.run({
+			...baseOptions,
+			agent: "dreamer-memory-mapper",
+			tokenBudget,
+		});
+		for (
+			let i = 0;
+			i < 100 && !child.stdinText.includes("dreamer-initial");
+			i++
+		)
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		expect(child.stdinText).toContain("dreamer-initial");
+		expect(spawnImpl.mock.calls[0]?.[1]).toContain("rpc");
+		return { child, run, spawnImpl };
+	}
+
+	it("finalizes the mapper before its step cap and retains a partial manifest below token budget", async () => {
+		const { child, run } = await started(3_000_000);
+		for (let step = 1; step <= 58; step++)
+			child.writeStdoutLine({
+				type: "message_end",
+				message: {
+					role: "assistant",
+					usage: { input: 1 },
+					stopReason: "toolUse",
+					content: [{ type: "toolCall", id: `read-${step}`, name: "read" }],
+				},
+			});
+		const steered = child.stdinText.includes("dreamer-finalize");
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 1 },
+				stopReason: "stop",
+				content: [
+					{ type: "text", text: '<verify><verified id="1"/></verify>' },
+				],
+			},
+		});
+		child.emitClose();
+		expect(await run).toMatchObject({
+			ok: true,
+			meta: { tokenBudget: { spent: 59, finalizeFired: true } },
+		});
+		expect(steered).toBe(true);
+		expect(child.stdinText.match(/dreamer-finalize/g)).toHaveLength(1);
+	});
+
+	it("does not steer a completed under-budget child", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 50 },
+				stopReason: "stop",
+				content: [{ type: "text", text: "<mappings/>" }],
+			},
+		});
+		child.emitClose();
+		expect(await run).toMatchObject({ ok: true, assistantText: "<mappings/>" });
+		expect(child.stdinText).not.toContain("dreamer-finalize");
+	});
+
+	it("steers once at 80%, retains its tools, and accepts a final manifest", async () => {
+		const { child, run, spawnImpl } = await started();
+		const argsBefore = JSON.stringify(spawnImpl.mock.calls[0]?.[1]);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 20, cacheRead: 61, cacheWrite: 0 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		expect(child.stdinText.match(/dreamer-finalize/g)).toHaveLength(1);
+		expect(child.stdinText).toContain("no more tool calls");
+		expect(JSON.stringify(spawnImpl.mock.calls[0]?.[1])).toBe(argsBefore);
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 1 },
+				stopReason: "stop",
+				content: [{ type: "text", text: "<mappings/>" }],
+			},
+		});
+		child.emitClose();
+		const result = await run;
+		expect(result).toMatchObject({ ok: true, assistantText: "<mappings/>" });
+	});
+
+	it("hard-stops at 100% even after only one refused call", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		child.writeStdoutLine({
+			type: "tool_execution_end",
+			toolCallId: "blocked-1",
+			toolName: "read",
+			isError: true,
+			result: {
+				content: [
+					{
+						type: "text",
+						text: "Out of token budget: no more tool calls. Output your result now.",
+					},
+				],
+			},
+		});
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 19 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		expect(await run).toMatchObject({ ok: false, reason: "token_budget" });
+	});
+
+	it("hard-stops after two blocked post-finalize calls", async () => {
+		const { child, run } = await started();
+		child.writeStdoutLine({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 81 },
+				stopReason: "toolUse",
+				content: [{ type: "toolCall", name: "read" }],
+			},
+		});
+		for (let i = 0; i < 2; i++)
+			child.writeStdoutLine({
+				type: "tool_execution_end",
+				toolCallId: `blocked-${i}`,
+				toolName: "read",
+				isError: true,
+				result: {
+					content: [
+						{
+							type: "text",
+							text: "Out of token budget: no more tool calls. Output your result now.",
+						},
+					],
+				},
+			});
+		expect(await run).toMatchObject({ ok: false, reason: "token_budget" });
 	});
 });

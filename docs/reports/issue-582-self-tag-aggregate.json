@@ -1,0 +1,178 @@
+{
+  "responseModels": [
+    "deepseek-flash"
+  ],
+  "variants": {
+    "A": {
+      "sessions": 7,
+      "replies": 167,
+      "toolOnly": 14,
+      "textParts": 153,
+      "wellFormed": 117,
+      "canonicalPrefix": 116,
+      "correct": 116,
+      "wrongNumber": 0,
+      "malformed": 6,
+      "misplaced": 6,
+      "byteIdentity": 114
+    },
+    "B": {
+      "sessions": 7,
+      "replies": 158,
+      "toolOnly": 5,
+      "textParts": 153,
+      "wellFormed": 146,
+      "canonicalPrefix": 145,
+      "correct": 145,
+      "wrongNumber": 0,
+      "malformed": 3,
+      "misplaced": 4,
+      "byteIdentity": 142
+    }
+  },
+  "buckets": [
+    {
+      "variant": "A",
+      "bucket": "1",
+      "textParts": 7,
+      "wellFormed": 0,
+      "canonicalPrefix": 0,
+      "correct": 0,
+      "wrongNumber": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 0
+    },
+    {
+      "variant": "A",
+      "bucket": "2–5",
+      "textParts": 24,
+      "wellFormed": 12,
+      "canonicalPrefix": 11,
+      "correct": 11,
+      "wrongNumber": 0,
+      "malformed": 0,
+      "misplaced": 1,
+      "byteIdentity": 11
+    },
+    {
+      "variant": "A",
+      "bucket": "6–20",
+      "textParts": 96,
+      "wellFormed": 79,
+      "canonicalPrefix": 79,
+      "correct": 79,
+      "wrongNumber": 0,
+      "malformed": 6,
+      "misplaced": 5,
+      "byteIdentity": 77
+    },
+    {
+      "variant": "A",
+      "bucket": ">20",
+      "textParts": 26,
+      "wellFormed": 26,
+      "canonicalPrefix": 26,
+      "correct": 26,
+      "wrongNumber": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 26
+    },
+    {
+      "variant": "B",
+      "bucket": "1",
+      "textParts": 7,
+      "wellFormed": 7,
+      "canonicalPrefix": 7,
+      "correct": 7,
+      "wrongNumber": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 7
+    },
+    {
+      "variant": "B",
+      "bucket": "2–5",
+      "textParts": 28,
+      "wellFormed": 21,
+      "canonicalPrefix": 21,
+      "correct": 21,
+      "wrongNumber": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 21
+    },
+    {
+      "variant": "B",
+      "bucket": "6–20",
+      "textParts": 101,
+      "wellFormed": 101,
+      "canonicalPrefix": 100,
+      "correct": 100,
+      "wrongNumber": 0,
+      "malformed": 3,
+      "misplaced": 4,
+      "byteIdentity": 97
+    },
+    {
+      "variant": "B",
+      "bucket": ">20",
+      "textParts": 17,
+      "wellFormed": 17,
+      "canonicalPrefix": 17,
+      "correct": 17,
+      "wrongNumber": 0,
+      "malformed": 0,
+      "misplaced": 0,
+      "byteIdentity": 17
+    }
+  ],
+  "spend": {
+    "calls": 500,
+    "input": 2511417,
+    "output": 17092,
+    "cacheHit": 2313344,
+    "cacheMiss": 198073,
+    "rejectedSetupRequests": 2,
+    "allRequests": 502,
+    "estimatedOffPeakUSD": 0.04690618199999999,
+    "estimatedPeakUSD": 0.09381236399999998,
+    "pricingSource": "https://api-docs.deepseek.com/quick_start/pricing",
+    "pricingAccessed": "2026-09-30"
+  },
+  "phases": [
+    {
+      "phase": "live",
+      "calls": 270,
+      "input": 1222444,
+      "output": 9009,
+      "cacheHit": 1132544,
+      "cacheMiss": 89900
+    },
+    {
+      "phase": "supplement",
+      "calls": 55,
+      "input": 379394,
+      "output": 1761,
+      "cacheHit": 328960,
+      "cacheMiss": 50434
+    },
+    {
+      "phase": "pilot",
+      "calls": 150,
+      "input": 563259,
+      "output": 5292,
+      "cacheHit": 530048,
+      "cacheMiss": 33211
+    },
+    {
+      "phase": "supplement-failed",
+      "calls": 25,
+      "input": 346320,
+      "output": 1030,
+      "cacheHit": 321792,
+      "cacheMiss": 24528
+    }
+  ]
+}

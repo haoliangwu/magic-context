@@ -8,8 +8,8 @@ use std::sync::Mutex;
 use crate::ck_wire::{CkIngressMessage, CkWireMessage};
 use crate::healing::SerializerProfile;
 use crate::transform::{
-    apply_frozen_trailing_blank_decision, is_newest_synthetic_user_prompt,
-    user_terminated_tail_decision, TransformRequest, TransformResponse, UserTerminatedTailDecision,
+    apply_frozen_trailing_blank_decision, is_module_composed_row, user_terminated_tail_decision,
+    TransformRequest, TransformResponse, UserTerminatedTailDecision,
 };
 use mc_core::{CoreState, DurabilityClass, FrozenUnit};
 
@@ -96,7 +96,7 @@ fn rust_wire_for_case(case: &GoldenCase, input_wire: &[Value]) -> Vec<Value> {
                     .iter()
                     .find(|ingress| ingress.mid == mid)
                     .expect("DG message must retain its ingress identity");
-                !message.meta.synthetic || is_newest_synthetic_user_prompt(&request, ingress)
+                !is_module_composed_row(ingress)
             });
         }
     }

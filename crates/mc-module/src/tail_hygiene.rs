@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use mc_core::CoreState;
 use mc_store::{
     CkOutputKind, McTagRow, MediaBlock, MediaKind, ResultBlockKind, TailHygieneBaseline,
-    TailHygienePartKind, TailHygienePartMeasurement,
+    TailHygienePartKind, TailHygienePartMeasurement, TailHygieneTokenBuckets,
 };
 use sha2::{Digest, Sha256};
 
@@ -21,13 +21,27 @@ pub(crate) const CHANNEL1_REFIRE_FLOOR_TOKENS: i64 = 25_000;
 pub(crate) const CHANNEL2_FLOOR_TOKENS: i64 = 50_000;
 pub(crate) const CHANNEL2_SEVERITY_THRESHOLD: f64 = 0.75;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HygieneCalibration {
+    pub(crate) units_version: u8,
+    pub(crate) tools_ratio: f64,
+    pub(crate) prose_ratio: f64,
+}
+
+impl Default for HygieneCalibration {
+    fn default() -> Self {
+        Self {
+            units_version: 1,
+            tools_ratio: 1.0,
+            prose_ratio: 1.0,
+        }
+    }
+}
+
 const RED_KEY_PREFIX: &str = "red:";
 const CAV_KEY_PREFIX: &str = "cav:";
 const CHANNEL1_REMINDER_OPEN: &str = "\n\n<system-reminder>\n";
 const CHANNEL1_REMINDER_CLOSE: &str = "\n</system-reminder>";
-const IMAGE_TOKEN_DIVISOR: u64 = 750;
-const IMAGE_FALLBACK_TOKENS: i64 = 1_200;
-const IMAGE_TOKEN_CAP: i64 = 4_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HygieneBand {
@@ -76,6 +90,45 @@ pub(crate) struct TailHygieneMeasurement {
     pub(crate) t: i64,
     pub(crate) content_signature: String,
     pub(crate) parts: Vec<TailHygienePartMeasurement>,
+    /// First index in `parts` that belongs to the newest message; the frozen prefix stops here.
+    pub(crate) newest_message_part_start: usize,
+}
+
+/// First point where a defer pass stopped matching the frozen prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TailHygienePrefixMismatch {
+    /// Index into the frozen prefix; when the measured tail is shorter, the first index it lacks.
+    pub(crate) part_index: usize,
+    /// Message the mismatching block belongs to, so a cause can be attributed to a message shape.
+    pub(crate) message_id: String,
+    pub(crate) field: &'static str,
+    pub(crate) frozen_parts: usize,
+    pub(crate) measured_parts: usize,
+}
+
+impl TailHygienePrefixMismatch {
+    /// One line per invalidation event: where it happened, which field moved, and the response.
+    pub(crate) fn diagnostic_line(&self, baseline_generation: u64) -> String {
+        format!(
+            "tail hygiene prefix invalidated: part_index={} message={} field={} frozen_parts={} measured_parts={} action=re-measured generation={}",
+            self.part_index,
+            if self.message_id.is_empty() {
+                "unknown"
+            } else {
+                self.message_id.as_str()
+            },
+            self.field,
+            self.frozen_parts,
+            self.measured_parts,
+            baseline_generation,
+        )
+    }
+}
+
+/// A refreshed baseline plus the mismatch that forced a re-measure, when there was one.
+pub(crate) struct TailHygieneRefresh {
+    pub(crate) baseline: TailHygieneBaseline,
+    pub(crate) prefix_mismatch: Option<TailHygienePrefixMismatch>,
 }
 
 /// Count distinct user messages that reached the tail as authored turns.
@@ -93,7 +146,64 @@ pub(crate) fn real_user_turn_count(projection: &FlatProjection) -> u64 {
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha256::digest(bytes.as_ref()))
+    crate::digest::hex(&Sha256::digest(bytes.as_ref()))
+}
+
+#[cfg(test)]
+pub(crate) fn profile_part_hash_variants(session: &str, projection: &FlatProjection) {
+    let mut samples = std::collections::BTreeMap::<&str, Vec<f64>>::new();
+    for sample in 0..23 {
+        let variants = if sample % 2 == 0 {
+            ["concat_formatter", "stream_formatter", "stream_table"]
+        } else {
+            ["stream_table", "stream_formatter", "concat_formatter"]
+        };
+        for variant in variants {
+            crate::per_pass_profile::begin_pass();
+            profile_start!(perf_operation, "hash_variant");
+            for block in &projection.blocks {
+                // Mirror the production child-clock overhead in every variant.
+                profile_start!(perf_hash, "variant_part");
+                let hash = if variant == "concat_formatter" {
+                    let mut input = String::with_capacity(9 + block.bytes.len());
+                    input.push_str("excluded");
+                    input.push('\0');
+                    input.push_str(&block.bytes);
+                    format!("{:x}", Sha256::digest(input.as_bytes()))
+                } else {
+                    let mut hash = Sha256::new();
+                    hash.update(b"excluded");
+                    hash.update([0]);
+                    hash.update(block.bytes.as_bytes());
+                    let digest = hash.finalize();
+                    if variant == "stream_formatter" {
+                        format!("{digest:x}")
+                    } else {
+                        crate::digest::hex(&digest)
+                    }
+                };
+                std::hint::black_box(hash);
+                profile_end!(perf_hash);
+            }
+            profile_end!(perf_operation);
+            let costs = crate::per_pass_profile::end_pass();
+            if sample >= 3 {
+                samples
+                    .entry(variant)
+                    .or_default()
+                    .push(costs["hash_variant"].thread_cpu_ms);
+            }
+        }
+    }
+    for (variant, mut samples) in samples {
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "COST_MICRO {}",
+            serde_json::json!({"session":session,"finding":"RT-3",
+            "shape":variant,"n":samples.len(),"parts":projection.blocks.len(),
+            "thread_cpu_p50_ms":(samples[9]+samples[10])/2.0})
+        );
+    }
 }
 
 fn strip_channel1_reminder_spans(output: &str) -> &str {
@@ -130,129 +240,9 @@ fn media_content(media: &MediaBlock) -> String {
         .unwrap_or_else(|| serde_json::to_string(&media.source).unwrap_or_default())
 }
 
-fn decode_base64_preview(payload: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::with_capacity(payload.len() * 3 / 4);
-    let mut quartet = [0u8; 4];
-    let mut filled = 0usize;
-    for byte in payload.bytes().take(512) {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            _ => return None,
-        };
-        quartet[filled] = value;
-        filled += 1;
-        if filled == 4 {
-            output.push((quartet[0] << 2) | (quartet[1] >> 4));
-            output.push((quartet[1] << 4) | (quartet[2] >> 2));
-            output.push((quartet[2] << 6) | quartet[3]);
-            filled = 0;
-        }
-    }
-    if filled >= 2 {
-        output.push((quartet[0] << 2) | (quartet[1] >> 4));
-    }
-    if filled >= 3 {
-        output.push((quartet[1] << 4) | (quartet[2] >> 2));
-    }
-    Some(output)
-}
-
-fn image_dimensions(header: &str, bytes: &[u8]) -> Option<(u64, u64)> {
-    if header.contains("image/png")
-        && bytes.len() >= 24
-        && bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-    {
-        let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as u64;
-        let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as u64;
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    if header.contains("image/gif") && bytes.len() >= 10 && bytes.starts_with(b"GIF") {
-        let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u64;
-        let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u64;
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    if (header.contains("image/jpeg") || header.contains("image/jpg"))
-        && bytes.starts_with(&[0xff, 0xd8])
-    {
-        let mut index = 2usize;
-        while index + 8 < bytes.len() {
-            if bytes[index] != 0xff {
-                index += 1;
-                continue;
-            }
-            let marker = bytes[index + 1];
-            let is_sof = matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf);
-            if is_sof {
-                let height = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]) as u64;
-                let width = u16::from_be_bytes([bytes[index + 7], bytes[index + 8]]) as u64;
-                return (width > 0 && height > 0).then_some((width, height));
-            }
-            if matches!(marker, 0xd8 | 0xd9 | 0x01) {
-                index += 2;
-                continue;
-            }
-            let segment_len = u16::from_be_bytes([bytes[index + 2], bytes[index + 3]]) as usize;
-            if segment_len < 2 {
-                return None;
-            }
-            index = index.saturating_add(2 + segment_len);
-        }
-    }
-    if header.contains("image/webp")
-        && bytes.len() >= 30
-        && bytes.starts_with(b"RIFF")
-        && &bytes[8..12] == b"WEBP"
-    {
-        let variant = &bytes[12..16];
-        let (width, height) = if variant == b"VP8 " {
-            (
-                u16::from_le_bytes([bytes[26], bytes[27]]) as u64 & 0x3fff,
-                u16::from_le_bytes([bytes[28], bytes[29]]) as u64 & 0x3fff,
-            )
-        } else if variant == b"VP8L" {
-            let width = 1 + (u16::from_le_bytes([bytes[21], bytes[22]]) as u64 & 0x3fff);
-            let height = 1
-                + (((bytes[22] as u64 >> 6)
-                    | ((bytes[23] as u64) << 2)
-                    | ((bytes[24] as u64) << 10))
-                    & 0x3fff);
-            (width, height)
-        } else if variant == b"VP8X" {
-            (
-                1 + bytes[24] as u64 + ((bytes[25] as u64) << 8) + ((bytes[26] as u64) << 16),
-                1 + bytes[27] as u64 + ((bytes[28] as u64) << 8) + ((bytes[29] as u64) << 16),
-            )
-        } else {
-            return None;
-        };
-        return (width > 0 && height > 0).then_some((width, height));
-    }
-    None
-}
-
-fn estimate_image_tokens(data_url: &str) -> i64 {
-    let Some((header, payload)) = data_url.split_once(',') else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let Some(bytes) = decode_base64_preview(payload) else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let Some((width, height)) = image_dimensions(header, &bytes) else {
-        return IMAGE_FALLBACK_TOKENS;
-    };
-    let pixels = width.saturating_mul(height);
-    let tokens = pixels.saturating_add(IMAGE_TOKEN_DIVISOR - 1) / IMAGE_TOKEN_DIVISOR;
-    (tokens as i64).clamp(1, IMAGE_TOKEN_CAP)
-}
-
 fn media_tokens(media: &MediaBlock, content: &str) -> i64 {
     match media.kind {
-        MediaKind::Image => estimate_image_tokens(content),
+        MediaKind::Image => crate::image_tokens::estimate_image_tokens(content),
         MediaKind::Audio | MediaKind::Video | MediaKind::File | MediaKind::Document => {
             estimated_tokens(content)
         }
@@ -296,14 +286,17 @@ fn part_measurement(
         TailHygienePartKind::File => "file",
         TailHygienePartKind::Excluded => "excluded",
     };
-    let mut hash_input = String::with_capacity(kind_name.len() + content.len() + 1);
-    hash_input.push_str(kind_name);
-    hash_input.push('\0');
-    hash_input.push_str(content);
+    profile_start!(perf_hash, "rt03_part_hash");
+    let mut hash = Sha256::new();
+    hash.update(kind_name.as_bytes());
+    hash.update([0]);
+    hash.update(content.as_bytes());
+    let content_hash = crate::digest::hex(&hash.finalize());
+    profile_end!(perf_hash);
     let active = tag_number.is_some() && !queued_for_drop;
     TailHygienePartMeasurement {
         key,
-        content_hash: hex_digest(hash_input),
+        content_hash,
         kind,
         tokens,
         u_tokens: if active && !protected { tokens } else { 0 },
@@ -350,6 +343,19 @@ fn neighborhood_consistent(
     matches!((previous_max, next_min), (Some(previous), Some(next)) if orphan_tag_number >= previous && orphan_tag_number <= next)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Block-id and caveman-key lookups made by this thread, read by the scaling test.
+    static ID_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts one id lookup for the scaling test; compiles to nothing outside tests.
+#[inline(always)]
+fn count_id_probe() {
+    #[cfg(test)]
+    ID_PROBES.with(|probes| probes.set(probes.get() + 1));
+}
+
 /// Build part attribution from exact block identities. Pre-composite legacy rows whose block id is
 /// only a raw call id use the fallback only when one owner arc and its tag-number neighborhood are
 /// unambiguous; recurring call ids otherwise remain T-only.
@@ -357,28 +363,23 @@ fn tag_numbers_by_block_and_arc(
     projection: &FlatProjection,
     tag_rows: &[McTagRow],
 ) -> (HashMap<String, i64>, HashMap<String, i64>) {
-    let block_ids = projection
-        .blocks
-        .iter()
-        .map(|block| block.id.as_str())
-        .collect::<HashSet<_>>();
+    // One borrowed index serves both membership and lookup. The first block with an id wins,
+    // matching a front-to-back search when a projection repeats an id.
+    let mut block_by_id = HashMap::<&str, &FlatBlock>::with_capacity(projection.blocks.len());
+    for block in &projection.blocks {
+        block_by_id.entry(block.id.as_str()).or_insert(block);
+    }
     let message_indexes = projection_message_indexes(projection);
     let mut by_block = HashMap::new();
     let mut by_arc = HashMap::new();
     let mut bounds_by_message = HashMap::<usize, (i64, i64)>::new();
 
-    for row in tag_rows
-        .iter()
-        .filter(|row| block_ids.contains(row.block_id.as_str()))
-    {
-        by_block.insert(row.block_id.clone(), row.tag_number);
-        let Some(block) = projection
-            .blocks
-            .iter()
-            .find(|block| block.id == row.block_id)
-        else {
+    for row in tag_rows {
+        count_id_probe();
+        let Some(block) = block_by_id.get(row.block_id.as_str()).copied() else {
             continue;
         };
+        by_block.insert(row.block_id.clone(), row.tag_number);
         if let Some(arc_id) = &block.arc_id {
             by_arc.entry(arc_id.clone()).or_insert(row.tag_number);
         }
@@ -400,7 +401,8 @@ fn tag_numbers_by_block_and_arc(
         .collect::<HashSet<_>>();
     let mut orphan_rows = HashMap::<&str, Vec<&McTagRow>>::new();
     for row in tag_rows.iter().filter(|row| {
-        !block_ids.contains(row.block_id.as_str()) && call_ids.contains(row.block_id.as_str())
+        count_id_probe();
+        !block_by_id.contains_key(row.block_id.as_str()) && call_ids.contains(row.block_id.as_str())
     }) {
         orphan_rows
             .entry(row.block_id.as_str())
@@ -452,12 +454,23 @@ fn red_targets(core: &CoreState) -> HashSet<&str> {
         .collect()
 }
 
-fn caveman_content<'a>(core: &'a CoreState, block: &FlatBlock) -> Option<&'a str> {
-    let key = format!("{CAV_KEY_PREFIX}{}", block.id);
-    core.frozen_units
-        .iter()
-        .find(|unit| unit.key == key)
-        .map(|unit| unit.frozen_payload.as_str())
+/// Frozen caveman payloads keyed by the block id they rewrite. The first unit with a key wins,
+/// matching a front-to-back search of the frozen units.
+fn caveman_payloads(core: &CoreState) -> HashMap<&str, &str> {
+    let mut payloads = HashMap::new();
+    for unit in &core.frozen_units {
+        if let Some(block_id) = unit.key.strip_prefix(CAV_KEY_PREFIX) {
+            payloads
+                .entry(block_id)
+                .or_insert(unit.frozen_payload.as_str());
+        }
+    }
+    payloads
+}
+
+fn caveman_content<'a>(payloads: &HashMap<&str, &'a str>, block: &FlatBlock) -> Option<&'a str> {
+    count_id_probe();
+    payloads.get(block.id.as_str()).copied()
 }
 
 fn block_tag_number(
@@ -552,6 +565,7 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
     protected_block_ids: &HashSet<String>,
     pending_drop_target_ids: &HashSet<String>,
 ) -> TailHygieneMeasurement {
+    profile_start!(perf_indexes, "hygiene_indexes");
     let (tags_by_block, tags_by_arc) = tag_numbers_by_block_and_arc(projection, tag_rows);
     let queued_numbers = queued_tag_numbers(tag_rows, pending_drop_target_ids);
     let protected_arc_ids = projection
@@ -561,6 +575,7 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
         .filter_map(|block| block.arc_id.as_deref())
         .collect::<HashSet<_>>();
     let red_targets = red_targets(core);
+    let caveman_payloads = caveman_payloads(core);
     let reduced_arcs = projection
         .blocks
         .iter()
@@ -571,17 +586,22 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
         .blocks
         .iter()
         .filter_map(|block| {
-            let mc_store::CkKind::ToolResult { output, .. } = &block.wire.kind else {
+            let mc_store::CkKind::ToolResult { output, .. } = &block.wire_shape().kind else {
                 return None;
             };
-            if is_drop_sentinel(&tool_output_content(&output.kind)) {
+            let text = block
+                .scalar_text()
+                .unwrap_or_else(|| std::borrow::Cow::Owned(tool_output_content(&output.kind)));
+            if is_drop_sentinel(&text) {
                 block.arc_id.as_deref()
             } else {
                 None
             }
         })
         .collect::<HashSet<_>>();
+    profile_end!(perf_indexes);
 
+    profile_start!(perf_parts, "hygiene_parts");
     let mut parts = Vec::with_capacity(projection.blocks.len());
     let mut u = 0i64;
     let mut t = 0i64;
@@ -609,11 +629,10 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
             &protected_arc_ids,
         );
         let queued_for_drop = tag_number.is_some_and(|number| queued_numbers.contains(&number));
-        let measured = match &block.wire.kind {
-            mc_store::CkKind::Text { text }
-                if block.role == "user" || block.role == "assistant" =>
-            {
-                let content = caveman_content(core, block).unwrap_or(text);
+        let measured = match &block.wire_shape().kind {
+            mc_store::CkKind::Text { .. } if block.role == "user" || block.role == "assistant" => {
+                let text = block.scalar_text().expect("text payload");
+                let content = caveman_content(&caveman_payloads, block).unwrap_or(&text);
                 let content = strip_channel1_reminder_spans(content);
                 if content.is_empty() || is_drop_sentinel(content) {
                     excluded_part(key, content)
@@ -642,7 +661,9 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
                 )
             }
             mc_store::CkKind::ToolResult { output, .. } => {
-                let raw_content = tool_output_content(&output.kind);
+                let raw_content = block
+                    .scalar_text()
+                    .unwrap_or_else(|| std::borrow::Cow::Owned(tool_output_content(&output.kind)));
                 let content = strip_channel1_reminder_spans(&raw_content);
                 if content.is_empty() || is_drop_sentinel(content) {
                     excluded_part(key, content)
@@ -683,125 +704,329 @@ pub(crate) fn measure_tail_hygiene_with_pending_drops(
         u = u.saturating_add(measured.u_tokens.max(0));
         parts.push(measured);
     }
+    profile_end!(perf_parts);
+    profile_start!(_perf_signature, "hygiene_signature");
     let mut signature_input = String::new();
     for part in &parts {
         let _ = write!(signature_input, "{}:{}\0", part.key, part.content_hash);
     }
     let t = t.max(0);
+    // Blocks are measured one-to-one and in projection order, so the newest
+    // message's blocks are the trailing run that shares the last block's mid.
+    let mut newest_message_part_start = parts.len();
+    if let Some(newest_mid) = projection.blocks.last().map(|block| block.mid.as_str()) {
+        while newest_message_part_start > 0
+            && projection.blocks[newest_message_part_start - 1].mid == newest_mid
+        {
+            newest_message_part_start -= 1;
+        }
+    }
     TailHygieneMeasurement {
         u: u.clamp(0, t),
         t,
         content_signature: hex_digest(signature_input),
         parts,
+        newest_message_part_start,
     }
+}
+
+enum PrefixComparison {
+    Valid {
+        boundary_advance_u: i64,
+        queued_drop_delta_u: i64,
+    },
+    Mismatch(TailHygienePrefixMismatch),
+}
+
+/// Message id of a measured block, recovered from its `{mid}#{index}\0{kind}` key.
+fn message_id_from_part_key(key: &str) -> &str {
+    let block_id = key.split('\0').next().unwrap_or(key);
+    crate::ck_wire::split_block_id(block_id).map_or(block_id, |(mid, _)| mid)
+}
+
+/// Name the first field of a frozen part that a defer pass cannot explain, or None
+/// when the part still matches. Protection release and queue membership are
+/// explainable state moves; they are only a mismatch when the tag is no longer
+/// active, because then the U they carry cannot be attributed.
+fn compared_field(
+    before: &TailHygienePartMeasurement,
+    after: &TailHygienePartMeasurement,
+) -> Option<&'static str> {
+    if before.key != after.key {
+        return Some("key");
+    }
+    if before.content_hash != after.content_hash {
+        return Some("contentHash");
+    }
+    if before.kind != after.kind {
+        return Some("kind");
+    }
+    if before.tokens != after.tokens {
+        return Some("tokens");
+    }
+    if before.tag_number != after.tag_number {
+        return Some("tagNumber");
+    }
+    if before.tag_status != after.tag_status {
+        return Some("tagStatus");
+    }
+    if !before.protected && after.protected {
+        return Some("protection-entered");
+    }
+    if before.protected && !after.protected {
+        return (after.tag_status.as_deref() != Some("active"))
+            .then_some("protection-exit-inactive");
+    }
+    if before.queued_for_drop != after.queued_for_drop {
+        return (before.tag_status.as_deref() != Some("active")
+            || after.tag_status.as_deref() != Some("active"))
+        .then_some("queued-drop-inactive");
+    }
+    (before.u_tokens != after.u_tokens).then_some("uTokens")
 }
 
 fn same_measured_prefix(
     baseline: &[TailHygienePartMeasurement],
     current: &[TailHygienePartMeasurement],
-) -> Option<(i64, i64)> {
+) -> PrefixComparison {
+    let mismatch = |part_index: usize, field: &'static str| {
+        PrefixComparison::Mismatch(TailHygienePrefixMismatch {
+            part_index,
+            message_id: baseline
+                .get(part_index)
+                .map(|part| message_id_from_part_key(&part.key).to_string())
+                .unwrap_or_default(),
+            field,
+            frozen_parts: baseline.len(),
+            measured_parts: current.len(),
+        })
+    };
     if current.len() < baseline.len() {
-        return None;
+        return mismatch(current.len(), "shorter");
     }
     let mut boundary_advance_u = 0i64;
     let mut queued_drop_delta_u = 0i64;
-    for (before, after) in baseline.iter().zip(current) {
-        if before.key != after.key
-            || before.content_hash != after.content_hash
-            || before.kind != after.kind
-            || before.tokens != after.tokens
-            || before.tag_number != after.tag_number
-            || before.tag_status != after.tag_status
-            || (!before.protected && after.protected)
-        {
-            return None;
+    for (index, (before, after)) in baseline.iter().zip(current).enumerate() {
+        if let Some(field) = compared_field(before, after) {
+            return mismatch(index, field);
         }
         if before.protected && !after.protected {
-            if after.tag_status.as_deref() != Some("active") {
-                return None;
-            }
             boundary_advance_u = boundary_advance_u.saturating_add(after.u_tokens);
         } else if before.queued_for_drop != after.queued_for_drop {
-            if before.tag_status.as_deref() != Some("active")
-                || after.tag_status.as_deref() != Some("active")
-            {
-                return None;
-            }
             queued_drop_delta_u =
                 queued_drop_delta_u.saturating_add(after.u_tokens.saturating_sub(before.u_tokens));
-        } else if before.u_tokens != after.u_tokens {
-            return None;
         }
     }
-    Some((boundary_advance_u, queued_drop_delta_u))
+    PrefixComparison::Valid {
+        boundary_advance_u,
+        queued_drop_delta_u,
+    }
 }
 
+/// Frozen prefix plus the delta the freezing pass itself carries.
+struct FrozenMeasurement {
+    baseline_u: i64,
+    baseline_t: i64,
+    turn_delta_u: i64,
+    turn_delta_t: i64,
+    baseline_parts: Vec<TailHygienePartMeasurement>,
+}
+
+/// Freeze a measurement into a baseline prefix plus this pass's delta.
+///
+/// The newest message is deliberately left out of the frozen prefix: while it is
+/// newest its blocks are still in flight (text is still being appended, reasoning
+/// is demoted once it stops being newest, new blocks keep arriving), so freezing
+/// them guarantees a mismatch on the very next pass. Everything after the cut is
+/// re-measured on every pass, so the reported totals are unchanged.
+fn freeze_tail_hygiene_measurement(
+    mut parts: Vec<TailHygienePartMeasurement>,
+    newest_message_part_start: usize,
+) -> FrozenMeasurement {
+    let cut = newest_message_part_start.min(parts.len());
+    let newest = parts.split_off(cut);
+    let mut baseline_t = 0i64;
+    let mut baseline_u = 0i64;
+    for part in &parts {
+        baseline_t = baseline_t.saturating_add(part.tokens.max(0));
+        baseline_u = baseline_u.saturating_add(part.u_tokens.max(0));
+    }
+    let mut turn_delta_t = 0i64;
+    let mut turn_delta_u = 0i64;
+    for part in &newest {
+        turn_delta_t = turn_delta_t.saturating_add(part.tokens);
+        if part.kind != TailHygienePartKind::ToolOutput || !part.protected {
+            turn_delta_u = turn_delta_u.saturating_add(part.u_tokens);
+        }
+    }
+    let baseline_t = baseline_t.max(0);
+    FrozenMeasurement {
+        baseline_u: baseline_u.clamp(0, baseline_t),
+        baseline_t,
+        turn_delta_u,
+        turn_delta_t,
+        baseline_parts: parts,
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn refresh_tail_hygiene_baseline(
     measured: TailHygieneMeasurement,
     cache_busting: bool,
     previous: Option<&TailHygieneBaseline>,
     now_ms: i64,
-) -> TailHygieneBaseline {
-    if !cache_busting && previous.is_some_and(|baseline| baseline.generation_invalidated) {
-        let mut baseline = previous.expect("checked previous baseline").clone();
-        baseline.content_signature = measured.content_signature;
-        return baseline;
+) -> TailHygieneRefresh {
+    refresh_tail_hygiene_baseline_calibrated(
+        measured,
+        cache_busting,
+        previous,
+        now_ms,
+        HygieneCalibration::default(),
+    )
+}
+
+fn token_buckets(parts: &[TailHygienePartMeasurement]) -> TailHygieneTokenBuckets {
+    let mut buckets = TailHygieneTokenBuckets::default();
+    for part in parts {
+        let (tail, reclaimable) = (part.tokens.max(0), part.u_tokens.max(0));
+        match part.kind {
+            TailHygienePartKind::ToolInput | TailHygienePartKind::ToolOutput => {
+                buckets.tools_t = buckets.tools_t.saturating_add(tail);
+                buckets.tools_u = buckets.tools_u.saturating_add(reclaimable);
+            }
+            TailHygienePartKind::Text | TailHygienePartKind::File => {
+                buckets.prose_t = buckets.prose_t.saturating_add(tail);
+                buckets.prose_u = buckets.prose_u.saturating_add(reclaimable);
+            }
+            TailHygienePartKind::Excluded => {}
+        }
     }
-    if cache_busting || previous.is_none() {
-        return TailHygieneBaseline {
-            baseline_u: measured.u,
-            baseline_t: measured.t,
-            turn_delta_u: 0,
-            turn_delta_t: 0,
+    buckets
+}
+
+pub(crate) fn refresh_tail_hygiene_baseline_calibrated(
+    measured: TailHygieneMeasurement,
+    cache_busting: bool,
+    previous: Option<&TailHygieneBaseline>,
+    now_ms: i64,
+    calibration: HygieneCalibration,
+) -> TailHygieneRefresh {
+    profile_start!(perf_buckets, "hygiene_refresh_buckets");
+    let TailHygieneMeasurement {
+        content_signature,
+        parts,
+        newest_message_part_start,
+        ..
+    } = measured;
+    let calibration = if !cache_busting {
+        previous.map_or(calibration, |baseline| HygieneCalibration {
+            units_version: baseline.hygiene_units_version.max(1),
+            tools_ratio: baseline.hygiene_tools_ratio,
+            prose_ratio: baseline.hygiene_prose_ratio,
+        })
+    } else {
+        calibration
+    };
+    let effective_token_buckets = token_buckets(&parts);
+    profile_end!(perf_buckets);
+    // A defer pass cannot attribute an unexplainable change to an append, and this
+    // walk measures the rendered tail rather than producing wire bytes, so it
+    // re-measures instead of holding the stale baseline until the next cache-busting
+    // pass. Holding left the reclaim reminders unevaluable for as long as the session
+    // went without a bust.
+    profile_start!(perf_compare, "hygiene_refresh_compare");
+    let comparison = match previous {
+        Some(previous) if !cache_busting => {
+            Some(same_measured_prefix(&previous.baseline_parts, &parts))
+        }
+        _ => None,
+    };
+    profile_end!(perf_compare);
+    profile_start!(_perf_baseline, "hygiene_refresh_baseline");
+    let (valid_delta, mismatch) = match comparison {
+        Some(PrefixComparison::Valid {
+            boundary_advance_u,
+            queued_drop_delta_u,
+        }) => (Some((boundary_advance_u, queued_drop_delta_u)), None),
+        Some(PrefixComparison::Mismatch(mismatch)) => (None, Some(mismatch)),
+        None => (None, None),
+    };
+    if let (Some(previous), Some((boundary_advance_u, queued_drop_delta_u))) =
+        (previous, valid_delta)
+    {
+        let mut turn_delta_t = 0i64;
+        // Queue membership is an action-state delta: it reduces the actionable token
+        // backlog while the frozen baseline and still-rendered token total remain unchanged.
+        let mut turn_delta_u = boundary_advance_u.saturating_add(queued_drop_delta_u);
+        for part in &parts[previous.baseline_parts.len()..] {
+            turn_delta_t = turn_delta_t.saturating_add(part.tokens);
+            // Tool-output tokens are not reclaimable while their parts are protected. As new
+            // outputs extend the measured tail, include outputs that have aged out of protection.
+            if part.kind != TailHygienePartKind::ToolOutput || !part.protected {
+                turn_delta_u = turn_delta_u.saturating_add(part.u_tokens);
+            }
+        }
+        return TailHygieneRefresh {
+            baseline: TailHygieneBaseline {
+                turn_delta_u,
+                turn_delta_t,
+                hygiene_units_version: calibration.units_version,
+                hygiene_tools_ratio: calibration.tools_ratio,
+                hygiene_prose_ratio: calibration.prose_ratio,
+                effective_token_buckets,
+                evaluable: true,
+                generation_invalidated: false,
+                content_signature,
+                ..previous.clone()
+            },
+            prefix_mismatch: None,
+        };
+    }
+    let frozen = freeze_tail_hygiene_measurement(parts, newest_message_part_start);
+    TailHygieneRefresh {
+        baseline: TailHygieneBaseline {
+            baseline_u: frozen.baseline_u,
+            baseline_t: frozen.baseline_t,
+            turn_delta_u: frozen.turn_delta_u,
+            turn_delta_t: frozen.turn_delta_t,
+            hygiene_units_version: calibration.units_version,
+            hygiene_tools_ratio: calibration.tools_ratio,
+            hygiene_prose_ratio: calibration.prose_ratio,
+            effective_token_buckets,
             baseline_generation: previous
                 .map_or(0, |baseline| baseline.baseline_generation)
                 .saturating_add(1),
             computed_at_ms: now_ms,
             evaluable: true,
             generation_invalidated: false,
-            baseline_parts: measured.parts,
-            content_signature: measured.content_signature,
+            baseline_parts: frozen.baseline_parts,
+            content_signature,
             channel1_post_reduce_grace_baseline_u: previous
                 .and_then(|baseline| baseline.channel1_post_reduce_grace_baseline_u),
             channel1_post_reduce_grace_pre_level: previous
                 .map(|baseline| baseline.channel1_post_reduce_grace_pre_level.clone())
                 .unwrap_or_default(),
-        };
-    }
-
-    let previous = previous.expect("non-busting refresh has a previous baseline");
-    let Some((boundary_advance_u, queued_drop_delta_u)) =
-        same_measured_prefix(&previous.baseline_parts, &measured.parts)
-    else {
-        let mut invalidated = previous.clone();
-        invalidated.evaluable = false;
-        invalidated.generation_invalidated = true;
-        invalidated.content_signature = measured.content_signature;
-        return invalidated;
-    };
-    let mut turn_delta_t = 0i64;
-    // Queue membership is an action-state delta: it reduces the actionable token
-    // backlog while the frozen baseline and still-rendered token total remain unchanged.
-    let mut turn_delta_u = boundary_advance_u.saturating_add(queued_drop_delta_u);
-    for part in &measured.parts[previous.baseline_parts.len()..] {
-        turn_delta_t = turn_delta_t.saturating_add(part.tokens);
-        // Tool-output tokens are not reclaimable while their parts are protected. As new
-        // outputs extend the measured tail, include outputs that have aged out of protection.
-        if part.kind != TailHygienePartKind::ToolOutput || !part.protected {
-            turn_delta_u = turn_delta_u.saturating_add(part.u_tokens);
-        }
-    }
-    TailHygieneBaseline {
-        turn_delta_u,
-        turn_delta_t,
-        evaluable: true,
-        generation_invalidated: false,
-        content_signature: measured.content_signature,
-        ..previous.clone()
+        },
+        prefix_mismatch: mismatch,
     }
 }
 
 pub(crate) fn effective_tail_hygiene(baseline: &TailHygieneBaseline) -> (i64, i64) {
+    if baseline.hygiene_units_version >= 2 {
+        let buckets = &baseline.effective_token_buckets;
+        let calibrated = |tools: i64, prose: i64| -> i64 {
+            let value = tools.max(0) as f64 * baseline.hygiene_tools_ratio
+                + prose.max(0) as f64 * baseline.hygiene_prose_ratio;
+            if value.is_finite() && value >= 0.0 {
+                value.ceil().min(i64::MAX as f64) as i64
+            } else {
+                i64::MAX
+            }
+        };
+        let t = calibrated(buckets.tools_t, buckets.prose_t);
+        let u = calibrated(buckets.tools_u, buckets.prose_u).clamp(0, t);
+        return (u, t);
+    }
     let t = baseline
         .baseline_t
         .saturating_add(baseline.turn_delta_t)
@@ -866,6 +1091,90 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::{json, Value};
 
+    #[test]
+    fn streamed_part_hash_matches_concatenated_reference_for_every_kind() {
+        for (kind, name) in [
+            (TailHygienePartKind::Text, "text"),
+            (TailHygienePartKind::ToolInput, "toolInput"),
+            (TailHygienePartKind::ToolOutput, "toolOutput"),
+            (TailHygienePartKind::File, "file"),
+            (TailHygienePartKind::Excluded, "excluded"),
+        ] {
+            for content in ["", "\0", "\"\\\n\r", "é漢字🙂§17§", "[dropped §1§]"] {
+                let reference = format!("{name}\0{content}");
+                let expected = format!("{:x}", Sha256::digest(reference.as_bytes()));
+                let actual =
+                    part_measurement("key".into(), kind, content, 3, Some(1), false, false);
+                assert_eq!(actual.content_hash, expected);
+                assert_eq!(actual.tokens, 3);
+                assert_eq!(actual.u_tokens, 3);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "release-only signature checkpoint prototype; no production cache"]
+    fn signature_checkpoint_prototype_matches_full_hash() {
+        if cfg!(debug_assertions) {
+            panic!("run the prototype with --release");
+        }
+        let parts: Vec<_> = (0_u64..23_000)
+            .map(|i| {
+                (
+                    format!("recorded-shape-{i}#0\0text"),
+                    hex_digest(i.to_le_bytes()),
+                )
+            })
+            .collect();
+        // SHA-256 continuation preserves the existing ordered byte stream. A
+        // tree/Merkle digest would not be a substitute for this content signature.
+        let mut prefix = Sha256::new();
+        let mut prefix_bytes = 0;
+        for (key, hash) in &parts[..parts.len() - 1] {
+            let bytes = format!("{key}:{hash}\0");
+            prefix_bytes += bytes.len();
+            prefix.update(bytes.as_bytes());
+        }
+        let mut full_costs = Vec::new();
+        let mut checkpoint_costs = Vec::new();
+        for pass in 0..23 {
+            let hash = hex_digest(format!("streaming-{pass}"));
+            crate::per_pass_profile::begin_pass();
+            profile_start!(perf_full, "full_signature");
+            let mut input = String::new();
+            for (key, content_hash) in &parts[..parts.len() - 1] {
+                let _ = write!(input, "{}:{}\0", key, content_hash);
+            }
+            let key = &parts.last().unwrap().0;
+            let _ = write!(input, "{}:{}\0", key, hash);
+            let full = hex_digest(input);
+            profile_end!(perf_full);
+            profile_start!(perf_checkpoint, "checkpoint_signature");
+            let mut candidate = prefix.clone();
+            candidate.update(format!("{key}:{hash}\0").as_bytes());
+            let checkpoint = format!("{:x}", candidate.finalize());
+            profile_end!(perf_checkpoint);
+            let costs = crate::per_pass_profile::end_pass();
+            assert_eq!(checkpoint, full, "signature bytes differ on pass {pass}");
+            if pass >= 3 {
+                full_costs.push(costs["full_signature"].thread_cpu_ms);
+                checkpoint_costs.push(costs["checkpoint_signature"].thread_cpu_ms);
+            }
+        }
+        let median = |mut costs: Vec<f64>| {
+            costs.sort_by(f64::total_cmp);
+            (costs[9] + costs[10]) / 2.0
+        };
+        println!(
+            "SIGNATURE_PROTOTYPE {}",
+            json!({"parts":parts.len(), "stable_prefix_bytes":prefix_bytes,
+                "samples":20, "byte_comparisons":23,
+                "checkpoint_bytes":std::mem::size_of::<Sha256>(),
+                "full_cpu_p50_ms":median(full_costs),
+                "checkpoint_cpu_p50_ms":median(checkpoint_costs)})
+        );
+    }
+
     fn message(mid: &str, ordinal: u64, role: &str, blocks: Vec<CkKind>) -> CkIngressMessage {
         CkIngressMessage {
             mid: mid.to_string(),
@@ -898,8 +1207,294 @@ mod tests {
             kind: "message".to_string(),
             token_count: 0,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
+    }
+
+    /// Tag attribution as it was before the borrowed block index: membership came from an id
+    /// set and every matching row searched the projection front to back. `comparisons` counts
+    /// the id comparisons that search made. Kept only as the differential reference.
+    fn scanning_tag_numbers_by_block_and_arc(
+        projection: &FlatProjection,
+        tag_rows: &[McTagRow],
+        comparisons: &std::cell::Cell<u64>,
+    ) -> (HashMap<String, i64>, HashMap<String, i64>) {
+        let block_ids = projection
+            .blocks
+            .iter()
+            .map(|block| block.id.as_str())
+            .collect::<HashSet<_>>();
+        let message_indexes = projection_message_indexes(projection);
+        let mut by_block = HashMap::new();
+        let mut by_arc = HashMap::new();
+        let mut bounds_by_message = HashMap::<usize, (i64, i64)>::new();
+        for row in tag_rows
+            .iter()
+            .filter(|row| block_ids.contains(row.block_id.as_str()))
+        {
+            by_block.insert(row.block_id.clone(), row.tag_number);
+            let Some(block) = projection.blocks.iter().find(|block| {
+                comparisons.set(comparisons.get() + 1);
+                block.id == row.block_id
+            }) else {
+                continue;
+            };
+            if let Some(arc_id) = &block.arc_id {
+                by_arc.entry(arc_id.clone()).or_insert(row.tag_number);
+            }
+            if let Some(index) = message_indexes.get(block.mid.as_str()) {
+                bounds_by_message
+                    .entry(*index)
+                    .and_modify(|(min, max)| {
+                        *min = (*min).min(row.tag_number);
+                        *max = (*max).max(row.tag_number);
+                    })
+                    .or_insert((row.tag_number, row.tag_number));
+            }
+        }
+        let call_ids = projection
+            .blocks
+            .iter()
+            .filter_map(|block| block.tool_call_id.as_deref())
+            .collect::<HashSet<_>>();
+        let mut orphan_rows = HashMap::<&str, Vec<&McTagRow>>::new();
+        for row in tag_rows.iter().filter(|row| {
+            !block_ids.contains(row.block_id.as_str()) && call_ids.contains(row.block_id.as_str())
+        }) {
+            orphan_rows
+                .entry(row.block_id.as_str())
+                .or_default()
+                .push(row);
+        }
+        for (call_id, rows) in orphan_rows {
+            if rows.len() != 1 {
+                continue;
+            }
+            let candidate_arcs = projection
+                .blocks
+                .iter()
+                .filter(|block| block.tool_call_id.as_deref() == Some(call_id))
+                .filter_map(|block| block.arc_id.as_deref())
+                .filter(|arc_id| !by_arc.contains_key(*arc_id))
+                .collect::<BTreeSet<_>>();
+            if candidate_arcs.len() != 1 {
+                continue;
+            }
+            let arc_id = *candidate_arcs.first().expect("one candidate arc");
+            let Some(owner_index) = projection
+                .blocks
+                .iter()
+                .filter(|block| block.arc_id.as_deref() == Some(arc_id))
+                .filter_map(|block| message_indexes.get(block.mid.as_str()).copied())
+                .min()
+            else {
+                continue;
+            };
+            if neighborhood_consistent(
+                rows[0].tag_number,
+                owner_index,
+                message_indexes.len(),
+                &bounds_by_message,
+            ) {
+                by_arc.insert(arc_id.to_string(), rows[0].tag_number);
+            }
+        }
+        (by_block, by_arc)
+    }
+
+    /// The caveman lookup before frozen units were indexed: a front-to-back search per block.
+    fn scanning_caveman_content<'a>(core: &'a CoreState, block: &FlatBlock) -> Option<&'a str> {
+        let key = format!("{CAV_KEY_PREFIX}{}", block.id);
+        core.frozen_units
+            .iter()
+            .find(|unit| unit.key == key)
+            .map(|unit| unit.frozen_payload.as_str())
+    }
+
+    fn frozen(key: String, payload: &str) -> mc_core::FrozenUnit {
+        mc_core::FrozenUnit {
+            key,
+            kind: "caveman".to_string(),
+            frozen_payload: payload.to_string(),
+            durability_class: mc_core::DurabilityClass::Lineage,
+            reset_rule: String::new(),
+        }
+    }
+
+    /// A tool-heavy tail of `arcs` call/result pairs plus a user text per arc, every block
+    /// tagged. Also carries rows for blocks outside the projection, legacy rows keyed by a raw
+    /// call id (unique and recurring), a call id shared by two arcs, and caveman units with a
+    /// duplicate key, so the orphan and first-match rules are exercised.
+    fn hygiene_scale_fixture(arcs: usize) -> (FlatProjection, Vec<McTagRow>, CoreState) {
+        let mut messages = Vec::new();
+        let mut tags = Vec::new();
+        let mut core = CoreState::default();
+        let mut number = 0i64;
+        for n in 0..arcs {
+            let ordinal = n as u64 * 3 + 1;
+            // Every 97th arc reuses the previous arc's call id, as recurring provider ids do.
+            let call_id = if n % 97 == 96 {
+                format!("c{}", n - 1)
+            } else {
+                format!("c{n}")
+            };
+            messages.push(message(
+                &format!("call{n}"),
+                ordinal,
+                "assistant",
+                vec![CkKind::ToolCall {
+                    id: call_id.clone(),
+                    name: "read".to_string(),
+                    input: json!({ "path": format!("f{n}") }),
+                    provider_executed: false,
+                }],
+            ));
+            messages.push(message(
+                &format!("result{n}"),
+                ordinal + 1,
+                "user",
+                vec![CkKind::ToolResult {
+                    id: call_id.clone(),
+                    tool_name: "read".to_string(),
+                    output: CkToolOutput::bare(CkOutputKind::Text {
+                        text: format!("out {n}"),
+                    }),
+                    provider_executed: false,
+                }],
+            ));
+            messages.push(text(&format!("user{n}"), ordinal + 2, &format!("ask {n}")));
+            if n % 13 == 5 {
+                // Legacy rows name the raw call id instead of a block id.
+                number += 1;
+                tags.push(tag(number, &call_id));
+            } else {
+                for block in [format!("call{n}#0"), format!("result{n}#0")] {
+                    number += 1;
+                    tags.push(tag(number, &block));
+                }
+            }
+            number += 1;
+            tags.push(tag(number, &format!("user{n}#0")));
+            if n % 7 == 0 {
+                number += 1;
+                tags.push(tag(number, &format!("gone{n}#0")));
+            }
+            if n % 5 == 0 {
+                core.frozen_units
+                    .push(frozen(format!("{CAV_KEY_PREFIX}user{n}#0"), "short"));
+                if n % 10 == 0 {
+                    core.frozen_units
+                        .push(frozen(format!("{CAV_KEY_PREFIX}user{n}#0"), "second"));
+                }
+            }
+        }
+        (project_messages(&messages).unwrap(), tags, core)
+    }
+
+    /// The indexed attribution and caveman lookup must agree exactly with the front-to-back
+    /// searches they replace, including legacy raw-call-id rows, recurring call ids, rows for
+    /// absent blocks and duplicate caveman keys.
+    #[test]
+    fn indexed_hygiene_attribution_matches_scanning_reference() {
+        for arcs in [1, 40, 300] {
+            let (projection, tags, core) = hygiene_scale_fixture(arcs);
+            let comparisons = std::cell::Cell::new(0);
+            assert_eq!(
+                tag_numbers_by_block_and_arc(&projection, &tags),
+                scanning_tag_numbers_by_block_and_arc(&projection, &tags, &comparisons),
+                "arcs={arcs}"
+            );
+            let payloads = caveman_payloads(&core);
+            let mut caveman_hits = 0;
+            for block in &projection.blocks {
+                let indexed = caveman_content(&payloads, block);
+                assert_eq!(indexed, scanning_caveman_content(&core, block));
+                caveman_hits += usize::from(indexed.is_some());
+            }
+            assert_eq!(caveman_hits, arcs.div_ceil(5), "arcs={arcs}");
+        }
+        // The fixture must reach the legacy fallback for the comparison to cover it.
+        let (projection, tags, _) = hygiene_scale_fixture(300);
+        let (by_block, by_arc) = tag_numbers_by_block_and_arc(&projection, &tags);
+        let legacy_numbers = tags
+            .iter()
+            .filter(|row| !row.block_id.contains('#'))
+            .map(|row| row.tag_number)
+            .collect::<HashSet<_>>();
+        assert!(by_arc
+            .values()
+            .any(|number| legacy_numbers.contains(number)));
+        assert!(!by_block.keys().any(|id| id.starts_with("gone")));
+    }
+
+    /// Scaling counter for the hygiene measurement: id lookups made by the full production
+    /// measurement must grow linearly with tagged blocks, while the replaced front-to-back
+    /// search grows quadratically. Counts, not wall clock, so the result is load-independent.
+    #[test]
+    #[ignore = "scaling benchmark; run with --ignored --nocapture"]
+    fn hygiene_lookup_scaling_counts() {
+        let mut per_block = Vec::new();
+        for arcs in [334, 1_334, 5_334] {
+            let (projection, tags, core) = hygiene_scale_fixture(arcs);
+            let blocks = projection.blocks.len();
+            let window = crate::protection_window::ProtectionWindow::from_persisted_rows(&tags, 0);
+            ID_PROBES.with(|probes| probes.set(0));
+            let measured = measure_tail_hygiene_with_pending_drops(
+                &projection,
+                &core,
+                None,
+                &tags,
+                &window.tag_numbers,
+                &HashSet::new(),
+                &HashSet::new(),
+            );
+            let probes = ID_PROBES.with(std::cell::Cell::get);
+            let comparisons = std::cell::Cell::new(0);
+            scanning_tag_numbers_by_block_and_arc(&projection, &tags, &comparisons);
+            eprintln!(
+                "hygiene-scaling tagged_blocks={blocks} tag_rows={} indexed_probes={probes} scanning_comparisons={} t={}",
+                tags.len(),
+                comparisons.get(),
+                measured.t
+            );
+            per_block.push((blocks, probes as f64 / blocks as f64));
+        }
+        // Linear: lookups per block stay flat (within 10%) from ~1k to ~16k blocks.
+        let (_, first) = per_block[0];
+        for (blocks, ratio) in &per_block {
+            assert!(
+                (*ratio - first).abs() <= first * 0.1,
+                "{blocks} blocks: {ratio} probes per block vs {first}"
+            );
+        }
+    }
+
+    /// Refresh for assertions that only read the baseline, not the named mismatch.
+    fn refreshed_baseline(
+        measured: TailHygieneMeasurement,
+        cache_busting: bool,
+        previous: Option<&TailHygieneBaseline>,
+        now_ms: i64,
+    ) -> TailHygieneBaseline {
+        refresh_tail_hygiene_baseline(measured, cache_busting, previous, now_ms).baseline
+    }
+
+    #[test]
+    fn fable_tool_only_hygiene_calibrates_absolute_floors_before_band() {
+        let baseline = TailHygieneBaseline {
+            hygiene_units_version: 2,
+            hygiene_tools_ratio: 1.551639,
+            hygiene_prose_ratio: 1.571778,
+            effective_token_buckets: TailHygieneTokenBuckets {
+                tools_t: 40_000,
+                tools_u: 20_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (u, t) = effective_tail_hygiene(&baseline);
+        assert_eq!((u, t), (31_033, 62_066));
+        assert_eq!(hygiene_band(u, t), HygieneBand::Firm);
     }
 
     #[test]
@@ -1002,7 +1597,7 @@ mod tests {
             2,
             &HashSet::new(),
         );
-        let baseline = refresh_tail_hygiene_baseline(measured, true, None, 10);
+        let baseline = refreshed_baseline(measured, true, None, 10);
         assert_eq!(baseline.baseline_u, 0);
 
         let mut appended = base;
@@ -1017,7 +1612,7 @@ mod tests {
             2,
             &HashSet::new(),
         );
-        let defer = refresh_tail_hygiene_baseline(measured, false, Some(&baseline), 20);
+        let defer = refreshed_baseline(measured, false, Some(&baseline), 20);
         assert!(defer.evaluable);
         assert!(defer.turn_delta_t > 0);
         assert!(
@@ -1045,7 +1640,7 @@ mod tests {
             &empty,
             &empty,
         );
-        let baseline = refresh_tail_hygiene_baseline(baseline_measurement, true, None, 10);
+        let baseline = refreshed_baseline(baseline_measurement, true, None, 10);
 
         let reminder =
             "\n\n<system-reminder>\nHousekeeping backlog: spent tool outputs are reclaimable.\n</system-reminder>";
@@ -1093,8 +1688,7 @@ mod tests {
             &empty,
             &empty,
         );
-        let protected_defer =
-            refresh_tail_hygiene_baseline(protected_measurement, false, Some(&baseline), 20);
+        let protected_defer = refreshed_baseline(protected_measurement, false, Some(&baseline), 20);
         let aged_measurement = measure_tail_hygiene_with_pending_drops(
             &projection,
             &CoreState::default(),
@@ -1104,12 +1698,8 @@ mod tests {
             &empty,
             &empty,
         );
-        let aged_defer = refresh_tail_hygiene_baseline(
-            aged_measurement.clone(),
-            false,
-            Some(&protected_defer),
-            30,
-        );
+        let aged_defer =
+            refreshed_baseline(aged_measurement.clone(), false, Some(&protected_defer), 30);
 
         assert_eq!(effective_tail_hygiene(&protected_defer).0, 0);
         assert_eq!(
@@ -1146,7 +1736,7 @@ mod tests {
             0,
             &HashSet::new(),
         );
-        let baseline = refresh_tail_hygiene_baseline(initial.clone(), true, None, 10);
+        let baseline = refreshed_baseline(initial.clone(), true, None, 10);
         let queued_targets = HashSet::from(["queued#0".to_string()]);
         let queued = measure_tail_hygiene_with_pending_drops(
             &projection,
@@ -1167,7 +1757,7 @@ mod tests {
             &HashSet::new(),
         )
         .u;
-        let defer = refresh_tail_hygiene_baseline(queued.clone(), false, Some(&baseline), 20);
+        let defer = refreshed_baseline(queued.clone(), false, Some(&baseline), 20);
 
         assert_eq!(queued.t, initial.t);
         assert_eq!(queued.u, initial.u - queued_mass);
@@ -1236,11 +1826,13 @@ mod tests {
     }
 
     #[test]
-    fn non_append_mutation_invalidates_until_a_bust() {
-        let messages = vec![text("m", 1, "original")];
+    fn non_append_mutation_is_named_and_re_measured_on_the_defer_pass() {
+        // The newest message is never frozen, so the mutated message needs one after
+        // it to land inside the frozen prefix that a defer pass compares.
+        let messages = vec![text("m", 1, "original"), text("newest", 2, "newest turn")];
         let tags = vec![tag(1, "m#0")];
         let projection = project_messages(&messages).unwrap();
-        let baseline = refresh_tail_hygiene_baseline(
+        let baseline = refreshed_baseline(
             measure_tail_hygiene(
                 &projection,
                 &CoreState::default(),
@@ -1253,8 +1845,65 @@ mod tests {
             None,
             10,
         );
-        let projection = project_messages(&[text("m", 1, "changed")]).unwrap();
-        let invalid = refresh_tail_hygiene_baseline(
+        let changed = vec![
+            text("m", 1, "changed and then some"),
+            text("newest", 2, "newest turn"),
+        ];
+        let projection = project_messages(&changed).unwrap();
+        let measured = measure_tail_hygiene(
+            &projection,
+            &CoreState::default(),
+            None,
+            &tags,
+            0,
+            &HashSet::new(),
+        );
+        let re_measured =
+            refresh_tail_hygiene_baseline(measured.clone(), false, Some(&baseline), 20);
+        let mismatch = re_measured
+            .prefix_mismatch
+            .as_ref()
+            .expect("an unattributable prefix change must be named");
+
+        assert_eq!(mismatch.part_index, 0);
+        assert_eq!(mismatch.message_id, "m");
+        assert_eq!(mismatch.field, "contentHash");
+        assert!(mismatch
+            .diagnostic_line(re_measured.baseline.baseline_generation)
+            .contains("message=m field=contentHash"));
+        // The mismatch is reported and measured on this same pass instead of being
+        // held until the next cache-busting pass.
+        assert!(re_measured.baseline.evaluable);
+        assert!(!re_measured.baseline.generation_invalidated);
+        assert_eq!(
+            re_measured.baseline.baseline_generation,
+            baseline.baseline_generation + 1
+        );
+        assert_eq!(
+            effective_tail_hygiene(&re_measured.baseline),
+            (measured.u, measured.t)
+        );
+
+        // One invalidation event, one diagnostic: the next unchanged pass names none.
+        let steady =
+            refresh_tail_hygiene_baseline(measured, false, Some(&re_measured.baseline), 30);
+        assert!(steady.prefix_mismatch.is_none());
+        assert_eq!(
+            steady.baseline.baseline_generation,
+            re_measured.baseline.baseline_generation
+        );
+    }
+
+    #[test]
+    fn compaction_shrink_and_tag_loss_report_their_own_causes() {
+        let messages = vec![
+            text("first", 1, &"first mass ".repeat(200)),
+            text("second", 2, &"second mass ".repeat(200)),
+            text("newest", 3, "newest turn"),
+        ];
+        let tags = vec![tag(1, "first#0"), tag(2, "second#0")];
+        let projection = project_messages(&messages).unwrap();
+        let frozen = refreshed_baseline(
             measure_tail_hygiene(
                 &projection,
                 &CoreState::default(),
@@ -1263,12 +1912,64 @@ mod tests {
                 0,
                 &HashSet::new(),
             ),
+            true,
+            None,
+            10,
+        );
+
+        // A coverage advance folds historical messages away, so the measured tail no
+        // longer reaches the end of the frozen prefix.
+        let shrunk = project_messages(&[text("newest", 3, "newest turn")]).unwrap();
+        let shorter = refresh_tail_hygiene_baseline(
+            measure_tail_hygiene(
+                &shrunk,
+                &CoreState::default(),
+                None,
+                &tags,
+                0,
+                &HashSet::new(),
+            ),
             false,
-            Some(&baseline),
+            Some(&frozen),
             20,
         );
-        assert!(!invalid.evaluable);
-        assert!(invalid.generation_invalidated);
+        // A tag row disappearing changes what an already-frozen block contributes.
+        let untagged = refresh_tail_hygiene_baseline(
+            measure_tail_hygiene(
+                &projection,
+                &CoreState::default(),
+                None,
+                &tags[1..],
+                0,
+                &HashSet::new(),
+            ),
+            false,
+            Some(&frozen),
+            20,
+        );
+
+        assert_eq!(
+            shorter
+                .prefix_mismatch
+                .as_ref()
+                .map(|mismatch| mismatch.field),
+            Some("shorter")
+        );
+        assert_eq!(
+            untagged
+                .prefix_mismatch
+                .as_ref()
+                .map(|mismatch| (mismatch.field, mismatch.message_id.as_str())),
+            Some(("tagNumber", "first"))
+        );
+        for refreshed in [&shorter, &untagged] {
+            assert!(refreshed.baseline.evaluable);
+            assert!(!refreshed.baseline.generation_invalidated);
+            assert_eq!(
+                refreshed.baseline.baseline_generation,
+                frozen.baseline_generation + 1
+            );
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -1458,7 +2159,7 @@ mod tests {
             kind: input.kind.clone(),
             token_count: input.token_count,
             created_at_ms: 0,
-            source_bytes: Vec::new(),
+            source_bytes: Default::default(),
         }
     }
 

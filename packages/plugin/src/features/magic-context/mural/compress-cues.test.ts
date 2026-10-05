@@ -2,10 +2,14 @@
 
 import { describe, expect, test } from "bun:test";
 
+import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import { Database } from "../../../shared/sqlite";
 import { closeQuietly } from "../../../shared/sqlite-helpers";
-import { ensureContextStoreUuid, installAuthorityManagedMarker } from "../context-authority";
 import { acquireLease } from "../dreamer/lease";
+import {
+    ensureContextStoreUuid,
+    installAuthorityManagedMarker,
+} from "../legacy-authority-fixture.test-support";
 import { getMemoryById, insertMemory, updateMemoryContent } from "../memory";
 import { computeNormalizedHash } from "../memory/normalize-hash";
 import { runMigrations } from "../migrations";
@@ -146,7 +150,7 @@ function cueArgs(db: Database, projectIdentity: string): CompressCuesArgs {
         db,
         client: {} as never,
         projectIdentity,
-        parentSessionId: undefined,
+        parentSessionId: "ses-parent",
         sessionDirectory: process.cwd(),
         holderId,
         leaseKey,
@@ -158,6 +162,43 @@ function cueArgs(db: Database, projectIdentity: string): CompressCuesArgs {
 }
 
 describe("runCompressCues disposition", () => {
+    test("compresses through the v2 executor without a v1 client", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:cues-v2";
+            insertMemory(db, {
+                projectPath: projectIdentity,
+                category: "ARCHITECTURE",
+                content: "Cue fact.",
+                sourceSessionId: "ses",
+            });
+            const args = cueArgs(db, projectIdentity);
+            args.client = undefined;
+            let opened = 0;
+            let manifest = "";
+            args.hiddenCompletionExecutor = {
+                capabilities: { tools: false, harness: "opencode2" },
+                open: async () => {
+                    opened++;
+                    return { id: "v2-cues" };
+                },
+                attempt: async (_handle, request) => {
+                    const prompt = request.body?.parts?.[0]?.text ?? "";
+                    const ids = [...prompt.matchAll(/^\[(\d+)\]/gm)].map((match) =>
+                        Number(match[1]),
+                    );
+                    manifest = `<cues>${ids.map((id) => `<cue id="${id}">anchor ${id}</cue>`).join("")}</cues>`;
+                },
+                collect: async () => ({ text: manifest, reasoning: null, lengthCapped: false }),
+                close: async () => {},
+            } satisfies HiddenCompletionExecutor;
+            const result = await runCompressCues(args);
+            expect(opened).toBe(1);
+            expect(result.compressed).toBe(1);
+        } finally {
+            closeQuietly(db);
+        }
+    });
     test("banks a completed chunk and reports the deadline remainder", async () => {
         const db = freshDb();
         try {

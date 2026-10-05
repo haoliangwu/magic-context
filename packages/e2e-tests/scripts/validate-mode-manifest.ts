@@ -15,11 +15,19 @@ export type Mode = "ts" | "rust";
 export type Host = (typeof HOSTS)[number];
 export type HarnessSelection = "all" | Host;
 
+export interface HostDivergence {
+    host: Host;
+    reason: string;
+    contract_ref: string;
+}
+
 export interface ModeManifestEntry {
     path: string;
     tier: Tier;
     invocation: { ts: boolean; rust: boolean };
     hosts: Host[];
+    behavior?: boolean;
+    divergences?: HostDivergence[];
     rationale: string;
     contract_refs: string[];
 }
@@ -52,23 +60,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function defaultHosts(path: string): Host[] {
-    if (path.startsWith("tests/opencode2/")) return ["opencode2"];
-    if (path.startsWith("tests/pi-")) return ["pi"];
-    return ["opencode"];
-}
-
 function validateEntry(value: unknown, index: number): ModeManifestEntry {
     if (!isRecord(value)) throw new Error(`entry ${index} is not an object`);
-    const requiredKeys = ["path", "tier", "invocation", "rationale", "contract_refs"];
-    const allowedKeys = [...requiredKeys, "hosts"];
+    const requiredKeys = ["path", "tier", "invocation", "hosts", "rationale", "contract_refs"];
+    const allowedKeys = [...requiredKeys, "behavior", "divergences"];
     const actualKeys = Object.keys(value).sort();
     if (
         requiredKeys.some((key) => !actualKeys.includes(key)) ||
         actualKeys.some((key) => !allowedKeys.includes(key))
     ) {
         throw new Error(
-            `entry ${index} must contain ${requiredKeys.join(", ")} and optional hosts; got ${actualKeys.join(", ")}`,
+            `entry ${index} must contain ${requiredKeys.join(", ")}; got ${actualKeys.join(", ")}`,
         );
     }
 
@@ -89,7 +91,7 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
     ) {
         throw new Error(`entry ${index} has invalid invocation; expected {ts:boolean,rust:boolean}`);
     }
-    const hosts = value.hosts ?? defaultHosts(path);
+    const hosts = value.hosts;
     if (
         !Array.isArray(hosts) ||
         hosts.length === 0 ||
@@ -98,6 +100,50 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
     ) {
         throw new Error(`entry ${index} has invalid hosts; expected unique values from ${HOSTS.join(", ")}`);
     }
+    const rawBehavior = value.behavior;
+    if (rawBehavior !== undefined && typeof rawBehavior !== "boolean") {
+        throw new Error(`entry ${index} has invalid behavior flag`);
+    }
+    const behavior = rawBehavior as boolean | undefined;
+    const rawDivergences = value.divergences;
+    if (rawDivergences !== undefined && !Array.isArray(rawDivergences)) {
+        throw new Error(`entry ${index} has invalid divergences; expected an array`);
+    }
+    const divergenceValues: unknown[] = Array.isArray(rawDivergences) ? rawDivergences : [];
+    const divergences: HostDivergence[] = divergenceValues.map((divergence, divergenceIndex) => {
+        if (!isRecord(divergence)) {
+            throw new Error(`entry ${index} divergence ${divergenceIndex} is not an object`);
+        }
+        const keys = Object.keys(divergence).sort().join("\0");
+        if (keys !== "contract_ref\0host\0reason") {
+            throw new Error(`entry ${index} divergence ${divergenceIndex} must contain host, reason, contract_ref`);
+        }
+        const host = divergence.host;
+        const reason = divergence.reason;
+        const contractRef = divergence.contract_ref;
+        if (typeof host !== "string" || !HOSTS.includes(host as Host)) {
+            throw new Error(`entry ${index} divergence ${divergenceIndex} has invalid host`);
+        }
+        if (typeof reason !== "string" || reason.trim().length === 0) {
+            throw new Error(`entry ${index} divergence ${divergenceIndex} has no reason`);
+        }
+        if (typeof contractRef !== "string" || contractRef.trim().length === 0) {
+            throw new Error(`entry ${index} divergence ${divergenceIndex} has no contract_ref`);
+        }
+        return { host: host as Host, reason, contract_ref: contractRef };
+    });
+    if (new Set(divergences.map((divergence) => divergence.host)).size !== divergences.length) {
+        throw new Error(`entry ${index} has duplicate divergence hosts`);
+    }
+    if (behavior === true) {
+        const declared = new Set(hosts as Host[]);
+        const explained = new Set(divergences.map((divergence) => divergence.host));
+        const silent = HOSTS.filter((host) => !declared.has(host) && !explained.has(host));
+        if (silent.length > 0) {
+            throw new Error(`entry ${index} (${path}) silently omits behavior hosts: ${silent.join(", ")}`);
+        }
+    }
+
     const rationale = value.rationale;
     if (typeof rationale !== "string" || rationale.trim().length === 0) {
         throw new Error(`entry ${index} must have a rationale`);
@@ -132,6 +178,8 @@ function validateEntry(value: unknown, index: number): ModeManifestEntry {
         tier: typedTier,
         invocation: { ts: invocation.ts, rust: invocation.rust },
         hosts: [...hosts] as Host[],
+        ...(behavior === undefined ? {} : { behavior }),
+        ...(divergences.length === 0 ? {} : { divergences }),
         rationale,
         contract_refs: [...contractRefs] as string[],
     };
@@ -149,7 +197,7 @@ export function validateManifestDocument(
     const entries = raw.entries.map(validateEntry);
     const expectedSet = new Set(expectedFiles);
     const seen = new Map<string, number>();
-    for (const [index, entry] of entries.entries()) {
+    for (const entry of entries) {
         seen.set(entry.path, (seen.get(entry.path) ?? 0) + 1);
         if (!expectedSet.has(entry.path)) {
             throw new Error(`dead or out-of-scope manifest path: ${entry.path}`);

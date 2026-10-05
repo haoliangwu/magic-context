@@ -1,12 +1,12 @@
 import { Buffer } from "node:buffer";
 import { getHarness } from "../../shared/harness";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
-import type { Database } from "../../shared/sqlite";
+import { type Database, prepareCachedStatement, type Statement } from "../../shared/sqlite";
 import type { SessionMeta } from "./types";
 
 export interface SessionMetaRow {
     session_id: string;
-    last_response_time: number;
+    last_response_time: number | null;
     cache_ttl: string;
     counter: number;
     last_nudge_tokens: number;
@@ -243,7 +243,8 @@ export function isSessionMetaRow(row: unknown): row is SessionMetaRow {
     const r = row as Record<string, unknown>;
     return (
         typeof r.session_id === "string" &&
-        typeof r.last_response_time === "number" &&
+        // session_id proves row existence; NULL here means the nullable timestamp is unset.
+        isNumberOrNull(r.last_response_time) &&
         isStringOrNull(r.cache_ttl) &&
         typeof r.counter === "number" &&
         typeof r.last_nudge_tokens === "number" &&
@@ -362,7 +363,22 @@ export function getDefaultSessionMeta(sessionId: string): SessionMeta {
     };
 }
 
-export function ensureSessionMetaRow(db: Database, sessionId: string): void {
+const sessionMetaExistsStatements = new WeakMap<Database, Statement>();
+
+export function ensureSessionMetaRow(
+    db: Database,
+    sessionId: string,
+    initialIsSubagent = false,
+): void {
+    let exists = sessionMetaExistsStatements.get(db);
+    if (!exists) {
+        exists = prepareCachedStatement(db, "SELECT 1 FROM session_meta WHERE session_id = ?");
+        sessionMetaExistsStatements.set(db, exists);
+    }
+    // Most callers already have a row. Even INSERT OR IGNORE takes the writer
+    // lock, so a read must not wait on sibling hosts merely to ensure it exists.
+    // Keep INSERT OR IGNORE for the race where another host creates it first.
+    if (exists.get(sessionId)) return;
     const defaults = getDefaultSessionMeta(sessionId);
     // Note-nudge persistence columns rely on session_meta defaults and are updated
     // through storage-meta-persisted helpers, not SessionMeta writes.
@@ -377,7 +393,7 @@ export function ensureSessionMetaRow(db: Database, sessionId: string): void {
         defaults.lastNudgeTokens,
         defaults.lastNudgeBand ?? "",
         defaults.lastTransformError ?? "",
-        defaults.isSubagent ? 1 : 0,
+        initialIsSubagent ? 1 : 0,
         defaults.lastContextPercentage,
         defaults.lastInputTokens,
         defaults.observedSafeInputTokens,
@@ -426,7 +442,7 @@ export function toSessionMeta(row: SessionMetaRow): SessionMeta {
         typeof value === "string" ? value : null;
     return {
         sessionId: row.session_id,
-        lastResponseTime: row.last_response_time,
+        lastResponseTime: numOrZero(row.last_response_time),
         cacheTtl: cacheTtlRaw,
         counter: row.counter,
         lastNudgeTokens: row.last_nudge_tokens,

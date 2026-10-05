@@ -12,16 +12,22 @@
  * resolve to the hidden ephemeral child session.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import type { ContextDatabase } from "@magic-context/core/features/magic-context/storage";
+import { log } from "@magic-context/core/shared/logger";
 import type { PromptSurfaceConfig } from "@magic-context/core/shared/prompt-surface";
 import type { PromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
 import { createPromptSurfaceRuntime } from "@magic-context/core/shared/prompt-surface-runtime";
+import { applyJsonSchemaParameterDescriptions } from "@magic-context/core/tools/parameter-descriptions";
 import { createCtxExpandTool } from "./ctx-expand";
-import { createCtxMemoryTool } from "./ctx-memory";
+import { createCtxMemoryListTool, createCtxMemoryTool } from "./ctx-memory";
 import { createCtxNoteTool } from "./ctx-note";
 import { createCtxReduceTool } from "./ctx-reduce";
 import { createCtxSearchTool } from "./ctx-search";
+import { throwReturnedToolErrors } from "./pi-tool-errors";
 import { registerTodosCommand } from "./todo-view-pi";
 import { createTodowriteTool } from "./todowrite";
 
@@ -58,10 +64,8 @@ export interface RegisterToolsOptions {
 	gitCommitsEnabled?: boolean;
 	/** Resolve the current directory's project identity using the user-level home-project setting. */
 	resolveProjectIdentity?: (ctx: { cwd: string }) => string | undefined;
-	/** When true, ctx_memory exposes dreamer-only actions (update, merge, archive).
-	 *  Set by the subagent extension entry when the parent passes
-	 *  `--magic-context-dreamer-actions`. The main extension entry
-	 *  (./index.ts) leaves this false to match OpenCode's primary-agent surface. */
+	/** When true, register the separate ctx_memory_list tool and enable Curate-only
+	 *  execution fields. Set only by the lean dreamer subagent extension. */
 	allowDreamerActions?: boolean;
 	/** Number of recent tags that ctx_reduce should treat as protected
 	 *  (deferred drops instead of immediate). Should match `magic_context.protected_tags`. */
@@ -74,6 +78,7 @@ export interface RegisterToolsOptions {
 	dreamerEnabled?: boolean;
 	/** Resolve smart-note enablement from the current cwd at tool-call time. */
 	resolveDreamerEnabled?: (ctx: { cwd: string }) => boolean | undefined;
+	expandTools?: Record<string, string | false>;
 	/** When false, omit ctx_memory from the registered surface. */
 	memoryToolEnabled?: boolean;
 	/** When true, omit session-scoped tools (ctx_note, ctx_expand) from the
@@ -103,8 +108,7 @@ export function registerMagicContextTools(
 		opts.promptSurfaceRuntime ??
 		createPromptSurfaceRuntime({
 			userConfigDirectory: process.cwd(),
-			warn: (message) =>
-				console.warn(`[magic-context][pi] config warning: ${message}`),
+			warn: (message) => log(`[magic-context][pi] config warning: ${message}`),
 		});
 	// Pi registers provider tools once when the extension loads. Resolve the
 	// registration default once here; project/model switches may reroute guidance
@@ -112,15 +116,22 @@ export function registerMagicContextTools(
 	const registration = promptSurfaceRuntime.resolveRegistration(
 		opts.promptSurface,
 	);
-	const surfaceTool = <T extends { name: string; description: string }>(
-		definition: T,
-	): T => ({
-		...definition,
-		description: registration.descriptionFor(
+	const surfaceTool = <T extends ToolDefinition>(definition: T): T => {
+		const parameters = structuredClone(definition.parameters);
+		applyJsonSchemaParameterDescriptions(
 			definition.name,
-			definition.description,
-		),
-	});
+			parameters,
+			registration.preset,
+		);
+		return throwReturnedToolErrors({
+			...definition,
+			parameters,
+			description: registration.descriptionFor(
+				definition.name,
+				definition.description,
+			),
+		});
+	};
 
 	pi.registerTool(
 		surfaceTool(
@@ -136,18 +147,20 @@ export function registerMagicContextTools(
 	);
 
 	if (opts.memoryToolEnabled !== false) {
-		pi.registerTool(
-			surfaceTool(
-				createCtxMemoryTool({
-					db: opts.db,
-					ensureProjectRegistered: opts.ensureProjectRegistered,
-					memoryEnabled: opts.memoryEnabled,
-					embeddingEnabled: opts.embeddingEnabled,
-					allowDreamerActions: opts.allowDreamerActions ?? false,
-					resolveProjectIdentity,
-				}),
-			),
-		);
+		const memoryDeps = {
+			db: opts.db,
+			ensureProjectRegistered: opts.ensureProjectRegistered,
+			memoryEnabled: opts.memoryEnabled,
+			embeddingEnabled: opts.embeddingEnabled,
+			allowDreamerActions: opts.allowDreamerActions ?? false,
+			resolveProjectIdentity,
+		};
+		pi.registerTool(surfaceTool(createCtxMemoryTool(memoryDeps)));
+		if (opts.allowDreamerActions === true) {
+			pi.registerTool(
+				throwReturnedToolErrors(createCtxMemoryListTool(memoryDeps)),
+			);
+		}
 	}
 
 	// ctx_note and ctx_expand are session-scoped: they resolve the CURRENT
@@ -167,10 +180,14 @@ export function registerMagicContextTools(
 			),
 		);
 
-		pi.registerTool(surfaceTool(createCtxExpandTool({ db: opts.db })));
+		pi.registerTool(
+			surfaceTool(
+				createCtxExpandTool({ db: opts.db, expandTools: opts.expandTools }),
+			),
+		);
 	}
 
-	if (opts.todowriteEnabled !== false) {
+	if (opts.todowriteEnabled === true) {
 		// `todowrite` parity with OpenCode. Pi-coding-agent has no built-in
 		// task list tool, so without this the synthetic-todowrite injector
 		// would never have anything to surface. The tool just captures the

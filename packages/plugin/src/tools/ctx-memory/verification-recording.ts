@@ -7,8 +7,8 @@ import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
  * a memory write + its mutation-log row commit atomically.
  */
 export function runImmediateTransaction<T>(db: Database, fn: () => T): T {
-    const transactionStartedAt = performance.now();
     db.exec("BEGIN IMMEDIATE");
+    const transactionStartedAt = performance.now();
     try {
         const result = fn();
         db.exec("COMMIT");

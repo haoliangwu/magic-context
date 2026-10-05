@@ -16,8 +16,8 @@ import { log } from "../shared/logger";
  * That default is wrong for our agents:
  *   - Historian should be a pure XML-emitting summarizer. It must not
  *     dispatch `task(subagent_type=explore)` to fan out, edit files,
- *     run bash, or fetch the web — its job is to read offloaded state
- *     files and emit `<compartment>` blocks.
+ *     run bash, or fetch the web — it receives all reference state inline
+ *     and emits `<compartment>` blocks without tools.
  *   - The `task` permission only gets auto-denied when an agent is
  *     INVOKED via the parent's `task()` tool (see OpenCode's
  *     `deriveSubagentSessionPermission`). Our hidden agents are spawned
@@ -36,19 +36,13 @@ import { log } from "../shared/logger";
  * This is the same pattern OpenCode's own `explore` subagent uses
  * (see `packages/opencode/src/agent/agent.ts:179-201`).
  *
- * User-supplied agent overrides (`pluginConfig.historian.permission`,
- * etc.) still merge on top via OpenCode's `Permission.merge`, so
- * advanced users can extend the allow-list without us blocking them.
+ * Locked hidden agents discard user tools and permission overrides so their
+ * capability boundaries cannot be broadened. Unlocked agents may merge overrides.
  *
  * # What each agent needs
  *
- *   - **historian / historian-editor / compressor**: `read` plus the
- *     read-only AFT navigation/search tools `aft_outline`, `aft_zoom`,
- *     and `aft_search`. The runner offloads large existing-state XML to
- *     a temp file under `<project>/.opencode/magic-context/historian/`
- *     and the prompt instructs the model to read that file. AFT
- *     navigation is allowed so historian can find or verify a symbol or
- *     file structure when writing accurate compartment summaries.
+ *   - **historian / historian-recomp / historian-editor**: no tools. Each pass
+ *     receives its transcript and bounded reference state in the prompt.
  *
  *   - **dreamer**: `read`, `grep`, `glob`, `bash`, `write`, `edit`, the
  *     read-only AFT navigation/search tools `aft_outline`, `aft_zoom`,
@@ -199,22 +193,8 @@ export function denyTaskRoutingToCallerAgents(
     return result;
 }
 
-/**
- * Tools the historian + historian-editor + compressor agents need.
- *
- * Historian runners offload large `<existing_state>` XML to disk and
- * tell the model to `read` it before emitting the summary XML. The
- * core need is `read`; we also allow the read-only AFT navigation
- * tools `aft_outline` and `aft_zoom` so that if a historian/compressor
- * ever needs to verify a symbol or skim a file's structure to write
- * an accurate compartment summary, it can do so token-efficiently
- * instead of pulling whole files via `read`.
- *
- * Still denied: bash, edit, write, task, grep/glob, webfetch/
- * websearch. Historian's job is summarizing the input it was given,
- * not exploring the repo.
- */
-export const HISTORIAN_ALLOWED_TOOLS = ["read", "aft_outline", "aft_zoom", "aft_search"] as const;
+/** Historians summarize the supplied transcript; no file access or tools are needed. */
+export const HISTORIAN_ALLOWED_TOOLS = [] as const;
 
 /**
  * Subtract `disallowed` from the default historian allow-list. `"*"` removes

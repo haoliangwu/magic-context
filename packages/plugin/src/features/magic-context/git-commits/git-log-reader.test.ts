@@ -37,6 +37,14 @@ describe("parseGitLogOutput", () => {
         expect(parseGitLogOutput(out)).toHaveLength(0);
     });
 
+    it("accepts SHA-256 object names alongside SHA-1", () => {
+        const sha256 = "d".repeat(64);
+        const out = `${sha256}${FS}subject${FS}me${FS}1700000000${FS}${RS}${"e".repeat(50)}${FS}subject${FS}me${FS}1700000000${FS}${RS}`;
+        const commits = parseGitLogOutput(out);
+        expect(commits.map((commit) => commit.sha)).toEqual([sha256]);
+        expect(commits[0].shortSha).toBe("ddddddd");
+    });
+
     it("skips records with non-finite or zero timestamps", () => {
         const sha = "c".repeat(40);
         const bad = `${sha}${FS}subject${FS}me${FS}NaN${FS}${RS}`;

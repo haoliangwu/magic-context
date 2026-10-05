@@ -20,15 +20,27 @@ import { openCodeDbExists, withReadOnlySessionDb } from "./read-session-db";
  * first-message map is fixed at session spawn, so the verdict is deterministic
  * across passes and restarts.
  *
- * The ctx_reduce verdict intentionally remains frozen even when OpenCode's live
- * permission rules deny the tool. Its value gates guidance and the system-prompt
- * hash; changing it mid-session would invalidate the provider prefix for a
- * permission change that is otherwise not part of the prompt. Todowrite's
- * synthetic pair has a separate live permission check at cache-busting
- * boundaries, so this asymmetry is deliberate and load-bearing.
+ * OpenCode does not write agent or session permissions into the first user
+ * message's tools map, so a session whose agent config (or session permission
+ * overlay) denies ctx_reduce would otherwise freeze as "callable". To cover it,
+ * whichever hook runs first on a session (the messages transform or the
+ * system-prompt hook; OpenCode may run either first) reads those permissions
+ * ONCE, before the ctx_reduce verdict first freezes (see
+ * primeCtxReduceSpawnPermission). A deny recorded there makes
+ * the frozen verdict "unavailable" from the session's first pass, so no
+ * provider-visible byte ever flips.
  *
- * Fail-open: no tools map (normal sessions), no wildcard-deny, or an
- * unreadable OpenCode DB all resolve to "available" — current behavior.
+ * After the verdict freezes it never changes again, even when OpenCode's live
+ * permission rules later deny the tool. Its value gates guidance and the
+ * system-prompt hash; changing it mid-session would invalidate the provider
+ * prefix for a permission change that is otherwise not part of the prompt. A
+ * mid-session deny is only logged. Todowrite's synthetic pair has a separate
+ * live permission check at cache-busting boundaries, so this asymmetry is
+ * deliberate and load-bearing.
+ *
+ * Fail-open: no tools map (normal sessions), no wildcard-deny, no recorded
+ * permission deny, or an unreadable OpenCode DB all resolve to "available" —
+ * current behavior.
  */
 
 /** Availability verdict plus whether it is final for the session's lifetime. */
@@ -95,6 +107,16 @@ const availabilityBySession = new BoundedSessionMap<boolean>(1000);
 const permissionDeniedBySession = new BoundedSessionMap<boolean>(2000);
 const ctxReducePermissionDenyLogged = new BoundedSessionMap<boolean>(1000);
 
+/**
+ * ctx_reduce permission read taken before the session's verdict froze (true =
+ * the agent or session permissions deny the tool). Only consulted while the
+ * verdict is still unfrozen; once `availabilityBySession` holds a value this
+ * map is never read again for that session.
+ */
+const ctxReduceSpawnPermissionDenied = new BoundedSessionMap<boolean>(1000);
+/** Concurrent passes for one session share a single in-flight permission read. */
+const ctxReduceSpawnPermissionReads = new Map<string, Promise<void>>();
+
 type PermissionAction = "ask" | "allow" | "deny";
 
 /** The small rule shape used by OpenCode's Permission.disabled evaluator. */
@@ -124,6 +146,18 @@ function verdictFromToolsMap(tools: unknown, toolName: string): boolean | null {
 }
 
 /**
+ * Final verdict for a session whose verdict has not frozen yet. A ctx_reduce
+ * deny read from the agent/session permissions before the freeze wins over the
+ * tools map, because OpenCode never offers a permission-denied tool to the model.
+ */
+function unfrozenVerdict(sessionId: string, toolName: string, mapVerdict: boolean | null): boolean {
+    if (toolName === CTX_REDUCE_TOOL && ctxReduceSpawnPermissionDenied.get(sessionId) === true) {
+        return false;
+    }
+    return mapVerdict ?? true;
+}
+
+/**
  * Resolve from the in-memory transform message array (preferred — free).
  * Caches the verdict on first resolution.
  */
@@ -147,7 +181,11 @@ export function resolveToolAvailabilityFromMessages(
         if (message.info?.role !== "user") continue;
         // First user message decides: explicit signal, or no-signal → available.
         // Either way the verdict is final — freeze it.
-        const verdict = verdictFromToolsMap(message.info.tools, toolName) ?? true;
+        const verdict = unfrozenVerdict(
+            sessionId,
+            toolName,
+            verdictFromToolsMap(message.info.tools, toolName),
+        );
         availabilityBySession.set(key, verdict);
         return { callable: verdict, frozen: true };
     }
@@ -193,7 +231,7 @@ export function resolveToolAvailability(
         if (!row) return { callable: true, frozen: false }; // session not persisted yet
         const verdict =
             row.tools === null ? null : verdictFromToolsMap(JSON.parse(row.tools), toolName);
-        const resolved = verdict ?? true;
+        const resolved = unfrozenVerdict(sessionId, toolName, verdict);
         availabilityBySession.set(key, resolved);
         return { callable: resolved, frozen: true };
     } catch (error) {
@@ -222,6 +260,7 @@ export function resolveCtxReduceAvailability(sessionId: string): CtxReduceAvaila
 
 export function clearCtxReduceAvailability(sessionId: string): void {
     clearToolAvailability(sessionId, CTX_REDUCE_TOOL);
+    ctxReduceSpawnPermissionDenied.delete(sessionId);
 }
 
 // --- live OpenCode permission signal ---
@@ -364,6 +403,117 @@ export async function resolveToolPermissionDenied(
     const denied = permissionDisabled(toolName, [...agentRules, ...sessionRules]);
     permissionDeniedBySession.set(permissionCacheKey(toolName, sessionId), denied);
     return denied;
+}
+
+/**
+ * Read the agent and session permissions for ctx_reduce ONCE, before the
+ * session's ctx_reduce verdict first freezes, so a permission deny makes that
+ * first frozen verdict "unavailable" (no §N§ tags, no reduce guidance, no
+ * reduce nudges). OpenCode keeps these permissions on the agent config and the
+ * session, not in the first user message's tools map, so the tools-map resolver
+ * alone cannot see them.
+ *
+ * Callers must await this before calling a resolveCtxReduceAvailability*
+ * function on a pass that may freeze the verdict. Once the verdict is frozen
+ * this is a no-op: a later permission change must not flip provider-visible
+ * bytes. `spawnAgent` should be the agent named on the session's FIRST user
+ * message, so a restart re-reads the same agent even if the user has since
+ * switched agents. A failed read records nothing and the verdict fails open to
+ * "available", exactly as before permissions were considered.
+ */
+export function primeCtxReduceSpawnPermission(
+    client: PluginContext["client"],
+    sessionId: string,
+    spawnAgent?: string,
+): Promise<void> {
+    if (!ctxReduceSpawnPermissionReadNeeded(sessionId)) return Promise.resolve();
+    const inFlight = ctxReduceSpawnPermissionReads.get(sessionId);
+    if (inFlight) return inFlight;
+    const read = (async () => {
+        try {
+            const denied = await resolveToolPermissionDenied(
+                client,
+                sessionId,
+                CTX_REDUCE_TOOL,
+                spawnAgent,
+            );
+            ctxReduceSpawnPermissionDenied.set(sessionId, denied);
+            if (denied) {
+                sessionLog(
+                    sessionId,
+                    `ctx_reduce permission is denied for agent=${spawnAgent ?? "(session default)"}; session freezes without ctx_reduce tags, guidance, or nudges`,
+                );
+            }
+        } catch (error) {
+            sessionLog(
+                sessionId,
+                "ctx_reduce permission read before freeze failed (fail-open):",
+                error,
+            );
+        } finally {
+            ctxReduceSpawnPermissionReads.delete(sessionId);
+        }
+    })();
+    ctxReduceSpawnPermissionReads.set(sessionId, read);
+    return read;
+}
+
+/**
+ * Cheap check (no I/O) for whether a pre-freeze permission read would still do
+ * anything: false once the verdict froze or a read already recorded a result.
+ */
+export function ctxReduceSpawnPermissionReadNeeded(sessionId: string): boolean {
+    return (
+        ctxReduceRegisteredGlobally &&
+        availabilityBySession.get(cacheKey(CTX_REDUCE_TOOL, sessionId)) === undefined &&
+        ctxReduceSpawnPermissionDenied.get(sessionId) === undefined
+    );
+}
+
+/** Agent named on the session's first user message (the agent it was spawned with). */
+export function spawnAgentFromMessages(
+    messages: ReadonlyArray<{ info?: { role?: string; agent?: unknown } }>,
+): string | undefined {
+    for (const message of messages) {
+        if (message.info?.role !== "user") continue;
+        const agent = message.info.agent;
+        return typeof agent === "string" && agent.length > 0 ? agent : undefined;
+    }
+    return undefined;
+}
+
+/**
+ * Spawn agent read from OpenCode's DB, for callers that run before the
+ * messages transform (OpenCode can run the system-prompt hook first).
+ * `persisted: false` means the session has no stored user message yet, so no
+ * verdict can freeze and no permission read should be recorded. A present
+ * message without an agent reports `agent: undefined`.
+ */
+export function spawnAgentFromOpenCodeDb(sessionId: string): {
+    persisted: boolean;
+    agent?: string;
+} {
+    if (!openCodeDbExists()) return { persisted: false };
+    try {
+        const row = withReadOnlySessionDb(
+            (db) =>
+                db
+                    .prepare(
+                        `SELECT json_extract(data, '$.agent') AS agent FROM message
+                          WHERE session_id = ? AND json_extract(data, '$.role') = 'user'
+                          ORDER BY time_created ASC LIMIT 1`,
+                    )
+                    .get(sessionId) as { agent: unknown } | undefined,
+        );
+        if (!row) return { persisted: false };
+        return {
+            persisted: true,
+            agent: typeof row.agent === "string" && row.agent.length > 0 ? row.agent : undefined,
+        };
+    } catch (error) {
+        sessionLog(sessionId, "ctx_reduce spawn agent read failed:", error);
+        return { persisted: false };
+    }
 }
 
 export function todowritePermissionDenied(
