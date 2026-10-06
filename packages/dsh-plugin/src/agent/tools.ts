@@ -494,11 +494,13 @@ export function createCtxSearchTool(ctx: Context, opts: CtxToolsOptions): ToolDe
 /* ─────────────────────────────── ctx_memory ────────────────────────────── */
 
 const ALL_ACTIONS = ["write", "archive", "update", "merge", "get", "list"] as const;
-/** Actions advertised to primary sessions — `list` stays dreamer-only
- * (opencode parity: the primary tool's allowedActions carry no `list`). */
-const PRIMARY_ACTIONS = ["write", "archive", "update", "merge", "get"] as const;
 type CtxMemoryAction = (typeof ALL_ACTIONS)[number];
 const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["list"]);
+/** Actions advertised to primary sessions — ALL_ACTIONS minus the dreamer-only
+ * set (opencode parity: the primary tool's allowedActions carry no `list`). */
+const PRIMARY_ACTIONS: readonly CtxMemoryAction[] = ALL_ACTIONS.filter(
+  (action) => !DREAMER_ONLY_ACTIONS.has(action),
+);
 const GET_MAX_IDS = 20;
 const DEFAULT_LIST_LIMIT = 10;
 

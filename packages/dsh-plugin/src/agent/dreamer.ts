@@ -916,21 +916,16 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
       // opencode BOOT_PROJECT_JITTER mirror: slot*1s + directory hash, so a
       // multi-project process does not create one writer burst).
       beginBootQuietPeriod();
-      const startupJitter = new Map<string, number>();
+      let nextStartupSlot = 0;
       const startupJitterMs = (projectIdentity: string): number => {
-        const existing = startupJitter.get(projectIdentity);
-        if (existing !== undefined) return existing;
-        const slot = startupJitter.size;
+        const slot = nextStartupSlot++;
         const hash = [...projectIdentity].reduce(
           (value, character) => (value * 33 + character.charCodeAt(0)) >>> 0,
           5381,
         );
-        const jitter =
-          startupJitterSlotMs === 0
-            ? 0
-            : slot * startupJitterSlotMs + (hash % startupJitterSlotMs);
-        startupJitter.set(projectIdentity, jitter);
-        return jitter;
+        return startupJitterSlotMs === 0
+          ? 0
+          : slot * startupJitterSlotMs + (hash % startupJitterSlotMs);
       };
       for (const projectIdentity of projects) {
         const timer = scheduleAfterBootQuiet(
