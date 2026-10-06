@@ -8,16 +8,12 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type { InvocationDescriptor } from "@deepseek-ai/dsh-typert-protocol";
 import type TypertRegistry from "@deepseek-ai/dsh-typert-registry";
-import type {
-  TypertContribution,
-  TypertSchema,
-} from "@deepseek-ai/dsh-typert-registry/types";
+import type { TypertContribution } from "@deepseek-ai/dsh-typert-registry/types";
 
 export type {
   InvocationDescriptor,
   TypertContribution,
   TypertRegistry,
-  TypertSchema,
 };
 
 /** Wire namespace of every MagicContext Remote endpoint (compatibility.json). */

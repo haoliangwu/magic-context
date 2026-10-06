@@ -102,9 +102,8 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
       const text = hint.content[0].type === "text" ? hint.content[0].text : "";
       expect(text).toContain("<ctx-search-hint>");
       expect(text).toContain("config cache primers");
-      const source = hint.source as { kind: string; plugin: string; messageId: string };
-      expect(source.kind).toBe("plugin");
-      expect(source.plugin).toBe("magic-context");
+      const source = hint.source as { kind: string; messageId: string };
+      expect(source.kind).toBe("magic-context");
       expect(source.messageId).toBe(`mc-auto-search:${message.id}`);
 
       // Decision persisted for replay/resume.
@@ -229,7 +228,7 @@ describe("agent auto-search (<ctx-search-hint> via agent.inject)", () => {
       id: "injected-1",
       role: "user" as const,
       content: [{ type: "text" as const, text: "magic context knowledge baseline" }],
-      source: { kind: "plugin" as const, plugin: "magic-context" },
+      source: { kind: "magic-context" as const },
     } as unknown as UserMessage;
     const prompt = userMessage("the real user question", "real-1");
     const found = extractLatestUserPrompt([injected, prompt]);

@@ -25,14 +25,29 @@ import {
   scanLivenessMarkers,
 } from "./doctor";
 import {
-  patchShippedPresets,
-  rewriteCompactionRowText,
-} from "../host/preset-patch";
-import {
   DSH_COMPAT_EXPECTED_VERSION,
   MAGIC_CONTEXT_PACKAGE,
   magicStandardDir,
 } from "./env";
+import { currentCompactionEntryUrl } from "../host/preset-audit";
+
+/**
+ * Simulate what the REMOVED (≤ 0.45) in-place patcher wrote: retarget the
+ * compaction-basic row of a preset file to a Magic entry URL with the
+ * `{ auto: true }` config. Used to build leftover-tampering fixtures.
+ */
+function tamperCompactionRow(file: string, url: string): void {
+  const entries = yamlLoad(readFileSync(file, "utf8"), {
+    schema: entryListSchema,
+  }) as Record<string, unknown>[];
+  const group = entries.find((row) => row.id === "compaction") as unknown as {
+    config: Array<Record<string, unknown>>;
+  };
+  const row = group.config.find((r) => r.id === "compaction-basic") as Record<string, unknown>;
+  row.name = url;
+  row.config = { auto: true };
+  writeFileSync(file, yamlDump(entries, { schema: entryListSchema }));
+}
 
 /** Minimal stand-in for a stock preset entry list (compaction group included). */
 function stockLayout(): Record<string, unknown>[] {
@@ -197,17 +212,14 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
     }
   });
 
-  it("reports ok across the full checklist on a patched environment", async () => {
+  it("reports ok across the full checklist on a clean stock environment", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
       fakeInstall(env.installDir);
       fakeProfile(env.dshHome, "web", [MAGIC_CONTEXT_PACKAGE]);
       const agentPresetsDir = join(env.root, "agent-presets-pkg");
-      const presetsDir = fakeAgentPresetsPackage(agentPresetsDir);
-      // Boot self-heal already patched the shipped files (applied state).
-      patchShippedPresets({ agentPresetsDir, warn: () => {} });
-      expect(existsSync(presetsDir)).toBe(true);
+      fakeAgentPresetsPackage(agentPresetsDir);
       // Doctor only reports config (setup no longer writes): a pre-existing
       // valid config keeps the config-load check ok.
       mkdirSync(join(env.configHome, "cortexkit"), { recursive: true });
@@ -236,8 +248,8 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
       const checks = byId(report);
       expect(checks.get("dsh-version")?.status).toBe("ok");
       expect(checks.get("bundle-install.web")?.status).toBe("ok");
-      expect(checks.get("preset-patch.standard")?.status).toBe("ok");
-      expect(checks.get("preset-patch.cordis")?.status).toBe("ok");
+      expect(checks.get("preset-audit.standard")?.status).toBe("ok");
+      expect(checks.get("preset-audit.cordis")?.status).toBe("ok");
       expect(checks.get("legacy-preset")?.status).toBe("ok");
       expect(checks.get("shared-db")?.status).toBe("ok");
       expect(checks.get("liveness-markers")?.status).toBe("ok");
@@ -290,7 +302,7 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
     }
   });
 
-  it("reports stock shipped presets as ok (heal applies at next host boot)", async () => {
+  it("reports stock shipped presets as ok (native compaction untouched)", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
@@ -305,7 +317,7 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
         directory: env.work,
         profile: "web",
       });
-      const standard = byId(report).get("preset-patch.standard");
+      const standard = byId(report).get("preset-audit.standard");
       expect(standard?.status).toBe("ok");
       expect(standard?.detail).toContain("stock engine");
       expect(byId(report).get("legacy-preset")?.status).toBe("ok");
@@ -316,7 +328,7 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
     }
   });
 
-  it("fails the preset-patch check on a rotted MC entry URL", async () => {
+  it("fails the preset-audit check on a leftover MC entry URL from an older build", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
@@ -324,11 +336,12 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
       fakeProfile(env.dshHome, "web", [MAGIC_CONTEXT_PACKAGE]);
       const agentPresetsDir = join(env.root, "agent-presets-pkg");
       const presetsDir = fakeAgentPresetsPackage(agentPresetsDir);
-      // The file was patched against an OLD MC install; the entry path moved.
-      const file = join(presetsDir, "standard", "agent.cordis.yml");
-      const text = readFileSync(file, "utf8");
-      const rewrite = rewriteCompactionRowText(text, "file:///rotten/entries/compaction.js");
-      writeFileSync(file, rewrite.patched, "utf8");
+      // The file was patched against an OLD MC install by the removed ≤ 0.45
+      // patcher; the entry path has since moved.
+      tamperCompactionRow(
+        join(presetsDir, "standard", "agent.cordis.yml"),
+        "file:///rotten/entries/compaction.js",
+      );
       const report = await runDshDoctor([], {
         dshHome: env.dshHome,
         dshInstallDir: env.installDir,
@@ -336,9 +349,9 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
         directory: env.work,
         profile: "web",
       });
-      const standard = byId(report).get("preset-patch.standard");
+      const standard = byId(report).get("preset-audit.standard");
       expect(standard?.status).toBe("fail");
-      expect(standard?.detail).toContain("stale entry path");
+      expect(standard?.detail).toContain("leftover in-place patch");
       expect(report.exitCode).toBe(1);
     } finally {
       delete process.env.XDG_CONFIG_HOME;
@@ -346,7 +359,37 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
     }
   });
 
-  it("warns (not fails) on a contract-mismatched shipped preset", async () => {
+  it("fails the preset-audit check on a CURRENT entry URL leftover", async () => {
+    const env = makeEnv();
+    process.env.XDG_CONFIG_HOME = env.configHome;
+    try {
+      fakeInstall(env.installDir);
+      fakeProfile(env.dshHome, "web", [MAGIC_CONTEXT_PACKAGE]);
+      const agentPresetsDir = join(env.root, "agent-presets-pkg");
+      const presetsDir = fakeAgentPresetsPackage(agentPresetsDir);
+      tamperCompactionRow(
+        join(presetsDir, "standard", "agent.cordis.yml"),
+        currentCompactionEntryUrl(),
+      );
+      const report = await runDshDoctor([], {
+        dshHome: env.dshHome,
+        dshInstallDir: env.installDir,
+        agentPresetsDir,
+        directory: env.work,
+        profile: "web",
+      });
+      const standard = byId(report).get("preset-audit.standard");
+      expect(standard?.status).toBe("fail");
+      expect(standard?.detail).toContain("leftover in-place patch");
+      expect(standard?.fix).toContain("reinstall");
+      expect(report.exitCode).toBe(1);
+    } finally {
+      delete process.env.XDG_CONFIG_HOME;
+      await cleanup(env.root);
+    }
+  });
+
+  it("warns (not fails) on a foreign-shaped shipped preset", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
     try {
@@ -370,7 +413,7 @@ describe("dsh-magic-context doctor (ADR 0001 model)", () => {
         directory: env.work,
         profile: "web",
       });
-      const standard = byId(report).get("preset-patch.standard");
+      const standard = byId(report).get("preset-audit.standard");
       expect(standard?.status).toBe("warn");
       expect(standard?.detail).toContain("Stock compaction keeps running");
       expect(report.exitCode).toBe(0);

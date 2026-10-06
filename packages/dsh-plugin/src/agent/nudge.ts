@@ -110,16 +110,15 @@ function injectNudge(
   if (
     events.some((event) => {
       if (event === null || typeof event !== "object") return false;
-      const e = event as { data?: { source?: { plugin?: unknown; messageId?: unknown } } };
+      const e = event as { data?: { source?: { kind?: unknown; messageId?: unknown } } };
       const source = e.data?.source;
-      return source?.plugin === "magic-context" && source?.messageId === marker;
+      return source?.kind === "magic-context" && source?.messageId === marker;
     })
   ) {
     return;
   }
   const source: MagicMessageSource = {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: "magic-context",
     messageId: marker,
   };
   const message = magicUserMessage(text, source, []);

@@ -103,7 +103,7 @@ function findCommand(registered: FakeCommandRecord[], name: string): FakeCommand
 }
 
 describe("registerCtxCommands (DSH /ctx-* commands)", () => {
-  it("registers all eight commands and unregisters via the disposer", async () => {
+  it("registers all seven commands and unregisters via the disposer", async () => {
     const { db, dir } = await openDb();
     try {
       const { ctx, registered } = makeFakeCtx();
@@ -114,7 +114,6 @@ describe("registerCtxCommands (DSH /ctx-* commands)", () => {
         "ctx-embed",
         "ctx-flush",
         "ctx-recomp",
-        "ctx-session-upgrade",
         "ctx-status",
         "ctx-wrapup",
       ]);

@@ -42,16 +42,25 @@ export function textBlock(text: string): { type: "text"; text: string } {
   return { type: "text", text };
 }
 
-/** Source marker for Magic-injected knowledge messages (m0 baseline / m1 deltas). */
+/** Source marker for Magic-injected knowledge messages (m0 baseline / m1 deltas).
+ *
+ *  DSH 0.2 removed the shared catch-all `kind: "plugin"` source: each producer
+ *  declares its own `kind` through a `MessageSourceMap` augmentation. Magic
+ *  Context declares `magic-context` below. */
 export interface MagicMessageSource {
-  kind: "plugin";
-  plugin: "magic-context";
+  kind: "magic-context";
   /** Baseline id for watermark de-duplication (PLAN §4.1). */
   messageId?: string;
   /** Render revision (materialization epoch) folded into the watermark. */
   revision?: string;
   /** Content digest (m0+m1) folded into the watermark. */
   digest?: string;
+}
+
+declare module "@deepseek-ai/dsh-llm" {
+  interface MessageSourceMap {
+    "magic-context": MagicMessageSource;
+  }
 }
 
 /** Create a Magic-owned user message (knowledge injection / checkpoints). */

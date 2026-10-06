@@ -9,13 +9,13 @@ It installs as a native DSH plugin and works on **every agent preset** — no pr
 
 - **Shared store.** One SQLite at `~/.local/share/cortexkit/magic-context/context.db`, `harness='dsh'` isolated — works alongside OpenCode and Pi with no extra DB, and cross-harness memories just work.
 - **Full Magic Context surface.** `ctx_reduce` / `ctx_expand` / `ctx_memory` / `ctx_search` / `ctx_note`, `/ctx-status` / `/ctx-recomp` / `/ctx-wrapup` / `/ctx-embed`, auto-search, `§N§` tags, decay rendering, smart-drops.
-- **DSH-native, zero-config mounting.** Host (`cordis` bundle) + agent plane (host-row, every preset) + client (status card). The boot-time self-heal patches the compaction row of the **shipped** presets in place (ADR 0001) — restart DSH and it is mounted.
+- **DSH-native, zero-config mounting.** Host (`cordis` bundle) + agent plane (host-row, every preset) + client (status card) — restart DSH and it is mounted. Shipped presets are **never modified** (see [Compaction](#compaction)): the stock engine keeps running, and Magic's own planes survive folds through their own reconciliation.
 
 ```sh
 # from a DSH profile (e.g. web = prod, mc = dev)
 dsh plugin --profile web install link:/path/to/magic-context/packages/dsh-plugin
 # restart DSH — every preset gets the Magic surface; the status panel's
-# "preset" row shows "patched 3/3" when the shipped presets are patched
+# "preset" row shows "native 3/3 stock" (shipped presets untouched)
 ```
 
 ## Install
@@ -38,7 +38,7 @@ dsh-magic-context doctor --profile <name>
 **Production — GitHub subpath (no npm publish, verified with pnpm 11):**
 
 Pin to a commit SHA for reproducibility, or track the branch (the plugin
-version follows the monorepo version — `0.42.6` in lockstep with
+version follows the monorepo version — `0.45.0` in lockstep with
 `@cortexkit/opencode-magic-context`; fork release tags use that scheme
 once cut):
 
@@ -73,20 +73,56 @@ dsh-magic-context doctor --profile <name>
 # inside magic-context monorepo
 bun run --cwd packages/dsh-plugin build
 dsh plugin --profile <name> install link:/absolute/path/to/magic-context/packages/dsh-plugin
-# restart the host: the boot-time self-heal (ADR 0001) resolves
-# @deepseek-ai/dsh-agent-presets from THIS package's module context and patches
-# the shipped compaction-basic rows to file://…/dist/entries/compaction.js
-# (tmp+rename atomic writes; pnpm hardlinks are never written in place)
 ```
 
-Restart DSH — every preset now mounts the Magic surface host-wide, and the
-shipped presets' compaction rows point at `file://…/magic-context/packages/dsh-plugin/dist/entries/compaction.js`. First session creates the shared SQLite if missing. `setup` is a report-only alias of `doctor`.
+Restart DSH — every preset now mounts the Magic surface host-wide. Shipped
+preset files are not touched; the only boot-time write is removing the
+plugin-OWNED legacy `magic-standard` preset (if an old version left one).
+First session creates the shared SQLite if missing. `setup` is a report-only
+alias of `doctor`.
+
+## Compaction
+
+**Shipped presets are never modified.** Earlier versions (≤ 0.45, ADR 0001)
+patched the shipped presets' `compaction-basic` row in place to mount the
+Magic compaction engine. That modified files shared by every profile on the
+machine and could not address the nested rows of the DSH 0.2 web-app preset
+declarations anyway, so the patcher was **removed**. `doctor` now only audits:
+a leftover patch from an old version is reported as `fail` with restore
+instructions (set the row's `name` back to `@deepseek-ai/dsh-compaction-basic`
+and drop its `config`), and a stock row reports `ok`.
+
+With the stock engine running, DSH folds normally and Magic survives each
+fold through its own reconciliation (historian compartments, baseline
+rebuild, outbox saga). The Magic engine stays available for **optional**
+mounting from a user-owned preset — create a preset that includes the Magic
+row and swaps the compaction engine:
+
+```yaml
+# ~/.dsh/.agent-presets/magic/agent.cordis.yml  (user-owned, never shipped)
+- id: magic-include-standard
+  name: 'file:///…/packages/dsh-plugin/dist/entries/preset-include.js'
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: 'file:///…/packages/dsh-plugin/dist/entries/compaction.js'
+      config: { auto: true }
+```
+
+Then start DSH with `--preset magic`. This mounts Magic-aware fold summaries
+(the Magic compartment block rendered by the historian); without it you get
+stock summaries with the same durability guarantees.
 
 ## Features
 
 - **Knowledge.** m0/m1 baseline injection (project docs + memories), auto-search, `§N§` tag hygiene with Channel-1/2 nudges
-- **Context.** DSH transcript + surface CAS (outbox saga), historian compartments (tiered decay), Magic compaction policy
-- **Automation.** Dreamer tasks, `/ctx-recomp` / `/ctx-wrapup` / `/ctx-session-upgrade`, `/ctx-embed`, feedback bridge
+- **Context.** DSH transcript + surface CAS (outbox saga), historian compartments (tiered decay), compaction-aware reconciliation
+- **Automation.** Dreamer tasks, `/ctx-recomp` / `/ctx-wrapup`, `/ctx-embed`, feedback bridge
 - **Web.** Settings config editor (form + raw JSONC over the CortexKit user config) plus the status card and Remote diagnostics via `src/client/client.tsx` → `dist/client.js` (`__ModuleLoader__` id `@cortexkit/dsh-magic-context`)
 
 Full feature table and constraints: see repository `README.md` and `ARCHITECTURE.md`.
@@ -97,12 +133,12 @@ Full feature table and constraints: see repository `README.md` and `ARCHITECTURE
 dsh plugin --profile <name> remove @cortexkit/dsh-magic-context
 ```
 
-Remove the `bundles` entry and restart DSH. Shared SQLite and `dsh_*` adapter rows are intentionally preserved (cross-harness data); any legacy `~/.dsh/.agent-presets/magic-standard/` thin preset is shape-verified and removed by the boot self-heal. Removing the package leaves the patched shipped-preset rows pointing at a missing path until the preset files rotate (ADR 0001 — accepted for single-user deploys; `doctor` reports the state).
+Remove the `bundles` entry and restart DSH. Shared SQLite and `dsh_*` adapter rows are intentionally preserved (cross-harness data); a legacy `~/.dsh/.agent-presets/magic-standard/` thin preset from an old plugin version is shape-verified and removed by the boot cleanup (the plugin-OWNED artifact — shipped presets are never touched by this package). Nothing else needs restoring: the shipped presets were never modified, so uninstall is fully clean.
 
 ## Compatibility
 
-- DSH `0.1.5-rc.2` (run `doctor` contract gate before upgrading; the boot heal's anchor chain fail-opens on layout changes)
-- Magic Context shared schema `v85` (this package's `LATEST_SUPPORTED_VERSION`)
+- DSH `0.2.0-rc.2` (run `doctor` contract gate before upgrading; the audit's anchor chain fail-opens on layout changes)
+- Magic Context shared schema `v94` (this package's `LATEST_SUPPORTED_VERSION`)
 
 ## Q&A
 
@@ -119,7 +155,7 @@ key 必须和报错信息里的完全一致。`github:...` 和 `git+https://...`
 
 **Q: I use Pi / OpenCode and DSH together and want to share memories. Do versions need to match?**
 
-Yes — all harnesses share one SQLite at `~/.local/share/cortexkit/magic-context/context.db`. The DB is versioned (`schema v85` at `LATEST_SUPPORTED_VERSION`); a newer plugin migrates the DB forward, an older one will fail the schema fence and refuse to open it. If you share memories across `pi` / `opencode` / `dsh`, keep their `@cortexkit/*-magic-context` versions in sync (same monorepo tag) so they agree on the schema. `doctor` reports the schema version and the adapter ceiling.
+Yes — all harnesses share one SQLite at `~/.local/share/cortexkit/magic-context/context.db`. The DB is versioned (`schema v94` at `LATEST_SUPPORTED_VERSION`); a newer plugin migrates the DB forward, an older one will fail the schema fence and refuse to open it. If you share memories across `pi` / `opencode` / `dsh`, keep their `@cortexkit/*-magic-context` versions in sync (same monorepo tag) so they agree on the schema. `doctor` reports the schema version and the adapter ceiling.
 
 **Q: What happens on a version mismatch?**
 

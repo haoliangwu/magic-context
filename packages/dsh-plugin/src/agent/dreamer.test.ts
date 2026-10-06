@@ -21,6 +21,7 @@ import { getDreamRuns } from "@magic-context/core/features/magic-context/dreamer
 import {
   getTaskScheduleStatesForProject,
 } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
+import { insertMemory } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { CANONICAL_DREAM_TASKS } from "@magic-context/core/features/magic-context/dreamer/task-registry";
 import { extractLatestAssistantText } from "@magic-context/core/shared/assistant-message-extractor";
 import { createTestDb, createTestStorageDir } from "../test-utils";
@@ -343,16 +344,19 @@ describe("dshDreamSeams (/ctx-dream seam)", () => {
     }
   });
 
-  it("executor completes a no-LLM path (compress-cues without mural) and records dream telemetry", async () => {
+  it("executor records a mural-disabled compress-cues as skipped with telemetry", async () => {
     const { db, cleanup } = await openDb();
     try {
       const { ctx } = makeFakeCtx({ llm: stubLlm() });
       const seam = dshDreamSeams(ctx, { db });
+      // Upstream v0.43+: an unavailable task is accounted as skipped (with a
+      // reason), never as success — mural is disabled by default, so
+      // compress-cues has nothing to work on.
       const outcome = await seam.executor(
         { task: "compress-cues", schedule: "", timeoutMinutes: 20 },
         { db, projectIdentity: PROJECT_A, holderId: "test-holder", leaseKey: `memory:${PROJECT_A}` },
       );
-      expect(outcome.status).toBe("completed");
+      expect(outcome.status).toBe("skipped");
       const runs = getDreamRuns(db, PROJECT_A);
       expect(runs.some((run) => run.tasks_json.includes("compress-cues"))).toBe(true);
     } finally {
@@ -370,6 +374,15 @@ describe("registerDshDreamer (schedule timer)", () => {
       insertSessionProject(db, "s1", "dsh", PROJECT_A);
       insertSessionProject(db, "s2", "dsh", PROJECT_B);
       insertSessionProject(db, "s3", "opencode", "git:/tmp/oc-proj"); // excluded
+      // Upstream v0.43+ seeds a task row only once the identity has the input
+      // the task works on: an active memory for the memory tasks, a bound
+      // session for retrospective. Tasks without input get no row.
+      insertMemory(db, { projectPath: PROJECT_A, category: "PROJECT_RULES", content: "mem-a" });
+      insertMemory(db, { projectPath: PROJECT_B, category: "PROJECT_RULES", content: "mem-b" });
+      const expectedSeeded = [...CANONICAL_DREAM_TASKS].filter((task) =>
+        task === "retrospective" ||
+        ["map-memories", "verify", "verify-broad", "curate", "compress-cues", "classify-memories"].includes(task),
+      );
       const logs: string[] = [];
       const { ctx, disposers } = makeFakeCtx({});
       registerDshDreamer(ctx, {
@@ -387,18 +400,18 @@ describe("registerDshDreamer (schedule timer)", () => {
       expect(captured.set.map((interval) => interval.ms)).toEqual([1000, 1000]);
       expect(logs.some((m) => m.includes(`registered schedule timer for ${PROJECT_A}`))).toBe(true);
 
-      // The immediate initial pass already ran the core scheduler: every
-      // canonical task has a seeded row — scheduled tasks with a future
-      // next_due_at and no run, maintain-docs (default-disabled) with NULL.
+      // The immediate initial pass already ran the core scheduler: every task
+      // that has input has a seeded row with a future next_due_at and no run
+      // (the memory tasks via the seeded memories, retrospective via the bound
+      // session). Tasks without input (maintain-docs, smart notes, primers,
+      // user-memory review) get no row at all.
       for (const project of [PROJECT_A, PROJECT_B]) {
         const states = getTaskScheduleStatesForProject(db, project);
-        expect(states.map((state) => state.task).sort()).toEqual([...CANONICAL_DREAM_TASKS].sort());
+        expect(states.map((state) => state.task).sort()).toEqual(
+          [...expectedSeeded].sort(),
+        );
         for (const state of states) {
-          if (state.task === "maintain-docs") {
-            expect(state.nextDueAt).toBeNull();
-          } else {
-            expect(state.nextDueAt).toBeGreaterThan(Date.now() - 60_000);
-          }
+          expect(state.nextDueAt).toBeGreaterThan(Date.now() - 60_000);
           expect(state.lastStatus).toBeNull();
         }
       }
@@ -407,7 +420,7 @@ describe("registerDshDreamer (schedule timer)", () => {
       // state stable.
       captured.set[0]!.fn();
       await flush();
-      expect(getTaskScheduleStatesForProject(db, PROJECT_A)).toHaveLength(CANONICAL_DREAM_TASKS.length);
+      expect(getTaskScheduleStatesForProject(db, PROJECT_A)).toHaveLength(expectedSeeded.length);
 
       // Fiber disposal stops every interval.
       for (const dispose of disposers) dispose();

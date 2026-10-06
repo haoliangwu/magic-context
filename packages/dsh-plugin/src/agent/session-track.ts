@@ -63,7 +63,8 @@ export function trackSessionProjectOnce(
 }
 
 /**
- * Register session→project tracking on `agent/session-start`. The listener
+ * Register session→project tracking on `agent/created` (DSH 0.1's
+ * `agent/session-start`). The listener
  * awaits the host bootstrap (fire-and-forget) and records the binding once per
  * session. `clear`/`compact` re-fires are no-ops via the per-session Set.
  */
@@ -74,7 +75,7 @@ export function registerSessionProjectTracking(
   if (deps.config?.enabled === false) return;
   const trackedSessions = new Set<string>();
   ctx.on(
-    "agent/session-start",
+    "agent/created",
     async (payload: { agent: Agent }) => {
       const { agent } = payload;
       try {

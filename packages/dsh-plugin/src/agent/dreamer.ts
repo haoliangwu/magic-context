@@ -89,7 +89,7 @@ const TOOL_REQUIRING_DREAM_AGENTS = new Set([
 ]);
 
 /** Magic-owned message source marker for dreamer LLM turns. */
-const DREAM_SOURCE = { kind: "plugin", plugin: "magic-context" } as const;
+const DREAM_SOURCE = { kind: "magic-context" } as const;
 
 /** Wiring deps for {@link registerDshDreamer}. */
 export interface DreamerWiringDeps {

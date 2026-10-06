@@ -299,10 +299,10 @@ function isSyntheticUserMessage(message: RawMessage): boolean {
   return typeof message.id === "string" && message.id.startsWith(SYNTH_USER_ID_PREFIX);
 }
 
-/** True for Magic-injected knowledge messages (source.plugin === 'magic-context'). */
+/** True for Magic-injected knowledge messages (source.kind === 'magic-context'). */
 function isKnowledgeMessage(message: Record<string, unknown>): boolean {
   const source = isRecord(message.source) ? message.source : null;
-  return source !== null && source.kind === "plugin" && source.plugin === "magic-context";
+  return source !== null && source.kind === "magic-context";
 }
 
 /**
@@ -344,7 +344,14 @@ function isAgentInstructionsMessage(message: Record<string, unknown> | RawMessag
 function isDshSystemPromptMessage(message: Record<string, unknown> | RawMessage): boolean {
   const rec = message as unknown as Record<string, unknown>;
   const source = isRecord(rec.source) ? (rec.source as Record<string, unknown>) : null;
-  return source !== null && source.kind === "plugin" && source.plugin === "@deepseek-ai/dsh-system-prompt";
+  // DSH 0.2: the system-prompt producer declares its own `system-prompt`
+  // kind; the legacy `plugin: "@deepseek-ai/dsh-system-prompt"` marker stays
+  // accepted for surfaces written by older hosts.
+  return (
+    source !== null &&
+    (source.kind === "system-prompt" ||
+      (source.kind === "plugin" && source.plugin === "@deepseek-ai/dsh-system-prompt"))
+  );
 }
 
 function parseToolArguments(raw: unknown): Record<string, unknown> {
@@ -414,6 +421,11 @@ function assistantParts(
  * multiple text fragments joined with "\n" (Pi `synthesizeToolResultParts`
  * mirror). The tool name resolves from `tool/call` events (or assistant
  * tool-call blocks) by callId; falls back to "unknown".
+ *
+ * DSH 0.2: a tool result is a first-class `role: "tool"` message whose content
+ * is plain blocks (source `{kind:"tool", callId}`). The legacy 0.1 shape —
+ * one `tool-result` block wrapping inner content — stays readable for
+ * surfaces written by older hosts.
  */
 function toolResultParts(
   message: Record<string, unknown>,
@@ -424,6 +436,9 @@ function toolResultParts(
   const source = isRecord(message.source) ? message.source : null;
   if (source && typeof source.callId === "string" && source.callId.length > 0) {
     callId = source.callId;
+  }
+  if (!callId && typeof message.toolCallId === "string" && message.toolCallId.length > 0) {
+    callId = message.toolCallId;
   }
   if (!callId) {
     for (const block of content) {
@@ -441,14 +456,22 @@ function toolResultParts(
   if (!callId) return [];
 
   const fragments: string[] = [];
+  const hasLegacyToolResultBlock = content.some(
+    (block) => isRecord(block) && block.type === "tool-result",
+  );
   for (const block of content) {
-    if (!isRecord(block) || block.type !== "tool-result") continue;
-    const inner = block.content;
-    if (!Array.isArray(inner)) continue;
-    for (const fragment of inner) {
-      if (isRecord(fragment) && fragment.type === "text" && typeof fragment.text === "string") {
-        fragments.push(fragment.text);
+    if (!isRecord(block)) continue;
+    if (hasLegacyToolResultBlock) {
+      if (block.type !== "tool-result") continue;
+      const inner = block.content;
+      if (!Array.isArray(inner)) continue;
+      for (const fragment of inner) {
+        if (isRecord(fragment) && fragment.type === "text" && typeof fragment.text === "string") {
+          fragments.push(fragment.text);
+        }
       }
+    } else if (block.type === "text" && typeof block.text === "string") {
+      fragments.push(block.text);
     }
   }
   return [
@@ -535,12 +558,17 @@ export function isAgentInstructionsBaselineMessage(message: RawMessage): boolean
   return source !== null && source.kind === "agent-instructions";
 }
 
-/** True when the view message is a durable dsh-system-prompt snapshot (plugin==='@deepseek-ai/dsh-system-prompt'). */
+/** True when the view message is a durable dsh-system-prompt snapshot (kind === 'system-prompt'). */
 export function isDshSystemPromptBaselineMessage(message: RawMessage): boolean {
   const rec = message as unknown as Record<string, unknown>;
   if (rec[DSH_SYSTEM_PROMPT_KEY] === true) return true;
   const source = isRecord(rec.source) ? (rec.source as Record<string, unknown>) : null;
-  return source !== null && source.kind === "plugin" && source.plugin === "@deepseek-ai/dsh-system-prompt";
+  // Same dual-shape acceptance as isDshSystemPromptMessage (0.2 kind + legacy marker).
+  return (
+    source !== null &&
+    (source.kind === "system-prompt" ||
+      (source.kind === "plugin" && source.plugin === "@deepseek-ai/dsh-system-prompt"))
+  );
 }
 
 /**

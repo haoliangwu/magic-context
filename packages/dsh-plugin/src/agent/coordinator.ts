@@ -153,8 +153,7 @@ export function applyPlanOps(
       // user/message same-type rewrite (assistant/message ops are never
       // emitted — deriveMutationPlan skips them; see transcript.ts).
       const message = magicUserMessage(replacementText(op), {
-        kind: "plugin",
-        plugin: "magic-context",
+        kind: "magic-context",
         messageId: `mc-op:${plan.opId}`,
         revision: String(plan.generation),
         digest: plan.inputDigest,
@@ -197,8 +196,7 @@ function applyInsertionMerge(
     .join("\n") ?? "";
   const merged = `${op.replacement}\n${originalText}`;
   const message = magicUserMessage(merged, {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: "magic-context",
     messageId: `mc-op:${plan.opId}:temporal`,
     revision: String(plan.generation),
     digest: plan.inputDigest,

@@ -1,8 +1,8 @@
 /**
- * agent/recomp — Phase 4 slice P3: recomp / wrapup / session-upgrade wiring.
+ * agent/recomp — Phase 4 slice P3: recomp / wrapup wiring.
  *
  * Design: docs/phase4-design.md decision 3. The managed orchestrators'
- * (`runManagedRecomp` / `runManagedWrapup` / `runManagedUpgrade`) ONLY harness
+ * (`runManagedRecomp` / `runManagedWrapup`) ONLY harness
  * injection point is `ManagedRecompContext.client` — an OpenCode-shaped
  * `client.session.{get,create,prompt,promptAsync,messages,delete}` facade.
  * This module provides:
@@ -21,7 +21,7 @@
  *          (`extractLatestAssistantText`); `delete`/`abort` no-op; `noReply`
  *          prompts surface their text through `log` and never call the LLM.
  *   2. {@link createRecompSeams} — the `CtxCommandSeams` runners
- *      (`runRecomp` / `runWrapup` / `runUpgrade`): build the managed contexts
+ *      (`runRecomp` / `runWrapup`): build the managed contexts
  *      and delegate to the shared core orchestrators, with the transcript-
  *      backed raw-message provider registered for the WHOLE run
  *      (`withRawMessageProvider`) so `readSessionChunk` has a source. Every
@@ -29,11 +29,10 @@
  *      nothing throws out of the seams.
  *
  * DSH adjustments over the OpenCode/Pi wiring (documented deviations):
- *   - no config file: `fallbackModels` is empty by default and
- *     `runMigration` defaults to `memoryEnabled` (the once-per-project memory
- *     migration runs with the session's live model as its primary, which DSH
- *     always resolves from the agent's options — OpenCode gates on
- *     `historian.model` being configured, DSH has no historian model config);
+ *   - no config file: `fallbackModels` is empty by default (the session's
+ *     live model remains the last resort, which DSH always resolves from
+ *     the agent's options — OpenCode gates on `historian.model` being
+ *     configured, DSH has no historian model config);
  *   - `liveSessionState` is a fresh per-instance state (DSH has no TUI
  *     sidebar; the orchestrator's progress maps are still populated so
  *     future surfaces can read them);
@@ -53,7 +52,6 @@ import { createLiveSessionState } from "@magic-context/core/hooks/magic-context/
 import { withRawMessageProvider } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import {
   runManagedRecomp,
-  runManagedUpgrade,
   type ManagedRecompContext,
 } from "@magic-context/core/hooks/magic-context/recomp-orchestrator";
 import {
@@ -278,7 +276,7 @@ export function createDshSessionClient(deps: DshSessionClientDeps): DshSessionCl
     const system = resolveSystemPrompt(body);
     const user = createUserMessage({
       content: [{ type: "text", text }],
-      source: { kind: "plugin", plugin: "magic-context" },
+      source: { kind: "magic-context" },
     });
 
     const controller = new AbortController();
@@ -427,11 +425,7 @@ export interface RecompSeamDeps {
   fallbackModels?: readonly string[];
   /** Language directive for historian/migration prompts. */
   language?: string;
-  /** Gate the upgrade's once-per-project memory migration (default:
-   *  `memoryEnabled` — DSH runs migration with the session's live model as
-   *  the primary, see module doc). */
-  runMigration?: boolean;
-  /** User-memory collection gate for the migration (default false). */
+  /** User-memory collection gate (default false). */
   userMemoriesEnabled?: boolean;
   /** Two-pass historian (editor cleanup) (default false). */
   historianTwoPass?: boolean;
@@ -444,7 +438,6 @@ export interface RecompSeamDeps {
   runners?: {
     recomp?: typeof runManagedRecomp;
     wrapup?: typeof runManagedWrapup;
-    upgrade?: typeof runManagedUpgrade;
   };
   /** Test seam: replace the compartment-agent runner used by wrapup
    *  iterations (the shared core's own test seam; production falls back to
@@ -474,8 +467,8 @@ function notificationParamsOf(agent: Agent): {
 }
 
 /**
- * Build the recomp / wrapup / upgrade seams for the /ctx-* commands
- * (`CtxCommandSeams.runRecomp|runWrapup|runUpgrade`).
+ * Build the recomp / wrapup seams for the /ctx-* commands
+ * (`CtxCommandSeams.runRecomp|runWrapup`).
  *
  * Each run:
  *   1. fails fast on an already-aborted invocation signal (skip text);
@@ -496,7 +489,7 @@ function notificationParamsOf(agent: Agent): {
  */
 export function createRecompSeams(
   deps: RecompSeamDeps,
-): Pick<CtxCommandSeams, "runRecomp" | "runWrapup" | "runUpgrade"> {
+): Pick<CtxCommandSeams, "runRecomp" | "runWrapup"> {
   const log = deps.log ?? (() => {});
   const liveSessionState = createLiveSessionState();
   const memoryEnabled = deps.memoryEnabled ?? true;
@@ -534,7 +527,6 @@ export function createRecompSeams(
       fallbackModels: deps.fallbackModels ?? [],
       language: deps.language,
       fallbackModelId: modelKeyOf(agent),
-      runMigration: deps.runMigration ?? memoryEnabled,
       userMemoriesEnabled: deps.userMemoriesEnabled ?? false,
       historianTwoPass: deps.historianTwoPass,
       getNotificationParams: () => notificationParamsOf(agent),
@@ -577,8 +569,9 @@ export function createRecompSeams(
         if (parsed.kind === "error") return `## Magic Recomp — Failed\n\n${parsed.message}`;
         if (parsed.kind === "upgrade") {
           // The /ctx-recomp command handler intercepts --upgrade before this
-          // seam; kept for defense-in-depth.
-          return "## Magic Recomp — Skipped\n\n`--upgrade` is deprecated — run `/ctx-session-upgrade` instead.";
+          // seam; kept for defense-in-depth (upstream removed the separate
+          // upgrade runner — a plain recomp rebuilds legacy compartments).
+          return "## Magic Recomp — Skipped\n\n`--upgrade` is deprecated — run `/ctx-recomp` to rebuild them in the current format.";
         }
 
         const directory = args.cwd ?? deps.directory ?? process.cwd();
@@ -631,30 +624,6 @@ export function createRecompSeams(
       } catch (error) {
         log(`[magic-context] wrapup seam failed: ${describeError(error).brief}`);
         return `## Magic Wrapup — Failed\n\nWrapup crashed: ${describeError(error).brief}`;
-      }
-    },
-
-    async runUpgrade(args) {
-      try {
-        if (args.signal.aborted) {
-          return "## Session Upgrade — Skipped\n\nCommand was cancelled before it started.";
-        }
-        const gate = await bootstrapGate();
-        if (gate !== null) return `## Session Upgrade — Failed\n\n${gate}`;
-
-        const directory = args.cwd ?? deps.directory ?? process.cwd();
-        const { client, dispose } = buildClient(directory, args.sessionId, args.signal);
-        try {
-          const ctx = baseRecompContext(client, args.agent, args.sessionId, directory);
-          const run = deps.runners?.upgrade ?? runManagedUpgrade;
-          const provider = transcriptRawMessageProvider(args.agent, args.sessionId);
-          return await withRawMessageProvider(args.sessionId, provider, () => run(ctx, args.sessionId));
-        } finally {
-          dispose();
-        }
-      } catch (error) {
-        log(`[magic-context] upgrade seam failed: ${describeError(error).brief}`);
-        return `## Session Upgrade — Failed\n\nUpgrade crashed: ${describeError(error).brief}`;
       }
     },
   };

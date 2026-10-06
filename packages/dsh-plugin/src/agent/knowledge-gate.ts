@@ -316,8 +316,7 @@ export function isMagicWatermarkOnSurface(
     const source = event.data?.source;
     if (
       source &&
-      source.kind === "plugin" &&
-      (source as MagicMessageSource).plugin === "magic-context" &&
+      source.kind === "magic-context" &&
       (source as MagicMessageSource).messageId === watermark
     ) {
       return true;
@@ -359,8 +358,7 @@ export async function maybeInjectKnowledge(
   }
 
   const source: MagicMessageSource = {
-    kind: "plugin",
-    plugin: "magic-context",
+    kind: "magic-context",
     messageId: blocks.watermark,
     revision: blocks.revision,
     digest: blocks.digest,
@@ -429,8 +427,7 @@ export async function maybeInjectKnowledge(
             `[tool: todowrite #${callId}]\ninput: ${inputText}\n\n` +
             `[tool result: todowrite #${callId}]\noutput: ${part.state.output}`;
           const todoSource: MagicMessageSource = {
-            kind: "plugin",
-            plugin: "magic-context",
+            kind: "magic-context",
             messageId: todoWatermark,
           };
           const todoMessage = magicUserMessage(todoText, todoSource, []);

@@ -46,7 +46,7 @@ import { createSnapshotStore, type SnapshotStore } from "@deepseek-ai/dsh-client
 import type { UseProjection } from "@deepseek-ai/dsh-api-session-controller/client";
 import type {} from "@deepseek-ai/dsh-token-meter"; // load SessionProjectionMap augmentation (contextPressure/contextBreakdown keys)
 import type { SnapshotSelectorHook } from "@deepseek-ai/dsh-client-ui-slots";
-import { IconChevronDownOutline14 } from "@deepseek-ai/dsh-client-ui-primitives";
+import { IconChevronDownOutlineMedium } from "@deepseek-ai/dsh-client-ui-primitives";
 import type { Context } from "@deepseek-ai/cordis";
 
 import {
@@ -219,8 +219,8 @@ export interface MagicStatus {
     readonly detail?: string;
   };
   readonly config: { readonly path: string; readonly exists: boolean };
-  /** Shipped-preset patch state (ADR 0001): patched/total distinct preset ids. */
-  readonly preset: { readonly patched: number; readonly total: number; readonly legacy?: string };
+  /** Shipped-preset audit: tampered/total distinct preset ids + legacy note. */
+  readonly preset: { readonly tampered: number; readonly total: number; readonly legacy?: string };
   readonly sessionId?: string | null;
 }
 
@@ -525,15 +525,14 @@ function Row({ label, value, tone = "plain" }: RowSpec) {
 
 /* ------------------------------------------------ status rows */
 
-/** Shipped-preset patch row (ADR 0001): patched/total + optional legacy note. */
+/** Shipped-preset audit row: native stock presets are the OK state. */
 function presetRow(preset: MagicStatus["preset"]): RowSpec {
-  const p = preset ?? { patched: 0, total: 0 };
-  const unpatched = p.total - p.patched;
+  const p = preset ?? { tampered: 0, total: 0 };
   let tone: RowTone = "ok";
-  let value = `patched ${p.patched}/${p.total}`;
-  if (unpatched > 0) {
+  let value = `native ${p.total - p.tampered}/${p.total} stock`;
+  if (p.tampered > 0) {
     tone = "err";
-    value = `stock ${unpatched} unpatched`;
+    value = `tampered ${p.tampered}/${p.total}`;
   } else if (p.legacy !== undefined) {
     tone = "warn";
   }
@@ -668,7 +667,7 @@ export function MagicHeaderAction({ useMagicStatus, refresh, sessionId }: MagicH
         onClick={() => setOpen(!open)}
       >
         <span>MC</span>
-        <IconChevronDownOutline14 className={open ? C.triggerOpen : undefined} />
+        <IconChevronDownOutlineMedium className={open ? C.triggerOpen : undefined} />
       </button>
       {open && (
         <div className={C.menu}>

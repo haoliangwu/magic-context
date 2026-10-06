@@ -12,9 +12,9 @@
  * model-invisible, exactly like Pi's `appendEntry` status entries, and never
  * routes into the model context.
  *
- * LLM-dependent commands (ctx-dream / ctx-recomp / ctx-wrapup /
- * ctx-session-upgrade) run their full guard/validation logic here and call the
- * core functions through seams (`dreamerExecutor`, `runRecomp`, `runWrapup`, `runUpgrade`) that the historian/dreamer/subagent
+ * LLM-dependent commands (ctx-dream / ctx-recomp / ctx-wrapup) run their
+ * full guard/validation logic here and call the
+ * core functions through seams (`dreamerExecutor`, `runRecomp`, `runWrapup`) that the historian/dreamer/subagent
  * slices wire in. Until wired, they answer with an explicit "not wired"
  * message instead of failing.
  */
@@ -89,14 +89,6 @@ export interface CtxCommandSeams {
     sessionId: string;
     cwd?: string;
     messagesToKeep: number;
-    signal: AbortSignal;
-    db: Database;
-  }) => Promise<string>;
-  /** Session-upgrade runner (historian slice); returns the status text. */
-  runUpgrade?: (deps: {
-    agent: Agent;
-    sessionId: string;
-    cwd?: string;
     signal: AbortSignal;
     db: Database;
   }) => Promise<string>;
@@ -447,7 +439,7 @@ export function registerCtxRecompCommand(ctx: Context, opts: CtxCommandsOptions)
               "## Magic Recomp Upgrade",
               "",
               `Found ${legacyCount} legacy compartment${legacyCount === 1 ? "" : "s"} for this session.`,
-              "The `--upgrade` flag is deprecated. Run `/ctx-session-upgrade` to upgrade this session.",
+              "The `--upgrade` flag is deprecated. Run `/ctx-recomp` to rebuild them in the current format.",
             ].join("\n"),
           );
         }
@@ -565,48 +557,10 @@ export function registerCtxWrapupCommand(ctx: Context, opts: CtxCommandsOptions)
   });
 }
 
-/* ──────────────────────────── /ctx-session-upgrade ─────────────────────── */
-
-export function registerCtxSessionUpgradeCommand(
-  ctx: Context,
-  opts: CtxCommandsOptions,
-): () => void {
-  return registerCommand(ctx, {
-    name: "ctx-session-upgrade",
-    description:
-      "Upgrade this session to the current Magic Context history format and re-organize project memories",
-    handler: async (invocation) => {
-      const agent = invocation.agent;
-      try {
-        const sessionId = resolveCanonicalKey(ctx, opts, agent);
-        if (!sessionId) return errorResult("No canonical session id is available for this agent.");
-        if (opts.compactionOff) return errorResult(COMPACTION_OFF_UNAVAILABLE);
-        if (!opts.runUpgrade) {
-          return successResult(
-            "## Session Upgrade\n\nThe upgrade runner is not wired yet (Phase 2 slice C).",
-          );
-        }
-        const db = await resolveDb(ctx, opts);
-        const cwd = cwdOf(agent);
-        const result = await opts.runUpgrade({
-          agent,
-          sessionId,
-          cwd,
-          signal: invocation.signal,
-          db,
-        });
-        return inferCommandLevel(result);
-      } catch (error) {
-        return errorResult(`## Session Upgrade — Failed\n\n${describeError(error).brief}`);
-      }
-    },
-  });
-}
-
 /* ─────────────────────────────── registration ──────────────────────────── */
 
 /**
- * Register all eight /ctx-* commands and return the combined disposer.
+ * Register all seven /ctx-* commands and return the combined disposer.
  * Every registration is reversible through `ctx.commands.register`'s disposer.
  */
 export function registerCtxCommands(ctx: Context, opts: CtxCommandsOptions = {}): () => void {
@@ -617,7 +571,6 @@ export function registerCtxCommands(ctx: Context, opts: CtxCommandsOptions = {})
     registerCtxEmbedCommand(ctx, opts),
     registerCtxRecompCommand(ctx, opts),
     registerCtxWrapupCommand(ctx, opts),
-    registerCtxSessionUpgradeCommand(ctx, opts),
   ];
   return () => {
     for (const dispose of disposers) {

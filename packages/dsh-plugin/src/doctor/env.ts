@@ -21,6 +21,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  statSync,
 } from "node:fs";
 import { describeError } from "@magic-context/core/shared/error-message";
 
@@ -31,7 +32,7 @@ export const MAGIC_CONTEXT_PACKAGE = "@cortexkit/dsh-magic-context";
 export const LEGACY_MAGIC_CONTEXT_PACKAGE = "dsh-magic-context";
 
 /** The exact DSH release this adapter's compat layer (compat/dsh-0.1) pins. */
-export const DSH_COMPAT_EXPECTED_VERSION = "0.1.5-rc.2";
+export const DSH_COMPAT_EXPECTED_VERSION = "0.2.0-rc.2";
 
 /** Installed-package identity of the DSH runtime. */
 export const DSH_PACKAGE = "@deepseek-ai/dsh";
@@ -139,6 +140,17 @@ export function locateDshInstall(
     if (isDshInstallRoot(candidate) && existsSync(stockV2)) {
       return { dshInstallDir: candidate, stockPresetPath: stockV2, tried };
     }
+    // 0.2 layout: no stock preset file next to the install; the shipped
+    // preset declarations live in the sibling dsh-web-app package. The
+    // install itself still resolves (doctor reports the preset state from
+    // the web-app scan), with no legacy stock preset path.
+    const stockV3 = join(dirname(candidate), "dsh-web-app");
+    if (
+      isDshInstallRoot(candidate) &&
+      existsSync(join(stockV3, "presets"))
+    ) {
+      return { dshInstallDir: candidate, tried };
+    }
   }
   return { tried };
 }
@@ -167,11 +179,40 @@ function findDshInstallOnPath(env: NodeJS.ProcessEnv): string[] {
     for (const ext of exts) {
       const bin = join(dir, `dsh${ext}`);
       if (!existsSync(bin)) continue;
-      const resolved = resolvePackageRoot(bin);
+      const resolved = resolvePackageRoot(bin) ?? resolvePackageRootFromShimText(bin);
       if (resolved !== undefined) return [resolved];
     }
   }
   return [];
+}
+
+/** Shim-text fallback: a package-manager launcher script (e.g. pnpm's
+ *  global shims) embeds the real `…/node_modules/@deepseek-ai/dsh/…` target
+ *  path in its body instead of symlinking to it, so directory walking cannot
+ *  find the package root. Scan the script text for the embedded path and
+ *  resolve `$basedir`/`$basedir_win`-relative spellings against the script's
+ *  own directory. */
+function resolvePackageRootFromShimText(binPath: string): string | undefined {
+  try {
+    const stat = statSync(binPath);
+    // Only scan small, regular, non-binary launcher scripts.
+    if (!stat.isFile() || stat.size > 64 * 1024) return undefined;
+    const text = readFileSync(binPath, "utf8");
+    const match = text.match(/([^\s"']*node_modules\/@deepseek-ai\/dsh)\//);
+    if (match === null) return undefined;
+    let candidate = match[1]!;
+    // Shell-variable prefixes: `$basedir/../…` / `$basedir_win/../…` resolve
+    // against the shim's own directory (its parent, via the `..`).
+    const varPrefix = /^\$(?:basedir_win|basedir)\//;
+    if (varPrefix.test(candidate)) {
+      candidate = join(dirname(binPath), candidate.replace(varPrefix, ""));
+    } else if (!candidate.startsWith("/")) {
+      return undefined; // some other relative spelling we cannot anchor
+    }
+    return isDshInstallRoot(candidate) ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Walk up from an executable to the nearest `@deepseek-ai/dsh` package root. */

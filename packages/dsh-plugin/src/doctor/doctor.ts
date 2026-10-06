@@ -32,11 +32,10 @@ import type { RpcPortFileRecord } from "../compat/dsh-0.1/liveness";
 import { describeError } from "@magic-context/core/shared/error-message";
 import {
   AGENT_PRESETS_PACKAGE,
+  auditShippedPresets,
   currentCompactionEntryUrl,
   detectLegacyMagicStandard,
-  resolveAgentPresetsDir,
-  scanPresetPatchStates,
-} from "../host/preset-patch";
+} from "../host/preset-audit";
 import {
   DSH_COMPAT_EXPECTED_VERSION,
   DSH_PACKAGE,
@@ -351,59 +350,64 @@ export async function runDshDoctor(
     }
   }
 
-  // 3. Shipped-preset patch state (ADR 0001) + legacy magic-standard.
-  const agentPresetsDir =
-    options.agentPresetsDir ??
-    stringFlag(flags, "agent-presets") ??
-    resolveAgentPresetsDir();
-  if (agentPresetsDir === undefined) {
+  // 3. Shipped-preset tampering audit + legacy magic-standard.
+  // The plugin no longer patches shipped presets (≤ 0.45 did, in place);
+  // this check only DETECTS leftovers and tells the user how to restore the
+  // stock rows. Only an EXPLICIT 0.1-layout pin (option or --agent-presets
+  // flag) fixes agentPresetsDir; otherwise the audit resolves both layouts
+  // itself (the 0.1 agent-presets package and the 0.2 dsh-web-app
+  // declarations).
+  const agentPresetsDirPin =
+    options.agentPresetsDir ?? stringFlag(flags, "agent-presets");
+  const audit = auditShippedPresets({
+    ...(agentPresetsDirPin !== undefined ? { agentPresetsDir: agentPresetsDirPin } : {}),
+    warn: () => {},
+  });
+  if (audit.agentPresetsDir === undefined && audit.webAppDir === undefined) {
     checks.push({
-      id: "preset-patch",
-      title: "Shipped-preset patch state",
+      id: "preset-audit",
+      title: "Shipped-preset audit",
       status: "warn",
       detail:
-        `Could not resolve ${AGENT_PRESETS_PACKAGE} from this module's context ` +
-        `(the profile node_modules that holds this package), so no shipped ` +
-        `preset is patched yet.`,
-      fix: "Verify the bundle is installed into the profile; the boot-time self-heal patches the shipped presets on the next host start.",
+        `Could not resolve ${AGENT_PRESETS_PACKAGE} (0.1 layout) or ` +
+        `@deepseek-ai/dsh-web-app (0.2 layout) from this machine, so the ` +
+        `shipped presets could not be audited.`,
+      fix: "Verify DSH is installed and on PATH; the audit is informational and never writes.",
     });
   } else {
-    // Read-only scan: doctor never writes — the boot self-heal does.
-    const scan = scanPresetPatchStates({ agentPresetsDir, warn: () => {} });
-    const currentUrl = currentCompactionEntryUrl();
-    if (scan.files.length === 0) {
+    if (audit.files.length === 0) {
       checks.push({
-        id: "preset-patch",
-        title: "Shipped-preset patch state",
+        id: "preset-audit",
+        title: "Shipped-preset audit",
         status: "ok",
         detail:
-          `${join(agentPresetsDir, "presets")}: no shipped preset carries a ` +
-          `compaction-basic row (nothing to patch).`,
+          `${audit.agentPresetsDir !== undefined ? join(audit.agentPresetsDir, "presets") : audit.webAppDir}: no shipped preset carries a ` +
+          `compaction-basic row.`,
       });
     } else {
-      for (const file of scan.files) {
+      for (const file of audit.files) {
         const status: CheckStatus =
-          file.state === "applied" || file.state === "stock"
+          file.state === "stock"
             ? "ok"
-            : file.state === "contract-mismatch"
+            : file.state === "foreign"
               ? "warn"
               : "fail";
         const detailByState: Record<string, string> = {
-          applied: `patched: compaction-basic now mounts ${currentUrl} with config { auto: true }.`,
-          stock: `stock engine; the boot-time self-heal patches it when the host mounts.`,
-          "contract-mismatch": `${file.issue}. Stock compaction keeps running; the rest of Magic Context is unaffected.`,
-          "mc-path-rotted": `${file.issue} — the preset mounts a stale entry path.`,
+          stock: `stock engine intact — native compaction runs untouched (the supported policy).`,
+          foreign: `${file.issue}. Shape unrecognized by the audit; likely a DSH composition change. Stock compaction keeps running; the rest of Magic Context is unaffected.`,
+          "mc-patched": `${file.issue ?? `row mounts ${currentCompactionEntryUrl()}`} — a leftover in-place patch from dsh-magic-context ≤ 0.45.`,
+          "mc-patched-rotted": `${file.issue} — a leftover in-place patch from an older dsh-magic-context build.`,
         };
         checks.push({
-          id: `preset-patch.${file.presetId}`,
-          title: `Shipped-preset patch state — ${file.presetId}`,
+          id: `preset-audit.${file.presetId}`,
+          title: `Shipped-preset audit — ${file.presetId}`,
           status,
           detail: `${file.path}: ${detailByState[file.state] ?? file.state}.`,
           fix: status === "ok"
             ? undefined
             : status === "fail"
-              ? "Restart the host so the boot self-heal rewrites the current entry URL (or reinstall the bundle)."
-              : "Check the composition against the expected compaction-group shape.",
+              ? "Restore the stock row: set the compaction-basic `name` back to '@deepseek-ai/dsh-compaction-basic' and remove the `config: { auto: true }` line — or reinstall the @deepseek-ai/dsh-web-app (0.2) / @deepseek-ai/dsh-agent-presets (0.1) package."
+              : "Check the composition against the expected compaction-group shape; the audit never writes.",
         });
       }
     }

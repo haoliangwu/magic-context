@@ -17,11 +17,30 @@ import { runDshSetup } from "./setup";
 function parseEntryListYaml(text: string): Record<string, unknown>[] {
   return yamlLoad(text, { schema: entryListSchema }) as Record<string, unknown>[];
 }
+import { currentCompactionEntryUrl } from "../host/preset-audit";
+
+/**
+ * Simulate what the REMOVED (≤ 0.45) in-place patcher wrote: retarget the
+ * compaction-basic row of a preset file to a Magic entry URL with the
+ * `{ auto: true }` config. Used to build leftover-tampering fixtures.
+ */
+function tamperCompactionRow(file: string, url: string): void {
+  const entries = yamlLoad(readFileSync(file, "utf8"), {
+    schema: entryListSchema,
+  }) as Record<string, unknown>[];
+  const group = entries.find((row) => row.id === "compaction") as unknown as {
+    config: Array<Record<string, unknown>>;
+  };
+  const row = group.config.find((r) => r.id === "compaction-basic") as Record<string, unknown>;
+  row.name = url;
+  row.config = { auto: true };
+  writeFileSync(file, yamlDump(entries, { schema: entryListSchema }));
+}
 import {
-  patchShippedPresets,
-  rewriteCompactionRowText,
-} from "../host/preset-patch";
-import { MAGIC_CONTEXT_PACKAGE, magicStandardDir } from "./env";
+  DSH_COMPAT_EXPECTED_VERSION,
+  MAGIC_CONTEXT_PACKAGE,
+  magicStandardDir,
+} from "./env";
 
 /** Minimal stand-in for a stock preset entry list (compaction group included). */
 function stockLayout(): Record<string, unknown>[] {
@@ -47,7 +66,7 @@ function fakeInstall(installDir: string): void {
   mkdirSync(installDir, { recursive: true });
   writeFileSync(
     join(installDir, "package.json"),
-    JSON.stringify({ name: "@deepseek-ai/dsh", version: "0.1.5-rc.2" }),
+    JSON.stringify({ name: "@deepseek-ai/dsh", version: DSH_COMPAT_EXPECTED_VERSION }),
   );
   const stock = join(installDir, "..", "dsh-agent-presets", "presets", "standard", "agent.cordis.yml");
   mkdirSync(dirname(stock), { recursive: true });
@@ -112,7 +131,7 @@ async function cleanup(root: string): Promise<void> {
   }
 }
 
-describe("dsh-magic-context setup (ADR 0001: diagnostics only)", () => {
+describe("dsh-magic-context setup (diagnostics only)", () => {
   it("reports a clean environment without writing anything", async () => {
     const env = makeEnv();
     process.env.XDG_CONFIG_HOME = env.configHome;
@@ -121,7 +140,6 @@ describe("dsh-magic-context setup (ADR 0001: diagnostics only)", () => {
       fakeProfile(env.dshHome, "web");
       const agentPresetsDir = join(env.root, "agent-presets-pkg");
       const { standard } = fakeAgentPresetsPackage(agentPresetsDir);
-      patchShippedPresets({ agentPresetsDir, warn: () => {} });
       const before = readFileSync(standard, "utf8");
 
       const report = await runDshSetup([], {
@@ -138,11 +156,11 @@ describe("dsh-magic-context setup (ADR 0001: diagnostics only)", () => {
       expect(existsSync(magicStandardDir(env.dshHome))).toBe(false);
       expect(existsSync(join(env.configHome, "cortexkit", "magic-context.jsonc"))).toBe(false);
       expect(readFileSync(standard, "utf8")).toBe(before);
-      // Steps cover the shipped-preset patch states + legacy detection.
+      // Steps cover the shipped-preset audit states + legacy detection.
       const byTitle = new Map(report.steps.map((step) => [step.title, step]));
-      const patchStep = report.steps.find((step) => step.title.includes("standard"));
-      expect(patchStep?.status).toBe("ok");
-      expect(patchStep?.detail).toContain("patched");
+      const auditStep = report.steps.find((step) => step.title.includes("standard"));
+      expect(auditStep?.status).toBe("ok");
+      expect(auditStep?.detail).toContain("stock engine");
       expect(byTitle.get("Legacy magic-standard preset")?.status).toBe("ok");
       expect(report.steps.some((step) => step.title.startsWith("User-root presets"))).toBe(true);
     } finally {
@@ -160,12 +178,10 @@ describe("dsh-magic-context setup (ADR 0001: diagnostics only)", () => {
       const agentPresetsDir = join(env.root, "agent-presets-pkg");
       const { presetsDir } = fakeAgentPresetsPackage(agentPresetsDir);
       // standard: rotted URL (old MC entry path).
-      const standardFile = join(presetsDir, "standard", "agent.cordis.yml");
-      const rewrite = rewriteCompactionRowText(
-        readFileSync(standardFile, "utf8"),
+      tamperCompactionRow(
+        join(presetsDir, "standard", "agent.cordis.yml"),
         "file:///old-entries/compaction.js",
       );
-      writeFileSync(standardFile, rewrite.patched, "utf8");
       // cordis: contract mismatch — compaction group id renamed.
       const cordisFile = join(presetsDir, "cordis", "agent.cordis.yml");
       const entries = parseEntryListYaml(readFileSync(cordisFile, "utf8"));
@@ -185,7 +201,7 @@ describe("dsh-magic-context setup (ADR 0001: diagnostics only)", () => {
         step.title.includes("— standard"),
       );
       expect(standard?.status).toBe("fail");
-      expect(standard?.detail).toContain("stale entry path");
+      expect(standard?.detail).toContain("leftover in-place patch");
       const cordis = report.steps.find((step) => step.title.includes("— cordis"));
       expect(cordis?.status).toBe("warn");
       expect(cordis?.detail).toContain("Stock compaction keeps running");

@@ -59,11 +59,10 @@ export type AutoSearchOutcome =
 
 /** Source marker for the injected hint (messageId = per-user-message id). */
 export function autoSearchHintSource(userMessageId: string): {
-  kind: "plugin";
-  plugin: "magic-context";
+  kind: "magic-context";
   messageId: string;
 } {
-  return { kind: "plugin", plugin: "magic-context", messageId: `mc-auto-search:${userMessageId}` };
+  return { kind: "magic-context", messageId: `mc-auto-search:${userMessageId}` };
 }
 
 /** Concatenate the text blocks of a DSH user message. */

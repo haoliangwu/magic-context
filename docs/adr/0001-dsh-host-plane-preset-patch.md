@@ -1,5 +1,13 @@
 # dsh integration: host-plane agent row + in-place shipped-preset patch
 
+> **Status: SUPERSEDED (compaction half).** The host-plane agent row remains
+> the current architecture. The in-place shipped-preset patch was **removed**
+> (see `0002-dsh-no-shipped-preset-patching.md`): it modified files shared
+> by every profile on the machine, and the DSH 0.2 web-app preset
+> declarations cannot be retargeted from any patch layer anyway. The shipped
+> `compaction-basic` engine now runs untouched; `doctor` audits for leftover
+> tampering from old versions. What follows is the original record.
+
 The dsh-plugin mounted its whole agent-side surface (memory gate, ctx_* tools, context plane, guidance) inside a generated `magic-standard` agent preset, so Magic Context only existed for sessions that picked that preset — unlike OpenCode, where the plugin is host-wide. We moved the agent rows to the **host plane** (a `dsh-magic-context` row in the package's `cordis.patch.yml`, mounted process-globally by the profile bundle): dsh's scope admission lets untagged host-plane listeners receive every agent's `agent/pre-step` events, and tool/command registrations are global layers, so every preset gets Magic Context. The one thing that cannot be done from the host plane is replacing the compaction engine — it must be a row inside each preset's isolated `compaction` realm, preset compositions mount without external patches, and shipped preset ids cannot be shadowed from roster roots — so the compaction-basic row is patched **in place in the shipped preset files** (tmp+rename atomic writes, never in-place content edits: pnpm node_modules files are hardlinks and in-place writes would pierce the shared store).
 
 ## Considered Options

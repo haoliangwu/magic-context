@@ -175,7 +175,7 @@ export function createLlmSummarizeCall(
     });
     const user = createUserMessage({
       content: [{ type: "text", text: prompt }],
-      source: { kind: "plugin", plugin: "magic-context" },
+      source: { kind: "magic-context" },
     });
     let text = "";
     let failed: string | undefined;

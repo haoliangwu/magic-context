@@ -139,7 +139,7 @@ function surfaceNext(
   return async () => {
     for (const m of messages) {
       harness.surfaceAppend(m);
-      if ((m.source as { plugin?: string }).plugin === "magic-context") {
+      if ((m.source as { kind?: string }).kind === "magic-context") {
         harness.delivered.push(m);
       }
     }
@@ -195,13 +195,11 @@ describe("agent knowledge gate (m0/m1 first-step injection)", () => {
       expect(m1Text).toContain("<session-history-since>");
       const source = message.source as {
         kind: string;
-        plugin: string;
         messageId?: string;
         revision?: string;
         digest?: string;
       };
-      expect(source.kind).toBe("plugin");
-      expect(source.plugin).toBe("magic-context");
+      expect(source.kind).toBe("magic-context");
       expect(source.messageId).toMatch(/^mc-kb:\d+:[0-9a-f]{16}$/);
       expect(source.revision).toBeDefined();
       expect(source.digest).toMatch(/^[0-9a-f]{16}$/);

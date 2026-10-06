@@ -158,8 +158,7 @@ describe("transcript mapping (DSH events → RawMessage[])", () => {
     session.append(
       "user/message",
       magicUserMessage("knowledge baseline", {
-        kind: "plugin",
-        plugin: "magic-context",
+        kind: "magic-context",
         messageId: "mc-kb:1:digest",
       }),
       { surfaceOp: "append" },
@@ -252,12 +251,14 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       expect(first!.ops.every((op) => op.surfaceType !== "assistant/message")).toBe(true);
       const userOp = first!.ops.find((op) => op.surfaceType === "user/message")!;
       expect(userOp.replacement).toContain("\u00a7");
-      // tool rows carry structured block replacements with the prefix inside.
+      // tool rows carry structured block replacements with the prefix inside
+      // (DSH 0.2: a tool result is plain content blocks on a role "tool"
+      // message — the block itself is a text block).
       const toolOp = first!.ops.find((op) => op.surfaceType === "tool/result");
       if (toolOp !== undefined) {
         expect(Array.isArray(toolOp.replacement)).toBe(true);
         const blocks = toolOp.replacement as Array<Record<string, unknown>>;
-        expect(blocks[0]!.type).toBe("tool-result");
+        expect(blocks[0]!.type).toBe("text");
         expect(JSON.stringify(toolOp.replacement)).toContain("\u00a7");
       }
       expect(first!.sessionId).toBe(view.sessionId);
@@ -439,13 +440,11 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       // Single-node, same-type.
       expect(dropOp!.start).toBe(dropOp!.end - 1);
       expect(dropOp!.shadowedSeqs.length).toBe(1);
-      // The tool-result block keeps its identity; only the output is sentinelized.
+      // The tool message keeps its identity (callId lives on the message
+      // envelope); only the output text is sentinelized.
       const blocks = dropOp!.replacement as Array<Record<string, unknown>>;
-      expect(blocks[0]!.type).toBe("tool-result");
-      expect(blocks[0]!.toolCallId).toBe("call-1");
-      expect(JSON.stringify(blocks[0]!.content)).toContain(
-        `[dropped \u00a7${toolTag.tagNumber}\u00a7]`,
-      );
+      expect(blocks[0]!.type).toBe("text");
+      expect(blocks[0]!.text).toContain(`[dropped \u00a7${toolTag.tagNumber}\u00a7]`);
       db.close();
     } finally {
       await cleanupDir(dir);
@@ -460,8 +459,7 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       const mcOpSeq = session.append(
         "user/message",
         magicUserMessage("§4§ already embedded", {
-          kind: "plugin",
-          plugin: "magic-context",
+          kind: "magic-context",
           messageId: "mc-op:legacy",
         }),
         { surfaceOp: "append" },
@@ -546,12 +544,11 @@ describe("deriveMutationPlan (recording pipeline)", () => {
       expect(toolOp!.surfaceType).toBe("tool/result");
       // No op shadows the assistant tool-call node.
       expect(plan.ops.some((op) => op.shadowedSeqs.includes(assistant1Seq))).toBe(false);
-      // The tool replacement is the ORIGINAL tool-result block with only the
-      // output text mutated (callId/isError preserved).
+      // The tool replacement is the ORIGINAL text block with only the
+      // output text mutated (message identity lives on the envelope).
       const blocks = toolOp!.replacement as Array<Record<string, unknown>>;
-      expect(blocks[0]!.type).toBe("tool-result");
-      expect(blocks[0]!.toolCallId).toBe("call-1");
-      expect(JSON.stringify(blocks[0]!.content)).toContain("\u00a7");
+      expect(blocks[0]!.type).toBe("text");
+      expect(blocks[0]!.text).toContain("\u00a7");
       db.close();
     } finally {
       await cleanupDir(dir);

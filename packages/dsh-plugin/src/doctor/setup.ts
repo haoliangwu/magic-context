@@ -1,21 +1,22 @@
 /**
- * doctor/setup — `dsh-magic-context setup` (ADR 0001 model).
+ * doctor/setup — `dsh-magic-context setup`.
  *
- * Diagnostics alias of doctor — PURE REPORT, no writes: the boot-time
- * self-heal in the host entry owns every write (shipped-preset patch + legacy
- * magic-standard removal). Reports:
- *   1. every doctor check (DSH version, bundle install, shipped-preset patch
- *      state, legacy magic-standard, shared DB, config);
+ * Diagnostics alias of doctor — PURE REPORT, no writes. The plugin never
+ * writes shipped presets (removed with the ≤ 0.45 in-place patcher); the
+ * only boot-time write is removing the plugin-OWNED legacy magic-standard
+ * preset. Reports:
+ *   1. every doctor check (DSH version, bundle install, shipped-preset
+ *      tampering audit, legacy magic-standard, shared DB, config);
  *   2. a notice listing user-root presets (`~/.agent-presets/*`, excluding
  *      magic-standard) that reference the stock `dsh-compaction-basic` engine
- *      — informational only: user-root presets are NEVER touched by the patch.
+ *      — informational only: user-root presets are never touched.
  * Nothing here ever writes to disk.
  */
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { resolveCortexKitUserConfigPath } from "@magic-context/core/config/migrate-config-location";
 import { runDshDoctor, type DshDoctorOptions } from "./doctor";
-import { listUserRootPresetsReferencingCompactionBasic } from "../host/preset-patch";
+import { listUserRootPresetsReferencingCompactionBasic } from "../host/preset-audit";
 import { parseFlags, resolveDshHome, stringFlag } from "./env";
 
 export type SetupStepStatus = "ok" | "warn" | "fail";
@@ -69,8 +70,8 @@ export async function runDshSetup(
       : check.detail,
   }));
 
-  // Informational notice: user-root presets that would keep using the stock
-  // compaction engine even after the shipped-preset patch (never touched).
+  // Informational notice: user-root presets that mount the stock compaction
+  // engine (the supported policy — shipped presets are never touched).
   const { flags } = parseFlags(argv);
   const env = options.env ?? process.env;
   const dshHome = options.dshHome ?? stringFlag(flags, "dsh-home") ?? resolveDshHome(env);
@@ -81,7 +82,7 @@ export async function runDshSetup(
     detail:
       userRootPresets.length === 0
         ? `${join(dshHome, ".agent-presets")}: no user-root presets reference the stock compaction engine.`
-        : `These user-root presets still mount the stock engine and are NOT patched (user root is never touched):\n` +
+        : `These user-root presets mount the stock engine (user root is never touched):\n` +
           userRootPresets.map((id) => `  - ${id}`).join("\n"),
   });
 
@@ -92,15 +93,15 @@ export async function runDshSetup(
     title: "Magic Context user config",
     detail: existsSync(configPath)
       ? `${configPath} exists; defaults apply for missing keys.`
-      : `${configPath} does not exist; defaults apply (setup no longer writes — boot heal owns all writes).`,
+      : `${configPath} does not exist; defaults apply (setup never writes).`,
   });
 
   const nextSteps: string[] = [
-    "No manual setup step: the host entry self-heals the shipped presets on every boot (ADR 0001).",
+    "No manual setup step: the plugin installs no preset and never modifies shipped ones.",
   ];
   if (doctor.exitCode !== 0) {
     nextSteps.push(
-      "Fix the failing checks above, then restart the host so the boot-time self-heal runs.",
+      "Fix the failing checks above (leftover preset tampering has explicit restore instructions), then re-run setup.",
     );
   } else {
     nextSteps.push("Verify with: dsh-magic-context doctor");

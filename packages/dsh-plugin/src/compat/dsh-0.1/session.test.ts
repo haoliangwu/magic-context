@@ -64,12 +64,7 @@ describe("magicToolResultRewrite (B2 same-type tool write-back)", () => {
     const originalData = JSON.parse(JSON.stringify(originalEvent.data)) as Record<string, unknown>;
 
     const rewritten = magicToolResultRewrite(originalEvent, [
-      {
-        type: "tool-result",
-        toolCallId: "c1",
-        content: [{ type: "text", text: "[dropped \u00a77\u00a7]" }],
-        isError: true,
-      },
+      { type: "text", text: "[dropped \u00a77\u00a7]" },
     ]);
 
     const originalDataView = originalEvent.data as Record<string, unknown>;
@@ -85,16 +80,15 @@ describe("magicToolResultRewrite (B2 same-type tool write-back)", () => {
     expect(rewrittenMessage.id).toBe(originalMessage.id);
     expect(rewrittenMessage.role).toBe(originalMessage.role);
     expect(rewrittenMessage.source).toEqual(originalMessage.source);
+    // DSH 0.2: the tool result's content is plain blocks — the swapped block
+    // is the mutated text block, message-level fields (source.callId,
+    // isError) ride the envelope untouched.
     const originalBlock = (originalMessage.content as Array<Record<string, unknown>>)[0]!;
     const rewrittenBlock = (rewrittenMessage.content as Array<Record<string, unknown>>)[0]!;
-    expect(rewrittenBlock.type).toBe("tool-result");
-    expect(rewrittenBlock.toolCallId).toBe(originalBlock.toolCallId);
-    expect(rewrittenBlock.isError).toBe(originalBlock.isError);
+    expect(rewrittenBlock.type).toBe("text");
 
     // ONLY the output text changed.
-    expect(
-      JSON.stringify((rewrittenBlock.content as Array<Record<string, unknown>>)[0]),
-    ).toContain("[dropped \u00a77\u00a7]");
+    expect(rewrittenBlock.text).toContain("[dropped \u00a77\u00a7]");
     expect(JSON.stringify(rewrittenBlock)).not.toBe(JSON.stringify(originalBlock));
     const { content: _rewrittenContent, ...rewrittenRest } = rewrittenMessage;
     const { content: _originalContent1, ...originalRest } = originalMessage;

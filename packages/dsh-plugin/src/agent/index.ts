@@ -380,9 +380,6 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
     get runWrapup() {
       return (seams.get("recomp") as ReturnType<typeof createRecompSeams> | undefined)?.runWrapup;
     },
-    get runUpgrade() {
-      return (seams.get("recomp") as ReturnType<typeof createRecompSeams> | undefined)?.runUpgrade;
-    },
     // The embed seam receives the DB at call time (no host dependency).
     runEmbedDrain: createEmbedSeam({ log }),
   });

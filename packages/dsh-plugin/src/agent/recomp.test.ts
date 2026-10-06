@@ -10,7 +10,7 @@
  *   - client unit tests: session.get/create, prompt (stub LLM), messages
  *     shape, per-attempt model override, agent-id system-prompt resolution,
  *     noReply notify, timeout (AbortSignal + race), external abort;
- *   - seam unit tests: runRecomp / runWrapup / runUpgrade with INJECTED fake
+ *   - seam unit tests: runRecomp / runWrapup with INJECTED fake
  *     runners (assert the ManagedRecompContext/ManagedWrapupContext shape,
  *     the partial-range parsing, the raw-message provider registration, and
  *     message passthrough);
@@ -392,7 +392,6 @@ describe("createRecompSeams", () => {
       expect(ctx.memoryEnabled).toBe(true);
       expect(ctx.autoPromote).toBe(true);
       expect(ctx.fallbackModels).toEqual([]);
-      expect(ctx.runMigration).toBe(true);
       expect(ctx.userMemoriesEnabled).toBe(false);
       expect(ctx.language).toBeUndefined();
       expect(ctx.historianTwoPass).toBeUndefined();
@@ -432,7 +431,6 @@ describe("createRecompSeams", () => {
         autoPromote: false,
         fallbackModels: ["anthropic/claude-sonnet-4-6"],
         language: "zh-CN",
-        runMigration: false,
         userMemoriesEnabled: true,
         historianTwoPass: true,
         runners: {
@@ -460,7 +458,6 @@ describe("createRecompSeams", () => {
       expect(ctx.autoPromote).toBe(false);
       expect(ctx.fallbackModels).toEqual(["anthropic/claude-sonnet-4-6"]);
       expect(ctx.language).toBe("zh-CN");
-      expect(ctx.runMigration).toBe(false);
       expect(ctx.userMemoriesEnabled).toBe(true);
       expect(ctx.historianTwoPass).toBe(true);
       db.close();
@@ -571,39 +568,6 @@ describe("createRecompSeams", () => {
       expect(captured?.ctx.contextLimit).toBe(128_000);
       expect(captured?.ctx.executeThresholdPercentage).toBe(65);
       expect(captured?.ctx.runCompartmentAgentForWrapup).toBeUndefined();
-      db.close();
-    } finally {
-      await env.cleanup();
-    }
-  });
-
-  it("runUpgrade forwards the session and the managed context", async () => {
-    const env = makeEnv();
-    try {
-      const db = await createTestDb(env.dbPath);
-      let captured: { ctx: ManagedRecompContext; sessionId: string } | null = null;
-      const seams = createRecompSeams({
-        ctx: {} as Context,
-        host: okHost(db),
-        db,
-        runners: {
-          upgrade: async (ctx, sessionId) => {
-            captured = { ctx, sessionId };
-            return "## Session Upgrade — Complete\n\nupgraded";
-          },
-        },
-      });
-      const result = await seams.runUpgrade?.({
-        agent: fakeAgent(buildSession()),
-        sessionId: SESSION_ID,
-        cwd: "C:/proj",
-        signal: new AbortController().signal,
-        db,
-      });
-      expect(result).toBe("## Session Upgrade — Complete\n\nupgraded");
-      expect(captured?.sessionId).toBe(SESSION_ID);
-      expect(captured?.ctx.runMigration).toBe(true);
-      expect(captured?.ctx.directory).toBe("C:/proj");
       db.close();
     } finally {
       await env.cleanup();
