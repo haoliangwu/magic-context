@@ -163,6 +163,15 @@ export class AgentPresence {
     }));
   }
 
+  /**
+   * Drop one identity→directory observation (the opencode sweepProject
+   * dead-directory guard's mirror: a vanished workspace must not keep its
+   * directory cached, or the maintenance lanes would retry it every tick).
+   */
+  forgetIdentity(projectIdentity: string): void {
+    this.directoryByIdentity.delete(projectIdentity);
+  }
+
   /** Resolve + cache identity → directory (the core resolver memoizes probes). */
   observeDirectory(directory: string): void {
     if (directory.length === 0) return;
@@ -450,8 +459,12 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-/** Mark an error transient — the core executor hot-retries transient failures. */
-function transient(error: Error): Error {
+/**
+ * Mark an error transient — the core executor hot-retries transient failures.
+ * Shared by the dream-worker and the dreamer facade (single definition; the
+ * DSH plugins keep one marker shape).
+ */
+export function transient(error: Error): Error {
   (error as Error & { transient?: boolean }).transient = true;
   return error;
 }

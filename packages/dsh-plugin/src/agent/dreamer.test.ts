@@ -25,6 +25,7 @@ import {
 } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import { insertMemory } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { CANONICAL_DREAM_TASKS } from "@magic-context/core/features/magic-context/dreamer/task-registry";
+import { setBootQuietPeriodForTests } from "@magic-context/core/plugin/boot-quiet";
 import { extractLatestAssistantText } from "@magic-context/core/shared/assistant-message-extractor";
 import { createTestDb, createTestStorageDir } from "../test-utils";
 import {
@@ -559,6 +560,11 @@ describe("registerDshDreamer (schedule timer)", () => {
       );
       const logs: string[] = [];
       const { ctx, disposers } = makeFakeCtx({});
+      // Initial passes now wait out the shared boot quiet period + stagger
+      // (opencode mirror): zero both for determinism (quiet already elapsed,
+      // jitter slot 0 → immediate).
+      setBootQuietPeriodForTests(Date.now() - 240_000);
+      __test.setStartupJitterSlotMs(0);
       registerDshDreamer(ctx, {
         host: {
           ready: Promise.resolve({ kind: "ok", db, storageDir: "/tmp", livenessPath: "/tmp/l" }),
@@ -568,6 +574,7 @@ describe("registerDshDreamer (schedule timer)", () => {
         config: { enabled: true, tickMs: 1000 },
         log: (message) => logs.push(message),
       });
+      await flush();
       await flush();
 
       // ONE shared interval over the discovered project set (ticks union in

@@ -12,7 +12,7 @@
  * makes the load UNTRUSTED and registration degrades to observation mode.
  */
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,7 @@ import {
   getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/memory/embedding";
 import { resolveProjectIdentityForSession } from "@magic-context/core/features/magic-context/memory/project-identity";
+import { insertMemory } from "@magic-context/core/features/magic-context/memory/storage-memory";
 import { getCommitCount } from "@magic-context/core/features/magic-context/git-commits/storage-git-commits";
 import { __test as dreamerTest } from "./dreamer";
 import { AgentPresence } from "./dream-worker";
@@ -150,6 +151,10 @@ describe("embedding-bootstrap (DSH)", () => {
       }));
       const identity = resolveProjectIdentityForSession(dir) as string;
       expect(identity.startsWith("git:")).toBe(true);
+      // A memory row with no embedding: the proactive memory-embed lane (the
+      // opencode runProjectMaintenance mirror) must backfill it during the
+      // same maintenance pass.
+      insertMemory(db, { projectPath: identity, category: "PROJECT_RULES", content: "mem-to-embed" });
 
       const presence = new AgentPresence();
       presence.observeDirectory(dir);
@@ -161,6 +166,9 @@ describe("embedding-bootstrap (DSH)", () => {
       // The git sweep lane indexed the repo's single commit.
       expect(getCommitCount(db, identity)).toBe(1);
       expect(logs.some((m) => m.includes("sweep finished"))).toBe(true);
+      // The proactive memory-embedding backfill lane ran (provider is active
+      // for this project, so snapshot.enabled is true).
+      expect(logs.some((m) => m.includes("proactively embedded 1 memory for"))).toBe(true);
     } finally {
       db.close();
       restore();
@@ -179,6 +187,38 @@ describe("embedding-bootstrap (DSH)", () => {
         logs.push(m),
       );
       expect(logs).toEqual([]);
+    } finally {
+      db.close();
+      restore();
+    }
+  });
+
+  it("skips and forgets a vanished workspace directory (dead-directory guard)", async () => {
+    const restore = isolateUserConfigTier();
+    const dir = await createTestStorageDir();
+    const db = await createTestDb(join(dir, "context.db"));
+    try {
+      const presence = new AgentPresence();
+      const gone = join(dir, "gone-workspace");
+      mkdirSync(gone, { recursive: true });
+      presence.observeDirectory(gone);
+      const identity = resolveProjectIdentityForSession(gone) as string;
+      expect(presence.directoryOf(identity)).toBe(gone);
+      rmSync(gone, { recursive: true, force: true });
+
+      const logs: string[] = [];
+      await dreamerTest.runDshPeriodicMaintenance(db, identity, { presence } as never, (m) =>
+        logs.push(m),
+      );
+      // Guard fired: skip logged, and the stale observation is dropped.
+      expect(logs.some((m) => m.includes("workspace directory vanished"))).toBe(true);
+      expect(presence.directoryOf(identity)).toBeUndefined();
+      // A second pass with no observation is a silent no-op.
+      const logs2: string[] = [];
+      await dreamerTest.runDshPeriodicMaintenance(db, identity, { presence } as never, (m) =>
+        logs2.push(m),
+      );
+      expect(logs2).toEqual([]);
     } finally {
       db.close();
       restore();

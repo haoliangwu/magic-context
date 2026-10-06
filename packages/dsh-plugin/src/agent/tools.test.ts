@@ -290,9 +290,12 @@ describe("ctx_memory write path", () => {
       const tool = findTool(registered, "ctx_memory");
       const agent = makeFakeAgent(SESSION_ID, "/tmp/dsh-proj");
 
+      // OpenCode parity: the primary tool does not even advertise `list` —
+      // the schema rejects it before execute runs (the execute-level gate
+      // stays as defense-in-depth for direct in-process callers).
       await expect(
         tool.execute({ action: "list", limit: 5 }, toolExec(agent)),
-      ).rejects.toThrow("not allowed in this context");
+      ).rejects.toThrow("must be one of");
     } finally {
       db.close();
       await removeTestDir(dir);

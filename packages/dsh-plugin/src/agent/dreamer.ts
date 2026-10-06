@@ -71,8 +71,10 @@ import {
   drainCommitBacklogForProject,
   drainProjectEmbeddingIdentityMaintenance,
   drainStaleEmbeddingIdentitiesForProject,
+  embedUnembeddedMemoriesForProject,
   getProjectEmbeddingSnapshot,
 } from "@magic-context/core/features/magic-context/project-embedding-registry";
+import { beginBootQuietPeriod, scheduleAfterBootQuiet } from "@magic-context/core/plugin/boot-quiet";
 import { runDueCompiledSmartNoteChecks } from "@magic-context/core/features/magic-context/smart-notes/runner";
 import {
   acquireLease,
@@ -99,12 +101,20 @@ import {
   TOOL_REQUIRING_DREAM_AGENTS,
   agentPresenceOf,
   runDreamToolWorker,
+  transient,
   AgentPresence,
   type DreamCompletedToolCall,
 } from "./dream-worker";
+import { existsSync } from "node:fs";
 
 /** Default dream tick (mirrors core's DREAM_TIMER_INTERVAL_MS: 15 minutes). */
 export const DEFAULT_DREAM_TICK_MS = 15 * 60 * 1000;
+
+/** Startup-pass stagger slot (mirrors core's BOOT_PROJECT_JITTER_SLOT_MS). */
+const BOOT_PROJECT_JITTER_SLOT_MS = 1_000;
+
+/** Test seam for the startup-pass stagger (0 = no stagger). */
+let startupJitterSlotMs = BOOT_PROJECT_JITTER_SLOT_MS;
 
 /**
  * Dream agents whose prompts REQUIRE tools — a direct single-turn LLM call
@@ -382,12 +392,12 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
           // later tick (with a session live) picks the task up.
           const parent = presence.pick(dreamSession.directory);
           if (parent === undefined) {
-            const error = new Error(
-              `magic-context: no live Magic agent available to host the dream tool worker ` +
-                `(agent "${agent}") — retry when a session is active`,
+            throw transient(
+              new Error(
+                `magic-context: no live Magic agent available to host the dream tool worker ` +
+                  `(agent "${agent}") — retry when a session is active`,
+              ),
             );
-            (error as Error & { transient?: boolean }).transient = true;
-            throw error;
           }
           const workerResult = await runDreamToolWorker(ctx, {
             parent,
@@ -560,11 +570,22 @@ const GIT_COMMIT_BACKLOG_DRAIN_MAX_MS = 5 * 60 * 1000;
  * no OpenCode server loop to sweep):
  *   1. ensureProjectRegistered — (re)load config, register embedding provider;
  *   2. embedding identity maintenance + stale-identity GC;
- *   3. git-commit indexing sweep (lease + cooldown coordinated);
- *   4. compiled smart-note checks (leased, matches the evaluate-smart-notes
+ *   3. proactive memory embedding backfill (snapshot.enabled — the opencode
+ *      runProjectMaintenance lane, dream-timer embedUnembeddedMemories);
+ *   4. git-commit indexing sweep (lease + cooldown coordinated);
+ *   5. compiled smart-note checks (leased, matches the evaluate-smart-notes
  *      lease domain).
  * Needs a workspace DIRECTORY for the config load and `git log`; identities
  * without a live observation (no session since process start) skip fail-open.
+ * The opencode smart-note lane's `dreamingEnabled` gate is vacuous here: the
+ * DSH timer itself only exists when the dreamer config is enabled.
+ *
+ * Dead-directory guard (the opencode sweepProject mirror): a workspace that
+ * vanished from disk is skipped for this pass and dropped from the presence
+ * map (a later session in the restored directory re-observes it). The
+ * opencode version additionally GC's the `dir:` schedule rows; DSH schedules
+ * are identity-keyed and re-seed on the next observation, so a map drop is
+ * the faithful equivalent.
  */
 async function runDshPeriodicMaintenance(
   db: Database,
@@ -574,6 +595,11 @@ async function runDshPeriodicMaintenance(
 ): Promise<void> {
   const directory = state.presence.directoryOf(projectIdentity);
   if (directory === undefined) return;
+  if (!existsSync(directory)) {
+    log(`[dreamer] workspace directory vanished for ${projectIdentity}: ${directory} — skipping maintenance`);
+    state.presence.forgetIdentity(projectIdentity);
+    return;
+  }
   try {
     await ensureProjectRegisteredFromDshDirectory(directory, db, log);
   } catch (error) {
@@ -601,6 +627,23 @@ async function runDshPeriodicMaintenance(
   }
 
   const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+  if (snapshot?.enabled === true) {
+    try {
+      const embeddedMemories = await embedUnembeddedMemoriesForProject(db, projectIdentity);
+      if (embeddedMemories > 0) {
+        log(
+          `[magic-context] proactively embedded ${embeddedMemories} ` +
+            `${embeddedMemories === 1 ? "memory" : "memories"} for ${projectIdentity}`,
+        );
+      }
+      // Compartment-chunk backfill stays demand-driven (opencode parity).
+    } catch (error) {
+      log(
+        `[magic-context] memory embedding backfill failed for ${projectIdentity}: ${describeError(error).brief}`,
+      );
+    }
+  }
+
   if (snapshot?.gitCommitEnabled === true) {
     await sweepGitCommitsForProject({ db, projectIdentity, directory, log });
   }
@@ -836,6 +879,24 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
         log,
       }));
       const executor = buildDreamExecutor(facade, state);
+      // Re-entry guard (the opencode tickInFlight mirror): a slow dream task
+      // (tool worker, LLM turn) must not stack onto a still-running tick for
+      // the same project; the lease/gate chain keeps the work correct, this
+      // keeps the process honest.
+      const tickInFlight = new Set<string>();
+      const tick = (projectIdentity: string, origin: "interval" | "startup") => {
+        if (tickInFlight.has(projectIdentity)) {
+          log(`[dreamer] tick ${origin} skipped for ${projectIdentity} — previous tick still in flight`);
+          return;
+        }
+        tickInFlight.add(projectIdentity);
+        runDreamTick(db, projectIdentity, executor, state, log)
+          .catch(() => {
+            // runDreamTick never rejects (both lanes catch internally);
+            // this is the last-resort belt.
+          })
+          .finally(() => tickInFlight.delete(projectIdentity));
+      };
       // ONE shared interval over the project set (not one interval per
       // project): a live-opened workspace joins the set without leaking a
       // per-project timer on every observation.
@@ -843,17 +904,40 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
         intervalFactory(() => {
           observeLive();
           for (const projectIdentity of projects) {
-            void runDreamTick(db, projectIdentity, executor, state, log);
+            tick(projectIdentity, "interval");
           }
         }, tickMs),
       );
       log(
         `[dreamer] registered schedule timer (every ${Math.round(tickMs / 60_000)}m; projects=${projects.size})`,
       );
-      // Initial pass per project (the core timer's startup sweep equivalent) so
-      // a fresh install does not wait a full tick for seeding.
+      // Initial pass per project (the core timer's startup sweep equivalent),
+      // behind the shared boot quiet period and staggered per project (the
+      // opencode BOOT_PROJECT_JITTER mirror: slot*1s + directory hash, so a
+      // multi-project process does not create one writer burst).
+      beginBootQuietPeriod();
+      const startupJitter = new Map<string, number>();
+      const startupJitterMs = (projectIdentity: string): number => {
+        const existing = startupJitter.get(projectIdentity);
+        if (existing !== undefined) return existing;
+        const slot = startupJitter.size;
+        const hash = [...projectIdentity].reduce(
+          (value, character) => (value * 33 + character.charCodeAt(0)) >>> 0,
+          5381,
+        );
+        const jitter =
+          startupJitterSlotMs === 0
+            ? 0
+            : slot * startupJitterSlotMs + (hash % startupJitterSlotMs);
+        startupJitter.set(projectIdentity, jitter);
+        return jitter;
+      };
       for (const projectIdentity of projects) {
-        void runDreamTick(db, projectIdentity, executor, state, log);
+        const timer = scheduleAfterBootQuiet(
+          () => tick(projectIdentity, "startup"),
+          startupJitterMs(projectIdentity),
+        );
+        disposers.push(() => clearTimeout(timer));
       }
     } catch (error) {
       log(`[dreamer] registration failed: ${describeError(error).brief}`);
@@ -906,8 +990,13 @@ export const __test = {
   setIntervalFactory(factory: IntervalFactory | null): void {
     intervalFactory = factory ?? defaultIntervalFactory;
   },
+  /** Zero the startup-pass stagger (deterministic immediate initial passes). */
+  setStartupJitterSlotMs(ms: number): void {
+    startupJitterSlotMs = ms;
+  },
   reset(): void {
     intervalFactory = defaultIntervalFactory;
+    startupJitterSlotMs = BOOT_PROJECT_JITTER_SLOT_MS;
     // Runtime state is keyed by ctx in a WeakMap and garbage-collected with
     // it, so only the factory needs restoring.
   },

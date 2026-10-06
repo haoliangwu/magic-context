@@ -494,6 +494,9 @@ export function createCtxSearchTool(ctx: Context, opts: CtxToolsOptions): ToolDe
 /* ─────────────────────────────── ctx_memory ────────────────────────────── */
 
 const ALL_ACTIONS = ["write", "archive", "update", "merge", "get", "list"] as const;
+/** Actions advertised to primary sessions — `list` stays dreamer-only
+ * (opencode parity: the primary tool's allowedActions carry no `list`). */
+const PRIMARY_ACTIONS = ["write", "archive", "update", "merge", "get"] as const;
 type CtxMemoryAction = (typeof ALL_ACTIONS)[number];
 const DREAMER_ONLY_ACTIONS: ReadonlySet<CtxMemoryAction> = new Set(["list"]);
 const GET_MAX_IDS = 20;
@@ -633,8 +636,8 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
     parameters: {
       action: {
         type: "string",
-        enum: [...ALL_ACTIONS],
-        description: "What to do: write, update, archive, merge, get, or list",
+        enum: [...(dreamerAllowed ? ALL_ACTIONS : PRIMARY_ACTIONS)],
+        description: "What to do: write, update, archive, merge, or get",
       },
       content: {
         type: "string",

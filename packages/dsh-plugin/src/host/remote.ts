@@ -385,52 +385,37 @@ export class MagicContextRemoteService extends Service {
       // Count lanes — same shared-store queries as OpenCode's rpc-handlers.
       // (The dsh host has no moduleStatus, so compartmentCount falls back to
       // the archived-row count exactly like OpenCode's fallback branch.)
-      const compartmentRow = db
-        .prepare("SELECT COUNT(*) as count FROM compartments WHERE session_id = ?")
-        .get(sessionId) as { count: number } | undefined;
-      const archivedCompartmentCount = compartmentRow?.count ?? 0;
-      let memoryCount = 0;
-      if (projectIdentity !== null) {
-        const memRow = db
-          .prepare(
-            "SELECT COUNT(*) as count FROM memories WHERE project_path = ? AND status = 'active'",
-          )
-          .get(projectIdentity) as { count: number } | undefined;
-        memoryCount = memRow?.count ?? 0;
-      }
-      let pendingOpsCount = 0;
-      try {
-        const pendingRow = db
-          .prepare("SELECT COUNT(*) as count FROM pending_ops WHERE session_id = ?")
-          .get(sessionId) as { count: number } | undefined;
-        pendingOpsCount = pendingRow?.count ?? 0;
-      } catch {
-        // pending_ops table may not exist on an older shared store
-      }
-      let sessionNoteCount = 0;
-      try {
-        const noteRow = db
-          .prepare(
-            "SELECT COUNT(*) as count FROM notes WHERE session_id = ? AND type = 'session' AND status = 'active'",
-          )
-          .get(sessionId) as { count: number } | undefined;
-        sessionNoteCount = noteRow?.count ?? 0;
-      } catch {
-        // notes table may not exist on an older shared store
-      }
-      let readySmartNoteCount = 0;
-      if (projectIdentity !== null) {
-        try {
-          const smartRow = db
-            .prepare(
-              "SELECT COUNT(*) as count FROM notes WHERE project_path = ? AND type = 'smart' AND status = 'ready'",
+      const archivedCompartmentCount = countRow(
+        db,
+        "SELECT COUNT(*) as count FROM compartments WHERE session_id = ?",
+        sessionId,
+      );
+      const memoryCount =
+        projectIdentity !== null
+          ? countRow(
+              db,
+              "SELECT COUNT(*) as count FROM memories WHERE project_path = ? AND status = 'active'",
+              projectIdentity,
             )
-            .get(projectIdentity) as { count: number } | undefined;
-          readySmartNoteCount = smartRow?.count ?? 0;
-        } catch {
-          // notes table may not exist on an older shared store
-        }
-      }
+          : 0;
+      const pendingOpsCount = countRow(
+        db,
+        "SELECT COUNT(*) as count FROM pending_ops WHERE session_id = ?",
+        sessionId,
+      );
+      const sessionNoteCount = countRow(
+        db,
+        "SELECT COUNT(*) as count FROM notes WHERE session_id = ? AND type = 'session' AND status = 'active'",
+        sessionId,
+      );
+      const readySmartNoteCount =
+        projectIdentity !== null
+          ? countRow(
+              db,
+              "SELECT COUNT(*) as count FROM notes WHERE project_path = ? AND type = 'smart' AND status = 'ready'",
+              projectIdentity,
+            )
+          : 0;
       // Dreamer V2: live "last successful run" is MAX(last_run_at) across the
       // project's task_schedule_state rows (issue #194).
       let lastDreamerRunAt: number | null = null;
@@ -576,6 +561,19 @@ export class MagicContextRemoteService extends Service {
  * wrapper's `args` key. Accept both that wire shape and a direct request
  * object (unit tests / future leaner clients).
  */
+/**
+ * One COUNT(*) over an optional shared-store table: 0 when the table does not
+ * exist on an older schema (mirrors OpenCode rpc-handlers' per-lane guards).
+ */
+function countRow(db: { prepare: (sql: string) => { get(...params: unknown[]): unknown } }, sql: string, param: string): number {
+  try {
+    const row = db.prepare(sql).get(param) as { count: number } | undefined;
+    return row?.count ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 function unwrapRemoteRequest(args: { args?: Record<string, unknown> } = {}): Record<string, unknown> | undefined {
   return args !== null && typeof args === "object" && args.args !== undefined
     ? args.args
