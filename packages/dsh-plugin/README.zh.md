@@ -72,25 +72,43 @@ dsh plugin --profile <name> install link:/absolute/path/to/magic-context/package
 
 **绝不修改 shipped presets。** 早期版本（≤ 0.45，ADR 0001）原地改写 shipped presets 的 `compaction-basic` 行来挂载 Magic 压缩引擎。这会改动机器上所有 profile 共享的文件，且 DSH 0.2 web-app preset 声明的嵌套行本身也无法从补丁层寻址，因此该改写机制已**移除**。`doctor` 现在只做审计：旧版本遗留的改写报告为 `fail` 并附恢复指引（把该行的 `name` 改回 `@deepseek-ai/dsh-compaction-basic`、删掉其 `config`），stock 行报告为 `ok`。
 
-原生引擎运行时，DSH 照常折叠，Magic 靠自身对账机制在每次折叠后存活（historian 分区、基线重建、outbox saga）。Magic 引擎仍可通过**用户自有 preset** 可选挂载——新建一个 preset，包含 Magic 行并替换压缩引擎：
+原生引擎运行时，DSH 照常折叠，Magic 靠自身对账机制在每次折叠后存活（historian 分区、基线重建、outbox saga）。Magic 引擎仍可通过**用户自有 preset** 可选挂载。
+
+> **DSH 0.2 注意。** 0.2 的 preset roster 不再扫描 0.1 的用户根
+> `~/.dsh/.agent-presets/*/agent.cordis.yml`，只有声明的
+> `@deepseek-ai/dsh-agent-preset` 行会组合。把 preset 作为 `insert` 行写进
+> profile overlay（`~/.dsh/profiles/<name>/cordis.patch.yml`），然后在 Web UI
+> 模式选择器里选用，或在「设置 → Agent presets」设为新任务默认。DSH ≤ 0.1
+> 仍走旧的 `--preset <name>` 用户根流程。
 
 ```yaml
-# ~/.dsh/.agent-presets/magic/agent.cordis.yml（用户自有，非 shipped）
-- id: magic-include-standard
-  name: 'file:///…/packages/dsh-plugin/dist/entries/preset-include.js'
-- id: compaction
-  name: cordis:group
-  group: true
-  isolate:
-    compaction: true
-    toolResultPruner: true
-  config:
-    - id: compaction-basic
-      name: 'file:///…/packages/dsh-plugin/dist/entries/compaction.js'
-      config: { auto: true }
+# ~/.dsh/profiles/<name>/cordis.patch.yml（profile overlay，用户自有）
+- insert:
+  - id: preset-magic
+    name: '@deepseek-ai/dsh-agent-preset'
+    config:
+      id: magic
+      name: magic
+      order: 99
+      description: standard with the Magic compaction engine
+      plugins:
+        - id: magic-include-standard
+          name: 'file:///…/packages/dsh-plugin/dist/entries/preset-include.js'
+        # …其余行照抄 stock standard 声明，
+        #    并把 stock compaction 组替换为：
+        - id: compaction
+          name: cordis:group
+          group: true
+          isolate:
+            compaction: true
+            toolResultPruner: true
+          config:
+            - id: compaction-basic
+              name: 'file:///…/packages/dsh-plugin/dist/entries/compaction.js'
+              config: { auto: true }
 ```
 
-之后 `dsh --preset magic` 启动即可。这会挂载 Magic 感知的折叠摘要（historian 渲染的 Magic 分区块）；不挂载则使用 stock 摘要，持久性保证相同。
+这会挂载 Magic 感知的折叠摘要（historian 渲染的 Magic 分区块）；不挂载则使用 stock 摘要，持久性保证相同。同一配方的已验证变体——照抄 stock standard 行但整段删除 `compaction` 组——会话将完全没有压缩服务（长会话会撞上下文窗口；`doctor` 的 shipped-preset 审计不受影响）。
 
 ## 功能
 

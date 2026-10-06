@@ -95,28 +95,49 @@ and drop its `config`), and a stock row reports `ok`.
 With the stock engine running, DSH folds normally and Magic survives each
 fold through its own reconciliation (historian compartments, baseline
 rebuild, outbox saga). The Magic engine stays available for **optional**
-mounting from a user-owned preset — create a preset that includes the Magic
-row and swaps the compaction engine:
+mounting from a user-owned preset.
+
+> **DSH 0.2 note.** The 0.2 preset roster no longer scans the 0.1 user root
+> `~/.dsh/.agent-presets/*/agent.cordis.yml`; only declared
+> `@deepseek-ai/dsh-agent-preset` rows compose. Declare the preset as an
+> `insert` row in the profile overlay
+> (`~/.dsh/profiles/<name>/cordis.patch.yml`), then pick it in the Web UI
+> mode picker or set it as the new-task default (Settings → Agent presets).
+> DSH ≤ 0.1 keeps the old `--preset <name>` user-root flow.
 
 ```yaml
-# ~/.dsh/.agent-presets/magic/agent.cordis.yml  (user-owned, never shipped)
-- id: magic-include-standard
-  name: 'file:///…/packages/dsh-plugin/dist/entries/preset-include.js'
-- id: compaction
-  name: cordis:group
-  group: true
-  isolate:
-    compaction: true
-    toolResultPruner: true
-  config:
-    - id: compaction-basic
-      name: 'file:///…/packages/dsh-plugin/dist/entries/compaction.js'
-      config: { auto: true }
+# ~/.dsh/profiles/<name>/cordis.patch.yml  (profile overlay, user-owned)
+- insert:
+  - id: preset-magic
+    name: '@deepseek-ai/dsh-agent-preset'
+    config:
+      id: magic
+      name: magic
+      order: 99
+      description: standard with the Magic compaction engine
+      plugins:
+        - id: magic-include-standard
+          name: 'file:///…/packages/dsh-plugin/dist/entries/preset-include.js'
+        # …remaining rows copied from the stock standard declaration,
+        #    with the stock compaction group replaced by:
+        - id: compaction
+          name: cordis:group
+          group: true
+          isolate:
+            compaction: true
+            toolResultPruner: true
+          config:
+            - id: compaction-basic
+              name: 'file:///…/packages/dsh-plugin/dist/entries/compaction.js'
+              config: { auto: true }
 ```
 
-Then start DSH with `--preset magic`. This mounts Magic-aware fold summaries
-(the Magic compartment block rendered by the historian); without it you get
-stock summaries with the same durability guarantees.
+This mounts Magic-aware fold summaries (the Magic compartment block rendered
+by the historian); without it you get stock summaries with the same
+durability guarantees. A verified variant of the same recipe — the stock
+standard rows with the whole `compaction` group dropped — boots sessions
+with no compaction service at all (long sessions then hit the context
+window; `doctor`'s shipped-preset audit is unaffected).
 
 ## Features
 
