@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
 import { createTestDb, createTestStorageDir } from "../test-utils";
-import { maybeNudgeChannels, scanSessionMetrics } from "./nudge";
+import { hasLiveMagicMessage, maybeNudgeChannels, scanSessionMetrics } from "./nudge";
 import { updateTagTokenCount } from "@magic-context/core/features/magic-context/storage-tags";
 
 describe("nudge (ctx_reduce Channel-1 parity)", () => {
@@ -71,5 +71,56 @@ describe("nudge (ctx_reduce Channel-1 parity)", () => {
       db.close();
       await import("node:fs").then((f) => f.rmSync(dir, { recursive: true, force: true }));
     }
+  });
+});
+
+describe("hasLiveMagicMessage (strip-aware nudge dedup)", () => {
+  const nudgeEvent = (seq: number) => ({
+    type: "user/message",
+    seq,
+    data: { source: { kind: "magic-context", messageId: "mc-nudge:channel1" } },
+  });
+
+  it("returns true when the nudge event is on the live surface", () => {
+    const agent = { session: { events: [nudgeEvent(5)], surface: { nodes: [5] } } } as never;
+    expect(hasLiveMagicMessage(agent, "mc-nudge:channel1")).toBe(true);
+  });
+
+  it("returns false when the nudge is log-only (stripped off the surface)", () => {
+    const agent = { session: { events: [nudgeEvent(5)], surface: { nodes: [] } } } as never;
+    expect(hasLiveMagicMessage(agent, "mc-nudge:channel1")).toBe(false);
+  });
+
+  it("falls back to the raw-log scan when the session exposes no surface", () => {
+    const agent = { session: { events: [nudgeEvent(5)] } } as never;
+    expect(hasLiveMagicMessage(agent, "mc-nudge:channel1")).toBe(true);
+    expect(hasLiveMagicMessage(agent, "mc-nudge:channel2")).toBe(false);
+  });
+
+  it("ignores other Magic messageIds and non-magic sources", () => {
+    const agent = {
+      session: {
+        events: [
+          nudgeEvent(1),
+          {
+            type: "user/message",
+            seq: 2,
+            data: { source: { kind: "magic-context", messageId: "mc-op:abc" } },
+          },
+          {
+            type: "user/message",
+            seq: 3,
+            data: { source: { kind: "user" } },
+          },
+        ],
+        surface: { nodes: [1, 2, 3] },
+      },
+    } as never;
+    expect(hasLiveMagicMessage(agent, "mc-nudge:channel1")).toBe(true);
+    // Any magic-context messageId matches generically — only the kind gate
+    // matters; other kinds never match.
+    expect(hasLiveMagicMessage(agent, "mc-op:abc")).toBe(true);
+    expect(hasLiveMagicMessage(agent, "mc-nudge:note")).toBe(false);
+    expect(hasLiveMagicMessage(agent, "mc-nudge:channel2")).toBe(false);
   });
 });

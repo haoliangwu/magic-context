@@ -39,7 +39,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { describeError } from "@magic-context/core/shared/error-message";
 import { checkDshCompartmentTrigger } from "./historian";
-import { maybeNudgeChannels } from "./nudge";
+import { hasLiveMagicMessage, maybeNudgeChannels } from "./nudge";
 import { createTagger } from "@magic-context/core/features/magic-context/tagger";
 import { markNoteNudgeDelivered, onNoteTrigger, peekNoteNudgeText } from "@magic-context/core/hooks/magic-context/note-nudger";
 import { transcriptRawMessageProvider } from "./historian-wiring";
@@ -453,13 +453,11 @@ export async function runContextPlaneStep(
       );
       if (noteText !== null) {
         const noteMarker = `mc-nudge:note`;
-        const events = sessionEventsOf(agent.session);
-        const alreadyInjected = events.some((event) => {
-          if (event === null || typeof event !== "object") return false;
-          const e = event as { data?: { source?: { kind?: unknown; messageId?: unknown } } };
-          const source = e.data?.source;
-          return source?.kind === "magic-context" && source?.messageId === noteMarker;
-        });
+        // Live-surface dedup (see hasLiveMagicMessage in nudge.ts): the strip
+        // lane retires delivered note nudges from the surface, but the original
+        // user/message event stays in the log forever — a raw-log scan would
+        // suppress every future note nudge in this session.
+        const alreadyInjected = hasLiveMagicMessage(agent, noteMarker);
         if (!alreadyInjected) {
           const { magicUserMessage } = await import("../compat/dsh-0.1/session");
           const noteMessage = magicUserMessage(

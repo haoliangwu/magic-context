@@ -204,6 +204,7 @@ const C = {
   catLeft: "ckmc-catLeft",
   dot: "ckmc-dot",
   footnote: "ckmc-footnote",
+  errorText: "ckmc-errorText",
 } as const;
 
 /* ----------------------------------------- wire types (mirror of src/host/remote.ts) */
@@ -254,6 +255,19 @@ export interface SidebarSnapshot {
   readonly conversationTokens: number;
   readonly toolCallTokens: number;
   readonly toolDefinitionTokens: number;
+  readonly compartmentCount: number;
+  readonly archivedCompartmentCount: number;
+  readonly memoryCount: number;
+  readonly memoryBlockCount: number;
+  readonly pendingOpsCount: number;
+  readonly compartmentInProgress: boolean;
+  readonly historianRunning: boolean;
+  readonly sessionNoteCount: number;
+  readonly readySmartNoteCount: number;
+  readonly cacheTtl: string;
+  readonly lastTransformError: string | null;
+  readonly lastDreamerRunAt: number | null;
+  readonly projectIdentity: string | null;
   readonly tailHygiene?: { readonly u: number; readonly t: number; readonly severity: string };
   readonly version: string;
 }
@@ -816,6 +830,31 @@ export function ContextTabView({ useMagicSidebar, refreshSidebar, sessionId, use
               label="Hygiene"
               value={`${s.tailHygiene.severity} · ${compactTokens(s.tailHygiene.u)} / ${compactTokens(s.tailHygiene.t)} tok`}
             />
+          )}
+          {/* Depth lanes (mirrors the OpenCode sidebar's count rows). */}
+          <div className={C.rows}>
+            <Row label="Compartments" value={String(s.compartmentCount)} />
+            <Row label="Memories" value={`${s.memoryCount} (${s.memoryBlockCount} blocks)`} />
+            {(s.sessionNoteCount > 0 || s.readySmartNoteCount > 0) && (
+              <Row label="Notes" value={`${s.sessionNoteCount} session · ${s.readySmartNoteCount} smart`} />
+            )}
+            <Row label="Cache TTL" value={s.cacheTtl} />
+            <Row
+              label="Dreamer"
+              value={
+                s.compartmentInProgress
+                  ? "wrapup in progress"
+                  : s.lastDreamerRunAt !== null
+                    ? `last ${new Date(s.lastDreamerRunAt).toLocaleTimeString()}`
+                    : "no run yet"
+              }
+            />
+            {s.pendingOpsCount > 0 && <Row label="Pending ops" value={String(s.pendingOpsCount)} />}
+          </div>
+          {s.lastTransformError !== null && s.lastTransformError !== "" && (
+            <p className={C.errorText} title={s.lastTransformError}>
+              transform error: {s.lastTransformError.slice(0, 120)}
+            </p>
           )}
         </>
       )}

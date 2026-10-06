@@ -105,7 +105,7 @@ function findTool(registered: ToolDefinition[], name: string): ToolDefinition {
 const textOf = (value: unknown): string => (value as { text: string }).text;
 
 describe("registerCtxTools (DSH ctx_* tools)", () => {
-  it("registers the six Pi-parity tools and unregisters them via the disposer", async () => {
+  it("registers the seven Pi-parity tools and unregisters them via the disposer", async () => {
     const { db, dir } = await openDb();
     try {
       const { ctx, registered } = makeFakeCtx();
@@ -114,6 +114,7 @@ describe("registerCtxTools (DSH ctx_* tools)", () => {
       expect(names).toEqual([
         "ctx_expand",
         "ctx_memory",
+        "ctx_memory_list",
         "ctx_note",
         "ctx_reduce",
         "ctx_search",
@@ -292,6 +293,92 @@ describe("ctx_memory write path", () => {
       await expect(
         tool.execute({ action: "list", limit: 5 }, toolExec(agent)),
       ).rejects.toThrow("not allowed in this context");
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+});
+
+describe("ctx_memory_list (dreamer-only enumeration surface)", () => {
+  /** Dream tool worker agent: subagent descriptor carries the magic-dream- label. */
+  function makeDreamerAgent(id: string, cwd: string, label: string): Agent {
+    return {
+      id,
+      options: { provider: "deepseek", model: "deepseek-chat" },
+      session: {
+        header: { id, cwd },
+        deriveMessages: () => [],
+        snapshotEvents: () => [{ type: "subagent/descriptor", data: { label } }],
+      },
+    } as unknown as Agent;
+  }
+
+  it("is registered alongside ctx_memory when memory is enabled", async () => {
+    const { ctx, registered } = makeFakeCtx();
+    registerCtxTools(ctx, { ...baseOpts(null as never), db: undefined as never });
+    // Registration shape only (no DB needed): ctx_memory_list present.
+    expect(registered.some((t) => t.name === "ctx_memory_list")).toBe(true);
+  });
+
+  it("refuses primary agents and non-dreamer subagents", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      registerCtxTools(ctx, baseOpts(db));
+      const tool = findTool(registered, "ctx_memory_list");
+
+      // Primary agent: no descriptor event at all.
+      const primary = makeFakeAgent(SESSION_ID, "/tmp/dsh-proj");
+      const refused = await tool.execute({ limit: 5 }, toolExec(primary));
+      expect(textOf(refused)).toBe(
+        "Error: ctx_memory_list is only available to the dreamer agent.",
+      );
+
+      // Subagent child with a foreign label: not a dream worker.
+      const foreign = makeDreamerAgent("child-1", "/tmp/dsh-proj", "generic-worker");
+      const refused2 = await tool.execute({ limit: 5 }, toolExec(foreign));
+      expect(textOf(refused2)).toBe(
+        "Error: ctx_memory_list is only available to the dreamer agent.",
+      );
+    } finally {
+      db.close();
+      await removeTestDir(dir);
+    }
+  });
+
+  it("lists memories for a dream tool worker, honoring category and limit", async () => {
+    const { db, dir } = await openDb();
+    try {
+      const { ctx, registered } = makeFakeCtx();
+      registerCtxTools(ctx, baseOpts(db));
+      // Seed via the primary ctx_memory tool.
+      const memoryTool = findTool(registered, "ctx_memory");
+      const primary = makeFakeAgent(SESSION_ID, "/tmp/dsh-proj");
+      await memoryTool.execute(
+        { action: "write", content: "rule one", category: "PROJECT_RULES" },
+        toolExec(primary),
+      );
+      await memoryTool.execute(
+        { action: "write", content: "the cache layer", category: "ARCHITECTURE" },
+        toolExec(primary),
+      );
+
+      const tool = findTool(registered, "ctx_memory_list");
+      const dreamer = makeDreamerAgent("child-2", "/tmp/dsh-proj", "magic-dream-dreamer");
+
+      const all = await tool.execute({}, toolExec(dreamer));
+      expect(textOf(all)).toContain("Found 2 active memories:");
+      expect(textOf(all)).toContain("rule one");
+      expect(textOf(all)).toContain("the cache layer");
+
+      const filtered = await tool.execute({ category: "ARCHITECTURE" }, toolExec(dreamer));
+      expect(textOf(filtered)).toContain("the cache layer");
+      expect(textOf(filtered)).not.toContain("rule one");
+
+      // No memories matching the filter → explicit empty text, not an error.
+      const none = await tool.execute({ category: "CONSTRAINTS" }, toolExec(dreamer));
+      expect(textOf(none)).toBe("No active memories found.");
     } finally {
       db.close();
       await removeTestDir(dir);

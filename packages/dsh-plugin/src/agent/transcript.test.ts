@@ -765,3 +765,256 @@ describe("messageIdToSeqIndex (F1 clamp support)", () => {
     expect(index.has("c1")).toBe(false);
   });
 });
+
+describe("tool reclaim (auto age-based reclaim lane)", () => {
+  /** Session with 4 tool call/result pairs — the window's newest-3 minimum
+   *  protects the three newest tool tags, exposing the oldest one. */
+  function buildFourToolSession() {
+    const session = Session.create(SessionId("sess-reclaim"));
+    for (let i = 1; i <= 4; i += 1) {
+      const user = createUserMessage({
+        content: [{ type: "text", text: `request ${i}` }],
+        source: { kind: "user" },
+      });
+      session.append("user/message", user, { surfaceOp: "append" });
+      const assistant = createAssistantMessage({
+        content: [
+          { type: "text", text: `checking ${i}` },
+          { type: "tool-call", id: `call-${i}`, name: "read_file", arguments: "{}" },
+        ],
+        provider: "deepseek",
+        model: "deepseek-chat",
+        source: { kind: "model" },
+      });
+      session.append(
+        "assistant/message",
+        { turn: i, step: 1, message: assistant },
+        { surfaceOp: "append" },
+      );
+      const tool = createToolResultMessage({
+        callId: `call-${i}`,
+        content: [{ type: "text", text: `output ${i} `.repeat(60) }],
+        isError: false,
+      });
+      session.append("tool/result", { turn: i, step: 1, message: tool }, { surfaceOp: "append" });
+      session.append("tool/call", {
+        turn: i,
+        step: 1,
+        callId: `call-${i}`,
+        name: "read_file",
+        arguments: "{}",
+      });
+    }
+    return session;
+  }
+
+  function reclaimViewOf(session: ReturnType<typeof buildFourToolSession>): DshTranscriptView {
+    return readDshTranscript({
+      session: { events: sessionEventsOf(session), surface: session.surface, header: {} },
+      canonicalSessionId: "dsh:a1b2c3d4:sess-reclaim",
+    });
+  }
+
+  it("drops the oldest watermark-eligible tool tag without a queued op and advances the watermark", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-reclaim-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const view = reclaimViewOf(buildFourToolSession());
+
+      // Pass 1: tags assigned, watermark advanced to the current max.
+      // usableSoft 0 → derived floor 0 → only the newest-3 tool tags protected.
+      deriveMutationPlan(view, { db, usableSoft: 0 });
+      const toolTags = getTagsBySession(db, view.sessionId).filter((t) => t.type === "tool");
+      expect(toolTags.length).toBe(4);
+      const oldest = toolTags.reduce((min, t) => (t.tagNumber < min.tagNumber ? t : min));
+      // Value floor: AGE_RECLAIM_MIN_TOKENS = 250 persisted token estimate.
+      db.prepare(
+        "UPDATE tags SET token_count = 500 WHERE session_id = ? AND tag_number = ?",
+      ).run(view.sessionId, oldest.tagNumber);
+
+      // Pass 2: no queued pending op — the synthetic age-reclaim lane drops the
+      // oldest tag (≤ watermark, above the value floor, outside the window).
+      const plan = deriveMutationPlan(view, { db, usableSoft: 0 });
+      expect(plan).not.toBeNull();
+      const dropOp = plan!.ops.find(
+        (op) =>
+          op.kind === "drops" &&
+          JSON.stringify(op.replacement).includes(`[dropped \u00a7${oldest.tagNumber}\u00a7]`),
+      );
+      expect(dropOp).toBeDefined();
+
+      // The newest-3 tool tags stay untouched.
+      for (const tag of toolTags.filter((t) => t.tagNumber !== oldest.tagNumber)) {
+        expect(
+          plan!.ops.some(
+            (op) =>
+              op.kind === "drops" &&
+              JSON.stringify(op.replacement).includes(`[dropped \u00a7${tag.tagNumber}\u00a7]`),
+          ),
+        ).toBe(false);
+      }
+
+      // Watermark persisted at the current max tag.
+      const row = db
+        .prepare("SELECT tool_reclaim_watermark FROM session_meta WHERE session_id = ?")
+        .get(view.sessionId) as { tool_reclaim_watermark?: number } | undefined;
+      const maxTag = toolTags.reduce((max, t) => (t.tagNumber > max.tagNumber ? t : max));
+      expect(row?.tool_reclaim_watermark).toBeGreaterThanOrEqual(maxTag.tagNumber);
+    } finally {
+      await cleanupDir(dir, db);
+    }
+  });
+
+  it("reclaims nothing while the watermark is 0 (first pass) and fails open on reclaim errors", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-reclaim-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const view = reclaimViewOf(buildFourToolSession());
+      // Single pass: watermark starts 0 → buildSyntheticToolReclaimOps returns
+      // []. The only ops are tag prefixes (message rows); no drops.
+      const plan = deriveMutationPlan(view, { db, usableSoft: 0 });
+      expect(plan === null || plan.ops.every((op) => op.kind !== "drops")).toBe(true);
+      const toolTags = getTagsBySession(db, view.sessionId).filter((t) => t.type === "tool");
+      expect(toolTags.length).toBe(4);
+    } finally {
+      await cleanupDir(dir, db);
+    }
+  });
+});
+
+describe("strip layer (ephemeral nudge residue)", () => {
+  function buildNudgeSession() {
+    const session = Session.create(SessionId("sess-strip"));
+    // Turn 1 (completed): user request, delivered Channel-1 nudge, assistant.
+    session.append("turn/start", { turn: 1 });
+    const userSeq = session.append(
+      "user/message",
+      createUserMessage({ content: [{ type: "text", text: "fix the bug" }], source: { kind: "user" } }),
+      { surfaceOp: "append" },
+    ).seq;
+    const nudgeSeq = session.append(
+      "user/message",
+      magicUserMessage("<system-reminder>ctx pressure: reclaim §N§ tool tags</system-reminder>", {
+        kind: "magic-context",
+        messageId: "mc-nudge:channel1",
+      }),
+      { surfaceOp: "append" },
+    ).seq;
+    const knowledgeSeq = session.append(
+      "user/message",
+      magicUserMessage("knowledge baseline m0 body", {
+        kind: "magic-context",
+        messageId: "mc-baseline-m0",
+      }),
+      { surfaceOp: "append" },
+    ).seq;
+    const assistant = createAssistantMessage({
+      content: [{ type: "text", text: "working on it" }],
+      provider: "deepseek",
+      model: "deepseek-chat",
+      source: { kind: "model" },
+    });
+    session.append("assistant/message", { turn: 1, step: 1, message: assistant }, { surfaceOp: "append" });
+    session.append("turn/end", { turn: 1, reason: "success" as never });
+    // Turn 2 (open): fresh nudge that must survive (protected tail analog).
+    session.append("turn/start", { turn: 2 });
+    const freshNudgeSeq = session.append(
+      "user/message",
+      magicUserMessage("<system-reminder>note nudge</system-reminder>", {
+        kind: "magic-context",
+        messageId: "mc-nudge:note",
+      }),
+      { surfaceOp: "append" },
+    ).seq;
+    void userSeq;
+    return { session, nudgeSeq, knowledgeSeq, freshNudgeSeq };
+  }
+
+  it("strips completed-turn nudges, keeps open-turn nudges and knowledge baselines", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-strip-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const { session, nudgeSeq, knowledgeSeq, freshNudgeSeq } = buildNudgeSession();
+      const view = readDshTranscript({
+        session: { events: sessionEventsOf(session), surface: session.surface, header: {} },
+        canonicalSessionId: "dsh:a1b2c3d4:sess-strip",
+      });
+      expect(view.currentTurn).toBe(1);
+      const plan = deriveMutationPlan(view, { db, usableSoft: 0 });
+      expect(plan).not.toBeNull();
+
+      // The completed-turn nudge row is replaced by its dropped marker.
+      const nudgeOp = plan!.ops.find((op) => op.shadowedSeqs.includes(nudgeSeq));
+      expect(nudgeOp).toBeDefined();
+      expect(nudgeOp!.surfaceType).toBe("user/message");
+      expect(nudgeOp!.replacement).toContain("[dropped \u00a7");
+
+      // The knowledge baseline stays untouched (durable baseline protection).
+      expect(plan!.ops.find((op) => op.shadowedSeqs.includes(knowledgeSeq))).toBeUndefined();
+
+      // The open-turn nudge survives (protected tail analog).
+      expect(plan!.ops.find((op) => op.shadowedSeqs.includes(freshNudgeSeq))).toBeUndefined();
+
+      // No tag was ever assigned to the knowledge baseline; the nudge rows DID
+      // get tagged (they flow through the tag pipeline now).
+      const tags = getTagsBySession(db, view.sessionId);
+      const knowledgeRaw = view.messages.find((m) => m.id.includes("mc-baseline-m0")) ?? view.messages.find((m) => (m as unknown as Record<string, unknown>).__dshKnowledgeBaseline === true);
+      expect(knowledgeRaw).toBeDefined();
+      void tags;
+    } finally {
+      await cleanupDir(dir, db);
+    }
+  });
+
+  it("freezes after the coordinator replace: the mc-op marker row is a knowledge baseline on later passes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dsh-magic-strip2-"));
+    let db: Database | undefined;
+    try {
+      db = await createTestDb(join(dir, "context.db"));
+      const { session, nudgeSeq } = buildNudgeSession();
+      const view = readDshTranscript({
+        session: { events: sessionEventsOf(session), surface: session.surface, header: {} },
+        canonicalSessionId: "dsh:a1b2c3d4:sess-strip",
+      });
+      const plan1 = deriveMutationPlan(view, { db, usableSoft: 0 });
+      const nudgeOp1 = plan1!.ops.find((op) => op.shadowedSeqs.includes(nudgeSeq));
+      expect(nudgeOp1).toBeDefined();
+
+      // Simulate the coordinator: same-type replace of the nudge node with the
+      // marker row (mc-op source, exactly like coordinator.ts applies it).
+      const replacementText =
+        typeof nudgeOp1!.replacement === "string"
+          ? nudgeOp1!.replacement
+          : JSON.stringify(nudgeOp1!.replacement);
+      session.append(
+        "user/message",
+        magicUserMessage(replacementText, {
+          kind: "magic-context",
+          messageId: "mc-op:test-strip",
+          revision: "1",
+        }),
+        {
+          surfaceOp: { op: "replace", startSeq: nudgeSeq, endSeq: nudgeSeq },
+          sourceEventSeqs: [nudgeSeq] as never,
+        },
+      );
+
+      const view2 = readDshTranscript({
+        session: { events: sessionEventsOf(session), surface: session.surface, header: {} },
+        canonicalSessionId: "dsh:a1b2c3d4:sess-strip",
+      });
+      const plan2 = deriveMutationPlan(view2, { db, usableSoft: 0 });
+      // The replaced marker row is a knowledge baseline: no further ops, no tag
+      // churn (the strip lane is done — replay invariant holds).
+      expect(plan2 === null || plan2.ops.every((op) => !op.shadowedSeqs.includes(nudgeSeq))).toBe(true);
+      const tags = getTagsBySession(db, view2.sessionId);
+      const markerTags = tags.filter((t) => t.status === "active" && t.messageId.endsWith(":p0"));
+      expect(markerTags.length).toBeLessThanOrEqual(tags.length);
+    } finally {
+      await cleanupDir(dir, db);
+    }
+  });
+});

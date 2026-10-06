@@ -10,10 +10,13 @@
  *      direct `ctx.llm.stream` turn (system + user; `purpose` omitted — an
  *      ordinary auxiliary call). Dream agents whose prompts REQUIRE tools
  *      (curate / maintain-docs / refresh-primers / map-memories / verify /
- *      verify-broad) fail with an explicit "tool worker not wired" error
- *      instead of pretending a tool-less answer is valid. `messages` returns the
- *      synthetic OpenCode-shaped message list for the turn (text result +
- *      `toolCallCount = 0` synthetic tool parts — the Pi facade's trick).
+ *      verify-broad) run through the dream tool worker
+ *      (`dream-worker.ts`: borrowed live parent agent + ctx.subagents.start
+ *      spawn + toolFilter allowlist + persona system prompt). `messages`
+ *      returns the synthetic OpenCode-shaped message list for the turn (text
+ *      result + synthetic tool parts from the worker's completed tool calls —
+ *      the Pi facade's trick, so curate's `inspectCurateMemoryOperations` sees
+ *      the applied ctx_memory operations).
  *
  *   2. `registerDshDreamer(ctx, deps)` — project discovery from
  *      `session_projects` (deduped, DSH-harness only) + one fiber-owned
@@ -35,18 +38,48 @@
  *     module-level timer state is not fiber-owned. Each DSH interval drives the
  *     exact same scheduler pass the singleton's tick runs for the dream
  *     portion (`runDueTasksForProject` → lease/gate/telemetry). The
- *     singleton's extra maintenance (message-history privacy sweep, compiled
- *     smart-note surfacing, embedding backfill) is deferred to a later slice.
- *   - Tool workers (`ctx.subagents.start` + `toolFilter` allowlist) are a
- *     Phase 4 follow-up / integrator decision; this slice is direct-LLM only.
+ *     singleton's extra maintenance lanes are mirrored DSH-side per tick
+ *     (`runDshPeriodicMaintenance`: embedding registration + identity
+ *     maintenance, git-commit indexing, compiled smart-note checks; the
+ *     OpenCode-session orphan sweep stays out — see that function's doc).
+ *   - Tool workers run through the borrowed-parent seam (`dream-worker.ts`);
+ *     see that module's header for the OpenCode/DSH deviations (no agent
+ *     registry, no per-agent step cap — the abort signal is the authority).
  *   - `createDshDreamClient`'s `db` parameter is accepted per contract but
  *     reserved (the facade is in-memory, exactly like the Pi facade); `log` is
  *     used for diagnostics.
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { LlmRuntime } from "@deepseek-ai/dsh-llm";
+import { randomUUID } from "node:crypto";
 import { createUserMessage } from "../compat/dsh-0.1/session";
 import { DSH_HARNESS } from "../shared/dsh-harness";
+import { loadPluginConfig } from "@magic-context/core/config";
+import {
+  acquireGitSweepLease,
+  GIT_SWEEP_LEASE_RENEWAL_MS,
+  markGitSweepSuccessAndRelease,
+  parkGitSweepNonIndexable,
+  releaseGitSweepLease,
+  renewGitSweepLease,
+} from "@magic-context/core/features/magic-context/git-commits/sweep-coordinator";
+import {
+  embedUnembeddedCommits,
+  indexCommitsForProject,
+} from "@magic-context/core/features/magic-context/git-commits/indexer";
+import {
+  drainCommitBacklogForProject,
+  drainProjectEmbeddingIdentityMaintenance,
+  drainStaleEmbeddingIdentitiesForProject,
+  getProjectEmbeddingSnapshot,
+} from "@magic-context/core/features/magic-context/project-embedding-registry";
+import { runDueCompiledSmartNoteChecks } from "@magic-context/core/features/magic-context/smart-notes/runner";
+import {
+  acquireLease,
+  releaseLease,
+} from "@magic-context/core/features/magic-context/dreamer/lease";
+import { leaseKeyFor } from "@magic-context/core/features/magic-context/dreamer/task-registry";
+import { ensureProjectRegisteredFromDshDirectory } from "./embedding-bootstrap";
 import {
   DreamerConfigSchema,
   type DreamerConfig,
@@ -62,31 +95,25 @@ import { describeError } from "@magic-context/core/shared/error-message";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import type { DshStorageBootstrap } from "../host/bootstrap";
 import type { CtxCommandSeams } from "./commands";
+import {
+  TOOL_REQUIRING_DREAM_AGENTS,
+  agentPresenceOf,
+  runDreamToolWorker,
+  AgentPresence,
+  type DreamCompletedToolCall,
+} from "./dream-worker";
 
 /** Default dream tick (mirrors core's DREAM_TIMER_INTERVAL_MS: 15 minutes). */
 export const DEFAULT_DREAM_TICK_MS = 15 * 60 * 1000;
 
 /**
  * Dream agents whose prompts REQUIRE tools — a direct single-turn LLM call
- * cannot produce a valid result for them. Mirrors the tool profiles in core
- * `agents/dreamer.ts` + `agents/hidden-agent-registrations.ts`:
- *   - `dreamer`                    (curate)              → ctx_memory only
- *   - `dreamer-docs`               (maintain-docs)       → read/grep/glob/bash/write/edit/aft
- *   - `dreamer-primer-investigator`(refresh-primers)     → read-only code investigation
- *   - `dreamer-memory-mapper`      (map-memories/verify/verify-broad) → read-only source reader
- * The remaining dream agents are zero-tool single-shot transforms and work
- * through the direct LLM path: `dreamer-classifier` (classify-memories +
- * compress-cues), `smart-note-compiler` (evaluate-smart-notes),
- * `dreamer-reviewer` (review-user-memories), `dreamer-retrospective` (friction
- * gate + deepen turns). Tool workers are a Phase 4 follow-up / integrator
- * decision (ctx.subagents.start + toolFilter allowlist).
+ * cannot produce a valid result for them. Re-exported from `dream-worker.ts`
+ * (single source of truth with DREAM_WORKER_PROFILES); see that module for the
+ * per-agent tool profiles and the remaining zero-tool dream agents
+ * (classifier / smart-note-compiler / reviewer / retrospective).
  */
-const TOOL_REQUIRING_DREAM_AGENTS = new Set([
-  "dreamer",
-  "dreamer-docs",
-  "dreamer-primer-investigator",
-  "dreamer-memory-mapper",
-]);
+// (TOOL_REQUIRING_DREAM_AGENTS imported above from ./dream-worker)
 
 /** Magic-owned message source marker for dreamer LLM turns. */
 const DREAM_SOURCE = { kind: "magic-context" } as const;
@@ -113,6 +140,9 @@ export interface DshDreamClientDeps {
   /** Reserved (per contract): the facade is in-memory like the Pi facade;
    *  `db` is accepted for signature stability / future persistence. */
   readonly db: Database;
+  /** Live-agent registry for tool-worker parents (defaults to the ctx-owned
+   *  `agentPresenceOf(ctx)` subscription). */
+  readonly presence?: AgentPresence;
   readonly log?: (message: string) => void;
 }
 
@@ -163,7 +193,42 @@ interface DreamSessionRecord {
 
 type SyntheticPart =
   | { type: "text"; text: string }
-  | { type: "tool"; tool: string; state: { input: { description: string } } };
+  | { type: "tool"; tool: string; state: { input: { description: string } } }
+  | {
+      type: "tool";
+      tool: string;
+      callID: string;
+      state: { status: "completed"; input: Record<string, unknown>; output: "completed" };
+    };
+
+/**
+ * Synthetic tool parts from a dream tool worker run — the Pi facade's
+ * `syntheticToolParts` mirror: completed calls first (curate's
+ * `inspectCurateMemoryOperations` reads these), then count-only filler parts
+ * (the refresh-primers grounding gate counts tool use).
+ */
+function syntheticToolParts(
+  count: number,
+  completedCalls: readonly DreamCompletedToolCall[],
+): SyntheticPart[] {
+  const completed = completedCalls.map((call, index) => ({
+    type: "tool" as const,
+    callID: `dsh-dream-completed-tool-${index}`,
+    tool: call.name,
+    state: {
+      status: "completed" as const,
+      input: call.arguments as Record<string, unknown>,
+      output: "completed" as const,
+    },
+  }));
+  const remaining = Math.max(0, Math.floor(count) - completed.length);
+  const filler = Array.from({ length: remaining }, () => ({
+    type: "tool" as const,
+    tool: "investigation",
+    state: { input: { description: "investigation step" } },
+  }));
+  return [...completed, ...filler];
+}
 
 /** OpenCode-shaped synthetic message (mirror of the Pi facade's makeMessage). */
 function makeMessage(role: "user" | "assistant", parts: SyntheticPart[]): unknown {
@@ -246,13 +311,15 @@ async function streamDreamTurn(
 /**
  * Create the DSH DreamTimerClient facade. One instance is shared by the
  * schedule timer AND the /ctx-dream seam (same synthetic session table), like
- * the Pi facade. Direct-LLM only in P1; tool-requiring dream agents throw an
- * explicit "tool worker not wired" error (classified by the core executor as a
- * PERMANENT failure — the message intentionally avoids the transient-failure
- * vocabulary so the task advances to its next cron slot instead of hot-retrying).
+ * the Pi facade. Zero-tool dream agents run one direct `ctx.llm.stream` turn;
+ * tool-requiring agents borrow a live top-level agent (AgentPresence) as the
+ * parent of a scoped subagent worker (`dream-worker.ts`). Facade failures are
+ * classified by the core executor: transient-marked errors hot-retry, others
+ * advance to the task's next cron slot.
  */
 export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): DshDreamSessionFacade {
   const log = deps.log ?? (() => {});
+  const presence = deps.presence ?? agentPresenceOf(ctx);
   const sessions = new Map<string, DreamSessionRecord>();
   let sessionCounter = 0;
 
@@ -283,15 +350,6 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
         typeof args.body?.agent === "string" && args.body.agent.length > 0
           ? args.body.agent
           : undefined;
-      if (agent !== undefined && TOOL_REQUIRING_DREAM_AGENTS.has(agent)) {
-        // Explicit, non-transient failure: tool worker wiring (ctx.subagents.start
-        // + toolFilter allowlist) is a Phase 4 follow-up / integrator decision.
-        throw new Error(
-          `dreamer tool worker not wired for agent "${agent}": this task requires tools ` +
-            `(ctx_memory / read / grep / write / edit), which the direct-LLM facade cannot provide. ` +
-            `Wire ctx.subagents.start workers in a later Phase 4 slice or disable this task.`,
-        );
-      }
       const rawParts = args.body?.parts;
       const userText = Array.isArray(rawParts)
         ? rawParts
@@ -312,10 +370,53 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
             }
           : undefined;
       const model = resolveDreamModel(ctx, bodyModel);
+      const rawSystem = args.body?.system;
+      const system =
+        typeof rawSystem === "string" && rawSystem.length > 0 ? rawSystem : undefined;
       try {
-        const rawSystem = args.body?.system;
-        const system =
-          typeof rawSystem === "string" && rawSystem.length > 0 ? rawSystem : undefined;
+        if (agent !== undefined && TOOL_REQUIRING_DREAM_AGENTS.has(agent)) {
+          // Tool-requiring dream agent: borrow a live top-level agent as the
+          // worker parent and run the task through a scoped child (toolFilter
+          // allowlist + persona system prompt + delegated approval 'never').
+          // No live agent → transient failure; the scheduler hot-retries and a
+          // later tick (with a session live) picks the task up.
+          const parent = presence.pick(dreamSession.directory);
+          if (parent === undefined) {
+            const error = new Error(
+              `magic-context: no live Magic agent available to host the dream tool worker ` +
+                `(agent "${agent}") — retry when a session is active`,
+            );
+            (error as Error & { transient?: boolean }).transient = true;
+            throw error;
+          }
+          const workerResult = await runDreamToolWorker(ctx, {
+            parent,
+            agent,
+            system,
+            userText,
+            model: bodyModel
+              ? { provider: bodyModel.providerID, model: bodyModel.modelID }
+              : undefined,
+            signal: args.signal ?? undefined,
+            log,
+          });
+          dreamSession.messages = [
+            makeMessage("user", [{ type: "text", text: userText }]),
+            makeMessage(
+              "assistant",
+              // Completed tool calls first (curate's memory-operation
+              // inspection reads them), then count-only filler parts for the
+              // grounding gate, then the final answer text.
+              [
+                ...syntheticToolParts(workerResult.toolCallCount, workerResult.completedToolCalls),
+                ...(workerResult.text.length > 0
+                  ? [{ type: "text" as const, text: workerResult.text }]
+                  : []),
+              ],
+            ),
+          ];
+          return {};
+        }
         const text = await streamDreamTurn(ctx, {
           system,
           userText,
@@ -324,7 +425,7 @@ export function createDshDreamClient(ctx: Context, deps: DshDreamClientDeps): Ds
         });
         dreamSession.messages = [
           makeMessage("user", [{ type: "text", text: userText }]),
-          // synthetic tool parts: always 0 in P1 direct-LLM (empty) — mirrors Pi facade intent
+          // Direct-LLM turns make no tool calls — no synthetic tool parts.
           makeMessage("assistant", [{ type: "text", text }]),
         ];
         return {};
@@ -357,6 +458,9 @@ interface DreamerRuntimeState {
   tickMs: number;
   coreConfig: DreamerConfig;
   directory: string;
+  /** Live-agent registry for tool-worker parents (created eagerly at
+   *  registration so early `agent/created` events are never missed). */
+  presence: AgentPresence;
   /** Lazily created once; both the timer and the seam share one facade. */
   facade: DshDreamSessionFacade | null;
 }
@@ -370,12 +474,13 @@ function synthesizeDreamerConfig(raw?: unknown): DreamerConfig {
   return DreamerConfigSchema.parse(raw ?? {});
 }
 
-function defaultState(): DreamerRuntimeState {
+function defaultState(ctx?: Context): DreamerRuntimeState {
   return {
     enabled: true,
     tickMs: DEFAULT_DREAM_TICK_MS,
     coreConfig: synthesizeDreamerConfig(),
     directory: process.cwd(),
+    presence: ctx !== undefined ? agentPresenceOf(ctx) : new AgentPresence(),
     facade: null,
   };
 }
@@ -422,6 +527,15 @@ async function runDreamTick(
   log: (message: string) => void,
 ): Promise<void> {
   try {
+    // Periodic maintenance sweeps (the opencode dream-timer lanes the DSH
+    // port deferred): embedding registration + identity maintenance, git-commit
+    // indexing, compiled smart-note checks. All fail-open — a sweep failure
+    // must never block the task scheduler below.
+    await runDshPeriodicMaintenance(db, projectIdentity, state, log);
+  } catch (error) {
+    log(`[dreamer] maintenance sweeps failed for ${projectIdentity}: ${describeError(error).brief}`);
+  }
+  try {
     const ran = await runDueTasksForProject({
       db,
       projectIdentity,
@@ -433,6 +547,189 @@ async function runDreamTick(
     if (ran > 0) log(`[dreamer] timer tick ${projectIdentity} — ran ${ran} task(s)`);
   } catch (error) {
     log(`[dreamer] timer tick failed for ${projectIdentity}: ${describeError(error).brief}`);
+  }
+}
+
+/** Wall-clock budget for one commit-embedding backlog drain. */
+const GIT_COMMIT_BACKLOG_DRAIN_MAX_MS = 5 * 60 * 1000;
+
+/**
+ * The periodic maintenance lanes the opencode dream-timer runs per project,
+ * mirrored for DSH (minus the OpenCode-session orphan sweep — DSH dream
+ * workers tear their child sessions down via SubagentRun.dispose, so there is
+ * no OpenCode server loop to sweep):
+ *   1. ensureProjectRegistered — (re)load config, register embedding provider;
+ *   2. embedding identity maintenance + stale-identity GC;
+ *   3. git-commit indexing sweep (lease + cooldown coordinated);
+ *   4. compiled smart-note checks (leased, matches the evaluate-smart-notes
+ *      lease domain).
+ * Needs a workspace DIRECTORY for the config load and `git log`; identities
+ * without a live observation (no session since process start) skip fail-open.
+ */
+async function runDshPeriodicMaintenance(
+  db: Database,
+  projectIdentity: string,
+  state: DreamerRuntimeState,
+  log: (message: string) => void,
+): Promise<void> {
+  const directory = state.presence.directoryOf(projectIdentity);
+  if (directory === undefined) return;
+  try {
+    await ensureProjectRegisteredFromDshDirectory(directory, db, log);
+  } catch (error) {
+    log(
+      `[magic-context] embedding registration failed for ${projectIdentity}: ${describeError(error).brief}`,
+    );
+    return; // no snapshot below can be trusted without registration
+  }
+
+  try {
+    await drainProjectEmbeddingIdentityMaintenance(db, projectIdentity);
+    const gc = await drainStaleEmbeddingIdentitiesForProject(db, projectIdentity);
+    const gcDeleted =
+      gc.memoryRowsDeleted + gc.commitRowsDeleted + gc.chunkRowsDeleted;
+    if (gcDeleted > 0) {
+      log(
+        `[magic-context] GC'd ${gcDeleted} stale embedding row(s) for ${projectIdentity} ` +
+          `(memory=${gc.memoryRowsDeleted} commit=${gc.commitRowsDeleted} chunk=${gc.chunkRowsDeleted})`,
+      );
+    }
+  } catch (error) {
+    log(
+      `[magic-context] embedding maintenance failed for ${projectIdentity}: ${describeError(error).brief}`,
+    );
+  }
+
+  const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+  if (snapshot?.gitCommitEnabled === true) {
+    await sweepGitCommitsForProject({ db, projectIdentity, directory, log });
+  }
+
+  await runCompiledSmartNoteSweep(db, projectIdentity, directory, log);
+}
+
+/**
+ * Mirror of the opencode sweepGitCommits: lease + cooldown coordinated
+ * (across processes via the shared DB), renewed while running, parked on
+ * non-indexable directories for the 24h re-probe horizon.
+ */
+async function sweepGitCommitsForProject(args: {
+  db: Database;
+  projectIdentity: string;
+  directory: string;
+  log: (message: string) => void;
+}): Promise<void> {
+  const { db, projectIdentity, directory, log } = args;
+  let sinceDays = 365;
+  let maxCommits = 2000;
+  try {
+    const config = loadPluginConfig(directory);
+    sinceDays = config.memory.git_commit_indexing.since_days;
+    maxCommits = config.memory.git_commit_indexing.max_commits;
+  } catch {
+    // Schema defaults above stand.
+  }
+  const holderId = randomUUID();
+  const lease = acquireGitSweepLease(db, projectIdentity, holderId);
+  if (!lease.acquired) {
+    const reason =
+      lease.reason === "cooldown_active"
+        ? `cooldown active until ${lease.nextAllowedAt}`
+        : `lease held by ${lease.leaseHolder ?? "another holder"} until ${lease.leaseExpiresAt ?? "unknown"}`;
+    log(`[git-commits] sweep skipped for ${projectIdentity}: ${reason}`);
+    return;
+  }
+
+  const startedAt = Date.now();
+  const renewal = setInterval(() => {
+    try {
+      if (!renewGitSweepLease(db, projectIdentity, holderId)) {
+        log(`[git-commits] sweep lease renewal failed for ${projectIdentity}`);
+      }
+    } catch {
+      // Renewal is best-effort; the TTL catches us on the next tick.
+    }
+  }, GIT_SWEEP_LEASE_RENEWAL_MS);
+  renewal.unref?.();
+  try {
+    const result = await indexCommitsForProject(db, projectIdentity, directory, {
+      sinceDays,
+      maxCommits,
+    });
+    if (result.nonIndexable) {
+      // Not a repo / empty repo: park on the long re-probe cooldown so the
+      // timer doesn't retry (and log) every tick.
+      if (!parkGitSweepNonIndexable(db, projectIdentity, holderId)) {
+        releaseGitSweepLease(db, projectIdentity, holderId);
+      }
+      return;
+    }
+    let drainedEmbeddings = 0;
+    if (result.embedded > 0) {
+      drainedEmbeddings = await embedUnembeddedCommits(db, projectIdentity);
+    }
+    if (!markGitSweepSuccessAndRelease(db, projectIdentity, holderId)) {
+      releaseGitSweepLease(db, projectIdentity, holderId);
+      log(
+        `[git-commits] sweep finished for ${projectIdentity}, but lease was no longer active; cooldown not advanced`,
+      );
+    }
+    let backlogDrained = 0;
+    const snapshot = getProjectEmbeddingSnapshot(projectIdentity);
+    if (snapshot?.gitCommitEnabled) {
+      try {
+        backlogDrained = await drainCommitBacklogForProject(
+          db,
+          projectIdentity,
+          Date.now() + GIT_COMMIT_BACKLOG_DRAIN_MAX_MS,
+        );
+      } catch (error) {
+        log(
+          `[git-commits] commit backlog drain failed for ${projectIdentity}: ${describeError(error).brief}`,
+        );
+      }
+    }
+    const elapsedMs = Date.now() - startedAt;
+    log(
+      `[git-commits] sweep finished for ${projectIdentity} in ${elapsedMs}ms: scanned=${result.scanned} inserted=${result.inserted} updated=${result.updated} evicted=${result.evicted} embedded=${result.embedded} drained=${drainedEmbeddings} backlogDrained=${backlogDrained}`,
+    );
+  } catch (error) {
+    releaseGitSweepLease(db, projectIdentity, holderId);
+    log(
+      `[git-commits] sweep failed for ${projectIdentity} after ${Date.now() - startedAt}ms: ${describeError(error).brief}`,
+    );
+  } finally {
+    clearInterval(renewal);
+  }
+}
+
+/**
+ * Mirror of the opencode runCompiledSmartNoteSweep: leased under the
+ * evaluate-smart-notes domain so it cannot race the scheduled dream task of
+ * the same name. DSH passes no retinaHandoff (no retina plane yet).
+ */
+async function runCompiledSmartNoteSweep(
+  db: Database,
+  projectIdentity: string,
+  projectRoot: string,
+  log: (message: string) => void,
+): Promise<void> {
+  const leaseKey = leaseKeyFor("evaluate-smart-notes", projectIdentity);
+  const holderId = randomUUID();
+  if (!acquireLease(db, holderId, leaseKey)) return;
+  try {
+    const result = await runDueCompiledSmartNoteChecks({
+      db,
+      projectIdentity,
+      projectRoot,
+    });
+    if (result.ran > 0) {
+      log(
+        `[dreamer] compiled smart-note sweep ${projectIdentity}: ran=${result.ran} surfaced=${result.surfaced} logic_failed=${result.failed} network_failed=${result.networkFailed}`,
+      );
+    }
+  } finally {
+    releaseLease(db, holderId, leaseKey);
   }
 }
 
@@ -478,6 +775,7 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
     // 缺失时回落核心默认调度（v1 保真）。
     coreConfig: synthesizeDreamerConfig(deps.coreConfig),
     directory: deps.directory ?? process.cwd(),
+    presence: agentPresenceOf(ctx),
     facade: null,
   };
   dreamerRuntime.set(ctx, state);
@@ -518,23 +816,40 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
     }
     try {
       const db = boot.db;
-      const projects = discoverDreamProjects(db);
-      if (projects.length === 0) {
+      const projects = new Set(discoverDreamProjects(db));
+      // Identities observed live since process start (agent/created → presence
+      // directoryByIdentity): new workspaces opened AFTER timer start get a
+      // tick without a restart.
+      const observeLive = () => {
+        for (const { identity } of state.presence.observedProjects()) {
+          projects.add(identity);
+        }
+      };
+      observeLive();
+      if (projects.size === 0) {
         log("[dreamer] no projects discovered from session_projects — timer idle");
         return;
       }
-      const facade = (state.facade ??= createDshDreamClient(ctx, { db, log }));
+      const facade = (state.facade ??= createDshDreamClient(ctx, {
+        db,
+        presence: state.presence,
+        log,
+      }));
       const executor = buildDreamExecutor(facade, state);
-      for (const projectIdentity of projects) {
-        disposers.push(
-          intervalFactory(() => {
+      // ONE shared interval over the project set (not one interval per
+      // project): a live-opened workspace joins the set without leaking a
+      // per-project timer on every observation.
+      disposers.push(
+        intervalFactory(() => {
+          observeLive();
+          for (const projectIdentity of projects) {
             void runDreamTick(db, projectIdentity, executor, state, log);
-          }, tickMs),
-        );
-        log(
-          `[dreamer] registered schedule timer for ${projectIdentity} (every ${Math.round(tickMs / 60_000)}m; projects=${projects.length})`,
-        );
-      }
+          }
+        }, tickMs),
+      );
+      log(
+        `[dreamer] registered schedule timer (every ${Math.round(tickMs / 60_000)}m; projects=${projects.size})`,
+      );
       // Initial pass per project (the core timer's startup sweep equivalent) so
       // a fresh install does not wait a full tick for seeding.
       for (const projectIdentity of projects) {
@@ -559,10 +874,18 @@ export function registerDshDreamer(ctx: Context, deps: DreamerWiringDeps): void 
  */
 export function dshDreamSeams(
   ctx: Context,
-  deps: { db: Database; log?: (message: string) => void; compactionOff?: boolean },
+  deps: {
+    db: Database;
+    log?: (message: string) => void;
+    compactionOff?: boolean;
+    presence?: AgentPresence;
+  },
 ): NonNullable<CtxCommandSeams["dreamer"]> {
-  const state = dreamerRuntime.get(ctx) ?? defaultState();
-  const facade = (state.facade ??= createDshDreamClient(ctx, deps));
+  const state = dreamerRuntime.get(ctx) ?? defaultState(ctx);
+  const facade = (state.facade ??= createDshDreamClient(ctx, {
+    ...deps,
+    presence: deps.presence ?? state.presence,
+  }));
   const executor = buildDreamExecutor(facade, state);
   const tasks = buildDreamTaskRuntimeConfigs(state.coreConfig, "opencode").filter(
     (task) => task.schedule.trim() !== "",
@@ -588,4 +911,6 @@ export const __test = {
     // Runtime state is keyed by ctx in a WeakMap and garbage-collected with
     // it, so only the factory needs restoring.
   },
+  /** Direct access to the per-tick maintenance sweeps (test seam). */
+  runDshPeriodicMaintenance,
 };

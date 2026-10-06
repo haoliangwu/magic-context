@@ -31,6 +31,7 @@ import { registerSessionProjectTracking } from "./session-track";
 import type { SessionTrackOptions } from "./session-track";
 import type { AutoSearchConfig } from "./auto-search";
 import { registerCtxTools, type CtxToolsOptions } from "./tools";
+import { ensureProjectRegisteredFromDshDirectory } from "./embedding-bootstrap";
 import { registerCtxCommands, type CtxCommandsOptions } from "./commands";
 import { registerContextPlane, type ContextPlaneConfig, type ContextPlaneHistorianConfig } from "./context-plane";
 import {
@@ -347,6 +348,12 @@ export function apply(ctx: Context, config: MagicAgentConfig = {}): void {
   const runtime = {
     canonicalKey: (dshSessionId: string) => host.canonicalKey(dshSessionId),
     resolveProjectIdentity: undefined,
+    // Embedding provider registration on first tool use (opencode's
+    // ensureProjectRegistered seam): ctx_search / ctx_memory / auto-search
+    // register the project before reading the embedding snapshot, so the
+    // semantic lanes work even before the first dreamer tick lands.
+    ensureProjectRegistered: (cwd: string, db: unknown) =>
+      ensureProjectRegisteredFromDshDirectory(cwd, db as never, log),
     log,
   };
   registerCtxTools(ctx, { ...runtime, ...(config.tools ?? {}) });

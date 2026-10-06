@@ -23,6 +23,7 @@ import {
   getPersistedSchemaVersion,
 } from "@magic-context/core/features/magic-context/storage-db";
 import { computeM0BlockTokens } from "@magic-context/core/hooks/magic-context/m0-token-breakdown";
+import { getMostRecentTaskRunAt } from "@magic-context/core/features/magic-context/dreamer/storage-task-schedule";
 import {
   calibrateBuckets,
   resolveModelCalibration,
@@ -69,10 +70,11 @@ export const MAGIC_CONFIG_SAVE_METHOD = "config-save";
 const MAGIC_CONTEXT_VERSION = pkg.version;
 
 /**
- * JSON-safe sidebar snapshot subset (`magicContext/sidebar-snapshot`). The dsh
- * host cannot fill OpenCode's live-state fields (tool-definition measurement,
- * tail-hygiene scans, dreamer progress), so this is a strict subset of the
- * OpenCode `SidebarSnapshot`: the token breakdown the Context tab renders.
+ * JSON-safe sidebar snapshot (`magicContext/sidebar-snapshot`). Mirrors the
+ * OpenCode `SidebarSnapshot`'s token breakdown PLUS the DB-derivable counts
+ * (compartments, memories, notes, dreamer recency) — same shared-store queries
+ * as plugin/rpc-handlers.ts, minus the OpenCode-only live-state fields
+ * (tool-definition measurement, tail-hygiene scans, dreamer progress maps).
  */
 export interface DshSidebarSnapshot {
   readonly sessionId: string;
@@ -89,6 +91,29 @@ export interface DshSidebarSnapshot {
   readonly conversationTokens: number;
   readonly toolCallTokens: number;
   readonly toolDefinitionTokens: number;
+  /** Compartments retained for this session (archived rows while native compaction owns the window). */
+  readonly compartmentCount: number;
+  readonly archivedCompartmentCount: number;
+  /** Active project memories (shared store, by project identity). */
+  readonly memoryCount: number;
+  readonly memoryBlockCount: number;
+  /** Pending transform ops for this session (0 when the table is absent). */
+  readonly pendingOpsCount: number;
+  /** Persisted wrapup latch (session_meta.compartment_in_progress). */
+  readonly compartmentInProgress: boolean;
+  /** Same latch as compartmentInProgress: no live wrapup state on the dsh host. */
+  readonly historianRunning: boolean;
+  /** Active session notes. */
+  readonly sessionNoteCount: number;
+  /** Ready smart notes for the project. */
+  readonly readySmartNoteCount: number;
+  /** Configured cache TTL label. */
+  readonly cacheTtl: string;
+  /** Persistent transform failure surfaced directly in the sidebar. */
+  readonly lastTransformError: string | null;
+  /** MAX(last_run_at) across the project's task_schedule_state rows. */
+  readonly lastDreamerRunAt: number | null;
+  readonly projectIdentity: string | null;
   readonly tailHygiene?: { readonly u: number; readonly t: number; readonly severity: string };
   readonly version: string;
 }
@@ -278,7 +303,7 @@ export class MagicContextRemoteService extends Service {
     }
   }
 
-  /** `magicContext/sidebar-snapshot` — token breakdown for the Context tab. */
+  /** `magicContext/sidebar-snapshot` — token breakdown + DB-derivable counts. */
   async ["sidebar-snapshot"](args: { sessionId: string }): Promise<DshSidebarSnapshot> {
     // Security: bound the session id exactly like diagnostics (PLAN §11).
     const rawSessionId = String(args?.sessionId ?? "").slice(0, 512);
@@ -301,6 +326,19 @@ export class MagicContextRemoteService extends Service {
       conversationTokens: 0,
       toolCallTokens: 0,
       toolDefinitionTokens: 0,
+      compartmentCount: 0,
+      archivedCompartmentCount: 0,
+      memoryCount: 0,
+      memoryBlockCount: 0,
+      pendingOpsCount: 0,
+      compartmentInProgress: false,
+      historianRunning: false,
+      sessionNoteCount: 0,
+      readySmartNoteCount: 0,
+      cacheTtl: "5m",
+      lastTransformError: null,
+      lastDreamerRunAt: null,
+      projectIdentity: null,
       version: MAGIC_CONTEXT_VERSION,
     };
     if (rawSessionId.length === 0) return empty;
@@ -318,7 +356,8 @@ export class MagicContextRemoteService extends Service {
           `SELECT last_context_percentage, last_input_tokens, system_prompt_tokens,
                   conversation_tokens, tool_call_tokens, cached_m0_bytes,
                   memory_block_count, cached_m0_project_identity,
-                  last_usage_context_limit, detected_context_limit
+                  last_usage_context_limit, detected_context_limit,
+                  compartment_in_progress, cache_ttl, last_transform_error
            FROM session_meta WHERE session_id = ?`,
         )
         .get(sessionId) as
@@ -333,9 +372,75 @@ export class MagicContextRemoteService extends Service {
             cached_m0_project_identity: string | null;
             last_usage_context_limit: number | null;
             detected_context_limit: number | null;
+            compartment_in_progress: number | null;
+            cache_ttl: string | null;
+            last_transform_error: string | null;
           }
         | undefined;
       if (!row) return { ...empty, sessionId };
+
+      const projectIdentity = row.cached_m0_project_identity ?? null;
+      const memoryBlockCount = Number(row.memory_block_count ?? 0);
+      const compartmentInProgress = Number(row.compartment_in_progress ?? 0) === 1;
+      // Count lanes — same shared-store queries as OpenCode's rpc-handlers.
+      // (The dsh host has no moduleStatus, so compartmentCount falls back to
+      // the archived-row count exactly like OpenCode's fallback branch.)
+      const compartmentRow = db
+        .prepare("SELECT COUNT(*) as count FROM compartments WHERE session_id = ?")
+        .get(sessionId) as { count: number } | undefined;
+      const archivedCompartmentCount = compartmentRow?.count ?? 0;
+      let memoryCount = 0;
+      if (projectIdentity !== null) {
+        const memRow = db
+          .prepare(
+            "SELECT COUNT(*) as count FROM memories WHERE project_path = ? AND status = 'active'",
+          )
+          .get(projectIdentity) as { count: number } | undefined;
+        memoryCount = memRow?.count ?? 0;
+      }
+      let pendingOpsCount = 0;
+      try {
+        const pendingRow = db
+          .prepare("SELECT COUNT(*) as count FROM pending_ops WHERE session_id = ?")
+          .get(sessionId) as { count: number } | undefined;
+        pendingOpsCount = pendingRow?.count ?? 0;
+      } catch {
+        // pending_ops table may not exist on an older shared store
+      }
+      let sessionNoteCount = 0;
+      try {
+        const noteRow = db
+          .prepare(
+            "SELECT COUNT(*) as count FROM notes WHERE session_id = ? AND type = 'session' AND status = 'active'",
+          )
+          .get(sessionId) as { count: number } | undefined;
+        sessionNoteCount = noteRow?.count ?? 0;
+      } catch {
+        // notes table may not exist on an older shared store
+      }
+      let readySmartNoteCount = 0;
+      if (projectIdentity !== null) {
+        try {
+          const smartRow = db
+            .prepare(
+              "SELECT COUNT(*) as count FROM notes WHERE project_path = ? AND type = 'smart' AND status = 'ready'",
+            )
+            .get(projectIdentity) as { count: number } | undefined;
+          readySmartNoteCount = smartRow?.count ?? 0;
+        } catch {
+          // notes table may not exist on an older shared store
+        }
+      }
+      // Dreamer V2: live "last successful run" is MAX(last_run_at) across the
+      // project's task_schedule_state rows (issue #194).
+      let lastDreamerRunAt: number | null = null;
+      if (projectIdentity !== null) {
+        try {
+          lastDreamerRunAt = getMostRecentTaskRunAt(db, projectIdentity);
+        } catch {
+          // task_schedule_state may not exist on a pre-V2 database
+        }
+      }
 
       const usagePercentage = Number(row.last_context_percentage ?? 0);
       const inputTokens = Number(row.last_input_tokens ?? 0);
@@ -359,7 +464,7 @@ export class MagicContextRemoteService extends Service {
         m0Text,
         projectIdentity: row.cached_m0_project_identity ?? undefined,
         injectionBudgetTokens: undefined,
-        memoryBlockCount: Number(row.memory_block_count ?? 0),
+        memoryBlockCount,
       });
       const injectedInMessages =
         m0Blocks.compartmentTokens +
@@ -403,6 +508,19 @@ export class MagicContextRemoteService extends Service {
         conversationTokens: calibrated.conversationTokens,
         toolCallTokens: calibrated.toolCallTokens,
         toolDefinitionTokens: calibrated.toolDefinitionTokens,
+        compartmentCount: archivedCompartmentCount,
+        archivedCompartmentCount,
+        memoryCount,
+        memoryBlockCount,
+        pendingOpsCount,
+        compartmentInProgress,
+        historianRunning: compartmentInProgress,
+        sessionNoteCount,
+        readySmartNoteCount,
+        cacheTtl: row.cache_ttl ? String(row.cache_ttl) : "5m",
+        lastTransformError: row.last_transform_error ? String(row.last_transform_error) : null,
+        lastDreamerRunAt,
+        projectIdentity,
         version: MAGIC_CONTEXT_VERSION,
       };
     } catch {

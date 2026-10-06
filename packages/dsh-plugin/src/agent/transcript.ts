@@ -52,6 +52,11 @@ import {
   applyPendingOperations,
 } from "@magic-context/core/hooks/magic-context/apply-operations";
 import { applyHeuristicCleanup } from "@magic-context/core/hooks/magic-context/heuristic-cleanup";
+import {
+  advanceToolReclaimWatermarkToCurrentMax,
+  buildSyntheticToolReclaimOps,
+} from "@magic-context/core/hooks/magic-context/tool-reclaim";
+import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta-session";
 import type {
   MessageLike,
   TagTarget,
@@ -69,7 +74,6 @@ import {
   temporalMarkerPrefix,
 } from "@magic-context/core/hooks/magic-context/temporal-awareness";
 import {
-  getOrCreateSessionMeta,
   getPendingOps,
   getTagsBySession,
 } from "@magic-context/core/features/magic-context/storage";
@@ -303,6 +307,37 @@ function isSyntheticUserMessage(message: RawMessage): boolean {
 function isKnowledgeMessage(message: Record<string, unknown>): boolean {
   const source = isRecord(message.source) ? message.source : null;
   return source !== null && source.kind === "magic-context";
+}
+
+/**
+ * Marker prefix for Magic's ephemeral injected messages (ctx_reduce nudges,
+ * note nudges): `source.kind === "magic-context"` + `messageId` starting with
+ * this prefix. Unlike knowledge baselines these are one-shot reminders — they
+ * must NOT get the durable-baseline protection (which would keep them on the
+ * wire forever), but flow through the tag pipeline so the strip lane below can
+ * retire them once their turn completes.
+ */
+export const NUDGE_MARKER_PREFIX = "mc-nudge:";
+
+export const DSH_NUDGE_KEY = "__dshEphemeralNudge";
+
+/**
+ * True for Magic's ephemeral nudge messages (ctx_reduce Channel-1/2 reminders,
+ * note nudges). These ride `agent.inject(...)` and enter the log as durable
+ * user/message events — without a strip lane they would accumulate as
+ * transcript residue (the opencode `stripSystemInjectedMessages` mirror gap).
+ * Accepts both shapes: a walk record (source field) and a view message
+ * (DSH_NUDGE_KEY marker stamped by readDshTranscript).
+ */
+export function isEphemeralNudgeMessage(message: Record<string, unknown>): boolean {
+  if (message[DSH_NUDGE_KEY] === true) return true;
+  const source = isRecord(message.source) ? message.source : null;
+  return (
+    source !== null &&
+    source.kind === "magic-context" &&
+    typeof source.messageId === "string" &&
+    source.messageId.startsWith(NUDGE_MARKER_PREFIX)
+  );
 }
 
 /**
@@ -597,6 +632,7 @@ interface DshWalkResult {
   readonly skillCatalogOrdinals: ReadonlySet<number>;
   readonly agentInstructionsOrdinals: ReadonlySet<number>;
   readonly dshSystemPromptOrdinals: ReadonlySet<number>;
+  readonly nudgeOrdinals: ReadonlySet<number>;
   readonly ordinalToSeq: Map<number, number>;
   readonly seqToOrdinal: Map<number, number>;
 }
@@ -677,6 +713,7 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
   const skillCatalogOrdinals = new Set<number>();
   const agentInstructionsOrdinals = new Set<number>();
   const dshSystemPromptOrdinals = new Set<number>();
+  const nudgeOrdinals = new Set<number>();
   const ordinalToSeq = new Map<number, number>();
   const seqToOrdinal = new Map<number, number>();
   let completedTurn = 0;
@@ -741,14 +778,22 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
     turns.push(turn);
     surfaceTypes.push(type as SurfaceType);
 
-    const knowledge = type === "user/message" && isKnowledgeMessage(record);
+    // Ephemeral nudge messages (mc-nudge:*) are Magic-owned but NOT durable
+    // baselines: they are one-shot reminders that must flow through the
+    // tag/strip pipeline, so they are carved out of the knowledge set here.
+    // Everything else with source.kind === "magic-context" (m0/m1 knowledge,
+    // mc-op replacement rows) keeps the baseline protection.
+    const knowledge =
+      type === "user/message" && isKnowledgeMessage(record) && !isEphemeralNudgeMessage(record);
     const skillCatalog = type === "user/message" && isSkillCatalogMessage(record);
     const agentInstructions = type === "user/message" && isAgentInstructionsMessage(record);
     const dshSystemPrompt = type === "user/message" && isDshSystemPromptMessage(record);
+    const nudge = type === "user/message" && isEphemeralNudgeMessage(record);
     if (knowledge) knowledgeOrdinals.add(ordinal);
     if (skillCatalog) skillCatalogOrdinals.add(ordinal);
     if (agentInstructions) agentInstructionsOrdinals.add(ordinal);
     if (dshSystemPrompt) dshSystemPromptOrdinals.add(ordinal);
+    if (nudge) nudgeOrdinals.add(ordinal);
     ordinalToSeq.set(ordinal, seq);
     if (seq >= 0) seqToOrdinal.set(seq, ordinal);
   }
@@ -764,6 +809,7 @@ function walkDshLog(events: readonly unknown[], surfaceNodes: readonly number[] 
     skillCatalogOrdinals,
     agentInstructionsOrdinals,
     dshSystemPromptOrdinals,
+    nudgeOrdinals,
     ordinalToSeq,
     seqToOrdinal,
   };
@@ -921,6 +967,13 @@ export function readDshTranscript(input: DshTranscriptInput): DshTranscriptView 
     }
     if (walk.dshSystemPromptOrdinals.has(message.ordinal)) {
       Object.defineProperty(message, DSH_SYSTEM_PROMPT_KEY, {
+        value: true,
+        enumerable: false,
+        configurable: true,
+      });
+    }
+    if (walk.nudgeOrdinals.has(message.ordinal)) {
+      Object.defineProperty(message, DSH_NUDGE_KEY, {
         value: true,
         enumerable: false,
         configurable: true,
@@ -1674,6 +1727,72 @@ export function deriveMutationPlan(view: DshTranscriptView, ctx: PlanContext): M
     }
 
     planReasoningReplay(view, byMessageId, recordingTargets, db);
+
+    // Tool reclaim (opencode/Pi auto-reclaim mirror): age-based synthetic drop
+    // ops for tool outputs at/below the persisted watermark. Every DSH
+    // pre-step rebuilds the wire (epoch-resolving, like a cache-busting pass
+    // upstream), so the application opportunity is every pass. Protections
+    // mirror the shared lane: watermark floor, AGE_RECLAIM_MIN_TOKENS value
+    // floor, newest todowrite, tags already carrying real pending ops, and
+    // only targets whose canDrop() is true. The watermark then advances to
+    // the current max tag so each newly eligible tag waits for the next
+    // independently priced batch (same advance-even-when-idle contract).
+    // DSH has no emergency-drop band yet (fail-closed/LKG layer is deferred),
+    // so there is no emergencyDropEligible gate here.
+    try {
+      const sessionMeta = getOrCreateSessionMeta(db, sessionId);
+      const syntheticOps = buildSyntheticToolReclaimOps({
+        db,
+        sessionId,
+        targets: recordingTargets,
+        watermark: sessionMeta.toolReclaimWatermark,
+        pendingOps: preloadedPendingOps,
+      });
+      if (syntheticOps.length > 0) {
+        applyPendingOperations(
+          sessionId,
+          db,
+          recordingTargets,
+          protectionWindow.protectedTagNumbers,
+          preloadedTags,
+          preloadedPendingOps,
+          syntheticOps,
+        );
+      }
+      advanceToolReclaimWatermarkToCurrentMax(db, sessionId);
+    } catch {
+      // Fail-open: reclaim must never break the pre-step chain.
+    }
+
+    // Strip layer (opencode `stripSystemInjectedMessages` mirror): Magic's
+    // ephemeral nudge messages (ctx_reduce Channel-1/2 reminders, note nudges)
+    // enter the log as durable user/message events via `agent.inject`. Once
+    // their turn completes they are residue — the reminder was already
+    // delivered to every request of that turn. Replace their content with the
+    // canonical dropped marker so the wire keeps a stable, byte-cheap row
+    // (same-type user replace; the mc-op row is then frozen as a knowledge
+    // baseline on later passes, so no churn). Nudges in the still-open turn
+    // (turn > currentTurn) stay verbatim — the protected-tail analog; the
+    // reminder may still be actionable in the running turn. Marker-only
+    // content is re-set idempotently (setContent is a no-op when unchanged).
+    try {
+      const nudgeIds = new Set<string>();
+      for (const raw of view.messages) {
+        if (!isEphemeralNudgeMessage(raw as unknown as Record<string, unknown>)) continue;
+        if (messageTurn(raw) > view.currentTurn) continue;
+        if (typeof raw.id === "string") nudgeIds.add(raw.id);
+      }
+      if (nudgeIds.size > 0) {
+        for (const [tagId, target] of recordingTargets) {
+          const id = target.message?.info.id;
+          if (typeof id !== "string" || !nudgeIds.has(id)) continue;
+          const marker = `[dropped §${tagId}§]`;
+          if (target.getContent?.() !== marker) target.setContent(marker);
+        }
+      }
+    } catch {
+      // Fail-open: the strip lane must never break the pre-step chain.
+    }
 
     const baseline = baselineNodeIndices(view);
     for (const message of transcript.messages) {

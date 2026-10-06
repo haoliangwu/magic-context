@@ -3,10 +3,12 @@
  *
  * Covers: project discovery (session_projects dedupe + harness filter), the
  * DreamTimerClient-shaped facade (stub LLM: create/prompt/messages/delete,
- * model override, abort, tool-agent explicit failure), the /ctx-dream seam
- * shape (tasks/executor/runnable/scheduleSummary; executor no-LLM path with
- * telemetry), and the schedule-timer registration (injectable interval
- * factory; tick runs the core scheduler pass against the test DB).
+ * model override, abort; tool agents via the borrowed-parent worker: transient
+ * no-live-agent failure, spawn allowlist/persona, synthetic tool parts,
+ * transient worker errors), the /ctx-dream seam shape (tasks/executor/runnable/
+ * scheduleSummary; executor no-LLM path with telemetry), and the
+ * schedule-timer registration (injectable interval factory; tick runs the
+ * core scheduler pass against the test DB).
  *
  * No network calls: the LLM is a stub stream, the timer factory is a capture.
  */
@@ -90,17 +92,35 @@ interface FakeCtx {
   ctx: Context;
   /** Disposers returned by the stubbed ctx.effect (fiber disposal simulation). */
   disposers: Array<() => void>;
+  /** Event listeners registered via ctx.on, by event name. */
+  listeners: Map<string, Array<(payload: unknown) => void | Promise<void>>>;
+  /** Fire all handlers registered for one event, in order. */
+  fire(event: string, payload: unknown): Promise<void>;
+  /** Register an extra service in the ctx.get map. */
+  service(name: string, value: unknown): void;
 }
 
 function makeFakeCtx(
   opts: { llm?: LlmRuntime; config?: unknown; agentDefaultModel?: unknown } = {},
 ): FakeCtx {
   const disposers: Array<() => void> = [];
+  const listeners = new Map<string, Array<(payload: unknown) => void | Promise<void>>>();
+  const services = new Map<string, unknown>();
   const ctx = {
     get: (name: string) => {
       if (name === "llm") return opts.llm;
       if (name === "agentDefaultModel") return opts.agentDefaultModel;
-      return undefined;
+      return services.get(name);
+    },
+    on: (event: string, handler: (payload: unknown) => void | Promise<void>) => {
+      const list = listeners.get(event) ?? [];
+      list.push(handler);
+      listeners.set(event, list);
+      return () => {
+        const current = listeners.get(event) ?? [];
+        const index = current.indexOf(handler);
+        if (index >= 0) current.splice(index, 1);
+      };
     },
     effect: (execute: () => () => void) => {
       disposers.push(execute());
@@ -108,7 +128,17 @@ function makeFakeCtx(
     },
     config: opts.config,
   };
-  return { ctx: ctx as unknown as Context, disposers };
+  return {
+    ctx: ctx as unknown as Context,
+    disposers,
+    listeners,
+    fire: async (event: string, payload: unknown) => {
+      for (const handler of listeners.get(event) ?? []) await handler(payload);
+    },
+    service: (name: string, value: unknown) => {
+      services.set(name, value);
+    },
+  };
 }
 
 interface CapturedInterval {
@@ -207,7 +237,7 @@ describe("createDshDreamClient (DreamTimerClient-shaped facade)", () => {
     }
   });
 
-  it("fails explicitly for tool-requiring dream agents (P1: no tool workers)", async () => {
+  it("fails transiently for tool-requiring agents when no live agent is present", async () => {
     const { db, cleanup } = await openDb();
     try {
       const { ctx } = makeFakeCtx({ llm: stubLlm() });
@@ -219,10 +249,154 @@ describe("createDshDreamClient (DreamTimerClient-shaped facade)", () => {
         "dreamer-memory-mapper", // map-memories / verify / verify-broad
       ]) {
         const { id } = await facade.session.create({});
-        await expect(
-          facade.session.prompt({ path: { id }, body: { agent, parts: [{ type: "text", text: "x" }] } }),
-        ).rejects.toThrow(/tool worker not wired/);
+        const failure = facade.session.prompt({
+          path: { id },
+          body: { agent, parts: [{ type: "text", text: "x" }] },
+        });
+        await expect(failure).rejects.toThrow(/no live Magic agent available/);
+        await failure.catch((error: Error & { transient?: boolean }) => {
+          expect(error.transient).toBe(true); // hot-retry classification
+        });
       }
+    } finally {
+      db.close();
+      await cleanup();
+    }
+  });
+
+  it("runs tool-requiring agents through a borrowed-parent worker and serves synthetic tool parts", async () => {
+    const { db, cleanup } = await openDb();
+    try {
+      const starts: Array<{ provider: string; request: Record<string, unknown> }> = [];
+      // Fake top-level parent agent (workspace matches the dream session).
+      const parentAgent = {
+        id: "parent-session-1",
+        session: { header: { cwd: "/workspace" } },
+        options: {},
+      };
+      // Fake child: its session log carries one ctx_memory call + a completed
+      // result, plus one failed call (no pairing) for count realism.
+      const childAgent = {
+        id: "child-session-1",
+        session: {
+          header: { origin: "subagent", delegationDepth: 1 },
+          events: [
+            {
+              type: "tool/call",
+              data: {
+                callId: "c1",
+                name: "ctx_memory",
+                arguments: JSON.stringify({ action: "update", id: 7, content: "rewritten" }),
+              },
+            },
+            { type: "tool/result", data: { callId: "c1", message: { content: [] } } },
+            {
+              type: "tool/call",
+              data: { callId: "c2", name: "read", arguments: JSON.stringify({ path: "/x" }) },
+            },
+            {
+              type: "tool/result",
+              data: { callId: "c2", message: { content: [] }, error: { name: "E", code: "X" } },
+            },
+          ],
+        },
+      };
+      const { ctx, fire, service } = makeFakeCtx({ llm: stubLlm() });
+      service("subagents", {
+        start: async (provider: string, request: Record<string, unknown>) => {
+          starts.push({ provider, request });
+          return {
+            id: "child-session-1",
+            localAgent: childAgent,
+            result: Promise.resolve({
+              output: [{ type: "text", text: "curated" }],
+              stopReason: "completed",
+            }),
+            dispose: async () => {},
+          };
+        },
+      });
+      const facade = createDshDreamClient(ctx, { db });
+      // Feed the presence registry (the agent/created subscription inside the facade).
+      await fire("agent/created", { agent: parentAgent });
+
+      const { id } = await facade.session.create({ query: { directory: "/workspace" } });
+      await facade.session.prompt({
+        path: { id },
+        query: { directory: "/workspace" },
+        body: {
+          agent: "dreamer",
+          system: "curate memories",
+          parts: [{ type: "text", text: "curate this" }],
+        },
+      });
+
+      // Spawn: one-shot worker with the curate tool profile and persona.
+      expect(starts).toHaveLength(1);
+      expect(starts[0]!.provider).toBe("spawn");
+      const request = starts[0]!.request;
+      expect(request.label).toBe("magic-dream-dreamer");
+      expect(request.maxDepth).toBe(0);
+      expect(request.toolFilter).toEqual({ allow: ["ctx_memory", "ctx_memory_list"] });
+      expect(request.persona).toBe("curate memories");
+      const promptBlocks = request.prompt as Array<{ type: string; text?: string }>;
+      expect(promptBlocks[0]?.text).toBe("curate this");
+
+      // messages: user + assistant(text + completed ctx_memory tool part).
+      const response = await facade.session.messages({ path: { id } });
+      expect(response.data).toHaveLength(2);
+      expect(extractLatestAssistantText(response.data)).toBe("curated");
+      const assistant = response.data[1] as {
+        parts: Array<{ type: string; tool?: string; state?: Record<string, unknown> }>;
+      };
+      const toolParts = assistant.parts.filter((part) => part.type === "tool");
+      // 1 completed-call part + 1 count-only filler part (toolCallCount 2 − 1).
+      expect(toolParts).toHaveLength(2);
+      expect(toolParts[0]!.tool).toBe("ctx_memory");
+      expect(toolParts[0]!.state).toEqual({
+        status: "completed",
+        input: { action: "update", id: 7, content: "rewritten" },
+        output: "completed",
+      });
+      expect(toolParts[1]!.tool).toBe("investigation");
+    } finally {
+      db.close();
+      await cleanup();
+    }
+  });
+
+  it("marks a failed dream worker run as transient", async () => {
+    const { db, cleanup } = await openDb();
+    try {
+      const parentAgent = {
+        id: "parent-session-2",
+        session: { header: { cwd: "/workspace" } },
+        options: {},
+      };
+      const { ctx, fire, service } = makeFakeCtx({ llm: stubLlm() });
+      service("subagents", {
+        start: async () => ({
+          id: "child-session-2",
+          localAgent: { id: "child-session-2", session: { header: {}, events: [] } },
+          result: Promise.resolve({
+            output: [],
+            stopReason: "error",
+            diagnostic: "model exploded",
+          }),
+          dispose: async () => {},
+        }),
+      });
+      const facade = createDshDreamClient(ctx, { db });
+      await fire("agent/created", { agent: parentAgent });
+      const { id } = await facade.session.create({ query: { directory: "/workspace" } });
+      const failure = facade.session.prompt({
+        path: { id },
+        body: { agent: "dreamer-docs", parts: [{ type: "text", text: "x" }] },
+      });
+      await expect(failure).rejects.toThrow(/dream tool worker ended \(error\)/);
+      await failure.catch((error: Error & { transient?: boolean }) => {
+        expect(error.transient).toBe(true);
+      });
     } finally {
       db.close();
       await cleanup();
@@ -396,9 +570,11 @@ describe("registerDshDreamer (schedule timer)", () => {
       });
       await flush();
 
-      expect(captured.set).toHaveLength(2);
-      expect(captured.set.map((interval) => interval.ms)).toEqual([1000, 1000]);
-      expect(logs.some((m) => m.includes(`registered schedule timer for ${PROJECT_A}`))).toBe(true);
+      // ONE shared interval over the discovered project set (ticks union in
+      // live-observed identities from the presence map).
+      expect(captured.set).toHaveLength(1);
+      expect(captured.set.map((interval) => interval.ms)).toEqual([1000]);
+      expect(logs.some((m) => m.includes("registered schedule timer"))).toBe(true);
 
       // The immediate initial pass already ran the core scheduler: every task
       // that has input has a seeded row with a future next_due_at and no run

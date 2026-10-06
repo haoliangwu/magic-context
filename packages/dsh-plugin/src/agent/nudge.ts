@@ -98,23 +98,52 @@ function oldestReclaimableToolTags(tags: readonly TagEntry[], protectedTags: num
     .map((t) => ({ tagNumber: t.tagNumber, toolName: t.toolName }));
 }
 
+/**
+ * True when a Magic message with this messageId is on the LIVE surface (not
+ * merely in the append-only log). The nudge dedup must check the live surface:
+ * the transcript strip lane retires delivered nudges by replacing their
+ * surface rows with marker rows, but the original `user/message` event stays
+ * in the log forever — a raw-log scan would suppress every later nudge of the
+ * same kind, and the gentle→firm→urgent level escalation could never re-fire.
+ * Falls back to the raw-log scan when the session exposes no surface (unit
+ * fakes, exotic hosts), preserving the pre-strip behavior.
+ */
+export function hasLiveMagicMessage(agent: Agent, messageId: string): boolean {
+  const surface = (
+    agent.session as unknown as { surface?: { nodes?: unknown } }
+  ).surface;
+  const nodes = Array.isArray(surface?.nodes)
+    ? new Set<number>((surface?.nodes as unknown[]).filter((n): n is number => typeof n === "number"))
+    : null;
+  const events = sessionEventsOf(agent.session);
+  let logHit = false;
+  for (const event of events) {
+    if (event === null || typeof event !== "object") continue;
+    const e = event as {
+      seq?: unknown;
+      data?: { source?: { kind?: unknown; messageId?: unknown } };
+    };
+    const source = e.data?.source;
+    if (source?.kind !== "magic-context" || source.messageId !== messageId) continue;
+    if (nodes === null) {
+      logHit = true; // no surface: fall back to log membership
+      continue;
+    }
+    if (typeof e.seq === "number" && nodes.has(e.seq)) return true;
+  }
+  return logHit;
+}
+
 function injectNudge(
   agent: Agent,
   sessionId: string,
   kind: "channel1" | "channel2",
   text: string,
 ): void {
-  // Dedup: only inject when the surface has no live mc-nudge:<kind> node.
+  // Dedup: only inject when the LIVE surface has no mc-nudge:<kind> row (see
+  // hasLiveMagicMessage — a raw-log scan would freeze after the first nudge).
   const marker = `mc-nudge:${kind}`;
-  const events = sessionEventsOf(agent.session);
-  if (
-    events.some((event) => {
-      if (event === null || typeof event !== "object") return false;
-      const e = event as { data?: { source?: { kind?: unknown; messageId?: unknown } } };
-      const source = e.data?.source;
-      return source?.kind === "magic-context" && source?.messageId === marker;
-    })
-  ) {
+  if (hasLiveMagicMessage(agent, marker)) {
     return;
   }
   const source: MagicMessageSource = {

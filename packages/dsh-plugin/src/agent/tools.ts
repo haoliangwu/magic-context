@@ -95,7 +95,8 @@ import { getErrorMessage } from "@magic-context/core/shared/error-message";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import { CTX_EXPAND_DESCRIPTION, CTX_EXPAND_TOKEN_BUDGET } from "@magic-context/core/tools/ctx-expand/constants";
 import { renderMessageByOrdinal, renderVerboseRange } from "@magic-context/core/tools/ctx-expand/render";
-import { CTX_MEMORY_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
+import { CTX_MEMORY_DESCRIPTION, CTX_MEMORY_LIST_DESCRIPTION } from "@magic-context/core/tools/ctx-memory/constants";
+import { isMagicDreamerAgent } from "./dream-worker";
 import { runImmediateTransaction } from "@magic-context/core/tools/ctx-memory/verification-recording";
 import { CTX_NOTE_DESCRIPTION } from "@magic-context/core/tools/ctx-note/constants";
 import { CTX_REDUCE_DESCRIPTION } from "@magic-context/core/tools/ctx-reduce/constants";
@@ -954,6 +955,44 @@ export function createCtxMemoryTool(ctx: Context, opts: CtxToolsOptions): ToolDe
   });
 }
 
+/**
+ * Separate dreamer-only enumeration surface (`ctx_memory_list`), mirroring
+ * core `createCtxMemoryListTool` / Pi's `createCtxMemoryListTool`.
+ *
+ * Gating: OpenCode checks `toolContext.agent === DREAMER_AGENT`; DSH has no
+ * agent identity inside tool exec, so the gate reads the caller's durable
+ * `subagent/descriptor` label (dream tool workers carry the
+ * `magic-dream-` prefix; primary sessions have no descriptor). The primary
+ * `ctx_memory` tool keeps `list` unadvertised — this tool owns enumeration.
+ */
+export function createCtxMemoryListTool(ctx: Context, opts: CtxToolsOptions): ToolDefinition {
+  const memoryTool = createCtxMemoryTool(ctx, { ...opts, allowDreamerActions: true });
+  return defineTool({
+    name: "ctx_memory_list",
+    description: CTX_MEMORY_LIST_DESCRIPTION,
+    parameters: {
+      category: {
+        type: "string",
+        enum: [...V2_MEMORY_CATEGORIES],
+        description: "Filter by memory category",
+      },
+      limit: { type: "integer", description: "Max results (default: 10)" },
+    },
+    output: { schema: TEXT_OUTPUT_SCHEMA, render: renderTextOutput },
+    async execute(args: { category?: string; limit?: number }, exec) {
+      if (!isMagicDreamerAgent(exec.agent)) {
+        return {
+          text: "Error: ctx_memory_list is only available to the dreamer agent.",
+        };
+      }
+      return memoryTool.execute(
+        { ...args, action: "list" } as CtxMemoryArgs,
+        exec,
+      ) as Promise<{ text: string }>;
+    },
+  });
+}
+
 /* ──────────────────────────────── ctx_note ─────────────────────────────── */
 
 const FILTER_VALUES = ["active", "pending", "ready", "dismissed", "all"] as const;
@@ -1612,6 +1651,7 @@ export function registerCtxTools(ctx: Context, opts: CtxToolsOptions = {}): () =
     }
     if (opts.memoryToolEnabled !== false) {
       disposers.push(registerTool(ctx, createCtxMemoryTool(ctx, opts)));
+      disposers.push(registerTool(ctx, createCtxMemoryListTool(ctx, opts)));
     }
     if (!opts.sessionScopedToolsDisabled) {
       disposers.push(registerTool(ctx, createCtxNoteTool(ctx, opts)));
