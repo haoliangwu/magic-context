@@ -7,6 +7,7 @@ import {
     pluginConfigReader,
 } from "../../config/live-run-config";
 import { getProtectedTokensTierOverrides } from "../../config/project-security";
+import { createSubcCheckoutClaimGate } from "../../features/magic-context/checkout-claim";
 import { summarizeManualDream } from "../../features/magic-context/dreamer/manual-summary";
 import { userMemoryCollectionEnabled } from "../../features/magic-context/dreamer/task-config";
 import { formatUnsupportedDreamTasks } from "../../features/magic-context/dreamer/task-registry";
@@ -40,7 +41,10 @@ import {
     getCurrentToolSetHash,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
-import type { HiddenCompletionExecutor } from "../../hooks/magic-context/compartment-runner-types";
+import {
+    type HiddenCompletionExecutor,
+    HiddenCompletionRefusal,
+} from "../../hooks/magic-context/compartment-runner-types";
 import { resolveCtxReduceAvailabilityFromMessages } from "../../hooks/magic-context/ctx-reduce-availability";
 import { DegradedPassRefusalError } from "../../hooks/magic-context/degraded-pass-refusal";
 import {
@@ -64,8 +68,15 @@ import {
     createToolExecuteAfterHook,
 } from "../../hooks/magic-context/hook-handlers";
 import { materializeM0 } from "../../hooks/magic-context/inject-compartments";
+import { armLatestThinkingRecoveryFromError } from "../../hooks/magic-context/latest-thinking-recovery";
+import {
+    beginV2LkgRequest,
+    lkgProviderInputTotal,
+    noteLkgProviderResponse,
+} from "../../hooks/magic-context/lkg-measured-request";
 import { getSlot } from "../../hooks/magic-context/lkg-slot";
 import { createModuleToolBackends } from "../../hooks/magic-context/module-tool-backends";
+import { getDefaultSubcConnectionFile } from "../../hooks/magic-context/module-transport";
 import { resolveOpenCodeProtectedTailBoundary } from "../../hooks/magic-context/protected-tail-boundary";
 import { setBoundedRawMessageProvider } from "../../hooks/magic-context/read-session-chunk";
 import { preloadTokenizer } from "../../hooks/magic-context/read-session-formatting";
@@ -82,6 +93,7 @@ import { scheduleAfterBootQuiet } from "../../plugin/boot-quiet";
 import { createMessagesTransformHandler } from "../../plugin/messages-transform";
 import { registerRpcHandlers } from "../../plugin/rpc-handlers";
 import { hideSubagentTools } from "../../plugin/subagent-tool-policy";
+import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { detectConflicts } from "../../shared/conflict-detector";
 import { getDataDir, getMagicContextStorageDir } from "../../shared/data-path";
 import { getErrorMessage } from "../../shared/error-message";
@@ -130,9 +142,10 @@ import {
 import { registerV2Commands } from "./commands";
 import { DeletedSessionTombstones } from "./deleted-session-tombstones";
 import { resolveManualDreamTask, runManualDreamNow } from "./dream-manual";
+import { registerV2DreamScheduleTimer } from "./dream-timer";
 import { startDreamTrigger } from "./dream-trigger";
 import { V2GenerateReplay } from "./generate";
-import { HiddenChildHook, registerHiddenChildAgents } from "./hidden-child";
+import { HiddenChildHook, hiddenToolCallRefusal, registerHiddenChildAgents } from "./hidden-child";
 import { hiddenTerminalError } from "./hidden-terminal-error";
 import { V2LkgSystemReplay } from "./lkg-system";
 import { modelLimitCacheWarm, warmModelLimitCacheFromCatalog } from "./model-limit-cache";
@@ -567,6 +580,10 @@ export async function registerContext(context: V2Context) {
         return;
     }
     const liveConfigReader = pluginConfigReader(directory, config);
+    const checkoutClaim = createSubcCheckoutClaimGate(
+        "opencode",
+        () => config.subc?.connection_file ?? getDefaultSubcConnectionFile(),
+    );
     const compactionOff = !isCompactionEnabled(config);
     const conflicts = detectConflicts(directory, {
         compactionEnabled: !compactionOff,
@@ -722,6 +739,19 @@ export async function registerContext(context: V2Context) {
         }
     });
     await registerHiddenChildAgents(context.agent);
+    // Registered before anything can start a hidden run. A hidden child's tool
+    // call is checked against that agent's fixed allowlist whatever the user's
+    // permissions allow: the host appends the user's rules after the agent's
+    // own, so the agent registration alone cannot keep edit or shell away.
+    await context.tool.hook("execute.before", (draft) => {
+        const refusal = hiddenToolCallRefusal(draft, hiddenChildHook);
+        if (refusal === undefined) return;
+        sessionLog(draft.sessionID, "hidden child tool call refused", {
+            tool: draft.tool,
+            agent: draft.agent ?? null,
+        });
+        throw new HiddenCompletionRefusal("hidden_prompt_unrecognized", refusal, true);
+    });
     let hiddenAgentsReady: Promise<void> | undefined;
     const readerPool = new V2StoreReaderPool();
     const openStoreReader = () =>
@@ -765,28 +795,55 @@ export async function registerContext(context: V2Context) {
         );
     };
     const dreamerAtBoot = config.dreamer;
-    const startDreamer = (executor: HiddenCompletionExecutor) =>
-        resolveProjectIdentityForSession(directory, config.allow_home_project) &&
-        dreamerAtBoot &&
-        !dreamerAtBoot.disable
-            ? startDreamTrigger(context, {
-                  config: dreamerAtBoot,
-                  sample: () => {
-                      const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
-                      return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
-                  },
-                  executor: withLiveDreamerOutputCap(
-                      executor,
-                      config,
-                      () => liveConfigReader.poll().effective,
-                  ),
-                  projectIdentity: () =>
-                      resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
-                  projectMemoryEnabled: config.memory.enabled,
-                  language: config.language,
-                  mural: config.mural,
-              })
-            : undefined;
+    /**
+     * Whether the user's current config turns the dreamer off. `dreamer.disable`
+     * is a live key: the trigger, the schedule timer and `/ctx-dream` re-read it
+     * before every run, and a dreamer turned on after boot is started by the
+     * next context pass (see `runManagedContext`).
+     */
+    const dreamerDisabledNow = (): boolean =>
+        dreamerRunConfig(config, liveConfigReader.poll().effective).dreamer?.disable === true;
+    const startDreamer = (executor: HiddenCompletionExecutor) => {
+        const projectIdentity = resolveProjectIdentityForSession(
+            directory,
+            config.allow_home_project,
+        );
+        if (!projectIdentity || !dreamerAtBoot || dreamerDisabledNow()) return undefined;
+        const cappedExecutor = withLiveDreamerOutputCap(
+            executor,
+            config,
+            () => liveConfigReader.poll().effective,
+        );
+        const trigger = startDreamTrigger(context, {
+            config: dreamerAtBoot,
+            sample: () => {
+                const current = dreamerRunConfig(config, liveConfigReader.poll().effective);
+                return { config: current.dreamer ?? dreamerAtBoot, mural: current.mural };
+            },
+            executor: cappedExecutor,
+            projectIdentity: () =>
+                resolveProjectIdentityForSession(directory, config.allow_home_project) ?? "",
+            projectMemoryEnabled: config.memory.enabled,
+            language: config.language,
+            mural: config.mural,
+        });
+        // The trigger runs due tasks after a session turn; the schedule timer runs
+        // them on their cron schedule when nobody is chatting.
+        const timer = registerV2DreamScheduleTimer({
+            directory,
+            projectIdentity,
+            config,
+            dreamer: dreamerAtBoot,
+            liveConfig: () => liveConfigReader.poll().effective,
+            executor: cappedExecutor,
+            openReader: openStoreReader,
+        });
+        return {
+            async dispose() {
+                await Promise.all([trigger.dispose(), timer.dispose()]);
+            },
+        };
+    };
     // Both stay undefined after a refused start until recoverHiddenWork wires them.
     let hiddenCompletionExecutor: HiddenCompletionExecutor | undefined =
         db &&
@@ -883,6 +940,18 @@ export async function registerContext(context: V2Context) {
         }
     });
     const pagedRead = createV2RawMessageReader(openStoreReader);
+    // Commands can precede the first context pass after a restart. Their background
+    // historian reads need the same durable v2 source as automatic historian work.
+    const prepareHistorySession = (sessionID: string): void => {
+        if (!rawProviders.has(sessionID))
+            rawProviders.set(
+                sessionID,
+                setBoundedRawMessageProvider(
+                    sessionID,
+                    createV2RawMessageProvider(pagedRead, sessionID),
+                ),
+            );
+    };
     if (db && isDatabasePersisted(db)) {
         const backfillDb = db;
         scheduleAfterBootQuiet(() => {
@@ -985,6 +1054,7 @@ export async function registerContext(context: V2Context) {
      * when that could not be done safely (the context database is not durable, or a
      * store could not be read); the usage figure itself never makes a turn unsafe.
      */
+    const latestLkgResponseIds = new BoundedSessionMap<string | undefined>(1000);
     const recordUsage = async (
         draft: Pick<SessionContext, "sessionID" | "model">,
     ): Promise<boolean> => {
@@ -998,6 +1068,22 @@ export async function registerContext(context: V2Context) {
             const reader = openStoreReader();
             try {
                 const latest = reader.latestAssistant(draft.sessionID);
+                latestLkgResponseIds.set(draft.sessionID, latest?.id);
+                if (latest)
+                    noteLkgProviderResponse({
+                        sessionId: draft.sessionID,
+                        responseId: latest.id,
+                        modelKey:
+                            latest.data.model?.providerID && latest.data.model?.id
+                                ? `${latest.data.model.providerID}/${latest.data.model.id}`
+                                : undefined,
+                        inputTokens: lkgProviderInputTotal(latest.data.tokens),
+                        completedAt: latest.data.time?.completed,
+                        createdAt: latest.data.time?.created ?? latest.time_created,
+                        finish: latest.data.finish,
+                        error: latest.data.error,
+                        v2: true,
+                    });
                 const draftModelKey = `${draft.model.providerID}/${draft.model.id}`;
                 if (!queriedModels.has(draftModelKey)) {
                     const catalog = await Promise.resolve(context.model.list());
@@ -1091,6 +1177,20 @@ export async function registerContext(context: V2Context) {
                 if (event.type === "session.error" || event.type === "session.execution.failed") {
                     const error = hiddenTerminalError(event);
                     if (error !== undefined) hiddenSessionErrors.set(sessionID, error);
+                    if (error !== undefined && db && !compactionOff) {
+                        const model = liveModels.get(sessionID);
+                        try {
+                            armLatestThinkingRecoveryFromError({
+                                db,
+                                sessionId: sessionID,
+                                error,
+                                providerID: model?.providerID,
+                                modelID: model?.modelID,
+                            });
+                        } catch (armError) {
+                            log("[magic-context] v2 latest-thinking recovery arm failed", armError);
+                        }
+                    }
                     continue;
                 }
                 if (event.type === "session.deleted") {
@@ -1170,7 +1270,7 @@ export async function registerContext(context: V2Context) {
         // checkpoint recognizable to the hidden-child guard. This holds even with
         // Magic Context's compaction off, where the host would otherwise summarize
         // the child with a model call and lose the marker.
-        const hiddenSummary = hiddenChildHook.compactionSummary(draft.sessionID);
+        const hiddenSummary = hiddenChildHook.compactionSummary(draft.sessionID, draft.agent);
         if (hiddenSummary !== undefined) {
             draft.result = { summary: hiddenSummary };
             return;
@@ -1235,10 +1335,33 @@ export async function registerContext(context: V2Context) {
         // after a host checkpoint can be rebuilt in the host's own shape.
         rememberHostMedia(draft.messages);
         if (hiddenChildHook.apply(draft)) return;
+        // A dreamer that was off at boot and has since been turned on in the
+        // config starts here; startDreamer stays a no-op while it is off.
+        if (dreamTrigger === undefined && hiddenCompletionExecutor !== undefined)
+            dreamTrigger = startDreamer(hiddenCompletionExecutor);
         removeDreamerOnlyTools(draft);
         // A deletion that races an in-flight pass must not let that pass rebuild
         // the state just cleared by the one deletion event.
         if (deletedSessions.has(draft.sessionID)) return;
+        // Before anything below writes for this session: refuse the turn when
+        // another machine holds the session's agent. This holds in compaction-off
+        // mode too; passing the draft through would keep working on an agent this
+        // machine does not hold.
+        const claimRefusal = await checkoutClaim.refusal(draft.sessionID, directory);
+        if (claimRefusal) {
+            pushNotification(
+                "toast",
+                { message: claimRefusal.message, variant: "error" },
+                draft.sessionID,
+            );
+            await refuseBeforeProvider(
+                context.session,
+                draft.sessionID,
+                "checkout-claim-held-elsewhere",
+                claimRefusal,
+            );
+            throw new V2ContextRefusal(claimRefusal.message, { cause: claimRefusal });
+        }
         const systemAtEntry = structuredClone(draft.system);
         const slotAtEntry = getSlot(draft.sessionID);
         const restoreLkgSystem = () => {
@@ -1393,16 +1516,11 @@ export async function registerContext(context: V2Context) {
             await cacheV2SessionDirectory(context.session, draft.sessionID, sessionDirectories);
             // Background historian reads outlive the context callback. Keep its source
             // registered until plugin disposal, rather than falling back to the v1 store.
-            if (!rawProviders.has(draft.sessionID))
-                rawProviders.set(
-                    draft.sessionID,
-                    setBoundedRawMessageProvider(
-                        draft.sessionID,
-                        createV2RawMessageProvider(pagedRead, draft.sessionID),
-                    ),
-                );
+            prepareHistorySession(draft.sessionID);
             transform ??= createTransform({
                 cacheTtlConfig: config.cache_ttl,
+                cacheTtlConfigured: config.cacheTtlConfigured,
+                sampleCacheTtlConfig: () => liveConfigReader.poll().effective,
                 db,
                 tagger,
                 ...createV2ThresholdDeps(config),
@@ -1437,7 +1555,7 @@ export async function registerContext(context: V2Context) {
                 pendingMaterializationSessions,
                 lastHeuristicsTurnId,
                 variantBySession: variants,
-                clearReasoningAge: config.clear_reasoning_age,
+                keepReasoningTokens: config.keep_reasoning_tokens,
                 directory,
                 sessionDirectoryBySession: sessionDirectories,
                 projectPath: directory,
@@ -1648,6 +1766,11 @@ export async function registerContext(context: V2Context) {
                     );
             }
             const mapped = adaptPayload(draft, admitted);
+            beginV2LkgRequest(
+                draft.sessionID,
+                `${draft.model.providerID}/${draft.model.id}`,
+                latestLkgResponseIds.get(draft.sessionID),
+            );
             await createMessagesTransformHandler({
                 magicContext: { "experimental.chat.messages.transform": transform },
                 compactionOff,
@@ -1864,16 +1987,18 @@ export async function registerContext(context: V2Context) {
         hiddenCompletionExecutor: storageOpenedAtBoot
             ? hiddenCompletionExecutor
             : lateHiddenExecutor,
+        compactionMarkerStrategy: v2CompactionMarkerStrategy,
+        prepareHistorySession,
         storageDir,
     });
     // The v2 TUI reaches manual dreaming through RPC because this host has no
     // command-template path. The run continues in the background and reports its
     // result through the notification socket.
-    const manualDreamer =
-        config.dreamer && config.dreamer.disable !== true ? config.dreamer : undefined;
     rpcServer.handle("dream", async (params) => {
         const sessionId = String(params.sessionId ?? "");
         if (!sessionId) return { ok: false, error: "no session" };
+        // Read per request: `dreamer.disable` takes effect without a restart.
+        const manualDreamer = config.dreamer && !dreamerDisabledNow() ? config.dreamer : undefined;
         if (!manualDreamer || !hiddenCompletionExecutor) {
             pushNotification(
                 "toast",

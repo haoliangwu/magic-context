@@ -10,7 +10,7 @@ import type { ModelInput } from "../../../shared/model-resolution";
 import { modelBodyField } from "../../../shared/resolve-fallbacks";
 import type { Database } from "../../../shared/sqlite";
 
-import { createSmartNoteCapabilities } from "../smart-notes/capabilities";
+import { createSmartNoteCapabilities, readSmartNoteGithubToken } from "../smart-notes/capabilities";
 import { compileSmartNoteCheck } from "../smart-notes/compiler";
 import { runDueCompiledSmartNoteChecks } from "../smart-notes/runner";
 import { runCompiledSmartNoteCheck } from "../smart-notes/sandbox-runner";
@@ -121,6 +121,7 @@ export async function evaluateSmartNotes(
         log("[dreamer] smart notes: no pending notes");
         return { surfaced: 0, pending: 0, ran: false };
     }
+    const githubToken = await readSmartNoteGithubToken();
 
     let leaseLost = false;
     const leaseAbortController = new AbortController();
@@ -157,6 +158,7 @@ export async function evaluateSmartNotes(
             leaseHeld,
             signal: leaseAbortController.signal,
             retinaHandoff: args.retinaHandoff,
+            githubToken,
         });
         surfaced += dueRun.surfaced;
         didWork ||= dueRun.ran > 0;
@@ -176,6 +178,7 @@ export async function evaluateSmartNotes(
                 args,
                 note,
                 projectRoot,
+                githubToken,
                 assertLeaseHeld,
                 leaseHeld,
                 leaseAbortController.signal,
@@ -198,6 +201,7 @@ export async function evaluateSmartNotes(
                 args,
                 note,
                 projectRoot,
+                githubToken,
                 assertLeaseHeld,
                 leaseHeld,
                 leaseAbortController.signal,
@@ -257,6 +261,7 @@ async function compileNote(
     args: EvaluateSmartNotesArgs,
     note: SmartNoteCheckNote,
     projectRoot: string,
+    githubToken: string | null,
     assertLeaseHeld: (phase: string) => void,
     leaseHeld: () => boolean,
     leaseSignal: AbortSignal,
@@ -275,7 +280,8 @@ async function compileNote(
             sessionDirectory: args.sessionDirectory,
             projectIdentity: args.projectIdentity,
             note,
-            capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
+            capabilityFactory: (signal) =>
+                createSmartNoteCapabilities({ projectRoot, signal, githubToken }),
             signal: promptSignal.signal,
             deadline: args.deadline,
             model: args.model,
@@ -346,6 +352,7 @@ async function runLivenessCheck(
     args: EvaluateSmartNotesArgs,
     note: SmartNoteCheckNote,
     projectRoot: string,
+    githubToken: string | null,
     assertLeaseHeld: (phase: string) => void,
     leaseHeld: () => boolean,
     leaseSignal: AbortSignal,
@@ -354,9 +361,9 @@ async function runLivenessCheck(
     const compiledCheck = note.compiledCheck;
     const result = await runCompiledSmartNoteCheck({
         compiledCheck,
-        capabilityFactory: (signal) => createSmartNoteCapabilities({ projectRoot, signal }),
+        capabilityFactory: (signal) =>
+            createSmartNoteCapabilities({ projectRoot, signal, githubToken }),
         signal: leaseSignal,
-        timeoutMs: 2_000,
     });
     if (!result.ok && result.cancelled) return false;
 

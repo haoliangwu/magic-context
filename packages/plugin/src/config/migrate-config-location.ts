@@ -1,18 +1,11 @@
-import {
-    closeSync,
-    existsSync,
-    mkdirSync,
-    openSync,
-    readFileSync,
-    renameSync,
-    rmSync,
-    statSync,
-    unlinkSync,
-    writeFileSync,
-} from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { removeJsoncValue } from "../shared/jsonc-edit";
+import {
+    ensureStorageDirectorySync,
+    writeStorageFileAtomicSync,
+} from "../shared/storage-permissions";
 
 /**
  * Config-LOCATION migration: move Magic Context config from the per-harness
@@ -285,7 +278,7 @@ function sortJson(value: unknown): unknown {
     if (value && typeof value === "object") {
         const sorted: Record<string, unknown> = {};
         for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-            if (key === "protected_tags") continue;
+            if (key === "protected_tags" || key === "clear_reasoning_age") continue;
             sorted[key] = sortJson((value as Record<string, unknown>)[key]);
         }
         return sorted;
@@ -328,7 +321,7 @@ const CONFIG_LOCK_STALE_MS = 4_000;
 function acquireConfigMigrationLock(lockDir: string): (() => void) | null {
     for (let attempt = 0; attempt < 2; attempt++) {
         try {
-            mkdirSync(lockDir, { recursive: false });
+            ensureStorageDirectorySync(lockDir, true, false);
             return () => {
                 try {
                     rmSync(lockDir, { recursive: true, force: true });
@@ -361,33 +354,7 @@ function acquireConfigMigrationLock(lockDir: string): (() => void) | null {
 // ── Atomic writes ────────────────────────────────────────────
 
 function atomicWriteConfigFile(targetPath: string, content: string): void {
-    mkdirSync(dirname(targetPath), { recursive: true });
-    const tmpPath = join(
-        dirname(targetPath),
-        `.${basename(targetPath)}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`,
-    );
-    let fd: number | null = null;
-    try {
-        fd = openSync(tmpPath, "wx", 0o600);
-        writeFileSync(fd, content);
-        closeSync(fd);
-        fd = null;
-        renameSync(tmpPath, targetPath);
-    } catch (err) {
-        if (fd !== null) {
-            try {
-                closeSync(fd);
-            } catch {
-                // best-effort close before cleanup
-            }
-        }
-        try {
-            unlinkSync(tmpPath);
-        } catch {
-            // best-effort temp cleanup
-        }
-        throw err;
-    }
+    writeStorageFileAtomicSync(targetPath, content, true);
 }
 
 // ── Marker ───────────────────────────────────────────────────
@@ -483,7 +450,7 @@ export function migrateConfigFile(opts: ConfigFileMigrationOptions): ConfigFileM
         return { migrated: false, conflict: false, targetPath: opts.targetPath, warnings };
     }
 
-    mkdirSync(dirname(opts.targetPath), { recursive: true });
+    ensureStorageDirectorySync(dirname(opts.targetPath), true);
     const release = acquireConfigMigrationLock(`${opts.targetPath}.lock`);
     if (!release) {
         // Another instance holds the lock past our short budget. Skip rather than
@@ -542,7 +509,9 @@ export function migrateConfigFile(opts: ConfigFileMigrationOptions): ConfigFileM
         let migratedContent = first.content;
         let strippedProtectedTags = false;
         try {
-            const stripped = removeJsoncValue(first.content, ["protected_tags"]);
+            const stripped = removeJsoncValue(removeJsoncValue(first.content, ["protected_tags"]), [
+                "clear_reasoning_age",
+            ]);
             if (stripped !== first.content) {
                 migratedContent = stripped;
                 strippedProtectedTags = true;
@@ -553,7 +522,12 @@ export function migrateConfigFile(opts: ConfigFileMigrationOptions): ConfigFileM
 
         atomicWriteConfigFile(opts.targetPath, migratedContent);
         if (strippedProtectedTags) {
-            info?.(`Stripped deprecated "protected_tags" key during config location migration`);
+            if (first.content.includes('"protected_tags"'))
+                info?.(`Stripped deprecated "protected_tags" key during config location migration`);
+            if (first.content.includes('"clear_reasoning_age"'))
+                info?.(
+                    `Stripped deprecated "clear_reasoning_age" key during config location migration`,
+                );
         }
         info?.(
             `Migrated Magic Context ${opts.scope} config from ${first.path} to ${opts.targetPath}`,

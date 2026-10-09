@@ -6,7 +6,10 @@ import {
 import { getSourceContents } from "@magic-context/core/features/magic-context/storage-source";
 import type { TagEntry } from "@magic-context/core/features/magic-context/types";
 import { stripSystemInjection } from "@magic-context/core/hooks/magic-context/system-injection-stripper";
-import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
+import {
+	peelLeadingMcTagNotation,
+	stripTagPrefix,
+} from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import { withoutPiLeadingTemporalMarker } from "./temporal-awareness-pi";
 
@@ -62,10 +65,11 @@ export function replayPiReminderStrips(args: {
 		const decision = encodePiContentDecision("reminder-strip", tag.messageId);
 		let frozen = decisions.has(decision);
 		const source = sources.get(tag.tagNumber) ?? "";
+		const legacyTemporalOnly =
+			source.trimStart().startsWith("<!-- +") &&
+			withoutPiLeadingTemporalMarker(`${source}\n`).trim().length === 0;
 		const legacyProjection =
-			args.legacyReminderTagNumbers.has(tag.tagNumber) ||
-			(source.trimStart().startsWith("<!-- +") &&
-				withoutPiLeadingTemporalMarker(`${source}\n`).trim().length === 0);
+			args.legacyReminderTagNumbers.has(tag.tagNumber) || legacyTemporalOnly;
 		if (
 			!frozen &&
 			args.cacheBusting &&
@@ -81,6 +85,14 @@ export function replayPiReminderStrips(args: {
 			frozen = true;
 		}
 		if (stripped === null) continue;
+		// Old releases persisted the exact marker-only projection, not the raw
+		// reminder. Replay that evidence even before the next rebuild adopts it.
+		if (legacyTemporalOnly) {
+			target?.setContent?.(
+				peelLeadingMcTagNotation(content).tagPrefix + source,
+			);
+			continue;
+		}
 		// Older releases stored the stripped body. Its exact defer projection must
 		// survive until a priced pass freezes the normal reminder-strip decision.
 		const legacyStripped =

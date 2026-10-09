@@ -3,10 +3,12 @@
 import { afterAll, beforeAll, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createTestTempDir } from "../../plugin/src/shared/test-temp-dir";
 import { TestHarness } from "../src/harness";
 import { buildMockHistorianPayload, findHistorianOrdinalRange } from "../src/mock-historian";
+import { assertOpenPaths } from "../src/opencode2-runner/spawn";
 
 /**
  * A native OpenCode compaction (`/compact`) on a Magic Context session.
@@ -147,26 +149,44 @@ function mainRequestBodies(): string[] {
         .map((request) => JSON.stringify(request.body));
 }
 
-/**
- * Every OpenCode or Magic Context store the OpenCode process holds open must live
- * under the harness data dir. (The embedding runtime also opens its own telemetry
- * database under the user's Library; that is neither store and is not checked.)
- */
+function assertThrowawayDatabasePaths(databases: string[], dataDir: string): void {
+    const canonicalData = realpathSync(dataDir);
+    const paths = databases.map((path) => realpathSync(path));
+    expect(paths.some((path) => path.endsWith("opencode.db") && path.startsWith(`${canonicalData}/`))).toBe(true);
+    expect(paths.some((path) => path.endsWith("context.db") && path.startsWith(`${canonicalData}/`))).toBe(true);
+    // CFFIXED_USER_HOME puts ONNX telemetry under private HOME, still inside the fixture root.
+    const root = realpathSync(dirname(dataDir));
+    assertOpenPaths(paths, root);
+}
+
 function assertOpenDatabasesAreThrowaway(): void {
     const result = spawnSync("lsof", ["-p", String(h.opencode.pid), "-Fn"], {
         encoding: "utf8",
+        windowsHide: true,
     });
     const dataDir = realpathSync(h.dataDir);
     const databases = result.stdout
         .split("\n")
         .filter((line) => line.startsWith("n") && /\.db(-wal|-shm)?$/.test(line))
-        .map((line) => line.slice(1))
-        .filter((path) => /opencode|cortexkit|magic-context|context\.db/.test(path));
-    expect(databases.some((path) => path.endsWith("opencode.db"))).toBe(true);
-    expect(databases.some((path) => path.endsWith("context.db"))).toBe(true);
-    const outside = databases.filter((path) => !realpathSync(path).startsWith(dataDir));
-    expect(outside).toEqual([]);
+        .map((line) => line.slice(1));
+    assertThrowawayDatabasePaths(databases, dataDir);
 }
+
+it("native compaction database fence rejects a database outside the complete throwaway root", () => {
+    const fixture = createTestTempDir("native-compaction-fence-");
+    try {
+        const root = join(fixture.dir, "host");
+        const data = join(root, "data");
+        mkdirSync(data, { recursive: true });
+        const paths = [join(data, "opencode.db"), join(data, "context.db"), join(root, "onnxruntime.db")];
+        const outside = join(fixture.dir, "outside.db");
+        for (const path of [...paths, outside]) writeFileSync(path, "path-fence fixture");
+        expect(() => assertThrowawayDatabasePaths(paths, data)).not.toThrow();
+        expect(() => assertThrowawayDatabasePaths([...paths, outside], data)).toThrow("forbidden");
+    } finally {
+        fixture.cleanup();
+    }
+});
 
 it(
     "re-anchors the baseline once on the first pass after /compact",

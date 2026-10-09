@@ -1,5 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+    existsSync,
+    mkdirSync,
+    readFileSync,
+    rmSync,
+    statSync,
+    utimesSync,
+    writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTestTempDirFromPath } from "../shared/test-temp-dir";
@@ -18,6 +26,28 @@ function src(path: string, label = "legacy"): LegacyConfigSource {
 }
 
 describe("migrateConfigFile (location migration)", () => {
+    it("writes a user config migration with owner-only permissions", () => {
+        if (process.platform === "win32") return;
+        const dir = tmp();
+        try {
+            const target = join(dir, "config", "cortexkit", "magic-context.jsonc");
+            const legacy = join(dir, "legacy.jsonc");
+            writeFileSync(legacy, '{ "api_key": "secret" }\n');
+
+            const result = migrateConfigFile({
+                scope: "user",
+                targetPath: target,
+                legacySources: [src(legacy)],
+            });
+
+            expect(result.migrated).toBe(true);
+            expect(statSync(target).mode & 0o777).toBe(0o600);
+            expect(statSync(join(dir, "config", "cortexkit")).mode & 0o777).toBe(0o700);
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
     it("no-ops when no legacy source exists", () => {
         const dir = tmp();
         try {

@@ -19,6 +19,11 @@ export const SESSION_SCOPED_TABLES: readonly SessionScopedTableDefinition[] = [
     { table: "tool_owner_backfill_state" },
     { table: "tags", harnessScoped: true },
     { table: "session_meta", harnessScoped: true },
+    {
+        table: "temporal_decisions",
+        extraPredicate:
+            "NOT EXISTS (SELECT 1 FROM session_meta AS remaining WHERE remaining.session_id = temporal_decisions.session_id)",
+    },
     // Replay decisions belong to the session's metadata row; a harness sweep that
     // keeps another harness's row keeps them too.
     {

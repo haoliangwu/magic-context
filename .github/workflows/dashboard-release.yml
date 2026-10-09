@@ -41,6 +41,20 @@ jobs:
             } catch (e) {
               if (e.status !== 404) throw e;
             }
+            // getReleaseByTag never returns drafts. A failed attempt leaves its draft
+            // behind, and the retry re-creates the tag on a new commit; without this
+            // lookup the retry would create a second draft with the same tag. Reuse the
+            // draft and clear its assets: every leg of this run uploads fresh ones, so
+            // nothing built from the earlier commit can end up in the release.
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            const draft = releases.find((r) => r.draft && r.tag_name === ref);
+            if (draft) {
+              for (const asset of draft.assets) {
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+              }
+              core.info(`Reusing draft release ${draft.id} for ${ref}; cleared ${draft.assets.length} earlier assets`);
+              return String(draft.id);
+            }
             const created = await github.rest.repos.createRelease({
               owner, repo,
               tag_name: ref,
@@ -117,7 +131,9 @@ jobs:
         if: contains(matrix.settings.host, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          # xdg-utils: the AppImage bundler copies xdg-open in for the opener plugin
+          # (help links open in the browser). The x64 image ships it; ARM64 does not.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
 
       - name: Install dependencies
         run: bun install

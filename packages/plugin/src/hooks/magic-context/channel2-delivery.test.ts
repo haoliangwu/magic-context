@@ -11,6 +11,7 @@ import {
     setChannel2NudgeState,
     updateSessionMeta,
 } from "../../features/magic-context/storage";
+import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { Database } from "../../shared/sqlite";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
@@ -684,10 +685,41 @@ describe("maybeDeliverChannel2", () => {
                 db,
                 sessionId,
                 baseline: channel2Baseline(24_999, 80_000),
+                rebuilding: true,
             }),
         ).toBe(true);
         expect(casChannel2NudgeState(db, sessionId, "", "pending")).toBe(true);
         expect(await maybeDeliverChannel2(sessionId, deps)).toBe(true);
         expect(promptAsync).toHaveBeenCalledTimes(2);
     });
+});
+it("an unchanged replay below the nudge floor is not a new collapse, but queued mass can collapse", () => {
+    const db = new Database(":memory:");
+    initializeDatabase(db);
+    const sessionId = "channel2-replay-collapse";
+    try {
+        setChannel2NudgeState(db, sessionId, "delivered");
+        expect(
+            rearmChannel2AfterMeasuredCollapse({
+                db,
+                sessionId,
+                rebuilding: false,
+                previous: channel2Baseline(20000, 80000),
+                baseline: channel2Baseline(20000, 80000),
+            }),
+        ).toBe(false);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("delivered");
+        expect(
+            rearmChannel2AfterMeasuredCollapse({
+                db,
+                sessionId,
+                rebuilding: false,
+                previous: channel2Baseline(75000, 100000),
+                baseline: channel2Baseline(20000, 80000),
+            }),
+        ).toBe(true);
+        expect(getChannel2NudgeState(db, sessionId)).toBe("");
+    } finally {
+        db.close();
+    }
 });

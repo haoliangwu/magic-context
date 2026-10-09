@@ -31,15 +31,17 @@ Every automatic lane that removes or shrinks a tool result:
 
 All four already pass candidates through one eligibility check (`canDrop` in TypeScript and Pi, the automatic-reduction filter in Rust), next to the user-answer rule from issue 581. Protection is added there, once.
 
-Not affected:
+Agent-directed and non-tool policies:
 
-- `ctx_reduce`: an explicit drop by the agent still works.
-- The historian: summarised results leave the prompt as usual.
-- The frozen strips (old images, stale `ctx_reduce` calls, placeholder-only messages), which don't select tool results by name.
+- Queued drops of a protected result, from the agent or from historian publication, are held; the historian's summary is unaffected, and the raw result leaves at the next fold.
+- Agent drops apply on a later cache-rebuilding pass once newer calls displace the result from its tool's protected count; already-dropped results are never restored. Compacted results are no longer active and stop counting toward N.
+- First detection of stale `ctx_reduce` stripping honours the effective protected tool set, just like other automatic result removal. Frozen strip replay is immutable: changing the map never resurrects an already-stripped result. Image and placeholder-only strips keep their separate structural policies.
 
 ## At 95% and above
 
 Today the protected tail and the tier reserve stop protecting at 95%. Protected tools keep holding, like user answers and the newest `ctx_reduce` results do now: the user asked for them explicitly, and N bounds how much they can pin. The cost is that protecting a tool with large outputs can bring a session to the 95% refusal sooner. The setting's description says so. There is no byte cap.
+
+The new pre-send refusal applies only when refusal-grade evidence proves that the calibrated protected results alone exceed the model's window after reclaim. If that subset is absent or fits, every existing fold, send and provider-overflow refusal decision stays unchanged. An over-limit full-request estimate or usage from an accepted reply must not prevent the provider from receiving a turn, reporting overflow and letting Magic Context learn the limit and fold. Default configuration must preserve the existing wire bytes and decisions except where its protected counts deliberately change result eligibility.
 
 ## Cache safety
 

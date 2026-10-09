@@ -1,3 +1,4 @@
+import { getUncoveredCompartmentEndsThrough } from "../../features/magic-context/compartment-storage";
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import {
     getPersistedCompactionMarkerState,
@@ -5,6 +6,11 @@ import {
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
 import type { MarkerUpdateOutcome } from "../../hooks/magic-context/compaction-marker-manager";
+import {
+    hasRawMessageProvider,
+    readRawSessionMessageIdOrdinalsForRange,
+    readRawSessionMessageOrdinalById,
+} from "../../hooks/magic-context/read-session-chunk";
 import type { RawMessage } from "../../hooks/magic-context/read-session-raw";
 import type { CompactionMarkerStrategy } from "../../hooks/magic-context/transform-postprocess-phase";
 import { sessionLog } from "../../shared/logger";
@@ -76,6 +82,7 @@ export function createV2RustCompactionMarkerStrategy(
             } catch (error) {
                 return {
                     kind: "retryable-failure",
+                    cut: "definitely-no-cut",
                     error: error instanceof Error ? error : new Error(String(error)),
                 };
             }
@@ -84,6 +91,7 @@ export function createV2RustCompactionMarkerStrategy(
                 // previous boundary in place rather than dropping back to full history.
                 return {
                     kind: "retryable-failure",
+                    cut: "definitely-no-cut",
                     error: new Error(
                         `no user boundary found at or before endMessageId ${pending.endMessageId} (ordinal ${pending.ordinal}); preserving existing boundary`,
                     ),
@@ -145,7 +153,7 @@ export function createV2RustCompactionMarkerStrategy(
 export function trimToRecordedBoundary(
     db: ContextDatabase,
     sessionId: string,
-    messages: Array<{ id?: string }>,
+    messages: Array<{ id?: string; role?: string; ordinal?: number }>,
 ): number {
     const marker = getPersistedCompactionMarkerState(db, sessionId);
     const boundaryId = marker?.boundaryMessageId;
@@ -162,23 +170,88 @@ export function trimToRecordedBoundary(
     // cannot be required to equal end+1 or 0; the ordinal continuation is what
     // proves nothing was skipped. The latest compartment has no successor, so its
     // indexed end always stays protected, and so does any end followed by a gap.
-    const partial = db
+    const uncovered = new Set(
+        getUncoveredCompartmentEndsThrough(db, sessionId).map((end) => end.endMessageId),
+    );
+    let partialIndex = messages.findIndex(
+        (message) => message.id !== undefined && uncovered.has(message.id),
+    );
+    // Endpoint visibility is not coverage of the raw span: a host cut/revert can
+    // remove an old endpoint but leave a real message in its successor gap.
+    // Resolve the visible prefix in the host's actual ordinal space. The provider
+    // range read returns ids only, never decodes full-history message bodies.
+    const ranges = db
         .prepare(
-            `SELECT k.end_message_id FROM compartments k
-             LEFT JOIN compartments n ON n.session_id = k.session_id AND n.sequence = k.sequence + 1
-             WHERE k.session_id = ?1 AND k.end_block_index IS NOT NULL
-               AND NOT (n.sequence IS NOT NULL AND (
-                   (n.start_message_id = k.end_message_id AND n.start_block_index > k.end_block_index)
-                   OR n.start_message = k.end_message + 1))
-             ORDER BY k.sequence LIMIT 1`,
+            "SELECT start_message AS start, end_message AS end FROM compartments WHERE session_id=? ORDER BY start_message, end_message",
         )
-        .get(sessionId) as { end_message_id: string } | undefined;
-    const partialIndex = partial
-        ? messages.findIndex((message) => message.id === partial.end_message_id)
-        : -1;
+        .all(sessionId) as Array<{ start: number; end: number }>;
+    const coveredRanges: Array<{ start: number; end: number }> = [];
+    for (const range of ranges) {
+        if (
+            !Number.isSafeInteger(range.start) ||
+            !Number.isSafeInteger(range.end) ||
+            range.start < 0 ||
+            range.end < range.start
+        )
+            continue;
+        const previous = coveredRanges.at(-1);
+        if (previous && range.start <= previous.end + 1)
+            previous.end = Math.max(previous.end, range.end);
+        else coveredRanges.push({ ...range });
+    }
+    const covers = (ordinal: number | undefined): boolean => {
+        if (ordinal === undefined || !Number.isSafeInteger(ordinal)) return false;
+        let low = 0,
+            high = coveredRanges.length - 1;
+        while (low <= high) {
+            const middle = (low + high) >>> 1;
+            const range = coveredRanges[middle];
+            if (!range) return false;
+            if (ordinal < range.start) high = middle - 1;
+            else if (ordinal > range.end) low = middle + 1;
+            else return true;
+        }
+        return false;
+    };
+    let ordinals: Map<string, number> | undefined;
+    const prefix = messages.slice(0, start);
+    if (
+        !prefix.every(
+            (message) => Number.isSafeInteger(message.ordinal) && (message.ordinal ?? -1) >= 1,
+        )
+    ) {
+        if (!hasRawMessageProvider(sessionId)) return 0;
+        try {
+            const cutOrdinal = readRawSessionMessageOrdinalById(sessionId, boundaryId);
+            if (cutOrdinal === null || cutOrdinal <= 1) return 0;
+            ordinals = readRawSessionMessageIdOrdinalsForRange(sessionId, 1, cutOrdinal - 1);
+        } catch {
+            return 0;
+        }
+    }
+    for (let index = 0; index < start; index++) {
+        const message = messages[index];
+        if (!message) return 0;
+        const ordinal = ordinals
+            ? message.id
+                ? ordinals.get(message.id)
+                : undefined
+            : message.ordinal;
+        const covered = covers(ordinal);
+        if (!covered) {
+            partialIndex = partialIndex >= 0 ? Math.min(partialIndex, index) : index;
+            break;
+        }
+    }
     // The recorded cut can predate this guard; never remove a visible
     // partially covered message even when that old cut lies after it.
-    const safeStart = partialIndex >= 0 ? Math.min(start, partialIndex) : start;
+    let safeStart = partialIndex >= 0 ? Math.min(start, partialIndex) : start;
+    if (partialIndex >= 0 && partialIndex < start) {
+        // A partial assistant/tool endpoint is not a valid turn boundary. Roll
+        // back to its user; if roles or that user are absent, do not guess a cut.
+        while (safeStart > 0 && messages[safeStart]?.role !== "user") safeStart--;
+        if (messages[safeStart]?.role !== "user") return 0;
+    }
     if (safeStart <= 0) return 0;
     messages.splice(0, safeStart);
     return safeStart;

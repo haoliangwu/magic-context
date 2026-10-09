@@ -328,6 +328,23 @@ export function markSmartNoteCompilationFailure(
     uncheckable = false,
 ): void {
     db.transaction(() => {
+        // Retryable transport failures have their own backoff counter. They must
+        // not spend logic strikes, even if a later attempt has a genuine bug.
+        if (!persistent && retryAt !== undefined) {
+            const networkFailureCount =
+                readFailureCount(db, noteId, "check_network_failure_count") + 1;
+            db.prepare(
+                `UPDATE notes SET check_network_failure_count = ?, check_status = 'uncompiled',
+                 check_next_due_at = ?, ready_reason = NULL, updated_at = ?
+                 WHERE id = ? AND type = 'smart'`,
+            ).run(
+                networkFailureCount,
+                Math.max(now + backoffMs(networkFailureCount), retryAt),
+                now,
+                noteId,
+            );
+            return;
+        }
         const failureCount = readFailureCount(db, noteId, "check_failure_count") + 1;
         // Body-size failures can be reauthored later. Inaccessible sources cannot
         // improve by retrying the same unauthenticated check; only a condition edit

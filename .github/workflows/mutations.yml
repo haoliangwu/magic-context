@@ -1,0 +1,178 @@
+name: Mutations
+
+# Mutation proofs (mutations.toml, replayed by ck-mutate): each row breaks one
+# production guard and requires its named test to fail. See README.md,
+# "Mutation catalogue".
+#
+#   pull_request, push to train/**   rows the change touches (`run --diff`)
+#   push to master/main              the full catalogue, sharded
+#   nightly schedule, dispatch       the full catalogue with `--broad`, sharded
+#
+# The timeouts below are first ceilings, not measurements. Tighten them from the
+# GitHub runner timings these jobs report (each row's build_ms/test_ms is in the
+# uploaded JSON report); a developer machine's timings say nothing about them.
+
+on:
+  pull_request:
+  push:
+    branches: [master, main, "train/**"]
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes the older run. A master push and the
+# nightly audit always finish, so a later run never cancels either.
+concurrency:
+  group: mutations-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: never
+  # The reviewed cortexkit/commons revision ck-mutate is built from (0.7.0).
+  CK_MUTATE_REV: 7d08e73722fa3e79bbcc2607753978ab768f1c6b
+  # package.json's packageManager pin. Replays must use one Bun version so a
+  # row's catch never depends on which release a runner happened to install.
+  BUN_VERSION: 1.4.2
+
+jobs:
+  check:
+    name: Catalogue check
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/cache@v4
+        id: mutate-cache
+        with:
+          path: ~/.cargo/bin/ck-mutate
+          key: ${{ runner.os }}-${{ runner.arch }}-ck-mutate-${{ env.CK_MUTATE_REV }}
+      - name: Install pinned mutation runner
+        if: steps.mutate-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-mutations-cargo-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-mutations-cargo-${{ hashFiles('Cargo.lock') }}-
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      # Validates every row's fields, anchors (each must match exactly once) and,
+      # for cargo rows, exact test names. Command rows' names are proven by the
+      # clean-tree baseline each replay runs first.
+      - name: Validate the catalogue
+        run: ck-mutate check
+
+  mutations-diff:
+    name: Replay touched rows
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/train/'))
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/cache@v4
+        id: mutate-cache
+        with:
+          path: ~/.cargo/bin/ck-mutate
+          key: ${{ runner.os }}-${{ runner.arch }}-ck-mutate-${{ env.CK_MUTATE_REV }}
+      - name: Install pinned mutation runner
+        if: steps.mutate-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+      # Restore the build the check job saved; never save a second copy here.
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-mutations-cargo-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-mutations-cargo-${{ hashFiles('Cargo.lock') }}-
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      # A row is selected when its edited file, its test_file or the row itself
+      # changed. A change to a helper a guarding test imports selects nothing;
+      # the master and nightly full replays catch those.
+      - name: Replay rows the change touches
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="origin/master"
+          fi
+          ck-mutate run --diff "$base" --report "$RUNNER_TEMP/mutations-diff.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutations-diff
+          path: ${{ runner.temp }}/mutations-diff.json
+          if-no-files-found: ignore
+
+  # A push to master/main replays every row against its own test. The nightly
+  # audit replays every row with --broad, which runs each cargo row's mutant
+  # against every test target in its package and so reveals a row whose mutant
+  # also breaks unrelated tests (CAUGHT_BROADLY). Command rows (all Bun rows and
+  # the mc-module rows) run normally under --broad: they have no package-wide
+  # test discovery.
+  mutations-full:
+    name: Replay full catalogue (${{ matrix.shard }}/4)
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')) || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/cache@v4
+        id: mutate-cache
+        with:
+          path: ~/.cargo/bin/ck-mutate
+          key: ${{ runner.os }}-${{ runner.arch }}-ck-mutate-${{ env.CK_MUTATE_REV }}
+      - name: Install pinned mutation runner
+        if: steps.mutate-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/cortexkit/commons --rev "$CK_MUTATE_REV" cortexkit-mutate
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-mutations-cargo-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-mutations-cargo-${{ hashFiles('Cargo.lock') }}-
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Replay the full catalogue in an isolated shard
+        run: ck-mutate run --all --shard ${{ matrix.shard }}/4 ${BROAD:+--broad} --report "$RUNNER_TEMP/mutations-all.json"
+        env:
+          BROAD: ${{ github.event_name != 'push' && 'true' || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutations-${{ github.event_name == 'push' && 'master' || 'broad' }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/mutations-all.json
+          if-no-files-found: ignore

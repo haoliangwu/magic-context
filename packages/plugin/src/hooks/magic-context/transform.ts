@@ -54,6 +54,7 @@ import {
     rebaseSessionCoordinatesAsync,
 } from "../../features/magic-context/store-generation-rebase";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { observeTemporalDecisions } from "../../features/magic-context/temporal-decisions";
 import {
     clearOpenCodePendingTransformDecision,
     normalizeMaterializeReason,
@@ -96,7 +97,7 @@ import {
 } from "./ctx-reduce-nudge";
 import { DegradedPassRefusalError, degradedPassError } from "./degraded-pass-refusal";
 import { deriveTriggerBudget } from "./derive-budgets";
-import { EmergencyFailClosedError } from "./emergency-fail-closed";
+import { contextRefusalError, EmergencyFailClosedError } from "./emergency-fail-closed";
 import {
     escalationBands,
     historyBudgetPolicyIdentity,
@@ -107,6 +108,7 @@ import {
     resolveTrustedContextLimit,
 } from "./event-resolvers";
 import {
+    createFinalWireUsageTracker,
     describeFinalWireTail,
     estimateFinalWireInputTokens,
     estimateMessageTokens,
@@ -121,6 +123,14 @@ import {
     prepareCompartmentInjection,
     selectHiddenMessagesAtCompactionSeam,
 } from "./inject-compartments";
+import {
+    hasActiveAnthropicThinkingTurn,
+    latestAssistantTurnMessages,
+} from "./latest-assistant-turn";
+import {
+    captureLatestTurnOriginals,
+    prepareLatestThinkingRecovery,
+} from "./latest-thinking-recovery";
 import { saveLkgSlotToDb } from "./lkg-persist";
 import { captureLkgSlot, createLkgEntryProjector, resolveLkgModelKeys } from "./lkg-replay";
 import { beginLkgPass, dropSlot, getInMemorySlot } from "./lkg-slot";
@@ -142,6 +152,10 @@ import {
 import { readRawSessionMessages } from "./read-session-chunk";
 import { findLastAssistantModelFromOpenCodeDb } from "./read-session-db";
 import { extractInMemoryMessageViews } from "./read-session-raw";
+import {
+    projectOpencodeReasoningBudgetCutoff,
+    resolveKeepReasoningTokens,
+} from "./reasoning-budget";
 import { createRustModeTransform, type RustModeModuleClient } from "./rust-mode-transform";
 import { sendStatusNotification } from "./send-session-notification";
 import { isAnthropicFamilyRoute, modelAcceptsEmptyContent } from "./sentinel";
@@ -151,7 +165,8 @@ import {
     snapshotTrailingBlankSourceDecisions,
     stripClearedReasoning,
 } from "./strip-content";
-import { injectTemporalMarkers } from "./temporal-awareness";
+import { collectTemporalCandidates, injectTemporalMarkers } from "./temporal-awareness";
+import { readServedTemporalDecisions } from "./temporal-served-projection";
 import { createPreAdoptionToolSweepResolver, useScopedToolSweep } from "./tool-sweep-policy";
 import { historianJoinFailClosedMessage, runCompartmentPhase } from "./transform-compartment-phase";
 import {
@@ -393,6 +408,11 @@ export async function sendEmergencyRefusalNotice(
 
 export interface TransformDeps {
     cacheTtlConfig?: import("../../shared/model-cache-ttl").CacheTtlConfig;
+    cacheTtlConfigured?: boolean;
+    sampleCacheTtlConfig?: () => {
+        cache_ttl: import("../../shared/model-cache-ttl").CacheTtlConfig;
+        cacheTtlConfigured?: boolean;
+    };
     hiddenCompletionExecutor?: import("./compartment-runner-types").HiddenCompletionExecutor;
     /** Host marker lifecycle; omission preserves OpenCode 1 marker writes and replay. */
     compactionMarkerStrategy?: CompactionMarkerStrategy & {
@@ -439,7 +459,10 @@ export interface TransformDeps {
      *  later call supersedes, on top of the age-based auto-drop. Off → messages
      *  sent to the model are byte-identical to the age-based-only behavior. */
     smartDrops?: boolean;
-    clearReasoningAge: number;
+    protectedTools?: Readonly<Record<string, number>>;
+    keepReasoningTokens?: number | Record<string, number>;
+    /** Deprecated caller input. Ignored; retained for old integrations. */
+    clearReasoningAge?: number;
     /** Commit-cluster historian trigger config (`commit_cluster_trigger`). */
     commitClusterTrigger?: { enabled: boolean; min_clusters: number };
     /**
@@ -606,6 +629,11 @@ export interface TransformDeps {
     };
     /** Fire-and-forget active-session embed backfill after transform returns. */
     maybeAutoEmbedSession?: (sessionId: string) => void;
+    /**
+     * Called once per pass, before either renderer runs, with the session and the
+     * host's input messages: the request these messages belong to is being built.
+     */
+    onMessagesPassStarted?: (sessionId: string, messages: readonly MessageLike[]) => void;
     /** Resolved project mode. Rust mode bypasses every TS mutation below. */
     transformMode?: "ts" | "rust";
     /** Prompt-surface routing and USER description overrides forwarded to Rust mode. */
@@ -656,6 +684,7 @@ export function resolveTransformHostSeams(
 }
 
 export function createTransform(deps: TransformDeps) {
+    const finalWireUsage = createFinalWireUsageTracker();
     const host = resolveTransformHostSeams(deps);
     const loadedSessions = new Set<string>();
     // Sessions whose history was clearly over the model's window, with no
@@ -713,6 +742,13 @@ export function createTransform(deps: TransformDeps) {
         if (!sessionId) {
             return;
         }
+        deps.onMessagesPassStarted?.(sessionId, messages);
+        const temporalCandidates = deps.experimentalTemporalAwareness
+            ? collectTemporalCandidates(messages)
+            : undefined;
+        const temporalReplayIds = temporalCandidates
+            ? messages.flatMap((message) => (message.info.id ? [message.info.id] : []))
+            : undefined;
         logTransformTiming(sessionId, "findSessionId", tSessionId, `messages=${messages.length}`);
         const tLkgEntry = performance.now();
         // The Rust adapter captures its own last-known-good input snapshot and returns
@@ -819,11 +855,13 @@ export function createTransform(deps: TransformDeps) {
                 findNewestUserModel(messages) ??
                 deps.liveModelBySession?.get(sessionId) ??
                 findLastAssistantModel(messages);
+            const ttlConfig = deps.sampleCacheTtlConfig?.();
             sessionMeta.cacheTtl = resolveSessionCacheTtl(
                 db,
                 sessionId,
-                deps.cacheTtlConfig,
+                ttlConfig?.cache_ttl ?? deps.cacheTtlConfig,
                 ttlModel ? `${ttlModel.providerID}/${ttlModel.modelID}` : undefined,
+                ttlConfig?.cacheTtlConfigured ?? deps.cacheTtlConfigured,
             ).value;
         } catch (error) {
             sessionLog(sessionId, "transform failed reading session meta:", error);
@@ -1102,18 +1140,39 @@ export function createTransform(deps: TransformDeps) {
         // as they always have: a session with nothing frozen yet, and one the
         // host has never resolved (no stored project binding), whose frozen
         // pair was itself rendered with the launch directory.
-        const freezeM0M1 =
-            sessionDirectoryFellBack &&
-            sessionMeta.cachedM0Bytes != null &&
-            sessionMeta.cachedM1Bytes != null &&
-            (() => {
-                try {
-                    return hasRecordedSessionProjectIdentity(db, sessionId);
-                } catch {
-                    // Unknown: keep the frozen pair rather than risk a rebuild.
-                    return true;
-                }
-            })();
+        const activeThinkingModel =
+            findLastAssistantModel(messages) ?? deps.liveModelBySession?.get(sessionId);
+        const thinkingRecovery = prepareLatestThinkingRecovery({
+            db,
+            sessionId,
+            messages,
+            id: (message) => (message as MessageLike)?.info.id,
+            parts: (message) => (message as MessageLike)?.parts ?? [],
+        });
+        if (thinkingRecovery.ended) deps.pendingMaterializationSessions?.add(sessionId);
+        let restoreLatestTurnOriginals: (() => void) | undefined;
+        let activeThinkingTurn = hasActiveAnthropicThinkingTurn(
+            messages,
+            activeThinkingModel?.providerID,
+            activeThinkingModel?.modelID,
+        );
+        let freezeM0M1 =
+            (activeThinkingTurn &&
+                isPrefixBoundThinkingModel(
+                    activeThinkingModel?.providerID,
+                    activeThinkingModel?.modelID,
+                )) ||
+            (sessionDirectoryFellBack &&
+                sessionMeta.cachedM0Bytes != null &&
+                sessionMeta.cachedM1Bytes != null &&
+                (() => {
+                    try {
+                        return hasRecordedSessionProjectIdentity(db, sessionId);
+                    } catch {
+                        // Unknown: keep the frozen pair rather than risk a rebuild.
+                        return true;
+                    }
+                })());
         if (freezeM0M1) {
             sessionLog(
                 sessionId,
@@ -1458,7 +1517,20 @@ export function createTransform(deps: TransformDeps) {
         // the live map. Reusing this value keeps cold/hot output identical and keeps
         // postprocess from making a divergent provider decision later in the pass.
         const resolvedProviderID = modelForBudget?.providerID;
+        activeThinkingTurn ||= hasActiveAnthropicThinkingTurn(
+            messages,
+            resolvedProviderID,
+            modelForBudget?.modelID,
+        );
+        freezeM0M1 ||=
+            activeThinkingTurn &&
+            isPrefixBoundThinkingModel(resolvedProviderID, modelForBudget?.modelID);
         const canUseEmptySentinels = modelAcceptsEmptyContent(resolvedProviderID);
+        const protectedThinkingMessages =
+            activeThinkingTurn ||
+            isAnthropicFamilyRoute(resolvedProviderID, modelForBudget?.modelID)
+                ? latestAssistantTurnMessages(messages)
+                : new Set<MessageLike>();
         const resolvedContextLimit = modelForBudget
             ? resolveTrustedContextLimit(modelForBudget.providerID, modelForBudget.modelID, {
                   db,
@@ -1989,13 +2061,29 @@ export function createTransform(deps: TransformDeps) {
                     sessionMeta.lastContextPercentage,
                     boundaryExecuteThreshold,
                     deriveTriggerBudget(boundaryContextLimit, boundaryExecuteThreshold),
-                    deps.clearReasoningAge,
+                    resolveKeepReasoningTokens(
+                        deps.keepReasoningTokens,
+                        currentModelKeyForBoundary,
+                    ),
                     historianRun?.commitClusterTrigger ?? deps.commitClusterTrigger,
                     undefined,
                     boundaryContextLimit,
                     inMemoryTail,
                     taggerFloor,
-                    { providerID: resolvedProviderID },
+                    {
+                        providerID: resolvedProviderID,
+                        budgetCutoff: projectOpencodeReasoningBudgetCutoff(
+                            db,
+                            sessionId,
+                            messages,
+                            resolveKeepReasoningTokens(
+                                deps.keepReasoningTokens,
+                                currentModelKeyForBoundary,
+                            ),
+                            sessionMeta.clearedReasoningThroughTag,
+                            sessionDecisionCalibration(db, sessionId).proseRatio,
+                        ),
+                    },
                     {
                         hardFold: false,
                         force:
@@ -2099,32 +2187,19 @@ export function createTransform(deps: TransformDeps) {
         let messageTagNumbers = new Map<MessageLike, number>();
         let batch: { finalize: () => void } | null = null;
         let hasRecentReduceCall = false;
-        // Inject temporal markers before tagging so the §N§ tag prefix wraps
-        // around our marker.
-        //
-        // Intentional — this runs on EVERY transform pass, including defer /
-        // cache-safe passes that are otherwise gated. Three invariants make
-        // that safe:
-        //   1. Idempotent: injectTemporalMarkers detects existing markers by
-        //      regex and will not double-prefix.
-        //   2. Deterministic: the marker value derives from immutable
-        //      message.time.created / time.completed timestamps — same input,
-        //      same output, every pass.
-        //   3. Required every pass: OpenCode rebuilds the messages array from
-        //      its DB for every transform, so markers must be re-applied on
-        //      each pass or they would disappear on defer passes. Skipping
-        //      defer passes here would cause the marker to flicker in/out and
-        //      bust cache when it reappeared.
-        //
-        // The retroactive-on-flag-flip behavior is the same mechanism — when
-        // the flag turns on, the first pass marks every eligible user message
-        // and subsequent passes just observe the already-marked content.
-        // Compaction-off: temporal markers/overlays are part of the gated
-        // compaction surface (additive but mode-owned), so the wire stays
-        // untouched in this mode.
+        // Replay before tagging. New choices wait for the independently priced
+        // rebuild permission in postprocess; a cut never recomputes an old gap.
+        let temporalObservedDecisions: ReadonlyMap<string, string> | undefined;
         if (deps.experimentalTemporalAwareness && !compactionOff) {
             const tTemporal = performance.now();
-            const injected = injectTemporalMarkers(messages);
+            temporalObservedDecisions = observeTemporalDecisions(
+                db,
+                sessionId,
+                temporalCandidates ?? new Map(),
+                (ids) => readServedTemporalDecisions(db, sessionId, "opencode", ids),
+                temporalReplayIds,
+            );
+            const injected = injectTemporalMarkers(messages, temporalObservedDecisions);
             if (injected > 0) {
                 sessionLog(sessionId, `temporal: injected ${injected} gap markers`);
             }
@@ -2178,6 +2253,8 @@ export function createTransform(deps: TransformDeps) {
                     servedMessages: messages,
                 });
                 targets = result.targets;
+                if (thinkingRecovery.restore)
+                    restoreLatestTurnOriginals = captureLatestTurnOriginals(messages);
                 reasoningByMessage = result.reasoningByMessage;
                 messageTagNumbers = result.messageTagNumbers;
                 batch = result.batch;
@@ -2441,8 +2518,10 @@ export function createTransform(deps: TransformDeps) {
         // change, plus the TTL idle window. The tool-set fingerprint is observed
         // alongside them but never folds m[0] because its process-global scope
         // would create false-positive folds across sessions. When system.transform
-        // follows messages.transform, systemHash is the persisted last-turn hash;
-        // a warm system change is then detected on the next pass.
+        // follows messages.transform (OpenCode 1), systemHash is the persisted
+        // last-turn hash. The system hook then adopts a change on the request that
+        // first carries it (see system-prompt-hash.ts), so the next pass does not
+        // fold on it and the provider rewrites its cache once, not twice.
         const hardModel = deps.liveModelBySession?.get(sessionId);
         const hardModelKey = hardModel ? `${hardModel.providerID}/${hardModel.modelID}` : "";
         const hardToolSetHash = deps.getToolSetHash?.(sessionId) ?? "";
@@ -2626,6 +2705,9 @@ export function createTransform(deps: TransformDeps) {
             schedulerDecision,
             schedulerDeferReason,
             fullFeatureMode,
+            temporalCandidates,
+            temporalReplayIds,
+            temporalObservedDecisions,
             compactionOff,
             canRunCompartments,
             awaitedCompartmentRun,
@@ -2648,7 +2730,10 @@ export function createTransform(deps: TransformDeps) {
             deferredHistoryRefreshSessions,
             deferredMaterializationSessions,
             lastHeuristicsTurnId: deps.lastHeuristicsTurnId,
-            clearReasoningAge: deps.clearReasoningAge,
+            keepReasoningTokens: resolveKeepReasoningTokens(
+                deps.keepReasoningTokens,
+                currentModelKeyForBoundary,
+            ),
             protectedTagIds,
             protectedTagNumbers,
             protectedCutoff,
@@ -2673,10 +2758,24 @@ export function createTransform(deps: TransformDeps) {
             // the primary agent that spawned them.
             cavemanTextCompression: !reducedMode ? deps.cavemanTextCompression : undefined,
             smartDrops: deps.smartDrops === true,
+            protectedTools: deps.protectedTools,
             // Pass the single resolved provider through to postprocess so every
             // empty-sentinel gate and whole-message placeholder choice agrees for
             // this transform pass, including cold DB-recovered passes.
             resolvedProviderID,
+            activeThinkingTurn,
+            protectedThinkingMessages: thinkingRecovery.restore
+                ? protectedThinkingMessages
+                : undefined,
+            restoreThinkingMessageIds: thinkingRecovery.restore
+                ? new Set(
+                      [...protectedThinkingMessages].flatMap((message) =>
+                          typeof message.info.id === "string" ? [message.info.id] : [],
+                      ),
+                  )
+                : undefined,
+            restoreLatestTurnOriginals,
+            resolvedModelID: modelForBudget?.modelID,
             thinkingBindingRecoveryEnabledForModel: isPrefixBoundThinkingModel(
                 modelForBudget?.providerID,
                 modelForBudget?.modelID,
@@ -2713,13 +2812,18 @@ export function createTransform(deps: TransformDeps) {
         let finalWireEstimate: ReturnType<typeof estimateFinalWireInputTokens> | undefined;
         if (postTransformResult.bustedThisPass) {
             try {
-                finalWireEstimate = estimateFinalWireInputTokens({
-                    messages,
-                    systemPromptTokens: sessionMeta.systemPromptTokens,
-                    providerID: modelForBudget?.providerID,
-                    modelID: modelForBudget?.modelID,
-                    agentName: notificationParams.agent,
-                });
+                finalWireEstimate = finalWireUsage.estimate(
+                    sessionId,
+                    {
+                        messages,
+                        systemPromptTokens: sessionMeta.systemPromptTokens,
+                        providerID: modelForBudget?.providerID,
+                        modelID: modelForBudget?.modelID,
+                        agentName: notificationParams.agent,
+                        systemPromptHash: sessionMeta.systemPromptHash,
+                    },
+                    boundaryContextLimit,
+                );
             } catch {
                 sessionLog(
                     sessionId,
@@ -2737,14 +2841,19 @@ export function createTransform(deps: TransformDeps) {
                   : contextUsage.percentage;
             finalWireEstimate =
                 finalWireEstimate ??
-                (emergencyUsagePercentage >= 95
-                    ? estimateFinalWireInputTokens({
-                          messages,
-                          systemPromptTokens: sessionMeta.systemPromptTokens,
-                          providerID: modelForBudget?.providerID,
-                          modelID: modelForBudget?.modelID,
-                          agentName: notificationParams.agent,
-                      })
+                (emergencyUsagePercentage >= 95 || schedulerDecision === "execute"
+                    ? finalWireUsage.estimate(
+                          sessionId,
+                          {
+                              messages,
+                              systemPromptTokens: sessionMeta.systemPromptTokens,
+                              providerID: modelForBudget?.providerID,
+                              modelID: modelForBudget?.modelID,
+                              agentName: notificationParams.agent,
+                              systemPromptHash: sessionMeta.systemPromptHash,
+                          },
+                          boundaryContextLimit,
+                      )
                     : undefined);
             if (finalWireEstimate) {
                 sessionLog(
@@ -2867,6 +2976,12 @@ export function createTransform(deps: TransformDeps) {
                 foldMaterializedThisPass: postTransformResult.historianFoldMaterializedThisPass,
                 finalWireEstimate,
                 providerProvenLimitTokens,
+                contextLimitTokens: boundaryContextLimit,
+                protectedToolTokens: protectedToolTokenCount(
+                    getActiveTagsBySession(db, sessionId),
+                    deps.protectedTools,
+                    resolveDecisionCalibration(modelForBudget?.providerID, modelForBudget?.modelID),
+                ),
             });
             if (emergencyFailClosed.disarm) {
                 clearEmergencyRecovery(db, sessionId);
@@ -2876,6 +2991,9 @@ export function createTransform(deps: TransformDeps) {
                 );
             }
             if (emergencyFailClosed.shouldAbort) {
+                if (emergencyFailClosed.refusalMessage) {
+                    throw contextRefusalError(emergencyFailClosed.refusalMessage);
+                }
                 // The notice must finish before host refusal so recovery instructions survive interruption.
                 try {
                     await host.hostRefusalNotice(
@@ -2987,6 +3105,8 @@ export function createTransform(deps: TransformDeps) {
                 output: messages,
                 modelKey,
                 providerKey,
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                agentName: notificationParams?.agent,
             });
             if (captured) {
                 // Keep the durable snapshot in step with the TS-mode capture too:
@@ -3211,6 +3331,15 @@ export function createTransform(deps: TransformDeps) {
                 `thinking binding recovery: stripped bound reasoning from ${bindingRecovery.messageIds.length} assistant(s) [${bindingRecovery.messageIds.join(",")}]; flag=${cleared ? "cleared" : "rearmed"}`,
             );
         }
+        if (passOutcome.captureEligible)
+            finalWireUsage.capture(sessionId, {
+                messages,
+                systemPromptTokens: sessionMeta.systemPromptTokens,
+                providerID: modelForBudget?.providerID,
+                modelID: modelForBudget?.modelID,
+                agentName: notificationParams.agent,
+                systemPromptHash: sessionMeta.systemPromptHash,
+            });
     };
 
     return Object.assign(transform, {
@@ -3289,3 +3418,6 @@ export function resolveHistoryBudgetTokens(
             historyBudgetPercentage,
     );
 }
+
+import { protectedToolTokenCount } from "../../features/magic-context/reclaim-protection";
+import { resolveDecisionCalibration } from "./decision-calibration";

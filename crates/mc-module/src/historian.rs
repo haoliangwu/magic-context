@@ -56,9 +56,9 @@ struct HistorianRunnerRefusalCacheState {
     transient: BTreeMap<String, TransientRunnerRefusal>,
 }
 
-/// Runner refusals are shared across sessions. Provider and model catalog failures remain cached
-/// until the model chain changes; credential and other resolution failures use an expiring retry
-/// for each model.
+/// Runner refusals are shared across sessions. Typed permanent failures remain
+/// cached until the model chain changes; other classes use an expiring retry.
+/// Older runners without a class use the provider/model stage as the durable fallback.
 #[derive(Debug, Default)]
 pub struct HistorianRunnerRefusalCache {
     state: Mutex<HistorianRunnerRefusalCacheState>,
@@ -134,7 +134,7 @@ impl HistorianRunnerRefusalCache {
         if state.generation != generation {
             return None;
         }
-        if refusal.stage.is_durable() {
+        if refusal.is_durable() {
             state.durable.insert(model.to_string(), refusal);
             state.transient.remove(model);
             return None;
@@ -1160,22 +1160,28 @@ pub trait HistorianProducerDriver: Send {
         prompt: &str,
         model: &str,
     ) -> Result<RunHandle, HistorianProducerError>;
+    /// `variant` is the host-configured variant of `model` (for example an OpenCode
+    /// reasoning variant); a module runner sends it as `model.variant`.
+    #[allow(clippy::too_many_arguments)] // Each value is a distinct field of one send.
     async fn start_with_temperature(
         &mut self,
         session_id: &str,
         system: &str,
         prompt: &str,
         model: &str,
+        _variant: Option<&str>,
         _temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
         self.start(session_id, system, prompt, model).await
     }
+    #[allow(clippy::too_many_arguments)] // Each value is a distinct field of one send.
     async fn start_with_generation(
         &mut self,
         session_id: &str,
         system: &str,
         prompt: &str,
         model: &str,
+        _variant: Option<&str>,
         _max_output_tokens: u32,
         _temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
@@ -1208,11 +1214,12 @@ pub trait HistorianProducerDriver: Send {
     async fn status(&mut self, run_id: &str) -> Result<RunState, HistorianProducerError>;
     async fn cancel(&mut self, run_id: &str) -> Result<(), HistorianProducerError>;
     async fn close(&mut self);
-    /// Delete the provider session on every terminal path. The default calls close()
-    /// for compatibility with older test producers, while production producers override
-    /// this method to explicitly delete session data before closing.
-    async fn purge_session(&mut self, _session_id: &str) {
+    /// Release the provider session on every terminal path. The default closes
+    /// test/host transports; module runners report unsupported deletion rather
+    /// than claiming that closing routes removed their retained snapshots.
+    async fn purge_session(&mut self, _session_id: &str) -> Result<(), HistorianProducerError> {
         self.close().await;
+        Ok(())
     }
 }
 
@@ -1239,6 +1246,7 @@ impl HistorianProducerDriver for HistorianProducer {
         system: &str,
         prompt: &str,
         model: &str,
+        variant: Option<&str>,
         temperature: Option<f64>,
     ) -> Result<RunHandle, HistorianProducerError> {
         HistorianProducer::start_with_temperature(
@@ -1247,6 +1255,7 @@ impl HistorianProducerDriver for HistorianProducer {
             system,
             prompt,
             model,
+            variant,
             temperature,
         )
         .await
@@ -1258,6 +1267,7 @@ impl HistorianProducerDriver for HistorianProducer {
         system: &str,
         prompt: &str,
         model: &str,
+        variant: Option<&str>,
         max_output_tokens: u32,
         temperature: f64,
     ) -> Result<RunHandle, HistorianProducerError> {
@@ -1267,6 +1277,7 @@ impl HistorianProducerDriver for HistorianProducer {
             system,
             prompt,
             model,
+            variant,
             max_output_tokens,
             Some(temperature),
         )
@@ -1315,13 +1326,8 @@ impl HistorianProducerDriver for HistorianProducer {
         HistorianProducer::close(self).await;
     }
 
-    async fn purge_session(&mut self, session_id: &str) {
-        if HistorianProducer::purge_session(self, session_id)
-            .await
-            .is_err()
-        {
-            HistorianProducer::close(self).await;
-        }
+    async fn purge_session(&mut self, session_id: &str) -> Result<(), HistorianProducerError> {
+        HistorianProducer::purge_session(self, session_id).await
     }
 }
 
@@ -1357,6 +1363,10 @@ pub struct HistorianFireRequest<'a> {
     /// Fallback windows must belong to their own model, never to the primary model.
     pub fallback_context_limits: std::collections::BTreeMap<String, usize>,
     pub model_limits: std::collections::BTreeMap<String, HistorianModelLimits>,
+    /// Host-configured variant per chain model (for example an OpenCode reasoning
+    /// variant), sent to the runner as `model.variant`. A model without an entry sends
+    /// no variant.
+    pub model_variants: std::collections::BTreeMap<String, String>,
     pub max_output_tokens: u32,
     pub from_ordinal: u64,
     pub to_ordinal: u64,
@@ -2115,6 +2125,7 @@ where
                 request.system.as_ref(),
                 &prompt,
                 model,
+                request.model_variants.get(model).map(String::as_str),
                 request.temperature,
             )
             .await
@@ -2138,7 +2149,7 @@ where
                             )
                         })
                         .or_else(|| {
-                            (!refusal.stage.is_durable()).then_some(request.failure_backoff_at_ms)
+                            (!refusal.is_durable()).then_some(request.failure_backoff_at_ms)
                         });
                     if let Some(retry_at_ms) = retry_at_ms {
                         earliest_runner_retry_ms = Some(
@@ -3281,6 +3292,7 @@ mod tests {
             protected_tags: 20,
             protected_tags_present: false,
             protected_tokens_effective: None,
+            keep_reasoning_tokens_effective: None,
             provider_id: None,
             model_key: None,
             clear_reasoning_age: 50,
@@ -3315,6 +3327,7 @@ mod tests {
             history_budget_tokens: None,
             historian_model_chain: None,
             historian_model_limits: Default::default(),
+            historian_model_variants: Default::default(),
             historian_timeout_ms: None,
             historian_max_output_tokens: None,
             declared_trim: None,
@@ -3350,8 +3363,10 @@ mod tests {
             protected_tokens_provenance: "derived",
             compaction_enabled: true,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
             cache_ttl_provenance: crate::config::CacheTtlProvenance::Default,
+            cache_ttl_policy: None,
             model_key: None,
             observed_last_response_at_ms: None,
             guidance_date: Some("Today's date: Thu Jan 01 1970".to_string()),
@@ -3549,6 +3564,7 @@ mod tests {
         observed_systems: Vec<String>,
         observed_prompts: Vec<String>,
         observed_temperatures: Vec<Option<f64>>,
+        observed_variants: Vec<Option<String>>,
         await_run_ids: Vec<String>,
         observed_await_timeouts: Vec<Duration>,
         cancels: Vec<String>,
@@ -3608,9 +3624,11 @@ mod tests {
             system: &str,
             prompt: &str,
             model: &str,
+            variant: Option<&str>,
             temperature: Option<f64>,
         ) -> Result<RunHandle, HistorianProducerError> {
             self.observed_temperatures.push(temperature);
+            self.observed_variants.push(variant.map(str::to_string));
             self.start(session_id, system, prompt, model).await
         }
 
@@ -3735,6 +3753,7 @@ mod tests {
             producer_source_tokens: 1,
             historian_context_limit_tokens: Some(200_000),
             model_limits: Default::default(),
+            model_variants: Default::default(),
             fallback_context_limits: models
                 .iter()
                 .map(|model| (model.clone(), 200_000))
@@ -4590,6 +4609,42 @@ mod tests {
         assert_eq!(recovered.observed_starts.len(), 1);
         assert_eq!(cache.activate_chain(&models), generation);
         assert!(cache.cached_refusal(generation, &models[0], 999).is_none());
+    }
+
+    #[test]
+    fn typed_runner_refusal_class_controls_durable_cache_not_reporting_stage() {
+        let models = vec!["prov/model-a".to_string(), "prov/model-b".to_string()];
+        let cache = HistorianRunnerRefusalCache::default();
+        let generation = cache.activate_chain(&models);
+        let permanent = HistorianProducerError::tagged_subc(
+            "open_failed",
+            "no apikey credential for provider 'prov'",
+            ErrorClass::Permanent,
+            None,
+        )
+        .runner_refusal()
+        .unwrap();
+        let transient = HistorianProducerError::tagged_subc(
+            "open_failed",
+            "unknown model 'model-b'",
+            ErrorClass::Transient,
+            None,
+        )
+        .runner_refusal()
+        .unwrap();
+        assert_eq!(permanent.stage, RunnerRefusalStage::Credential);
+        assert_eq!(transient.stage, RunnerRefusalStage::Model);
+        assert_eq!(
+            cache.record_refusal(generation, &models[0], permanent, 100, 500),
+            None
+        );
+        assert_eq!(
+            cache.record_refusal(generation, &models[1], transient, 100, 500),
+            Some(600)
+        );
+        assert_eq!(cache.cached_durable_refusals(generation, &models).len(), 1);
+        assert!(cache.cached_refusal(generation, &models[0], 601).is_some());
+        assert!(cache.cached_refusal(generation, &models[1], 601).is_none());
     }
 
     #[test]

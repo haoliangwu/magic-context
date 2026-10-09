@@ -13,8 +13,8 @@
  *   - Assistant (in-flight/aborted): prev.time.created (best available)
  *   - User: prev.time.created (user messages have no completed field)
  *
- * All values are derived deterministically from immutable message timestamps,
- * so injection is stable across transform passes and cache-safe.
+ * Timestamps determine candidates only. The runtime persists the first decision
+ * per message and replays it, because compaction can remove the predecessor.
  */
 
 import { hasMeaningfulUserText } from "./read-session-formatting";
@@ -94,6 +94,8 @@ export function formatDate(ms: number): string {
 /** Regex matching the injected HTML comment so we can recognize / avoid
  *  double-injecting on retried transform passes. */
 export const TEMPORAL_MARKER_PATTERN = /^<!-- \+[\d]+[mhdw](?: [\d]+[mhdw])? -->\n/;
+/** Placeholder trimming may remove the newline from a marker-only projection. */
+export const TEMPORAL_MARKER_REPLAY_PATTERN = /^<!-- \+[\d]+[mhdw](?: [\d]+[mhdw])? -->(?:\n|$)/;
 
 /**
  * Produce the HTML comment prefix line for a given gap marker, or null if the
@@ -111,7 +113,7 @@ export function temporalMarkerPrefix(seconds: number): string | null {
  * our narrower `MessageInfo` type doesn't declare it.
  */
 type MessageLikeWithTime = {
-    info: { role?: string; time?: { created?: number; completed?: number } };
+    info: { id?: string; role?: string; time?: { created?: number; completed?: number } };
     parts: unknown[];
 };
 
@@ -150,7 +152,38 @@ function findFirstVisibleTextPart(parts: unknown[]): MutableTextPart | null {
  * stripTagPrefix re-strips `§N§` on re-tagging — leaving the marker intact
  * between the tag and the user's text on subsequent passes.
  */
-export function injectTemporalMarkers(messages: unknown[]): number {
+export function collectTemporalCandidates(messages: unknown[]): Map<string, string> {
+    const candidates = new Map<string, string>();
+    let prev: MessageLikeWithTime | null = null;
+    for (const raw of messages) {
+        if (!raw || typeof raw !== "object") continue;
+        const msg = raw as MessageLikeWithTime;
+        if (
+            msg.info?.id &&
+            msg.info.role === "user" &&
+            Array.isArray(msg.parts) &&
+            hasMeaningfulUserText(msg.parts)
+        ) {
+            const current = msg.info.time?.created;
+            const prior = prev?.info?.time;
+            candidates.set(
+                msg.info.id,
+                current !== undefined && prior?.created !== undefined
+                    ? (temporalMarkerPrefix(
+                          (current - (prior.completed ?? prior.created)) / 1000,
+                      ) ?? "")
+                    : "",
+            );
+        }
+        prev = msg;
+    }
+    return candidates;
+}
+
+export function injectTemporalMarkers(
+    messages: unknown[],
+    frozen?: ReadonlyMap<string, string>,
+): number {
     let injected = 0;
     let prev: MessageLikeWithTime | null = null;
 
@@ -158,6 +191,21 @@ export function injectTemporalMarkers(messages: unknown[]): number {
         if (!raw || typeof raw !== "object") continue;
         const msg = raw as MessageLikeWithTime;
         const role = msg.info?.role;
+
+        if (frozen) {
+            const marker = msg.info?.id ? frozen.get(msg.info.id) : undefined;
+            const target = Array.isArray(msg.parts) ? findFirstVisibleTextPart(msg.parts) : null;
+            if (marker !== undefined && target?.text !== undefined) {
+                const { tagPrefix, body } = peelLeadingMcTagNotation(target.text);
+                const source = body.replace(TEMPORAL_MARKER_REPLAY_PATTERN, "");
+                const text = tagPrefix + (source ? marker + source : marker.trimEnd());
+                if (text !== target.text) {
+                    target.text = text;
+                    injected++;
+                }
+            }
+            continue;
+        }
 
         const authoredUser =
             role === "user" && Array.isArray(msg.parts) && hasMeaningfulUserText(msg.parts);

@@ -6,6 +6,36 @@ import { ensureSessionMetaRow } from "./storage-meta-shared";
 const CAS_RETRY_LIMIT = 5;
 const MISSING_REPLAY_DOCUMENT_COLUMN = Symbol("missing replay document column");
 
+/**
+ * A marker may make the host omit earlier messages on its next request.
+ * Block last-known-good request (LKG) replay until that change is proven not to
+ * have happened, or a rebuilt request passes all send checks and is saved.
+ */
+export function isRustMarkerAdmissionFenced(db: Database, sessionId: string): boolean {
+    const row = db
+        .prepare(
+            "SELECT COALESCE(json_extract(NULLIF(trailing_blank_decisions, ''), '$.rustMarkerAdmissionFence'), 0) AS fenced FROM session_meta WHERE session_id=?",
+        )
+        .get(sessionId) as { fenced?: number } | undefined;
+    return row?.fenced === 1;
+}
+
+export function setRustMarkerAdmissionFence(
+    db: Database,
+    sessionId: string,
+    fenced: boolean,
+): void {
+    if (
+        !updateReplayDocument(db, sessionId, (doc) => {
+            doc.version = 2;
+            if (fenced) doc.rustMarkerAdmissionFence = true;
+            else delete doc.rustMarkerAdmissionFence;
+            return true;
+        })
+    )
+        throw new Error("cannot persist Rust marker admission fence");
+}
+
 export type PersistedTrailingBlankDecision = "keep" | `keep:${number}` | "strip";
 
 export interface ReplayDocument {

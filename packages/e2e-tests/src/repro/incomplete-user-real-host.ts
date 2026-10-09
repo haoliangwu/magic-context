@@ -183,9 +183,9 @@ export default async (ctx) => {
             compaction: { auto: false, prune: false },
         }),
     );
-    mkdirSync(join(dirs.config!, "opencode"), { recursive: true });
+    mkdirSync(join(dirs.config!, "cortexkit"), { recursive: true });
     writeFileSync(
-        join(dirs.config!, "opencode", "magic-context.jsonc"),
+        join(dirs.config!, "cortexkit", "magic-context.jsonc"),
         JSON.stringify({
             dreamer: { disable: true },
             historian: { opencode: { model: "mock-anthropic/mock-sonnet" } },

@@ -21,6 +21,7 @@
 # new code are the consistent pair, so nothing is restored: the script stops and
 # says not to start the hosts. The last line says which case applies.
 set -uo pipefail
+umask 077
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DATA="${MAGIC_CONTEXT_STORAGE_DIR:-$HOME/.local/share/cortexkit/magic-context}"

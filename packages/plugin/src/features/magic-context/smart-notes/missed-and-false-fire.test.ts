@@ -1,6 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import * as dns from "node:dns/promises";
 import { rmSync } from "node:fs";
+import * as https from "node:https";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
@@ -23,9 +25,27 @@ import { SmartNoteNetworkError } from "./types";
 
 const directories: string[] = [];
 const databases: Database[] = [];
+let lookup: ReturnType<typeof spyOn<typeof dns, "lookup">>;
+let request: ReturnType<typeof spyOn<typeof https, "request">>;
+beforeEach(() => {
+    // All HTTP data comes from injected capabilities. Fail closed if a future
+    // compiler change accidentally bypasses those fixtures.
+    lookup = spyOn(dns, "lookup").mockImplementation(() => {
+        throw new Error("fixture must not perform DNS");
+    });
+    request = spyOn(https, "request").mockImplementation(() => {
+        throw new Error("fixture must not open a network connection");
+    });
+});
 afterEach(() => {
+    const dnsCalls = lookup.mock.calls.length;
+    const networkCalls = request.mock.calls.length;
+    lookup.mockRestore();
+    request.mockRestore();
     for (const db of databases.splice(0)) db.close();
     for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
+    expect(dnsCalls).toBe(0);
+    expect(networkCalls).toBe(0);
 });
 function tempDirectory(): string {
     const dir = createTestTempDirFromPath(path.join(tmpdir(), "smart-notes-fixture-"));
@@ -137,10 +157,14 @@ const original =
 function tagRepository() {
     const dir = tempDirectory();
     const git = (...args: string[]) =>
-        execFileSync("git", ["-C", dir, ...args], {
+        // Fixture commits must not invoke inherited hooks, signing agents or
+        // user configuration: these can contact services or wait for input.
+        execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-C", dir, ...args], {
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
             windowsHide: true,
+            timeout: 5_000,
+            env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
         }).trim();
     git("init", "-b", "master");
     git("config", "user.name", "Fixture");

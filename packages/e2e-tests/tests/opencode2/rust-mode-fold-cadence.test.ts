@@ -207,12 +207,13 @@ describe.skipIf(!prereqs.ok)(
             });
             host = await spawnOpencode2({
                 existingIsolation: fixture,
-                // A 24k context against a 1k output: a small context with the default
-                // 32k output makes 2.0.5's first-request ceiling negative and the host
-                // never reaches the plugin.
-                modelContextLimit: 24_000,
+                // The fixed prompt plus protected 3k-turn tail estimates over 30k
+                // even after a fold, so a 24k window can never admit this fixture's
+                // boundary. Leave room for that floor without changing its pressure
+                // trigger below. A 1k output also avoids a negative first-request ceiling.
+                modelContextLimit: 40_000,
                 modelOutputLimit: 1_024,
-                // The historian gets its own 128k mock model: the 24k session window
+                // The historian gets its own 128k mock model: the 40k session window
                 // cannot hold a historian prompt, and the module refuses one that
                 // does not fit the historian model's window.
                 historianModel: { id: "mock-historian", contextLimit: 128_000 },
@@ -225,7 +226,8 @@ describe.skipIf(!prereqs.ok)(
                     // shared resolver reads `historian.<harness>`, and the v2 lane
                     // resolves with "opencode".
                     historian: { opencode: { model: "openai/mock-historian" } },
-                    execute_threshold_percentage: 40,
+                    // About 9.4k usable tokens, matching the former 24k/40% trigger.
+                    execute_threshold_percentage: 24,
                     history_budget_percentage: 0.15,
                 },
             });
@@ -372,7 +374,8 @@ describe.skipIf(!prereqs.ok)(
             // summarizes with its own model, rejects the answer as "Compaction
             // summary did not match the required template", and ends the turn with
             // idle outcome=failed.
-            forcedUsage = 20_000;
+            // Keep the same above-trigger report under the fixture's larger window.
+            forcedUsage = 36_000;
             const client = OpenCode.make({
                 baseUrl: host.url,
                 headers: { authorization: `Basic ${btoa(`opencode:${host.password}`)}` },

@@ -65,12 +65,18 @@ function createTestDb(): Database {
 
 function seedTags(
     db: Database,
-    tags: Array<{ id: number; sessionId: string; status?: string; type?: string }>,
+    tags: Array<{
+        id: number;
+        sessionId: string;
+        status?: string;
+        type?: string;
+        toolName?: string | null;
+    }>,
 ) {
     for (const [index, tag] of tags.entries()) {
         const rowId = 10_000 + tag.id + index;
         db.prepare(
-            "INSERT INTO tags (id, message_id, type, status, byte_size, session_id, tag_number) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tags (id, message_id, type, status, byte_size, session_id, tag_number, tool_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         ).run(
             rowId,
             `msg-${tag.id}`,
@@ -79,6 +85,7 @@ function seedTags(
             100,
             tag.sessionId,
             tag.id,
+            tag.toolName ?? null,
         );
     }
 }
@@ -171,6 +178,48 @@ describe("createCtxReduceTools", () => {
                 expect.objectContaining({ tag_id: 4, operation: "drop" }),
                 expect.objectContaining({ tag_id: 5, operation: "drop" }),
             ]);
+        });
+
+        it("skips ctx_reduce stamps while still queueing sibling tags", async () => {
+            seedTags(db, [
+                { id: 41, sessionId: "ses-1", type: "tool", toolName: "ctx_reduce" },
+                { id: 42, sessionId: "ses-1", type: "tool", toolName: "read" },
+            ]);
+            const tool = createCtxReduceTools({ db, protectedSet: new Set() });
+
+            const result = await tool.ctx_reduce.execute({ drop: "41,42" }, toolContext());
+
+            expect(result).toBe(
+                "Queued: drop §42§. §41§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+            expect(getPendingOps(db, "ses-1")).toEqual([
+                expect.objectContaining({ tag_id: 42, operation: "drop" }),
+            ]);
+            expect(await tool.ctx_reduce.execute({ drop: "41" }, toolContext())).toBe(
+                "§41§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+        });
+
+        it("orders mixed outcomes as free drop, protected hold, then ctx_reduce self-stamp", async () => {
+            seedTags(db, [
+                { id: 1, sessionId: "ses-1", type: "tool", toolName: "custom" },
+                { id: 2, sessionId: "ses-1", type: "tool", toolName: "ctx_reduce" },
+                { id: 3, sessionId: "ses-1", type: "tool", toolName: "bash" },
+            ]);
+            const tool = createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+                protectedTools: { custom: 1 },
+            });
+            const result = await tool.ctx_reduce.execute({ drop: "2,1,3" }, toolContext());
+            expect(result).toBe(
+                "Queued: drop §3§. Held: §1 is inside the protected working set; it applies once newer work displaces it. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+            expect(
+                getPendingOps(db, "ses-1")
+                    .map((op) => op.tag_id)
+                    .sort(),
+            ).toEqual([1, 3]);
         });
 
         it("resets the rolling nudge anchor to the current token count", async () => {
@@ -339,6 +388,48 @@ describe("createCtxReduceTools", () => {
             );
         });
 
+        it("surfaces refused ctx_reduce self-stamps returned by the module backend", async () => {
+            const tool = createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 1,
+                        ctx_reduce_queued_tags: [42],
+                        ctx_reduce_self_stamps: [41],
+                    }),
+                },
+            });
+
+            const result = await tool.ctx_reduce.execute({ drop: "41,42" }, toolContext());
+
+            expect(result).toBe(
+                "Queued: drop §42§. §41§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+        });
+
+        it("retains free, held and self-stamp outcomes from the Rust backend in stable order", async () => {
+            const tool = createCtxReduceTools({
+                db,
+                protectedSet: new Set(),
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 2,
+                        ctx_reduce_queued_tags: [1, 3],
+                        ctx_reduce_self_stamps: [2],
+                        held_tag_numbers: [1],
+                        immediate_tag_numbers: [3],
+                    }),
+                },
+            });
+            const result = await tool.ctx_reduce.execute({ drop: "2,1,3" }, toolContext());
+            expect(result).toBe(
+                "Queued: drop §3§. Held: §1 is inside the protected working set; it applies once newer work displaces it. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+            );
+        });
+
         it("uses the raw drop string and stable call id in rust mode", async () => {
             seedTags(db, [{ id: 3, sessionId: "ses-1" }]);
             const calls: Array<{ drop: string; commandId: string; projectRoot: string }> = [];
@@ -379,6 +470,23 @@ describe("createCtxReduceTools", () => {
                 callID: "call-2",
             } as never);
             expect(calls[2]?.commandId).not.toBe(calls[0]?.commandId);
+        });
+
+        it("uses the module's protected set acknowledgement for held Rust drops", async () => {
+            const rustTools = createCtxReduceTools({
+                db,
+                rustToolBackends: {
+                    reduce: async () => ({
+                        ok: true,
+                        queued: 2,
+                        held_tag_numbers: [9],
+                        immediate_tag_numbers: [1],
+                    }),
+                },
+            });
+            expect(await rustTools.ctx_reduce.execute({ drop: "1,9" }, toolContext())).toBe(
+                "Queued: drop §1§. Held: §9 is inside the protected working set; it applies once newer work displaces it.",
+            );
         });
 
         it("returns capability copy when the engine rejects a drop", async () => {

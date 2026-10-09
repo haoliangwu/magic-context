@@ -20,6 +20,7 @@ import {
 } from "../../features/magic-context/storage-meta";
 import {
     recordDetectedContextLimit,
+    recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
 } from "../../features/magic-context/storage-meta-persisted";
 import {
@@ -30,8 +31,10 @@ import { __test as transformDecisionTest } from "../../features/magic-context/tr
 import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/models-dev-cache";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
+import { EmergencyFailClosedError } from "./emergency-fail-closed";
 import { resolveContextWindowGeometry, resolveTrustedContextLimit } from "./event-resolvers";
 import { estimateFinalWireInputTokens } from "./final-wire-token-estimate";
+import { clearLkgMeasuredRequest, noteLkgProviderResponse } from "./lkg-measured-request";
 import { createDbLkgPersistence } from "./lkg-persist";
 import { lkgReplayFits, lkgReplayLimit } from "./lkg-replay-fit";
 import { registerLkgPersistence, resetLkgSlotsForTest } from "./lkg-slot";
@@ -190,7 +193,7 @@ type Step = "throw" | string | { decision: string; response: Record<string, unkn
  * process: a fresh adapter on the same database with the in-memory slot store
  * emptied, so the next read hydrates the durable slot.
  */
-function reviewSession(label: string, model: Model = OPUS) {
+function reviewSession(label: string, model: Model = OPUS, pageBytes = 512 * 1024) {
     sessionCounter += 1;
     const sessionId = `rust-frozen-review-r2-${label}-${sessionCounter}-${Date.now()}`;
     const modelKey = `${model.providerID}/${model.modelID}`;
@@ -201,18 +204,62 @@ function reviewSession(label: string, model: Model = OPUS) {
     const script: Step[] = [];
     let moduleOutput: (input: MessageLike[]) => unknown[] = (input) => structuredClone(input);
     let lastInput: MessageLike[] = [];
+    const wireRecords: Array<{ bytes: number; delta: boolean; nativeDelta: boolean }> = [];
+    let outputDeltas = false;
+    let moduleIngress: MessageLike[] = [];
+    let previousNative: unknown[] = [];
     const moduleClient: RustModeModuleClient = {
-        call: async ({ method }) => {
+        call: async ({ method, body }) => {
             if (method !== "transform") return { ok: true };
+            const request = body as Record<string, unknown>;
+            const delta = request.tail_delta as
+                | { after: string; native_replace_from: number }
+                | undefined;
+            const record = {
+                bytes: Buffer.byteLength(JSON.stringify(request)),
+                delta: !!delta,
+                nativeDelta: false,
+            };
+            wireRecords.push(record);
             pass += 1;
             const step = script.shift() ?? "SOFT+";
             if (step === "throw") throw new Error("daemon unavailable");
+            moduleIngress = delta
+                ? [
+                      ...moduleIngress.slice(0, delta.native_replace_from),
+                      ...(request.native_messages as MessageLike[]),
+                  ]
+                : structuredClone(request.native_messages as MessageLike[]);
+            if (outputDeltas) expect(moduleIngress).toEqual(lastInput);
+            const next = moduleOutput(outputDeltas ? moduleIngress : lastInput);
+            let replaceFrom = 0;
+            while (
+                replaceFrom < previousNative.length &&
+                replaceFrom < next.length &&
+                JSON.stringify(previousNative[replaceFrom]) === JSON.stringify(next[replaceFrom])
+            )
+                replaceFrom++;
+            const native =
+                outputDeltas && delta
+                    ? {
+                          native_messages_delta: {
+                              after: delta.after,
+                              replace_from: replaceFrom,
+                              messages: structuredClone(next.slice(replaceFrom)),
+                          },
+                      }
+                    : { native_messages: structuredClone(next) };
+            record.nativeDelta = "native_messages_delta" in native;
+            previousNative = structuredClone(next);
             return {
                 ...(typeof step === "string" ? {} : step.response),
                 decision: typeof step === "string" ? step : step.decision,
+                prefix_bust_permitted: ["HARD", "SOFT"].includes(
+                    typeof step === "string" ? step : step.decision,
+                ),
                 served_from: "transform",
                 row_version: pass,
-                native_messages: moduleOutput(lastInput),
+                ...native,
             };
         },
     };
@@ -239,7 +286,7 @@ function reviewSession(label: string, model: Model = OPUS) {
     const makeAdapter = () =>
         createRustModeTransform(deps, {
             moduleClient,
-            modulePageMaxBytes: 512 * 1024,
+            modulePageMaxBytes: pageBytes,
             scheduleLkgCapture: (capture) => capture(),
             rawFallbackEstimatorForTests: (args) => estimateFinalWireInputTokens(args),
         });
@@ -266,6 +313,10 @@ function reviewSession(label: string, model: Model = OPUS) {
         sessionId,
         db,
         model,
+        wireRecords,
+        enableOutputDeltas: () => {
+            outputDeltas = true;
+        },
         user: (id: string, text: string) => user(sessionId, id, text, model),
         get transform() {
             return transform;
@@ -389,8 +440,8 @@ describe("review r2: the four-bytes-per-token proxy over whole OpenCode messages
     });
 });
 
-describe("review r2: a restart and the count-release budget", () => {
-    it("FINDING: a freeze resumed by each restart never reaches its count release", async () => {
+describe("review r2: a restart and frozen recovery debt", () => {
+    it("preserves raw-served bytes across repeated restarts until a producer rebuild", async () => {
         const s = reviewSession("restart-budget");
         const sid = s.sessionId;
         s.setModuleOutput(tagAllUsers);
@@ -400,36 +451,42 @@ describe("review r2: a restart and the count-release budget", () => {
             assistant(sid, "a1"),
             s.user("m2", "turn 2"),
         ];
-        await s.run([...conversation], "throw");
+        const replay = await s.run([...conversation], "throw");
+        const frozenBytes = JSON.stringify(replay);
         expect(s.transform.getState(sid).lkgRepresentationFrozen).toBe(true);
         let turn = 2;
         let frozenPasses = 0;
         const frozenInputCount = conversation.length;
-        // Three restarts, each after six frozen healthy passes. The count release
-        // ends a freeze after 8 healthy passes or 16 messages of raw tail growth.
+        // Three restarts, each after six defers. Neither healthy-pass debt nor
+        // growing raw input authorizes tags on messages already served raw.
         for (let cycle = 0; cycle < 3; cycle += 1) {
             for (let index = 0; index < 6; index += 1) {
                 turn += 1;
                 conversation.push(assistant(sid, `a${turn}`), s.user(`m${turn}`, `turn ${turn}`));
-                await s.run([...conversation], "SOFT+");
+                const served = await s.run([...conversation], "SOFT+");
+                expect(JSON.stringify(served.slice(0, replay.length))).toBe(frozenBytes);
                 if (s.transform.getState(sid).lkgRepresentationFrozen) frozenPasses += 1;
             }
             s.restart();
         }
         turn += 1;
         conversation.push(assistant(sid, `a${turn}`), s.user(`m${turn}`, `turn ${turn}`));
-        await s.run([...conversation], "SOFT+");
+        const served = await s.run([...conversation], "SOFT+");
+        expect(JSON.stringify(served.slice(0, replay.length))).toBe(frozenBytes);
         const stillFrozen = s.transform.getState(sid).lkgRepresentationFrozen;
-        // The freeze must end within the count budget whatever the restarts do.
+        // Repeated restarts must not hide the raw tail's already-served bytes.
         expect({
             frozenPasses,
             rawTailGrowth: conversation.length - frozenInputCount,
             stillFrozen,
         }).toEqual({
-            frozenPasses,
-            rawTailGrowth: conversation.length - frozenInputCount,
-            stillFrozen: false,
+            frozenPasses: 18,
+            rawTailGrowth: 38,
+            stillFrozen: true,
         });
+        const rebuilt = await s.run([...conversation], "HARD");
+        expect(s.transform.getState(sid).lkgRepresentationFrozen).toBe(false);
+        expect(JSON.stringify(rebuilt)).not.toBe(JSON.stringify(served));
     });
 });
 
@@ -507,5 +564,167 @@ describe("review r2: an adapter OpenCode drops without disposing it", () => {
             if (liveRustLkgReplayParticipantCountForTest() === 0) break;
         }
         expect(liveRustLkgReplayParticipantCountForTest()).toBe(0);
+    });
+});
+
+describe("frozen recovery admission", () => {
+    for (const emergency of [false, true]) {
+        it(`${emergency ? "CONTROL: emergency" : "REVIEW: both-over"} frozen recovery must refuse rather than send ten known-over requests`, async () => {
+            const s = reviewSession(`known-over-${emergency}`, OPUS, 8 * 1024 * 1024);
+            s.setModuleOutput(tagAllUsers);
+            const input = [s.user("m1", "question")];
+            await s.run(input, "HARD");
+            await s.run(input, "throw");
+            if (emergency)
+                recordOverflowDetected(s.db, s.sessionId, 200_000, "anthropic/claude-opus-5-5");
+            input.push(assistant(s.sessionId, "a1"), s.user("m2", "word ".repeat(300_000)));
+            let sent = 0;
+            const refusals: unknown[] = [];
+            for (let i = 0; i < 10; i++) {
+                try {
+                    await s.run(input, "SOFT+");
+                    sent++;
+                } catch (error) {
+                    refusals.push(error);
+                }
+            }
+            expect({ sent, refused: refusals.length }).toEqual({ sent: 0, refused: 10 });
+            for (const refusal of refusals) {
+                expect(refusal).toBeInstanceOf(EmergencyFailClosedError);
+                expect((refusal as Error).message).toContain("MC-H07");
+            }
+            expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+            expect(s.transform.getState(s.sessionId).failureCount).toBe(1);
+        });
+    }
+
+    it("refuses known-over frozen bytes when native fit is unproven without an emergency", async () => {
+        const s = reviewSession("native-unproven", OPUS, 8 * 1024 * 1024);
+        const input = [s.user("m1", "question")];
+        await s.run(input, "HARD");
+        await s.run(input, "throw");
+        input.push(assistant(s.sessionId, "a1"), s.user("m2", "word ".repeat(300_000)));
+        const unknown = s.user("native", "small native output");
+        unknown.parts.push({ type: "future-provider-part" } as never);
+        s.setModuleOutput(() => [unknown]);
+        await expect(s.run(input, "SOFT+")).rejects.toBeInstanceOf(EmergencyFailClosedError);
+        expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+        expect(s.transform.getState(s.sessionId).failureCount).toBe(1);
+    });
+
+    it("CONTROL: unproven frozen fit still holds even when native output fits", async () => {
+        const s = reviewSession("frozen-unproven");
+        const input = [s.user("m1", "question")];
+        await s.run(input, "HARD");
+        const frozen = await s.run(input, "throw");
+        const tail = s.user("m2", "unknown tail");
+        tail.parts.push({ type: "future-provider-part" } as never);
+        input.push(assistant(s.sessionId, "a1"), tail);
+        s.setModuleOutput(() => [s.user("m1", "small native output")]);
+        expect(await s.run(input, "SOFT+")).toEqual([...frozen, ...input.slice(1)]);
+        expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+    });
+
+    it("CONTROL: frozen replay measured under the limit still sends despite an over-budget prefix estimate", async () => {
+        const s = reviewSession("measured-under", OPUS, 8 * 1024 * 1024);
+        const modelKey = "anthropic/claude-opus-5-5";
+        const input = [s.user("m1", "word ".repeat(300_000))];
+        noteLkgProviderResponse({
+            sessionId: s.sessionId,
+            modelKey,
+            responseId: "a1",
+            inputTokens: 0,
+        });
+        try {
+            const initial = await s.run(input, "HARD");
+            noteLkgProviderResponse({
+                sessionId: s.sessionId,
+                modelKey,
+                responseId: "a1",
+                inputTokens: 1_000,
+                finish: "stop",
+            });
+            input.push(assistant(s.sessionId, "a1"), s.user("m2", "small tail"));
+            const frozen = await s.run(input, "throw");
+            expect(frozen).toEqual([...initial, ...input.slice(1)]);
+            expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+            s.setModuleOutput(tagAllUsers);
+            expect(await s.run(input, "SOFT+")).toEqual(frozen);
+            expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+        } finally {
+            clearLkgMeasuredRequest(s.sessionId);
+        }
+    });
+});
+
+describe("frozen native transport", () => {
+    it("continues native input and output deltas while serving frozen bytes and adopts the native basis on rebuild", async () => {
+        const s = reviewSession("native-delta");
+        s.enableOutputDeltas();
+        s.setModuleOutput(tagAllUsers);
+        const input = [s.user("m1", "question")];
+        await s.run(input, "HARD");
+        const frozen = await s.run(input, "throw");
+        // The module's native prefix has a different shape and nested bytes from
+        // the provider-visible replay. Its deltas must never use the replay as a base.
+        const native = (raw: MessageLike[]) => [
+            s.user("native-only", "module prefix"),
+            ...tagAllUsers(raw),
+        ];
+        s.setModuleOutput(native);
+        for (let i = 0; i < 5; i++) {
+            input.push(assistant(s.sessionId, `a${i}`), s.user(`m${i + 2}`, `tail ${i}`));
+            expect(await s.run(input, "SOFT+")).toEqual([...frozen, ...input.slice(1)]);
+            expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+            if (i > 0)
+                expect(s.wireRecords.at(-1)).toMatchObject({ delta: true, nativeDelta: true });
+        }
+        // A no-append delta reuses the entire native array. The adoption seam
+        // must select it, not the shorter frozen array the provider last saw.
+        expect(await s.run(input, "HARD")).toEqual(native(input));
+        expect(s.wireRecords.at(-1)).toMatchObject({ delta: true, nativeDelta: true });
+        expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(false);
+        const adopted = native(input);
+        input.push(assistant(s.sessionId, "a-final"), s.user("m-final", "after adoption"));
+        const continued = await s.run(input, "SOFT+");
+        expect(continued).toEqual(native(input));
+        expect(continued.slice(0, adopted.length)).toEqual(adopted);
+        expect(s.wireRecords.at(-1)).toMatchObject({ delta: true, nativeDelta: true });
+        expect(s.transform.getState(s.sessionId).consecutiveFailures).toBe(0);
+    });
+
+    it("CONTROL: measures one hundred fitting frozen defers against full transport without changing served bytes", async () => {
+        const measure = async (full: boolean) => {
+            const s = reviewSession(full ? "transport-full" : "transport-delta");
+            s.enableOutputDeltas();
+            s.setModuleOutput(tagAllUsers);
+            const input = [s.user("m1", "question")];
+            await s.run(input, "HARD");
+            const frozen = await s.run(input, "throw");
+            for (let i = 0; i < 100; i++) {
+                input.push(
+                    assistant(s.sessionId, `a${i}`),
+                    s.user(`m${i + 2}`, "word ".repeat(100)),
+                );
+                if (full) s.transform.invalidateWireState(s.sessionId);
+                expect(await s.run(input, "SOFT+")).toEqual([...frozen, ...input.slice(1)]);
+                expect(s.transform.getState(s.sessionId).lkgRepresentationFrozen).toBe(true);
+            }
+            const bodies = s.wireRecords.slice(2);
+            return {
+                bytes: bodies.reduce((sum, r) => sum + r.bytes, 0),
+                deltas: bodies.filter((r) => r.delta).length,
+            };
+        };
+        const delta = await measure(false);
+        const full = await measure(true);
+        console.log(
+            "FROZEN_TRANSPORT",
+            JSON.stringify({ delta, full, ratio: full.bytes / delta.bytes }),
+        );
+        expect(full.deltas).toBe(0);
+        expect(full.bytes).toBeGreaterThan(8_000_000);
+        expect(delta.bytes).toBeLessThan(full.bytes / 8);
+        expect(delta.deltas).toBe(99);
     });
 });

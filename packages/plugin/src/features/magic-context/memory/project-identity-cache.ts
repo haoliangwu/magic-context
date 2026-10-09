@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { getMagicContextStorageDir } from "../../../shared/data-path";
 import { projectDirectoryKey } from "../../../shared/project-directory-key";
+import { writeStorageFileAtomicSync } from "../../../shared/storage-permissions";
 
 // Lives in shared/ so the TUI (which ships without features/) can use the same
 // normalization; re-exported here for the existing importers.
@@ -17,14 +18,10 @@ function cachePath(directory: string, storageDir = getMagicContextStorageDir()):
 export function rememberGitIdentity(directory: string, identity: string): void {
     try {
         const destination = cachePath(directory);
-        mkdirSync(path.dirname(destination), { recursive: true });
-        const temporary = `${destination}.${randomUUID()}.tmp`;
-        writeFileSync(
-            temporary,
+        writeStorageFileAtomicSync(
+            destination,
             JSON.stringify({ directory: projectDirectoryKey(directory), identity }),
-            { mode: 0o600 },
         );
-        renameSync(temporary, destination);
     } catch {
         // Read-only storage must not turn a successful git probe into a failure.
     }

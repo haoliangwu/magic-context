@@ -118,7 +118,12 @@ describe("status view model", () => {
         expect(rowLabels("Tags")).toEqual(["Active", "Dropped", "Total"]);
         expect(rowLabels("Reductions")).toEqual(["Execute threshold", "Last reduce anchor"]);
         expect(rowLabels("Pending Queue")).toEqual(["Drops", "Marker"]);
-        expect(rowLabels("Context Details")).toEqual(["Protected tags", "Subagent"]);
+        expect(rowLabels("Context Details")).toEqual([
+            "Protected tags",
+            "Subagent",
+            "Denominator",
+            "Window source",
+        ]);
         expect(rowLabels("Cache TTL")).toEqual([
             "Configured",
             "Last response",
@@ -264,7 +269,7 @@ describe("status view model", () => {
      * gap fit; otherwise the caller draws one column.
      */
     test("draws two columns only when both columns' values fit", () => {
-        const sections = view().sections;
+        const sections = view({ cacheTtlSource: "default" }).sections;
         for (const section of sections) {
             const longest = Math.max(...section.rows.map((row) => row.value.length));
             expect(statusSectionWidth(section)).toBe(section.labelWidth + 1 + longest);
@@ -297,7 +302,7 @@ describe("status view model", () => {
         expect(statusColumnsFor(narrowValues, needed).twoColumn).toBe(true);
         expect(statusColumnsFor(narrowValues, needed - 1).twoColumn).toBe(false);
 
-        // A long value — the model key on the Configured row — pushes the left
+        // A long value — the frozen-default source on the Configured row — pushes the left
         // column past what the dialog has, so the same sections go one column
         // rather than wrapping that value mid-word.
         expect(statusColumnsFor(sections, 84).twoColumn).toBe(false);
@@ -398,6 +403,15 @@ describe("status view model", () => {
      * (issue 496).
      */
     describe("blocked background maintenance", () => {
+        test("shows a scheduled task's primary quota deadline in the status dialog", () => {
+            const error =
+                "primary quota exhausted until 2026-10-08T03:40:04.275Z; account=private@example.com";
+            const row = view({ dreamerFailures: [{ task: "verify", error }] })
+                .sections.find((section) => section.title === "History Compression")
+                ?.rows.find((entry) => entry.label === "Dreamer quota");
+            expect(row?.value).toBe("primary quota exhausted until 2026-10-08T03:40:04.275Z");
+            expect(row?.tone).toBe("warning");
+        });
         const failure = {
             at: NOW - 2 * 3_600_000,
             stage: "message-history maintenance",

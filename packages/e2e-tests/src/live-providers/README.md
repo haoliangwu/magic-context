@@ -91,6 +91,94 @@ The first live attempt is documented in
 Both authorized accounts were rate-limited before thinking generation: acceptance,
 trim-only behavior, mixed-edit stripping and cache reads remain **unverified live**.
 
+## Independent preserved-thinking wire matrix
+
+For an isolated signature-rule experiment, rather than MC's actual age/flush
+behavior, use the native Messages matrix. Prefer a recorded request containing at
+least six signed blocks across three assistant messages, with intervening tool
+calls. Copy only selected request bodies into
+`~/.local/share/cortexkit/magic-context/specimens/thinking-matrix/` as mode-0600
+regular files; never put them in the repository. The source dumps are read-only.
+
+```sh
+MC_LIVE_PROVIDERS=1 MC_LIVE_MAX_CALLS=9 \
+MC_E2E_ENROLLMENT_PATH=/explicitly-authorized/mc-e2e/enrollment.json \
+  bun packages/e2e-tests/src/live-providers/thinking-matrix-live.ts \
+  --opencode /absolute/opencode-1.18.30 \
+  --anthropic-auth /absolute/anthropic-auth/packages/opencode/dist/index.js \
+  --opus-seed "$HOME/.local/share/cortexkit/magic-context/specimens/thinking-matrix/opus-5-5-recorded.json" \
+  --out "$TMPDIR/magic-context/live-providers/thinking-matrix-UNIQUE"
+```
+
+Add `--sonnet-seed` only if a qualifying Sonnet 5.5 body exists (and set the total
+cap to at most 18). An omitted model is skipped, never seeded synthetically. The
+recorded seed must already contain `thinking.type: adaptive` and
+`output_config.effort`; no compatibility shim is applied. Its history, system,
+tools and effort remain unchanged in the control. All cells share a 64-token
+output cap, non-streaming transport, and strict block binding with its beta.
+
+The recorded mode sends at most nine one-shot requests per model: unchanged
+control, oldest-one trim, suffix removal (all but the oldest signed block), all
+thinking removal, second-block gap with later blocks kept, restoration, earlier
+tool-result edit, first-user re-render, and literal `[cleared]`. Restoration
+reuses the prefix-trim response only if it produced a new signed block; otherwise
+the cell is explicitly not reached and the run exits nonzero. No tool is executed:
+new tool calls in that response get local error results for the restoration probe.
+Every other cell is an independent clone of the same seed. The restoration probe
+does not undo a rejected middle gap; it tests reinserting the removed oldest block
+after generation while that block was absent. Any rejected control, 429 or quota
+error stops the entire run without retries or changing credentials. Error bodies
+are preserved in full except for secret/conversation redactions, alongside usage
+and hashed request shapes. No raw body or signature is retained in the output.
+
+The older synthetic seeding mode remains available when neither seed flag is
+provided, but its Oct 8 attempts produced insufficient signed history:
+
+```sh
+MC_LIVE_PROVIDERS=1 MC_LIVE_MAX_CALLS=92 timeout --kill-after=30s 600s \
+  bun packages/e2e-tests/src/live-providers/thinking-matrix-live.ts \
+  --opencode /absolute/opencode-1.18.30 \
+  --anthropic-auth /absolute/anthropic-auth/packages/opencode/dist/index.js \
+  --out "$TMPDIR/magic-context/live-providers/thinking-matrix-UNIQUE"
+```
+
+This uses only `oauth:anthropic`, read once through `mc-e2e`. The installed auth
+plugin first shapes a request against a **loopback-only** rejection; that bootstrap
+spends no model quota and deletes its disposable credential root. The native
+client then keeps the captured bearer headers and signed history only in memory.
+It explicitly requests strict thinking binding and its beta. A seed refusal gets
+one neutral-prompt retry; 429s and other errors are never retried. Alternate accounts,
+persistent raw bodies, and signature dumps are not supported.
+
+Each model gets one conversation with completed `record_note` tool rounds. Every
+seed request uses adaptive thinking at high effort with a 1,152-token response
+cap, the supported mode for Opus 5.5 and Sonnet 5.5. Adaptive thinking can still
+skip a block on an easy turn, so the runner counts actual signed blocks and
+continues for up to eight rounds until at least four exist across at least two
+completed rounds. A refusal on a seed request gets one retry with a different
+neutral arithmetic prompt; other errors are not retried. The tool and prompts
+only use harmless short arithmetic results. There is no cache ballast: the matrix
+measures signature binding, not prompt-cache behavior.
+
+Every next-request variant is a fresh copy of the same seed, and both models run
+the same common cells: control, oldest one/two, middle-only, suffix and all
+removal, tool-input and tool-result edits (each keep/strip pair), first-user
+re-render (keep/strip), and literal `[cleared]`. The restore check reuses the
+oldest-one response and makes one follow-up request only if that response contains
+a new signed block generated while the prefix was absent. Branch responses never
+enter another branch's history. A 429 stops the whole run immediately; no account
+rotation or retry occurs. Authentication rejection also stops both. The hard cap
+is 92 calls: enough for eight rounds and one refusal retry per tool/final request
+for both models, plus every common cell and restore check. Errors, missing signed
+history, and an unreached restore check exit nonzero and leave reached-call
+evidence in `results.json`.
+
+`completed` means every one-shot cell and the restore check were reached, **not**
+that all memory claims were validated. Inspect per-variant status/request IDs and
+transformation diagnostics, particularly the unchanged control. The Oct 7 quota
+block and the Oct 8 insufficient-seed runs are recorded in
+[`live-thinking-trim-opus-5-5.md`](../../../../docs/reports/live-thinking-trim-opus-5-5.md).
+
 ## Local verification
 
 ```sh

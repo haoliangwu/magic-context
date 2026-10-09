@@ -17,7 +17,7 @@
 //   - All accounting is in TOKENS. Tags store BYTES, so we convert with the one
 //     canonical estimator (`TOKENS_PER_BYTE`, shared with the Phase 1 nudge).
 
-import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import { TOKENS_PER_BYTE } from "./ctx-reduce-nudge";
 import { estimateTokens } from "./read-session-formatting";
 import type { TagTarget } from "./tag-messages";
@@ -137,6 +137,8 @@ export function estimateEmergencyDropReclaimTokens(tag: EmergencyDropTag): numbe
 export function planEmergencyDrop(input: {
     /** Evictable candidates: active tool tags with a working drop target. */
     tags: readonly EmergencyDropTag[];
+    protectedTools?: Readonly<Record<string, number>>;
+    protectedToolTags?: ReadonlySet<number>;
     /**
      * FULL active live-window tag set (all types) — floor accounting only.
      * See the fixedFloor contract above.
@@ -264,9 +266,8 @@ export function planEmergencyDrop(input: {
     // classifies them as T3. This is safe without changing the target math:
     // fixedFloor above derives from every active floor tag, so removing candidates
     // changes neither the floor nor the target (panel-verified emergency interaction).
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(
-        floorTags.filter((tag) => tag.status === "active" && tag.type === "tool"),
-    );
+    const protectedTags =
+        input.protectedToolTags ?? protectedToolTagNumbers(floorTags, input.protectedTools);
 
     // Build evictable candidates per tier. Only active tags are eligible, so a
     // tag dropped on a prior pass (now status!=='active') is never re-selected —
@@ -288,7 +289,7 @@ export function planEmergencyDrop(input: {
             }
         }
 
-        if (protectedCtxReduceTags.has(tag.tagNumber)) continue;
+        if (protectedTags.has(tag.tagNumber)) continue;
         const tier = resolveToolTier(tag.toolName);
         if ((tier === 1 || tier === 2) && reserved.has(tag.tagNumber)) continue;
         byTier[tier].push(tag);

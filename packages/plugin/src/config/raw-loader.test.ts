@@ -375,6 +375,21 @@ describe("per-harness raw config migration", () => {
         expect(statSync(backupPath).ino).toBe(backupInode);
     });
 
+    it("creates user migration backups and replacement configs owner-only", () => {
+        if (process.platform === "win32") return;
+        const directory = temporaryDirectory();
+        const configPath = join(directory, "magic-context.jsonc");
+        const original = Buffer.from('{ "historian": { "model": "provider/model" } }\n');
+        writeFileSync(configPath, original);
+        chmodSync(configPath, 0o644);
+
+        const loaded = loadRawConfigFile({ configPath, tier: "user" });
+
+        expect(loaded?.migrated).toBe(true);
+        expect(statSync(configPath).mode & 0o777).toBe(0o600);
+        expect(statSync(`${configPath}.pre-per-harness.bak`).mode & 0o777).toBe(0o600);
+    });
+
     // stow, chezmoi and home-manager link the user config into a dotfiles repo.
     // Replacing the link with a regular file would silently stop later edits
     // from reaching that repo, so the migration writes through to the target.

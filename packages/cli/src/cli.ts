@@ -20,6 +20,8 @@
  *   --help, -h              Print help and exit
  */
 import { createRequire } from "node:module";
+import { loadPluginConfig } from "@magic-context/core/config";
+import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
 import { subcommandHelp } from "./lib/cli-help";
 import { isPromptCancelledError } from "./lib/prompts";
 import { runSqlitePreflight } from "./lib/sqlite-preflight";
@@ -122,6 +124,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     }
 
     try {
+        setStoragePrivatePermissionEnforcement(
+            loadPluginConfig(process.cwd()).storage.enforce_private_permissions,
+        );
         // Await here, inside the try: returning the command's promise directly
         // would let a cancelled prompt reject past this handler, so the
         // process-level handler printed "Cancelled." again and exited 1.
@@ -162,6 +167,10 @@ async function runCommand(command: string | undefined, rest: string[]): Promise<
         if (rest[0] === "repair-db") {
             const { runRepairDbCli } = await import("./commands/doctor-repair-db");
             return runRepairDbCli(rest.slice(1));
+        }
+        if (rest[0] === "git-fts-map") {
+            const { runDoctorGitFtsMapCli } = await import("./commands/doctor-git-fts-map");
+            return runDoctorGitFtsMapCli(rest.slice(1));
         }
         if (rest[0] === "list-hidden-sessions") {
             const { runListHiddenSessions } = await import("./commands/doctor-hidden-sessions");

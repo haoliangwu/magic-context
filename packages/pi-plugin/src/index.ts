@@ -41,6 +41,7 @@ import type {
 	HistorianConfig,
 	MagicContextConfig,
 } from "@magic-context/core/config/schema/magic-context";
+import { createSubcCheckoutClaimGate } from "@magic-context/core/features/magic-context/checkout-claim";
 import {
 	summarizeDreamSchedule,
 	userMemoryCollectionEnabled,
@@ -84,6 +85,7 @@ import {
 	resolveHistorianContextLimit,
 	resolveKnownHistorianContextLimit,
 } from "@magic-context/core/hooks/magic-context/derive-budgets";
+import { getDefaultSubcConnectionFile } from "@magic-context/core/hooks/magic-context/module-transport";
 import {
 	clearNoteNudgeTriggerAndCooldown,
 	onNoteTrigger,
@@ -122,10 +124,8 @@ import {
 	providerResponseFailed,
 } from "@magic-context/core/shared/provider-response-completion";
 import { setStoragePrivatePermissionEnforcement } from "@magic-context/core/shared/storage-permissions";
-import {
-	hasTrustedAbsoluteWall,
-	reloadWindowOverlay,
-} from "@magic-context/core/shared/window-geometry";
+import { reloadWindowOverlay } from "@magic-context/core/shared/window-geometry";
+import { gatePiEventsByCheckoutClaim } from "./checkout-claim-pi";
 import { handlePiCloneSessionStart } from "./clone-inheritance";
 import { registerCtxDreamCommand } from "./commands/ctx-dream";
 import {
@@ -211,8 +211,12 @@ import {
 	isPiContextUsageRawBranchEstimate,
 	notePiUsageReadingUsed,
 	noteRawBranchEstimateSetAside,
+	noteRejectedPiUsage,
 	piMessageAnchorsLiveUsage,
+	piPressureEvidenceLimit,
+	piUsageInputTokens,
 	recordPiLiveUsageClassification,
+	recordPiProviderUsageValidity,
 } from "./pi-pressure";
 import {
 	piProvenFloorModelKey,
@@ -225,9 +229,9 @@ import { handlePiProviderFailure } from "./provider-error-recovery-pi";
 import { bindStaleBuildNotice } from "./stale-build-notice";
 import { registerStatusLine, updateStatusLine } from "./status-line";
 import { stripTagPrefixFromAssistantMessage } from "./strip-tag-prefix";
+import { registerPiSubagentHostTools } from "./subagent-host-tools";
 import {
 	configurePiSubagentExtensions,
-	configurePiSubagentHostTools,
 	MAGIC_CONTEXT_PI_SUBAGENT_ENV,
 	PiSubagentRunner,
 } from "./subagent-runner";
@@ -388,6 +392,7 @@ export function persistPiMessageEndModelMeta(args: {
 	sessionId: string;
 	message: unknown;
 	cacheTtlConfig: MagicContextConfig["cache_ttl"];
+	cacheTtlConfigured?: boolean;
 }): void {
 	if (!args.message || typeof args.message !== "object") return;
 	const msg = args.message as {
@@ -412,6 +417,7 @@ export function persistPiMessageEndModelMeta(args: {
 		args.sessionId,
 		args.cacheTtlConfig,
 		modelKey,
+		args.cacheTtlConfigured,
 	).value;
 	const currentMeta = getOrCreateSessionMeta(args.db, args.sessionId);
 	updateSessionMeta(args.db, args.sessionId, {
@@ -648,35 +654,6 @@ function getPiMessageModel(message: unknown): {
 	};
 }
 
-const piUsageBoundLogSeen = new Set<string>();
-
-function logPiUsageBoundOnce(
-	sessionId: string,
-	reading: number,
-	absoluteWall: number,
-	reason: "current reading" | "persisted floor",
-): void {
-	const key = `${sessionId}|${reason}`;
-	if (piUsageBoundLogSeen.has(key)) return;
-	piUsageBoundLogSeen.add(key);
-	info(
-		`message_end: session=${sessionId} bounded ${reason} ${reading} at trusted absolute wall ${absoluteWall}; pressure_proof_not_capacity`,
-	);
-}
-
-function logPiUsageAboveWindowOnce(
-	sessionId: string,
-	reading: number,
-	absoluteWall: number,
-): void {
-	const key = `${sessionId}|accepted above window`;
-	if (piUsageBoundLogSeen.has(key)) return;
-	piUsageBoundLogSeen.add(key);
-	info(
-		`message_end: session=${sessionId} provider usage ${reading} exceeds configured window ${absoluteWall}; counted as real pressure against the configured limit`,
-	);
-}
-
 function resolvePiPressureContextLimit(args: {
 	db: ContextDatabase;
 	sessionId: string;
@@ -728,6 +705,7 @@ export async function persistPiPressureFromMessageEnd(args: {
 	piTokens?: number;
 	/** `piTokens` is Pi's raw-branch estimate (see isPiLiveUsageRawBranchEstimate). */
 	piTokensIsRawBranchEstimate?: boolean;
+	readBranch?: () => readonly unknown[] | undefined;
 	notifyIssue?: (message: string) => unknown | Promise<unknown>;
 }): Promise<void> {
 	// Pi emits message_end before it appends the message to the branch, so the
@@ -748,16 +726,37 @@ export async function persistPiPressureFromMessageEnd(args: {
 			? piModelRefToCanonical(`${activeModel.provider}/${activeModel.id}`)
 			: undefined;
 	const usage = extractAssistantUsage(args.message);
+	const detectedContextLimit = getOverflowState(
+		args.db,
+		args.sessionId,
+		modelKey,
+	).detectedContextLimit;
 	const reportedGeometry = resolvePiWindowGeometry({
 		rawContextWindow: args.piContextWindow,
 		rawContextWindowSource: args.piContextWindowSource,
 		model: activeModel,
+		detectedContextLimit,
 	});
-	const trustedAbsoluteWall =
-		reportedGeometry && hasTrustedAbsoluteWall(reportedGeometry)
-			? reportedGeometry.derivation.absoluteWall
-			: undefined;
-	const unboundedPressure = computePiPressure(usage, args.piContextWindow);
+
+	const providerInputLimit = piPressureEvidenceLimit(reportedGeometry);
+	const reportedInput = piUsageInputTokens(usage);
+	const rejectedUsage =
+		reportedInput !== null && reportedInput > providerInputLimit;
+	if (reportedInput !== null)
+		recordPiProviderUsageValidity(args.sessionId, rejectedUsage);
+	const unboundedPressure = computePiPressure(
+		usage,
+		args.piContextWindow,
+		providerInputLimit,
+	);
+	if (rejectedUsage) {
+		noteRejectedPiUsage(
+			args.sessionId,
+			reportedInput,
+			providerInputLimit,
+			"message_end",
+		);
+	}
 	const msg =
 		args.message && typeof args.message === "object"
 			? (args.message as { errorMessage?: unknown })
@@ -765,35 +764,16 @@ export async function persistPiPressureFromMessageEnd(args: {
 	const messageHadOverflowError =
 		typeof msg?.errorMessage === "string" &&
 		detectOverflow(msg.errorMessage).isOverflow;
-	const readingAboveTrustedWall =
-		unboundedPressure !== null &&
-		trustedAbsoluteWall !== undefined &&
-		unboundedPressure.inputTokens > trustedAbsoluteWall;
-	// Provider usage on a request the provider accepted is the real prompt
-	// size, so it counts in full whatever its size. The trusted window is a
-	// configured figure that can be smaller than what the model serves; a
-	// reading past it is real overflow of the user's limit. Only after an
-	// overflow error (no accepted request) is the reading clamped at the wall.
-	const requestAccepted = !messageHadOverflowError;
-	if (readingAboveTrustedWall && unboundedPressure && trustedAbsoluteWall) {
-		if (requestAccepted) {
-			logPiUsageAboveWindowOnce(
-				args.sessionId,
-				unboundedPressure.inputTokens,
-				trustedAbsoluteWall,
-			);
-		} else {
-			logPiUsageBoundOnce(
-				args.sessionId,
-				unboundedPressure.inputTokens,
-				trustedAbsoluteWall,
-				"current reading",
-			);
-		}
-	}
-	// Only a reading within the configured window proves capacity: one past it
-	// is pressure, and recording it as proven would widen the configured window.
-	const requestSucceeded = requestAccepted && !readingAboveTrustedWall;
+	// A successful reply can carry turn-aggregate billing counters. Success
+	// alone does not prove that such a reading measures one request.
+	const requestAccepted =
+		!messageHadOverflowError &&
+		!providerResponseFailed({
+			finish: (args.message as { stopReason?: unknown } | undefined)
+				?.stopReason,
+			error: msg?.errorMessage,
+		});
+	const requestSucceeded = requestAccepted && !rejectedUsage;
 	// A limit learned from an earlier overflow error is stale once the provider
 	// accepts a larger request, whatever the configured window says.
 	if (requestAccepted && unboundedPressure) {
@@ -817,10 +797,12 @@ export async function persistPiPressureFromMessageEnd(args: {
 	// The floor is proof about the model that served it; see pi-proven-floor.ts.
 	// Resolved before the row is read, because an unkeyed floor is cleared here.
 	const floorModelKey = piProvenFloorModelKey(activeModel);
-	let observedSafeInputTokens = resolvePiProvenInputFloor({
+	const observedSafeInputTokens = resolvePiProvenInputFloor({
 		db: args.db,
 		sessionId: args.sessionId,
 		modelKey: floorModelKey,
+		readBranch: args.readBranch,
+		providerInputLimit,
 	});
 	const meta = getOrCreateSessionMeta(args.db, args.sessionId);
 	const updates: Partial<{
@@ -860,29 +842,6 @@ export async function persistPiPressureFromMessageEnd(args: {
 		updates.lastResponseTime = Math.max(meta.lastResponseTime, Date.now());
 	}
 
-	if (
-		trustedAbsoluteWall !== undefined &&
-		observedSafeInputTokens > trustedAbsoluteWall
-	) {
-		logPiUsageBoundOnce(
-			args.sessionId,
-			observedSafeInputTokens,
-			trustedAbsoluteWall,
-			"persisted floor",
-		);
-		observedSafeInputTokens = 0;
-		updates.observedSafeInputTokens = 0;
-		updates.cacheAlertSent = false;
-		updates.lastUsageContextLimit = reportedGeometry?.usableSoft ?? 0;
-		if (meta.lastInputTokens > trustedAbsoluteWall) {
-			updates.lastInputTokens = trustedAbsoluteWall;
-			updates.lastContextPercentage =
-				reportedGeometry && reportedGeometry.usableSoft > 0
-					? (trustedAbsoluteWall / reportedGeometry.usableSoft) * 100
-					: 0;
-		}
-	}
-
 	const effectiveContextLimit = resolvePiPressureContextLimit({
 		db: args.db,
 		sessionId: args.sessionId,
@@ -891,11 +850,18 @@ export async function persistPiPressureFromMessageEnd(args: {
 		model: activeModel,
 		provenInputTokens: observedSafeInputTokens,
 	});
+	if (rejectedUsage) {
+		// Do not preserve a poisoned numerator or clamp it to the wall. If Pi
+		// also lacks a usable reading, the context pass will count request bytes.
+		updates.lastInputTokens = 0;
+		updates.lastContextPercentage = 0;
+		updates.lastUsageContextLimit = effectiveContextLimit;
+	}
 	const reportedContextLimit = reportedGeometry?.usableSoft ?? 0;
 	const pressure = computePiPressure(
 		usage,
 		effectiveContextLimit,
-		requestAccepted ? undefined : trustedAbsoluteWall,
+		providerInputLimit,
 	);
 
 	// Sent only after the reading is stored below, so a slow notification
@@ -938,9 +904,11 @@ export async function persistPiPressureFromMessageEnd(args: {
 			updates.observedSafeInputTokens = provenSafeInputTokens;
 		}
 	} else if (
-		usage === null &&
+		(usage === null || rejectedUsage) &&
 		typeof args.piTokens === "number" &&
-		(trustedAbsoluteWall === undefined || args.piTokens <= trustedAbsoluteWall)
+		Number.isFinite(args.piTokens) &&
+		args.piTokens > 0 &&
+		args.piTokens <= providerInputLimit
 	) {
 		// Non-assistant message_end events (tool results, user messages) carry
 		// no provider usage, so Pi's own figure stands in. Normally it is the
@@ -1115,7 +1083,7 @@ export function resolveHistorianFromConfig(
 		executeThresholdTokens: config.execute_threshold_tokens,
 		commitClusterTrigger: config.commit_cluster_trigger,
 		protectedTags: config.protected_tags,
-		clearReasoningAge: config.clear_reasoning_age,
+		keepReasoningTokens: config.keep_reasoning_tokens,
 		historyBudgetPercentage: config.history_budget_percentage,
 		memoryEnabled: config.memory.enabled,
 		autoPromote: config.memory.auto_promote,
@@ -1170,13 +1138,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		);
 		return;
 	}
-	configurePiSubagentHostTools(() => {
-		if (typeof pi.getAllTools === "function") {
-			return pi.getAllTools().map((tool) => tool.name);
-		}
-		if (typeof pi.getActiveTools === "function") return pi.getActiveTools();
-		return undefined;
-	});
+	registerPiSubagentHostTools(pi, PI_HARNESS_KIND);
 	const unregisterPiSubagentInitContext = registerPiSubagentInitContext(pi);
 	registerPiSubagentInitContextCleanup(pi, unregisterPiSubagentInitContext);
 
@@ -1287,10 +1249,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
  * runtime without requiring a process restart.
  */
 async function startPiMagicContextRuntime(
-	pi: ExtensionAPI,
+	hostPi: ExtensionAPI,
 	database: ContextDatabase,
 	dbPath: string,
 ): Promise<void> {
+	// One checkout-claim gate per runtime: Magic Context must not write for a
+	// session whose agent another machine holds. Session start and every context
+	// pass check it explicitly (session start tells the user, the context pass
+	// refuses the turn); every other event handler registered through `pi` below
+	// skips such a session. Verdicts are cached per session, so a pass pays for
+	// at most one check per cache period. The connection file is resolved per
+	// check, so the configured one applies once the config below has loaded.
+	let subcConnectionFile: string | undefined;
+	const checkoutClaim = createSubcCheckoutClaimGate(
+		"pi",
+		() => subcConnectionFile ?? getDefaultSubcConnectionFile(),
+	);
+	const pi = gatePiEventsByCheckoutClaim(hostPi, () => checkoutClaim);
 	const db = database;
 
 	// v22 deferred legacy-memory identity backfill. openDatabase() has already
@@ -1531,7 +1506,8 @@ async function startPiMagicContextRuntime(
 	): PiContextHandlerOptions => ({
 		db: database,
 		cacheTtlConfig: cfg.cache_ttl,
-		smartDrops: cfg.smart_drops === true,
+		cacheTtlConfigured: cfg.cacheTtlConfigured,
+		protectedTools: cfg.protected_tools,
 		protectedTokens: cfg.protected_tokens,
 		protectedTokenTierOverrides: getProtectedTokensTierOverrides(cfg) ?? {},
 		protectedTags: cfg.protected_tags ?? 20,
@@ -1544,7 +1520,7 @@ async function startPiMagicContextRuntime(
 						wordRules: cavemanWordRulesForLanguage(cfg.language),
 					}
 				: undefined,
-			clearReasoningAge: cfg.clear_reasoning_age,
+			keepReasoningTokens: cfg.keep_reasoning_tokens,
 		},
 		injection: {
 			memoryEnabled: cfg.memory.enabled,
@@ -1731,7 +1707,12 @@ async function startPiMagicContextRuntime(
 			PI_HARNESS_KIND,
 			activeModelRegistry,
 		);
-		return { ...project.contextOptions, historian };
+		return {
+			...project.contextOptions,
+			historian,
+			cacheTtlConfig: sampled.cache_ttl,
+			cacheTtlConfigured: sampled.cacheTtlConfigured,
+		};
 	}
 
 	const bootProjectDeps = buildProjectDeps(
@@ -1745,6 +1726,7 @@ async function startPiMagicContextRuntime(
 		},
 	);
 	projectDepsByDir.set(projectDir, bootProjectDeps);
+	subcConnectionFile = config.subc?.connection_file;
 
 	function syncDreamerProjectRegistration(
 		current: ResolvedPiProjectDeps,
@@ -1826,6 +1808,9 @@ async function startPiMagicContextRuntime(
 		// Dreamer tasks, a separate security concern.)
 		memoryToolEnabled: true,
 		protectedTags: config.protected_tags ?? 20,
+		protectedTools: config.protected_tools,
+		resolveProtectedTools: (ctx) =>
+			resolveCurrentProjectDeps(ctx).config.protected_tools,
 		resolveProtectedTags: (ctx) =>
 			resolveCurrentProjectDeps(ctx).config.protected_tags ?? 20,
 		resolveProjectIdentity: (ctx) =>
@@ -1879,6 +1864,16 @@ async function startPiMagicContextRuntime(
 		}
 
 		const sessionId = resolveSessionId(ctx);
+		// Session start is Magic Context's first write for a session in this
+		// process. Skip every write below when another machine holds the
+		// session's agent; the first turn is then refused by the context handler.
+		if (sessionId) {
+			const claimRefusal = await checkoutClaim.refusal(sessionId, ctx.cwd);
+			if (claimRefusal) {
+				if (ctx.hasUI) ctx.ui.notify(claimRefusal.message, "error");
+				return;
+			}
+		}
 		const model = ctx.model;
 		if (sessionId && model?.provider && model.id) {
 			seedSessionCacheTtlIfUnsynced({
@@ -1921,7 +1916,9 @@ async function startPiMagicContextRuntime(
 	// Register the per-LLM-call transform pipeline. Tags eligible message
 	// parts via the shared Tagger and applies queued drops from
 	// `pending_ops` so /ctx-flush and ctx_reduce work against Pi sessions.
-	registerPiContextHandler(pi, bootProjectDeps.contextOptions);
+	registerPiContextHandler(pi, bootProjectDeps.contextOptions, {
+		checkoutClaim,
+	});
 	// Pi's model registry reaches the extension only with the first session
 	// context, so the chain the historian will actually use is logged by
 	// reportPiModelChains at session start. Logging the configured model here
@@ -1976,6 +1973,7 @@ async function startPiMagicContextRuntime(
 		resolveStatusDeps: (ctx) => {
 			const current = resolveCurrentProjectDeps(ctx);
 			const live = liveReaderFor(current.projectDir, current.config);
+			const fresh = live.poll().effective;
 			const failure = live.lastFailure();
 			return {
 				configGeneration: live.current().generation,
@@ -2018,8 +2016,8 @@ async function startPiMagicContextRuntime(
 					return `Pi model chain empty (no model found): ${parts.join("; ")}`;
 				})(),
 				activeProfile: current.config.profile,
-				cacheTtlConfig: current.config.cache_ttl,
-				cacheTtlConfigured: current.cacheTtlConfigured,
+				cacheTtlConfig: fresh.cache_ttl,
+				cacheTtlConfigured: fresh.cacheTtlConfigured,
 				configParseFailures: current.configParseFailures,
 				hasDeprecatedProtectedTags: current.hasDeprecatedProtectedTags,
 				compactionEnabled: isCompactionEnabled(current.config),
@@ -2779,7 +2777,15 @@ async function startPiMagicContextRuntime(
 				db,
 				sessionId,
 				message: event.message,
-				cacheTtlConfig: resolveCurrentProjectDeps(ctx).config.cache_ttl,
+				...(() => {
+					const project = resolveCurrentProjectDeps(ctx);
+					const fresh = liveReaderFor(project.projectDir, project.config).poll()
+						.effective;
+					return {
+						cacheTtlConfig: fresh.cache_ttl,
+						cacheTtlConfigured: fresh.cacheTtlConfigured,
+					};
+				})(),
 			});
 			// Compute pressure with OpenCode-equivalent semantics: pull
 			// the assistant's `usage` field, normalize inclusive OpenAI
@@ -2808,6 +2814,7 @@ async function startPiMagicContextRuntime(
 				// Both Pi hosts report the configured model window here, not a provider-observed limit.
 				piContextWindowSource: "catalog",
 				piModel: ctx.model,
+				readBranch: () => ctx.sessionManager.getBranch(),
 				piTokens:
 					piUsage && typeof piUsage.tokens === "number"
 						? piUsage.tokens

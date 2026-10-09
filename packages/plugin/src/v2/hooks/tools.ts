@@ -44,6 +44,7 @@ export async function registerTools(
         ...(compaction
             ? createCtxReduceTools({
                   db,
+                  protectedTools: config.protected_tools,
                   getProtectionWindow: (sessionID) =>
                       getProtectionWindowForSession(
                           db,

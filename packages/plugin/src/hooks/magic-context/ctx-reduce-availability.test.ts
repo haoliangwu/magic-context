@@ -4,6 +4,9 @@ import { describe, expect, it } from "bun:test";
 import {
     clearCtxReduceAvailability,
     clearTodowriteAvailability,
+    clearToolPermissionDenied,
+    hasLoggedCtxReducePermissionDeny,
+    observeCtxReducePermissionDeny,
     permissionDisabled,
     primeCtxReduceSpawnPermission,
     resetCtxReduceRegisteredGloballyForTest,
@@ -349,6 +352,37 @@ describe("ctx_reduce availability (agent and session permissions before the free
         ]);
         await primeCtxReduceSpawnPermission(client, sessionId, "reviewer");
         expect(calls.agents).toBe(1);
+    });
+
+    it("keeps one background deny observation in flight per session and stops once it logged", async () => {
+        const sessionId = "ses-permission-observe";
+        clearToolPermissionDenied(sessionId);
+        const { client, calls } = permissionClient({ agentPermission: { ctx_reduce: "deny" } });
+        const first = observeCtxReducePermissionDeny(client, sessionId, "reviewer");
+        const second = observeCtxReducePermissionDeny(client, sessionId, "reviewer");
+        expect(first).toBeDefined();
+        expect(second).toBe(first);
+        await first;
+        expect(calls.agents).toBe(1);
+        expect(hasLoggedCtxReducePermissionDeny(sessionId)).toBe(true);
+        // The deny is logged once; later busting passes read nothing more.
+        expect(observeCtxReducePermissionDeny(client, sessionId, "reviewer")).toBeUndefined();
+        expect(calls.agents).toBe(1);
+        clearToolPermissionDenied(sessionId);
+    });
+
+    it("settles a failed background observation without rejecting", async () => {
+        const sessionId = "ses-permission-observe-failure";
+        clearToolPermissionDenied(sessionId);
+        const { client, calls } = permissionClient({ fail: true });
+        await expect(
+            observeCtxReducePermissionDeny(client, sessionId, "reviewer"),
+        ).resolves.toBeUndefined();
+        expect(hasLoggedCtxReducePermissionDeny(sessionId)).toBe(false);
+        // The failed read left no in-flight entry behind, so a later pass retries.
+        await observeCtxReducePermissionDeny(client, sessionId, "reviewer");
+        expect(calls.agents).toBe(2);
+        clearToolPermissionDenied(sessionId);
     });
 
     it("names the spawn agent from the first user message, not the latest", () => {

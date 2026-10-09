@@ -13,14 +13,16 @@ import { join, resolve } from "node:path";
 import { OpenCode } from "@opencode/client";
 import {
 	closeDatabase,
-    LATEST_SUPPORTED_VERSION,
+	LATEST_SUPPORTED_VERSION,
 	openDatabase,
 } from "../../../plugin/src/features/magic-context/storage-db";
 import {
 	CLI,
+	PLUGIN,
 	isolation,
 	spawnOpencode2,
 	waitForPluginActive,
+	waitForPluginLog,
 } from "../../src/opencode2-runner/spawn";
 
 async function checkStorageBoot(blocked: boolean) {
@@ -40,11 +42,12 @@ async function checkStorageBoot(blocked: boolean) {
 	const storage = fixture.env.MAGIC_CONTEXT_STORAGE_DIR!;
 	mkdirSync(join(storage, "rpc", "older-host"), { recursive: true });
 	const dbPath = join(storage, "context.db");
-	if (!openDatabase(dbPath))
-		throw new Error("could not seed isolated storage");
+	if (!openDatabase(dbPath)) throw new Error("could not seed isolated storage");
 	closeDatabase();
 	const db = new Database(dbPath);
-	db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(LATEST_SUPPORTED_VERSION);
+	db.prepare("DELETE FROM schema_migrations WHERE version = ?").run(
+		LATEST_SUPPORTED_VERSION,
+	);
 	if (blocked) db.exec("BEGIN IMMEDIATE");
 	const blockerPid = process.pid;
 	if (blocked)
@@ -75,7 +78,9 @@ async function checkStorageBoot(blocked: boolean) {
 			main: "index.js",
 		}),
 	);
-	const entry = join(plugin, "entry.ts");
+	// Keep the source outside the plugin package: the host prefers server.ts to
+	// server.js when both exist, which would bypass the bundle under test.
+	const entry = join(fixture.root, "server.ts");
 	writeFileSync(
 		entry,
 		`
@@ -91,9 +96,14 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 `,
 	);
 	const built = await Bun.build({
-		entrypoints: [entry],
+		// Bundle the worker alongside the probe just as the published plugin does.
+		// A missing worker must fail closed, not migrate on the host's event loop.
+		entrypoints: [
+			entry,
+			join(source, "features/magic-context/migration-worker.ts"),
+		],
 		outdir: plugin,
-		naming: "server.js",
+		naming: "[name].js",
 		target: "bun",
 		define: { "process.env.NODE_ENV": JSON.stringify("production") },
 		external: [
@@ -148,8 +158,7 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 			await Bun.sleep(10);
 		// The fixture's RPC discovery record still names a live older host, so the
 		// migration guard must refuse even after the SQLite writer lock releases.
-		if (blocked)
-			releaseLock = setTimeout(() => db.exec("ROLLBACK"), 10_000);
+		if (blocked) releaseLock = setTimeout(() => db.exec("ROLLBACK"), 10_000);
 		const secondStarted = performance.now();
 		const secondSession = client.session
 			.create(
@@ -163,9 +172,7 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 			.then((session) => ({
 				id: session.id,
 				latencyMs: performance.now() - secondStarted,
-				setupPending: !readFileSync(trace, "utf8").includes(
-					"setup-end",
-				),
+				setupPending: !readFileSync(trace, "utf8").includes("setup-end"),
 			}))
 			.catch((error: unknown) => ({
 				id: null,
@@ -196,18 +203,13 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 		const second = await secondSession;
 		clearTimeout(releaseLock);
 		if (db.inTransaction) db.exec("ROLLBACK");
-		const openFiles = execFileSync(
-			"lsof",
-			["-p", String(host.pid), "-Fn"],
-			{
-				encoding: "utf8",
-			},
-		);
+		const openFiles = execFileSync("lsof", ["-p", String(host.pid), "-Fn"], {
+			encoding: "utf8",
+		});
 		const databases = openFiles
 			.split("\n")
 			.filter(
-				(line) =>
-					line.startsWith("n") && /\.db(?:-wal|-shm)?$/.test(line),
+				(line) => line.startsWith("n") && /\.db(?:-wal|-shm)?$/.test(line),
 			);
 		expect(databases.length).toBeGreaterThan(0);
 		for (const path of databases)
@@ -256,7 +258,11 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 			checked
 				.query("SELECT MAX(version) AS version FROM schema_migrations")
 				.get(),
-		).toEqual({ version: blocked ? LATEST_SUPPORTED_VERSION - 1 : LATEST_SUPPORTED_VERSION });
+		).toEqual({
+			version: blocked
+				? LATEST_SUPPORTED_VERSION - 1
+				: LATEST_SUPPORTED_VERSION,
+		});
 		checked.close();
 		if (!blocked) {
 			expect(
@@ -278,22 +284,15 @@ export default { id: "opencode-magic-context", async setup(context) { mark("setu
 				.requests()
 				.filter((request) => request.body.model === "mock-model");
 			expect(requests.length).toBeGreaterThan(0);
-			const tools = (
-				requests[0].body.tools as Array<{ name?: string }>
-			).map((tool) => tool.name);
+			const tools = (requests[0].body.tools as Array<{ name?: string }>).map(
+				(tool) => tool.name,
+			);
 			console.log(
 				JSON.stringify({
-					registeredTools: tools.filter((name) =>
-						name?.startsWith("ctx_"),
-					),
+					registeredTools: tools.filter((name) => name?.startsWith("ctx_")),
 				}),
 			);
-			for (const name of [
-				"ctx_reduce",
-				"ctx_expand",
-				"ctx_note",
-				"ctx_search",
-			])
+			for (const name of ["ctx_reduce", "ctx_expand", "ctx_note", "ctx_search"])
 				expect(tools).toContain(name);
 		}
 	} catch (error) {
@@ -315,5 +314,159 @@ test(
 test(
 	"OpenCode 2 registers context tools after a two-second healthy storage open",
 	() => checkStorageBoot(false),
+	120_000,
+);
+
+test.each([
+	["published union", PLUGIN],
+	["dist/v2", join(PLUGIN, "dist/v2/server.js")],
+])(
+	"OpenCode 2 %s bundle migrates pending storage off-thread before registering tools",
+	async (_label, magicContextPlugin) => {
+		const fixture = isolation();
+		// The host resolves plugin package directories, not bare entry files. A
+		// re-export-only package loads the real v2 dist without rebundling its chunks
+		// or changing import.meta.url, which determines the worker's location.
+		if (magicContextPlugin.endsWith(".js")) {
+			const packageDir = join(fixture.root, "v2-dist-plugin");
+			mkdirSync(packageDir);
+			writeFileSync(
+				join(packageDir, "package.json"),
+				JSON.stringify({
+					name: "v2-dist-probe",
+					type: "module",
+					main: "index.js",
+				}),
+			);
+			writeFileSync(
+				join(packageDir, "index.js"),
+				`export { default } from ${JSON.stringify(magicContextPlugin)};\n`,
+			);
+			magicContextPlugin = packageDir;
+		}
+		const dbPath = join(fixture.env.MAGIC_CONTEXT_STORAGE_DIR!, "context.db");
+		if (!openDatabase(dbPath))
+			throw new Error("could not seed isolated storage");
+		closeDatabase();
+		const seed = new Database(dbPath);
+		try {
+			seed
+				.prepare("DELETE FROM schema_migrations WHERE version = ?")
+				.run(LATEST_SUPPORTED_VERSION);
+			// Remove new schema objects as well as the version marker: the packaged
+			// worker must actually install them, not just report an already-current DB.
+			seed.run("DROP TABLE temporal_decisions");
+			seed.run("DROP TABLE git_commit_fts_rowid_map");
+			seed.run("DROP INDEX idx_transform_decisions_retention");
+		} finally {
+			seed.close();
+		}
+		const host = await spawnOpencode2({
+			existingIsolation: fixture,
+			magicContextPlugin,
+			prepareContextDatabase: false,
+			magicContextConfig: {
+				dreamer: { disable: true },
+				historian: { disable: true },
+				memory: { enabled: false },
+			},
+		});
+		try {
+			const client = OpenCode.make({
+				baseUrl: host.url,
+				headers: {
+					authorization: `Basic ${btoa(`opencode:${host.password}`)}`,
+				},
+			});
+			const session = await client.session.create({
+				title: "packaged storage migration",
+				location: { directory: host.cwd },
+				model: { providerID: "openai", id: "mock-model" },
+			});
+			await waitForPluginActive(
+				client,
+				host.cwd,
+				_label === "dist/v2"
+					? "@cortexkit/opencode-magic-context"
+					: "opencode-magic-context",
+			);
+			const log = await waitForPluginLog(
+				fixture.env,
+				"async open main-thread migration-body count: 0",
+			);
+			expect(log).toContain("migration worker ready");
+			expect(log).toContain("async open main-thread migration-body count: 0");
+			expect(log).not.toContain("migration worker could not start");
+			const checked = new Database(dbPath, { readonly: true });
+			try {
+				expect(
+					checked
+						.query("SELECT MAX(version) AS version FROM schema_migrations")
+						.get(),
+				).toEqual({ version: LATEST_SUPPORTED_VERSION });
+				for (const name of [
+					"temporal_decisions",
+					"git_commit_fts_rowid_map",
+					"idx_transform_decisions_retention",
+				])
+					expect(
+						checked
+							.query("SELECT name FROM sqlite_master WHERE name = ?")
+							.get(name),
+					).toEqual({ name });
+			} finally {
+				checked.close();
+			}
+			const inventory = execFileSync("lsof", ["-p", String(host.pid), "-Fn"], {
+				encoding: "utf8",
+			});
+			const databases = inventory
+				.split("\n")
+				.filter(
+					(line) => line.startsWith("n") && /\.db(?:-wal|-shm)?$/.test(line),
+				);
+			expect(databases.length).toBeGreaterThan(0);
+			for (const path of databases)
+				expect(path.slice(1).startsWith(fixture.root + "/")).toBe(true);
+			writeFileSync(join(fixture.root, "host-lsof.txt"), inventory);
+			await client.session.prompt({
+				sessionID: session.id,
+				text: "Check tools after packaged migration",
+			});
+			await client.session.wait(
+				{ sessionID: session.id },
+				{ signal: AbortSignal.timeout(30_000) },
+			);
+			const requests = host.mock
+				.requests()
+				.filter((request) => request.body.model === "mock-model");
+			expect(requests.length).toBeGreaterThan(0);
+			const tools = (requests[0].body.tools as Array<{ name?: string }>).map(
+				(tool) => tool.name,
+			);
+			for (const name of ["ctx_reduce", "ctx_expand", "ctx_note", "ctx_search"])
+				expect(tools).toContain(name);
+			console.log(
+				JSON.stringify({
+					root: fixture.root,
+					pid: host.pid,
+					cliVersion: execFileSync(CLI, ["--version"], {
+						env: fixture.env,
+						encoding: "utf8",
+					}).trim(),
+					schemaVersion: LATEST_SUPPORTED_VERSION,
+					databases,
+					registeredTools: tools.filter((name) => name?.startsWith("ctx_")),
+					pluginLog: log,
+				}),
+			);
+		} catch (error) {
+			writeFileSync(join(fixture.root, "host-stderr.log"), host.stderr());
+			console.error(`Host diagnostics: ${fixture.root}`);
+			throw error;
+		} finally {
+			await host.stop();
+		}
+	},
 	120_000,
 );

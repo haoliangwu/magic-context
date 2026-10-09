@@ -1,7 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import * as dns from "node:dns/promises";
-import { EventEmitter } from "node:events";
-import * as https from "node:https";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import type { HiddenCompletionExecutor } from "../../../hooks/magic-context/compartment-runner-types";
 import { Database } from "../../../shared/sqlite";
 import { createCtxNoteTools } from "../../../tools/ctx-note/tools";
@@ -10,6 +7,13 @@ import { acquireLease } from "../dreamer/lease";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { addNote, dismissNote, getNotes } from "../storage-notes";
+import {
+    GITHUB_FAILURE_CHECK,
+    GITHUB_FAILURE_CONDITION,
+    githubPrivateResponses,
+    githubRateLimitResponses,
+} from "./__tests__/github-http-fixture.test";
+import { localSmartNoteHttpTransport } from "./__tests__/http-timeout-fixture.test";
 import { createSmartNoteCapabilities } from "./capabilities";
 import { compileSmartNoteCheck } from "./compiler";
 import { runDueCompiledSmartNoteChecks } from "./runner";
@@ -27,7 +31,7 @@ const PRIVATE_CHECK = `function check(cap) { cap.httpGet("${URL}"); return {met:
 const FAR_FUTURE = Date.now() + 365 * 24 * 3600 * 1000;
 const context = { sessionID: OWNER, directory: process.cwd() } as never;
 let db: Database;
-let restoreTransport: (() => void) | undefined;
+let restoreTransport: (() => Promise<void>) | undefined;
 
 beforeEach(() => {
     __wakePlaneTest.reset();
@@ -38,40 +42,20 @@ beforeEach(() => {
     db.prepare("INSERT INTO session_meta (session_id) VALUES (?)").run(OWNER);
     expect(acquireLease(db, "holder", "parking-lease")).toBe(true);
 });
-afterEach(() => {
-    restoreTransport?.();
+afterEach(async () => {
+    await restoreTransport?.();
     restoreTransport = undefined;
     db.close();
     __wakePlaneTest.reset();
 });
 
-function transport(status: number, headers: Record<string, string> = {}) {
-    const paths: string[] = [];
-    const lookup = spyOn(dns, "lookup").mockResolvedValue([
-        { address: "1.1.1.1", family: 4 },
-    ] as never);
-    const request = spyOn(https, "request").mockImplementation(((
-        options: { path: string },
-        callback: (response: unknown) => void,
-    ) => {
-        paths.push(options.path);
-        const response = Object.assign(new EventEmitter(), {
-            statusCode: status,
-            headers,
-            destroy: () => {},
-        });
-        const req = Object.assign(new EventEmitter(), {
-            destroy: () => {},
-            end: () => queueMicrotask(() => response.emit("end")),
-        });
-        callback(response);
-        return req;
-    }) as typeof https.request);
-    restoreTransport = () => {
-        request.mockRestore();
-        lookup.mockRestore();
-    };
-    return paths;
+async function transport(status: number, headers: Record<string, string> = {}, body = "") {
+    const fixture = await localSmartNoteHttpTransport("api.github.com", (_request, response) => {
+        response.writeHead(status, headers);
+        response.end(body);
+    });
+    restoreTransport = fixture.dispose;
+    return fixture.paths;
 }
 
 function carrier(check = PRIVATE_CHECK) {
@@ -141,7 +125,7 @@ test.each([
     "due",
     "liveness",
 ])("private-repo %s failure parks with one owner notice and no later sweep", async (phase) => {
-    const paths = transport(404);
+    const paths = await transport(404);
     const source = note();
     if (phase !== "compile") seedCompiled(source.id, phase === "liveness");
     const compiler = carrier();
@@ -235,7 +219,7 @@ test.each([
     401, 403,
 ])("rate-limited HTTP %i remains transient through compilation and evaluation", async (status) => {
     const reset = Math.floor(Date.now() / 1000) + 7200;
-    transport(status, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) });
+    await transport(status, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) });
     const source = note();
     const compiler = carrier();
     const result = await compileSmartNoteCheck({
@@ -287,8 +271,11 @@ test.each([
     expect(state()).toMatchObject({
         checkStatus: "compiled",
         readyReason: null,
-        checkNextDueAt: reset * 1000,
     });
+    // Compilation quota failures now join the network backoff counter rather
+    // than spending logic strikes. That accumulated backoff may exceed the reset hint.
+    expect(state().checkNextDueAt).toBeGreaterThanOrEqual(reset * 1000);
+    expect(state().checkFailureCount).toBe(0);
     expect(getStaleCompiledSmartNotes(db, PROJECT, Date.now(), 10)).toEqual([]);
     expect(notices()).toEqual([]);
 });
@@ -296,7 +283,7 @@ test.each([
 test.each([
     401, 403,
 ])("HTTP %i without quota signals parks instead of reauthoring", async (status) => {
-    transport(status);
+    await transport(status);
     note();
     await sweep(carrier().executor);
     expect(state()).toMatchObject({ checkStatus: "parked", checkNextDueAt: null });
@@ -304,8 +291,95 @@ test.each([
     expect(notices()).toHaveLength(1);
 });
 
+for (const response of githubRateLimitResponses(Math.floor(Date.now() / 1000) + 7200)) {
+    test.each([
+        "compile",
+        "due",
+    ])(`GitHub ${response.name} defers %s without parking or notices`, async (phase) => {
+        await transport(response.status, response.headers, response.body);
+        const source = addNote(db, "smart", {
+            projectPath: PROJECT,
+            sessionId: OWNER,
+            content: "wake on CI failure",
+            surfaceCondition: GITHUB_FAILURE_CONDITION,
+        });
+        if (phase === "due") seedCompiled(source.id, false, GITHUB_FAILURE_CHECK);
+        const compiler = carrier(GITHUB_FAILURE_CHECK);
+        const startedAt = Date.now();
+        await sweep(compiler.executor);
+        expect(state()).toMatchObject({
+            status: "pending",
+            checkStatus: phase === "compile" ? "uncompiled" : "compiled",
+            checkFailureCount: 0,
+            checkNetworkFailureCount: 1,
+            readyReason: null,
+        });
+        const retryFloor =
+            response.name === "primary 403"
+                ? Number(response.headers["x-ratelimit-reset"]) * 1000
+                : startedAt + response.delayMs;
+        expect(state().checkNextDueAt).toBeGreaterThanOrEqual(retryFloor);
+        expect(getSmartNotesNeedingCompilation(db, PROJECT, retryFloor - 1, 10)).toEqual([]);
+        expect(notices()).toEqual([]);
+        expect(getDueCompiledSmartNoteChecks(db, PROJECT, retryFloor - 1, 10)).toEqual([]);
+    });
+}
+
+for (const response of githubPrivateResponses) {
+    test.each([
+        "compile",
+        "due",
+    ])(`GitHub private ${response.status} parks on %s, unlike rate limits`, async (phase) => {
+        await transport(response.status, {}, response.body);
+        const source = note();
+        if (phase === "due") seedCompiled(source.id);
+        await sweep(carrier().executor);
+        expect(state()).toMatchObject({
+            status: "pending",
+            checkStatus: "parked",
+            checkNextDueAt: null,
+        });
+        expect(notices()).toHaveLength(1);
+    });
+}
+
+test.each([
+    "compile",
+    "due",
+])("GitHub CI-failure wake survives a rate-limited %s and fires when checkable", async (phase) => {
+    const response = githubRateLimitResponses(Math.floor(Date.now() / 1000) + 7200)[3];
+    await transport(response.status, response.headers, response.body);
+    const source = addNote(db, "smart", {
+        projectPath: PROJECT,
+        sessionId: OWNER,
+        content: "wake on CI failure",
+        surfaceCondition: GITHUB_FAILURE_CONDITION,
+    });
+    if (phase === "due") seedCompiled(source.id, false, GITHUB_FAILURE_CHECK);
+    const compiler = carrier(GITHUB_FAILURE_CHECK);
+    await sweep(compiler.executor);
+    expect(state().status).toBe("pending");
+    await restoreTransport?.();
+    restoreTransport = undefined;
+    await transport(
+        200,
+        {},
+        JSON.stringify({
+            workflow_runs: [
+                { event: "schedule", created_at: "2026-10-01T00:00:00Z", conclusion: "failure" },
+            ],
+        }),
+    );
+    db.prepare("UPDATE notes SET check_next_due_at=0, check_quarantined_until=NULL WHERE id=?").run(
+        source.id,
+    );
+    expect(await sweep(compiler.executor)).toMatchObject({ surfaced: 1, pending: 0 });
+    expect(state().status).toBe("ready");
+    expect(notices()).toEqual([]);
+});
+
 test("older compiled code-search checks park without attempting a request", async () => {
-    const paths = transport(200);
+    const paths = await transport(200);
     const source = note();
     seedCompiled(
         source.id,
@@ -320,7 +394,7 @@ test("older compiled code-search checks park without attempting a request", asyn
 });
 
 test("compiler refuses GitHub code search before fetching even in an unexecuted branch", async () => {
-    const paths = transport(200);
+    const paths = await transport(200);
     const source = note();
     const compiler = carrier(
         'function check(cap) { if (false) cap.httpGet("https://api.github.com/search/code?q=repo:cortexkit/wernicke+schema"); return {met:false}; }',

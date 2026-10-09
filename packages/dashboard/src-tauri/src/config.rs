@@ -224,15 +224,27 @@ fn write_config_atomic(
     let parent = path
         .parent()
         .ok_or_else(|| "Config path has no parent directory".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
-
-    // Keep the existing file's permissions: a config holding API keys is
-    // often 0600, and the fresh temp file would otherwise make it 0644.
-    let permissions = std::fs::metadata(path)
-        .ok()
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.permissions());
-    let temp_path = create_temp_config_file(parent, path.file_name(), content, permissions)?;
+    ensure_private_config_directory(parent)
+        .map_err(|e| format!("Failed to create directory: {e}"))?;
+    // A user config always ends owner-only, including when replacing a formerly
+    // permissive file. Project config retains its prior mode when one exists.
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        if project_root.is_none() {
+            0o600
+        } else {
+            std::fs::metadata(path)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.permissions().mode() & 0o777)
+                .unwrap_or(0o600)
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = 0o600;
+    // Create the temporary config with its final mode, before content is written.
+    let temp_path = create_temp_config_file(parent, path.file_name(), content, mode)?;
     if let Some(root) = project_root {
         if let Err(e) = validate_project_config_target(root, path) {
             let _ = std::fs::remove_file(&temp_path);
@@ -269,11 +281,25 @@ fn resolve_symlinked_config(path: &Path) -> Result<PathBuf, String> {
     Err("Config path has too many levels of symlinks".to_string())
 }
 
+fn ensure_private_config_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
 fn create_temp_config_file(
     parent: &Path,
     file_name: Option<&std::ffi::OsStr>,
     content: &str,
-    permissions: Option<std::fs::Permissions>,
+    mode: u32,
 ) -> Result<PathBuf, String> {
     let file_name = file_name
         .and_then(|name| name.to_str())
@@ -296,16 +322,10 @@ fn create_temp_config_file(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
+            options.custom_flags(libc::O_NOFOLLOW).mode(mode);
         }
         match options.open(&temp_path) {
             Ok(mut file) => {
-                if let Some(permissions) = permissions.clone() {
-                    if let Err(e) = file.set_permissions(permissions) {
-                        let _ = std::fs::remove_file(&temp_path);
-                        return Err(format!("Failed to set config permissions: {e}"));
-                    }
-                }
                 if let Err(e) = file.write_all(content.as_bytes()) {
                     let _ = std::fs::remove_file(&temp_path);
                     return Err(format!("Failed to write config: {e}"));
@@ -571,6 +591,40 @@ mod tests {
             .filter(|name| name.to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_user_config_is_created_with_owner_only_mode() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let root = std::env::temp_dir().join("magic-context").join(format!(
+            "dashboard-config-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(&root).unwrap();
+        let path = root.join("config/cortexkit/magic-context.jsonc");
+
+        write_config(&path, "{ \"api_key\": \"secret\" }\n").expect("write");
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

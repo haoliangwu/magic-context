@@ -187,6 +187,9 @@ function scriptedSession(label: string) {
             return {
                 ...(typeof step === "string" ? { decision: step } : step.response),
                 ...(typeof step === "string" ? {} : { decision: step.decision }),
+                prefix_bust_permitted: ["HARD", "SOFT"].includes(
+                    typeof step === "string" ? step : step.decision,
+                ),
                 served_from: "transform",
                 row_version: pass,
                 native_messages: moduleOutput(lastInput),
@@ -285,6 +288,7 @@ describe("release strip: the stored snapshot is not always what was served last"
             expect(releaseLines(logSpy, sid)).toEqual([
                 "lkg_frozen_replay_released reason=lkg_anthropic_reasoning_run_invalid",
             ]);
+            expect(s.frozen()).toBe(false);
             // The served bytes did change at m2 ...
             expect(textOf(served, "m2")).toBe("§2§ follow-up");
             // ... so the thinking after it is invalid and must be removed.
@@ -294,7 +298,7 @@ describe("release strip: the stored snapshot is not always what was served last"
         }
     });
 
-    it("strips thinking after the raw tail an outage served when the first healthy pass releases on tail growth", async () => {
+    it("keeps outage-tail thinking on growth and strips it on the next genuine rebuild", async () => {
         const logSpy = spyOn(logger, "sessionLog").mockImplementation(() => {});
         try {
             const s = scriptedSession("outage-growth");
@@ -314,13 +318,16 @@ describe("release strip: the stored snapshot is not always what was served last"
             expect(s.frozen()).toBe(true);
             expect(textOf(outageServed, "m2")).toBe("turn 2");
 
-            // The module is back; the raw tail has grown past the freeze limit.
+            // Raw growth is debt, not permission to retag the outage tail or strip thinking.
             for (let index = 7; index <= 10; index += 1) turn(index);
             s.setModuleOutput(tagging({ m2: 2, m3: 3, m4: 4, m5: 5, m6: 6, m7: 7 }));
-            const served = await s.run([...conversation], "SOFT+");
-            expect(releaseLines(logSpy, sid)).toEqual([
-                "lkg_frozen_replay_released reason=raw_tail_growth_limit",
-            ]);
+            const deferred = await s.run([...conversation], "SOFT+");
+            expect(s.frozen()).toBe(true);
+            expect(textOf(deferred, "m2")).toBe("turn 2");
+            expect(hasReasoning(deferred, "a2")).toBe(true);
+            expect(releaseLines(logSpy, sid)).toEqual([]);
+            const served = await s.run([...conversation], "HARD");
+            expect(s.frozen()).toBe(false);
             expect(textOf(served, "m2")).toBe("§2§ turn 2");
             // a2 sits after the first changed message (m2) and was served with
             // its thinking by the outage replay.

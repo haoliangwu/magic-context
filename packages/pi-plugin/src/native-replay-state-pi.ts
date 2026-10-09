@@ -110,7 +110,7 @@ export function applyNativeReasoningReplayPi(
 		messageIdToMaxTag: ReadonlyMap<string, number>;
 		stableId: (message: unknown, index: number) => string | undefined;
 		localWatermark: number;
-		clearReasoningAge: number;
+		budgetCutoff: number;
 		omissionAllowed: boolean;
 		canApply: boolean;
 		detectAged: boolean;
@@ -118,11 +118,8 @@ export function applyNativeReasoningReplayPi(
 	saved: ReadonlySet<string>,
 ): number {
 	if (!args.omissionAllowed) return 0;
-	let maxTag = 0;
-	for (const tag of args.messageIdToMaxTag.values())
-		maxTag = Math.max(maxTag, tag);
 	const cutoff = args.detectAged
-		? Math.max(args.localWatermark, maxTag - args.clearReasoningAge)
+		? Math.max(args.localWatermark, args.budgetCutoff)
 		: args.localWatermark;
 	const nextIds = new Set<string>();
 	const pending = new Map<number, Record<string, unknown>>();
@@ -159,6 +156,39 @@ export function applyNativeReasoningReplayPi(
 	}
 	for (const [index, message] of pending) args.messages[index] = message;
 	return nextIds.size;
+}
+
+/**
+ * Freeze the same removal decisions that emergency measurement would request,
+ * merging the replay envelope once instead of once per visible call. Publish
+ * the in-memory markers only after commit; a failed batch leaves the ordinary
+ * per-call authorization path (including its fail-closed behavior) unchanged.
+ */
+export function preparePiToolRemovalMeasurements(args: {
+	db: ContextDatabase;
+	sessionId: string;
+	callIds: readonly string[];
+	saved: Map<string, string> | undefined;
+	canApply: boolean;
+}): void {
+	if (!args.saved || !args.canApply) return;
+	const requested = new Map<string, string>();
+	for (const callId of args.callIds) {
+		if (args.saved.get(callId) !== NATIVE_TOOL_REMOVAL_MARKER)
+			requested.set(callId, NATIVE_TOOL_REMOVAL_MARKER);
+	}
+	if (requested.size === 0) return;
+	try {
+		args.db
+			.transaction(() => {
+				saveNativeToolInputs(args.db, args.sessionId, requested);
+			})
+			.immediate();
+		for (const [callId, marker] of requested) args.saved.set(callId, marker);
+	} catch {
+		// The per-call path still distinguishes a prior skeleton from a new drop
+		// and may retry if a competing writer has released the lock meanwhile.
+	}
 }
 
 /** Freeze structural removal before touching either half of a Pi tool arc. */

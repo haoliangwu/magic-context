@@ -33,6 +33,10 @@
  */
 
 import { freezePiContentDecision } from "@magic-context/core/features/magic-context/pi-content-decisions";
+import {
+	CTX_REDUCE_KEEP,
+	protectedToolTagNumbers,
+} from "@magic-context/core/features/magic-context/reclaim-protection";
 import { sessionDecisionCalibration } from "@magic-context/core/features/magic-context/session-decision-calibration";
 import {
 	type ContextDatabase,
@@ -71,7 +75,7 @@ import { sessionLog } from "@magic-context/core/shared/logger";
  * Pi names its built-in tools bare (`read`, `grep`), so the bare names
  * are what match; the `mcp_` forms cover MCP servers using that prefix.
  */
-export const PI_CTX_REDUCE_KEEP = 3;
+export const PI_CTX_REDUCE_KEEP = CTX_REDUCE_KEEP;
 
 const DEDUP_SAFE_TOOLS = new Set([
 	"grep",
@@ -95,6 +99,10 @@ const DEDUP_SAFE_TOOLS = new Set([
 ]);
 
 export interface PiHeuristicCleanupConfig {
+	/** Bulk-freeze native removal decisions before measuring the active wire tools. */
+	prepareToolRemovalMeasurements?: (callIds: readonly string[]) => void;
+	protectedTools?: Readonly<Record<string, number>>;
+	protectedToolTags?: ReadonlySet<number>;
 	protectedTags: number;
 	/** Token-window cutoff; null means no tool-backed protection window exists. */
 	protectedCutoff?: number | null;
@@ -282,14 +290,10 @@ function collectStaleReduceCallIds(
 		if (left.composite === right.composite) return 0;
 		return left.composite < right.composite ? 1 : -1;
 	});
-	const protectedComposite = new Set(
-		newestFirst.slice(0, PI_CTX_REDUCE_KEEP).map((call) => call.composite),
-	);
 	const composite = new Set<string>();
 	const bareCallIds = new Set<string>();
 	for (const call of newestFirst) {
-		if (call.maxTag > toolAgeCutoff || protectedComposite.has(call.composite))
-			continue;
+		if (call.maxTag > toolAgeCutoff) continue;
 		composite.add(call.composite);
 		bareCallIds.add(call.callId);
 	}
@@ -323,6 +327,11 @@ export function applyPiHeuristicCleanup(
 	// When omitted (older tests), falls back to the legacy index-based pi-msg-* id.
 	resolveId?: (msg: unknown, index: number) => string | undefined,
 ): PiHeuristicCleanupResult {
+	const logStep = (stage: string, start: number, extra = "") =>
+		sessionLog(
+			sessionId,
+			`heuristic cleanup stage: stage=${stage} elapsed=${(performance.now() - start).toFixed(1)}ms${extra ? ` ${extra}` : ""}`,
+		);
 	// Resolve owner/stable ids the same way the transcript tagged messages, so the
 	// ids built here key into messageIdToMaxTag (= target.message.info.id) correctly.
 	// Legacy fallback (no resolver) keeps the old index-based pi-msg-* scheme.
@@ -338,7 +347,16 @@ export function applyPiHeuristicCleanup(
 
 	// All work in this function short-circuits on `tag.status !== "active"`.
 	// See OpenCode `applyHeuristicCleanup` for the full P0 perf rationale.
+	const tTags = performance.now();
 	const tags = preloadedTags ?? getActiveTagsBySession(db, sessionId);
+	logStep(
+		"tagLoad",
+		tTags,
+		`tags=${tags.length} preloaded=${preloadedTags !== undefined}`,
+	);
+	const protectedTools =
+		config.protectedToolTags ??
+		protectedToolTagNumbers(tags, config.protectedTools);
 	// `maxTag` must reflect the true session max (including dropped/compacted)
 	// so the protected-cutoff window is anchored to the most recent tag
 	// regardless of status. `getMaxTagNumberBySession` resolves with a
@@ -349,8 +367,7 @@ export function applyPiHeuristicCleanup(
 			? maxTag + 1
 			: (config.protectedCutoff ?? maxTag - config.protectedTags);
 	const routine = config.routine !== false;
-	// Stale ctx_reduce removal uses the protected-tail window after first retaining
-	// the newest housekeeping exemplars; only older calls can become stale.
+	// Stale-result detection uses the same protected-tool cutoff as the other result-handling paths.
 	const toolAgeCutoff = protectedCutoff;
 
 	let droppedTools = 0;
@@ -388,6 +405,22 @@ export function applyPiHeuristicCleanup(
 				.map((tag) => tag.tagNumber),
 		);
 		const calibration = sessionDecisionCalibration(db, sessionId);
+		const tPrepare = performance.now();
+		// Measurement requests removal authorization even for retained skeletons.
+		// Prepare precisely those active, visible calls, preserving tag order and
+		// the existing freeze-before-wire-edit rule without per-call envelope CAS.
+		config.prepareToolRemovalMeasurements?.(
+			tags.flatMap((tag) =>
+				tag.status === "active" &&
+				tag.type === "tool" &&
+				tag.messageId &&
+				targets.get(tag.tagNumber)?.measureReclaim
+					? [tag.messageId]
+					: [],
+			),
+		);
+		logStep("prepareNativeRemovals", tPrepare);
+		const tMeasure = performance.now();
 		const activeTags = tags
 			.filter((t) => t.status === "active")
 			.map((tag) =>
@@ -408,10 +441,16 @@ export function applyPiHeuristicCleanup(
 				return measured ? [measured] : [];
 			})
 			.filter((tag) => (tag.reclaimableTokens ?? 0) > 0);
+		logStep(
+			"measureEmergencyTags",
+			tMeasure,
+			`active=${activeTags.length} candidates=${droppableTags.length}`,
+		);
 		sessionLog(
 			sessionId,
 			`emergency candidates: loaded=${tags.length} active=${activeTags.length} activeTools=${activeTags.filter((tag) => tag.type === "tool").length} visibleCompleteTools=${droppableTags.length} windowYields=${(emergency.usagePercentage ?? 0) >= 95} cutoff=${protectedCutoff}`,
 		);
+		const tPlan = performance.now();
 		const plan = planEmergencyDrop({
 			tags: droppableTags as readonly EmergencyDropTag[],
 			floorTags: activeTags as readonly EmergencyDropTag[],
@@ -423,8 +462,11 @@ export function applyPiHeuristicCleanup(
 			priorInputSample,
 			hasPriorDrop: priorInputSample > 0,
 			passAlreadyPriced: emergency.passAlreadyPriced === true,
+			protectedToolTags: protectedTools,
 		});
+		logStep("planEmergencyDrop", tPlan);
 		if (plan.shouldDrop) {
+			const tPersist = performance.now();
 			const toDrop = new Set(plan.tagNumbers);
 			const newestEmergencyTags = recentTags;
 			db.transaction(() => {
@@ -456,6 +498,11 @@ export function applyPiHeuristicCleanup(
 					}
 				}
 			}).immediate();
+			logStep(
+				"applyEmergencyDrops",
+				tPersist,
+				`dropped=${emergencyDroppedTools}`,
+			);
 			sessionLog(sessionId, `emergency tiered drop: ${plan.reason}`);
 		} else {
 			sessionLog(sessionId, `emergency tiered drop skipped: ${plan.reason}`);
@@ -482,6 +529,7 @@ export function applyPiHeuristicCleanup(
 			for (const tag of tags) {
 				if (tag.status !== "active") continue;
 				if (tag.type !== "tool") continue;
+				if (protectedTools.has(tag.tagNumber)) continue;
 				if (!tag.messageId) continue;
 				// Composite match for tags carrying an owner — prevents a reused
 				// callId in a fresh turn from being dropped by a stale call in an
@@ -526,6 +574,7 @@ export function applyPiHeuristicCleanup(
 				const strippedSource = stripTagPrefix(stripped);
 
 				if (strippedSource.trim().length === 0) {
+					if (target.thinkingDropProtected) continue;
 					const dropResult = target.drop?.() ?? "absent";
 					const didReplace =
 						dropResult === "absent"
@@ -550,7 +599,7 @@ export function applyPiHeuristicCleanup(
 							tag.messageId,
 						)
 					) {
-						if (target.setContent(stripped)) {
+						if (target.setContent(stripped, { keepReasoning: true })) {
 							droppedInjections++;
 							droppedTokenReductions.push({
 								tagNumber: tag.tagNumber,
@@ -603,6 +652,7 @@ export function applyPiHeuristicCleanup(
 					const tag = group[i];
 					if (tag.tagNumber > protectedCutoff) continue;
 					const target = targets.get(tag.tagNumber);
+					if (protectedTools.has(tag.tagNumber)) continue;
 					if (target?.canDrop?.() === false) continue;
 					// Deduplication stays full-drop; only emergency recent arcs keep
 					// skeletons. A call that cannot be removed keeps real arguments.

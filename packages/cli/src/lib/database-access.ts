@@ -1,4 +1,5 @@
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
+import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
     ensureContextStoreUuid,
@@ -11,6 +12,11 @@ import {
 import type { Database as DatabaseType } from "@magic-context/core/shared/sqlite";
 import { Database } from "@magic-context/core/shared/sqlite";
 import { configureContextDatabasePragmas } from "@magic-context/core/shared/sqlite-context-pragmas";
+import {
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    writeStorageFileSync,
+} from "@magic-context/core/shared/storage-permissions";
 
 export function getPersistedSchemaVersion(db: DatabaseType): number {
     return getCorePersistedSchemaVersion(db);
@@ -170,7 +176,8 @@ export async function backupDatabaseSnapshot(
 ): Promise<void> {
     const serializable = db as DatabaseType & { serialize?: () => Uint8Array };
     if (typeof serializable.serialize === "function") {
-        writeFileSync(destination, serializable.serialize(), { flag: "wx" });
+        ensureStorageDirectorySync(dirname(destination));
+        writeStorageFileSync(destination, serializable.serialize(), { flag: "wx" });
         return;
     }
 
@@ -185,6 +192,9 @@ export async function backupDatabaseSnapshot(
         throw new Error(`Refusing to overwrite existing backup ${destination}`);
     }
     const reader = new Database(sourcePath, { readonly: true });
+    const previousUmask = shouldEnforcePrivateStoragePermissions()
+        ? process.umask(0o077)
+        : undefined;
     try {
         await sqlite.backup(reader, destination);
     } catch (error) {
@@ -192,5 +202,6 @@ export async function backupDatabaseSnapshot(
         throw error;
     } finally {
         reader.close();
+        if (previousUmask !== undefined) process.umask(previousUmask);
     }
 }

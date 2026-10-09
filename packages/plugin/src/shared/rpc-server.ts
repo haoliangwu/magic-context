@@ -1,15 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import {
-    chmodSync,
-    mkdirSync,
-    readdirSync,
-    readFileSync,
-    renameSync,
-    rmSync,
-    unlinkSync,
-    writeFileSync,
-} from "node:fs";
-import { dirname } from "node:path";
+import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import type { Server, ServerWebSocket } from "bun";
 import { log } from "./logger";
 import {
@@ -25,7 +15,7 @@ import {
     rpcPortDir,
     rpcPortFilePath,
 } from "./rpc-utils";
-import { shouldEnforcePrivateStoragePermissions } from "./storage-permissions";
+import { writeStorageFileAtomicSync } from "./storage-permissions";
 
 type RpcHandler = (params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
@@ -177,38 +167,11 @@ export class MagicContextRpcServer {
         // recent instead of cross-wiring via one shared project file.
         try {
             void this.warnIfOtherLiveInstance();
-            const dir = dirname(this.portFilePath);
-            // The port file carries the RPC bearer token. The normal policy keeps
-            // it owner-only; a trusted-group deployment explicitly delegates every
-            // storage mode to its operator, so this path must not chmod or supply a
-            // restrictive creation mode in that case.
-            const enforcePrivatePermissions = shouldEnforcePrivateStoragePermissions();
-            if (enforcePrivatePermissions) {
-                mkdirSync(dir, { recursive: true, mode: 0o700 });
-                try {
-                    chmodSync(dir, 0o700);
-                } catch {
-                    // Continue RPC startup when directory tightening is rejected.
-                }
-            } else {
-                mkdirSync(dir, { recursive: true });
-            }
-            // Registered before the file appears, so the storage migration guard in
-            // this process never sees its own discovery file as another live host.
+            // The discovery file carries the RPC bearer token. The shared writer
+            // creates its directory and temporary file with owner-only modes.
             this.unregisterOwnInstance ??= registerOwnRpcServerInstance(this.instanceId);
-            const tmpPath = `${this.portFilePath}.tmp`;
-            // A stale tmp from a crashed write could exist with loose perms;
-            // writeFileSync's mode only applies on create, so remove it first.
-            try {
-                rmSync(tmpPath, { force: true });
-            } catch {
-                // best-effort
-            }
-            // Synchronous write so the renameSync below sees a fully-written file.
-            // The private mode keeps the bearer token out of other local accounts;
-            // externally managed storage intentionally leaves its mode to the umask.
-            writeFileSync(
-                tmpPath,
+            writeStorageFileAtomicSync(
+                this.portFilePath,
                 JSON.stringify({
                     port: this.port,
                     pid: process.pid,
@@ -217,18 +180,7 @@ export class MagicContextRpcServer {
                     token: this.token,
                     instance_id: this.instanceId,
                 }),
-                enforcePrivatePermissions
-                    ? { encoding: "utf-8", mode: 0o600 }
-                    : { encoding: "utf-8" },
             );
-            renameSync(tmpPath, this.portFilePath);
-            if (enforcePrivatePermissions) {
-                try {
-                    chmodSync(this.portFilePath, 0o600);
-                } catch {
-                    // Continue RPC startup when port-file tightening is rejected.
-                }
-            }
             log(`[rpc] server listening on 127.0.0.1:${this.port}`);
         } catch (err) {
             log(`[rpc] failed to write port file: ${err}`);

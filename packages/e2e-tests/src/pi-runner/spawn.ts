@@ -268,6 +268,8 @@ export function childEnv(env: PiIsolatedEnv): Record<string, string> {
   result.TMPDIR = hostExtractCache();
   result.PI_CODING_AGENT_DIR = env.agentDir;
   result.HOME = env.baseDir;
+  // macOS Foundation may create an HTTP-cache database independently of XDG.
+  result.CFFIXED_USER_HOME = result.HOME;
   result.XDG_CONFIG_HOME = env.configDir;
   result.XDG_DATA_HOME = env.dataDir;
   result.XDG_CACHE_HOME = env.cacheDir;

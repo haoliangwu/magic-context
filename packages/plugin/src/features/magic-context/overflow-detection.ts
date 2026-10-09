@@ -230,6 +230,17 @@ export function detectThinkingBindingMismatch(error: unknown): ThinkingBindingMi
     };
 }
 
+/** Distinct from prefix binding: the provider rejected edits to its active turn. */
+export function detectLatestTurnThinkingMismatch(error: unknown): boolean {
+    const status = extractExplicitHttpStatus(error);
+    return (
+        (status === undefined || status === 400) &&
+        /(?:thinking|redacted_thinking)[\s\S]*latest assistant (?:message|turn)[\s\S]*cannot be modified/i.test(
+            extractErrorMessage(error),
+        )
+    );
+}
+
 /**
  * Claude models whose signed thinking blocks Anthropic binds to the request
  * prefix, as `[family, major, minor]`. The source of truth is Anthropic's

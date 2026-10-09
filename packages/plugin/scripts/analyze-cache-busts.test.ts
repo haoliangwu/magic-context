@@ -411,6 +411,131 @@ describe("analyze-cache-bust dump discovery", () => {
         expect(rows[2]?.divergenceClass).toBe("unaccounted_defer_pass");
         expect(rows[3]?.verdict).toBe("STABLE");
     });
+    test("classifies a shorter tail with no cache rewrite without changing the meter", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-tail-shrink-no-rewrite-"));
+        tempDirs.push(dir);
+        const session = "ses_tailshrink";
+        writeDump(
+            dir,
+            `2026-09-11T08-00-00-000Z-000001-${session}`,
+            "2026-09-11T08:00:00Z",
+            session,
+            bodyWithBreakpointMessage("the previous request had a longer tail"),
+            responseUsage({ input_tokens: 0, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 0 }),
+        );
+        writeDump(
+            dir,
+            `2026-09-11T08-00-10-000Z-000002-${session}`,
+            "2026-09-11T08:00:10Z",
+            session,
+            bodyWithBreakpointMessage("the previous request had a longer"),
+            responseUsage({ input_tokens: 0, cache_read_input_tokens: 930, cache_creation_input_tokens: 0 }),
+        );
+
+        const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[1];
+
+        expect(row.verdict).toBe("BUST");
+        expect(row.rewrittenTokens).toBe(0);
+        expect(row.divergenceClass).toBe("tail_shrink_no_rewrite");
+    });
+    test("classifies a zero-write request that removes multiple trailing messages", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-tail-messages-shrunk-"));
+        tempDirs.push(dir);
+        const session = "ses_tailmessages";
+        const bodyWithTailMessages = (count: number) => ({
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        {
+                            type: "text",
+                            text: "shared cached prefix",
+                            cache_control: { type: "ephemeral" },
+                        },
+                    ],
+                },
+                ...Array.from({ length: count }, (_, index) => ({
+                    role: index % 2 === 0 ? "assistant" : "user",
+                    content: [
+                        {
+                            type: "text",
+                            text: `tail message ${index}`,
+                            ...(index === count - 1
+                                ? { cache_control: { type: "ephemeral" } }
+                                : {}),
+                        },
+                    ],
+                })),
+            ],
+        });
+        writeDump(
+            dir,
+            `2026-09-11T08-00-20-000Z-000001-${session}`,
+            "2026-09-11T08:00:20Z",
+            session,
+            bodyWithTailMessages(20),
+            responseUsage({ input_tokens: 0, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 0 }),
+        );
+        writeDump(
+            dir,
+            `2026-09-11T08-00-30-000Z-000002-${session}`,
+            "2026-09-11T08:00:30Z",
+            session,
+            bodyWithTailMessages(10),
+            responseUsage({ input_tokens: 0, cache_read_input_tokens: 930, cache_creation_input_tokens: 0 }),
+        );
+
+        const row = __test.analyzeSnapshots(snapshotsFor(dir, session))[1];
+
+        expect(row.divergenceIndex).toBe(11);
+        expect(row.previous?.segments.length).toBe(21);
+        expect(row.current.segments.length).toBe(11);
+        expect(row.verdict).toBe("BUST");
+        expect(row.rewrittenTokens).toBe(0);
+        expect(row.divergenceClass).toBe("tail_shrink_no_rewrite");
+    });
+    test("keeps a 1,000-token tail rewrite unaccounted", () => {
+        const dir = mkdtempSync(join(tmpdir(), "cache-tail-rewrite-1000-"));
+        tempDirs.push(dir);
+        const session = "ses_tailrewrite";
+        writeDump(
+            dir,
+            `2026-09-11T08-01-00-000Z-000001-${session}`,
+            "2026-09-11T08:01:00Z",
+            session,
+            bodyWithBreakpointMessage("the original tail with extra content"),
+            responseUsage({ input_tokens: 0, cache_read_input_tokens: 1_000, cache_creation_input_tokens: 0 }),
+        );
+        writeDump(
+            dir,
+            `2026-09-11T08-01-10-000Z-000002-${session}`,
+            "2026-09-11T08:01:10Z",
+            session,
+            bodyWithBreakpointMessage("the original tail"),
+            responseUsage({ input_tokens: 0, cache_read_input_tokens: 1, cache_creation_input_tokens: 1_000 }),
+        );
+
+        const rows = __test.analyzeSnapshots(snapshotsFor(dir, session), [
+            {
+                timestampMs: Date.parse("2026-09-11T08:01:10Z"),
+                decision: "unknown",
+                canonicalDecision: "unknown",
+                materialized: false,
+                materializeReason: null,
+                emergency: false,
+                droppedTokens: 0,
+                droppedCount: 0,
+                inputTokens: 1_000,
+                flush: false,
+                source: "fixture",
+            },
+        ]);
+        const row = rows[1];
+
+        expect(row.verdict).toBe("BUST");
+        expect(row.rewrittenTokens).toBe(1_000);
+        expect(row.divergenceClass).toBe("unaccounted_tail_rewrite");
+    });
     test("does not forgive consecutive prefix rewrites at the same read floor", () => {
         const dir = mkdtempSync(join(tmpdir(), "cache-rebust-"));
         tempDirs.push(dir);

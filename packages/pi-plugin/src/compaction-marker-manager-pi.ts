@@ -1,4 +1,7 @@
-import { getCompartmentsByEndMessageId } from "@magic-context/core/features/magic-context/compartment-storage";
+import {
+	getCompartmentsByEndMessageId,
+	getUncoveredCompartmentEndThrough,
+} from "@magic-context/core/features/magic-context/compartment-storage";
 import type { PendingPiCompactionMarker } from "@magic-context/core/features/magic-context/storage-meta-persisted";
 import { sessionLog } from "@magic-context/core/shared/logger";
 import type { Database } from "@magic-context/core/shared/sqlite";
@@ -9,7 +12,11 @@ export type PiMarkerUpdateOutcome =
 	| { kind: "already-current"; firstKeptEntryId: string; compactionId: string }
 	| {
 			kind: "stale-skip";
-			reason: "compartment-removed" | "target-superseded" | "entry-removed";
+			reason:
+				| "compartment-removed"
+				| "target-superseded"
+				| "entry-removed"
+				| "partial-message-boundary";
 	  }
 	| { kind: "waiting-for-entry" }
 	| { kind: "retryable-failure"; error: Error };
@@ -48,6 +55,17 @@ export function applyDeferredPiCompactionMarker(
 		}
 		if (matches[0]?.endMessage !== pending.ordinal) {
 			return { kind: "stale-skip", reason: "target-superseded" };
+		}
+
+		// Pi keeps the first entry after the summarized range, not OpenCode's
+		// earlier user turn. A summary ending within a message could hide its
+		// remaining parts. Require the next summary to continue it at a later block
+		// or start at the next message ordinal, even if publication already chose
+		// which entry to keep.
+		if (
+			getUncoveredCompartmentEndThrough(deps.db, sessionId, pending.ordinal)
+		) {
+			return { kind: "stale-skip", reason: "partial-message-boundary" };
 		}
 
 		const branchEntries = deps.readBranchEntries();

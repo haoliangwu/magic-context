@@ -56,11 +56,12 @@ import {
 } from "../features/magic-context/project-embedding-registry";
 import { runDueCompiledSmartNoteChecks } from "../features/magic-context/smart-notes/runner";
 import {
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     retryPendingRustSessionCleanupsForProject,
     runSqliteOptimize,
 } from "../features/magic-context/storage";
 import { retryPendingSessionCleanups } from "../features/magic-context/storage-meta-session";
+import type { HiddenCompletionExecutor } from "../hooks/magic-context/compartment-runner-types";
 import { drainStaleLkgSlots } from "../hooks/magic-context/lkg-persist";
 import type { RawMessageProvider } from "../hooks/magic-context/read-session-chunk";
 import { projectNeedsSingleStoreMigration } from "../hooks/magic-context/single-store-refusal";
@@ -94,7 +95,25 @@ interface ProjectRegistration {
     projectIdentity: string;
     /** The runtime selecting models for this registration. */
     harness: ModelHarness;
-    client: PluginContext["client"];
+    /** OpenCode 1 and Pi run dream tasks through child sessions of this client. */
+    client?: PluginContext["client"];
+    /**
+     * OpenCode 2 has no such client: its dream tasks run through the hidden
+     * completion carrier of the plugin context that registered the project.
+     * When set, the executor uses it instead of `client`.
+     */
+    hiddenCompletionExecutor?: HiddenCompletionExecutor;
+    /**
+     * Finds the session a timer-started run's child session hangs under. A
+     * timer run has no triggering session; see `DreamTaskExecutorDeps`.
+     */
+    findParentSessionId?: () => Promise<string | undefined> | string | undefined;
+    /**
+     * Opens OpenCode 1's store read-only for dream tasks that scan it. Defaults
+     * to the shared opener; OpenCode 2 passes one returning null, because its
+     * sessions are not in that store.
+     */
+    openOpenCodeDb?: () => Database | null;
     dreamerConfig?: DreamerConfig;
     validateTaskModels?: (tasks: DreamTaskRuntimeConfig[]) => DreamTaskRuntimeConfig[];
     sampleDreamRun?: () => Partial<
@@ -461,6 +480,7 @@ async function runMessageHistoryMaintenance(db: Database): Promise<void> {
     }
 
     const sweep = sweepOrphanedOpenCodeMessageIndexes(db, openOpenCodeDb);
+    if (sweep.reason) log(`[message-index] orphan sweep parked: ${sweep.reason}`);
     if (sweep.deleted > 0) {
         log(
             `[message-index] orphan sweep: scanned=${sweep.scanned} deleted=${sweep.deleted} cursor=${sweep.cursor || "<complete>"}`,
@@ -508,8 +528,12 @@ async function runProjectMaintenance(
     origin: "startup" | "interval",
     db: Database,
 ): Promise<void> {
+    // Sampled before the gate, so a dreamer turned on or off in the live config
+    // (`dreamer.disable` is a live key) is honoured on this tick.
+    const sampled = reg.sampleDreamRun?.();
+    const current = sampled ? { ...reg, ...sampled } : reg;
     const projectMaintenanceEnabled =
-        Boolean(reg.dreamerConfig && reg.dreamerConfig.disable !== true) ||
+        Boolean(current.dreamerConfig && current.dreamerConfig.disable !== true) ||
         reg.memoryEnabled === true ||
         reg.gitCommitIndexing?.enabled === true ||
         reg.historianChildSweep !== undefined;
@@ -527,8 +551,7 @@ async function runProjectMaintenance(
         // Compartment-chunk backfill remains demand-driven to avoid bursty
         // requests to local embedding endpoints.
     }
-    const sampled = reg.sampleDreamRun?.();
-    await sweepProject(sampled ? { ...reg, ...sampled } : reg, origin, db);
+    await sweepProject(current, origin, db);
 }
 
 /**
@@ -640,8 +663,10 @@ async function sweepProject(
         // worktree the shared git:<sha> identity might resolve to).
         const executor = createDreamTaskExecutor({
             client: reg.client,
+            hiddenCompletionExecutor: reg.hiddenCompletionExecutor,
+            findParentSessionId: reg.findParentSessionId,
             sessionDirectory: reg.directory,
-            openOpenCodeDb,
+            openOpenCodeDb: reg.openOpenCodeDb ?? openOpenCodeDb,
             // Each registration brings its own provider factory (Pi supplies the
             // JSONL provider); default to OpenCode when none is given.
             retrospectiveRawProvider:
@@ -683,14 +708,17 @@ async function sweepOrphanedInternalChildren(
     privacyTimeoutMinutes: readonly number[],
 ): Promise<void> {
     const config = reg.historianChildSweep;
-    if (!config) return;
+    // The sweep removes leftover children through OpenCode 1's session client;
+    // a host without one (OpenCode 2) cleans up its hidden children itself.
+    const client = reg.client;
+    if (!config || !client) return;
 
     const ocDb = openOpenCodeDb();
     if (!ocDb) return;
     try {
         await sweepOrphanedRetrospectiveChildren({
             opencodeDb: ocDb,
-            client: reg.client,
+            client,
             sessionDirectory: reg.directory,
             staleMs: {
                 privacy: retrospectiveOrphanStaleMs(privacyTimeoutMinutes),
@@ -706,6 +734,11 @@ async function sweepOrphanedInternalChildren(
     } finally {
         closeQuietly(ocDb);
     }
+}
+
+/** What the process-wide timer holds right now, for tests of host registration. */
+export function _getDreamTimerStateForTests(): { active: boolean; directories: string[] } {
+    return { active: activeTimer !== null, directories: [...registeredProjects.keys()] };
 }
 
 export function _resetDreamTimerForTests(): void {

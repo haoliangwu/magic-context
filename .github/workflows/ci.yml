@@ -5,18 +5,25 @@ on:
     # train/** runs the same checks on a train branch before it is fast-forwarded
     # onto master; required status checks on master are satisfied by that run.
     branches: [master, main, "train/**"]
-  # The nightly run checks sibling repositories at their default-branch heads;
+  # The nightly run rechecks the Cargo graph pinned by Cargo.lock;
   # workflow_dispatch remains available for an operator-triggered run.
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
+
+# A train branch gets pushed again with each merge, and every run is about twenty
+# jobs against a shared runner limit, so a new push cancels the train's older run.
+# master keeps every run, so a failure still names the commit that broke it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && github.ref != 'refs/heads/main' }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # Pipeline shape on every push to master/main:
 #
-#   check-plugin, check-pi-plugin                          (unit tests + lint + typecheck, parallel)
+#   check-plugin (plugin, CLI, retina), check-pi-plugin     (unit tests + lint + typecheck, parallel)
 #                  ↓
 #   e2e-opencode, e2e-opencode2, e2e-pi, e2e-omp           (Docker install + smoke, parallel — gated by unit)
 #   e2e-host-opencode, e2e-host-opencode2, e2e-host-pi, e2e-host-omp (host-behavior lanes from the mode manifest)
@@ -32,13 +39,16 @@ env:
 #
 # Docker e2e was previously in a separate workflow (e2e-docker.yml). Folding it here means
 # every master/main push exercises the full unit → Docker → host gauntlet. The
-# Rust jobs run on every push and scheduled run, checking the current public sibling sources:
+# Rust jobs run on every push and scheduled run. Pushes use Cargo.lock-pinned crates;
+# the scheduled hermetic build additionally probes the subconscious default branch:
 #
 #   rust-crates          cargo fmt / clippy --all-targets / cargo test, including every
 #                        integration target under crates/*/tests
 #   e2e-rust-hermetic-build → e2e-rust-hermetic (4 shards)
 #
-# Both check out ../commons and ../subconscious from their public default branches.
+# The mc-module integration tests always build ck-subc from its Cargo.lock revision.
+# Hermetic push builds use that same revision; the nightly build intentionally builds
+# subconscious default-branch HEAD and reports it as drift in the job summary.
 
 jobs:
   check-plugin:
@@ -61,13 +71,23 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: TypeScript typecheck
-        run: bun run typecheck
+        run: |
+          bun run --cwd packages/plugin typecheck
+          bun run --cwd packages/cli typecheck
+          bun run --cwd packages/retina-local-fs typecheck
 
       - name: Lint
-        run: bun run lint
+        run: |
+          bun run --cwd packages/plugin lint
+          bun run --cwd packages/cli lint
+          bun run --cwd packages/retina-local-fs lint
 
       - name: Build
-        run: bun run build
+        run: |
+          bun run --cwd packages/plugin build
+          bun run --cwd packages/cli build
+          # Plugin tests load the Pi worker bundles from packages/pi-plugin/dist.
+          bun run --cwd packages/pi-plugin build
 
       - name: Check compiled TUI freshness
         run: bun run --cwd packages/plugin check:tui-compiled
@@ -81,7 +101,22 @@ jobs:
         run: bun crates/mc-module/gen/gen-historian-prompt-golden.ts --check
 
       - name: Test
-        run: bun run test
+        # Keep CLI and retina coverage here, but let check-pi-plugin own Pi's
+        # normal/assertion pair rather than fanning out through the root script.
+        run: |
+          bun run --cwd packages/plugin test
+          bun run --cwd packages/cli test
+          bun run --cwd packages/retina-local-fs test
+
+      - name: Test (debug assertions)
+        env:
+          MAGIC_CONTEXT_DEBUG_ASSERTIONS: "1"
+        # Keep each package's existing assertion-lane timeout; the root command
+        # previously forwarded --timeout=60000 only to the final retina suite.
+        run: |
+          bun run --cwd packages/plugin test
+          bun run --cwd packages/cli test
+          bun run --cwd packages/retina-local-fs test --timeout=60000
 
       # Exercise the node:sqlite branch of shared/sqlite.ts under REAL Node —
       # bun test only covers the bun:sqlite branch, so the transaction() shim,
@@ -109,13 +144,13 @@ jobs:
       # exercises the resolution path OpenCode's plugin cache uses (v0.31.1
       # shipped without runtime deps and passed every dev-path check).
       - name: Smoke (TUI packaged install import)
-        run: bun packages/plugin/scripts/smoke-tui-pack-install.ts
+        run: bun packages/plugin/scripts/smoke-tui-pack-install.ts --skip-build
 
       # Tokenizer loading is lazy, so an import-only smoke misses resolution
       # failures. Pack + npm-install prod deps, then exercise an estimate from a
       # compiled Bun host matching OpenCode's /$bunfs/root runtime.
       - name: Smoke (tokenizer packaged install estimate)
-        run: bun packages/plugin/scripts/smoke-tokenizer-pack-install.ts
+        run: bun packages/plugin/scripts/smoke-tokenizer-pack-install.ts --skip-build
 
   check-pi-plugin:
     name: Check (pi-plugin)
@@ -141,6 +176,13 @@ jobs:
 
       - name: Test
         run: bun run --cwd packages/pi-plugin test
+
+      - name: Test (debug assertions)
+        env:
+          MAGIC_CONTEXT_DEBUG_ASSERTIONS: "1"
+        # Run serially so full-content assertion walks do not compete with Pi's
+        # full-runtime tests, whose existing per-test budgets remain 15 seconds.
+        run: bun run --cwd packages/pi-plugin test --parallel=1 --timeout=60000
 
   check-dashboard:
     name: Check (dashboard)
@@ -528,11 +570,12 @@ jobs:
 
   rust-crates:
     name: Rust (crates)
-    # Public sibling workspaces are checked out at their default-branch heads,
-    # so each push validates the crates against the current shared sources.
+    # mc-module integration tests build ck-subc from the locked source revision.
+    # Published commons and subconscious crates resolve from this repository's
+    # Cargo.lock, so there is no commons checkout or floating crate source here.
     #
-    # It exists because NOTHING ran `cargo test` in this workflow: the drift leg
-    # below builds the crates only as a side effect of the hermetic harness, so an
+    # It exists because no other CI job runs cargo test; the hermetic build below
+    # compiles the crates only as part of producing its Rust test binaries, so an
     # integration test under crates/*/tests could fail unobserved. It depends on the
     # no other suite, so a Rust regression is reported even
     # when an unrelated host suite is red.
@@ -555,41 +598,40 @@ jobs:
       - name: Install CLI dependencies
         run: bun install --frozen-lockfile
 
-      - name: Check out commons
-        uses: actions/checkout@v5
-        with:
-          repository: cortexkit/commons
-          path: .siblings/commons
+      - name: Resolve Cargo.lock crate pins
+        id: cargo-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/cargo-lock-pins.py --self-test
+          pins="$(python3 scripts/cargo-lock-pins.py)"
+          printf '%s\n' "$pins" >> "$GITHUB_OUTPUT"
+          locked_crates="$(printf '%s\n' "$pins" | sed -n 's/^locked_crates=//p')"
+          echo "Cargo.lock pins: $locked_crates" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check out subconscious
+      # real_daemon.rs builds ck-subc and checks its launch-nonce history; this
+      # exact locked checkout is therefore needed only by this integration-test job.
+      - name: Check out locked subconscious source for daemon integration tests
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: .siblings/subconscious
-          # real_daemon checks that the launch-nonce prerequisite is in history.
+          ref: ${{ steps.cargo-pins.outputs.subc_revision }}
           fetch-depth: 0
 
-      # actions/checkout refuses a path outside $GITHUB_WORKSPACE, so the siblings
-      # land inside the workspace and are linked to the ../ paths the Rust workspace
-      # expects. Same shape as the hermetic leg below.
-      - name: Link siblings at the expected relative paths
+      # These integration tests use ../subconscious to build ck-subc. Cargo now
+      # resolves commons crates from the registry/Git lock instead of ../commons.
+      - name: Link locked daemon source for integration tests
         shell: bash
         run: |
           set -euo pipefail
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
           ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
-          test -f "$GITHUB_WORKSPACE/../commons/Cargo.toml"
           test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
 
-      - name: Record public sibling revisions
-        shell: bash
+      - name: Check Cargo path dependency boundaries
         run: |
-          set -euo pipefail
-          commons_sha="$(git -C "$GITHUB_WORKSPACE/../commons" rev-parse HEAD)"
-          subconscious_sha="$(git -C "$GITHUB_WORKSPACE/../subconscious" rev-parse HEAD)"
-          summary="Rust crate checks against commons=${commons_sha}; subconscious=${subconscious_sha}"
-          echo "$summary"
-          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          timeout 180s python3 scripts/check-cargo-path-dependencies.py
+          timeout 180s python3 scripts/check-cargo-path-dependencies.py --self-test
 
       - name: Format check
         run: cargo fmt --check
@@ -610,8 +652,9 @@ jobs:
         run: cargo test --workspace --exclude mc-module
 
   e2e-rust-hermetic-build:
-    name: E2E (Rust hermetic drift build)
-    # Public sibling workspaces are checked out at their default-branch heads.
+    name: E2E (Rust hermetic build)
+    # Cargo.lock pins the published crate versions and both git dependency revisions.
+    # On schedule the daemon checkout below intentionally switches to upstream HEAD.
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -625,49 +668,60 @@ jobs:
         with:
           bun-version: latest
 
-      # actions/checkout requires sibling checkouts inside $GITHUB_WORKSPACE, so they land
-      # inside the workspace and are
-      # linked to the ../ paths the Rust workspace and the hermetic harness expect.
-      # Same shape as release.yml.
-      - name: Check out commons
+      - name: Resolve Cargo.lock crate pins
+        id: cargo-pins
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/cargo-lock-pins.py --self-test
+          pins="$(python3 scripts/cargo-lock-pins.py)"
+          printf '%s\n' "$pins" >> "$GITHUB_OUTPUT"
+          locked_crates="$(printf '%s\n' "$pins" | sed -n 's/^locked_crates=//p')"
+          echo "Cargo.lock pins: $locked_crates" >> "$GITHUB_STEP_SUMMARY"
+
+      # Cargo can resolve subc-core as a library dependency but does not build its
+      # ck-subc binary target. Pushes use the root lockfile revision; only the scheduled
+      # run deliberately checks the subconscious default branch for upstream drift.
+      - name: Check out Cargo.lock-pinned subconscious source for ck-subc
+        if: ${{ github.event_name != 'schedule' }}
         uses: actions/checkout@v5
         with:
-          repository: cortexkit/commons
-          path: .siblings/commons
+          repository: cortexkit/subconscious
+          path: .siblings/subconscious
+          ref: ${{ steps.cargo-pins.outputs.subc_revision }}
 
-      - name: Check out subconscious
+      - name: Check out subconscious default branch for scheduled drift
+        if: ${{ github.event_name == 'schedule' }}
         uses: actions/checkout@v5
         with:
           repository: cortexkit/subconscious
           path: .siblings/subconscious
 
-      - name: Link siblings at the expected relative paths
+      - name: Record ck-subc source revision
+        id: daemon-source
         shell: bash
         run: |
           set -euo pipefail
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
-          test -f "$GITHUB_WORKSPACE/../commons/Cargo.toml"
-          test -f "$GITHUB_WORKSPACE/../subconscious/Cargo.lock"
-
-      - name: Record public sibling revisions
-        shell: bash
-        run: |
-          set -euo pipefail
-          commons_sha="$(git -C "$GITHUB_WORKSPACE/../commons" rev-parse HEAD)"
-          subconscious_sha="$(git -C "$GITHUB_WORKSPACE/../subconscious" rev-parse HEAD)"
-          summary="Rust hermetic sibling checkouts: commons=${commons_sha}; subconscious=${subconscious_sha}"
+          sha="$(git -C "$GITHUB_WORKSPACE/.siblings/subconscious" rev-parse HEAD)"
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            summary="ck-subc source drift: subconscious default-branch HEAD $sha"
+          else
+            summary="ck-subc source pinned by Cargo.lock: $sha"
+          fi
           echo "$summary"
           echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Derive hermetic Cargo cache key
         id: cargo-cache-key
         shell: bash
         run: |
           set -euo pipefail
-          # commons is a library workspace with no committed Cargo.lock; key on its
-          # Cargo.toml instead (release.yml does the same).
-          digest="$(sha256sum Cargo.lock ../commons/Cargo.toml ../subconscious/Cargo.lock | sha256sum | awk '{print $1}')"
+          # Key on the resolved Cargo graph plus the exact daemon source, including
+          # nightly HEAD, so pinned and drift builds never reuse one another's cache.
+          lock_digest="$(sha256sum Cargo.lock | awk '{print $1}')"
+          source_sha="${{ steps.daemon-source.outputs.sha }}"
+          digest="$(printf '%s\n%s\n' "$lock_digest" "$source_sha" | sha256sum | awk '{print $1}')"
           echo "key=rust-hermetic-${RUNNER_OS}-${RUNNER_ARCH}-${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Restore ck-subc and ckdev-mc-e2e Cargo target cache
@@ -689,8 +743,8 @@ jobs:
           cp "$target/release/ck-mc" "$target/prebuilt/ckdev-mc-e2e"
           CARGO_TARGET_DIR="$target" cargo build --release -p mc-module --features drive-fault
           cp "$target/release/ck-mc" "$target/prebuilt/ckdev-mc-e2e-drive-fault"
-          (cd ../subconscious && CARGO_TARGET_DIR="$target" cargo build --release -p subc-core --bins)
-          cp "$target/release/ck-subc" "$target/prebuilt/ck-subc"
+          (cd "$GITHUB_WORKSPACE/.siblings/subconscious" && CARGO_TARGET_DIR="$target" cargo build --release -p subc-core --bins)
+          cp "$target/release/ck-subc" "$target/prebuilt/ckdev-subc"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -700,7 +754,7 @@ jobs:
           retention-days: 1
 
   e2e-rust-hermetic:
-    name: E2E (Rust hermetic drift ${{ matrix.shard }}/4)
+    name: E2E (Rust hermetic ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     needs: [e2e-rust-hermetic-build]
     timeout-minutes: 60
@@ -716,18 +770,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - uses: actions/checkout@v5
-        with:
-          repository: cortexkit/commons
-          path: .siblings/commons
-      - uses: actions/checkout@v5
-        with:
-          repository: cortexkit/subconscious
-          path: .siblings/subconscious
-      - name: Link sibling workspaces
-        run: |
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/commons" "$GITHUB_WORKSPACE/../commons"
-          ln -sfn "$GITHUB_WORKSPACE/.siblings/subconscious" "$GITHUB_WORKSPACE/../subconscious"
       - name: Install workspace dependencies
         run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
@@ -735,7 +777,7 @@ jobs:
           name: rust-hermetic-binaries
           path: packages/e2e-tests/.cache/prebuilt
       - name: Make downloaded binaries executable
-        run: chmod +x packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e-drive-fault packages/e2e-tests/.cache/prebuilt/ck-subc
+        run: chmod +x packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e-drive-fault packages/e2e-tests/.cache/prebuilt/ckdev-subc
       - name: Install pinned OpenCode
         run: |
           OPENCODE_VERSION=1.18.32 bash tests/docker/install-opencode.sh
@@ -749,5 +791,5 @@ jobs:
           MC_E2E_SHARD: ${{ matrix.shard }}/4
           MC_E2E_CK_MC_PREBUILT_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e
           MC_E2E_CK_MC_DRIVE_FAULT_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ckdev-mc-e2e-drive-fault
-          MC_E2E_CK_SUBC_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ck-subc
+          MC_E2E_CK_SUBC_BIN: ${{ github.workspace }}/packages/e2e-tests/.cache/prebuilt/ckdev-subc
         run: scripts/run-rust-hermetic-e2e.sh

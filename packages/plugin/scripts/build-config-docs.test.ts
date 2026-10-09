@@ -36,7 +36,7 @@ describeRender("generated reference table cell escaping", () => {
         // A double backslash before a pipe renders as a literal backslash plus a
         // real cell separator and shifts every later cell one column right.
         expectRender(md).not.toContain("\\\\|");
-        const cacheTtlRow = md.split("\n").find((line) => line.startsWith("| `cache_ttl` |"));
+        const cacheTtlRow = md.split("\n").find((line) => line.startsWith("| `cache_ttl` "));
         expectRender(cacheTtlRow).toBeDefined();
         // Split on unescaped pipes only: 4 data cells + the two outer empties.
         const cells = (cacheTtlRow as string).split(/(?<!\\)\|/);

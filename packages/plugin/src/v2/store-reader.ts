@@ -548,6 +548,31 @@ export class V2StoreReader {
         return typeof row.parent_id === "string" && row.parent_id.length > 0;
     }
 
+    /**
+     * The most recently updated top-level user session the host created in
+     * `directory`, or undefined when there is none. Children, Magic Context's
+     * own hidden runs and archived sessions are never returned. The directory
+     * must match exactly: OpenCode 2 puts a child session in its parent's
+     * location, and only the plugin context of that location recognises the
+     * child, so a parent from a sibling checkout would strand the run.
+     */
+    latestRootSessionInDirectory(directory: string): string | undefined {
+        const columns = new Set(
+            (this.prepare("PRAGMA table_info(session_v2)").all() as Array<{ name: string }>).map(
+                (column) => column.name,
+            ),
+        );
+        const archived = columns.has("time_archived") ? " AND time_archived IS NULL" : "";
+        const order = columns.has("time_updated") ? "time_updated DESC, id DESC" : "id DESC";
+        const row = this.prepare(
+            `SELECT id FROM session_v2
+                 WHERE directory = ? AND parent_id IS NULL${archived}
+                   AND COALESCE(json_extract(metadata, '$.magic_context'), '') <> 'hidden-run'
+                 ORDER BY ${order} LIMIT 1`,
+        ).get(directory) as { id: string } | undefined;
+        return row?.id;
+    }
+
     /** Native user activity on root sessions; internal children must never become
      * retrospective input. Activity is read from the source, not project-binding
      * times or optional activity keys in Magic Context's store. */

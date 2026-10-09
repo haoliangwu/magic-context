@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -50,9 +51,16 @@ const HEADER_LEN: usize = 4 + 1 + 8 + 8 + 32;
 const RECORD_VERSION: u8 = 1;
 const LINEAGE_VERSION: u8 = 2;
 const GATED_VERSION: u8 = 3;
+/// Broca's own table (`KNOWN_FEATURES` in broca-wal's framing.rs). A name
+/// missing here stops the session at the first frame that requires it: a
+/// missing `restart-pause/v1` cut every mason run Broca paused for a daemon
+/// restart at the pause, hiding every step after the resume. Each name below
+/// only adds a field or a record type this reader does not use.
 const KNOWN_FEATURES: &[&str] = &[
-    "scope/v1",
+    "flow-scopes/v1",
     "plan-manifest/v1",
+    "restart-pause/v1",
+    "scope/v1",
     "steer-queue/v1",
     "archive-index/v2",
     "dispatch-module/v1",
@@ -162,6 +170,10 @@ pub(crate) struct WalRun {
     pub ts_ms: Option<i64>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// The context window the run was admitted with
+    /// (`run_started.config.context_limit`: the caller's override, else the
+    /// catalog's window for the model), frozen for the whole run.
+    pub context_limit: Option<i64>,
     pub steps: Vec<WalStep>,
     /// True once the run's `run_finished` record has been read.
     pub finished: bool,
@@ -176,20 +188,27 @@ pub(crate) fn session_runs(
     session_snapshot(state_root, identity).map(|fold| (fold.runs, fold.activity_note))
 }
 
-pub(crate) fn session_activity_note(
-    state_root: &Path,
-    identity: &SessionIdentity,
-) -> Option<String> {
-    session_snapshot(state_root, identity)?.activity_note
+/// The session's compatibility note as of the last time its WAL was read in
+/// this process, without reading it now. The Cache tab's session list calls
+/// this for every listed Broca session on every poll; decoding each of those
+/// WALs (and archived ones out of their containers) just for the note cost far
+/// more than the list. A session's WAL is read when its events are fetched,
+/// which the tab does for the sessions it shows, so their notes appear by the
+/// next poll.
+pub(crate) fn session_activity_note(identity: &SessionIdentity) -> Option<String> {
+    shared_cache().lock().ok()?.known_note(identity)
+}
+
+fn shared_cache() -> &'static Mutex<WalCache> {
+    static CACHE: OnceLock<Mutex<WalCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(WalCache::default()))
 }
 
 fn session_snapshot(state_root: &Path, identity: &SessionIdentity) -> Option<Fold> {
-    static CACHE: OnceLock<Mutex<WalCache>> = OnceLock::new();
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(WalCache::default()))
+    shared_cache()
         .lock()
-        .ok()?;
-    cache.session_snapshot(state_root, identity)
+        .ok()?
+        .session_snapshot(state_root, identity)
 }
 
 // ── Frame decoding ─────────────────────────────────────────────────────────
@@ -462,6 +481,11 @@ impl Fold {
             let model_id = model.and_then(|model| {
                 string_field(model, "model_id").or_else(|| string_field(model, "model"))
             });
+            let context_limit = record
+                .get("config")
+                .and_then(|config| config.get("context_limit"))
+                .and_then(non_negative_int)
+                .filter(|limit| *limit > 0);
             self.step_started_ts.clear();
             self.attempt_ts.clear();
             self.runs.push(WalRun {
@@ -469,6 +493,7 @@ impl Fold {
                 ts_ms: envelope_ts,
                 provider,
                 model: model_id,
+                context_limit,
                 steps: Vec::new(),
                 finished: false,
             });
@@ -539,8 +564,13 @@ struct WalCursor {
     expected_seq: u64,
     fold: Fold,
     /// Set once the file proved unreadable; it stays unreadable until it
-    /// shrinks (Broca rewrote it), since corruption does not heal.
+    /// shrinks or is replaced (Broca rewrote it), since corruption does not
+    /// heal.
     failed: Option<String>,
+    /// The (device, inode) of the file this cursor read, when known. A
+    /// different file at the same path (replaced, not appended to) is read
+    /// again from the start even when it is not shorter.
+    file_key: Option<(u64, u64)>,
 }
 
 impl Default for WalCursor {
@@ -551,6 +581,7 @@ impl Default for WalCursor {
             expected_seq: 1,
             fold: Fold::default(),
             failed: None,
+            file_key: None,
         }
     }
 }
@@ -560,7 +591,10 @@ impl WalCursor {
     /// (or one frame, when a single frame is bigger).
     fn advance<R: Read + Seek>(&mut self, reader: &mut R, len: u64, budget: usize) {
         if len < self.offset {
-            *self = Self::default();
+            *self = Self {
+                file_key: self.file_key,
+                ..Self::default()
+            };
         }
         if self.failed.is_some()
             || self.fold.activity_note.is_some()
@@ -617,6 +651,30 @@ impl WalCursor {
     }
 }
 
+/// Bytes this process has read from Broca WAL files and archive containers,
+/// for measuring what a Cache tab refresh costs (`bench_cache_poll`).
+static BYTES_READ: AtomicU64 = AtomicU64::new(0);
+
+pub fn bytes_read_total() -> u64 {
+    BYTES_READ.load(Ordering::Relaxed)
+}
+
+/// The (device, inode) pair naming the file behind `metadata`, so a reader can
+/// tell a file replaced at the same path from the one it already read. `None`
+/// where the platform does not expose it; callers then rely on length alone.
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
 fn read_exact_at<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
@@ -625,6 +683,7 @@ fn read_exact_at<R: Read + Seek>(
     reader.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0; len as usize];
     reader.read_exact(&mut buf)?;
+    BYTES_READ.fetch_add(len, Ordering::Relaxed);
     Ok(buf)
 }
 
@@ -823,6 +882,8 @@ fn fold_stamp(name: &str) -> Option<u64> {
 #[derive(Debug, Default)]
 pub(crate) struct WalCache {
     live: HashMap<PathBuf, WalCursor>,
+    /// Each session's compatibility note from its last read, by address.
+    notes: HashMap<String, Option<String>>,
     containers: HashMap<PathBuf, CachedContainer>,
     /// Decoded archived members by (container, member offset, container length).
     archived: HashMap<(PathBuf, u64, u64), Result<Fold, String>>,
@@ -839,16 +900,39 @@ impl WalCache {
             .map(|fold| fold.runs)
     }
 
+    fn known_note(&self, identity: &SessionIdentity) -> Option<String> {
+        self.notes.get(&identity.addr()).cloned().flatten()
+    }
+
     fn session_snapshot(&mut self, state_root: &Path, identity: &SessionIdentity) -> Option<Fold> {
         let address = identity.addr();
+        let fold = self.read_session(state_root, &address);
+        if self.notes.len() >= MAX_REMEMBERED_FILES && !self.notes.contains_key(&address) {
+            self.notes.clear();
+        }
+        self.notes.insert(
+            address,
+            fold.as_ref().and_then(|fold| fold.activity_note.clone()),
+        );
+        fold
+    }
+
+    fn read_session(&mut self, state_root: &Path, address: &str) -> Option<Fold> {
         let live_path = state_root.join("wal").join(format!("{address}.wal"));
         match File::open(&live_path) {
             Ok(mut file) => {
-                let len = file.metadata().ok()?.len();
+                let metadata = file.metadata().ok()?;
+                let (len, file_key) = (metadata.len(), file_identity(&metadata));
                 if !self.live.contains_key(&live_path) && self.live.len() >= MAX_REMEMBERED_FILES {
                     self.live.clear();
                 }
                 let cursor = self.live.entry(live_path).or_default();
+                if cursor.file_key != file_key {
+                    *cursor = WalCursor {
+                        file_key,
+                        ..WalCursor::default()
+                    };
+                }
                 cursor.advance(&mut file, len, READ_BUDGET_BYTES);
                 if cursor.failed.is_some() {
                     return None;
@@ -857,7 +941,7 @@ impl WalCache {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.live.remove(&live_path);
-                self.archived_runs(&state_root.join("wal-archive"), &address)
+                self.archived_runs(&state_root.join("wal-archive"), address)
             }
             Err(_) => None,
         }
@@ -1549,6 +1633,117 @@ pub(crate) mod tests {
         bytes
     }
 
+    /// WAL bytes holding `payloads` in order: a payload with a `requires` key
+    /// is written as a gated (version 3) frame, any other as a plain record.
+    pub(crate) fn wal_bytes(payloads: &[Value]) -> Vec<u8> {
+        let mut bytes = lineage();
+        for (index, payload) in payloads.iter().enumerate() {
+            let version = if payload.get("requires").is_some() {
+                3
+            } else {
+                1
+            };
+            bytes.extend(frame(
+                version,
+                index as u64 + 1,
+                1,
+                payload.to_string().as_bytes(),
+            ));
+        }
+        bytes
+    }
+
+    /// A mason run cut by a daemon restart, shaped like the live one: Broca
+    /// pauses the run in a gated `run_paused` frame (`restart-pause/v1`),
+    /// then resumes the same run id without a new `run_started`, and step ids
+    /// carry on from where they stopped.
+    pub(crate) fn restart_resumed_wal() -> Vec<u8> {
+        let run = "run-sid-restart";
+        wal_bytes(&[
+            json!({"type": "run_started", "run_id": run, "ts_ms": 1_000,
+                   "session": {"project_root": "/work", "harness": "broca", "session": "alfonso:bg_mason"},
+                   "config": {"model": {"provider_module_id": "openai", "model_id": "gpt-6.1-sol"},
+                              "context_limit": 1_050_000},
+                   "input": [], "origin": {"kind": "fresh"}}),
+            step_started(1),
+            attempt(1, 1_100),
+            step_finished(
+                1,
+                json!({"input_tokens": 3_928, "cached_input_tokens": 13_056,
+                                    "cache_write_tokens": 0, "output_tokens": 89}),
+            ),
+            step_started(2),
+            attempt(2, 1_200),
+            step_finished(
+                2,
+                json!({"input_tokens": 260, "cached_input_tokens": 16_896,
+                                    "cache_write_tokens": 0, "output_tokens": 135}),
+            ),
+            json!({"requires": ["restart-pause/v1"],
+                   "record": {"type": "run_paused", "run_id": run, "ts_ms": 1_300, "reason": "restart"}}),
+            json!({"type": "resume_started", "episode": run, "resumed_from_seq": 8,
+                   "replayed": {"messages": 4, "model_steps": 2, "tool_results": 0},
+                   "redone": [], "indeterminate": []}),
+            step_started(3),
+            attempt(3, 2_000),
+            step_finished(
+                3,
+                json!({"input_tokens": 485, "cached_input_tokens": 89_600,
+                                    "cache_write_tokens": 0, "output_tokens": 780}),
+            ),
+            json!({"type": "run_finished", "reason": "completed", "ts_ms": 2_100,
+                   "usage": {"input_tokens": 4_673, "cached_input_tokens": 119_552,
+                             "cache_write_tokens": 0, "output_tokens": 1_004}}),
+        ])
+    }
+
+    #[test]
+    fn a_run_resumed_after_a_restart_pause_keeps_every_step() {
+        let mut cursor = WalCursor::default();
+        let bytes = restart_resumed_wal();
+        cursor.advance(
+            &mut std::io::Cursor::new(&bytes),
+            bytes.len() as u64,
+            bytes.len(),
+        );
+        assert_eq!(cursor.failed, None);
+        assert_eq!(cursor.fold.activity_note, None);
+        let runs = cursor.fold.runs;
+        assert_eq!(
+            step_ids(&runs),
+            [
+                ("run-sid-restart".to_string(), 1),
+                ("run-sid-restart".to_string(), 2),
+                ("run-sid-restart".to_string(), 3)
+            ]
+        );
+        assert!(runs[0].finished);
+    }
+
+    /// Every feature name Broca 0.3.189 writes (`KNOWN_FEATURES` in
+    /// broca-wal's framing.rs), spelled out rather than taken from this
+    /// reader's own list, so a name Broca adds and this reader lacks shows up
+    /// here instead of silently truncating sessions.
+    #[test]
+    fn every_feature_broca_writes_is_understood() {
+        for feature in [
+            "flow-scopes/v1",
+            "plan-manifest/v1",
+            "restart-pause/v1",
+            "scope/v1",
+            "steer-queue/v1",
+            "archive-index/v2",
+            "dispatch-module/v1",
+        ] {
+            let bytes = wal_bytes(&[
+                json!({"requires": [feature], "record": run_started("r1", 1)}),
+                step_finished(1, usage(1, 2, 3, 4)),
+            ]);
+            let runs = decode(&bytes).unwrap_or_else(|e| panic!("{feature}: {e}"));
+            assert_eq!(step_ids(&runs), [("r1".to_string(), 1)], "{feature}");
+        }
+    }
+
     #[test]
     fn a_gather_run_decodes_every_model_step() {
         let steps = [
@@ -1754,6 +1949,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_live_file_replaced_by_one_no_shorter_is_read_again_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_live(dir.path(), &one_step_wal("r1"));
+        let mut cache = WalCache::default();
+        let runs = cache.session_runs(dir.path(), &identity()).unwrap();
+        assert_eq!(step_ids(&runs), [("r1".to_string(), 1)]);
+
+        // Same length, different file: written aside and renamed over the
+        // old one, so only the file's identity says it changed.
+        let replacement = one_step_wal("r2");
+        assert_eq!(replacement.len(), one_step_wal("r1").len());
+        let aside = path.with_extension("tmp");
+        std::fs::write(&aside, &replacement).unwrap();
+        std::fs::rename(&aside, &path).unwrap();
+        let runs = cache.session_runs(dir.path(), &identity()).unwrap();
+        assert_eq!(step_ids(&runs), [("r2".to_string(), 1)]);
+    }
+
+    #[test]
+    fn the_list_note_reports_only_what_was_already_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = two_runs();
+        wal.bytes.extend(frame(4, wal.seq + 1, 0, b"future"));
+        write_live(dir.path(), &wal.bytes);
+        let mut cache = WalCache::default();
+        // Asking for the note reads nothing, so nothing is known yet.
+        assert_eq!(cache.known_note(&identity()), None);
+        assert!(cache.live.is_empty());
+        let note = cache
+            .session_snapshot(dir.path(), &identity())
+            .unwrap()
+            .activity_note;
+        assert!(note.is_some());
+        assert_eq!(cache.known_note(&identity()), note);
+    }
+
+    #[test]
     fn compatibility_notes_and_prefix_steps_survive_live_and_archive_caches() {
         for archived in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -1772,7 +2004,7 @@ pub(crate) mod tests {
                 let (runs, note) = session_runs(dir.path(), &identity()).unwrap();
                 assert_eq!(step_ids(&runs).len(), 3);
                 assert!(note.as_deref().unwrap().contains("showing data up to"));
-                assert_eq!(session_activity_note(dir.path(), &identity()), note);
+                assert_eq!(session_activity_note(&identity()), note);
             }
         }
     }

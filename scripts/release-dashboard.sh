@@ -206,11 +206,15 @@ echo ""
 echo "→ Waiting for the Dashboard Release workflow (fail-fast on any leg)..."
 echo "  (checking every 15s for up to 60 minutes)"
 RUN_ID=""
+# Match the run by the tagged commit too: after a failed attempt the tag is
+# re-created, and the earlier run for the same tag name is still listed (often
+# first, before the new run registers). Watching it would report its stale legs.
+TAG_SHA=$(git rev-list -n 1 "$TAG")
 DEADLINE=$(( $(date +%s) + 3600 ))
 while [[ $(date +%s) -lt $DEADLINE ]]; do
   RUN_INFO=$(gh run list --repo cortexkit/magic-context --workflow "Dashboard Release" --limit 20 \
-    --json databaseId,status,conclusion,headBranch \
-    --jq ".[] | select(.headBranch == \"$TAG\") | \"\(.databaseId) \(.status) \(.conclusion)\"" 2>/dev/null | head -n 1 || true)
+    --json databaseId,status,conclusion,headBranch,headSha \
+    --jq ".[] | select(.headBranch == \"$TAG\" and .headSha == \"$TAG_SHA\") | \"\(.databaseId) \(.status) \(.conclusion)\"" 2>/dev/null | head -n 1 || true)
 
   if [[ -n "$RUN_INFO" ]]; then
     read -r RUN_ID RUN_STATUS RUN_CONCLUSION <<<"$RUN_INFO"

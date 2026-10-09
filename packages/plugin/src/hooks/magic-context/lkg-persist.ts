@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { assembleLkgPrefix, layoutLkgPrefix } from "../../features/magic-context/lkg-prefix-chunks";
+import { isRustMarkerAdmissionFenced } from "../../features/magic-context/storage-replay-document";
 import { drainBackgroundBatches } from "../../shared/background-batch-drain";
 import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
@@ -290,17 +291,23 @@ export function saveLkgSlotToDb(db: Database, sessionId: string, slot: LkgSlot):
 
 export function clearPersistedLkgSlot(db: Database, sessionId: string): void {
     try {
-        db.transaction(() => {
-            db.prepare("DELETE FROM lkg_slot_chunks WHERE session_id = ?").run(sessionId);
-            db.prepare("DELETE FROM lkg_slots WHERE session_id = ?").run(sessionId);
-        }).immediate();
-        persistedFingerprints.get(db)?.delete(sessionId);
+        clearPersistedLkgSlotStrict(db, sessionId);
     } catch (error) {
         sessionLog(sessionId, "LKG snapshot durable clear failed:", error);
     }
 }
 
+/** A cut must not commit when durable old-representation invalidation failed. */
+export function clearPersistedLkgSlotStrict(db: Database, sessionId: string): void {
+    db.transaction(() => {
+        db.prepare("DELETE FROM lkg_slot_chunks WHERE session_id = ?").run(sessionId);
+        db.prepare("DELETE FROM lkg_slots WHERE session_id = ?").run(sessionId);
+    }).immediate();
+    persistedFingerprints.get(db)?.delete(sessionId);
+}
+
 export function loadPersistedLkgSlot(db: Database, sessionId: string): LkgSlot | undefined {
+    if (isRustMarkerAdmissionFenced(db, sessionId)) return undefined;
     type ChunkRow = { chunk?: unknown; hash?: unknown; body?: unknown };
     let row: Record<string, unknown> | undefined;
     let chunkRows: ChunkRow[];

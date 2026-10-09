@@ -140,7 +140,8 @@ JSON
 # Magic Context config — local embeddings (no network), historian
 # pointed at the same mock model so any background historian call also
 # resolves through aimock without external API.
-cat > "$HOME/.config/opencode/magic-context.jsonc" <<'JSON'
+mkdir -p "$HOME/.config/cortexkit"
+cat > "$HOME/.config/cortexkit/magic-context.jsonc" <<'JSON'
 {
   "enabled": true,
   "historian": { "model": "mock/mock-model" },

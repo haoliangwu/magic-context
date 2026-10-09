@@ -246,6 +246,8 @@ describe("Pi marker-drain wire stability", () => {
 			).toBe(true);
 			expect(pass1.messages).toHaveLength(15);
 			expect(messageText(pass1.messages[1]).length).toBeGreaterThan(2_400);
+			// The first retained user keeps the decision made before the cut.
+			expect(messageText(pass1.messages[2])).toContain("<!-- +10m -->");
 
 			const sessionFile = sessionManager.getSessionFile();
 			if (!sessionFile) throw new Error("expected persisted Pi session file");
@@ -302,6 +304,8 @@ describe("Pi marker-drain wire stability", () => {
 			expect(wireBytes(pass2Stable)).toBe(wireBytes(pass1.messages));
 			expect(differences).toEqual([]);
 			expect(pass2Stable).toEqual(pass1.messages);
+			// New markers wait for a rebuild, even on a newly appended user.
+			expect(messageText(pass2.messages.at(-1))).not.toContain("<!-- +");
 		} finally {
 			clearContextHandlerSession(sessionId);
 			closeQuietly(db);

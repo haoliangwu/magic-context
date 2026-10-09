@@ -37,6 +37,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { ProtectedTokensTierOverrides } from "@magic-context/core/config/project-security";
+import type { CheckoutClaimGate } from "@magic-context/core/features/magic-context/checkout-claim";
 import {
 	acquireCompartmentLease,
 	COMPARTMENT_LEASE_RENEWAL_MS,
@@ -55,14 +56,18 @@ import {
 } from "@magic-context/core/features/magic-context/message-index-async";
 import { isPrefixBoundThinkingModel } from "@magic-context/core/features/magic-context/overflow-detection";
 import {
+	decodePiContentDecision,
 	encodePiContentDecision,
-	freezePiContentDecision,
+	getPiContentDecisions,
 } from "@magic-context/core/features/magic-context/pi-content-decisions";
 import {
 	computeProtectionWindow,
 	getProtectionWindowForSession,
 } from "@magic-context/core/features/magic-context/protection-window";
-import { newestCtxReduceTagNumbers } from "@magic-context/core/features/magic-context/reclaim-protection";
+import {
+	protectedToolTagNumbers,
+	protectedToolTokenCount,
+} from "@magic-context/core/features/magic-context/reclaim-protection";
 import {
 	createScheduler,
 	parseCacheTtl,
@@ -95,7 +100,7 @@ import {
 	getPendingPiCompactionMarkerState,
 	getPersistedToolTagAccounting,
 	getTagsByNumbers,
-	getTagsBySession,
+	type getTagsBySession,
 	getTagsForPendingOperations,
 	isWrapupInProgress,
 	setSessionWorkMetrics,
@@ -130,6 +135,10 @@ import {
 	type Tagger,
 } from "@magic-context/core/features/magic-context/tagger";
 import {
+	freezeTemporalDecisions,
+	observeTemporalDecisions,
+} from "@magic-context/core/features/magic-context/temporal-decisions";
+import {
 	findNewestPiAssistantEntryId,
 	normalizeMaterializeReason,
 	recordPendingPiTransformDecision,
@@ -158,12 +167,17 @@ import {
 } from "@magic-context/core/hooks/magic-context/channel2-cycle";
 import { checkCompartmentTrigger } from "@magic-context/core/hooks/magic-context/compartment-trigger";
 import { evaluateChannel2 } from "@magic-context/core/hooks/magic-context/ctx-reduce-nudge";
+import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
 import { deriveTriggerBudget } from "@magic-context/core/hooks/magic-context/derive-budgets";
 import {
 	type DroppedTokenReduction,
 	estimateDroppedTokensFromTagReductions,
 } from "@magic-context/core/hooks/magic-context/dropped-token-estimate";
-import { EmergencyFailClosedError } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
+import {
+	contextRefusalError,
+	EmergencyFailClosedError,
+	outgoingContextRefusal,
+} from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import {
 	DEFAULT_CONTEXT_LIMIT,
 	historyBudgetPolicyIdentity,
@@ -172,7 +186,17 @@ import {
 import { foldExecutesThisPass } from "@magic-context/core/hooks/magic-context/fold-execution-gate";
 import { getVisibleMemoryIds } from "@magic-context/core/hooks/magic-context/inject-compartments";
 import {
+	hasActiveAnthropicThinkingTurn,
+	latestAssistantTurnStart,
+	protectNewTagMutations,
+} from "@magic-context/core/hooks/magic-context/latest-assistant-turn";
+import {
+	captureOriginalTurn,
+	prepareLatestThinkingRecovery,
+} from "@magic-context/core/hooks/magic-context/latest-thinking-recovery";
+import {
 	markNoteNudgeDelivered,
+	observeNoteNudgeServe,
 	onNoteTrigger,
 	peekNoteNudgeText,
 } from "@magic-context/core/hooks/magic-context/note-nudger";
@@ -189,6 +213,11 @@ import {
 } from "@magic-context/core/hooks/magic-context/read-session-chunk";
 import { invalidateTrueRawTokenCache } from "@magic-context/core/hooks/magic-context/read-session-true-raw-tokens";
 import {
+	DEFAULT_KEEP_REASONING_TOKENS,
+	resolveKeepReasoningTokens,
+} from "@magic-context/core/hooks/magic-context/reasoning-budget";
+import { captureOpencodeReasoningBudgetStatus } from "@magic-context/core/hooks/magic-context/reasoning-budget-status";
+import {
 	modelAcceptsEmptyContent,
 	variantChangeBustsProviderCache,
 } from "@magic-context/core/hooks/magic-context/sentinel";
@@ -200,6 +229,7 @@ import {
 import { stripSystemInjection } from "@magic-context/core/hooks/magic-context/system-injection-stripper";
 import { stripTagPrefix } from "@magic-context/core/hooks/magic-context/tag-content-primitives";
 import { formatTailHygienePrefixMismatch } from "@magic-context/core/hooks/magic-context/tail-hygiene-walk";
+import { readServedTemporalDecisions } from "@magic-context/core/hooks/magic-context/temporal-served-projection";
 import {
 	advanceToolReclaimWatermarkToCurrentMax,
 	buildSyntheticToolReclaimOps,
@@ -214,7 +244,6 @@ import {
 	TEXT_TAG_IDENTITY_MARKER,
 	tagTranscript,
 } from "@magic-context/core/shared/tag-transcript";
-import { hasTrustedAbsoluteWall } from "@magic-context/core/shared/window-geometry";
 import { logSlowWriteTransaction } from "@magic-context/core/shared/write-transaction-timing";
 import {
 	clearAutoSearchForPiSession,
@@ -272,6 +301,7 @@ import {
 	applyNativeReasoningReplayPi,
 	applyNativeToolInputReplayPi,
 	authorizePiToolRemoval,
+	preparePiToolRemovalMeasurements,
 } from "./native-replay-state-pi";
 import { hasVisibleNoteReadCallPi } from "./note-visibility-pi";
 import {
@@ -295,12 +325,16 @@ import {
 	clearPiLiveUsageClassification,
 	formatPiPressureForLog,
 	isPiLiveUsageRawBranchEstimate,
+	noteRejectedPiUsage,
+	piPressureEvidenceLimit,
+	piProviderUsageWasRejected,
 	recordPiLiveUsageClassification,
 	resolvePiPressureSnapshotWithEstimateGuard,
 } from "./pi-pressure";
 import { resolvePiProvenInputFloor } from "./pi-proven-floor";
 import {
 	assertPiRawFallbackFits,
+	estimatePiOutgoingInputTokens,
 	PiDegradedPassError,
 	PiStorageBusyError,
 } from "./pi-raw-fallback";
@@ -325,6 +359,7 @@ import {
 	buildMessageIdToMaxTag,
 	clearOldReasoningPi,
 	piReasoningClearCutoff,
+	piReasoningStatusMessages,
 	replayClearedReasoningPi,
 	replayStrippedInlineThinkingPi,
 	stripInlineThinkingPi,
@@ -353,6 +388,7 @@ import {
 	refreshPiTailHygieneBaseline,
 } from "./tail-hygiene-walk-pi";
 import {
+	collectPiTemporalCandidates,
 	injectPiTemporalMarkers,
 	stripPiLeadingTemporalMarker,
 	withoutPiLeadingTemporalMarker,
@@ -511,13 +547,6 @@ export const __test = {
 		};
 	},
 };
-
-/**
- * Default `clear_reasoning_age` when neither the Pi caller nor the user
- * config specifies one. Matches OpenCode's schema default
- * (`packages/plugin/src/config/schema/magic-context.ts:303` → `.default(50)`).
- */
-const DEFAULT_CLEAR_REASONING_AGE = 50;
 
 /**
  * Current Pi message stable-id scheme version. Bump when the durable message
@@ -1175,6 +1204,7 @@ export interface PiHistorianOptions {
 	commitClusterTrigger?: { enabled: boolean; min_clusters: number };
 	protectedTags?: number;
 	clearReasoningAge?: number;
+	keepReasoningTokens?: number | Record<string, number>;
 	/** Fraction of executable context reserved for rendered <session-history>. */
 	historyBudgetPercentage?: number;
 }
@@ -1206,6 +1236,7 @@ export interface PiHeuristicsOptions {
 	 * cleared reasoning more aggressively than the user configured.
 	 */
 	clearReasoningAge?: number;
+	keepReasoningTokens?: number | Record<string, number>;
 }
 
 /** <session-history> injection config — writes compartments+facts+memories into message[0]. */
@@ -1234,11 +1265,11 @@ export interface PiSchedulerOptions {
 
 export interface PiContextHandlerOptions {
 	cacheTtlConfig?: import("@magic-context/core/shared/model-cache-ttl").CacheTtlConfig;
+	cacheTtlConfigured?: boolean;
 	db: ContextDatabase;
-	/** Smart-drops (experimental, default off): also reclaim tool output that a
-	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
-	 *  sent to the model are byte-identical to the age-based-only behavior. */
+	/** Deprecated caller input, ignored. Supersession always rides an existing rebuild. */
 	smartDrops?: boolean;
+	protectedTools?: Readonly<Record<string, number>>;
 	/**
 	 * Heuristic-cleanup config (tiered emergency drop + caveman). When
 	 * omitted, heuristic cleanup is disabled — tagging and queued-drop
@@ -2391,6 +2422,13 @@ function loadPiHistorianStateSnapshot(
 export function registerPiContextHandler(
 	pi: ExtensionAPI,
 	baseOptions: PiContextHandlerOptions,
+	processOptions: {
+		/**
+		 * The checkout claim check, run before the pass writes anything. A refusal
+		 * escapes the handler, so the guarded wrapper aborts the turn and shows it.
+		 */
+		checkoutClaim?: Pick<CheckoutClaimGate, "refusal">;
+	} = {},
 ): void {
 	const tagger = createTagger();
 	const lkgCoordinator = createPiLkgCoordinator(
@@ -2450,6 +2488,16 @@ export function registerPiContextHandler(
 	});
 
 	registerPiGuardedContext(pi, async (event, ctx) => {
+		if (processOptions.checkoutClaim) {
+			const claimSessionId = resolveSessionId(ctx);
+			if (claimSessionId) {
+				const refusal = await processOptions.checkoutClaim.refusal(
+					claimSessionId,
+					ctx.cwd,
+				);
+				if (refusal) throw refusal;
+			}
+		}
 		const transformStartTime = performance.now();
 		let rawMessageCount = 0;
 		let rawFallbackLimit: number | undefined;
@@ -2790,12 +2838,13 @@ export function registerPiContextHandler(
 			const previousModelKey = liveModelBySession.get(sessionId);
 			const currentModelKey = resolvePiContextModelKey(ctx);
 			if (options.cacheTtlConfig !== undefined)
-				resolveSessionCacheTtl(
+				sessionMetaForUsage.cacheTtl = resolveSessionCacheTtl(
 					options.db,
 					sessionId,
 					options.cacheTtlConfig,
 					currentModelKey,
-				);
+					options.cacheTtlConfigured,
+				).value;
 			const modelChanged =
 				previousModelKey !== undefined &&
 				currentModelKey !== undefined &&
@@ -3024,46 +3073,15 @@ export function registerPiContextHandler(
 				detectedContextLimit,
 			});
 			rawFallbackLimit = baseWindowGeometry?.usableHard ?? rawFallbackLimit;
-			let provenInputTokens = resolvePiProvenInputFloor({
+			const providerInputLimit = piPressureEvidenceLimit(baseWindowGeometry);
+			const provenInputTokens = resolvePiProvenInputFloor({
 				db: options.db,
 				sessionId,
 				modelKey: currentModelKey,
+				readBranch: () => branchEntries ?? undefined,
+				providerInputLimit,
 			});
-			if (
-				baseWindowGeometry &&
-				hasTrustedAbsoluteWall(baseWindowGeometry) &&
-				provenInputTokens > baseWindowGeometry.derivation.absoluteWall
-			) {
-				sessionLog(
-					sessionId,
-					`transform: persisted proven floor ${provenInputTokens} exceeds trusted absolute wall ${baseWindowGeometry.derivation.absoluteWall}; cleared and re-resolved to ${baseWindowGeometry.usableSoft}`,
-				);
-				updateSessionMeta(options.db, sessionId, {
-					observedSafeInputTokens: 0,
-					cacheAlertSent: false,
-					lastUsageContextLimit: baseWindowGeometry.usableSoft,
-					lastInputTokens:
-						sessionMeta.lastInputTokens >
-						baseWindowGeometry.derivation.absoluteWall
-							? baseWindowGeometry.derivation.absoluteWall
-							: sessionMeta.lastInputTokens,
-					lastContextPercentage:
-						sessionMeta.lastInputTokens >
-						baseWindowGeometry.derivation.absoluteWall
-							? (baseWindowGeometry.derivation.absoluteWall /
-									baseWindowGeometry.usableSoft) *
-								100
-							: sessionMeta.lastContextPercentage,
-				});
-				provenInputTokens = 0;
-				sessionMeta.observedSafeInputTokens = 0;
-				sessionMeta.cacheAlertSent = false;
-				if (usageInputTokens > baseWindowGeometry.derivation.absoluteWall) {
-					usageInputTokens = baseWindowGeometry.derivation.absoluteWall;
-					usagePercentage =
-						(usageInputTokens / baseWindowGeometry.usableSoft) * 100;
-				}
-			}
+
 			const windowGeometry = resolvePiWindowGeometry({
 				rawContextWindow: usageContextLimit,
 				rawContextWindowSource: usageContextWindowSource,
@@ -3098,8 +3116,48 @@ export function registerPiContextHandler(
 			) {
 				usagePercentage = (usageInputTokens / usageContextLimit) * 100;
 			}
+			let fallbackInputTokens: number | undefined;
+			const suspectReading = Math.max(usageInputTokens, piUsage?.tokens ?? 0);
+			if (
+				suspectReading > providerInputLimit ||
+				piProviderUsageWasRejected(sessionId)
+			) {
+				if (suspectReading > providerInputLimit)
+					noteRejectedPiUsage(
+						sessionId,
+						suspectReading,
+						providerInputLimit,
+						"transform",
+					);
+				// Count request messages, replaying the last served prefix where it is
+				// available. Pi rebuilds raw history on every pass; counting that old
+				// prefix again would forget reductions already served to the model.
+				const replay =
+					!lkgCompactionOff && lkgPassSnapshot
+						? lkgCoordinator.replay(
+								lkgPassSnapshot,
+								(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
+							)
+						: undefined;
+				const counts = tokenizePiMessages(
+					replay?.ok ? replay.messages : event.messages,
+				);
+				const envelope = readPiLkgFitEnvelope(
+					ctx,
+					pi,
+					currentModelKey,
+					sessionDecisionCalibration(options.db, sessionId),
+				);
+				fallbackInputTokens =
+					counts.conversation +
+					counts.toolCall +
+					(envelope?.systemTokens ?? 0) +
+					(envelope?.toolDefinitionTokens ?? 0);
+			}
 			({ percentage: usagePercentage, inputTokens: usageInputTokens } =
 				resolvePiPressureSnapshotWithEstimateGuard({
+					providerInputLimit,
+					fallbackInputTokens,
 					sessionId,
 					source: "transform",
 					liveIsRawBranchEstimate: piLiveUsageIsRawBranchEstimate,
@@ -3397,6 +3455,7 @@ export function registerPiContextHandler(
 					lkgInputIdByRef.get(message),
 				),
 				smartDrops: options.smartDrops === true,
+				protectedTools: options.protectedTools,
 				protectedTags: options.protectedTags ?? 20,
 				protectedTokens: options.protectedTokens,
 				protectedTokenTierOverrides: options.protectedTokenTierOverrides,
@@ -3447,9 +3506,10 @@ export function registerPiContextHandler(
 				},
 				isCacheBusting,
 				reasoningClearing: {
-					clearReasoningAge:
-						options.heuristics?.clearReasoningAge ??
-						DEFAULT_CLEAR_REASONING_AGE,
+					keepReasoningTokens: resolveKeepReasoningTokens(
+						options.heuristics?.keepReasoningTokens,
+						resolvePiContextModelKey(ctx),
+					),
 					nativeReasoningMayClear: canClearNativeReasoning(ctx.model),
 					prefixBound: isPrefixBoundThinkingModel(
 						typeof ctx.model?.provider === "string"
@@ -3461,6 +3521,8 @@ export function registerPiContextHandler(
 						ctx.model?.api !== "openai-codex-responses" &&
 						ctx.model?.api !== "openai-responses",
 				},
+				resolvedProviderID: ctx.model?.provider,
+				resolvedModelID: ctx.model?.id,
 				canUseEmptySentinels,
 				temporalAwareness: options.injection?.temporalAwareness === true,
 				appendCompaction: resolvePiAppendCompaction(ctx),
@@ -3538,6 +3600,10 @@ export function registerPiContextHandler(
 					taggerFloor,
 					sessionMeta,
 					piUsage,
+					pressureSnapshot: {
+						percentage: usagePercentage,
+						inputTokens: usageInputTokens,
+					},
 					minimumPercentage: usagePercentage,
 					liveIsRawBranchEstimate: piLiveUsageIsRawBranchEstimate,
 					historianStateSnapshot: historianStateForPass,
@@ -3807,15 +3873,21 @@ export function registerPiContextHandler(
 						result.bustedThisPass,
 						hygieneCalibration,
 					);
+					const previousBaseline = getPiChannel1Baseline(sessionId);
 					const baseline = refreshPiTailHygieneBaseline({
 						messages: outputMessages,
 						tags,
 						protectedTagNumbers,
+						protectedTools: options.protectedTools,
 						pendingDropTagNumbers,
 						stableId,
+						protectedToolTags: protectedToolTagNumbers(
+							tags,
+							options.protectedTools,
+						),
 						syntheticLeadingCount: result.syntheticLeadingCount,
 						cacheBusting: result.bustedThisPass,
-						previous: getPiChannel1Baseline(sessionId),
+						previous: previousBaseline,
 						calibration:
 							hygieneUnitsVersion >= HYGIENE_PROVIDER_UNITS_VERSION
 								? hygieneCalibration
@@ -3881,6 +3953,8 @@ export function registerPiContextHandler(
 								db: options.db,
 								sessionId,
 								baseline: channelState,
+								rebuilding: result.bustedThisPass,
+								previous: previousBaseline,
 							});
 						} catch (error) {
 							sessionLog(
@@ -4001,6 +4075,41 @@ export function registerPiContextHandler(
 				`transform completed in ${transformElapsedMs.toFixed(1)}ms (${outputMessages.length} messages, ${result.targetCount} targets, watermark: ${result.reasoningWatermark})`,
 			);
 			runPiDebugAssertion(assertTailHygieneLastWriter);
+			if (
+				!options.compactionOff &&
+				(result.executedWorkThisPass ||
+					isCacheBusting ||
+					schedulerDecision === "execute")
+			) {
+				const envelope = readPiLkgFitEnvelope(
+					ctx,
+					pi,
+					resolvePiContextModelKey(ctx),
+					sessionDecisionCalibration(options.db, sessionId),
+				);
+				const estimate = estimatePiOutgoingInputTokens(
+					outputMessages,
+					envelope,
+					lkgPassSnapshot
+						? lkgCoordinator.measureOutgoingPrefix(
+								lkgPassSnapshot,
+								outputMessages,
+								(id) => ctx.sessionManager.getEntry?.(id)?.parentId,
+							)
+						: undefined,
+					rawFallbackLimit,
+				);
+				const refusal = outgoingContextRefusal(
+					estimate,
+					rawFallbackLimit,
+					protectedToolTokenCount(
+						getActiveTagsBySession(options.db, sessionId),
+						options.protectedTools,
+						envelope ? calibrationForModelKey(envelope.modelKey) : undefined,
+					),
+				);
+				if (refusal) throw contextRefusalError(refusal);
+			}
 			let serializedOutput: PiLkgSerializedOutput | undefined;
 			if (!lkgCompactionOff && lkgPassSnapshot) {
 				let hostEnvelopeSignature: string | undefined;
@@ -4031,6 +4140,16 @@ export function registerPiContextHandler(
 				});
 			}
 			capturePiServedArray(sessionId, outputMessages, { serializedOutput });
+			captureOpencodeReasoningBudgetStatus(
+				sessionId,
+				piReasoningStatusMessages(outputMessages),
+				resolveKeepReasoningTokens(
+					options.heuristics?.keepReasoningTokens,
+					resolvePiContextModelKey(ctx),
+				),
+				isPrefixBoundThinkingModel(ctx.model?.provider, ctx.model?.id),
+				sessionDecisionCalibration(options.db, sessionId).proseRatio,
+			);
 			if (thinkingBindingRecoveryApplied) {
 				try {
 					clearThinkingBindingRecoveryIf(
@@ -4228,7 +4347,7 @@ export function resolvePiHistorianTriggerInputs(args: {
 	executeThresholdPercentage: number;
 	triggerBudget: number;
 	protectedTags: number | undefined;
-	clearReasoningAge: number;
+	keepReasoningTokens: number;
 	commitClusterTrigger: { enabled: boolean; min_clusters: number } | undefined;
 	contextLimit: number;
 	/** ceiling = contextLimit × executeThreshold% (tiered emergency drop). */
@@ -4262,8 +4381,10 @@ export function resolvePiHistorianTriggerInputs(args: {
 			executeThresholdPercentage,
 		),
 		protectedTags: args.historian.protectedTags,
-		clearReasoningAge:
-			args.historian.clearReasoningAge ?? DEFAULT_CLEAR_REASONING_AGE,
+		keepReasoningTokens: resolveKeepReasoningTokens(
+			args.historian.keepReasoningTokens,
+			args.modelKey,
+		),
 		commitClusterTrigger: args.historian.commitClusterTrigger,
 		contextLimit,
 		emergencyCeilingTokens: Math.floor(
@@ -4665,6 +4786,8 @@ function maybeFireHistorian(args: {
 	};
 	taggerFloor?: number;
 	sessionMeta: ReturnType<typeof getOrCreateSessionMeta>;
+	/** The transform and reclaim already admitted this request-pressure pair. */
+	pressureSnapshot?: { percentage: number; inputTokens: number };
 	liveIsRawBranchEstimate?: boolean;
 	piUsage:
 		| ReturnType<NonNullable<ExtensionContext["getContextUsage"]>>
@@ -4710,7 +4833,7 @@ function maybeFireHistorian(args: {
 	let usage: { percentage: number; inputTokens: number };
 	let usageContextLimit: number | undefined;
 	try {
-		let usageSource: "session_meta" | "piUsage fallback";
+		let usageSource: "session_meta" | "piUsage fallback" | "request snapshot";
 		// Sane-bound (isSaneLimit, NOT `> 0`) so a garbage-but-positive window
 		// can't drive the trigger budget — mirrors the main pressure pass.
 		usageContextLimit = isSaneLimit(piUsage?.contextWindow)
@@ -4751,9 +4874,21 @@ function maybeFireHistorian(args: {
 					db,
 					sessionId,
 					modelKey: resolvePiContextModelKey(ctx),
+					readBranch: () => ctx.sessionManager.getBranch(),
+					providerInputLimit: piPressureEvidenceLimit(
+						resolvePiWindowGeometry({
+							rawContextWindow: usageContextLimit,
+							rawContextWindowSource: usageContextWindowSource,
+							model: ctx.model,
+							detectedContextLimit,
+						}),
+					),
 				}) || undefined,
 		});
-		if (
+		if (args.pressureSnapshot) {
+			usage = args.pressureSnapshot;
+			usageSource = "request snapshot";
+		} else if (
 			sessionMeta.lastContextPercentage > 0 &&
 			sessionMeta.lastInputTokens > 0
 		) {
@@ -4793,17 +4928,19 @@ function maybeFireHistorian(args: {
 			};
 			usageSource = "piUsage fallback";
 		}
-		usage = resolvePiPressureSnapshotWithEstimateGuard({
-			sessionId,
-			source: "historian trigger",
-			liveIsRawBranchEstimate: args.liveIsRawBranchEstimate,
-			persistedFromLive: usageSource === "piUsage fallback",
-			persistedPercentage: usage.percentage,
-			persistedInputTokens: usage.inputTokens,
-			liveInputTokens: piUsage?.tokens,
-			usableContextLimit: usageContextLimit,
-			minimumPercentage: args.minimumPercentage,
-		});
+		usage =
+			args.pressureSnapshot ??
+			resolvePiPressureSnapshotWithEstimateGuard({
+				sessionId,
+				source: "historian trigger",
+				liveIsRawBranchEstimate: args.liveIsRawBranchEstimate,
+				persistedFromLive: usageSource === "piUsage fallback",
+				persistedPercentage: usage.percentage,
+				persistedInputTokens: usage.inputTokens,
+				liveInputTokens: piUsage?.tokens,
+				usableContextLimit: usageContextLimit,
+				minimumPercentage: args.minimumPercentage,
+			});
 		sessionLog(
 			sessionId,
 			`historian trigger eval: usage=${usage.percentage.toFixed(1)}% (${usage.inputTokens} tokens) [${usageSource}], checking trigger...`,
@@ -4940,7 +5077,7 @@ function maybeFireHistorian(args: {
 			0, // _previousPercentage — unused by current trigger logic
 			triggerInputs.executeThresholdPercentage,
 			triggerInputs.triggerBudget,
-			triggerInputs.clearReasoningAge,
+			triggerInputs.keepReasoningTokens,
 			triggerInputs.commitClusterTrigger,
 			args.activeTags,
 			boundaryContextLimit,
@@ -5051,6 +5188,8 @@ function maybeFireHistorian(args: {
 	}
 }
 interface RunPipelineArgs {
+	resolvedProviderID?: string;
+	resolvedModelID?: string;
 	db: ContextDatabase;
 	tagger: Tagger;
 	sessionId: string;
@@ -5063,6 +5202,7 @@ interface RunPipelineArgs {
 	 *  later call supersedes, on top of the age-based auto-drop. Off → messages
 	 *  sent to the model are byte-identical to the age-based-only behavior. */
 	smartDrops?: boolean;
+	protectedTools?: Readonly<Record<string, number>>;
 	protectedTags: number;
 	protectedTokens?: number;
 	protectedTokenTierOverrides?: ProtectedTokensTierOverrides;
@@ -5167,7 +5307,9 @@ interface RunPipelineArgs {
 	 * needed prior reasoning preserved no longer reject the request.
 	 */
 	reasoningClearing?: {
-		clearReasoningAge: number;
+		keepReasoningTokens?: number;
+		/** Deprecated caller input, ignored. */
+		clearReasoningAge?: number;
 		nativeReasoningMayClear: boolean;
 		preserveReasoningToolArcs: boolean;
 		/** Model binds signed thinking to the request prefix (Fable 5.1, Opus 5.5, Sonnet 5.5). */
@@ -5376,6 +5518,40 @@ async function runCompactionOffPipeline(
 
 async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.compactionOff) return runCompactionOffPipeline(args);
+	const thinkingRecovery = prepareLatestThinkingRecovery({
+		db: args.db,
+		sessionId: args.sessionId,
+		messages: args.messages,
+		id: (message, index) =>
+			resolvePiStableId(
+				message,
+				index,
+				args.entryIds,
+				args.entryIdByRef ?? undefined,
+			),
+		parts: (message) =>
+			Array.isArray((message as { content?: unknown })?.content)
+				? (message as { content: unknown[] }).content
+				: [],
+	});
+	if (thinkingRecovery.ended) signalPiPendingMaterialization(args.sessionId);
+	let restoreOriginals:
+		| ReturnType<typeof captureOriginalTurn<unknown>>
+		| undefined;
+	const activeThinkingTurn = hasActiveAnthropicThinkingTurn(
+		args.messages,
+		args.resolvedProviderID,
+		args.resolvedModelID,
+	);
+	const protectedSignedPrefix =
+		activeThinkingTurn && args.reasoningClearing?.prefixBound === true;
+	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
+		resolvePiStableId(
+			msg,
+			index,
+			args.entryIds,
+			args.entryIdByRef ?? undefined,
+		);
 	let foldingSystemState: PiEffectiveSystemState | null = null;
 	try {
 		// Capture the provider-visible system state before transforming the served
@@ -5497,16 +5673,35 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const deferredHistoryWasPendingAtPassStart =
 		deferredHistoryRefreshSessions.has(args.sessionId);
 
-	// 0. Inject temporal `<!-- +Xm -->` markers into user messages
-	// BEFORE tagging so the §N§ tag prefix wraps around our marker on
-	// re-tagging. Idempotent: existing markers are detected by regex
-	// and skipped. Same invariants as OpenCode's `injectTemporalMarkers`
-	// at transform.ts:648 — runs on every pass, deterministic from
-	// timestamps, retroactive when the flag flips.
+	// Observe candidates before any history cut. Replay only durable decisions
+	// until the independently priced rebuild permission below is known.
+	const temporalCandidates = args.temporalAwareness
+		? collectPiTemporalCandidates(args.messages, args.entryIds ?? [])
+		: new Map<string, string>();
+	// Older versions removed a gap at a compaction seam. Preserve those already
+	// served choices; new seams no longer create a position-dependent removal.
+	for (const entry of getPiContentDecisions(args.db, args.sessionId)) {
+		const decision = decodePiContentDecision(entry);
+		if (decision?.[0] === "seam-temporal-strip")
+			temporalCandidates.set(decision[1], "");
+	}
+	let temporalDecisions = args.temporalAwareness
+		? observeTemporalDecisions(
+				args.db,
+				args.sessionId,
+				temporalCandidates,
+				(ids) =>
+					readServedTemporalDecisions(args.db, args.sessionId, "pi", ids),
+			)
+		: new Map<string, string>();
 	if (args.temporalAwareness) {
 		const tTemporal = performance.now();
 		try {
-			const injected = injectPiTemporalMarkers(args.messages);
+			const injected = injectPiTemporalMarkers(
+				args.messages,
+				temporalDecisions,
+				stableIdResolver,
+			);
 			if (injected > 0) {
 				sessionLog(
 					args.sessionId,
@@ -5554,6 +5749,14 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 					saved: nativeRemovalInputs,
 					canApply: isCacheBustingPass,
 				}),
+			authorizeToolRemovals: (callIds) =>
+				preparePiToolRemovalMeasurements({
+					db: args.db,
+					sessionId: args.sessionId,
+					callIds,
+					saved: nativeRemovalInputs,
+					canApply: isCacheBustingPass,
+				}),
 		},
 	);
 	logTransformTiming(args.sessionId, "transcriptBuild", tTranscriptBuild);
@@ -5570,13 +5773,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// hits). Reasoning runs on `workingMessages` where tagging may have cloned
 	// working[i] → entryIdByRef misses those, so positional args.entryIds is the
 	// mandatory fallback (same precedence resolvePiStableId enforces).
-	const stableIdResolver = (msg: unknown, index: number): string | undefined =>
-		resolvePiStableId(
-			msg,
-			index,
-			args.entryIds,
-			args.entryIdByRef ?? undefined,
-		);
 	const currentTurnId = (() => {
 		const ids = buildPiMessageIdByIndex(
 			args.messages as PiAgentMessage[],
@@ -5699,7 +5895,18 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		persistedM0BeforeFold.cachedM0Bytes === null
 			? -1
 			: persistedM0BeforeFold.cachedM0MaxCompartmentSeq;
-	if ((foldDueDecision.value || softRefreshOpportunity) && piM0State) {
+	if (protectedSignedPrefix && piM0State) {
+		piM0State.preparedPrefix = prepareCachedM0M1PiReplay(
+			piM0State,
+			args.db,
+			injectionPassSnapshot?.cachedRow,
+		);
+	}
+	if (
+		!protectedSignedPrefix &&
+		(foldDueDecision.value || softRefreshOpportunity) &&
+		piM0State
+	) {
 		try {
 			// Persist the fold before opening mutation gates. The shadow array keeps
 			// this pre-execution off the outgoing wire; the normal injection below
@@ -5780,7 +5987,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			: "";
 		sessionLog(
 			args.sessionId,
-			`pi m[0] HARD fold decision: reason=${foldDueDecision.reason ?? "unknown"}${mismatch} executed=${foldExecutedThisPass} bustsServedPrefix=${foldBustsServedPrefixThisPass}`,
+			`pi m[0] HARD fold decision: reason=${preFoldInjectionResult?.m0Reason ?? foldDueDecision.reason ?? "soft_refresh"}${mismatch} executed=${foldExecutedThisPass} bustsServedPrefix=${foldBustsServedPrefixThisPass}`,
 		);
 	}
 	// Primary sessions run routine age-sensitive cleanup only once during an
@@ -5818,6 +6025,22 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				(canConsumeDeferredLate && deferredHistoryWasPendingAtPassStart)),
 	};
 	const isCacheBustingPass = hasReclaimRide(rideSignals);
+	if (args.temporalAwareness && isCacheBustingPass) {
+		temporalDecisions = freezeTemporalDecisions(
+			args.db,
+			args.sessionId,
+			temporalCandidates,
+		);
+		if (
+			injectPiTemporalMarkers(
+				args.messages,
+				temporalDecisions,
+				stableIdResolver,
+			) > 0
+		) {
+			recordFirstApplicationWireEdit(true);
+		}
+	}
 	const publishedWorkDrainAllowed = isCacheBustingPass;
 	const usesTokenProtection =
 		args.protectedTokenTierOverrides !== undefined ||
@@ -5898,6 +6121,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		args.reusableMessageIds,
 	);
 	const tTag = performance.now();
+	// Part getters build fresh proxy objects. Reuse one view for tagging and
+	// safety coordinates; its proxies still read/write the working messages.
+	const mutationView = transcript.messages.map((message) => ({
+		...message,
+		parts: message.parts,
+	}));
 	let tagTextTokenCache = piTagTextTokenCacheBySession.get(args.sessionId);
 	if (!tagTextTokenCache) {
 		tagTextTokenCache = new Map();
@@ -5915,26 +6144,87 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		"tagging-persistence-failure",
 		() => args.tagger.cleanup(args.sessionId),
 		() =>
-			tagTranscript(args.sessionId, transcript, args.tagger, args.db, {
-				skipPrefixInjection: !ctxReduceCallable,
-				entryFingerprintByMessageId,
-				reuseMessageIds: textIdentityPlan.reusableMessageIds,
-				textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
-				textIdentitySourceCache: textIdentityPlan.sourceCache,
-				textTokenCache: tagTextTokenCache,
-				toolTokenCache: tagToolTokenCache,
-				onTiming: hasPiTransformTimingObserver()
-					? (phase, elapsedMs) => {
-							recordPiTransformTiming({
-								sessionId: args.sessionId,
-								stage: `tag:${phase}`,
-								elapsedMs,
-							});
-						}
-					: undefined,
-			}),
+			tagTranscript(
+				args.sessionId,
+				{ ...transcript, messages: mutationView },
+				args.tagger,
+				args.db,
+				{
+					skipPrefixInjection: !ctxReduceCallable,
+					entryFingerprintByMessageId,
+					reuseMessageIds: textIdentityPlan.reusableMessageIds,
+					textIdentityDriftMessageIds: textIdentityPlan.driftedMessageIds,
+					textIdentitySourceCache: textIdentityPlan.sourceCache,
+					textTokenCache: tagTextTokenCache,
+					toolTokenCache: tagToolTokenCache,
+					onTiming: hasPiTransformTimingObserver()
+						? (phase, elapsedMs) => {
+								recordPiTransformTiming({
+									sessionId: args.sessionId,
+									stage: `tag:${phase}`,
+									elapsedMs,
+								});
+							}
+						: undefined,
+				},
+			),
 	);
 	logTransformTiming(args.sessionId, "tagMessages", tTag);
+	const reasoningTagsForProtection = buildMessageIdToMaxTag(targets);
+	const frozenThinkingForProtection = activeThinkingTurn
+		? frozenBindingEntryIds(args.db, args.sessionId)
+		: new Set<string>();
+	const protectedThinkingProxies = new Set<unknown>();
+	if (activeThinkingTurn) {
+		for (
+			let i = latestAssistantTurnStart(workingMessages);
+			i < mutationView.length;
+			i++
+		) {
+			const id = stableIdResolver(workingMessages[i], i);
+			if (
+				!thinkingRecovery.restore &&
+				id &&
+				frozenThinkingForProtection.has(id)
+			)
+				continue;
+			for (let p = 0; p < mutationView[i].parts.length; p++) {
+				const part = mutationView[i].parts[p];
+				if (part.kind !== "thinking") continue;
+				const local = (
+					workingMessages[i] as { content?: { redacted?: boolean }[] }
+				).content?.[p];
+				if (
+					!thinkingRecovery.restore &&
+					!local?.redacted &&
+					id &&
+					(reasoningTagsForProtection.get(id) ?? Infinity) <=
+						(args.sessionMeta.clearedReasoningThroughTag ?? 0)
+				)
+					continue;
+				protectedThinkingProxies.add(part);
+			}
+		}
+	}
+	const newTargets = protectNewTagMutations(
+		mutationView.map((message) => ({
+			info: message.info,
+			parts: message.parts,
+		})),
+		targets,
+		protectedThinkingProxies,
+		args.reasoningClearing?.prefixBound === true,
+	);
+	if (thinkingRecovery.restore) {
+		transcript.commit();
+		restoreOriginals = captureOriginalTurn(
+			args.messages as unknown[],
+			(message) => (message as { content: unknown }).content,
+			(message, content) => {
+				(message as { content: unknown }).content = content;
+			},
+		);
+	}
 
 	// Legacy dropped-tool skeletons (argument marker) convert to the
 	// real-or-absent rule only on a pass whose HARD fold executed and loses the
@@ -6046,6 +6336,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	const pendingOps = shouldReadPendingOps
 		? getPendingOps(args.db, args.sessionId)
 		: [];
+	const protectedToolTags = protectedToolTagNumbers(
+		getActiveTagsBySession(args.db, args.sessionId),
+		args.protectedTools,
+	);
 	const protectionWindowForPass = getProtectionWindowForSession(
 		args.db,
 		args.sessionId,
@@ -6101,10 +6395,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			pendingOpsDidMutate = applyPendingOperations(
 				args.sessionId,
 				args.db,
-				targets,
-				args.contextUsage.percentage >= 95
-					? newestCtxReduceTagNumbers(getTagsBySession(args.db, args.sessionId))
-					: protectedTagNumbersForPass,
+				newTargets,
+				new Set([
+					...(args.contextUsage.percentage >= 95
+						? []
+						: protectedTagNumbersForPass),
+					...protectedToolTags,
+				]),
 				pendingOperationTags,
 				pendingOps,
 				[],
@@ -6128,7 +6425,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			pendingOpsAppliedThisPass = true;
 			if (hasPendingMaterializeSignal) {
 				if (args.heuristics === undefined) {
-					consumePendingMaterialization(args.sessionId);
+					if (
+						!pendingOps.some(
+							(op) => newTargets.get(op.tagId)?.thinkingDropProtected,
+						)
+					)
+						consumePendingMaterialization(args.sessionId);
 				}
 			}
 			// NOTE: do NOT consume deferredMaterialization here. OpenCode only
@@ -6228,6 +6530,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		try {
 			const tReplayReasoning = performance.now();
 			const clearedReplay = replayClearedReasoningPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -6235,6 +6538,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				piMessageStableId: stableIdResolver,
 			});
 			const inlineReplay = replayStrippedInlineThinkingPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -6354,10 +6658,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			heuristicsResult = applyPiHeuristicCleanup(
 				args.sessionId,
 				args.db,
-				targets,
+				newTargets,
 				args.messages,
 				{
 					protectedTags: args.protectedTags,
+					prepareToolRemovalMeasurements:
+						transcript.prepareToolRemovalMeasurements,
+					protectedToolTags,
 					protectedCutoff: usesTokenProtection
 						? protectionWindowForPass.cutoff
 						: undefined,
@@ -6390,10 +6697,11 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 				const ridingCleanup = applyPiHeuristicCleanup(
 					args.sessionId,
 					args.db,
-					targets,
+					newTargets,
 					args.messages,
 					{
 						protectedTags: args.protectedTags,
+						protectedToolTags,
 						protectedCutoff: usesTokenProtection
 							? protectionWindowForPass.cutoff
 							: undefined,
@@ -6459,7 +6767,12 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			heuristicsExecuted = true;
 			executedWorkThisPass = true;
 			if (hasPendingMaterializeSignal) {
-				consumePendingMaterialization(args.sessionId);
+				if (
+					!pendingOps.some(
+						(op) => newTargets.get(op.tagId)?.thinkingDropProtected,
+					)
+				)
+					consumePendingMaterialization(args.sessionId);
 			}
 			if (currentTurnId !== null) {
 				lastHeuristicsTurnIdBySession.set(args.sessionId, currentTurnId);
@@ -6516,6 +6829,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	// wire on a pass that already dropped tools (inconsistent + a missed
 	// same-pass mutation). shouldRunHeuristics is the broader, correct set.
 	let reasoningPersistenceFailed = false;
+	let reasoningBudgetCutoffThisPass = 0;
 	if (args.reasoningClearing && shouldRunHeuristics && routineCleanupApplied) {
 		const rollbackReasoning = captureReasoningMutationRollback(workingMessages);
 		try {
@@ -6528,18 +6842,29 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const bindingStripped = prefixBound
 				? frozenBindingEntryIds(args.db, args.sessionId)
 				: new Set<string>();
+			const nativeGone = getNativeReplayState(
+				args.db,
+				args.sessionId,
+			).reasoningIds;
 			const maxCutoff = piReasoningClearCutoff({
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
-				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
+				keepReasoningTokens:
+					args.reasoningClearing.keepReasoningTokens ??
+					DEFAULT_KEEP_REASONING_TOKENS,
+				proseRatio: sessionDecisionCalibration(args.db, args.sessionId)
+					.proseRatio,
 				piMessageStableId: stableIdResolver,
 				prefixBound,
-				alreadyGone: (id) => bindingStripped.has(id),
+				anthropic: args.canUseEmptySentinels || prefixBound,
+				alreadyGone: (id) => bindingStripped.has(id) || nativeGone.has(id),
 			});
+			reasoningBudgetCutoffThisPass = maxCutoff;
 			const clearOutcome = clearOldReasoningPi({
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
-				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
 				piMessageStableId: stableIdResolver,
 				maxCutoff,
 			});
@@ -6547,9 +6872,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			// message, so it never starts on a prefix-bound model; the cutoff
 			// above already stops below any text it could reach on replay.
 			const stripOutcome = stripInlineThinkingPi({
+				protectLatestTurn: activeThinkingTurn,
 				messages: workingMessages,
 				messageIdToMaxTag,
-				clearReasoningAge: args.reasoningClearing.clearReasoningAge,
 				piMessageStableId: stableIdResolver,
 				maxCutoff: prefixBound ? 0 : maxCutoff,
 			});
@@ -6609,6 +6934,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 	if (args.reasoningClearing && shouldRunHeuristics && routineCleanupApplied) {
 		try {
 			replayStrippedInlineThinkingPi({
+				protectLatestTurn: false,
 				db: args.db,
 				sessionId: args.sessionId,
 				messages: workingMessages,
@@ -6631,8 +6957,9 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		const syntheticPendingOps = buildSyntheticToolReclaimOps({
 			db: args.db,
 			sessionId: args.sessionId,
-			targets,
+			targets: newTargets,
 			watermark: reclaimMeta.toolReclaimWatermark ?? 0,
+			protectedToolTags,
 			pendingOps,
 		});
 		// Smart-drops: also reclaim older todowrite/ctx_reduce/meta outputs that
@@ -6641,7 +6968,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		// already-gated drop apply as the age-based sweep above. Dedupe (a tag
 		// can qualify under more than one rule).
 		const editMarkerTagIds = new Set<number>();
-		if (args.smartDrops) {
+		{
 			const recentMessageIds = recentSupersessionOwnerMessageIds(
 				args.db,
 				args.sessionId,
@@ -6650,9 +6977,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const supersessionOps = buildSupersessionReclaimOps({
 				db: args.db,
 				sessionId: args.sessionId,
-				targets,
+				targets: newTargets,
 				pendingOps,
 				recentMessageIds,
+				protectedToolTags,
 			});
 			for (const op of supersessionOps) {
 				if (!selectedIds.has(op.tagId)) {
@@ -6663,9 +6991,10 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			const editReclaim = buildEditSupersessionReclaim({
 				db: args.db,
 				sessionId: args.sessionId,
-				targets,
+				targets: newTargets,
 				pendingOps,
 				recentMessageIds,
+				protectedToolTags,
 			});
 			for (const op of editReclaim.ops) {
 				// Drop wins over compress: only compress an edit no earlier rule
@@ -6682,7 +7011,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 			autoReclaimDidMutate = applyPendingOperations(
 				args.sessionId,
 				args.db,
-				targets,
+				newTargets,
 				protectedTagNumbersForPass,
 				undefined,
 				[],
@@ -6785,7 +7114,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						messageIdToMaxTag,
 						stableId: stableIdResolver,
 						localWatermark: args.sessionMeta.clearedReasoningThroughTag ?? 0,
-						clearReasoningAge: args.reasoningClearing.clearReasoningAge,
+						budgetCutoff: reasoningBudgetCutoffThisPass,
 						omissionAllowed: args.reasoningClearing.nativeReasoningMayClear,
 						canApply: isCacheBustingPass && !reasoningPersistenceFailed,
 						detectAged: shouldRunHeuristics && routineCleanupApplied,
@@ -6920,38 +7249,6 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 						m0ModelKeyNew: preFoldInjectionResult.m0ModelKeyNew ?? null,
 					}
 				: wireInjectionResult;
-			// Temporal markers are derived before history injection trims raw messages.
-			// If that trim promotes a user message to the raw-history head, its marker
-			// was based on a predecessor that is no longer visible. Remove it now so the
-			// marker-applying pass matches the next pass, where trimming happens first.
-			if (
-				args.temporalAwareness &&
-				isCacheBustingPass &&
-				injectionResult.skippedVisibleMessages > 0
-			) {
-				const firstRetainedMessage =
-					args.messages[injectionResult.syntheticLeadingCount];
-				const id =
-					firstRetainedMessage && typeof firstRetainedMessage === "object"
-						? postCommitStableIdByRef.get(firstRetainedMessage)
-						: undefined;
-				if (
-					id &&
-					firstRetainedMessage !== null &&
-					typeof firstRetainedMessage === "object" &&
-					stripPiLeadingTemporalMarker({ ...firstRetainedMessage }) &&
-					freezePiContentDecision(
-						args.db,
-						args.sessionId,
-						"seam-temporal-strip",
-						id,
-					)
-				) {
-					contentDecisions.add(
-						encodePiContentDecision("seam-temporal-strip", id),
-					);
-				}
-			}
 			// A prior trim's marker removal remains authoritative after caveman
 			// restores pre-trim source, even when this pass trims nothing late.
 			for (const message of args.messages) {
@@ -7189,6 +7486,13 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		"batchFinalize:heuristics",
 		performance.now(),
 	);
+	if (args.temporalAwareness) {
+		injectPiTemporalMarkers(args.messages, temporalDecisions, (message) =>
+			message && typeof message === "object"
+				? postCommitStableIdByRef.get(message)
+				: undefined,
+		);
+	}
 
 	const outputMessages = transcript.getOutputMessages();
 
@@ -7229,6 +7533,7 @@ async function runPipeline(args: RunPipelineArgs): Promise<RunPipelineResult> {
 		);
 	}
 
+	restoreOriginals?.(workingMessages);
 	const materialized = injectionResult?.m0Materialized === true;
 	if (
 		args.reasoningClearing?.prefixBound &&
@@ -7586,8 +7891,8 @@ function applyNoteNudges(args: {
 	}
 	logTransformTiming(sessionId, "stickyReplayDecisions", tStickyReplay);
 
-	// Path 2: fresh delivery. Use the latest user message id (or null if
-	// no user messages yet) as the trigger-message hint to peekNoteNudgeText.
+	// Path 2: fresh delivery. Observe even when no trigger is pending, so a
+	// later trigger cannot change a user already served without the reminder.
 	//
 	// Visibility-aware suppression: peekNoteNudgeText suppresses the
 	// nudge when the agent already ran ctx_note(read) since the latest
@@ -7598,6 +7903,16 @@ function applyNoteNudges(args: {
 	// OpenCode's transform-postprocess-phase.ts:647 wiring.
 	const latestUser = findLatestUserMessageIdPi(messages, messageIdByIndex);
 	const latestUserId = latestUser?.messageId ?? null;
+	const eligibility = observeNoteNudgeServe({
+		db,
+		sessionId,
+		userMessageIds: [...messageIdByIndex]
+			.filter(([index]) => messages[index]?.role === "user")
+			.map(([, id]) => id),
+		anchorMessageId: latestUserId,
+		isLiveTail: latestUser?.index === messages.length - 1,
+		isCacheBustingPass: args.isCacheBusting,
+	});
 	const noteReadStillVisible = hasVisibleNoteReadCallPi(messages);
 	// The row snapshot is the change signal for expensive note/smart-note reads.
 	// A false trigger cannot produce a nudge, so avoid entering the shared helper
@@ -7611,6 +7926,7 @@ function applyNoteNudges(args: {
 					latestUserId,
 					projectIdentity,
 					noteReadStillVisible,
+					eligibility,
 				);
 	if (deferredNoteText) {
 		if (entryIds === null) {

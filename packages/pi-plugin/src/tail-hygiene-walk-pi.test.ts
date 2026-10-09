@@ -882,6 +882,7 @@ describe("Pi Channel-2 tail-cycle cap", () => {
 					db,
 					sessionId: session,
 					baseline: held,
+					rebuilding: true,
 				}),
 			).toBe(false);
 			expect(getChannel2NudgeState(db, session)).toBe("delivered");
@@ -892,6 +893,7 @@ describe("Pi Channel-2 tail-cycle cap", () => {
 				db,
 				sessionId: session,
 				baseline: baseline(24_999),
+				rebuilding: true,
 			}),
 		).toBe(true);
 		expect(getChannel2NudgeState(db, session)).toBe("");
@@ -1321,4 +1323,126 @@ describe("Pi hygiene walk performance", () => {
 		if (process.env.MC_PERF_GATE === "1")
 			expect(memoizedMedian).toBeLessThan(15);
 	});
+});
+it("Pi adopts map edits only on rebuilding and preserves the Channel 2 lease on SOFT+", () => {
+	const db = createTestDb();
+	try {
+		const arc = toolArc("owner", "call", "probe", {}, "word ".repeat(12000));
+		const input = {
+			messages: arc.messages,
+			tags: [arc.tag],
+			stableId: arc.stableId,
+			protectedTagNumbers: new Set<number>(),
+		};
+		const before = refreshPiTailHygieneBaseline({
+			...input,
+			cacheBusting: true,
+		});
+		expect(effectivePiTailHygiene(before).u).toBeGreaterThan(6000);
+		setChannel2NudgeState(db, "pi-policy", "delivered");
+		const deferred = refreshPiTailHygieneBaseline({
+			...input,
+			previous: before,
+			cacheBusting: false,
+			protectedTools: { probe: 1 },
+		});
+		rearmChannel2AfterMeasuredCollapse({
+			db,
+			sessionId: "pi-policy",
+			baseline: deferred,
+			rebuilding: false,
+			previous: before,
+		});
+		expect(effectivePiTailHygiene(deferred)).toEqual(
+			effectivePiTailHygiene(before),
+		);
+		expect(getChannel2NudgeState(db, "pi-policy")).toBe("delivered");
+		const rebuilt = refreshPiTailHygieneBaseline({
+			...input,
+			previous: deferred,
+			cacheBusting: true,
+			protectedTools: { probe: 1 },
+		});
+		rearmChannel2AfterMeasuredCollapse({
+			db,
+			sessionId: "pi-policy",
+			baseline: rebuilt,
+			rebuilding: true,
+		});
+		expect(effectivePiTailHygiene(rebuilt).u).toBe(0);
+		expect(getChannel2NudgeState(db, "pi-policy")).toBe("");
+	} finally {
+		db.close();
+	}
+});
+
+it("Pi legacy default upgrade preserves U until rebuilding", () => {
+	const arc = toolArc("owner", "call", "todowrite", {}, "word ".repeat(12000));
+	const input = {
+		messages: arc.messages,
+		tags: [arc.tag],
+		stableId: arc.stableId,
+		protectedTagNumbers: new Set<number>(),
+	};
+	const before = refreshPiTailHygieneBaseline({
+		...input,
+		cacheBusting: true,
+		protectedTools: { todowrite: 0 },
+	});
+	delete before.protectedToolsPolicy;
+	expect(effectivePiTailHygiene(before).u).toBeGreaterThan(6000);
+	const deferred = refreshPiTailHygieneBaseline({
+		...input,
+		cacheBusting: false,
+		previous: before,
+	});
+	expect(effectivePiTailHygiene(deferred)).toEqual(
+		effectivePiTailHygiene(before),
+	);
+	const rebuilt = refreshPiTailHygieneBaseline({
+		...input,
+		cacheBusting: true,
+		previous: deferred,
+	});
+	expect(effectivePiTailHygiene(rebuilt).u).toBe(0);
+});
+
+it("Pi rotation inside the adopted policy keeps queued mass out of U on SOFT+", () => {
+	const first = toolArc("owner-1", "call-1", "probe", {}, "word ".repeat(3000));
+	const second = toolArc(
+		"owner-2",
+		"call-2",
+		"probe",
+		{},
+		"word ".repeat(3000),
+	);
+	const before = refreshPiTailHygieneBaseline({
+		messages: first.messages,
+		tags: [first.tag],
+		stableId: first.stableId,
+		protectedTagNumbers: new Set(),
+		pendingDropTagNumbers: new Set([1]),
+		protectedTools: { probe: 1 },
+		cacheBusting: true,
+	});
+	const messages = [...first.messages, ...second.messages];
+	const tags = [first.tag, { ...second.tag, tagNumber: 2 }];
+	const deferred = refreshPiTailHygieneBaseline({
+		messages,
+		tags,
+		stableId: withStableIds(messages, [
+			"owner-1",
+			"owner-1-result",
+			"owner-2",
+			"owner-2-result",
+		]),
+		protectedTagNumbers: new Set(),
+		pendingDropTagNumbers: new Set([1]),
+		protectedTools: { probe: 0 },
+		cacheBusting: false,
+		previous: before,
+	});
+	expect(effectivePiTailHygiene(deferred).u).toBe(
+		effectivePiTailHygiene(before).u,
+	);
 });

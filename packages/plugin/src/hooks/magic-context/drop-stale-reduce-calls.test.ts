@@ -298,3 +298,24 @@ describe("dropStaleReduceCalls (frozen-set replay)", () => {
         });
     });
 });
+it("stale protection affects detection but never resurrects a frozen result", () => {
+    const raw = [makeMessage("tool", [makeToolPart("ctx_reduce", "kept result", "keep")], "owner")];
+    const held = structuredClone(raw);
+    expect(
+        dropStaleReduceCalls(held, NO_FROZEN, { detect: true, protectedCallIds: new Set(["keep"]) })
+            .didDrop,
+    ).toBe(false);
+    expect(held).toEqual(raw);
+    const stripped = structuredClone(raw);
+    const detection = dropStaleReduceCalls(stripped, NO_FROZEN, {
+        detect: true,
+        protectedCallIds: new Set(),
+    });
+    expect(detection.newlyStrippedIds).toEqual(["owner"]);
+    const replay = structuredClone(raw);
+    dropStaleReduceCalls(replay, new Set(detection.newlyStrippedIds), {
+        detect: false,
+        protectedCallIds: new Set(["keep"]),
+    });
+    expect(replay).toEqual(stripped);
+});

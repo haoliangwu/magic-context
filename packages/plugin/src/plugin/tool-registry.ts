@@ -6,7 +6,7 @@ import { getProtectionWindowForSession } from "../features/magic-context/protect
 import {
     getDatabasePersistenceError,
     isDatabasePersisted,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
 } from "../features/magic-context/storage";
 import { getObservedEpochFloor } from "../features/magic-context/storage-meta-persisted";
 import { setCtxReduceRegisteredGlobally } from "../hooks/magic-context/ctx-reduce-availability";
@@ -144,6 +144,7 @@ export function createToolRegistry(args: {
             ? {}
             : createCtxReduceTools({
                   db,
+                  protectedTools: pluginConfig.protected_tools,
                   getProtectionWindow: (sessionId) =>
                       getProtectionWindowForSession(
                           db,

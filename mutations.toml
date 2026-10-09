@@ -1,0 +1,658 @@
+# Mutation proofs replayed by the pinned ck-mutate runner (README.md,
+# "Mutation catalogue"). Each row deliberately breaks one production guard and
+# names the test that must fail because of it. A row earns its place only by
+# guarding a silent, costly failure: a prompt-cache bust, a refusal that must
+# fail closed, a wire contract, crash safety, data loss, or file permissions.
+# Every anchor was copied from the code, never written from memory; `ck-mutate
+# check` fails the moment one stops matching exactly once.
+#
+# Bun rows are `command` rows. `{test}` is a Bun `-t` filter, which Bun reads as
+# a regular expression over the full test name (describe names and the test
+# name joined by single spaces). The ids are anchored (^...$) and escaped, with
+# `\s` for each space because ck-mutate refuses whitespace in an id.
+# `Ran {count} test` matches Bun's summary line ("Ran 1 test across 1 file."),
+# proving the filter selected a test on both the clean and the mutated tree.
+# Bun tests import the TypeScript sources, so no build step runs between
+# mutants; run `bun install --frozen-lockfile` once before replaying.
+#
+# Rust rows in mc-module are `command` rows too: its lib target holds about
+# 1,650 tests and takes far too long to replay whole for every mutant, so each
+# row runs only its named test with `cargo test --lib -- --exact`. The count
+# pattern `running {count} test` matches libtest's "running 1 test" line, and
+# cargo rebuilds the mutant inside the same command. Small targets (mc-store's
+# lib, one integration test binary) are ordinary `cargo` rows with `only = true`.
+#
+# Replay with the Bun version package.json pins (packageManager, bun 1.4.2).
+# Never `git checkout` a file while a replay runs: it removes the mutation and
+# fakes a survivor.
+
+# --- cache stability: one bust permission, byte-identical defers ---
+# ARCHITECTURE.md, load-bearing invariants 2-4: a defer (SOFT+) pass replays the
+# served prefix byte for byte, and every mutation lane consults the one per-pass
+# bust permission. Any break here is a silent prompt-cache bust: the provider
+# answers normally and only the bill shows it.
+
+[[control]]
+id = 'ts-single-bust-permission-gates-first-applications'
+guards = 'every first-application lane (age sweep, heuristics, strips, m[1] refresh) consults the one per-pass bust permission, so candidates alone never originate a bust'
+file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
+old = 'const isCacheBustingPass = publishedWorkDrainAllowed;'
+new = 'const isCacheBustingPass = !compactionOff;'
+test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^age\sand\sheuristic\scandidates\salone\sat\s75\spercent\scannot\soriginate\sa\sbust$']
+expect_message = '{"id":"old-a","role":"assistant"},"parts":[]}'
+
+[[control]]
+id = 'ts-queued-drops-ride-the-bust-permission'
+guards = 'queued ctx_reduce drops apply only on a pass that already holds the bust permission; a plain execute pass holds them'
+file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
+old = 'const shouldApplyPendingOps = publishedWorkDrainAllowed;'
+new = 'const shouldApplyPendingOps = !compactionOff;'
+test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^ride-only\squeued\sdrops\sholds\sexecute-only\squeued\sdrops\swith\shistorian=false$']
+expect_message = '{"id":"ride-only-tool","role":"assistant"},"parts":[]}'
+
+[[control]]
+id = 'ts-dropped-placeholder-is-pure-of-tag-id'
+guards = 'the one message-drop placeholder is `[dropped §N§]`, a pure function of the tag id, so every pass renders identical bytes'
+file = 'packages/plugin/src/hooks/magic-context/apply-operations.ts'
+old = 'return `[dropped \u00a7${tagId}\u00a7]`;'
+new = 'return `[truncated \u00a7${tagId}\u00a7]`;'
+test_file = 'packages/plugin/src/hooks/magic-context/apply-operations.replacement.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/apply-operations.replacement.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^buildReplacementContent\s—\sone\scanonical\splaceholder\sis\sa\spure\sfunction\sof\stagId\s—\sno\starget/content\sneeded$']
+expect_message = 'Received: "[truncated §42§]"'
+
+[[control]]
+id = 'ts-stale-reduce-frozen-id-replay'
+guards = 'a ctx_reduce call stripped on a bust is replayed from its frozen id on every later pass, including a defer whose tail grew'
+file = 'packages/plugin/src/hooks/magic-context/drop-stale-reduce-calls.ts'
+old = 'const inFrozen = id !== undefined && frozenIds.has(id);'
+new = 'const inFrozen = false;'
+test_file = 'packages/plugin/src/hooks/magic-context/drop-stale-reduce-calls.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/drop-stale-reduce-calls.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^dropStaleReduceCalls\s\(frozen-set\sreplay\)\s#given\sa\sctx_reduce\scall\sfrozen\son\sa\sprior\scache-busting\spass\s#when\sa\slater\sDEFER\spass\sreplays\swith\stail\sgrowth\s\(detect=false\)\s#then\sre-strips\sthe\sSAME\sfrozen\sid\sand\snever\snewly\sstrips\sa\sgrown-past\scall$']
+expect_message = '/didDrop\)\.toBe\(true\)/'
+
+[[control]]
+id = 'ts-stale-reduce-detects-only-on-bust'
+guards = 'new stale ctx_reduce strips are detected only on a pass holding the bust permission, never first-applied on a defer'
+file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
+old = '''
+                detect: isCacheBustingPass,
+                protectedCount: args.protectedCount,'''
+new = '''
+                detect: true,
+                protectedCount: args.protectedCount,'''
+test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^issue\s619\sterminal\sfirst\sedits\sprimary\sterminal\sstale\sedit\spreserves\sthinking\swhose\spreceding\sprefix\sis\sunchanged$']
+expect_message = 'expect(received).not.toBe(expected)'
+
+[[control]]
+id = 'ts-image-strip-detects-only-on-bust'
+guards = 'processed images are newly stripped only on a pass holding the bust permission; a defer only replays the frozen ids'
+file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
+old = 'detect: isCacheBustingPass && args.watermark > 0,'
+new = 'detect: args.watermark > 0,'
+test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^issue\s619\sterminal\sfirst\sedits\sprimary\sterminal\simage\sedit\spreserves\sthinking\swhose\spreceding\sprefix\sis\sunchanged$']
+expect_message = 'expect(received).not.toBe(expected)'
+
+# --- cache stability: Rust-mode host adapter ---
+# In Rust mode the module decides whether a pass may bust the prefix and says so
+# in the response's prefix_bust_permitted. The host grants nothing on its own:
+# the marker cut, the frozen last-known-good (LKG) release and every host first
+# application ride only on that exact boolean.
+
+[[control]]
+id = 'ts-frozen-lkg-holds-until-producer-rebuild'
+guards = 'a frozen LKG replay keeps serving until the producer permits a rebuild or the frozen replay is released (shouldAdoptModuleAfterFreeze)'
+file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.ts'
+old = 'return prefixRebuildPermitted || frozenReplayReleased;'
+new = 'return true;'
+test_file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^Rust\smode\sauthority\sadapter\sfrozen\sSOFT\+\sholds\sretained\smarkers\sbeyond\sthe\sformer\sbounded\srelease$']
+expect_message = '/lkgRepresentationFrozen\)\.toBe\(true\)/'
+
+[[control]]
+id = 'ts-prefix-bust-permission-must-be-exactly-true'
+guards = 'only an actual boolean prefix_bust_permitted=true grants host authority; a missing, null or non-boolean value holds every host first application'
+file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.ts'
+old = 'const moduleDecisionBusts = response.prefix_bust_permitted === true;'
+new = 'const moduleDecisionBusts = response.prefix_bust_permitted !== false;'
+test_file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^Rust\smode\sauthority\sadapter\sall\shost\sfirst\sapplications\shold\swithout\san\sactual\sboolean\spermission$']
+expect_message = '/expect\(writes\)\.toBe\(0\)[\s\S]*Received: 1/'
+
+[[control]]
+id = 'ts-softplus-cannot-carry-bust-permission'
+guards = 'a SOFT+ response that also claims prefix_bust_permitted=true is a protocol error and grants no marker cut'
+file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.ts'
+old = 'if (moduleDecisionBusts && decisionUpper === "SOFT+") {'
+new = 'if (false) {'
+test_file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^Rust\smode\sauthority\sadapter\sa\sSOFT\+\sresponse\sthat\salso\sclaims\sprefix-bust\spermission\sis\srejected\sbefore\sany\shost\sedit$']
+expect_message = '/Expected: 0\s+Received: 1/'
+
+[[control]]
+id = 'ts-marker-boundary-rides-only-the-permission'
+guards = 'a committed module boundary becomes a host compaction-marker target only on a pass whose permission is exactly true'
+file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.ts'
+old = '''
+    if (!cacheBustingPass) return undefined;
+    if (response.committed !== true) return undefined;'''
+new = '    if (response.committed !== true) return undefined;'
+test_file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/rust-mode-transform.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^Rust\smode\sauthority\sadapter\sdeferred\srebuilding\sextraction\spreserves\severy\sdurable\scoordinate\sguard$']
+expect_message = '/materializedCompactionBoundary\(valid, false\)/'
+
+# Two edits: runRustModePostprocess checks the permission before calling the
+# drain, and the drain checks it again on entry. Either check alone holds the
+# line, so removing one is an equivalent mutant; the row removes both.
+[[control]]
+id = 'ts-marker-drain-rides-only-the-permission'
+guards = 'the deferred host compaction-marker cut drains only on a Rust pass permitted to bust the prefix; a scheduler-execute metadata commit cannot cut it'
+edits = [
+  { file = "packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts", old = "    if (args.cacheBustingPass) {\n        applyRustModeDeferredCompactionMarker({", new = "    if (true) {\n        applyRustModeDeferredCompactionMarker({" },
+  { file = "packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts", old = "    if (!args.cacheBustingPass) return;\n    const { boundary } = args;", new = "    const { boundary } = args;" },
+]
+test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^deferred\scompaction\smarker\srepresentation\scommitted\sscheduler-execute\sboundary\smetadata\scannot\sdrain\sa\smarker\swithout\sserved\sbust\spermission$']
+
+[[control]]
+id = 'ts-marker-coverage-guard-keeps-newer-target'
+guards = "a pending marker target newer than the served response's coverage is retained, never cut by an older response"
+file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
+old = '        pending.ordinal > consumed.ordinal ||'
+new = '        false ||'
+test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^deferred\scompaction\smarker\srepresentation\snewer\spending\spublication\swaits\suntil\sconsumed\sby\sthe\sserved\sresponse$']
+expect_message = 'expect(received).toBeNull()'
+
+[[control]]
+id = 'ts-marker-cas-clear-keeps-newer-pending'
+guards = 'clearing the pending marker target is compare-and-set: a newer pending target published meanwhile survives the drain (exactly-once marker cut)'
+file = 'packages/plugin/src/features/magic-context/storage-meta-persisted.ts'
+old = '''
+            `UPDATE session_meta SET pending_compaction_marker_state = NULL
+             WHERE session_id = ? AND pending_compaction_marker_state = ?`,'''
+new = '''
+            `UPDATE session_meta SET pending_compaction_marker_state = NULL
+             WHERE session_id = ? AND (pending_compaction_marker_state = ? OR 1)`,'''
+test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^deferred\scompaction\smarker\sCAS\sdrain\spreserves\sthe\sdeferred-history\ssignal\swhen\sa\snewer\spending\sblob\sexists$']
+expect_message = 'Received: "cleared"'
+
+[[control]]
+id = 'ts-signed-thinking-invalidated-by-prefix-edit'
+guards = 'a busting pass whose first application edits bytes before newer signed thinking strips that thinking (the provider would reject the edited signature)'
+file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.ts'
+old = '''
+        dropModeSwitchesThisPass ||
+        firstApplicationEdits.beforeNewerThinking;'''
+new = '''
+        dropModeSwitchesThisPass ||
+        false;'''
+test_file = 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/transform-postprocess-phase.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^issue\s619\sfirst-application\sthinking\saccounting\ssentinel\salone\sinvalidates\slater\ssigned\sthinking\son\sclaude-opus-5-5$']
+expect_message = '/proactiveThinkingStrip\?\.messageIds\)\.toEqual/'
+
+# --- refusals that must fail closed ---
+# Each guard refuses a turn rather than send a request that is over the window,
+# incomplete, or built from history the transform could not manage.
+
+[[control]]
+id = 'ts-mc-h06-over-window-first-pass-refused'
+guards = 'MC-H06: a first pass with no Magic Context state whose request is still over the window after reductions is refused, not sent'
+file = 'packages/plugin/src/hooks/magic-context/transform.ts'
+old = '''
+                    servedTokens > unmanagedOverWindowPass.limit
+'''
+new = '''
+                    servedTokens > Number.POSITIVE_INFINITY
+'''
+test_file = 'packages/plugin/src/hooks/magic-context/unmanaged-over-window.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/unmanaged-over-window.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^a\sfirst\spass\swith\sno\sMagic\sContext\sstate\sand\sa\shistory\sover\sthe\swindow\sis\srefused\sbefore\sthe\sprovider,\snaming\sthe\sreason$']
+expect_message = 'toBeInstanceOf(UnmanagedOverWindowError)'
+
+[[control]]
+id = 'ts-mc-h07-known-over-frozen-replay-refused'
+guards = 'MC-H07: frozen replay bytes over the trusted limit, with module output not shown to fit, refuse instead of sending a known-over request'
+file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.ts'
+old = '            throw new FrozenReplayOverProvenLimitRefusal(moduleFit, limit);'
+new = '            return null;'
+test_file = 'packages/plugin/src/hooks/magic-context/rust-mode-frozen-review-r2.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/rust-mode-frozen-review-r2.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^frozen\srecovery\sadmission\sREVIEW:\sboth-over\sfrozen\srecovery\smust\srefuse\srather\sthan\ssend\sten\sknown-over\srequests$']
+expect_message = '"sent": 10'
+
+[[control]]
+id = 'ts-mc-h07-provider-proven-over-refused'
+guards = 'MC-H07 under a provider-proven limit: frozen bytes and module output both over refuse and keep the freeze'
+file = 'packages/plugin/src/hooks/magic-context/rust-mode-transform.ts'
+old = '                        throw new FrozenReplayOverProvenLimitRefusal(moduleFit, provenLimit);'
+new = '                        return null;'
+test_file = 'packages/plugin/src/hooks/magic-context/rust-mode-frozen-defects.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/rust-mode-frozen-defects.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^a\shealthy\sfrozen\spass\sis\sadmitted\slike\sany\sother\sreplay\sfrozen\sbytes\sover\sa\sprovider-proven\slimit\swith\smodule\soutput\salso\sover\srefuse\sand\skeep\sthe\sfreeze$']
+expect_message = 'Received promise that resolved'
+
+[[control]]
+id = 'ts-incomplete-user-message-refused'
+guards = 'an arriving user row persisted without its parts (empty user message) is refused before any transform or LKG replay can stand in for it'
+file = 'packages/plugin/src/plugin/messages-transform.ts'
+old = '''
+                tail.parts.length === 0
+            ) {
+                throw new IncompleteUserMessageError();'''
+new = '''
+                tail.parts.length < 0
+            ) {
+                throw new IncompleteUserMessageError();'''
+test_file = 'packages/plugin/src/plugin/messages-transform.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/plugin/messages-transform.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^incomplete\sarriving\suser\smessage\srefuses\suser:none\sbefore\stransform\sor\sfallback\s\(compactionOff=false\)$']
+expect_message = 'toBeInstanceOf(IncompleteUserMessageError)'
+
+[[control]]
+id = 'ts-user-message-never-emptied'
+guards = 'a user message is never neutralized to an empty sentinel, even when its only text is a dropped placeholder: emptying it merges two assistants and breaks their signed thinking'
+file = 'packages/plugin/src/hooks/magic-context/strip-content.ts'
+old = '''
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (msg.parts.length === 0) continue;
+
+        // Never neutralize user-role messages — they anchor turn boundaries
+        // that AI SDK depends on to avoid merging consecutive assistants.
+        if (msg.info.role === "user") continue;'''
+new = '''
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (msg.parts.length === 0) continue;
+
+        // Never neutralize user-role messages — they anchor turn boundaries
+        // that AI SDK depends on to avoid merging consecutive assistants.
+        if (msg.info.role === "__mutant__") continue;'''
+test_file = 'packages/plugin/src/hooks/magic-context/strip-content.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/strip-content.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^strip-content\sstripDroppedPlaceholderMessages\s\(sentinel-based\)\s#given\sa\suser\smessage\swhose\sonly\stext\sis\sa\sdropped\splaceholder\s#then\sit\skeeps\sthe\suser\smessage\sshell\sUNCHANGED\s\(turn\sboundary\spreserved\)$']
+expect_message = '/stripped\)\.toBe\(0\)/'
+
+[[control]]
+id = 'ts-protected-tool-results-over-limit-refused'
+guards = 'protected_tool_results_over_limit: protected tool results that alone exceed the window refuse the turn with that code'
+file = 'packages/plugin/src/hooks/magic-context/emergency-fail-closed.ts'
+old = '''
+    return PROTECTED_TOOL_RESULTS_OVER_LIMIT;
+}'''
+new = '''
+    return undefined;
+}'''
+test_file = 'packages/plugin/src/hooks/magic-context/emergency-fail-closed.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/hooks/magic-context/emergency-fail-closed.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^calibrated\smeasured\sprotected\sresults\sstill\srefuse\swith\sthe\sprotected-results\scode$']
+expect_message = '/expect\(refusal\)\.toBe\(golden\.message\)/'
+
+[[control]]
+id = 'ts-sqlite-busy-never-passes-raw-history'
+guards = 'a transient SQLITE_BUSY with no fitting LKG refuses the turn; it never passes the unmanaged raw history through'
+file = 'packages/plugin/src/plugin/messages-transform.ts'
+old = '''
+                if (!args.compactionOff) {
+                    const refusal ='''
+new = '''
+                if (false) {
+                    const refusal ='''
+test_file = 'packages/plugin/src/plugin/messages-transform.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/plugin/messages-transform.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^createMessagesTransformHandler\s—\serror\sboundary\s\(issue\s#23\)\srefuses\sSQLITE_BUSY\swithout\sLKG\sinstead\sof\ssending\sraw$']
+expect_message = 'Received promise that resolved'
+
+[[control]]
+id = 'ts-fail-closed-error-is-rethrown'
+guards = 'a fail-closed refusal (schema fence, emergency) is rethrown by the messages wrapper before any LKG replay or raw send is tried'
+file = 'packages/plugin/src/plugin/messages-transform.ts'
+old = '''
+            if (error instanceof EmergencyFailClosedError || isFailClosedBlockingError(error)) {
+                if (!args.compactionOff) throw error;'''
+new = '''
+            if (error instanceof EmergencyFailClosedError || isFailClosedBlockingError(error)) {
+                if (false) throw error;'''
+test_file = 'packages/plugin/src/plugin/messages-transform.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/plugin/messages-transform.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^createMessagesTransformHandler\s—\sschema\sfence\son\sa\scached\shandle\sblocks\sthe\sturn\sbefore\sthe\sinner\stransform\swrites,\sand\skeeps\sblocking$']
+expect_message = '/isFailClosedBlockingError\(thrown\)\)\.toBe\(true\)/'
+
+# --- data safety ---
+# Session state deleted by mistake, a database migrated by an older writer, a
+# store file readable by other users: none of these announces itself.
+
+[[control]]
+id = 'ts-opencode2-orphan-sweep-parked'
+guards = "the OpenCode 1 orphan sweep is parked on OpenCode 2 (issue 627): it cannot read session_v2 and would delete every live OpenCode 2 session's state"
+file = 'packages/plugin/src/features/magic-context/message-index.ts'
+old = '''
+    return harness === "opencode";
+}'''
+new = '''
+    return harness === "opencode" || harness === "opencode2";
+}'''
+test_file = 'packages/plugin/src/features/magic-context/message-index-maintenance.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/features/magic-context/message-index-maintenance.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ["^message\\shistory\\sorphan\\ssweep\\son\\sOpenCode\\s2\\sparks\\swithout\\sopening\\sany\\sstore,\\sand\\skeeps\\severy\\sOpenCode\\s2\\ssession's\\sstate$"]
+expect_message = '"status": "swept"'
+
+[[control]]
+id = 'ts-schema-fence-refuses-newer-database'
+guards = 'a binary refuses to open (and so to write or migrate) a database whose upstream migration lane is newer than it supports'
+file = 'packages/plugin/src/features/magic-context/storage-db.ts'
+old = '    if (persistedVersion <= latestSupportedVersion) {'
+new = '    if (true) {'
+test_file = 'packages/plugin/src/features/magic-context/storage-db.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/features/magic-context/storage-db.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^upstream\smigration\sversion\slane\skeeps\sfuture\supstream\srows\sfail-closed\swhile\sallowing\sfork-only\srows$']
+expect_message = '/LATEST_SUPPORTED_VERSION\)\)\.toBe\(false\)/'
+
+[[control]]
+id = 'ts-storage-files-created-owner-only'
+guards = 'storage files are created 0600 from their first byte'
+file = 'packages/plugin/src/shared/storage-permissions.ts'
+old = '        ...(privateMode ? { mode: 0o600 } : {}),'
+new = '        ...{},'
+test_file = 'packages/plugin/src/shared/storage-permissions.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/shared/storage-permissions.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^owner-only\sstorage\spermissions\screates\sstate\sand\sidentity\sfiles\sthrough\stheir\spublic\sdata-directory\swriters\sprivately$']
+expect_message = 'mode 644'
+
+[[control]]
+id = 'ts-storage-directories-created-owner-only'
+guards = 'storage directories are created 0700'
+file = 'packages/plugin/src/shared/storage-permissions.ts'
+old = '        ...(privateMode ? { mode: 0o700 } : {}),'
+new = '        ...{},'
+test_file = 'packages/plugin/src/shared/storage-permissions.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/shared/storage-permissions.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^owner-only\sstorage\spermissions\screates\sstorage\sdirectories,\sordinary\sfiles,\sand\satomic\stemporaries\sprivately,\sthen\stightens\sold\sentries$']
+expect_message = '/tightened\)\.toBe\(2\)/'
+
+# --- exactly-once: the dreamer lease ---
+# One holder at a time across handles and processes, and a heartbeat renews only
+# the acquisition it was started for.
+
+[[control]]
+id = 'ts-lease-refuses-a-second-holder'
+guards = 'an active dreamer lease refuses a second holder, across separate database handles'
+file = 'packages/plugin/src/features/magic-context/dreamer/lease.ts'
+old = '''
+        if (isLeaseActive(db, leaseKey) && existingHolder && existingHolder !== holderId) {
+            return null;'''
+new = '''
+        if (false) {
+            return null;'''
+test_file = 'packages/plugin/src/features/magic-context/dreamer/lease.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/features/magic-context/dreamer/lease.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ['^dreamer\slease\s\(serialized\sacquisition\)\sallows\sexactly\sone\swinner\sacross\sseparate\sDB\shandles$']
+expect_message = 'Received length: 2'
+
+[[control]]
+id = 'ts-lease-renew-is-generation-fenced'
+guards = "a renew carrying an earlier acquisition's generation fails once the same holder has reacquired"
+file = 'packages/plugin/src/features/magic-context/dreamer/lease.ts'
+old = '''
+            (expectedGeneration !== undefined &&
+                getLeaseGeneration(db, leaseKey) !== expectedGeneration)'''
+new = '            false'
+test_file = 'packages/plugin/src/features/magic-context/dreamer/lease.test.ts'
+runner = 'command'
+command = ['bun', 'test', 'packages/plugin/src/features/magic-context/dreamer/lease.test.ts', '--timeout', '30000', '-t', '{test}']
+test_count_pattern = 'Ran {count} test'
+expect_red = ["^dreamer\\slease\\s\\(serialized\\sacquisition\\)\\srenew\\swith\\san\\searlier\\sacquisition's\\sgeneration\\sfails\\safter\\sthe\\ssame\\sholder\\sreacquires$"]
+expect_message = '/Expected: false\s+Received: true/'
+
+# --- Rust module: the producer's bust permission ---
+# The module computes the one per-pass permission and reports it to every host
+# as prefix_bust_permitted. These rows break it at the source.
+
+[[control]]
+id = 'rs-prefix-bust-permitted-reports-the-pass'
+guards = 'prefix_bust_permitted is true only on a pass that may rebuild the provider prefix; a replaying SOFT+ reports false, so hosts cut no marker on it'
+file = 'crates/mc-module/src/transform.rs'
+old = 'prefix_bust_permitted: is_provider_prefix_mutation_pass,'
+new = 'prefix_bust_permitted: true,'
+test_file = 'crates/mc-module/src/transform.rs'
+runner = 'command'
+command = ['cargo', 'test', '--locked', '-p', 'mc-module', '--lib', '--', '--exact', '{test}']
+test_count_pattern = 'running {count} test'
+expect_red = ['transform::tests::published_history_and_age_reclaim_share_one_bust_during_historian']
+expect_message = 'assertion failed: !replay.prefix_bust_permitted'
+timeout_s = 2400
+
+[[control]]
+id = 'rs-defer-replays-the-served-prefix'
+guards = 'a pass without the bust permission preserves the served prefix: no tag, overlay or strip is first-applied to bytes the provider already cached'
+file = 'crates/mc-module/src/transform.rs'
+old = 'let prefix_replay_must_be_preserved = !is_provider_prefix_mutation_pass;'
+new = 'let prefix_replay_must_be_preserved = false;'
+test_file = 'crates/mc-module/src/transform.rs'
+runner = 'command'
+command = ['cargo', 'test', '--locked', '-p', 'mc-module', '--lib', '--', '--exact', '{test}']
+test_count_pattern = 'running {count} test'
+expect_red = ['transform::tests::opencode_defer_does_not_first_tag_an_already_served_assistant']
+expect_message = 'left: Some("§2§ completed answer")'
+timeout_s = 2400
+
+[[control]]
+id = 'rs-identical-bytes-hard-grants-no-bust'
+guards = 'a HARD pass that serves the frozen prefix unchanged (an identical-bytes epoch fold) does not grant the bust permission, so queued work keeps waiting'
+file = 'crates/mc-module/src/transform.rs'
+old = '''
+    ) && !marker_hard_serves_frozen_prefix;
+'''
+new = '''
+    );
+'''
+test_file = 'crates/mc-module/src/transform.rs'
+runner = 'command'
+command = ['cargo', 'test', '--locked', '-p', 'mc-module', '--lib', '--', '--exact', '{test}']
+test_count_pattern = 'running {count} test'
+expect_red = ['transform::tests::identical_bytes_epoch_hard_holds_pending_drop_and_serves_identical_bytes']
+expect_message = 'assertion failed: !hard.prefix_bust_permitted'
+timeout_s = 2400
+
+[[control]]
+id = 'rs-dropped-placeholder-is-pure-of-tag-id'
+guards = 'a frozen reduction replays as the one `[dropped §N§]` placeholder, a pure function of the tag id'
+file = 'crates/mc-module/src/transform.rs'
+old = '.map(|tag_number| format!("[dropped §{tag_number}§]"))'
+new = '.map(|tag_number| format!("[truncated §{tag_number}§]"))'
+test_file = 'crates/mc-module/src/transform.rs'
+runner = 'command'
+command = ['cargo', 'test', '--locked', '-p', 'mc-module', '--lib', '--', '--exact', '{test}']
+test_count_pattern = 'running {count} test'
+expect_red = ['transform::tests::mixed_legacy_numbered_and_new_canonical_freezes_replay_correctly']
+expect_message = 'left: "[truncated §3§]"'
+timeout_s = 2400
+
+# --- Rust store: owner-only files and the exactly-once historian report ---
+# mc-store's lib tests run in a few minutes, so these are ordinary cargo rows:
+# `check` validates their names, and the nightly --broad audit sees breadth.
+
+[[control]]
+id = 'rs-store-files-created-owner-only'
+guards = 'mc-store creates store files 0600 from creation'
+file = 'crates/mc-store/src/private_permissions.rs'
+old = '''
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);'''
+new = '''
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o644);'''
+test_file = 'crates/mc-store/src/private_permissions.rs'
+runner = 'cargo'
+package = 'mc-store'
+target = '--lib'
+expect_red = ['private_permissions::tests::storage_creators_and_startup_tightening_are_owner_only']
+only = true
+
+[[control]]
+id = 'rs-store-directories-created-owner-only'
+guards = 'mc-store creates storage directories 0700'
+file = 'crates/mc-store/src/private_permissions.rs'
+old = 'builder.recursive(true).mode(0o700).create(path)'
+new = 'builder.recursive(true).mode(0o755).create(path)'
+test_file = 'crates/mc-store/src/private_permissions.rs'
+runner = 'cargo'
+package = 'mc-store'
+target = '--lib'
+expect_red = ['private_permissions::tests::storage_creators_and_startup_tightening_are_owner_only']
+only = true
+
+[[control]]
+id = 'rs-historian-report-lands-once'
+guards = 'a historian run accepts exactly one report; a second report for the same run is refused'
+file = 'crates/mc-store/src/historian_claim.rs'
+old = '            if existing_report.is_some() {'
+new = '            if false {'
+test_file = 'crates/mc-store/src/historian_claim.rs'
+runner = 'cargo'
+package = 'mc-store'
+target = '--lib'
+expect_red = ['historian_claim::tests::only_the_current_claim_may_leave_a_report_and_only_once']
+expect_message = 'right: Refused(AlreadyReported)'
+only = true
+
+[[control]]
+id = 'rs-historian-report-needs-current-claim'
+guards = "only the current claim's token may report: a claimant whose lease lapsed and was replaced cannot land a late report"
+file = 'crates/mc-store/src/historian_claim.rs'
+old = '''
+            if stored_token != token {
+                return Ok(HistorianRecordOutcome::Refused(
+                    HistorianReportRefusal::SupersededToken,
+                ));
+            }
+            // A run whose own deadline'''
+new = '''
+            if false {
+                return Ok(HistorianRecordOutcome::Refused(
+                    HistorianReportRefusal::SupersededToken,
+                ));
+            }
+            // A run whose own deadline'''
+test_file = 'crates/mc-store/src/historian_claim.rs'
+runner = 'cargo'
+package = 'mc-store'
+target = '--lib'
+expect_red = ['historian_claim::tests::only_the_current_claim_may_leave_a_report_and_only_once']
+expect_message = "the replaced claimant's late report must not land"
+only = true
+
+# --- scan guards: each has a planted violation ---
+# A source scan that finds nothing in the shipped code passes whether or not it
+# can still see a violation. Each row blinds one scan and requires the test that
+# plants a violation to go red, while the shipped-source scan stays green.
+
+[[control]]
+id = 'rs-scan-private-permission-creators'
+guards = 'the storage source scan flags a direct fs::create_dir/create_dir_all/write outside the private-permission helper'
+file = 'crates/mc-module/src/private_permissions_source_test.rs'
+old = '            if filesystem_path && matches!(last, "create_dir" | "create_dir_all" | "write")'
+new = '            if false && filesystem_path && matches!(last, "create_dir" | "create_dir_all" | "write")'
+test_file = 'crates/mc-module/src/private_permissions_source_test.rs'
+runner = 'command'
+command = ['cargo', 'test', '--locked', '-p', 'mc-module', '--lib', '--', '--exact', '{test}']
+test_count_pattern = 'running {count} test'
+expect_red = ['private_permissions_source_test::the_creator_scan_flags_planted_direct_store_creators']
+expect_message = 'the scan must flag each planted direct creator'
+timeout_s = 2400
+
+# A command row, not a cargo row: under --broad a cargo row widens to every
+# mc-module test target, which includes the 1,650-test lib and the daemon
+# integration tests that need a subconscious checkout.
+[[control]]
+id = 'rs-scan-launch-nonce-direct-reads'
+guards = 'the launch-nonce source scan flags a direct read of the daemon launch-nonce variables in shipped source'
+file = 'crates/mc-module/tests/launch_nonce_source_scan.rs'
+old = '                if FORBIDDEN.iter().any(|name| text.contains(name)) {'
+new = '                if false && FORBIDDEN.iter().any(|name| text.contains(name)) {'
+test_file = 'crates/mc-module/tests/launch_nonce_source_scan.rs'
+runner = 'command'
+command = ['cargo', 'test', '--locked', '-p', 'mc-module', '--test', 'launch_nonce_source_scan', '--', '--exact', '{test}']
+test_count_pattern = 'running {count} test'
+expect_red = ['temp_copy_direct_read_is_found']
+expect_message = 'left: 0'
+timeout_s = 2400

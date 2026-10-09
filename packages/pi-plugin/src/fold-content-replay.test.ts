@@ -143,7 +143,7 @@ describe("Pi fold content replay", () => {
 		}
 	});
 
-	it("replays seam temporal removal after caveman with no next-pass late trim", async () => {
+	it("replays the frozen temporal marker after caveman with no next-pass late trim", async () => {
 		const db = createTestDb();
 		const sessionId = "pi-fold-temporal";
 		const fake = createFakePi();
@@ -207,7 +207,7 @@ describe("Pi fold content replay", () => {
 			]);
 			clearCachedM0M1(db, sessionId);
 			const fold = await pass();
-			expect(textOf(fold.messages[2] as never)).not.toContain("<!-- +");
+			expect(textOf(fold.messages[2] as never)).toContain("<!-- +1w -->");
 			updateSessionMeta(db, sessionId, {
 				lastResponseTime: Date.now(),
 				cacheTtl: "59m",
@@ -444,6 +444,7 @@ describe("Pi fold content replay", () => {
 	it("keeps an old seam decision inert after a different head is promoted; the new head uses only its own stable-id decision", async () => {
 		const db = createTestDb();
 		const sessionId = "pi-seam-repromoted-head";
+		updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
 		const fake = createFakePi();
 		registerPiContextHandler(fake.pi as never, {
 			db,
@@ -493,11 +494,15 @@ describe("Pi fold content replay", () => {
 					p1: "old history",
 				},
 			]);
-			await pass();
 			const firstHeadDecision = encodePiContentDecision(
 				"seam-temporal-strip",
 				"head-1",
 			);
+			// Model an old version's persisted seam choice, not a newly derived cut.
+			db.prepare(
+				"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",
+			).run(JSON.stringify([firstHeadDecision]), sessionId);
+			await pass();
 			expect(getPiContentDecisions(db, sessionId).has(firstHeadDecision)).toBe(
 				true,
 			);
@@ -522,12 +527,12 @@ describe("Pi fold content replay", () => {
 			);
 			const decisions = getPiContentDecisions(db, sessionId);
 			expect(decisions.has(firstHeadDecision)).toBe(true);
-			expect(decisions.has(secondHeadDecision)).toBe(true);
+			expect(decisions.has(secondHeadDecision)).toBe(false);
 			const secondFoldHead = secondFold.messages.find((message) =>
 				textOf(message as never).includes("different promoted head"),
 			);
 			expect(secondFoldHead).toBeDefined();
-			expect(textOf(secondFoldHead as never)).not.toContain("<!-- +");
+			expect(textOf(secondFoldHead as never)).toContain("<!-- +10m -->");
 
 			db.prepare(
 				"UPDATE session_meta SET merged_reasoning_stripped_ids = ? WHERE session_id = ?",

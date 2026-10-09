@@ -947,6 +947,52 @@ pub struct ModelCatalogs {
     pub omp: Vec<String>,
     #[serde(rename = "opencodeError", skip_serializing_if = "Option::is_none")]
     pub opencode_error: Option<String>,
+    #[serde(
+        rename = "opencodeVariants",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub opencode_variants: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Default, Debug)]
+struct OpencodeCatalog {
+    models: Vec<String>,
+    variants: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// OpenCode 1's verbose listing emits an ID followed by a pretty JSON model.
+/// A plain listing (including versions without verbose metadata) keeps variants unknown.
+fn parse_opencode_catalog(text: &str) -> OpencodeCatalog {
+    let mut catalog = OpencodeCatalog {
+        models: parse_opencode_models_output(text),
+        ..Default::default()
+    };
+    let mut id = None;
+    let mut block = String::new();
+    for line in text.lines() {
+        if block.is_empty() {
+            if let Some(model) = catalog_model_id(line) {
+                id = Some(model);
+            }
+            if !line.trim_start().starts_with('{') {
+                continue;
+            }
+        }
+        block.push_str(line);
+        block.push('\n');
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&block) {
+            if let (Some(model), Some(variants)) = (
+                &id,
+                value.get("variants").and_then(serde_json::Value::as_object),
+            ) {
+                catalog
+                    .variants
+                    .insert(model.clone(), variants.keys().cloned().collect());
+            }
+            block.clear();
+        }
+    }
+    catalog
 }
 
 fn catalog_model_id(value: &str) -> Option<String> {
@@ -976,19 +1022,18 @@ pub fn parse_opencode_models_output(text: &str) -> Vec<String> {
 // than the short probe used for install-state detection.
 const MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
-async fn probe_opencode_models(
+async fn probe_opencode_catalog(
     bin: &str,
     timeout: std::time::Duration,
-) -> Result<Vec<String>, String> {
-    let output = tokio::time::timeout(
-        timeout,
-        tokio::process::Command::new(bin)
-            .arg("models")
-            .no_window()
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
+    verbose: bool,
+) -> Result<OpencodeCatalog, String> {
+    let mut command = tokio::process::Command::new(bin);
+    command.arg("models");
+    if verbose {
+        command.arg("--verbose");
+    }
+    let output =
+        tokio::time::timeout(timeout, command.no_window().kill_on_drop(true).output()).await;
     match output {
         Err(_) => Err(format!(
             "Couldn't load models from OpenCode (timed out after {}s)",
@@ -999,21 +1044,31 @@ async fn probe_opencode_models(
             Err(format!("OpenCode models exited with {}", output.status))
         }
         Ok(Ok(output)) => {
-            let models = parse_opencode_models_output(&String::from_utf8_lossy(&output.stdout));
-            if models.is_empty() {
+            let catalog = parse_opencode_catalog(&String::from_utf8_lossy(&output.stdout));
+            if catalog.models.is_empty() {
                 Err("OpenCode returned no models; try again after it finishes starting".to_string())
             } else {
-                Ok(models)
+                Ok(catalog)
             }
         }
     }
 }
 
-async fn discover_opencode_models() -> Result<Vec<String>, String> {
+#[cfg(test)]
+async fn probe_opencode_models(
+    bin: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<String>, String> {
+    probe_opencode_catalog(bin, timeout, false)
+        .await
+        .map(|catalog| catalog.models)
+}
+
+async fn discover_opencode_models() -> Result<OpencodeCatalog, String> {
     let candidates = opencode_cli_candidates();
     let mut failure = None;
 
-    // Use the plain `opencode models` command, NOT `--pure`. `--pure` skips all
+    // Use `opencode models` with provider loading, NOT `--pure`. `--pure` skips all
     // external plugins, including the auth/provider plugins that register the
     // user's configured providers (e.g. anthropic, google), so under `--pure`
     // the dropdowns silently omit exactly the models the user set up. The plain
@@ -1021,7 +1076,15 @@ async fn discover_opencode_models() -> Result<Vec<String>, String> {
     // start background work only on a tool call (rather than at plugin load) are
     // not triggered by a model listing.
     for bin in &candidates {
-        match probe_opencode_models(bin, MODEL_PROBE_TIMEOUT).await {
+        // Older/newer hosts may not expose verbose model metadata. IDs remain usable.
+        let catalog = match probe_opencode_catalog(bin, MODEL_PROBE_TIMEOUT, true).await {
+            Ok(catalog) => Ok(catalog),
+            Err(error) if error.contains("timed out") || error.contains("Couldn't run") => {
+                Err(error)
+            }
+            Err(_) => probe_opencode_catalog(bin, MODEL_PROBE_TIMEOUT, false).await,
+        };
+        match catalog {
             Ok(models) => return Ok(models),
             Err(err) if !err.contains("Couldn't run OpenCode models:") => failure = Some(err),
             Err(_) => {}
@@ -1030,7 +1093,7 @@ async fn discover_opencode_models() -> Result<Vec<String>, String> {
 
     if cfg!(target_os = "windows") {
         if let Some(bin) = resolve_via_where("opencode").await {
-            if let Ok(models) = probe_opencode_models(&bin, MODEL_PROBE_TIMEOUT).await {
+            if let Ok(models) = probe_opencode_catalog(&bin, MODEL_PROBE_TIMEOUT, false).await {
                 return Ok(models);
             }
         }
@@ -1041,7 +1104,10 @@ async fn discover_opencode_models() -> Result<Vec<String>, String> {
     if let Some(text) = run_via_login_shell("opencode models".to_string()).await {
         let models = parse_opencode_models_output(&text);
         if !models.is_empty() {
-            return Ok(models);
+            return Ok(OpencodeCatalog {
+                models,
+                ..Default::default()
+            });
         }
     }
 
@@ -1057,11 +1123,16 @@ pub async fn get_model_catalogs() -> ModelCatalogs {
         discover_pi_models(),
         get_available_omp_models()
     );
+    let (catalog, error) = match opencode {
+        Ok(catalog) => (catalog, None),
+        Err(error) => (OpencodeCatalog::default(), Some(error)),
+    };
     ModelCatalogs {
-        opencode: opencode.as_ref().cloned().unwrap_or_default(),
+        opencode: catalog.models,
         pi,
         omp,
-        opencode_error: opencode.err(),
+        opencode_error: error,
+        opencode_variants: catalog.variants,
     }
 }
 
@@ -1778,6 +1849,7 @@ mod tests {
             ],
             omp: vec!["opencode-zen/gpt-5".to_string(), "shared/model".to_string()],
             opencode_error: None,
+            opencode_variants: Default::default(),
         })
         .expect("catalogs serialize");
 
@@ -1794,12 +1866,44 @@ mod tests {
             pi: vec![],
             omp: vec![],
             opencode_error: Some("Couldn't load models from OpenCode (timed out after 45s)".into()),
+            opencode_variants: Default::default(),
         };
         let value = serde_json::to_value(&unavailable).expect("failure serializes");
         assert_eq!(
             value["opencodeError"].as_str(),
             unavailable.opencode_error.as_deref()
         );
+    }
+
+    #[test]
+    fn verbose_catalog_preserves_exact_variant_support() {
+        let catalog = super::parse_opencode_catalog("openai/gpt-5\n{\n  \"variants\": {\"high\": {}, \"low\": {}}\n}\ncustom/model\n{\"variants\": {}}\nunknown/model\n");
+        assert_eq!(catalog.variants["openai/gpt-5"], vec!["high", "low"]);
+        assert!(catalog.variants["custom/model"].is_empty());
+        assert!(!catalog.variants.contains_key("unknown/model"));
+        assert_eq!(
+            catalog.models,
+            vec!["custom/model", "openai/gpt-5", "unknown/model"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verbose_probe_requests_metadata_from_the_host() {
+        let bin = crate::test_bin::write_test_executable(
+            "opencode-catalog",
+            "#!/bin/sh\nprintf 'mock/model\\n'\nif [ \"$2\" = \"--verbose\" ]; then printf '{\"variants\": {\"operator-defined\": {}}}\\n'; fi\n",
+            "",
+        );
+        let catalog = super::probe_opencode_catalog(
+            bin.to_str().unwrap(),
+            std::time::Duration::from_secs(2),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog.models, vec!["mock/model"]);
+        assert_eq!(catalog.variants["mock/model"], vec!["operator-defined"]);
     }
 
     #[test]

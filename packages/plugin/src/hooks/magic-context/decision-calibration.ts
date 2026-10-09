@@ -41,6 +41,15 @@ export interface LocalMass {
     prose?: number;
 }
 
+/** Family/provider ratios can estimate fit for admission (deciding whether to send),
+ * but cannot prove that a request does not fit. */
+export function hasMeasuredDecisionCalibration(seed: DecisionCalibration): boolean {
+    // Persisted session policy may omit its diagnostic model-family label. Check
+    // the model's measured seed directly so that omission does not discard evidence.
+    const measured = calibrationForModelKey(seed.modelKey);
+    return seed.seeded && seed.source === "seed" && measured.seeded && measured.source === "seed";
+}
+
 /** Accumulate fractional provider mass, then ceil once at the decision boundary. */
 export function providerMass(raw: LocalMass, seed: DecisionCalibration, fit = false): number {
     const { system = 0, tools = 0, prose = 0 } = raw;

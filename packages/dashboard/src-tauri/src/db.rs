@@ -4,7 +4,7 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::broca_wal;
 use crate::external_cache_sessions;
@@ -341,8 +341,32 @@ impl OpenCodeSessions {
 }
 
 fn resolve_opencode_sessions(conn: &Connection) -> Result<OpenCodeSessions, rusqlite::Error> {
-    let mut generations = Vec::new();
+    let generations = opencode_store_generations(conn)?;
     let mut owners = HashMap::new();
+    for &generation in &generations {
+        if !table_exists(conn, opencode_session_table(generation)) {
+            continue;
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id FROM {}",
+            opencode_session_table(generation)
+        ))?;
+        for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
+            owners.insert(id?, generation);
+        }
+    }
+    Ok(OpenCodeSessions {
+        generations,
+        owners,
+    })
+}
+
+/// The session generations an OpenCode store holds, oldest first. A later
+/// generation's row owns an id both tables hold.
+fn opencode_store_generations(
+    conn: &Connection,
+) -> Result<Vec<OpenCodeStoreGeneration>, rusqlite::Error> {
+    let mut generations = Vec::new();
     // OpenCode 1 can create session_message before an upgrade, so its
     // presence alone does not identify V2. Only a populated session_v2
     // alongside session_message adds V2 ownership to a mixed store.
@@ -362,18 +386,6 @@ fn resolve_opencode_sessions(conn: &Connection) -> Result<OpenCodeSessions, rusq
     if generations.is_empty() && table_exists(conn, "project") {
         generations.push(OpenCodeStoreGeneration::V1);
     }
-    for &generation in &generations {
-        if !table_exists(conn, opencode_session_table(generation)) {
-            continue;
-        }
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id FROM {}",
-            opencode_session_table(generation)
-        ))?;
-        for id in stmt.query_map([], |row| row.get::<_, String>(0))? {
-            owners.insert(id?, generation);
-        }
-    }
     if generations.is_empty() {
         return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
             std::io::Error::new(
@@ -382,10 +394,7 @@ fn resolve_opencode_sessions(conn: &Connection) -> Result<OpenCodeSessions, rusq
             ),
         )));
     }
-    Ok(OpenCodeSessions {
-        generations,
-        owners,
-    })
+    Ok(generations)
 }
 
 fn open_opencode_sessions(
@@ -1070,6 +1079,7 @@ pub struct SessionDetail {
     /// thousands of rows for a long-running session and dominate IPC time.
     pub messages_count: i64,
     pub cache_events_count: i64,
+    pub historian_runs: i64,
     pub compartments: Vec<Compartment>,
     pub facts: Vec<SessionFact>,
     pub notes: Vec<Note>,
@@ -1177,7 +1187,6 @@ pub struct SessionMetaRow {
     pub is_subagent: bool,
     pub last_context_percentage: f64,
     pub last_input_tokens: i64,
-    pub times_execute_threshold_reached: i64,
     pub compartment_in_progress: bool,
     pub system_prompt_hash: String,
     pub memory_block_count: i64,
@@ -2094,14 +2103,22 @@ fn resolve_session_context_limits_from_conn(
     if keys.is_empty() {
         return out;
     }
+    // Only the wanted sessions, by primary key: session_meta rows are wide
+    // (cached prompt blobs sit before this column), so filtering the whole
+    // table read every row of a busy store (35 MB) on each events fetch.
+    let wanted: Vec<&str> = keys.iter().map(|(_, id)| id.as_str()).collect();
+    let Ok(wanted) = serde_json::to_string(&wanted) else {
+        return out;
+    };
     let Ok(mut stmt) = conn.prepare(
         "SELECT session_id, harness, COALESCE(last_usage_context_limit, 0)
          FROM session_meta
-         WHERE COALESCE(last_usage_context_limit, 0) > 0",
+         WHERE session_id IN (SELECT value FROM json_each(?1))
+           AND COALESCE(last_usage_context_limit, 0) > 0",
     ) else {
         return out;
     };
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([wanted], |row| {
         let sid: String = row.get(0)?;
         let harness_str: String = row.get(1)?;
         let limit: i64 = row.get(2)?;
@@ -2872,7 +2889,7 @@ pub fn get_cache_events_from_db(limit: usize, since_timestamp: Option<i64>) -> V
     build_db_cache_events(rows, true)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CacheSessionListEntry {
     harness: Harness,
     session_id: String,
@@ -2901,17 +2918,60 @@ fn broca_state_root() -> Option<PathBuf> {
 fn open_broca_store(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(std::time::Duration::from_millis(50))?;
+    // Any sort that remains stays in memory instead of a temporary file.
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(conn)
+}
+
+mod broca_run_index;
+
+/// A `BrocaRunIndex` with the store path and file identity it was built from.
+type CachedBrocaRunIndex = (PathBuf, Option<(u64, u64)>, broca_run_index::BrocaRunIndex);
+
+/// The process-wide `BrocaRunIndex`.
+static BROCA_RUN_INDEX: OnceLock<Mutex<Option<CachedBrocaRunIndex>>> = OnceLock::new();
+
+/// Refreshes the shared run index from `conn` (the store at `path`) and runs
+/// `f` on it. A replaced store file starts a fresh index.
+fn with_broca_run_index<T>(
+    conn: &Connection,
+    path: &Path,
+    f: impl FnOnce(&mut broca_run_index::BrocaRunIndex) -> T,
+) -> Option<T> {
+    let file_key = std::fs::metadata(path)
+        .ok()
+        .as_ref()
+        .and_then(broca_wal::file_identity);
+    let mut guard = BROCA_RUN_INDEX
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?;
+    if !guard
+        .as_ref()
+        .is_some_and(|(cached, key, _)| cached == path && *key == file_key)
+    {
+        *guard = Some((path.to_path_buf(), file_key, Default::default()));
+    }
+    let (_, _, index) = guard.as_mut()?;
+    if index.refresh(conn, std::time::Instant::now()).is_err() {
+        // Leave nothing half-read behind for the next poll to build on.
+        *guard = None;
+        return None;
+    }
+    Some(f(index))
 }
 
 fn load_broca_cache_sessions(limit: usize) -> Vec<CacheSessionListEntry> {
     let Some(root) = broca_state_root() else {
         return Vec::new();
     };
-    let Ok(conn) = open_broca_store(&root.join("run-index.db")) else {
+    let path = root.join("run-index.db");
+    let Ok(conn) = open_broca_store(&path) else {
         return Vec::new();
     };
-    load_broca_cache_sessions_from_conn(&conn, Some(&root), limit).unwrap_or_default()
+    with_broca_run_index(&conn, &path, |index| index.list(limit))
+        .map(|listed| broca_list_entries(listed, Some(&root), limit))
+        .unwrap_or_default()
 }
 
 // Every Broca run is started by one of our own systems (Alfonso heads and
@@ -2934,44 +2994,29 @@ fn load_broca_cache_sessions(limit: usize) -> Vec<CacheSessionListEntry> {
 // dated by its live WAL's modification time as well, which moves on every
 // append. Such sessions are fetched past `limit` (there are only a few), so a
 // long run started before newer sessions can still rise into the list.
+//
+// The grouping itself is `BrocaRunIndex::list`, which production keeps across
+// polls; this builds a fresh index from `conn` each call.
+#[cfg(test)]
 fn load_broca_cache_sessions_from_conn(
     conn: &Connection,
     wal_state_root: Option<&Path>,
     limit: usize,
 ) -> rusqlite::Result<Vec<CacheSessionListEntry>> {
-    let active_runs = if table_exists(conn, "run_index") {
-        "UNION ALL
-         SELECT CASE WHEN json_valid(session) THEN json(session) END, state_changed_ms, 1
-         FROM run_index WHERE state = 'active'"
-    } else {
-        ""
-    };
-    let mut stmt = conn.prepare(&format!(
-        "SELECT identity, activity, running FROM (
-             SELECT identity, MAX(activity) AS activity, MAX(running) AS running,
-                    ROW_NUMBER() OVER (ORDER BY MAX(activity) DESC) AS rank
-             FROM (
-                 SELECT json_extract(segment_json, '$.session') AS identity,
-                        CAST(json_extract(segment_json, '$.occurred_at_ms') AS INTEGER) AS activity,
-                        0 AS running
-                 FROM export_facts
-                 {active_runs}
-             )
-             WHERE identity IS NOT NULL
-             GROUP BY identity HAVING MAX(activity) IS NOT NULL
-         )
-         WHERE rank <= ?1 OR running = 1
-         ORDER BY activity DESC"
-    ))?;
-    let rows = stmt.query_map(params![limit as i64], |row| {
-        let session_id: String = row.get(0)?;
-        let activity: i64 = row.get(1)?;
-        let running: i64 = row.get(2)?;
-        Ok((session_id, activity, running != 0))
-    })?;
+    let mut index = broca_run_index::BrocaRunIndex::default();
+    index.refresh(conn, std::time::Instant::now())?;
+    Ok(broca_list_entries(index.list(limit), wal_state_root, limit))
+}
+
+fn broca_list_entries(
+    listed: Vec<broca_run_index::ListedSession>,
+    wal_state_root: Option<&Path>,
+    limit: usize,
+) -> Vec<CacheSessionListEntry> {
     let mut sessions = Vec::new();
-    for row in rows {
-        let (session_id, mut activity, running) = row?;
+    for listed in listed {
+        let (session_id, mut activity, running) =
+            (listed.identity, listed.activity, listed.running);
         if running {
             if let Some(written) = wal_state_root
                 .zip(broca_wal::SessionIdentity::from_json(&session_id))
@@ -2992,7 +3037,7 @@ fn load_broca_cache_sessions_from_conn(
     }
     sessions.sort_by_key(|row| std::cmp::Reverse(row.last_activity_ms));
     sessions.truncate(limit);
-    Ok(sessions)
+    sessions
 }
 
 /// When the session's live WAL was last written, in Unix milliseconds, or
@@ -3014,7 +3059,14 @@ fn get_broca_session_cache_events(
     let Some(root) = broca_state_root() else {
         return Vec::new();
     };
-    let Ok(conn) = open_broca_store(&root.join("run-index.db")) else {
+    let path = root.join("run-index.db");
+    let Ok(conn) = open_broca_store(&path) else {
+        return Vec::new();
+    };
+    // The session's run ids let its totals be read through the run_id index
+    // instead of filtering every fact by its JSON session.
+    let Some(run_ids) = with_broca_run_index(&conn, &path, |index| index.run_ids(session_id))
+    else {
         return Vec::new();
     };
     let snapshot = broca_wal::SessionIdentity::from_json(session_id)
@@ -3024,6 +3076,7 @@ fn get_broca_session_cache_events(
     load_broca_cache_events_with_compatibility(
         &conn,
         session_id,
+        Some(&run_ids),
         wal_runs,
         !partial,
         limit,
@@ -3059,6 +3112,7 @@ fn load_broca_cache_events_from_conn(
     load_broca_cache_events_with_compatibility(
         conn,
         session_id,
+        None,
         wal_runs,
         true,
         limit,
@@ -3069,6 +3123,7 @@ fn load_broca_cache_events_from_conn(
 fn load_broca_cache_events_with_compatibility(
     conn: &Connection,
     session_id: &str,
+    run_ids: Option<&[String]>,
     wal_runs: Option<&[broca_wal::WalRun]>,
     allow_totals: bool,
     limit: Option<usize>,
@@ -3083,7 +3138,7 @@ fn load_broca_cache_events_with_compatibility(
     let totals = if !allow_totals {
         Vec::new()
     } else {
-        load_broca_run_totals(conn, session_id)?
+        load_broca_run_totals(conn, session_id, run_ids)?
     };
     let mut runs: Vec<RunRows> = Vec::with_capacity(totals.len());
     let mut stepped: HashSet<&str> = HashSet::new();
@@ -3145,16 +3200,30 @@ fn load_broca_cache_events_with_compatibility(
 // below coalesce absent to 0 only for arithmetic; `cache_reported` (reads) and
 // `write_reported` (writes) record whether any segment carried the key, and
 // the view shows "not reported" rather than the 0 when it did not.
+//
+// With `run_ids` (the session's runs, from `BrocaRunIndex`) the facts are
+// found through the `export_facts(run_id)` index; without, by filtering every
+// fact's JSON session, which reads the whole table.
 fn load_broca_run_totals(
     conn: &Connection,
     session_id: &str,
+    run_ids: Option<&[String]>,
 ) -> rusqlite::Result<Vec<RawDbCacheEvent>> {
-    let mut stmt = conn.prepare(
+    let run_filter = if run_ids.is_some() {
+        "run_id IN (SELECT value FROM json_each(?2)) AND"
+    } else {
+        "?2 IS NULL AND"
+    };
+    let run_ids = run_ids
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let mut stmt = conn.prepare(&format!(
         "WITH facts AS (
              SELECT run_id, segment_json,
                     ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY export_seq DESC) AS newest
              FROM export_facts
-             WHERE json_extract(segment_json, '$.session') = ?1
+             WHERE {run_filter} json_extract(segment_json, '$.session') = ?1
          )
          SELECT run_id,
                 MAX(CAST(json_extract(segment_json, '$.occurred_at_ms') AS INTEGER)) AS activity,
@@ -3169,9 +3238,9 @@ fn load_broca_run_totals(
                 MAX(json_extract(segment_json, '$.terminal_reason'))
          FROM facts
          GROUP BY run_id HAVING activity IS NOT NULL
-         ORDER BY activity, run_id",
-    )?;
-    let rows = stmt.query_map(params![session_id], |row| {
+         ORDER BY activity, run_id"
+    ))?;
+    let rows = stmt.query_map(params![session_id, run_ids], |row| {
         let run_id: String = row.get(0)?;
         let input: i64 = row.get(2)?;
         let read: i64 = row.get(3)?;
@@ -3260,7 +3329,10 @@ fn broca_wal_step_rows(
             finish: step.finish_reason.clone(),
             // Every step of one run answers the same prompt, so the run is the turn.
             native_turn_id: Some(run.run_id.clone()),
-            context_limit: None,
+            // The window the run was admitted with; Magic Context records no
+            // limit for Broca sessions, so without it the timeline scaled each
+            // session by its own largest prompt.
+            context_limit: run.context_limit,
             provider,
             model,
             broca: Some(BrocaRow {
@@ -3385,47 +3457,67 @@ const FIRST_OPENCODE2_CACHE_EVENT_SQL: &str = "SELECT time_created
      LIMIT 1";
 
 type OpenCodeCachePresenceCache = HashMap<String, (i64, bool)>;
-static OPENCODE_CACHE_PRESENCE: OnceLock<RwLock<OpenCodeCachePresenceCache>> = OnceLock::new();
 
-fn opencode_cache_presence() -> &'static RwLock<OpenCodeCachePresenceCache> {
-    OPENCODE_CACHE_PRESENCE.get_or_init(|| RwLock::new(HashMap::new()))
+mod opencode_list_cache;
+
+static OPENCODE_LIST_CACHE: OnceLock<Mutex<Option<opencode_list_cache::OpenCodeListCache>>> =
+    OnceLock::new();
+
+/// Runs `f` on the process-wide OpenCode list cache for the current store,
+/// (re)opening it when the store path or file changed. `None` when there is
+/// no OpenCode store or it cannot be opened.
+fn with_opencode_list_cache<T>(
+    f: impl FnOnce(&mut opencode_list_cache::OpenCodeListCache) -> T,
+) -> Option<T> {
+    let path = resolve_opencode_db_path()?;
+    let mut guard = OPENCODE_LIST_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?;
+    if !guard.as_ref().is_some_and(|cache| cache.serves(&path)) {
+        *guard = None;
+        *guard = Some(opencode_list_cache::OpenCodeListCache::open(&path).ok()?);
+    }
+    guard.as_mut().map(f)
 }
 
 /// The recent OpenCode sessions for the Cache tab, plus a note to show when
 /// OpenCode 2 sessions can only be dated by their session row (see
-/// `OPENCODE2_ACTIVITY_FALLBACK_NOTE`).
+/// `OPENCODE2_ACTIVITY_FALLBACK_NOTE`). Served from `OpenCodeListCache`,
+/// which reads only what changed since the previous poll.
 fn load_recent_opencode_cache_sessions(
     limit: usize,
     hidden_subagent_ids: &HashSet<String>,
 ) -> (Vec<CacheSessionListEntry>, Option<&'static str>) {
-    let Some(path) = resolve_opencode_db_path() else {
-        return (Vec::new(), None);
-    };
-    let Ok((conn, resolved)) = open_opencode_sessions(&path) else {
+    with_opencode_list_cache(|cache| {
+        cache.recent_sessions(limit, hidden_subagent_ids, std::time::Instant::now())
+    })
+    .unwrap_or((Vec::new(), None))
+}
+
+/// The same list from one connection with nothing kept between calls: the
+/// reference `OpenCodeListCache` must agree with.
+#[cfg(test)]
+fn load_recent_opencode_cache_sessions_uncached(
+    conn: &Connection,
+    limit: usize,
+    hidden_subagent_ids: &HashSet<String>,
+) -> (Vec<CacheSessionListEntry>, Option<&'static str>) {
+    let Ok(resolved) = resolve_opencode_sessions(conn) else {
         return (Vec::new(), None);
     };
     let note = resolved
         .generations
         .iter()
-        .find_map(|&generation| opencode_cache_activity_note(&conn, generation));
+        .find_map(|&generation| opencode_cache_activity_note(conn, generation));
     let mut sessions = Vec::new();
     for &generation in &resolved.generations {
-        let rows = if let Ok(mut cache) = opencode_cache_presence().write() {
-            load_recent_opencode_cache_sessions_with_cache(
-                &conn,
-                generation,
-                limit,
-                hidden_subagent_ids,
-                &mut cache,
-            )
-        } else {
-            load_recent_opencode_cache_sessions_from_conn(
-                &conn,
-                generation,
-                limit,
-                hidden_subagent_ids,
-            )
-        };
+        let rows = load_recent_opencode_cache_sessions_from_conn(
+            conn,
+            generation,
+            limit,
+            hidden_subagent_ids,
+        );
         sessions.extend(
             rows.into_iter()
                 .filter(|row| resolved.owns(&row.session_id, generation)),
@@ -3445,6 +3537,7 @@ fn opencode_cache_activity_note(
         .then_some(OPENCODE2_ACTIVITY_FALLBACK_NOTE)
 }
 
+#[cfg(test)]
 fn load_recent_opencode_cache_sessions_from_conn(
     conn: &Connection,
     generation: OpenCodeStoreGeneration,
@@ -3467,18 +3560,9 @@ fn load_recent_opencode_cache_sessions_with_cache(
     hidden_subagent_ids: &HashSet<String>,
     presence_cache: &mut OpenCodeCachePresenceCache,
 ) -> Vec<CacheSessionListEntry> {
-    const ABSOLUTE_MAX_SCANNED_SESSIONS: usize = 2_000;
     if limit == 0 {
         return Vec::new();
     }
-
-    // One extra result budget after the first 4x page gets past a dense recent
-    // run of eventless or hidden sessions. The floor gives small requests the
-    // same protection without letting metadata polling grow unbounded.
-    let max_scanned_sessions = limit
-        .saturating_mul(5)
-        .clamp(256, ABSOLUTE_MAX_SCANNED_SESSIONS);
-    let batch_size = limit.saturating_mul(4).clamp(1, max_scanned_sessions);
     let activity = opencode_cache_activity(conn, generation);
     let mut candidate_sql = recent_opencode_cache_sessions_sql(generation, activity);
     if generation == OpenCodeStoreGeneration::V1
@@ -3498,10 +3582,59 @@ fn load_recent_opencode_cache_sessions_with_cache(
     let Ok(mut candidates_stmt) = conn.prepare(&candidate_sql) else {
         return Vec::new();
     };
-    let harness = match generation {
+    let harness = opencode_generation_harness(generation);
+    filter_opencode_cache_candidates(
+        conn,
+        generation,
+        limit,
+        hidden_subagent_ids,
+        presence_cache,
+        |page_limit, offset| {
+            let rows = candidates_stmt
+                .query_map(params![page_limit, offset], |row| {
+                    Ok(CacheSessionListEntry {
+                        harness,
+                        session_id: row.get(0)?,
+                        last_activity_ms: row.get(1)?,
+                        title: row.get(2)?,
+                    })
+                })
+                .ok()?;
+            Some(rows.flatten().collect())
+        },
+    )
+}
+
+fn opencode_generation_harness(generation: OpenCodeStoreGeneration) -> Harness {
+    match generation {
         OpenCodeStoreGeneration::V1 => Harness::Opencode,
         OpenCodeStoreGeneration::V2 => Harness::Opencode2,
-    };
+    }
+}
+
+/// Walks candidate sessions newest first, `page(limit, offset)` at a time,
+/// and keeps those that are not hidden and hold at least one cache event,
+/// until `limit` are found or the scan budget runs out.
+fn filter_opencode_cache_candidates(
+    conn: &Connection,
+    generation: OpenCodeStoreGeneration,
+    limit: usize,
+    hidden_subagent_ids: &HashSet<String>,
+    presence_cache: &mut OpenCodeCachePresenceCache,
+    mut page: impl FnMut(i64, i64) -> Option<Vec<CacheSessionListEntry>>,
+) -> Vec<CacheSessionListEntry> {
+    const ABSOLUTE_MAX_SCANNED_SESSIONS: usize = 2_000;
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    // One extra result budget after the first 4x page gets past a dense recent
+    // run of eventless or hidden sessions. The floor gives small requests the
+    // same protection without letting metadata polling grow unbounded.
+    let max_scanned_sessions = limit
+        .saturating_mul(5)
+        .clamp(256, ABSOLUTE_MAX_SCANNED_SESSIONS);
+    let batch_size = limit.saturating_mul(4).clamp(1, max_scanned_sessions);
     let (recent_messages_sql, first_event_sql) = match generation {
         OpenCodeStoreGeneration::V1 => (
             RECENT_OPENCODE_SESSION_MESSAGES_SQL,
@@ -3529,18 +3662,8 @@ fn load_recent_opencode_cache_sessions_with_cache(
         let Ok(offset) = i64::try_from(scanned) else {
             break;
         };
-        let page = {
-            let Ok(rows) = candidates_stmt.query_map(params![page_limit, offset], |row| {
-                Ok(CacheSessionListEntry {
-                    harness,
-                    session_id: row.get(0)?,
-                    last_activity_ms: row.get(1)?,
-                    title: row.get(2)?,
-                })
-            }) else {
-                break;
-            };
-            rows.flatten().collect::<Vec<_>>()
+        let Some(page) = page(page_limit, offset) else {
+            break;
         };
         let page_len = page.len();
         scanned = scanned.saturating_add(page_len);
@@ -3549,9 +3672,16 @@ fn load_recent_opencode_cache_sessions_with_cache(
             if hidden_subagent_ids.contains(&candidate.session_id) {
                 continue;
             }
+            // A session that once held a cache event is not probed again when
+            // its activity moves; only a session without one is. Re-probing
+            // every active session read up to 200 of its newest message
+            // bodies on every poll. (A revert that deletes every assistant
+            // message would leave the session listed with an empty window.)
             let cached_presence = presence_cache
                 .get(&candidate.session_id)
-                .filter(|(time_updated, _)| *time_updated == candidate.last_activity_ms)
+                .filter(|(time_updated, has_event)| {
+                    *has_event || *time_updated == candidate.last_activity_ms
+                })
                 .map(|(_, has_event)| *has_event);
             let has_event = cached_presence.unwrap_or_else(|| {
                 // Most active sessions have a cache event in their newest rows.
@@ -3808,7 +3938,13 @@ pub fn get_session_cache_stats_from_db(
                 );
             }
         }
-        mark_opencode_store_children_as_subagents(&mut pre_cap_subagent_flags);
+        // OpenCode's own parent ids only matter when OpenCode sessions are
+        // listed; reading them for another harness filter cost every poll.
+        if harness_filter.map_or(true, |filter| {
+            matches!(filter, Harness::Opencode | Harness::Opencode2)
+        }) {
+            mark_opencode_store_children_as_subagents(&mut pre_cap_subagent_flags);
+        }
     }
     let hidden_opencode_ids: HashSet<String> = pre_cap_subagent_flags
         .iter()
@@ -3949,10 +4085,8 @@ pub fn get_session_cache_stats_from_db(
         .map(|row| {
             let key = (row.harness, row.session_id.clone());
             let broca_note = if row.harness == Harness::Broca {
-                broca_state_root().and_then(|root| {
-                    broca_wal::SessionIdentity::from_json(&row.session_id)
-                        .and_then(|identity| broca_wal::session_activity_note(&root, &identity))
-                })
+                broca_wal::SessionIdentity::from_json(&row.session_id)
+                    .and_then(|identity| broca_wal::session_activity_note(&identity))
             } else {
                 None
             };
@@ -5500,6 +5634,39 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
     .unwrap_or(false)
 }
 
+fn count_historian_runs(conn: &Connection, session_id: &str) -> i64 {
+    if !table_exists(conn, "historian_runs") {
+        return 0;
+    }
+    conn.query_row(
+        "SELECT COUNT(*) FROM historian_runs WHERE session_id = ?1",
+        [session_id],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod historian_runs_reader_tests {
+    use super::*;
+
+    #[test]
+    fn counts_recorded_runs_for_only_the_requested_session() {
+        let conn = Connection::open_in_memory().expect("open test database");
+        assert_eq!(count_historian_runs(&conn, "session-a"), 0);
+
+        conn.execute_batch(
+            "CREATE TABLE historian_runs (session_id TEXT NOT NULL);
+             INSERT INTO historian_runs (session_id) VALUES ('session-a'), ('session-b'), ('session-a');",
+        )
+        .expect("create historian run fixture");
+
+        assert_eq!(count_historian_runs(&conn, "session-a"), 2);
+        assert_eq!(count_historian_runs(&conn, "session-b"), 1);
+        assert_eq!(count_historian_runs(&conn, "session-c"), 0);
+    }
+}
+
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
     conn.query_row(
         &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
@@ -6642,14 +6809,85 @@ fn session_matches_filter(row: &SessionRow, filter: &SessionFilter) -> bool {
 /// under that label while the host store still lists the session as OpenCode.
 /// Match either label so the dashboard filter still sees those rows.
 fn load_subagent_map_for_harness(harness: Harness) -> std::collections::HashMap<String, bool> {
+    let Some(db_path) = resolve_db_path() else {
+        return HashMap::new();
+    };
+    static CACHE: OnceLock<Mutex<Option<SubagentMapCache>>> = OnceLock::new();
+    let Ok(mut guard) = CACHE.get_or_init(|| Mutex::new(None)).lock() else {
+        return HashMap::new();
+    };
+    let file_key = std::fs::metadata(&db_path)
+        .ok()
+        .as_ref()
+        .and_then(broca_wal::file_identity);
+    if !guard
+        .as_ref()
+        .is_some_and(|cache| cache.path == db_path && cache.file_key == file_key)
+    {
+        *guard = None;
+        let Ok(conn) = open_readonly(&db_path) else {
+            return HashMap::new();
+        };
+        *guard = Some(SubagentMapCache {
+            path: db_path,
+            file_key,
+            conn,
+            data_version: None,
+            computed_at: std::time::Instant::now(),
+            maps: HashMap::new(),
+        });
+    }
+    let cache = guard.as_mut().expect("set above");
+    let Ok(version) = cache
+        .conn
+        .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+    else {
+        *guard = None;
+        return HashMap::new();
+    };
+    // context.db is written on every Magic Context transform, so its data
+    // version moves almost every poll while a session runs. `is_subagent` is
+    // set when a session starts and does not change after, so a map up to
+    // SUBAGENT_MAP_MAX_AGE old is kept rather than scanning `session_meta`
+    // (16 MB on a busy store) once per harness per poll. OpenCode children
+    // are also flagged from the OpenCode store's own parent ids, which follow
+    // every poll.
+    const SUBAGENT_MAP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+    if cache.data_version != Some(version) && cache.computed_at.elapsed() >= SUBAGENT_MAP_MAX_AGE {
+        cache.maps.clear();
+    }
+    if cache.maps.is_empty() {
+        cache.data_version = Some(version);
+        cache.computed_at = std::time::Instant::now();
+    }
+    let group = match harness {
+        Harness::Opencode | Harness::Opencode2 => Harness::Opencode,
+        other => other,
+    };
+    if !cache.maps.contains_key(&group) {
+        let map = load_subagent_map_from_conn(&cache.conn, harness);
+        cache.maps.insert(group, map);
+    }
+    cache.maps.get(&group).cloned().unwrap_or_default()
+}
+
+/// `load_subagent_map_for_harness`'s connection to context.db, kept between
+/// polls with the maps it last read.
+struct SubagentMapCache {
+    path: PathBuf,
+    file_key: Option<(u64, u64)>,
+    conn: Connection,
+    data_version: Option<i64>,
+    computed_at: std::time::Instant,
+    maps: HashMap<Harness, HashMap<String, bool>>,
+}
+
+fn load_subagent_map_from_conn(
+    conn: &Connection,
+    harness: Harness,
+) -> std::collections::HashMap<String, bool> {
     use std::collections::HashMap;
     let mut map: HashMap<String, bool> = HashMap::new();
-    let Some(db_path) = resolve_db_path() else {
-        return map;
-    };
-    let Ok(conn) = open_readonly(&db_path) else {
-        return map;
-    };
     if matches!(harness, Harness::Opencode | Harness::Opencode2) {
         let Ok(mut stmt) = conn.prepare(
             "SELECT session_id, is_subagent
@@ -6692,31 +6930,11 @@ fn load_subagent_map_for_harness(harness: Harness) -> std::collections::HashMap<
 /// child. That column is the host's structural subagent signal and is present
 /// even when Magic Context has no `session_meta` row yet (or the row was
 /// mislabelled). Empty-string parent_id is treated as primary, matching the
-/// plugin fallback.
+/// plugin fallback. Served from `OpenCodeListCache`, which tracks parents as
+/// it follows the session table, instead of a full scan per poll.
 fn load_opencode_store_child_session_ids() -> HashSet<String> {
-    let mut out = HashSet::new();
-    let Some(path) = resolve_opencode_db_path() else {
-        return out;
-    };
-    let Ok((conn, resolved)) = open_opencode_sessions(&path) else {
-        return out;
-    };
-    for &generation in &resolved.generations {
-        let Ok(mut stmt) = conn.prepare(&format!(
-            "SELECT id FROM {} WHERE parent_id IS NOT NULL AND TRIM(parent_id) != ''",
-            opencode_session_table(generation)
-        )) else {
-            continue;
-        };
-        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-            for id in rows.flatten() {
-                if resolved.owns(&id, generation) {
-                    out.insert(id);
-                }
-            }
-        };
-    }
-    out
+    with_opencode_list_cache(|cache| cache.child_session_ids(std::time::Instant::now()))
+        .unwrap_or_default()
 }
 
 fn mark_opencode_store_children_as_subagents(flags: &mut HashMap<(Harness, String), bool>) {
@@ -6866,6 +7084,9 @@ pub fn get_opencode_session_detail(
         .map(|c| get_session_meta(c, &session_id))
         .transpose()?
         .flatten();
+    let historian_runs = conn
+        .map(|c| count_historian_runs(c, &session_id))
+        .unwrap_or(0);
     let token_breakdown = conn
         .map(|c| get_context_token_breakdown(c, &session_id))
         .transpose()?
@@ -6889,6 +7110,7 @@ pub fn get_opencode_session_detail(
         pi_jsonl_path: None,
         messages_count,
         cache_events_count,
+        historian_runs,
         compartments,
         facts,
         notes,
@@ -7062,6 +7284,9 @@ pub fn get_pi_session_detail(
     let meta = conn
         .and_then(|c| get_session_meta(c, session_id).ok())
         .flatten();
+    let historian_runs = conn
+        .map(|c| count_historian_runs(c, session_id))
+        .unwrap_or(0);
     let token_breakdown = conn
         .and_then(|c| get_context_token_breakdown(c, session_id).ok())
         .flatten();
@@ -7078,6 +7303,7 @@ pub fn get_pi_session_detail(
         pi_jsonl_path: Some(detail.meta.jsonl_path.to_string_lossy().to_string()),
         messages_count,
         cache_events_count,
+        historian_runs,
         compartments,
         facts,
         notes,
@@ -7429,7 +7655,7 @@ pub fn get_session_meta(
     let mut stmt = conn.prepare(
         "SELECT session_id, last_response_time, cache_ttl, counter, last_nudge_tokens,
                 last_nudge_band, is_subagent, last_context_percentage, last_input_tokens,
-                times_execute_threshold_reached, compartment_in_progress, system_prompt_hash,
+                compartment_in_progress, system_prompt_hash,
                 memory_block_count, COALESCE(new_work_tokens, 0), COALESCE(total_input_tokens, 0)
          FROM session_meta WHERE session_id = ?1",
     )?;
@@ -7444,12 +7670,11 @@ pub fn get_session_meta(
             is_subagent: row.get::<_, i64>(6)? != 0,
             last_context_percentage: row.get(7)?,
             last_input_tokens: row.get(8)?,
-            times_execute_threshold_reached: row.get(9)?,
-            compartment_in_progress: row.get::<_, i64>(10)? != 0,
-            system_prompt_hash: row.get(11)?,
-            memory_block_count: row.get(12)?,
-            new_work_tokens: row.get(13)?,
-            total_input_tokens: row.get(14)?,
+            compartment_in_progress: row.get::<_, i64>(9)? != 0,
+            system_prompt_hash: row.get(10)?,
+            memory_block_count: row.get(11)?,
+            new_work_tokens: row.get(12)?,
+            total_input_tokens: row.get(13)?,
         })
     })?;
     match rows.next() {
@@ -12484,6 +12709,7 @@ mod broca_cache_tests {
             ts_ms: Some(ts_ms),
             provider: Some("anthropic".to_string()),
             model: Some("claude-opus-5".to_string()),
+            context_limit: None,
             steps,
             finished: true,
         }
@@ -12554,6 +12780,7 @@ mod broca_cache_tests {
         let rows = load_broca_cache_events_with_compatibility(
             &conn,
             &id.to_string(),
+            None,
             Some(&runs),
             false,
             None,
@@ -12875,6 +13102,232 @@ mod broca_cache_tests {
         assert_eq!(sessions[0].session_id, finished.to_string());
     }
 
+    /// The grouping query the session list ran on every poll before
+    /// `BrocaRunIndex`, kept as the reference the index must agree with.
+    fn reference_list(conn: &Connection, limit: usize) -> Vec<(String, i64, bool)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT identity, activity, running FROM (
+                     SELECT identity, MAX(activity) AS activity, MAX(running) AS running,
+                            ROW_NUMBER() OVER (ORDER BY MAX(activity) DESC, identity) AS rank
+                     FROM (
+                         SELECT json_extract(segment_json, '$.session') AS identity,
+                                CAST(json_extract(segment_json, '$.occurred_at_ms') AS INTEGER) AS activity,
+                                0 AS running
+                         FROM export_facts
+                         UNION ALL
+                         SELECT CASE WHEN json_valid(session) THEN json(session) END, state_changed_ms, 1
+                         FROM run_index WHERE state = 'active'
+                     )
+                     WHERE identity IS NOT NULL
+                     GROUP BY identity HAVING MAX(activity) IS NOT NULL
+                 )
+                 WHERE rank <= ?1 OR running = 1
+                 ORDER BY activity DESC, identity",
+            )
+            .unwrap();
+        stmt.query_map(params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    fn index_list(
+        index: &mut broca_run_index::BrocaRunIndex,
+        limit: usize,
+    ) -> Vec<(String, i64, bool)> {
+        index
+            .list(limit)
+            .into_iter()
+            .map(|s| (s.identity, s.activity, s.running))
+            .collect()
+    }
+
+    fn run(conn: &Connection, run: &str, session: &serde_json::Value, state: &str, ts: i64) {
+        // Broca's own upsert: a terminal row never reopens, an open one is
+        // updated in place (same rowid).
+        conn.execute(
+            "INSERT INTO run_index (run_id, session, state, state_changed_ms) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(run_id) DO UPDATE SET state = excluded.state,
+                 state_changed_ms = excluded.state_changed_ms
+             WHERE run_index.state IN ('active', 'paused')",
+            params![run, session.to_string(), state, ts],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_run_index_follows_new_facts_and_run_states_like_the_grouping_query() {
+        let conn = store();
+        conn.execute_batch(
+            "CREATE TABLE run_index (run_id TEXT PRIMARY KEY, session TEXT NOT NULL,
+                                     state TEXT NOT NULL, state_changed_ms INTEGER);",
+        )
+        .unwrap();
+        let usage = serde_json::json!({"input_tokens": 1});
+        for (index, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            let ts = 1_000 + index as i64;
+            insert(
+                &conn,
+                &format!("f-{name}"),
+                &format!("r-{name}"),
+                &identity(name),
+                ts,
+                usage.clone(),
+            );
+            run(
+                &conn,
+                &format!("r-{name}"),
+                &identity(name),
+                "completed",
+                ts,
+            );
+        }
+        run(&conn, "r-run", &identity("running"), "active", 500);
+        run(&conn, "r-pause", &identity("paused"), "paused", 600);
+
+        let mut index = broca_run_index::BrocaRunIndex::default();
+        let start = std::time::Instant::now();
+        index.refresh(&conn, start).unwrap();
+        for limit in [2, 10] {
+            assert_eq!(index_list(&mut index, limit), reference_list(&conn, limit));
+        }
+
+        // A new fact, the running run finishing, the paused run resuming, a
+        // new run starting and a fact without a time.
+        insert(&conn, "f-b2", "r-b2", &identity("b"), 5_000, usage.clone());
+        run(&conn, "r-run", &identity("running"), "completed", 5_100);
+        insert(
+            &conn,
+            "f-run",
+            "r-run",
+            &identity("running"),
+            5_100,
+            usage.clone(),
+        );
+        run(&conn, "r-pause", &identity("paused"), "active", 5_200);
+        run(&conn, "r-new", &identity("new"), "active", 5_300);
+        conn.execute(
+            "INSERT INTO export_facts (fact_id, run_id, segment_json) VALUES ('f-x', 'r-x', ?1)",
+            params![serde_json::json!({"session": identity("timeless")}).to_string()],
+        )
+        .unwrap();
+        index
+            .refresh(&conn, start + std::time::Duration::from_secs(1))
+            .unwrap();
+        for limit in [1, 3, 10] {
+            assert_eq!(index_list(&mut index, limit), reference_list(&conn, limit));
+        }
+        assert_eq!(index.run_ids(&identity("b").to_string()), ["r-b", "r-b2"]);
+    }
+
+    #[test]
+    fn run_totals_through_the_run_index_match_the_full_filter() {
+        let (conn, id) = two_run_session();
+        let mut index = broca_run_index::BrocaRunIndex::default();
+        index.refresh(&conn, std::time::Instant::now()).unwrap();
+        let run_ids = index.run_ids(&id);
+        assert_eq!(run_ids, ["r1", "r2"]);
+        let indexed = load_broca_run_totals(&conn, &id, Some(&run_ids)).unwrap();
+        let filtered = load_broca_run_totals(&conn, &id, None).unwrap();
+        assert_eq!(format!("{indexed:?}"), format!("{filtered:?}"));
+        assert_eq!(indexed.len(), 2);
+        // A run id of another session never leaks into this one.
+        let other = load_broca_run_totals(&conn, &id, Some(&["elsewhere".to_owned()])).unwrap();
+        assert!(other.is_empty());
+    }
+
+    fn pages_read(conn: &Connection) -> i64 {
+        let (mut current, mut high) = (0, 0);
+        unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut current,
+                &mut high,
+                1,
+            );
+        }
+        i64::from(current)
+    }
+
+    #[test]
+    fn a_poll_reads_only_what_the_run_index_gained() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run-index.db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE export_facts (export_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                     fact_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL, segment_json TEXT NOT NULL);
+                 CREATE INDEX export_facts_run_id ON export_facts(run_id);
+                 CREATE TABLE run_index (run_id TEXT PRIMARY KEY, session TEXT NOT NULL,
+                     state TEXT NOT NULL, usage_json TEXT, state_changed_ms INTEGER);",
+            )
+            .unwrap();
+        let padding = "p".repeat(2_000);
+        for index in 0..2_000 {
+            let session = identity(&format!("s{}", index % 200));
+            let segment = serde_json::json!({"session": session, "occurred_at_ms": index,
+                                             "usage": {"input_tokens": 1}, "padding": padding});
+            writer
+                .execute(
+                    "INSERT INTO export_facts (fact_id, run_id, segment_json) VALUES (?1, ?2, ?3)",
+                    params![
+                        format!("f{index}"),
+                        format!("r{index}"),
+                        segment.to_string()
+                    ],
+                )
+                .unwrap();
+            writer
+                .execute(
+                    "INSERT INTO run_index (run_id, session, state, usage_json, state_changed_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        format!("r{index}"),
+                        session.to_string(),
+                        if index % 500 == 0 {
+                            "active"
+                        } else {
+                            "completed"
+                        },
+                        padding,
+                        index
+                    ],
+                )
+                .unwrap();
+        }
+        let mut index = broca_run_index::BrocaRunIndex::default();
+        let start = std::time::Instant::now();
+        let first = open_broca_store(&path).unwrap();
+        index.refresh(&first, start).unwrap();
+        let full = pages_read(&first);
+        assert!(full > 1_000, "the first refresh reads every fact: {full}");
+
+        // Each poll opens a fresh connection, as production does.
+        insert(
+            &writer,
+            "f-new",
+            "r-new",
+            &identity("s7"),
+            9_999,
+            serde_json::json!({}),
+        );
+        let poll = open_broca_store(&path).unwrap();
+        index
+            .refresh(&poll, start + std::time::Duration::from_secs(1))
+            .unwrap();
+        let delta = pages_read(&poll);
+        assert!(
+            delta * 20 < full,
+            "a one-fact poll read {delta} pages, a full read {full}"
+        );
+        assert_eq!(index.list(1)[0].identity, identity("s7").to_string());
+    }
+
     /// Writes `bytes` as the session's live WAL under `root`, last modified
     /// at `modified_ms`.
     fn write_live_wal(root: &Path, identity: &serde_json::Value, bytes: &[u8], modified_ms: u64) {
@@ -13004,6 +13457,61 @@ mod broca_cache_tests {
             .find(|row| row.session_id == gather_id)
             .unwrap();
         assert_eq!(row.last_activity_ms, started);
+    }
+
+    /// A Broca step's fill is its prompt over the context window its run was
+    /// admitted with (`run_started.config.context_limit`, the caller's
+    /// override or the catalog's window). Without it the timeline fell back
+    /// to the largest prompt in view, so every session's biggest step read
+    /// 100% full: a 90k prompt in a 1.05M window showed as a full window.
+    /// The run here is a mason run Broca paused for a restart and resumed;
+    /// every step after the resume must be shown too.
+    #[test]
+    fn broca_steps_are_scaled_by_the_runs_frozen_context_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = serde_json::json!({"project_root": "/work", "harness": "broca",
+                                         "session": "alfonso:bg_mason"});
+        write_live_wal(
+            dir.path(),
+            &session,
+            &broca_wal::tests::restart_resumed_wal(),
+            2_100,
+        );
+        let runs = broca_wal::WalCache::default()
+            .session_runs(
+                dir.path(),
+                &broca_wal::SessionIdentity::from_json(&session.to_string()).unwrap(),
+            )
+            .unwrap();
+        let events = build_db_cache_events(
+            load_broca_cache_events_from_conn(
+                &store(),
+                &session.to_string(),
+                Some(&runs),
+                None,
+                None,
+            )
+            .unwrap(),
+            false,
+        );
+        for event in &events {
+            assert_eq!(event.context_limit, 1_050_000, "{}", event.message_id);
+            assert!(!event.context_limit_estimated, "{}", event.message_id);
+        }
+        assert_eq!(
+            ids(&events),
+            [
+                "run-sid-restart#1",
+                "run-sid-restart#2",
+                "run-sid-restart#3"
+            ]
+        );
+        // Fill counts fresh input, cache reads and cache writes.
+        let last = events.last().unwrap();
+        assert_eq!(
+            last.input_tokens + last.cache_read + last.cache_write,
+            90_085
+        );
     }
 
     #[test]

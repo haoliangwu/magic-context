@@ -1,5 +1,5 @@
 import { parse, stringify } from "comment-json";
-import { applyEdits, findNodeAtLocation, modify, parseTree } from "jsonc-parser";
+import { applyEdits, createScanner, findNodeAtLocation, modify, parseTree } from "jsonc-parser";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -128,6 +128,37 @@ export function patchConfigJsonc(text: string, next: Record<string, unknown>): s
         patched.slice(0, node.offset) +
         JSON.stringify(after) +
         patched.slice(node.offset + node.length);
+    } else if (!node && after !== undefined) {
+      const parent = tree && findNodeAtLocation(tree, path.slice(0, -1));
+      const children = parent?.type === "object" ? parent.children : undefined;
+      const last = children?.[children.length - 1];
+      if (parent && last) {
+        // Add a property without reformatting neighboring lines or moving their
+        // comments. Preserve the object's existing trailing-comma style as well.
+        let close = parent.offset + parent.length - 1;
+        const end = last.offset + last.length;
+        const tail = patched.slice(end, close);
+        const scanner = createScanner(tail, true);
+        scanner.scan();
+        const trailingComma = tail[scanner.getTokenOffset()] === ",";
+        if (!trailingComma) {
+          patched = `${patched.slice(0, end)},${patched.slice(end)}`;
+          close++;
+        }
+        const lineStart = patched.lastIndexOf("\n", close - 1) + 1;
+        const closingIndent = patched.slice(lineStart, close);
+        const property = `${JSON.stringify(path[path.length - 1])}: ${JSON.stringify(after)}${trailingComma ? "," : ""}`;
+        if (lineStart > parent.offset && /^[\t ]*$/.test(closingIndent)) {
+          const insertion = `${closingIndent}${indentation}${property}${formattingOptions.eol}`;
+          patched = patched.slice(0, lineStart) + insertion + patched.slice(lineStart);
+        } else {
+          const spacing = patched.slice(end, close).match(/[\t ]*$/)?.[0] ?? "";
+          const insertion = `${spacing ? "" : " "}${property}${spacing}`;
+          patched = patched.slice(0, close) + insertion + patched.slice(close);
+        }
+      } else {
+        patched = applyEdits(patched, modify(patched, path, after, { formattingOptions }));
+      }
     } else {
       patched = applyEdits(patched, modify(patched, path, after, { formattingOptions }));
     }

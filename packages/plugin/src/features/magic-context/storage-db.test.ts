@@ -3,7 +3,6 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import type { execFileSync } from "node:child_process";
 import {
-    type chmodSync,
     existsSync,
     mkdirSync,
     readdirSync,
@@ -31,9 +30,7 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
 import {
     __resetRpcDiscoveryFsForTests,
     __resetSchemaFenceStateForTests,
-    __resetStoragePermissionFsForTests,
     __setRpcDiscoveryFsForTests,
-    __setStoragePermissionFsForTests,
     closeDatabase,
     enforceSchemaFence,
     FORK_MIGRATION_VERSION_FLOOR,
@@ -120,7 +117,6 @@ afterEach(() => {
     closeDatabase();
     __resetRpcDiscoveryFsForTests();
     __resetSchemaFenceStateForTests();
-    __resetStoragePermissionFsForTests();
     __resetRpcIdentityTestHooks();
     __resetStoragePrivatePermissionEnforcementForTests();
     if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
@@ -380,42 +376,29 @@ describe("storage-db", () => {
             }
         });
 
-        it("#when private permission enforcement is disabled #then a full storage open makes zero chmod calls", () => {
+        it("#when private permission enforcement is disabled #then storage creation leaves modes to the operator", () => {
             const dataHome = useTempDataHome("storage-db-external-perms-");
-            const chmodCalls: Array<[string, number]> = [];
             setStoragePrivatePermissionEnforcement(false);
-            __setStoragePermissionFsForTests({
-                chmodSync: ((path, mode) => {
-                    chmodCalls.push([String(path), Number(mode)]);
-                }) as typeof chmodSync,
-            });
 
             openDatabase();
 
-            expect(existsSync(resolveDbPath(dataHome))).toBe(true);
-            expect(chmodCalls).toEqual([]);
+            const dbPath = resolveDbPath(dataHome);
+            const callerUmask = process.umask();
+            expect(existsSync(dbPath)).toBe(true);
+            expect(statSync(dirname(dbPath)).mode & 0o777).toBe(0o777 & ~callerUmask);
+            expect(statSync(dbPath).mode & 0o777).toBe(0o666 & ~callerUmask);
         });
 
-        it("#when private permission enforcement is enabled #then a full storage open restricts the directory and database", () => {
+        it("#when private permission enforcement is enabled #then storage and database are private", () => {
             if (process.platform === "win32") return;
             const dataHome = useTempDataHome("storage-db-private-perms-spy-");
             const dbPath = resolveDbPath(dataHome);
-            const chmodCalls: Array<[string, number]> = [];
             setStoragePrivatePermissionEnforcement(true);
-            __setStoragePermissionFsForTests({
-                chmodSync: ((path, mode) => {
-                    chmodCalls.push([String(path), Number(mode)]);
-                }) as typeof chmodSync,
-            });
 
             openDatabase();
 
-            expect(chmodCalls).toEqual(
-                expect.arrayContaining([
-                    [dirname(dbPath), 0o700],
-                    [dbPath, 0o600],
-                ]),
-            );
+            expect(statSync(dirname(dbPath)).mode & 0o777).toBe(0o700);
+            expect(statSync(dbPath).mode & 0o777).toBe(0o600);
         });
 
         it("#when downstream rows share context.db #then opens without treating them as future upstream schema", () => {
@@ -594,11 +577,11 @@ describe("storage-db", () => {
 
             expect(indexNames).toEqual(
                 expect.arrayContaining([
-                    "idx_tags_session_tag_number",
-                    "idx_pending_ops_session",
-                    "idx_source_contents_session",
-                    "idx_compartments_session",
-                    "idx_compression_depth_session",
+                    "idx_message_fts_rowid_map_session_rowid",
+                    "idx_pending_ops_session_tag_id",
+                    "idx_transform_decisions_retention",
+                    "idx_plugin_messages_session",
+                    "idx_user_memory_candidates_session",
                     "idx_session_facts_session",
                     "idx_notes_session_status",
                     "idx_notes_project_status",

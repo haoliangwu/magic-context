@@ -5,11 +5,17 @@ import type { MigrationWorkerData, MigrationWorkerMessage } from "./migration-wo
 
 /**
  * - `migrated`: the worker applied every pending migration, or found none left.
- * - `worker_unavailable`: no worker could be started (its file is missing, or
- *   this runtime cannot load it); the caller applies the migrations itself on
- *   the main thread, as every build before this one did.
+ * A missing or unloadable worker rejects the open. Running a long SQLite batch
+ * on the host thread instead can trip a supervisor's health watchdog, whose
+ * restart rolls back the batch and repeats the same stall indefinitely.
  */
-export type OffThreadMigrationOutcome = "migrated" | "worker_unavailable";
+export type OffThreadMigrationOutcome = "migrated";
+
+function workerStartError(detail: string): Error {
+    return new Error(
+        `the migration worker could not start (${detail}); reinstall or rebuild the plugin`,
+    );
+}
 
 function defaultWorkerEntry(): URL {
     // Tests run the TypeScript sources; packaged builds emit migration-worker.js
@@ -48,10 +54,7 @@ export function runMigrationsOffThread(
         try {
             worker = new Worker(workerEntryOverride ?? defaultWorkerEntry(), { workerData: data });
         } catch (error) {
-            log(
-                `[migrations] could not start the migration worker (${error instanceof Error ? error.message : String(error)}); applying migrations on the main thread`,
-            );
-            resolve("worker_unavailable");
+            reject(workerStartError(error instanceof Error ? error.message : String(error)));
             return;
         }
         log(`[migrations] applying pending migrations on a worker thread: ${data.dbPath}`);
@@ -74,10 +77,7 @@ export function runMigrationsOffThread(
         };
         const unavailable = (detail: string): void => {
             settle(() => {
-                log(
-                    `[migrations] the migration worker did not start (${detail}); applying migrations on the main thread`,
-                );
-                resolve("worker_unavailable");
+                reject(workerStartError(detail));
             });
         };
 
@@ -85,6 +85,7 @@ export function runMigrationsOffThread(
             switch (message.type) {
                 case "ready":
                     ready = true;
+                    log(`[migrations] migration worker ready: ${data.dbPath}`);
                     return;
                 case "log":
                     writeForwardedLogLine(message.line);
@@ -93,9 +94,17 @@ export function runMigrationsOffThread(
                     if (!settled) setBusy(!message.waiting);
                     return;
                 case "done":
+                    if (!ready) {
+                        unavailable("reported completion before ready");
+                        return;
+                    }
                     settle(() => resolve("migrated"));
                     return;
                 case "failed":
+                    if (!ready) {
+                        unavailable(message.message);
+                        return;
+                    }
                     settle(() => reject(new Error(message.message)));
                     return;
             }

@@ -8,9 +8,12 @@ function fixture(): Database {
     const db = new Database(":memory:");
     db.exec(`CREATE TABLE tags (
         id INTEGER PRIMARY KEY, session_id TEXT, message_id TEXT,
-        tool_owner_message_id TEXT, status TEXT);
+        tool_owner_message_id TEXT, status TEXT,
+        tag_number INTEGER GENERATED ALWAYS AS (id) VIRTUAL,
+        UNIQUE(session_id, tag_number));
         CREATE INDEX idx_tags_session_message_id ON tags(session_id, message_id);
-        CREATE INDEX idx_tags_session_tag_number ON tags(session_id, id);`);
+        CREATE TABLE pending_ops (session_id TEXT, tag_id INTEGER);
+        CREATE INDEX idx_pending_ops_session_tag ON pending_ops(session_id, tag_id);`);
     return db;
 }
 
@@ -35,7 +38,9 @@ describe("trimmed-message tag retirement", () => {
     test("retires 100k tags with 4000 trimmed ids within two seconds", () => {
         const db = fixture();
         try {
-            const insert = db.prepare("INSERT INTO tags VALUES (?, 's', ?, ?, ?)");
+            const insert = db.prepare(
+                "INSERT INTO tags(id, session_id, message_id, tool_owner_message_id, status) VALUES (?, 's', ?, ?, ?)",
+            );
             db.transaction(() => {
                 for (let i = 0; i < 100_000; i++) {
                     insert.run(
@@ -105,7 +110,9 @@ describe("trimmed-message tag retirement", () => {
                     "nul:p0",
                     null,
                 ];
-                const insert = db.prepare("INSERT INTO tags VALUES (?, ?, ?, ?, ?)");
+                const insert = db.prepare(
+                    "INSERT INTO tags(id, session_id, message_id, tool_owner_message_id, status) VALUES (?, ?, ?, ?, ?)",
+                );
                 let id = 0;
                 for (const session of ["old", "new", "other"]) {
                     for (const value of values) {
@@ -141,7 +148,7 @@ describe("trimmed-message tag retirement", () => {
         const db = fixture();
         try {
             const insert = db.prepare(
-                "INSERT INTO tags VALUES (?, 's', 'root:p0', NULL, 'dropped')",
+                "INSERT INTO tags(id, session_id, message_id, tool_owner_message_id, status) VALUES (?, 's', 'root:p0', NULL, 'dropped')",
             );
             db.transaction(() => {
                 for (let i = 1; i <= 1000; i++) insert.run(i);
@@ -177,7 +184,9 @@ describe("trimmed-message tag retirement", () => {
     test("does not retire tags retargeted between discovery and writer acquisition", () => {
         const db = fixture();
         try {
-            db.exec("INSERT INTO tags VALUES (1, 's', 'root:p0', NULL, 'active')");
+            db.exec(
+                "INSERT INTO tags(id, session_id, message_id, tool_owner_message_id, status) VALUES (1, 's', 'root:p0', NULL, 'active')",
+            );
             const exec = db.exec.bind(db);
             let retargeted = false;
             const intercept = spyOn(db, "exec").mockImplementation((sql: string) => {

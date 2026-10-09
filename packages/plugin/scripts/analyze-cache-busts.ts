@@ -837,6 +837,43 @@ function firstDivergence(prev: Segment[], cur: Segment[]): number {
     return prev.length === cur.length ? -1 : n;
 }
 
+function isTailShrink(previous: Snapshot, current: Snapshot, divergenceIndex: number): boolean {
+    if (divergenceIndex < 0) return false;
+    const previousTail = previous.segments[divergenceIndex];
+    const currentTail = current.segments[divergenceIndex];
+    if (!previousTail) return false;
+    if (!currentTail) return divergenceIndex === current.segments.length;
+    if (
+        divergenceIndex !== current.segments.length - 1 ||
+        divergenceIndex < Math.max(0, previous.segments.length - 2)
+    ) {
+        return false;
+    }
+    if (
+        currentTail.role !== previousTail.role ||
+        currentTail.bytes >= previousTail.bytes ||
+        currentTail.parts.length !== previousTail.parts.length
+    ) {
+        return false;
+    }
+    let shortenedPart = false;
+    for (let index = 0; index < currentTail.parts.length; index += 1) {
+        const currentPart = currentTail.parts[index];
+        const previousPart = previousTail.parts[index];
+        if (
+            !currentPart ||
+            !previousPart ||
+            currentPart.type !== previousPart.type ||
+            currentPart.length > previousPart.length ||
+            !previousPart.textPrefix.startsWith(currentPart.textPrefix)
+        ) {
+            return false;
+        }
+        shortenedPart ||= currentPart.length < previousPart.length;
+    }
+    return shortenedPart;
+}
+
 /** Effective cached prefix = bytes up to the last breakpoint strictly before divergence. */
 function cachedPrefixBytes(segs: Segment[], divergeIdx: number): { bytes: number; at: string } {
     let bytes = 0;
@@ -1018,6 +1055,7 @@ export function analyzeSnapshots(
             divergenceIndex < 0
                 ? undefined
                 : (current.segments[divergenceIndex] ?? previous.segments[divergenceIndex]);
+        const tailShrink = isTailShrink(previous, current, divergenceIndex);
         // A LATENCY row is also classified: a short read over an unchanged reusable
         // prefix is a provider-side fact and deserves a name, not a blank cell.
         const divergenceClass =
@@ -1031,11 +1069,12 @@ export function analyzeSnapshots(
                       currentProvider: current.provider,
                       firstDivergenceRole: divergentSegment?.role,
                       firstDivergenceSize: divergentSegment?.bytes,
-                       rewrittenTokens,
-                       cacheCreationTokens: current.usage.cacheCreation,
-                       promptTokens: prevTotal,
-                       providerComparableRead: current.usage.cacheRead,
-                       directInput: current.usage.input,
+                      rewrittenTokens,
+                      cacheCreationTokens: current.usage.cacheCreation,
+                      promptTokens: prevTotal,
+                      tailShrink,
+                      providerComparableRead: current.usage.cacheRead,
+                      directInput: current.usage.input,
                        previousTotal: prevTotal,
                        previousModel: previous.wireModel,
                        currentModel: current.wireModel,

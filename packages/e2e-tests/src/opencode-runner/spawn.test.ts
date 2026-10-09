@@ -2,10 +2,12 @@
 import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-dir";
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { waitForReady } from "./spawn";
+import { dirname, join } from "node:path";
+import { loadPluginConfigDetailed } from "../../../plugin/src/config";
+import { migrateConfigFile } from "../../../plugin/src/config/migrate-config-location";
+import { createIsolatedEnv, waitForReady, writeConfigs } from "./spawn";
 
 let server: ReturnType<typeof Bun.serve> | undefined;
 const tempDirs: string[] = [];
@@ -33,6 +35,47 @@ afterEach(() => {
     for (const directory of tempDirs.splice(0)) {
         rmSync(directory, { recursive: true, force: true });
     }
+});
+
+describe("opencode configuration", () => {
+    it("restart config edits replace the authoritative CortexKit user policy", () => {
+        const env = createIsolatedEnv();
+        tempDirs.push(dirname(env.dataDir));
+        const previousConfigHome = process.env.XDG_CONFIG_HOME;
+        process.env.XDG_CONFIG_HOME = env.configDir;
+        try {
+            const options = {
+                mockProviderURL: "http://127.0.0.1:12345",
+                magicContextConfig: { cache_ttl: "0" },
+            };
+            const authoritative = join(env.configDir, "cortexkit", "magic-context.jsonc");
+            const legacy = join(env.configDir, "opencode", "magic-context.jsonc");
+            writeConfigs(env, options.mockProviderURL, options);
+            // Simulate the first host boot: an old harness writer gets migrated here.
+            // The next write must update the target rather than recreate the old source.
+            migrateConfigFile({
+                scope: "user",
+                targetPath: authoritative,
+                legacySources: [{ path: legacy, label: "OpenCode user" }],
+            });
+            expect(loadPluginConfigDetailed(env.workdir, false).config.cache_ttl).toBe("0");
+            writeConfigs(env, options.mockProviderURL, {
+                ...options,
+                magicContextConfig: { cache_ttl: "5m" },
+                openCodeGlobalConfigExtra: { compaction: { auto: false } },
+            });
+            expect(loadPluginConfigDetailed(env.workdir, false).config.cache_ttl).toBe("5m");
+            expect(JSON.parse(readFileSync(authoritative, "utf8")).cache_ttl).toBe("5m");
+            expect(existsSync(legacy)).toBe(false);
+            const globalHostConfig = JSON.parse(
+                readFileSync(join(env.configDir, "opencode", "opencode.json"), "utf8"),
+            );
+            expect(globalHostConfig.compaction).toEqual({ auto: false });
+        } finally {
+            if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+            else process.env.XDG_CONFIG_HOME = previousConfigHome;
+        }
+    });
 });
 
 describe("opencode readiness", () => {

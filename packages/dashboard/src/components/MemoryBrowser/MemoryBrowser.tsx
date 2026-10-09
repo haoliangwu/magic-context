@@ -377,12 +377,12 @@ export default function MemoryBrowser(props: MemoryBrowserProps = {}) {
         <div style={{ padding: "8px 20px" }}>
           <div
             style={{
-              background: "var(--error-bg, #3a1c1c)",
-              border: "1px solid var(--error-border, #6b2c2c)",
+              background: "var(--error-bg)",
+              border: "1px solid var(--error-border)",
               "border-radius": "var(--radius-md)",
               padding: "8px 12px",
               "font-size": "12px",
-              color: "var(--error-text, #ef4444)",
+              color: "var(--error-text)",
               display: "flex",
               "justify-content": "space-between",
               "align-items": "center",

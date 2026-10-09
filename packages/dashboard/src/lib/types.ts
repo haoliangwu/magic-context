@@ -182,6 +182,7 @@ export interface SessionDetail {
   // `getSessionMessages`; cache events by `getSessionCacheEvents`.
   messages_count: number;
   cache_events_count: number;
+  historian_runs: number;
   compartments: Compartment[];
   facts: SessionFact[];
   notes: Note[];
@@ -271,7 +272,6 @@ export interface SessionMetaRow {
   is_subagent: boolean;
   last_context_percentage: number;
   last_input_tokens: number;
-  times_execute_threshold_reached: number;
   compartment_in_progress: boolean;
   system_prompt_hash: string;
   memory_block_count: number;
@@ -550,6 +550,8 @@ export type OpencodeInstallState = "cli" | "desktop" | "none";
 
 /** Harness-scoped model catalogs returned together by the Tauri backend. */
 export interface ModelCatalogs {
+  /** Exact variant keys from verbose OpenCode metadata; absence means unknown, [] means none. */
+  opencodeVariants?: Record<string, string[]>;
   opencode: string[];
   pi: string[];
   omp: string[];

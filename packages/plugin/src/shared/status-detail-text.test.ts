@@ -100,7 +100,7 @@ describe("status detail text", () => {
         expect(formatStatusDetailMarkdown(STATUS_FIXTURE)).toBe(`## Magic Context Status
 
 - **Context:** 75.0% of usable context (96,000 / 128,000 tokens)
-- **Cache lifetime:** 1h (config for anthropic/claude-opus-5)
+- **Cache lifetime:** 1h (your config)
 - **Automatic compression:** at 65.0% of usable context
 - **History compression:** Compressing history · 12 history blocks
 - **Reclaimable:** 3 spent tool outputs (~14k tokens)
@@ -146,6 +146,23 @@ describe("status detail text", () => {
         expect(
             formatStatusDetailMarkdown({ ...STATUS_FIXTURE, dreamerFailures: [] }),
         ).not.toContain("MC-S05");
+    });
+
+    test("shows the primary quota deadline without exposing surrounding account diagnostics", () => {
+        const summary = formatStatusDetailMarkdown({
+            ...STATUS_FIXTURE,
+            dreamerFailures: [
+                {
+                    task: "verify",
+                    error: "primary quota exhausted until 2026-10-08T03:40:04.275Z; account=private@example.com",
+                    lastSucceededAt: null,
+                    retryCount: 1,
+                },
+            ],
+        });
+        expect(summary).toContain("primary quota exhausted until 2026-10-08T03:40:04.275Z");
+        expect(summary).not.toContain("private@example.com");
+        expect(summary).not.toContain("manifest missing");
     });
 
     test("keeps internal vocabulary and identifiers out of the summary", () => {

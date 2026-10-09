@@ -21,6 +21,8 @@ pub mod context_boundaries;
 pub use context_boundaries::ResolvedContextBoundary;
 pub mod context_writes;
 mod historian_claim;
+pub mod move_inventory;
+pub mod private_permissions;
 pub mod single_store_domain;
 pub mod single_store_schema;
 
@@ -4584,6 +4586,10 @@ fn one_f64() -> f64 {
 /// live tail rather than the full history.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TailHygieneBaseline {
+    /// Protected-tool keep counts saved by the last nudge measurement that
+    /// rebuilt the baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_tools_policy: Option<std::collections::BTreeMap<String, usize>>,
     pub baseline_u: i64,
     pub baseline_t: i64,
     pub turn_delta_u: i64,
@@ -4669,9 +4675,21 @@ pub struct FrozenDecisionCalibration {
     pub source: String,
 }
 
+/// Why the host chose this cache lifetime, with the built-in fallback kept for this session and model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCacheTtlPolicy {
+    pub value: String,
+    pub source: String,
+    pub model_key: Option<String>,
+    pub built_in_default: String,
+}
+
 /// The non-CoreState durable blob: bootstrap + epoch-detection + coverage watermark.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModuleMeta {
+    /// Idle-expiry policy only; it never changes rendered context or cached prompt text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_policy: Option<SessionCacheTtlPolicy>,
     /// Host ordinals and module block IDs used for rendering, only while the shared
     /// row's original IDs, block indices, and ordinals still match.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4924,6 +4942,11 @@ pub struct ModuleMeta {
     /// asynchronous reduction acknowledgements use the same floor as transforms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protected_tokens_effective: Option<u64>,
+    /// Block IDs identified by selection as protected-tool results. Acknowledgements
+    /// use these IDs because tag rows store output text, not tool names. They guide
+    /// decisions but do not identify rendered content or trigger a cache bust.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub protected_tool_block_ids: std::collections::BTreeSet<String>,
     /// Decision calibration frozen at the last authorized bust. Absent legacy state stays
     /// neutral until the next bust so a binary table update cannot alter a defer decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7858,6 +7881,41 @@ impl McStore {
     }
 
     pub fn open(descriptor: &StorageDescriptor) -> Result<Self, McStoreError> {
+        Self::open_with_private_permissions(descriptor, true)
+    }
+
+    pub fn open_with_private_permissions(
+        descriptor: &StorageDescriptor,
+        enforce_private_permissions: bool,
+    ) -> Result<Self, McStoreError> {
+        let mut storage_root = None;
+        let mut before = private_permissions::TightenReport::default();
+        if let cortexkit_store_types::StorageBackend::Sqlite { path } = &descriptor.backend {
+            let path = Path::new(path);
+            let root = path.parent().unwrap_or_else(|| Path::new("."));
+            private_permissions::ensure_directory(root, true).map_err(|error| {
+                McStoreError::Serde(format!("storage directory unavailable: {error}"))
+            })?;
+            let root_tightening = private_permissions::tighten_directory(root, true);
+            let tree_tightening =
+                private_permissions::tighten_tree(root, enforce_private_permissions);
+            before = private_permissions::TightenReport {
+                tightened: root_tightening.tightened + tree_tightening.tightened,
+                failures: root_tightening.failures + tree_tightening.failures,
+            };
+            if !path.exists() {
+                match private_permissions::create_file(path, true) {
+                    Ok(file) => drop(file),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(McStoreError::Serde(format!(
+                            "storage file unavailable: {error}"
+                        )));
+                    }
+                }
+            }
+            storage_root = Some(root.to_path_buf());
+        }
         let inner = open_sqlite(descriptor)?;
         inner.with_conn(single_store_domain::set_synchronous_normal_if_wal)?;
         // Registered before migrating: the older migrations of a store below v53 install
@@ -7950,6 +8008,18 @@ impl McStore {
             route_identities_for_test: Mutex::new(HashMap::new()),
         };
         store.prune_transform_session_roots()?;
+        if let Some(root) = storage_root {
+            let after = if enforce_private_permissions {
+                private_permissions::tighten_tree(&root, true)
+            } else {
+                private_permissions::tighten_directory(&root, true)
+            };
+            tracing::info!(
+                tightened = before.tightened + after.tightened,
+                failures = before.failures + after.failures,
+                "mc-store: storage permission tightening"
+            );
+        }
         Ok(store)
     }
 
@@ -17708,6 +17778,19 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn bundled_sqlite_disables_global_memory_status() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let enabled: i64 = conn
+            .query_row(
+                "SELECT sqlite_compileoption_used('DEFAULT_MEMSTATUS=0')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(enabled, 1);
+    }
+
     fn descriptor(dir: &std::path::Path) -> StorageDescriptor {
         StorageDescriptor {
             module_id: "magic-context-test".to_string(),
@@ -19968,6 +20051,78 @@ mod tests {
             .remove("protected_tokens_effective");
         let legacy: ModuleMeta = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.protected_tokens_effective, None);
+    }
+
+    #[test]
+    fn protected_tool_selection_snapshot_round_trips_without_a_schema_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let expected = std::collections::BTreeSet::from(["result#0".to_string()]);
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                protected_tool_block_ids: expected.clone(),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("held-tool", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let restarted = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            restarted
+                .load("held-tool")
+                .unwrap()
+                .meta
+                .protected_tool_block_ids,
+            expected
+        );
+        let legacy: ModuleMeta =
+            serde_json::from_value(serde_json::to_value(ModuleMeta::default()).unwrap()).unwrap();
+        assert!(legacy.protected_tool_block_ids.is_empty());
+    }
+
+    #[test]
+    fn protected_nudge_policy_round_trips_in_the_existing_baseline_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(dir.path());
+        let policy = std::collections::BTreeMap::from([("probe".to_string(), 2)]);
+        let baseline = TailHygieneBaseline {
+            protected_tools_policy: Some(policy.clone()),
+            ..TailHygieneBaseline::default()
+        };
+        {
+            let store = McStore::open_for_test(&descriptor).unwrap();
+            let meta = ModuleMeta {
+                tail_hygiene_baseline: Some(baseline.clone()),
+                ..ModuleMeta::default()
+            };
+            store
+                .commit("nudge-policy", None, &CoreState::default(), &meta)
+                .unwrap();
+        }
+        let store = McStore::open_for_test(&descriptor).unwrap();
+        assert_eq!(
+            store
+                .load("nudge-policy")
+                .unwrap()
+                .meta
+                .tail_hygiene_baseline
+                .unwrap()
+                .protected_tools_policy,
+            Some(policy)
+        );
+        let mut legacy = serde_json::to_value(baseline).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("protected_tools_policy");
+        assert_eq!(
+            serde_json::from_value::<TailHygieneBaseline>(legacy)
+                .unwrap()
+                .protected_tools_policy,
+            None
+        );
     }
 
     #[test]

@@ -79,7 +79,7 @@ function importanceInfo(importance: number): {
 }
 
 /**
- * Importance band → the same CSS color the row pills use, so the timeline strip
+ * Importance band → the chart fill matching the row pill's hue, so the timeline strip
  * encodes importance (red=critical, amber=high, blue=medium, gray=low) instead
  * of a meaningless per-sequence rainbow. `dim` recedes low-importance segments.
  */
@@ -87,12 +87,12 @@ function importanceBarColor(importance: number, expanded: boolean): string {
   const { pillColor } = importanceInfo(importance);
   const base =
     pillColor === "red"
-      ? "var(--red)"
+      ? "var(--chart-bad)"
       : pillColor === "amber"
-        ? "var(--amber)"
+        ? "var(--chart-warn)"
         : pillColor === "blue"
-          ? "var(--accent)"
-          : "var(--text-muted)";
+          ? "var(--chart-info)"
+          : "var(--chart-neutral)";
   // Slightly mute unexpanded segments so the expanded one (and high-importance
   // warm colors) read as the focal points; gray bands recede the most.
   const mix = expanded ? 100 : pillColor === "gray" ? 55 : 78;
@@ -621,10 +621,10 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
           }}
         >
           <span class={`pill ${roleClass(role())}`}>{role()}</span>
-          <span class="mono" style={{ "font-size": "11px", color: "var(--text-secondary)" }}>
+          <span class="num" style={{ "font-size": "11px", color: "var(--text-secondary)" }}>
             {formatDateTime(props.message.timestamp_ms)}
           </span>
-          <span class="mono" style={{ "font-size": "10px", color: "var(--text-muted)" }}>
+          <span class="id-text" title={props.message.message_id}>
             {truncate(props.message.message_id, 16)}
           </span>
         </div>
@@ -855,12 +855,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                           <span class="pill gray">subagent</span>
                         </Show>
                         <Show when={!session.title}>
-                          <span
-                            class="mono"
-                            style={{ "font-size": "10px", color: "var(--text-muted)" }}
-                          >
-                            {truncate(session.session_id, 16)}
-                          </span>
+                          <span class="id-text">{truncate(session.session_id, 16)}</span>
                         </Show>
                       </div>
                       <div class="card-meta">
@@ -964,9 +959,13 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                 </span>
               </div>
               <div class="card-meta">
-                <span class="mono">{detail().session_id}</span>
+                <span class="id-text selectable">{detail().session_id}</span>
                 <Show when={detail().pi_jsonl_path}>
-                  {(path) => <span class="mono">JSONL: {path()}</span>}
+                  {(path) => (
+                    <span>
+                      JSONL: <span class="id-text selectable">{path()}</span>
+                    </span>
+                  )}
                 </Show>
                 <Show when={detail().opencode_session_json}>
                   <span class="pill gray">OpenCode session JSON available</span>
@@ -1098,7 +1097,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                     "margin-bottom": "4px",
                                   }}
                                 >
-                                  <span class="pill gray">📜 #{comp.sequence}</span>
+                                  <span class="pill gray num">#{comp.sequence}</span>
                                   <span
                                     style={{
                                       flex: "1 1 auto",
@@ -1112,8 +1111,8 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                     {comp.title}
                                   </span>
                                   <span
-                                    class="mono"
-                                    style={{ "font-size": "10px", color: "var(--text-muted)" }}
+                                    class="num"
+                                    style={{ "font-size": "11px", color: "var(--text-muted)" }}
                                   >
                                     {compSeg.messages.length} msgs · ordinals {comp.start_message}-
                                     {comp.end_message}
@@ -1182,7 +1181,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                         >
                           <div class="card-title">
                             <span
-                              class="mono"
+                              class="num"
                               style={{ color: "var(--text-muted)", "margin-right": "6px" }}
                             >
                               #{comp.sequence}
@@ -1501,7 +1500,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 }}
                               >
                                 <div class="card-meta">
-                                  <span class="mono">#{note.id}</span>
+                                  <span class="num">#{note.id}</span>
                                   <span>·</span>
                                   <span>{formatRelativeTime(note.created_at)}</span>
                                 </div>
@@ -1599,7 +1598,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                     {(smartNote) => (
                       <div class="card" style={{ "border-left": "3px solid var(--accent)" }}>
                         <div class="card-meta" style={{ "margin-bottom": "4px" }}>
-                          <span class="mono">#{smartNote.id}</span>
+                          <span class="num">#{smartNote.id}</span>
                         </div>
                         <div
                           style={{
@@ -1637,9 +1636,11 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 background:
                                   smartNote.status === "ready"
                                     ? "var(--success)"
-                                    : "var(--text-muted)",
+                                    : "var(--badge-neutral-bg)",
                                 color:
-                                  smartNote.status === "ready" ? "#fff" : "var(--text-primary)",
+                                  smartNote.status === "ready"
+                                    ? "var(--on-accent)"
+                                    : "var(--badge-neutral-text)",
                               }}
                             >
                               {smartNote.status}
@@ -1772,7 +1773,9 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                   <tbody>
                     <tr>
                       <td>Session ID</td>
-                      <td>{metaData().session_id}</td>
+                      <td>
+                        <span class="id-text selectable">{metaData().session_id}</span>
+                      </td>
                     </tr>
                     <tr>
                       <td>Counter</td>
@@ -1803,8 +1806,8 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                       <td>{metaData().last_nudge_tokens.toLocaleString()}</td>
                     </tr>
                     <tr>
-                      <td>Execute hits</td>
-                      <td>{metaData().times_execute_threshold_reached}</td>
+                      <td>Historian runs</td>
+                      <td>{sessionDetail()?.historian_runs ?? 0}</td>
                     </tr>
                     <Show
                       when={sessionDetail()?.harness !== "pi" && sessionDetail()?.harness !== "omp"}
@@ -1824,7 +1827,11 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                     </tr>
                     <tr>
                       <td>System hash</td>
-                      <td>{truncate(metaData().system_prompt_hash, 16) || "—"}</td>
+                      <td>
+                        <span class="id-text" title={metaData().system_prompt_hash}>
+                          {truncate(metaData().system_prompt_hash, 16) || "—"}
+                        </span>
+                      </td>
                     </tr>
                   </tbody>
                 </table>
@@ -1881,13 +1888,21 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                 const conversationPct = () =>
                   hasData() ? (data().conversation_tokens / total()) * 100 : 0;
 
-                // Colors for each section
+                // Segment fills and the label drawn on each come from theme tokens
+                // so the chart stays legible in both light and dark themes.
                 const colors = {
-                  system: "#c084fc",
-                  compartments: "#4a9eff",
-                  facts: "#f0b429",
-                  memories: "#48bb78",
-                  conversation: "#a0aec0",
+                  system: "var(--chart-system)",
+                  compartments: "var(--chart-compartments)",
+                  facts: "var(--chart-facts)",
+                  memories: "var(--chart-memories)",
+                  conversation: "var(--chart-conversation)",
+                };
+                const labelColors = {
+                  system: "var(--chart-system-text)",
+                  compartments: "var(--chart-compartments-text)",
+                  facts: "var(--chart-facts-text)",
+                  memories: "var(--chart-memories-text)",
+                  conversation: "var(--chart-conversation-text)",
                 };
 
                 return (
@@ -1922,7 +1937,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#fff",
+                                color: labelColors.system,
                                 "min-width": systemPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -1939,7 +1954,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#fff",
+                                color: labelColors.compartments,
                                 "min-width": compartmentPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -1956,7 +1971,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#1a1a1a",
+                                color: labelColors.facts,
                                 "min-width": factPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -1973,7 +1988,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#fff",
+                                color: labelColors.memories,
                                 "min-width": memoryPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -1990,7 +2005,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 "justify-content": "center",
                                 "font-size": "11px",
                                 "font-weight": "600",
-                                color: "#1a1a1a",
+                                color: labelColors.conversation,
                                 "min-width": conversationPct() > 8 ? "auto" : "0",
                               }}
                             >
@@ -2025,7 +2040,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 style={{
                                   "font-size": "13px",
                                   "font-weight": "500",
-                                  "font-family": "var(--font-mono)",
+                                  "font-variant-numeric": "tabular-nums",
                                 }}
                               >
                                 {data().system_prompt_tokens.toLocaleString()}{" "}
@@ -2065,7 +2080,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 style={{
                                   "font-size": "13px",
                                   "font-weight": "500",
-                                  "font-family": "var(--font-mono)",
+                                  "font-variant-numeric": "tabular-nums",
                                 }}
                               >
                                 {data().compartment_tokens.toLocaleString()}{" "}
@@ -2105,7 +2120,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 style={{
                                   "font-size": "13px",
                                   "font-weight": "500",
-                                  "font-family": "var(--font-mono)",
+                                  "font-variant-numeric": "tabular-nums",
                                 }}
                               >
                                 {data().fact_tokens.toLocaleString()}{" "}
@@ -2145,7 +2160,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 style={{
                                   "font-size": "13px",
                                   "font-weight": "500",
-                                  "font-family": "var(--font-mono)",
+                                  "font-variant-numeric": "tabular-nums",
                                 }}
                               >
                                 {data().memory_tokens.toLocaleString()}{" "}
@@ -2180,7 +2195,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                                 style={{
                                   "font-size": "13px",
                                   "font-weight": "500",
-                                  "font-family": "var(--font-mono)",
+                                  "font-variant-numeric": "tabular-nums",
                                 }}
                               >
                                 {data().conversation_tokens.toLocaleString()}{" "}
@@ -2214,7 +2229,7 @@ export default function SessionViewer(props: SessionViewerProps = {}) {
                               style={{
                                 "font-size": "14px",
                                 "font-weight": "600",
-                                "font-family": "var(--font-mono)",
+                                "font-variant-numeric": "tabular-nums",
                               }}
                             >
                               {data().total_input_tokens.toLocaleString()}

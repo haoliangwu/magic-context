@@ -54,6 +54,9 @@ function isolateDb(): void {
     const dir = createTestTempDirFromPath(join(tmpdir(), "tool-registry-"));
     tempDirs.push(dir);
     process.env.XDG_DATA_HOME = dir;
+    // The host opens storage asynchronously before registration; this fixture
+    // uses the explicitly synchronous test opener to establish that ready state.
+    expect(openDatabase()).not.toBeNull();
 }
 
 // createToolRegistry only reads ctx.directory; the rest of PluginContext is

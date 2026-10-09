@@ -1,0 +1,1031 @@
+{
+  "schema": 1,
+  "sourceCommit": "114e9ff617a1f492b1baf546b52a93585eb4cfeb",
+  "capturedAt": 1791228540000,
+  "projectionFormat": "exact Magic Context context-hook output before host SDK conversion",
+  "cases": {
+    "Pi": {
+      "sessionId": "pi-temporal-upgrade",
+      "cwd": "/__magic_context_temporal_upgrade_fixture__",
+      "input": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "answer"
+            }
+          ],
+          "api": "test-api",
+          "provider": "test-provider",
+          "model": "test-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 300000
+        },
+        {
+          "role": "user",
+          "content": "question",
+          "timestamp": 600000
+        },
+        {
+          "role": "user",
+          "content": "follow up",
+          "timestamp": 1200000
+        }
+      ],
+      "entryIds": [
+        "prior",
+        "user",
+        "later"
+      ],
+      "projection": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "<session-history></session-history>"
+            }
+          ],
+          "timestamp": 299998
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "<session-history-since>(no new content since last materialization)</session-history-since>"
+            }
+          ],
+          "timestamp": 299999
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "§1§ answer"
+            }
+          ],
+          "api": "test-api",
+          "provider": "test-provider",
+          "model": "test-model",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 300000
+        },
+        {
+          "role": "user",
+          "content": "§2§ <!-- +5m -->\nquestion",
+          "timestamp": 600000
+        },
+        {
+          "role": "user",
+          "content": "§3§ <!-- +10m -->\nfollow up",
+          "timestamp": 1200000
+        }
+      ],
+      "projectionJson": "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<session-history></session-history>\"}],\"timestamp\":299998},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\"}],\"timestamp\":299999},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"§1§ answer\"}],\"api\":\"test-api\",\"provider\":\"test-provider\",\"model\":\"test-model\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":300000},{\"role\":\"user\",\"content\":\"§2§ <!-- +5m -->\\nquestion\",\"timestamp\":600000},{\"role\":\"user\",\"content\":\"§3§ <!-- +10m -->\\nfollow up\",\"timestamp\":1200000}]",
+      "state": {
+        "session_meta": [
+          {
+            "session_id": "pi-temporal-upgrade",
+            "harness": "pi",
+            "last_response_time": 1791228540000,
+            "cache_ttl": "59m",
+            "counter": 3,
+            "tags_version": 3,
+            "last_nudge_tokens": 0,
+            "last_nudge_band": "",
+            "last_nudge_undropped": 0,
+            "last_nudge_level": "",
+            "channel2_nudge_state": "",
+            "channel2_nudge_claimed_at": 0,
+            "channel2_nudge_claim_token": "",
+            "last_emergency_input_sample": 0,
+            "last_transform_error": "",
+            "nudge_anchor_message_id": "",
+            "nudge_anchor_text": "",
+            "sticky_turn_reminder_text": "",
+            "sticky_turn_reminder_message_id": "",
+            "note_nudge_trigger_pending": 0,
+            "note_nudge_trigger_message_id": "",
+            "note_nudge_sticky_text": "",
+            "note_nudge_sticky_message_id": "",
+            "note_nudge_anchors": "[]",
+            "auto_search_hint_decisions": "[]",
+            "last_todo_state": "",
+            "todo_permission_denied": 2,
+            "todo_synthetic_call_id": "",
+            "todo_synthetic_anchor_message_id": "",
+            "todo_synthetic_state_json": "",
+            "is_subagent": 0,
+            "last_context_percentage": 1,
+            "last_input_tokens": 100,
+            "detected_context_limit_provenance": "unknown",
+            "observed_safe_input_tokens": 0,
+            "cache_alert_sent": 0,
+            "times_execute_threshold_reached": 0,
+            "compartment_in_progress": 0,
+            "historian_failure_count": 0,
+            "historian_last_error": null,
+            "historian_last_failure_at": null,
+            "system_prompt_hash": "",
+            "memory_block_cache": "",
+            "memory_block_count": 0,
+            "memory_block_ids": "[]",
+            "pending_compaction_marker_state": null,
+            "compaction_marker_target_end_message_id": null,
+            "pending_pi_compaction_marker_state": null,
+            "new_work_tokens": 0,
+            "total_input_tokens": 0,
+            "deferred_execute_state": "{\"magicContextTokenizerCalibration\":{\"active\":{\"revision\":\"2026-09-30-sol-tokenizer-seeds-v3\",\"providerId\":\"unknown\",\"modelId\":\"unknown\",\"systemRatio\":1,\"toolsRatio\":1,\"proseRatio\":1,\"source\":\"seed\"},\"hygieneUnitsVersion\":2}}",
+            "cached_m0_bytes": {
+              "base64": "PHNlc3Npb24taGlzdG9yeT48L3Nlc3Npb24taGlzdG9yeT4="
+            },
+            "cached_m0_project_memory_epoch": 0,
+            "cached_m0_workspace_fingerprint": null,
+            "cached_m0_project_user_profile_version": 0,
+            "cached_m0_max_compartment_seq": -1,
+            "cached_m0_max_memory_id": 0,
+            "cached_m0_max_mutation_id": 0,
+            "cached_m0_max_memory_mutation_id": 0,
+            "cached_m0_project_docs_hash": "",
+            "cached_m1_bytes": {
+              "base64": "PHNlc3Npb24taGlzdG9yeS1zaW5jZT4obm8gbmV3IGNvbnRlbnQgc2luY2UgbGFzdCBtYXRlcmlhbGl6YXRpb24pPC9zZXNzaW9uLWhpc3Rvcnktc2luY2U+"
+            },
+            "last_observed_model_key": null,
+            "last_usage_context_limit": 0,
+            "prior_boundary_ordinal": 1,
+            "protected_tokens_effective": 8000,
+            "protected_tokens_pre_snapshot": null,
+            "protected_tail_policy_version": 0,
+            "protected_tail_drain_window_started_at": 0,
+            "protected_tail_drain_tokens": 0,
+            "recovery_no_eligible_head_count": 0,
+            "force_emergency_bypass_window_start": 0,
+            "force_emergency_bypass_used": 0,
+            "emergency_drain_active": 0,
+            "historian_drain_failure_at": 0,
+            "wrapup_in_progress_state": null,
+            "compaction_mode_record": "on",
+            "cached_m0_materialized_at": 1791228540000,
+            "cached_m0_session_facts_version": 0,
+            "cached_m0_upgrade_state": "pi-m0m1-v2:ready|compartment-render:cre2|memory-render:mre3|mural-enabled:0|render-budgets:m10000-hpdefault|rendered-budgets:m10000-h60000",
+            "cached_m0_system_hash": "",
+            "cached_m0_tool_set_hash": "",
+            "cached_m0_model_key": "",
+            "cached_m0_project_identity": "dir:8619eb4e7433",
+            "cached_m0_last_baseline_end_message_id": null,
+            "thinking_binding_recovery_target": "",
+            "upgrade_reminded_at": null,
+            "pi_stable_id_scheme": 1,
+            "note_last_read_at": 0,
+            "cleared_reasoning_through_tag": 0,
+            "tool_reclaim_watermark": 3,
+            "stripped_placeholder_ids": "",
+            "stale_reduce_stripped_ids": "",
+            "processed_image_stripped_ids": "",
+            "merged_reasoning_stripped_ids": "",
+            "trailing_blank_decisions": "",
+            "system_prompt_tokens": 0,
+            "compaction_marker_state": "",
+            "key_files": "",
+            "conversation_tokens": 55,
+            "tool_call_tokens": 0,
+            "recomp_partial_range_start": 0,
+            "recomp_partial_range_end": 0,
+            "detected_context_limit": 0,
+            "detected_context_limit_model_key": null,
+            "needs_emergency_recovery": 0,
+            "emergency_recovery_origin": "",
+            "upgrade_reminder_last_sent_at": null,
+            "upgrade_reminder_count": 0,
+            "cached_m0_mural_data_url": null,
+            "cached_m0_mural_hash": null,
+            "coordinate_generation": null,
+            "coordinate_rebase_notice": null
+          }
+        ],
+        "tags": [
+          {
+            "id": 1,
+            "session_id": "pi-temporal-upgrade",
+            "message_id": "prior:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 6,
+            "tag_number": 1,
+            "harness": "pi",
+            "entry_fingerprint": "[null,300000,\"assistant\",null,\"0db52f4076c08251\"]",
+            "token_count": 1,
+            "input_token_count": null,
+            "reasoning_token_count": null,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          },
+          {
+            "id": 2,
+            "session_id": "pi-temporal-upgrade",
+            "message_id": "user:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 21,
+            "tag_number": 2,
+            "harness": "pi",
+            "entry_fingerprint": "[null,600000,\"user\",null,\"7ba488cd4bdbd207\"]",
+            "token_count": 7,
+            "input_token_count": null,
+            "reasoning_token_count": null,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          },
+          {
+            "id": 3,
+            "session_id": "pi-temporal-upgrade",
+            "message_id": "later:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 23,
+            "tag_number": 3,
+            "harness": "pi",
+            "entry_fingerprint": "[null,1200000,\"user\",null,\"8aeabe94cade7041\"]",
+            "token_count": 8,
+            "input_token_count": null,
+            "reasoning_token_count": null,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          }
+        ],
+        "source_contents": [
+          {
+            "tag_id": 1,
+            "session_id": "pi-temporal-upgrade",
+            "content": "answer",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          },
+          {
+            "tag_id": 2,
+            "session_id": "pi-temporal-upgrade",
+            "content": "<!-- +5m -->\nquestion",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          },
+          {
+            "tag_id": 3,
+            "session_id": "pi-temporal-upgrade",
+            "content": "<!-- +10m -->\nfollow up",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          }
+        ],
+        "compression_depth": [],
+        "session_projects": [
+          {
+            "session_id": "pi-temporal-upgrade",
+            "harness": "pi",
+            "project_path": "dir:8619eb4e7433",
+            "updated_at": 1791228540000
+          }
+        ],
+        "lkg_slots": [
+          {
+            "session_id": "pi-temporal-upgrade",
+            "json_prefix_chars": 741,
+            "json_prefix_chunks": 1,
+            "json_prefix_hash": "b6402c83b77e2f66209d024ff9613b2db862c8b34ea0f5e8bb0d3b248738e9e1",
+            "input_id_seq": "{\"version\":1,\"inputIds\":[\"prior\",\"user\",\"later\"],\"piOutputEntryIds\":[null,null,\"prior\",\"user\",\"later\"]}",
+            "input_content_digests": "[\"xqJt8YlgzzcrsZgl24A5ArBG2r7Sg2VAm8kG6jBW8cs\",\"EB_qBR6-6PAijWmw6fjY1w80_SRE4UZeIyyZ_wHqmP4\",\"iIjFKWWy6YzzQpOzPt2hyMYOSgMqJH8Z2dE1u6Y6cCc\"]",
+            "input_content_signatures": "[\"7632e8d6\",\"950ecc4a\",\"d46e6d93\"]",
+            "last_input_message_id": "later",
+            "model_key": null,
+            "provider_key": null,
+            "captured_at": 1791228540000,
+            "row_version": null,
+            "capture_sequence": 1
+          }
+        ],
+        "lkg_slot_chunks": [
+          {
+            "session_id": "pi-temporal-upgrade",
+            "chunk": 0,
+            "hash": "41cf9540a28b1e3a9fe6a03f0dec0c8a03375379a8631c0435ad0f15bdd770de",
+            "body": "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<session-history></session-history>\"}],\"timestamp\":299998},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\"}],\"timestamp\":299999},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"§1§ answer\"}],\"api\":\"test-api\",\"provider\":\"test-provider\",\"model\":\"test-model\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":300000},{\"role\":\"user\",\"content\":\"§2§ <!-- +5m -->\\nquestion\",\"timestamp\":600000},{\"role\":\"user\",\"content\":\"§3§ <!-- +10m -->\\nfollow up\",\"timestamp\":1200000}]"
+          }
+        ]
+      }
+    },
+    "OpenCode 1": {
+      "sessionId": "upgrade-OpenCode 1",
+      "input": [
+        {
+          "info": {
+            "id": "prior",
+            "sessionID": "upgrade-OpenCode 1",
+            "role": "assistant",
+            "time": {
+              "created": 100000,
+              "completed": 300000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "answer"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "user",
+            "sessionID": "upgrade-OpenCode 1",
+            "role": "user",
+            "time": {
+              "created": 600000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "question"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "later",
+            "sessionID": "upgrade-OpenCode 1",
+            "role": "user",
+            "time": {
+              "created": 1200000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "follow up"
+            }
+          ]
+        }
+      ],
+      "projection": [
+        {
+          "info": {
+            "id": "prior",
+            "sessionID": "upgrade-OpenCode 1",
+            "role": "assistant",
+            "time": {
+              "created": 100000,
+              "completed": 300000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ answer"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "user",
+            "sessionID": "upgrade-OpenCode 1",
+            "role": "user",
+            "time": {
+              "created": 600000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§2§ <!-- +5m -->\nquestion"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "later",
+            "sessionID": "upgrade-OpenCode 1",
+            "role": "user",
+            "time": {
+              "created": 1200000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§3§ <!-- +10m -->\nfollow up"
+            }
+          ]
+        }
+      ],
+      "projectionJson": "[{\"info\":{\"id\":\"prior\",\"sessionID\":\"upgrade-OpenCode 1\",\"role\":\"assistant\",\"time\":{\"created\":100000,\"completed\":300000}},\"parts\":[{\"type\":\"text\",\"text\":\"§1§ answer\"}]},{\"info\":{\"id\":\"user\",\"sessionID\":\"upgrade-OpenCode 1\",\"role\":\"user\",\"time\":{\"created\":600000}},\"parts\":[{\"type\":\"text\",\"text\":\"§2§ <!-- +5m -->\\nquestion\"}]},{\"info\":{\"id\":\"later\",\"sessionID\":\"upgrade-OpenCode 1\",\"role\":\"user\",\"time\":{\"created\":1200000}},\"parts\":[{\"type\":\"text\",\"text\":\"§3§ <!-- +10m -->\\nfollow up\"}]}]",
+      "state": {
+        "session_meta": [
+          {
+            "session_id": "upgrade-OpenCode 1",
+            "harness": "pi",
+            "last_response_time": 1791228540000,
+            "cache_ttl": "59m",
+            "counter": 3,
+            "tags_version": 3,
+            "last_nudge_tokens": 0,
+            "last_nudge_band": "",
+            "last_nudge_undropped": 0,
+            "last_nudge_level": "",
+            "channel2_nudge_state": "",
+            "channel2_nudge_claimed_at": 0,
+            "channel2_nudge_claim_token": "",
+            "last_emergency_input_sample": 0,
+            "last_transform_error": "",
+            "nudge_anchor_message_id": "",
+            "nudge_anchor_text": "",
+            "sticky_turn_reminder_text": "",
+            "sticky_turn_reminder_message_id": "",
+            "note_nudge_trigger_pending": 0,
+            "note_nudge_trigger_message_id": "",
+            "note_nudge_sticky_text": "",
+            "note_nudge_sticky_message_id": "",
+            "note_nudge_anchors": "[]",
+            "auto_search_hint_decisions": "[]",
+            "last_todo_state": "",
+            "todo_permission_denied": 2,
+            "todo_synthetic_call_id": "",
+            "todo_synthetic_anchor_message_id": "",
+            "todo_synthetic_state_json": "",
+            "is_subagent": 0,
+            "last_context_percentage": 0,
+            "last_input_tokens": 0,
+            "detected_context_limit_provenance": "unknown",
+            "observed_safe_input_tokens": 0,
+            "cache_alert_sent": 0,
+            "times_execute_threshold_reached": 0,
+            "compartment_in_progress": 0,
+            "historian_failure_count": 0,
+            "historian_last_error": null,
+            "historian_last_failure_at": null,
+            "system_prompt_hash": "",
+            "memory_block_cache": "",
+            "memory_block_count": 0,
+            "memory_block_ids": "",
+            "pending_compaction_marker_state": null,
+            "compaction_marker_target_end_message_id": null,
+            "pending_pi_compaction_marker_state": null,
+            "new_work_tokens": 0,
+            "total_input_tokens": 0,
+            "deferred_execute_state": "{\"magicContextTokenizerCalibration\":{\"active\":{\"revision\":\"2026-09-30-sol-tokenizer-seeds-v3\",\"providerId\":\"anthropic\",\"modelId\":\"claude-sonnet-4-5\",\"systemRatio\":1.02,\"toolsRatio\":1.16,\"proseRatio\":1,\"source\":\"seed\"}}}",
+            "cached_m0_bytes": null,
+            "cached_m0_project_memory_epoch": null,
+            "cached_m0_workspace_fingerprint": null,
+            "cached_m0_project_user_profile_version": null,
+            "cached_m0_max_compartment_seq": null,
+            "cached_m0_max_memory_id": null,
+            "cached_m0_max_mutation_id": null,
+            "cached_m0_max_memory_mutation_id": null,
+            "cached_m0_project_docs_hash": null,
+            "cached_m1_bytes": null,
+            "last_observed_model_key": null,
+            "last_usage_context_limit": 0,
+            "prior_boundary_ordinal": 1,
+            "protected_tokens_effective": 10240,
+            "protected_tokens_pre_snapshot": null,
+            "protected_tail_policy_version": 0,
+            "protected_tail_drain_window_started_at": 0,
+            "protected_tail_drain_tokens": 0,
+            "recovery_no_eligible_head_count": 0,
+            "force_emergency_bypass_window_start": 0,
+            "force_emergency_bypass_used": 0,
+            "emergency_drain_active": 0,
+            "historian_drain_failure_at": 0,
+            "wrapup_in_progress_state": null,
+            "compaction_mode_record": "on",
+            "cached_m0_materialized_at": null,
+            "cached_m0_session_facts_version": null,
+            "cached_m0_upgrade_state": null,
+            "cached_m0_system_hash": null,
+            "cached_m0_tool_set_hash": null,
+            "cached_m0_model_key": null,
+            "cached_m0_project_identity": null,
+            "cached_m0_last_baseline_end_message_id": null,
+            "thinking_binding_recovery_target": "",
+            "upgrade_reminded_at": null,
+            "pi_stable_id_scheme": null,
+            "note_last_read_at": 0,
+            "cleared_reasoning_through_tag": 0,
+            "tool_reclaim_watermark": 3,
+            "stripped_placeholder_ids": "",
+            "stale_reduce_stripped_ids": "",
+            "processed_image_stripped_ids": "",
+            "merged_reasoning_stripped_ids": "",
+            "trailing_blank_decisions": "{\"version\":2,\"trailingBlank\":{},\"cacheTtlPolicy\":{\"value\":\"5m\",\"source\":\"default\",\"modelKey\":\"anthropic/claude-sonnet-4-5\",\"config\":\"5m\"}}",
+            "system_prompt_tokens": 0,
+            "compaction_marker_state": "",
+            "key_files": "",
+            "conversation_tokens": 16,
+            "tool_call_tokens": 0,
+            "recomp_partial_range_start": 0,
+            "recomp_partial_range_end": 0,
+            "detected_context_limit": 0,
+            "detected_context_limit_model_key": null,
+            "needs_emergency_recovery": 0,
+            "emergency_recovery_origin": "",
+            "upgrade_reminder_last_sent_at": null,
+            "upgrade_reminder_count": 0,
+            "cached_m0_mural_data_url": null,
+            "cached_m0_mural_hash": null,
+            "coordinate_generation": null,
+            "coordinate_rebase_notice": null
+          }
+        ],
+        "tags": [
+          {
+            "id": 1,
+            "session_id": "upgrade-OpenCode 1",
+            "message_id": "prior:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 6,
+            "tag_number": 1,
+            "harness": "pi",
+            "entry_fingerprint": null,
+            "token_count": 1,
+            "input_token_count": null,
+            "reasoning_token_count": 0,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          },
+          {
+            "id": 2,
+            "session_id": "upgrade-OpenCode 1",
+            "message_id": "user:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 21,
+            "tag_number": 2,
+            "harness": "pi",
+            "entry_fingerprint": null,
+            "token_count": 7,
+            "input_token_count": null,
+            "reasoning_token_count": 0,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          },
+          {
+            "id": 3,
+            "session_id": "upgrade-OpenCode 1",
+            "message_id": "later:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 23,
+            "tag_number": 3,
+            "harness": "pi",
+            "entry_fingerprint": null,
+            "token_count": 8,
+            "input_token_count": null,
+            "reasoning_token_count": 0,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          }
+        ],
+        "source_contents": [
+          {
+            "tag_id": 1,
+            "session_id": "upgrade-OpenCode 1",
+            "content": "answer",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          },
+          {
+            "tag_id": 2,
+            "session_id": "upgrade-OpenCode 1",
+            "content": "<!-- +5m -->\nquestion",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          },
+          {
+            "tag_id": 3,
+            "session_id": "upgrade-OpenCode 1",
+            "content": "<!-- +10m -->\nfollow up",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          }
+        ],
+        "compression_depth": [],
+        "session_projects": [],
+        "lkg_slots": [
+          {
+            "session_id": "upgrade-OpenCode 1",
+            "json_prefix_chars": 488,
+            "json_prefix_chunks": 1,
+            "json_prefix_hash": "ce241588a94f02a31abddece7cdc7b296ef38cf38505d98bcf6f59edabbca7c1",
+            "input_id_seq": "[\"prior\",\"user\",\"later\"]",
+            "input_content_digests": "[\"1IEu0EJ2Qd0B8LWcZ8NogtczV-7hKUN5y1dMm2n5xCY\",\"_ItOeSGW-34ewZu85_tFUW72TGhbp453G_SrSZZh7cM\",\"YD2t-mUALXcM0bSfAmwx1qWO-eHU83CZnUDVosN74uQ\"]",
+            "input_content_signatures": null,
+            "last_input_message_id": "later",
+            "model_key": "anthropic/claude-sonnet-4-5",
+            "provider_key": "anthropic",
+            "captured_at": 1791228540000,
+            "row_version": null,
+            "capture_sequence": null
+          }
+        ],
+        "lkg_slot_chunks": [
+          {
+            "session_id": "upgrade-OpenCode 1",
+            "chunk": 0,
+            "hash": "84eb42fd3653a2abd7a0a413fb3254ccfbcd34c4b729873597f8d2c9398c6345",
+            "body": "[{\"info\":{\"id\":\"prior\",\"sessionID\":\"upgrade-OpenCode 1\",\"role\":\"assistant\",\"time\":{\"created\":100000,\"completed\":300000}},\"parts\":[{\"type\":\"text\",\"text\":\"§1§ answer\"}]},{\"info\":{\"id\":\"user\",\"sessionID\":\"upgrade-OpenCode 1\",\"role\":\"user\",\"time\":{\"created\":600000}},\"parts\":[{\"type\":\"text\",\"text\":\"§2§ <!-- +5m -->\\nquestion\"}]},{\"info\":{\"id\":\"later\",\"sessionID\":\"upgrade-OpenCode 1\",\"role\":\"user\",\"time\":{\"created\":1200000}},\"parts\":[{\"type\":\"text\",\"text\":\"§3§ <!-- +10m -->\\nfollow up\"}]}]"
+          }
+        ]
+      }
+    },
+    "OpenCode 2": {
+      "sessionId": "upgrade-OpenCode 2",
+      "input": [
+        {
+          "info": {
+            "id": "prior",
+            "sessionID": "upgrade-OpenCode 2",
+            "role": "assistant",
+            "time": {
+              "created": 100000,
+              "completed": 300000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "answer"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "user",
+            "sessionID": "upgrade-OpenCode 2",
+            "role": "user",
+            "time": {
+              "created": 600000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "question"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "later",
+            "sessionID": "upgrade-OpenCode 2",
+            "role": "user",
+            "time": {
+              "created": 1200000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "follow up"
+            }
+          ]
+        }
+      ],
+      "projection": [
+        {
+          "info": {
+            "id": "prior",
+            "sessionID": "upgrade-OpenCode 2",
+            "role": "assistant",
+            "time": {
+              "created": 100000,
+              "completed": 300000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§1§ answer"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "user",
+            "sessionID": "upgrade-OpenCode 2",
+            "role": "user",
+            "time": {
+              "created": 600000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§2§ <!-- +5m -->\nquestion"
+            }
+          ]
+        },
+        {
+          "info": {
+            "id": "later",
+            "sessionID": "upgrade-OpenCode 2",
+            "role": "user",
+            "time": {
+              "created": 1200000
+            }
+          },
+          "parts": [
+            {
+              "type": "text",
+              "text": "§3§ <!-- +10m -->\nfollow up"
+            }
+          ]
+        }
+      ],
+      "projectionJson": "[{\"info\":{\"id\":\"prior\",\"sessionID\":\"upgrade-OpenCode 2\",\"role\":\"assistant\",\"time\":{\"created\":100000,\"completed\":300000}},\"parts\":[{\"type\":\"text\",\"text\":\"§1§ answer\"}]},{\"info\":{\"id\":\"user\",\"sessionID\":\"upgrade-OpenCode 2\",\"role\":\"user\",\"time\":{\"created\":600000}},\"parts\":[{\"type\":\"text\",\"text\":\"§2§ <!-- +5m -->\\nquestion\"}]},{\"info\":{\"id\":\"later\",\"sessionID\":\"upgrade-OpenCode 2\",\"role\":\"user\",\"time\":{\"created\":1200000}},\"parts\":[{\"type\":\"text\",\"text\":\"§3§ <!-- +10m -->\\nfollow up\"}]}]",
+      "state": {
+        "session_meta": [
+          {
+            "session_id": "upgrade-OpenCode 2",
+            "harness": "pi",
+            "last_response_time": 1791228540000,
+            "cache_ttl": "59m",
+            "counter": 3,
+            "tags_version": 3,
+            "last_nudge_tokens": 0,
+            "last_nudge_band": "",
+            "last_nudge_undropped": 0,
+            "last_nudge_level": "",
+            "channel2_nudge_state": "",
+            "channel2_nudge_claimed_at": 0,
+            "channel2_nudge_claim_token": "",
+            "last_emergency_input_sample": 0,
+            "last_transform_error": "",
+            "nudge_anchor_message_id": "",
+            "nudge_anchor_text": "",
+            "sticky_turn_reminder_text": "",
+            "sticky_turn_reminder_message_id": "",
+            "note_nudge_trigger_pending": 0,
+            "note_nudge_trigger_message_id": "",
+            "note_nudge_sticky_text": "",
+            "note_nudge_sticky_message_id": "",
+            "note_nudge_anchors": "[]",
+            "auto_search_hint_decisions": "[]",
+            "last_todo_state": "",
+            "todo_permission_denied": 2,
+            "todo_synthetic_call_id": "",
+            "todo_synthetic_anchor_message_id": "",
+            "todo_synthetic_state_json": "",
+            "is_subagent": 0,
+            "last_context_percentage": 0,
+            "last_input_tokens": 0,
+            "detected_context_limit_provenance": "unknown",
+            "observed_safe_input_tokens": 0,
+            "cache_alert_sent": 0,
+            "times_execute_threshold_reached": 0,
+            "compartment_in_progress": 0,
+            "historian_failure_count": 0,
+            "historian_last_error": null,
+            "historian_last_failure_at": null,
+            "system_prompt_hash": "",
+            "memory_block_cache": "",
+            "memory_block_count": 0,
+            "memory_block_ids": "",
+            "pending_compaction_marker_state": null,
+            "compaction_marker_target_end_message_id": null,
+            "pending_pi_compaction_marker_state": null,
+            "new_work_tokens": 0,
+            "total_input_tokens": 0,
+            "deferred_execute_state": "{\"magicContextTokenizerCalibration\":{\"active\":{\"revision\":\"2026-09-30-sol-tokenizer-seeds-v3\",\"providerId\":\"anthropic\",\"modelId\":\"claude-sonnet-4-5\",\"systemRatio\":1.02,\"toolsRatio\":1.16,\"proseRatio\":1,\"source\":\"seed\"}}}",
+            "cached_m0_bytes": null,
+            "cached_m0_project_memory_epoch": null,
+            "cached_m0_workspace_fingerprint": null,
+            "cached_m0_project_user_profile_version": null,
+            "cached_m0_max_compartment_seq": null,
+            "cached_m0_max_memory_id": null,
+            "cached_m0_max_mutation_id": null,
+            "cached_m0_max_memory_mutation_id": null,
+            "cached_m0_project_docs_hash": null,
+            "cached_m1_bytes": null,
+            "last_observed_model_key": null,
+            "last_usage_context_limit": 0,
+            "prior_boundary_ordinal": 1,
+            "protected_tokens_effective": 10240,
+            "protected_tokens_pre_snapshot": null,
+            "protected_tail_policy_version": 0,
+            "protected_tail_drain_window_started_at": 0,
+            "protected_tail_drain_tokens": 0,
+            "recovery_no_eligible_head_count": 0,
+            "force_emergency_bypass_window_start": 0,
+            "force_emergency_bypass_used": 0,
+            "emergency_drain_active": 0,
+            "historian_drain_failure_at": 0,
+            "wrapup_in_progress_state": null,
+            "compaction_mode_record": "on",
+            "cached_m0_materialized_at": null,
+            "cached_m0_session_facts_version": null,
+            "cached_m0_upgrade_state": null,
+            "cached_m0_system_hash": null,
+            "cached_m0_tool_set_hash": null,
+            "cached_m0_model_key": null,
+            "cached_m0_project_identity": null,
+            "cached_m0_last_baseline_end_message_id": null,
+            "thinking_binding_recovery_target": "",
+            "upgrade_reminded_at": null,
+            "pi_stable_id_scheme": null,
+            "note_last_read_at": 0,
+            "cleared_reasoning_through_tag": 0,
+            "tool_reclaim_watermark": 3,
+            "stripped_placeholder_ids": "",
+            "stale_reduce_stripped_ids": "",
+            "processed_image_stripped_ids": "",
+            "merged_reasoning_stripped_ids": "",
+            "trailing_blank_decisions": "{\"version\":2,\"trailingBlank\":{},\"cacheTtlPolicy\":{\"value\":\"5m\",\"source\":\"default\",\"modelKey\":\"anthropic/claude-sonnet-4-5\",\"config\":\"5m\"}}",
+            "system_prompt_tokens": 0,
+            "compaction_marker_state": "",
+            "key_files": "",
+            "conversation_tokens": 16,
+            "tool_call_tokens": 0,
+            "recomp_partial_range_start": 0,
+            "recomp_partial_range_end": 0,
+            "detected_context_limit": 0,
+            "detected_context_limit_model_key": null,
+            "needs_emergency_recovery": 0,
+            "emergency_recovery_origin": "",
+            "upgrade_reminder_last_sent_at": null,
+            "upgrade_reminder_count": 0,
+            "cached_m0_mural_data_url": null,
+            "cached_m0_mural_hash": null,
+            "coordinate_generation": null,
+            "coordinate_rebase_notice": null
+          }
+        ],
+        "tags": [
+          {
+            "id": 1,
+            "session_id": "upgrade-OpenCode 2",
+            "message_id": "prior:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 6,
+            "tag_number": 1,
+            "harness": "pi",
+            "entry_fingerprint": null,
+            "token_count": 1,
+            "input_token_count": null,
+            "reasoning_token_count": 0,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          },
+          {
+            "id": 2,
+            "session_id": "upgrade-OpenCode 2",
+            "message_id": "user:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 21,
+            "tag_number": 2,
+            "harness": "pi",
+            "entry_fingerprint": null,
+            "token_count": 7,
+            "input_token_count": null,
+            "reasoning_token_count": 0,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          },
+          {
+            "id": 3,
+            "session_id": "upgrade-OpenCode 2",
+            "message_id": "later:p0",
+            "type": "message",
+            "status": "active",
+            "byte_size": 23,
+            "tag_number": 3,
+            "harness": "pi",
+            "entry_fingerprint": null,
+            "token_count": 8,
+            "input_token_count": null,
+            "reasoning_token_count": 0,
+            "reasoning_byte_size": 0,
+            "drop_mode": "full",
+            "tool_name": null,
+            "input_byte_size": 0,
+            "caveman_depth": 0,
+            "tool_owner_message_id": null
+          }
+        ],
+        "source_contents": [
+          {
+            "tag_id": 1,
+            "session_id": "upgrade-OpenCode 2",
+            "content": "answer",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          },
+          {
+            "tag_id": 2,
+            "session_id": "upgrade-OpenCode 2",
+            "content": "<!-- +5m -->\nquestion",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          },
+          {
+            "tag_id": 3,
+            "session_id": "upgrade-OpenCode 2",
+            "content": "<!-- +10m -->\nfollow up",
+            "created_at": 1791228540000,
+            "harness": "pi"
+          }
+        ],
+        "compression_depth": [],
+        "session_projects": [],
+        "lkg_slots": [
+          {
+            "session_id": "upgrade-OpenCode 2",
+            "json_prefix_chars": 488,
+            "json_prefix_chunks": 1,
+            "json_prefix_hash": "e50af976c0c297c64e549bbf3d6dec9a8d1f329ab705d3ee1587d09f100d464b",
+            "input_id_seq": "[\"prior\",\"user\",\"later\"]",
+            "input_content_digests": "[\"nolvA-LeUzEMwDCw49XWfiJu7K2JFE-E1Cmvkd4eunU\",\"sA584INPakHUtqWEiKUW-JbzsBqbfiScjcqcVnodoVc\",\"D765fcOY2oaDPwImE1W5YElI0PcGlq0ypWknT0hr3Wo\"]",
+            "input_content_signatures": null,
+            "last_input_message_id": "later",
+            "model_key": "anthropic/claude-sonnet-4-5",
+            "provider_key": "anthropic",
+            "captured_at": 1791228540000,
+            "row_version": null,
+            "capture_sequence": null
+          }
+        ],
+        "lkg_slot_chunks": [
+          {
+            "session_id": "upgrade-OpenCode 2",
+            "chunk": 0,
+            "hash": "1c0116b30e70555fe2292551033021e14da95b39ed6fc45744c0b5e47070a985",
+            "body": "[{\"info\":{\"id\":\"prior\",\"sessionID\":\"upgrade-OpenCode 2\",\"role\":\"assistant\",\"time\":{\"created\":100000,\"completed\":300000}},\"parts\":[{\"type\":\"text\",\"text\":\"§1§ answer\"}]},{\"info\":{\"id\":\"user\",\"sessionID\":\"upgrade-OpenCode 2\",\"role\":\"user\",\"time\":{\"created\":600000}},\"parts\":[{\"type\":\"text\",\"text\":\"§2§ <!-- +5m -->\\nquestion\"}]},{\"info\":{\"id\":\"later\",\"sessionID\":\"upgrade-OpenCode 2\",\"role\":\"user\",\"time\":{\"created\":1200000}},\"parts\":[{\"type\":\"text\",\"text\":\"§3§ <!-- +10m -->\\nfollow up\"}]}]"
+          }
+        ]
+      }
+    }
+  }
+}

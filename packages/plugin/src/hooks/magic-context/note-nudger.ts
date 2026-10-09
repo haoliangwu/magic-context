@@ -34,6 +34,45 @@ import { formatNoteNudge, noteNudgePickIndex, noteTouchedAt } from "../../tools/
 
 export type NoteNudgeTrigger = "historian_complete" | "commit_detected" | "todos_complete";
 
+export interface NoteNudgeDeliveryEligibility {
+    isFirstServe: boolean;
+    isCacheBustingPass: boolean;
+}
+
+// A cold observer cannot prove that its input was never served by an earlier
+// plugin version. Seed that window conservatively; only later, unseen live-tail
+// users can receive fresh nudges on defer. Retaining every observed user fences
+// off earlier users reintroduced by a branch/window change. Observation is read-
+// only: replay must not acquire a database write lock just to suppress a nudge.
+const observedUsers = new WeakMap<Database, Map<string, Set<string>>>();
+
+export function observeNoteNudgeServe(args: {
+    db: Database;
+    sessionId: string;
+    userMessageIds: readonly string[];
+    anchorMessageId: string | null;
+    isLiveTail: boolean;
+    isCacheBustingPass: boolean;
+}): NoteNudgeDeliveryEligibility {
+    let sessions = observedUsers.get(args.db);
+    if (!sessions) {
+        sessions = new Map();
+        observedUsers.set(args.db, sessions);
+    }
+    let seen = sessions.get(args.sessionId);
+    const warm = seen !== undefined && seen.size > 0;
+    if (!seen) seen = new Set();
+    const firstServe = args.anchorMessageId !== null && !seen.has(args.anchorMessageId);
+    // Reserve before appending or serving anything. An aborted request may miss
+    // one nudge rather than changing a message a previous request could have sent.
+    for (const id of args.userMessageIds) seen.add(id);
+    sessions.set(args.sessionId, seen);
+    return {
+        isFirstServe: warm && args.isLiveTail && firstServe,
+        isCacheBustingPass: args.anchorMessageId !== null && args.isCacheBustingPass,
+    };
+}
+
 const NOTE_NUDGE_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes
 
 // In-memory delivery timestamp per session. Deliberately not persisted: after
@@ -88,10 +127,10 @@ export function onNoteTrigger(db: Database, sessionId: string, trigger: NoteNudg
  * Returns the nudge text if yes, null if no.
  * Does NOT clear triggerPending — call markNoteNudgeDelivered() after successful placement.
  *
- * @param currentUserMessageId - The latest user message ID in this transform pass.
- *   If it matches the trigger-time message, delivery is deferred to avoid busting
- *   the Anthropic prompt-cache prefix (the trigger fired during the agent's turn,
- *   so injecting into the current user message would mutate cached content).
+ * @param currentUserMessageId - The user message that will receive the nudge.
+ * @param eligibility - Hosts must supply first-serve/cache-bust permission from
+ *   observeNoteNudgeServe on every pass. Trigger-time deferral is retained only
+ *   for legacy callers that do not have a wire window.
  * @param projectIdentity - Project identity for resolving ready smart notes.
  * @param noteReadStillVisible - True if the agent currently has a non-stripped
  *   `ctx_note(action="read")` tool call in their visible message context. When
@@ -108,15 +147,27 @@ export function peekNoteNudgeText(
     currentUserMessageId?: string | null,
     projectIdentity?: string,
     noteReadStillVisible?: boolean,
+    eligibility?: NoteNudgeDeliveryEligibility,
 ): string | null {
     const state = getPersistedNoteNudge(db, sessionId);
 
     if (!state.triggerPending) return null;
 
+    // Trigger-time identity is not evidence of first serve. In particular a
+    // rebuilt/tagged window may resolve a different user than the raw window.
+    // Hosts observe every pass, including those with no pending trigger.
+    if (eligibility && !eligibility.isFirstServe && !eligibility.isCacheBustingPass) {
+        sessionLog(
+            sessionId,
+            "note-nudge: deferring — user already served or first serve unproven",
+        );
+        return null;
+    }
+
     // On first peek after trigger, record the current user message as the
     // trigger-time message. This is filled here (not in onNoteTrigger) because
     // hook callers like tool.execute.after don't have access to the message array.
-    if (!state.triggerMessageId && currentUserMessageId) {
+    if (!eligibility && !state.triggerMessageId && currentUserMessageId) {
         setPersistedNoteNudgeTriggerMessageId(db, sessionId, currentUserMessageId);
         state.triggerMessageId = currentUserMessageId;
     }
@@ -124,6 +175,7 @@ export function peekNoteNudgeText(
     // Defer delivery until a NEW user message arrives after the trigger.
     // Injecting into the trigger-time message would bust the cached prefix.
     if (
+        !eligibility &&
         state.triggerMessageId &&
         currentUserMessageId &&
         state.triggerMessageId === currentUserMessageId
@@ -302,7 +354,11 @@ export function markNoteNudgeDelivered(
     const outcome = db
         .transaction(() => {
             const delivered = deliverNoteNudgeAtomic(db, sessionId, messageId, text);
-            const noticeId = text?.match(
+            // Both hosts persist the instruction envelope, not the bare nudge.
+            // Match its contents so a delivered warning is acknowledged instead
+            // of being selected again at every later work boundary.
+            const nudgeText = text?.replace(/^\s*<instruction name="deferred_notes">/, "") ?? "";
+            const noticeId = nudgeText.match(
                 /^Smart note check unavailable: [\s\S]*Read ctx_note #(\d+) for the condition/,
             );
             if (delivered.ok && noticeId) {
@@ -368,6 +424,7 @@ export function clearNoteNudgeState(
         clearAllNoteNudgeState(db, sessionId);
     }
     lastDeliveredAt.delete(sessionId); // also reset in-memory cooldown
+    observedUsers.get(db)?.delete(sessionId);
 }
 
 export function clearAllNoteNudgeState(db: Database, sessionId: string): void {

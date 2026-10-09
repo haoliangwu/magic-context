@@ -1,16 +1,22 @@
 import { afterEach, expect, test } from "bun:test";
 import { runMigrations } from "@magic-context/core/features/magic-context/migrations";
 import { initializeDatabase } from "@magic-context/core/features/magic-context/storage-db";
+import { getOrCreateSessionMeta } from "@magic-context/core/features/magic-context/storage-meta";
 import { calibrationForModelKey } from "@magic-context/core/hooks/magic-context/decision-calibration";
+import { outgoingContextRefusal } from "@magic-context/core/hooks/magic-context/emergency-fail-closed";
 import { resetLkgSlotsForTest } from "@magic-context/core/hooks/magic-context/lkg-slot";
 import { Database } from "@magic-context/core/shared/sqlite";
+import { persistPiPressureFromMessageEnd } from "./index";
 import {
 	clearPiLkgSessionState,
 	createPiLkgCoordinator,
 	notePiLkgProviderUsage,
 } from "./pi-lkg";
 import { readPiLkgFitEnvelope } from "./pi-lkg-fit-envelope";
-import { assertPiRawFallbackFits } from "./pi-raw-fallback";
+import {
+	assertPiRawFallbackFits,
+	estimatePiOutgoingInputTokens,
+} from "./pi-raw-fallback";
 
 const key = "openai-codex/gpt-5.6-sol";
 const databases: Database[] = [];
@@ -20,7 +26,8 @@ afterEach(() => {
 	resetLkgSlotsForTest();
 	for (const db of databases.splice(0)) db.close();
 });
-function harness() {
+function harness(modelKey = key, prefixOverride?: unknown[]) {
+	const provider = modelKey.slice(0, modelKey.indexOf("/"));
 	const db = new Database(":memory:");
 	databases.push(db);
 	initializeDatabase(db);
@@ -34,12 +41,12 @@ function harness() {
 	const envelope = readPiLkgFitEnvelope(
 		{ getSystemPrompt: () => "Complete host prompt." },
 		{ getAllTools: () => [] },
-		key,
-		calibrationForModelKey(key),
+		modelKey,
+		calibrationForModelKey(modelKey),
 	);
 	if (!envelope?.envelopeSignature)
 		throw new Error("complete envelope required");
-	const prefix = [
+	const prefix = prefixOverride ?? [
 		{
 			role: "user",
 			timestamp: 1,
@@ -56,8 +63,8 @@ function harness() {
 		sessionId,
 		messages: prefix,
 		entryIds: ["input"],
-		modelKey: key,
-		providerKey: "openai-codex",
+		modelKey,
+		providerKey: provider,
 	});
 	const recapture = (flush = true) => {
 		coordinator.captureAppliedPass({
@@ -77,8 +84,8 @@ function harness() {
 	const assistant = {
 		role: "assistant",
 		content: [{ type: "text", text: "Accepted reply" }],
-		model: "gpt-5.6-sol",
-		provider: "openai-codex",
+		model: modelKey.slice(modelKey.indexOf("/") + 1),
+		provider,
 		timestamp: Date.now() + 1,
 		stopReason: "stop",
 		usage: {
@@ -99,8 +106,8 @@ function harness() {
 				sessionId,
 				messages: [...prefix, ...tail],
 				entryIds: ["input", "answer", "new-input"],
-				modelKey: key,
-				providerKey: "openai-codex",
+				modelKey,
+				providerKey: provider,
 			}),
 			(id) => (id === "answer" ? parent : undefined),
 		);
@@ -108,6 +115,42 @@ function harness() {
 		db,
 		sessionId,
 		coordinator,
+		prefix,
+		captureMessages(
+			messages: unknown[],
+			entryIds: string[],
+			outputMessages = messages,
+			outputEntryIds = entryIds,
+		) {
+			coordinator.captureAppliedPass({
+				snapshot: coordinator.beginPass({
+					sessionId,
+					messages,
+					entryIds,
+					modelKey,
+					providerKey: provider,
+				}),
+				outputMessages,
+				outputEntryIds,
+				cacheBusting: false,
+				hostEnvelopeSignature: envelope.envelopeSignature,
+			});
+			if (!capture) throw new Error("scheduled capture required");
+			capture();
+			capture = undefined;
+		},
+		outgoing(messages: readonly unknown[], parent = "input") {
+			const snapshot = coordinator.beginPass({
+				sessionId,
+				messages: [...prefix, ...tail],
+				entryIds: ["input", "answer", "new-input"],
+				modelKey,
+				providerKey: provider,
+			});
+			return coordinator.measureOutgoingPrefix(snapshot, messages, (id) =>
+				id === "answer" ? parent : undefined,
+			);
+		},
 		envelope,
 		assistant,
 		tail,
@@ -115,6 +158,57 @@ function harness() {
 		recapture,
 	};
 }
+
+test("Pi healthy refusal prefers correlated provider usage and prices only the new tail", () => {
+	const h = harness("anthropic/claude-fable-5-1", [
+		{ role: "user", content: "word ".repeat(20000) },
+	]);
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	const messages = [
+		...h.prefix,
+		{
+			...h.assistant,
+			content: [{ type: "text", text: "§2§ Accepted reply" }],
+		},
+		h.tail[1],
+	];
+	const basis = h.outgoing(messages);
+	expect(basis?.inputTokens).toBe(130);
+	const estimate = estimatePiOutgoingInputTokens(messages, h.envelope, basis);
+	expect(estimate.tokens).toBeGreaterThan(16000);
+	expect(estimate.refusalGrade).toBe(true);
+	expect(estimate.refusalBasis).toBe("provider-prefix");
+	expect(estimate.refusalTokens).toBeLessThan(200);
+	expect(outgoingContextRefusal(estimate, 16000)).toBeUndefined();
+	expect(
+		h.outgoing([{ role: "user", content: "changed prefix" }, ...h.tail]),
+	).toBeUndefined();
+	expect(h.outgoing(messages, "wrong-parent")).toBeUndefined();
+	const mismatched = estimatePiOutgoingInputTokens(
+		messages,
+		{ ...h.envelope!, envelopeSignature: "different" },
+		basis,
+	);
+	expect(mismatched.refusalBasis).toBe("calibrated");
+});
+
+test("Pi measured preceding overflow does not refuse a fitting protected subset", () => {
+	const h = harness("anthropic/claude-fable-5-1", [
+		{ role: "user", content: "hello" },
+	]);
+	h.assistant.usage.input = 17000;
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	const messages = [...h.prefix, ...h.tail];
+	const estimate = estimatePiOutgoingInputTokens(
+		messages,
+		h.envelope,
+		h.outgoing(messages),
+	);
+	expect(estimate.tokens).toBeLessThan(1000);
+	expect(estimate.refusalTokens).toBeGreaterThan(16000);
+	expect(outgoingContextRefusal(estimate, 16000, 0)).toBeUndefined();
+	expect(outgoingContextRefusal(estimate, 16000, 10)).toBeUndefined();
+});
 
 test("correlated provider input includes cached tokens and prices only the appended reply and new tail", () => {
 	const h = harness();
@@ -184,9 +278,201 @@ test("provider usage requires the real JSONL parent and the exact captured pass"
 	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
 	const wrongParent = h.replay("different-parent");
 	expect(wrongParent.ok && wrongParent.measuredPrefix).toBeUndefined();
-	h.recapture();
-	const superseded = h.replay();
-	expect(superseded.ok && superseded.measuredPrefix).toBeUndefined();
+});
+
+for (const flush of [true, false]) {
+	test(`identical unmeasured recapture retains the correlated provider prefix (deferred commit ${flush ? "flushed" : "pending"})`, () => {
+		const h = harness();
+		expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(
+			true,
+		);
+		h.recapture(flush);
+		const replay = h.replay();
+		if (!replay.ok) throw new Error(replay.reason);
+		expect(replay.measuredPrefix?.inputTokens).toBe(130);
+		expect(replay.measuredPrefix?.appendedMessages).toEqual(h.tail);
+	});
+}
+
+test("append-only unmeasured capture and set-aside estimate retain provider-priced fit without changing replay bytes", async () => {
+	const h = harness("anthropic/claude-fable-5-1", [
+		{ role: "user", content: "word ".repeat(310000) },
+	]);
+	h.assistant.usage.input = 262325;
+	h.assistant.usage.totalTokens = 262365;
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	await persistPiPressureFromMessageEnd({
+		db: h.db,
+		sessionId: h.sessionId,
+		message: h.assistant,
+		piContextWindow: 500000,
+	});
+	const appended = [...h.prefix, ...h.tail];
+	h.captureMessages(appended, ["input", "answer", "new-input"]);
+	const failedReply = {
+		...h.assistant,
+		stopReason: "error",
+		usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, totalTokens: 0 },
+	};
+	expect(notePiLkgProviderUsage(h.sessionId, "new-input", failedReply)).toBe(
+		false,
+	);
+	const newTail = [
+		failedReply,
+		{ role: "user", content: "retry", timestamp: Date.now() + 2 },
+	];
+	await persistPiPressureFromMessageEnd({
+		db: h.db,
+		sessionId: h.sessionId,
+		message: newTail[1],
+		piContextWindow: 500000,
+		piTokens: 418211,
+		piTokensIsRawBranchEstimate: true,
+	});
+	expect(getOrCreateSessionMeta(h.db, h.sessionId).lastInputTokens).toBe(
+		262355,
+	);
+	const replay = h.coordinator.replay(
+		h.coordinator.beginPass({
+			sessionId: h.sessionId,
+			messages: [...appended, ...newTail],
+			entryIds: ["input", "answer", "new-input", "failed", "retry"],
+			modelKey: "anthropic/claude-fable-5-1",
+			providerKey: "anthropic",
+		}),
+		(id) => (id === "answer" ? "input" : "new-input"),
+	);
+	if (!replay.ok) throw new Error(replay.reason);
+	expect(JSON.stringify(replay.messages)).toBe(
+		JSON.stringify([...appended, ...newTail]),
+	);
+	expect(replay.measuredPrefix?.inputTokens).toBe(262355);
+	expect(replay.measuredPrefix?.appendedMessages).toEqual([
+		...h.tail,
+		...newTail,
+	]);
+	const logs: string[] = [];
+	expect(() =>
+		assertPiRawFallbackFits(
+			replay.messages,
+			375000,
+			(line) => logs.push(line),
+			null,
+			h.envelope,
+			replay.measuredPrefix,
+		),
+	).not.toThrow();
+	expect(logs.join("\n")).toContain(
+		"lkg_fit_basis=provider_input measured_input=262355",
+	);
+	// The same bytes must still fail closed without a correlated measurement.
+	expect(() =>
+		assertPiRawFallbackFits(
+			replay.messages,
+			375000,
+			() => {},
+			null,
+			h.envelope,
+		),
+	).toThrow();
+	const healthy = h.outgoing(appended);
+	expect(healthy?.inputTokens).toBe(262355);
+	expect(healthy?.appendedMessages).toEqual(h.tail);
+	expect(h.outgoing(appended, "wrong-parent")).toBeUndefined();
+});
+
+for (const change of ["rewrite", "drop", "envelope"] as const) {
+	test(`unmeasured ${change} capture cannot borrow an earlier provider measurement`, () => {
+		const h = harness();
+		expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(
+			true,
+		);
+		const messages = [...h.prefix, ...h.tail];
+		const ids = ["input", "answer", "new-input"];
+		const output = [...messages];
+		const outputIds = [...ids];
+		if (change === "rewrite")
+			output[0] = { role: "user", content: "changed earlier served bytes" };
+		if (change === "drop") {
+			output.shift();
+			outputIds.shift();
+		}
+		if (change === "envelope") h.envelope.envelopeSignature = "changed-host";
+		h.captureMessages(messages, ids, output, outputIds);
+		const replay = h.coordinator.replay(
+			h.coordinator.beginPass({
+				sessionId: h.sessionId,
+				messages: [...messages, { role: "user", content: "retry" }],
+				entryIds: [...ids, "retry"],
+				modelKey: key,
+				providerKey: "openai-codex",
+			}),
+			(id) => (id === "answer" ? "input" : "new-input"),
+		);
+		if (!replay.ok) throw new Error(replay.reason);
+		expect(replay.measuredPrefix).toBeUndefined();
+		// Restoring the old bytes cannot resurrect invalidated provider evidence.
+		h.captureMessages(messages, ids);
+		const restored = h.outgoing(messages);
+		expect(restored).toBeUndefined();
+	});
+}
+
+test("a new correlated provider reply replaces the retained older measurement", () => {
+	const h = harness();
+	expect(notePiLkgProviderUsage(h.sessionId, "input", h.assistant)).toBe(true);
+	const appended = [...h.prefix, ...h.tail];
+	h.captureMessages(appended, ["input", "answer", "new-input"]);
+	const newReply = {
+		...h.assistant,
+		timestamp: Date.now() + 1,
+		usage: {
+			input: 200,
+			cacheRead: 20,
+			cacheWrite: 10,
+			output: 10,
+			totalTokens: 240,
+		},
+	};
+	expect(notePiLkgProviderUsage(h.sessionId, "new-input", newReply)).toBe(true);
+	const tail = [newReply, { role: "user", content: "next input" }];
+	const replay = h.coordinator.replay(
+		h.coordinator.beginPass({
+			sessionId: h.sessionId,
+			messages: [...appended, ...tail],
+			entryIds: ["input", "answer", "new-input", "new-answer", "next-input"],
+			modelKey: key,
+			providerKey: "openai-codex",
+		}),
+		(id) => (id === "new-answer" ? "new-input" : "input"),
+	);
+	if (!replay.ok) throw new Error(replay.reason);
+	expect(replay.measuredPrefix?.inputTokens).toBe(230);
+	expect(replay.measuredPrefix?.appendedMessages).toEqual(tail);
+});
+
+test("an over-limit replay without any provider measurement remains fail closed", () => {
+	const h = harness("anthropic/claude-fable-5-1", [
+		{ role: "user", content: "word ".repeat(310000) },
+	]);
+	const replay = h.replay();
+	if (!replay.ok) throw new Error(replay.reason);
+	expect(replay.measuredPrefix).toBeUndefined();
+	const logs: string[] = [];
+	expect(() =>
+		assertPiRawFallbackFits(
+			replay.messages,
+			375000,
+			(line) => logs.push(line),
+			null,
+			h.envelope,
+			replay.measuredPrefix,
+		),
+	).toThrow();
+	expect(logs.join("\n")).toContain(
+		"lkg_fit_basis=host_metadata measured_input=0",
+	);
+	expect(logs.join("\n")).toContain("raw_fallback_over_context_limit");
 });
 
 test("changed host metadata cannot borrow the old measured prefix", () => {

@@ -4,6 +4,7 @@ import { type FileHandle, lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { readSmartNoteGithubToken } from "./github-token";
 import { guardedSmartNoteHttpGet, type SmartNoteResolver } from "./ssrf-guard";
 import { SmartNoteNetworkError } from "./types";
 
@@ -31,6 +32,7 @@ export interface SmartNoteCapabilitiesOptions {
     signal: AbortSignal;
     fileLimitBytes?: number;
     resolver?: SmartNoteResolver;
+    githubToken?: string | null;
 }
 
 export function createSmartNoteCapabilities(
@@ -50,9 +52,15 @@ export function createSmartNoteCapabilities(
             ),
         gitLog: (opts) => guardedGitLog(projectRoot, opts, options.signal),
         httpGet: (url) =>
-            guardedSmartNoteHttpGet(url, { signal: options.signal, resolver: options.resolver }),
+            guardedSmartNoteHttpGet(url, {
+                signal: options.signal,
+                resolver: options.resolver,
+                githubToken: options.githubToken,
+            }),
     };
 }
+
+export { readSmartNoteGithubToken };
 
 const SECRET_KEY_EXTENSIONS = [".p12", ".pfx", ".crt", ".key", ".pem"] as const;
 

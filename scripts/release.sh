@@ -256,9 +256,6 @@ run_package_tests "pi-plugin" "$PI_DIR"
 echo "  [pi-plugin] bun build..."
 bun run --cwd "$PI_DIR" build 2>&1 || { echo "Error: Pi-plugin build failed"; exit 1; }
 
-echo "  [packages] auditing packed consumer dependency graphs..."
-bun run --cwd "$REPO_ROOT" audit:packed-packages 2>&1 || { echo "Error: Packed-package audit failed"; exit 1; }
-
 echo "  [cli] bun lint..."
 bun run --cwd "$CLI_DIR" lint 2>&1 || { echo "Error: CLI lint failed"; exit 1; }
 
@@ -269,6 +266,9 @@ run_package_tests "cli" "$CLI_DIR"
 
 echo "  [cli] bun build..."
 bun run --cwd "$CLI_DIR" build 2>&1 || { echo "Error: CLI build failed"; exit 1; }
+
+echo "  [packages] auditing packed consumer dependency graphs..."
+bun run --cwd "$REPO_ROOT" audit:packed-packages 2>&1 || { echo "Error: Packed-package audit failed"; exit 1; }
 
 # Host behavior E2E suite (packages/e2e-tests). This is the deep suite that
 # spawns a real `opencode serve` (and resolves Pi from node_modules) against a
@@ -433,9 +433,9 @@ run_host_e2e() {
   run_e2e_group "ts" "pi" "$E2E_PI_FILES"
 }
 
-# Rust stays on the host because its daemon and sibling path dependencies cross
-# the container boundary. The shared runner selects the manifest tests, checks
-# prerequisites, and requires a positive test summary just like release CI.
+# Rust stays on the host because the hermetic daemon and its module are spawned as
+# native processes by the end-to-end scenarios. The shared runner selects the manifest
+# tests, checks prerequisites, and requires a positive test summary just like release CI.
 if [[ -n "$CI_GATE_SHA" ]]; then
   echo "  [e2e] host legs: covered by master CI on $CI_GATE_SHA"
 else
@@ -482,19 +482,17 @@ echo "→ Committing version bump..."
 git add -- packages/plugin/package.json packages/pi-plugin/package.json packages/cli/package.json \
   assets/magic-context.schema.json \
   packages/plugin/src/hooks/magic-context/reference-seeds.generated.ts
-# Cargo.lock is the common dirty file here: the rust e2e lane builds against the
-# sibling subc checkout, so a sibling crate release that lands while the gates run
-# resolves into the lock. The gates just ran on that resolved graph, so the tested
-# artifact IS the drifted lock; committing it on its own (never folded into the
-# release commit) is what the deploy doctrine requires, and re-running two hours of
-# gates for a sibling patch bump the gates already exercised is pure waste. Only a
-# lock that still builds --locked qualifies; anything else dirty is foreign and aborts.
+# Cargo.lock is the common dirty file here: Cargo can update the resolved versions
+# of crates declared by this repository while the release gates run. The gates just
+# ran on that resolved graph, so the tested artifact IS the drifted lock; committing
+# it on its own records the graph they passed. Only a lock that still builds --locked
+# qualifies; anything else dirty is foreign and aborts.
 unrelated="$(git status --porcelain --untracked-files=no | grep -v '^[MARC] ' || true)"
 if [ "$unrelated" = " M Cargo.lock" ]; then
-  echo "  Cargo.lock drifted during the gates (sibling crate release); verifying it builds --locked..."
+  echo "  Cargo.lock drifted (a crate version or pinned source changed in this repository's lockfile); verifying it builds --locked..."
   if cargo build --locked --release -p mc-module >/dev/null 2>&1; then
     versions="$(git diff Cargo.lock | grep -E '^[-+]version' | sed -E 's/^([-+])version = "([^"]+)"/\1\2/' | paste -sd' ' -)"
-    git commit -q -o Cargo.lock -m "cargo: reconcile lock to the sibling graph the release gates ran on (lock-only: ${versions})"
+    git commit -q -o Cargo.lock -m "cargo: reconcile lock to the tested crate graph (lock-only: ${versions})"
     echo "  committed lock reconciliation: $(git log --oneline -1)"
     unrelated=""
   fi

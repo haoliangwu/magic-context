@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { randomUUID } from "node:crypto";
 import {
     chmodSync,
     existsSync,
@@ -32,6 +33,18 @@ describe("writeFileAtomic", () => {
         writeFileAtomic(target, '{"ok":true}\n');
         expect(readFileSync(target, "utf-8")).toBe('{"ok":true}\n');
         expect(existsSync(`${target}.tmp`)).toBe(false);
+    });
+
+    it("creates a new user config and its parent directory privately", () => {
+        if (process.platform === "win32") return;
+        const root = join(tmpdir(), "magic-context", `cli-config-${process.pid}-${randomUUID()}`);
+        roots.push(root);
+        const target = join(root, "config", "cortexkit", "magic-context.jsonc");
+
+        writeFileAtomic(target, '{ "api_key": "secret" }\n', { ownerOnly: true });
+
+        expect(statSync(target).mode & 0o777).toBe(0o600);
+        expect(statSync(join(root, "config", "cortexkit")).mode & 0o777).toBe(0o700);
     });
 
     it("preserves file mode on replace", () => {

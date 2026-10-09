@@ -666,6 +666,8 @@ pub struct HistorianAssemblerConfig {
     pub project_slug: String,
     pub model_chain: Vec<String>,
     pub model_limits: std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    /// Host-configured variant per chain model; see `HistorianFireRequest::model_variants`.
+    pub model_variants: std::collections::BTreeMap<String, String>,
     pub token_budget: usize,
     pub historian_context_limit_tokens: Option<usize>,
     pub max_output_tokens: u32,
@@ -723,6 +725,7 @@ pub struct AssembledHistorianFiring {
     pub prompt: String,
     pub model_chain: Vec<String>,
     pub model_limits: std::collections::BTreeMap<String, crate::historian::HistorianModelLimits>,
+    pub model_variants: std::collections::BTreeMap<String, String>,
     pub producer_source_tokens: usize,
     pub historian_context_limit_tokens: Option<usize>,
     pub max_output_tokens: u32,
@@ -778,6 +781,7 @@ impl AssembledHistorianFiring {
             historian_context_limit_tokens: self.historian_context_limit_tokens,
             fallback_context_limits: Default::default(),
             model_limits: self.model_limits.clone(),
+            model_variants: self.model_variants.clone(),
             max_output_tokens: self.max_output_tokens,
             from_ordinal: self.from_ordinal,
             to_ordinal: self.to_ordinal,
@@ -1227,11 +1231,13 @@ pub fn assemble_historian_firing(
         let Some(limit) = producer_input_limit else {
             return false;
         };
+        let input_source =
+            historian_input_source(chunk.chunk.start_index, chunk.chunk.end_index, source);
         let prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
             seed_examples: &reference_blocks.seed_examples,
             session_references: &reference_blocks.session_references,
             project_memory: &memory_block,
-            input_source: source,
+            input_source: &input_source,
             memory_enabled: config.memory_enabled,
             extraction_free: config.extraction_free,
         });
@@ -1255,14 +1261,21 @@ pub fn assemble_historian_firing(
             &fits_producer_prompt,
         )
     });
-    let input_source = if oversize_atomic_unit {
+    let historian_text = if oversize_atomic_unit {
         fitted_atomic_source
             .as_ref()
             .map(|fitted| fitted.text.clone())
             .unwrap_or_else(|| chunk.text.clone())
     } else {
+        // The header is added after truncation, matching the TypeScript path where the
+        // rendered transcript is fitted first and its raw ordinal range is prepended.
         truncate_historian_input_if_needed(&chunk.text, source_budget)
     };
+    let input_source = historian_input_source(
+        chunk.chunk.start_index,
+        chunk.chunk.end_index,
+        &historian_text,
+    );
     let producer_source_tokens = estimate_tokens(&input_source);
     if let Some(fitted) = fitted_atomic_source
         .as_ref()
@@ -1326,6 +1339,7 @@ pub fn assemble_historian_firing(
     Ok(AssembleHistorianFiringOutcome::Fire(Box::new(
         AssembledHistorianFiring {
             model_limits: config.model_limits.clone(),
+            model_variants: config.model_variants.clone(),
             prompt,
             model_chain: config.model_chain,
             producer_source_tokens,
@@ -1455,6 +1469,10 @@ fn fit_atomic_historian_source_to_producer_window(
         split_boundary_ordinal: boundary.map(|boundary| boundary.ordinal),
         removed_tokens: original_tokens.saturating_sub(fitted_tokens),
     }
+}
+
+fn historian_input_source(start_index: u64, end_index: u64, text: &str) -> String {
+    format!("Messages {start_index}-{end_index}:\n\n{text}")
 }
 
 pub fn truncate_historian_input_if_needed(input: &str, token_budget: usize) -> String {
@@ -1957,6 +1975,8 @@ mod tests {
         #[serde(rename = "tokenEstimate")]
         token_estimate: usize,
         text: String,
+        #[serde(rename = "inputSource")]
+        input_source: String,
         lines: Vec<GoldenLine>,
         #[serde(rename = "toolOnlyRanges")]
         tool_only_ranges: Vec<MessageRange>,
@@ -2360,6 +2380,7 @@ mod tests {
             HistorianAssemblerConfig {
                 expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "issue424-capacity".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2398,11 +2419,15 @@ mod tests {
             firing.prompt.contains(&built.text),
             "producer must receive the whole formatted component"
         );
+        assert!(
+            firing.prompt.contains("Messages 1-3:\n\n"),
+            "producer prompt must label the raw message ordinal range"
+        );
         let prompt_hash = format!("{:x}", sha2::Sha256::digest(firing.prompt.as_bytes()));
-        // Calibration uses three seeds; the transcript component itself is unchanged.
+        // The digest now covers the raw-ordinal header; transcript bytes stay unchanged.
         assert_eq!(
             prompt_hash,
-            "1b08d1670ba7beb7434d8d8140a74d7037b9a271c31088b731b3326786f76e5c"
+            "de9fcb7dacb191f6b93bbb242ab08f00d1789d825e3d8645925e8285b2253066"
         );
         let validated = crate::historian_validate::validate_historian_output(
             &historian_output(1, 3, 4),
@@ -2630,6 +2655,7 @@ mod tests {
         let config = HistorianAssemblerConfig {
             expand_tools: BTreeMap::new(),
             model_limits: Default::default(),
+            model_variants: Default::default(),
             session_id: "noise".to_string(),
             project_path: "/proj".to_string(),
             project_slug: "proj".to_string(),
@@ -2771,6 +2797,7 @@ mod tests {
             HistorianAssemblerConfig {
                 expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-below-budget".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2830,6 +2857,7 @@ mod tests {
             HistorianAssemblerConfig {
                 expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-fold-only".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -2914,6 +2942,7 @@ mod tests {
             HistorianAssemblerConfig {
                 expand_tools: BTreeMap::new(),
                 model_limits: Default::default(),
+                model_variants: Default::default(),
                 session_id: "ses-sparse".to_string(),
                 project_path: "/proj".to_string(),
                 project_slug: "proj".to_string(),
@@ -3332,6 +3361,29 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn historian_input_source_matches_typescript_chunk_golden() {
+        let root: GoldenRoot =
+            serde_json::from_str(include_str!("../testdata/historian-chunk-golden.json")).unwrap();
+        for case in &root.cases {
+            let projection = project_messages(&case.ck).unwrap();
+            let built = build_historian_chunk(
+                &case.ck,
+                &projection.blocks,
+                case.offset,
+                case.budget,
+                case.eligible_end,
+            );
+            assert_eq!(
+                historian_input_source(built.chunk.start_index, built.chunk.end_index, &built.text,),
+                case.expected.input_source,
+                "{} historian input source",
+                case.label
+            );
+        }
+    }
+
     #[test]
     fn fixture_builder_drives_boundary_chunk_assembly() {
         let fixture = FixtureBuilder::session_with_boundary();

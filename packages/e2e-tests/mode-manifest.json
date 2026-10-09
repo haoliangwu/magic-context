@@ -1,7 +1,87 @@
 {
     "schema": 1,
-    "header": "CI push workflows run the manifest-derived TypeScript suites and the Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh. The tag release workflow also runs the Rust invocation; both Rust lanes require public sibling path dependencies (../commons and ../subconscious).",
+    "header": "CI push workflows run the manifest-derived TypeScript suites and Rust hermetic suite through scripts/run-rust-hermetic-e2e.sh; tag releases run the same Rust invocation. Cargo.lock pins the Rust dependency versions and git revisions. CI mc-module daemon tests and push/release builders use the locked subconscious source to build ck-subc; the scheduled CI builder intentionally probes default-branch HEAD as drift, while test shards consume its prebuilt artifact.",
     "entries": [
+        {
+            "path": "tests/latest-turn-thinking.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 1.18.x task child and primary long tool loop at execute and force against a provider-side thinking oracle; negative controls reject edited, removed and reordered latest-turn blocks, queued drops release only after a real user turn, accepted legacy strips replay unchanged, a provider rejection restores the original thinking once, and host PID lsof proves throwaway containment. OpenCode 2, Pi and Rust have caller and module unit gates.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/pi-historian-runtime.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real Pi loader-only evaluation leaves a separate unbound action runtime but must not poison the serving historian; real OMP historian and mapper retain the disabled-built-in intersection. Mock provider only, throwaway roots checked by host and child PID lsof. Pi version comparisons use MC_E2E_PI_PACKAGE_JSON.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["pi", "omp"]
+        },
+        {
+            "path": "tests/opencode2/error-result-compaction.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2 failing read then /compact preserves error status and provider bytes; a successful read remains byte-identical; the same arm runs on a fresh host-converted OpenCode 1 store. Host PID lsof proves throwaway-store containment.",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/rust-tool-attachments.test.ts",
+            "tier": "rust-only",
+            "invocation": { "ts": false, "rust": true },
+            "rationale": "Real OpenCode 1 Rust-mode native attach: mock screenshot plus read image/PDF reach the Anthropic wire with tagged text on first sight and replay byte-identically on later defers; host PID lsof proves throwaway-store containment",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/rust-tool-attachment-upgrade.test.ts",
+            "tier": "rust-only",
+            "invocation": { "ts": false, "rust": true },
+            "rationale": "Real OpenCode 1 old-adapter upgrade preserves previously served attachment-free bytes on three defers across restart, restores once on acknowledged independent module flush permission, then replays media byte-identically on three tail deltas; host PID lsof proves throwaway-store containment",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/reasoning-token-budget.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 1 thinking-capable mock proves an over-budget defer retains identical provider bytes, a rebuilding pass keeps whole steps within budget, and later defers replay the frozen watermark; host PID lsof proves throwaway-store containment. Pi and Rust have corresponding module/unit gates.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/opencode2/latest-turn-thinking-recovery.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Real OpenCode 2.0.22 Anthropic tool loop against the provider-side thinking oracle: a replayed legacy omission in the active turn is rejected once, the host's session event arms recovery bound to the turn's real user message, a same-id resubmission reaches no provider, and the synthetic resume ends the turn, disarms without restoring and is accepted. Host PID lsof proves throwaway containment.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE", "OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/checkout-claim.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Agent checkout claim: real OpenCode 1 and Pi hosts against a wire-level fake subc daemon playing ALF agent.for_host_session and engram claim.read refuse a held-elsewhere session before any Magic Context write or provider call, then serve it once the claim moves back; PID lsof proves throwaway-store containment. OpenCode 2 runs the same gate in its context hook (unit-tested against the same fake daemon); OMP shares Pi's plugin; Rust mode goes through the TypeScript plugin's pass",
+            "contract_refs": ["AGENT-CHECKOUT-CLAIM"],
+            "hosts": ["opencode", "pi"]
+        },
+        {
+            "path": "tests/cache-ttl-live-config.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 624: real OpenCode 1 reloads edited user TTL before the next idle decision, preserves provider prefix bytes on a raise, and lowers only through ttl_idle; PID lsof proves throwaway-store containment",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/protected-tools.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "OpenCode 1.18.30 mock provider custom tool newest-two protection through emergency; PID lsof proves throwaway-store containment. Pi and Rust share the selection golden.",
+            "contract_refs": ["FOLD-UNDER-PRESSURE"],
+            "hosts": ["opencode"]
+        },
         {
             "path": "tests/subagent-write-tools.test.ts",
             "tier": "ts-only",
@@ -42,6 +122,22 @@
             "contract_refs": ["S2-MIGRATION"],
             "hosts": ["opencode", "pi", "omp", "opencode2"],
             "behavior": true
+        },
+        {
+            "path": "tests/rust-plugin-stage-cache.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "opt-in measurement (MC_RUST_STAGE_BASELINE): compares the pre-change Rust adapter bundle with the current one for byte-identical output and todo/mural stage cost through a hermetic module and isolated OpenCode 1.18; needs a preserved baseline bundle, so it runs by hand, outside the mode lanes",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
+        },
+        {
+            "path": "tests/system-prompt-change-order.test.ts",
+            "tier": "excluded",
+            "invocation": { "ts": false, "rust": false },
+            "rationale": "Opt-in real-host hook-order probe: run directly with bun test tests/system-prompt-change-order.test.ts (also with MC_E2E_MODE=rust) and a pinned npm opencode-darwin-arm64 1.18.30/1.18.35 executable first on PATH. An AGENTS.md edit and a configured instruction-file edit with a queued drop must each rewrite the provider prefix once, not again on the next request. Only these executable hashes have been validated as messages-first; Linux CI installs OpenCode 1.18.32, which is not a validated reference host, so selecting this probe there yields zero passing tests. Keep the hash guard and byte assertions intact until a Linux reference host is validated",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
         },
         {
             "path": "tests/opencode2/subagent-mode.test.ts",
@@ -745,12 +841,12 @@
         },
         {
             "path": "tests/opencode2/commands-s2-wrapup.test.ts",
-            "tier": "excluded",
+            "tier": "ts-only",
             "invocation": {
-                "ts": false,
+                "ts": true,
                 "rust": false
             },
-            "rationale": "OpenCode v2 lane: /ctx-wrapup executed over the GA command API runs the historian through the v2 hidden-completion executor and publishes compartments; before the fix wrapup fell back to the v1 executor, which has no client on 2.x; the v2 lane runs from its own invocation (bun test tests/opencode2)",
+            "rationale": "Real OpenCode 2 /ctx-wrapup publishes through v2 bounded history and hidden completions on a pure-v2 store, including before the first pass after reopening, and a real v1-converted store. A flush renders the publication; no v1 pending marker, legacy row write or reconversion is allowed; PID lsof proves throwaway-store containment.",
             "contract_refs": [
                 "OC2-S1"
             ],
@@ -760,12 +856,12 @@
         },
         {
             "path": "tests/opencode2/recomp-hidden-executor.test.ts",
-            "tier": "excluded",
+            "tier": "ts-only",
             "invocation": {
-                "ts": false,
+                "ts": true,
                 "rust": false
             },
-            "rationale": "OpenCode v2 lane (issue 591): /ctx-recomp over the GA command API rebuilds compartments through the v2 hidden-completion executor instead of failing with MC-R01 on the missing OpenCode 1 client, and the next turn renders the rebuilt history; the v2 lane runs from its own invocation (bun test tests/opencode2)",
+            "rationale": "Real OpenCode 2 /ctx-recomp rebuilds and renders compartments through v2 bounded history and hidden completions on pure-v2 and real v1-converted stores, including before the first pass after reopening. Legacy rows and migration.v1-v2 remain unchanged; PID lsof proves throwaway-store containment.",
             "contract_refs": [
                 "OC2-S1"
             ],
@@ -1152,6 +1248,22 @@
             "hosts": [
                 "opencode2"
             ]
+        },
+        {
+            "path": "tests/opencode2/hidden-child-foreign-location.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 639: two directories of one real OpenCode 2 host run Magic Context with a user config allowing edit and shell; a turn ending in the other directory starts no hidden run there and no tool touches either tree (file hashes unchanged), a run in its own directory still reads with its read-only allowlist and maps, and dreamer.disable applies without a restart in both directions. Throwaway roots proven by host PID lsof",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
+        },
+        {
+            "path": "tests/hidden-agent-user-permissions.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 639 parity check: real OpenCode 1.18.x resolves every hidden Magic Context agent's ruleset with the agent's own rules after a user config that allows everything, so edit, write, bash, task and webfetch evaluate to deny and only each allowlist to allow; host PID lsof proves throwaway-store containment",
+            "contract_refs": ["S2-MIGRATION"],
+            "hosts": ["opencode"]
         },
         {
             "path": "tests/opencode2/hidden-child-two-directories.test.ts",
@@ -2727,6 +2839,14 @@
             "hosts": [
                 "opencode2"
             ]
+        },
+        {
+            "path": "tests/opencode2/dream-schedule-timer.test.ts",
+            "tier": "ts-only",
+            "invocation": { "ts": true, "rust": false },
+            "rationale": "Issue 627: the dreamer's schedule timer registers from the OpenCode 2 lane and dispatches a due task on the pinned GA host with no session turn, parenting its child session to the idle session in the location",
+            "contract_refs": ["OC2-S1"],
+            "hosts": ["opencode2"]
         },
         {
             "path": "tests/opencode2/generate.test.ts",

@@ -1065,6 +1065,7 @@
         },
         "disable": {
           "description": "Disable this agent",
+          "x-mc-live-reload": true,
           "type": "boolean"
         },
         "description": {
@@ -2073,7 +2074,8 @@
     },
     "cache_ttl": {
       "default": "5m",
-      "description": "How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. \"5m\", \"1h\", \"30s\") or per-model object ({ default: \"5m\", \"provider/model\": \"1h\", \"provider/*\": \"never\" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard). Explicit per-model entries win; otherwise GPT-5.6 and later (including gpt-6*, through any provider prefix) use a built-in 30m lifetime before the object default or 5m fallback. An unset or global \"5m\" opts into built-in defaults; any other global string is an explicit policy and wins. Policy is frozen per session, including across restarts; a model switch resolves against that frozen policy. /ctx-status shows the effective value and source. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to \"never\" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).",
+      "description": "How long Magic Context assumes the provider's cached prefix stays valid. This is MC's own deferral gate — it does not change the provider's actual cache lifetime. String (e.g. \"5m\", \"1h\", \"30s\") or per-model object ({ default: \"5m\", \"provider/model\": \"1h\", \"provider/*\": \"never\" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). User and project settings, including an explicit \"5m\" or object default, apply on the next pass. Only built-in defaults are frozen per session, including across restarts: when unset, GPT-5.6 and later (including gpt-6*, through any provider prefix) use 30m, other models use 5m. /ctx-status shows the effective TTL and whether it comes from your config or a frozen built-in default. Editing the TTL does not itself rewrite prompt bytes; a lowered TTL rebuilds only after normal idle expiry. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to \"never\" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).",
+      "x-mc-live-reload": true,
       "anyOf": [
         {
           "type": "string"
@@ -2239,10 +2241,33 @@
       "deprecated": true
     },
     "clear_reasoning_age": {
-      "default": 50,
-      "description": "Clear reasoning/thinking blocks older than N tags (default: 50)",
-      "type": "number",
-      "minimum": 10
+      "description": "Deprecated and ignored. Use keep_reasoning_tokens instead.",
+      "deprecated": true
+    },
+    "keep_reasoning_tokens": {
+      "description": "Reasoning tokens to keep on rebuilding passes. Number or per-model object; exact, shorter model keys, provider/*, then default. Omitted: fixed 10,000. 0 removes all eligible historical reasoning; newest and exempt steps always stay.",
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        {
+          "type": "object",
+          "properties": {
+            "default": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            }
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000000
+          }
+        }
+      ]
     },
     "history_budget_percentage": {
       "default": 0.15,
@@ -2336,12 +2361,12 @@
       "default": {
         "enforce_private_permissions": true
       },
-      "description": "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories.",
+      "description": "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; TypeScript mode follows that policy, but Rust transform mode always keeps its shared data directory owner-only because ck-mc's store library enforces it.",
       "type": "object",
       "properties": {
         "enforce_private_permissions": {
           "default": true,
-          "description": "When true (default), Magic Context creates and re-tightens its storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages directory, database, WAL/SHM, cache, and RPC file permissions externally; Magic Context then never chmods or supplies restrictive creation modes. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
+          "description": "When true (default), Magic Context creates and re-tightens its TypeScript-mode storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages those files externally; in TypeScript mode Magic Context then skips its own creation modes and recursive tightening. In Rust transform mode, ck-mc's store library always keeps the shared data directory owner-only 0700, regardless of this setting. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
           "type": "boolean"
         }
       }
@@ -2544,9 +2569,24 @@
       }
     },
     "smart_drops": {
-      "default": false,
-      "description": "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 3), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",
-      "type": "boolean"
+      "description": "Deprecated: ignored. Content-aware supersession reclaim is always on, only on passes already rebuilding the cache. Remove this key; it no longer does anything.",
+      "deprecated": true
+    },
+    "protected_tools": {
+      "description": "Keep each tool's newest N still-active results in every automatic drop lane (issue 621). User and project maps merge over defaults {todowrite: 1, ctx_reduce: 3}; 0 turns protection off. Names are case-insensitive and ignore leading mcp_. Holds even at 95% pressure, with no byte cap: large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Changes and rotation never originate a bust; dropped results are never restored.",
+      "default": {
+        "todowrite": 1,
+        "ctx_reduce": 3
+      },
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      }
     },
     "caveman_text_compression": {
       "default": {

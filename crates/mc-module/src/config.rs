@@ -111,6 +111,8 @@ pub struct McModuleConfig {
     /// User and project protected-token overrides remain separate until usable geometry is known.
     pub protected_tokens_user: Option<u64>,
     pub protected_tokens_project: Option<u64>,
+    /// Fixed-default reasoning retention, scalar or cache_ttl-style model map.
+    pub keep_reasoning_tokens: Option<Value>,
     /// Whether compaction is enabled, as resolved during host startup. This determines which
     /// component controls context-window compaction for the request.
     pub compaction_enabled: bool,
@@ -139,9 +141,11 @@ pub struct McModuleConfig {
     /// filesystem path.
     pub prompt_surface_guidance_override: Option<String>,
     pub smart_drops: bool,
+    pub protected_tools: std::collections::BTreeMap<String, usize>,
     pub cache_ttl: String,
-    /// Per-model TTL overrides from the object config shape. Resolution uses the
-    /// shared exact, bare, dash-stripped, provider-wildcard, then default walk.
+    /// Configured cache lifetimes (including an explicit `default`). Try the exact model key first;
+    /// then try provider-qualified and bare model names, removing the final dash suffix and
+    /// retrying after each miss. Finally try `provider/*`, then the default.
     pub cache_ttl_by_model: std::collections::BTreeMap<String, String>,
     /// Settings only `tool.catalog` reads (`src/tool_catalog.rs`).
     pub catalog: CatalogConfigInputs,
@@ -180,6 +184,7 @@ impl Default for McModuleConfig {
             execute_threshold_project_config: None,
             protected_tokens_user: None,
             protected_tokens_project: None,
+            keep_reasoning_tokens: None,
             compaction_enabled: true,
             memory_enabled: true,
             auto_search: AutoSearchConfig::default(),
@@ -194,6 +199,7 @@ impl Default for McModuleConfig {
             temporal_awareness: true,
             prompt_surface_guidance_override: None,
             smart_drops: false,
+            protected_tools: crate::selection::default_protected_tools(),
             cache_ttl: "5m".to_string(),
             cache_ttl_by_model: std::collections::BTreeMap::new(),
             catalog: CatalogConfigInputs::default(),
@@ -204,6 +210,9 @@ impl Default for McModuleConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTtlProvenance {
     Explicit,
+    /// A user or project default sets when an idle session expires; it does not tell the
+    /// provider to place a cache marker in a request.
+    ConfiguredDefault,
     Default,
 }
 
@@ -256,6 +265,23 @@ fn resolve_threshold_config(
 }
 
 impl McModuleConfig {
+    pub fn resolve_keep_reasoning_tokens(&self, model_key: Option<&str>) -> u64 {
+        let Some(value) = &self.keep_reasoning_tokens else {
+            return 10_000;
+        };
+        if let Some(tokens) = value.as_u64() {
+            return tokens;
+        }
+        let Some(values) = value.as_object() else {
+            return 10_000;
+        };
+        model_key
+            .into_iter()
+            .flat_map(crate::tool_catalog::model_key_candidates)
+            .find_map(|candidate| values.get(&candidate).and_then(Value::as_u64))
+            .or_else(|| values.get("default").and_then(Value::as_u64))
+            .unwrap_or(10_000)
+    }
     pub fn resolve_protected_tokens(&self, usable_soft: u64) -> ResolvedProtectedTokens {
         let derived = crate::protection_window::derive_default_floor(usable_soft);
         let (mut floor, mut provenance) = self
@@ -309,7 +335,11 @@ impl McModuleConfig {
         };
         let default = || ResolvedCacheTtl {
             value: self.cache_ttl.clone(),
-            provenance: CacheTtlProvenance::Default,
+            provenance: if self.cache_ttl_by_model.contains_key("default") {
+                CacheTtlProvenance::ConfiguredDefault
+            } else {
+                CacheTtlProvenance::Default
+            },
         };
 
         // Check an exact key before splitting into provider and model parts, so a bare key cannot
@@ -420,8 +450,9 @@ pub struct ConfiguredRunners {
 /// Both runner settings are read from the user tier only, so the answer is the same
 /// for every project this process serves. That is what lets the boot manifest
 /// declare its routes from it. The harness default is per request, and a Claude
-/// Code request with nothing configured still goes to Broca, so the Broca route is
-/// declared unless BOTH roles are configured to the host runner.
+/// Code request with nothing configured still goes to Broca, so the background-
+/// completion route to Broca is declared unless BOTH roles are configured to the
+/// host runner. The optional provider runner route is declared independently.
 pub fn user_configured_runners() -> ConfiguredRunners {
     user_configured_runners_at(&user_config_path())
 }
@@ -437,6 +468,21 @@ pub fn user_configured_runners_at(user_path: &Path) -> ConfiguredRunners {
 
 fn user_config_path() -> PathBuf {
     user_config_path_from(std::env::var_os("XDG_CONFIG_HOME"), user_home_dir())
+}
+
+/// Read the user-only permission override shared with the plugin.
+/// Project config cannot loosen filesystem permissions for the user's store.
+pub fn private_storage_permissions_enabled() -> bool {
+    fs::read_to_string(user_config_path())
+        .ok()
+        .and_then(|raw| parse_config_text(&raw).ok())
+        .and_then(|config| config.get("storage").and_then(Value::as_object).cloned())
+        .and_then(|storage| {
+            storage
+                .get("enforce_private_permissions")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true)
 }
 
 /// The user config file, chosen the way the host chooses it (`configHome()` and
@@ -627,12 +673,63 @@ fn guidance_marker_count(content: &str) -> usize {
         .count()
 }
 
+fn apply_cache_ttl_config(cfg: &mut McModuleConfig, value: Option<&Value>) {
+    match value {
+        Some(Value::String(ttl)) if !ttl.trim().is_empty() => {
+            cfg.cache_ttl = ttl.trim().to_string();
+            // A project-wide cache lifetime clears the user's per-model entries and becomes the default.
+            cfg.cache_ttl_by_model.clear();
+            cfg.cache_ttl_by_model
+                .insert("default".to_string(), cfg.cache_ttl.clone());
+        }
+        Some(Value::Object(map)) => {
+            for (key, value) in map {
+                let Some(ttl) = value.as_str().map(str::trim).filter(|ttl| !ttl.is_empty()) else {
+                    continue;
+                };
+                if key == "default" {
+                    cfg.cache_ttl = ttl.to_string();
+                }
+                // This distinguishes an explicitly configured `5m` from the built-in `5m` default.
+                cfg.cache_ttl_by_model.insert(key.clone(), ttl.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
 fn merge_tiers_with_warnings(
     user: Option<&Value>,
     project: Option<&Value>,
 ) -> (McModuleConfig, Vec<String>) {
     let mut cfg = McModuleConfig::default();
     let mut warnings = Vec::new();
+    for (tier, value) in [("user", user), ("project", project)] {
+        let Some(value) = value else {
+            continue;
+        };
+        if value.get("clear_reasoning_age").is_some() {
+            warnings.push(format!("clear_reasoning_age in {tier} tier is deprecated and ignored; use keep_reasoning_tokens (default 10,000)"));
+        }
+        if let Some(tokens) = value.get("keep_reasoning_tokens") {
+            let valid = |value: &Value| value.as_u64().is_some_and(|n| n <= 1_000_000);
+            if valid(tokens)
+                || tokens
+                    .as_object()
+                    .is_some_and(|map| map.values().all(valid))
+            {
+                if let (Some(Value::Object(existing)), Value::Object(overrides)) =
+                    (&mut cfg.keep_reasoning_tokens, tokens)
+                {
+                    existing.extend(overrides.clone());
+                } else {
+                    cfg.keep_reasoning_tokens = Some(tokens.clone());
+                }
+            } else {
+                warnings.push(format!("invalid keep_reasoning_tokens in {tier} tier; expected integer 0..1,000,000 or per-model object"));
+            }
+        }
+    }
 
     if let Some(user) = user {
         if let Some(temperature) = number_at(user, "/historian/temperature") {
@@ -707,8 +804,13 @@ fn merge_tiers_with_warnings(
             cfg.historian_context_limit_tokens = limit;
             cfg.historian_context_limit_known = true;
         }
-        if let Some(enabled) = user.pointer("/smart_drops").and_then(Value::as_bool) {
-            cfg.smart_drops = enabled;
+        if let Some(map) = user.pointer("/protected_tools").and_then(Value::as_object) {
+            for (name, count) in map {
+                if let Some(count) = count.as_u64().and_then(|count| usize::try_from(count).ok()) {
+                    cfg.protected_tools
+                        .insert(crate::selection::normalize_tool_name(name), count);
+                }
+            }
         }
         if let Some(enabled) = user
             .pointer("/dreamer/inject_docs")
@@ -726,35 +828,13 @@ fn merge_tiers_with_warnings(
         {
             cfg.prompt_surface_guidance_override = Some(guidance.to_string());
         }
-        match user.pointer("/cache_ttl") {
-            Some(Value::String(cache_ttl)) => {
-                if !cache_ttl.trim().is_empty() {
-                    cfg.cache_ttl = cache_ttl.trim().to_string();
-                }
-            }
-            // Per-model map: { "default": "5m", "anthropic/claude-opus-4-8": "300m", ... }.
-            // Silently ignoring this shape left the module on the 5m default while the
-            // user had configured 300m for Anthropic models (a spurious idle-TTL HARD on
-            // a still-warm provider cache).
-            Some(Value::Object(map)) => {
-                for (key, value) in map {
-                    let Some(ttl) = value.as_str() else { continue };
-                    if ttl.trim().is_empty() {
-                        continue;
-                    }
-                    if key == "default" {
-                        cfg.cache_ttl = ttl.trim().to_string();
-                    } else {
-                        cfg.cache_ttl_by_model
-                            .insert(key.clone(), ttl.trim().to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
+        apply_cache_ttl_config(&mut cfg, user.get("cache_ttl"));
     }
 
     if let Some(project) = project {
+        // Cache lifetime controls idle-expiry scheduling, not prompt text, so project config may
+        // set it. Project entries replace user entries with the same key.
+        apply_cache_ttl_config(&mut cfg, project.get("cache_ttl"));
         cfg.execute_threshold_project_config = execute_threshold_at(project);
         cfg.protected_tokens_project = protected_tokens_at(project, "project", &mut warnings);
         warn_deprecated_protected_tags(project, "project", &mut warnings);
@@ -781,8 +861,16 @@ fn merge_tiers_with_warnings(
         warn_ignored_project_key(project, "/memory/user_profile_budget_tokens", &mut warnings);
         warn_ignored_project_key(project, "/historian/context_limit_tokens", &mut warnings);
         warn_ignored_project_key(project, "/historian/runner", &mut warnings);
-        if let Some(enabled) = project.pointer("/smart_drops").and_then(Value::as_bool) {
-            cfg.smart_drops = enabled;
+        if let Some(map) = project
+            .pointer("/protected_tools")
+            .and_then(Value::as_object)
+        {
+            for (name, count) in map {
+                if let Some(count) = count.as_u64().and_then(|count| usize::try_from(count).ok()) {
+                    cfg.protected_tools
+                        .insert(crate::selection::normalize_tool_name(name), count);
+                }
+            }
         }
         if let Some(enabled) = project
             .pointer("/dreamer/inject_docs")
@@ -1075,6 +1163,58 @@ pub fn strip_jsonc(input: &str) -> String {
 
 #[cfg(test)]
 mod protected_tokens_tests {
+    #[test]
+    fn review_reasoning_budget_aliases_follow_the_shared_canonical_first_lookup() {
+        let (cfg, _) = super::merge_tiers_with_warnings(
+            Some(&serde_json::json!({"keep_reasoning_tokens": {
+                "openai/*": 250,
+                "openai-codex/*": 500,
+                "google/*": 750
+            }})),
+            None,
+        );
+        // The shared TS/Pi resolver checks canonical spellings first. Both a
+        // collision and a canonical-only wildcard must behave the same in Rust.
+        assert_eq!(
+            cfg.resolve_keep_reasoning_tokens(Some("openai-codex/gpt-6.1-sol")),
+            250
+        );
+        assert_eq!(
+            cfg.resolve_keep_reasoning_tokens(Some("google-antigravity/gemini-3.8-flash")),
+            750
+        );
+    }
+
+    #[test]
+    fn reasoning_budget_resolution_fixed_default_and_deprecated_age() {
+        use super::*;
+        let (cfg, warnings) = merge_tiers_with_warnings(
+            Some(
+                &serde_json::json!({"clear_reasoning_age": 1, "keep_reasoning_tokens": {"default": 4000, "openai/*": 3000, "openai/gpt-5": 2000, "openai/gpt-5-mini": 1000}}),
+            ),
+            None,
+        );
+        assert_eq!(
+            cfg.resolve_keep_reasoning_tokens(Some("openai/gpt-5-mini")),
+            1000
+        );
+        assert_eq!(
+            cfg.resolve_keep_reasoning_tokens(Some("openai/gpt-5-pro")),
+            2000
+        );
+        assert_eq!(cfg.resolve_keep_reasoning_tokens(Some("openai/o3")), 3000);
+        assert_eq!(cfg.resolve_keep_reasoning_tokens(Some("other/model")), 4000);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("clear_reasoning_age") && warning.contains("ignored")));
+        assert_eq!(
+            McModuleConfig::default().resolve_keep_reasoning_tokens(None),
+            10_000
+        );
+        let (zero, _) =
+            merge_tiers_with_warnings(None, Some(&serde_json::json!({"keep_reasoning_tokens": 0})));
+        assert_eq!(zero.resolve_keep_reasoning_tokens(None), 0);
+    }
     use super::*;
     use serde_json::json;
 
@@ -1192,11 +1332,24 @@ mod cache_ttl_tests {
     }
 
     #[test]
-    fn project_tier_cannot_set_cache_ttl() {
+    fn project_tier_cache_ttl_overrides_user_policy_per_key() {
         let project = json!({ "cache_ttl": { "default": "600m" } });
-        let cfg = merge_tiers(None, Some(&project));
-        assert_eq!(cfg.cache_ttl, "5m");
-        assert!(cfg.cache_ttl_by_model.is_empty());
+        let user = json!({ "cache_ttl": { "default": "1h", "anthropic/opus": "13h" } });
+        let cfg = merge_tiers(Some(&user), Some(&project));
+        assert_eq!(cfg.resolve_cache_ttl(Some("other/model")), "600m");
+        assert_eq!(cfg.resolve_cache_ttl(Some("anthropic/opus")), "13h");
+        assert_eq!(
+            cfg.resolve_cache_ttl_with_provenance(None).provenance,
+            CacheTtlProvenance::ConfiguredDefault
+        );
+        let global = merge_tiers(Some(&user), Some(&json!({ "cache_ttl": "5m" })));
+        assert_eq!(global.resolve_cache_ttl(Some("anthropic/opus")), "5m");
+        assert_eq!(
+            global
+                .resolve_cache_ttl_with_provenance(Some("anthropic/opus"))
+                .provenance,
+            CacheTtlProvenance::ConfiguredDefault
+        );
     }
 }
 
@@ -1722,6 +1875,31 @@ mod tests {
         let defaults = merge_tiers(None, None);
         assert!(defaults.inject_docs);
         assert!(defaults.temporal_awareness);
+    }
+
+    #[test]
+    fn protected_tools_merge_defaults_user_project_and_ignore_smart_drops() {
+        let config = merge_tiers(
+            Some(
+                &serde_json::json!({"protected_tools":{"MCP_CUSTOM":3,"todowrite":0},"smart_drops":false}),
+            ),
+            Some(
+                &serde_json::json!({"protected_tools":{"custom":2,"CTX_REDUCE":1},"smart_drops":"ignored"}),
+            ),
+        );
+        assert_eq!(
+            config.protected_tools,
+            [
+                ("custom".to_string(), 2),
+                ("ctx_reduce".to_string(), 1),
+                ("todowrite".to_string(), 0)
+            ]
+            .into()
+        );
+        assert_eq!(
+            merge_tiers(None, None).protected_tools,
+            crate::selection::default_protected_tools()
+        );
     }
 
     #[test]

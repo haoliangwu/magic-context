@@ -14,7 +14,7 @@
  * finishes.
  */
 import { parentPort, workerData } from "node:worker_threads";
-import { setLogLineForwarder } from "../../shared/logger";
+import { log, setLogLineForwarder } from "../../shared/logger";
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import type { MigrationWorkerData, MigrationWorkerMessage } from "./migration-worker-protocol";
@@ -50,6 +50,7 @@ async function main(): Promise<void> {
         const finished = db;
         db = undefined;
         finished.close();
+        log(`[migrations] migration worker connection closed: ${data.dbPath}`);
         post({ type: "done" });
     } catch (error) {
         post({

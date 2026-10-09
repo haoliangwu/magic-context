@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { CTX_REDUCE_DESCRIPTION } from "./constants";
+import { readFileSync } from "node:fs";
+import {
+    CTX_REDUCE_DESCRIPTION,
+    CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE,
+    ctxReduceSelfStampMessage,
+} from "./constants";
 
 describe("ctx-reduce constants", () => {
     //#given
@@ -19,5 +24,14 @@ describe("ctx-reduce constants", () => {
             expect(CTX_REDUCE_DESCRIPTION).not.toContain("gone forever");
             expect(CTX_REDUCE_DESCRIPTION).not.toContain("Remove entirely");
         });
+    });
+
+    it("matches the shared TypeScript/Rust self-stamp message golden", () => {
+        const golden = readFileSync(
+            new URL("./self-stamp-message.golden", import.meta.url),
+            "utf8",
+        ).trimEnd();
+        expect(CTX_REDUCE_SELF_STAMP_MESSAGE_TEMPLATE).toBe(golden);
+        expect(ctxReduceSelfStampMessage(17)).toBe(golden.replace("§N§", "§17§"));
     });
 });

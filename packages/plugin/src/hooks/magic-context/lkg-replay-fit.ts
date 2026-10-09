@@ -1,7 +1,13 @@
 import type { ContextDatabase } from "../../features/magic-context/storage";
 import { getOverflowState } from "../../features/magic-context/storage-meta-persisted";
 import { resolveTrustedContextLimit } from "./event-resolvers";
-import { estimateFinalWireInputTokens, wireContentBytes } from "./final-wire-token-estimate";
+import {
+    estimateAppendedWireTokens,
+    estimateFinalWireInputTokens,
+    wireContentBytes,
+} from "./final-wire-token-estimate";
+import { measuredLkgPrefix } from "./lkg-measured-request";
+import { getSlot } from "./lkg-slot";
 import type { MessageLike } from "./transform-operations";
 
 /**
@@ -71,15 +77,19 @@ export function measureLkgReplay(args: {
     messages: readonly MessageLike[];
     limit: number;
     estimate: () => ReturnType<typeof estimateFinalWireInputTokens>;
+    /** Provider-measured input of this exact prefix; `messages` is only its tail. */
+    measuredInputTokens?: number;
 }): LkgReplayMeasure {
+    const baseline = args.measuredInputTokens ?? 0;
+    const tailLimit = Math.max(0, args.limit - baseline);
     const proxy = wireContentBytes(
         args.messages,
-        args.limit * RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
+        tailLimit * RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
         RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN,
     );
     const skipped = { proxy, estimatorRan: false, trusted: false };
     if (proxy === null) return { fit: "unproven", tokens: null, ...skipped };
-    const proxyTokens = Math.ceil(proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
+    const proxyTokens = baseline + Math.ceil(proxy.bytes / RAW_FALLBACK_BYTES_PER_CONTEXT_TOKEN);
     if (proxy.aborted || proxyTokens > args.limit) {
         return { fit: "over", tokens: null, proxyTokens, ...skipped };
     }
@@ -90,22 +100,71 @@ export function measureLkgReplay(args: {
         return { fit: "unproven", tokens: null, ...skipped };
     }
     const seen = { proxy, estimatorRan: true, trusted: estimate.trusted };
-    if (!estimate.trusted || !Number.isFinite(estimate.tokens) || estimate.tokens <= 0) {
+    const tokens = baseline + estimate.tokens;
+    if (!estimate.trusted || !Number.isFinite(tokens) || tokens <= 0 || estimate.tokens < 0) {
         return {
             fit: "unproven",
             tokens: Number.isFinite(estimate.tokens) ? estimate.tokens : null,
             ...seen,
         };
     }
-    return estimate.tokens > args.limit
-        ? { fit: "over", tokens: estimate.tokens, proxyTokens, ...seen }
-        : { fit: "under", tokens: estimate.tokens, ...seen };
+    return tokens > args.limit
+        ? { fit: "over", tokens, proxyTokens, ...seen }
+        : { fit: "under", tokens, ...seen };
 }
 
 export type LkgReplayFit =
     | { fits: true }
     /** `detail` is the log line explaining the decline, when there is one to log. */
     | { fits: false; detail: string | null };
+
+/** Prefer the input usage bound to this exact saved request. It already includes
+ * system and tool definitions, so neither its messages nor its envelope are
+ * estimated again. The byte risk budget likewise applies only to the new tail. */
+export function measureLkgReplayRequest(args: {
+    sessionId: string;
+    messages: readonly MessageLike[];
+    model: ReplayModel;
+    systemPromptTokens: number;
+    agentName?: string;
+    limit: number;
+    estimator?: typeof estimateFinalWireInputTokens;
+}): LkgReplayMeasure {
+    let measured: ReturnType<typeof measuredLkgPrefix>;
+    try {
+        measured = args.model
+            ? measuredLkgPrefix({
+                  ...args,
+                  slot: getSlot(args.sessionId),
+                  modelKey: `${args.model.providerID}/${args.model.modelID}`,
+              })
+            : undefined;
+    } catch {
+        // If the saved request can't be matched to its own usage, fall back to the
+        // full estimate; the session's latest usage reading may belong to another request.
+        measured = undefined;
+    }
+    const estimator = args.estimator ?? estimateFinalWireInputTokens;
+    return measureLkgReplay({
+        messages: measured?.appendedMessages ?? args.messages,
+        limit: args.limit,
+        measuredInputTokens: measured?.inputTokens,
+        estimate: () =>
+            measured
+                ? estimateAppendedWireTokens({
+                      messages: measured.appendedMessages,
+                      providerID: args.model?.providerID,
+                      modelID: args.model?.modelID,
+                  })
+                : estimator({
+                      messages: args.messages,
+                      systemPromptTokens: args.systemPromptTokens,
+                      providerID: args.model?.providerID,
+                      modelID: args.model?.modelID,
+                      agentName: args.agentName,
+                  }),
+    });
+}
 
 /**
  * Whether a last-known-good replay of `messages` may be sent in place of a failed
@@ -137,19 +196,7 @@ export function lkgReplayFits(args: {
         return { fits: false, detail: null };
     }
     if (limit === undefined) return { fits: false, detail: null };
-    const estimator = args.estimator ?? estimateFinalWireInputTokens;
-    const measure = measureLkgReplay({
-        messages: args.messages,
-        limit,
-        estimate: () =>
-            estimator({
-                messages: args.messages,
-                systemPromptTokens: args.systemPromptTokens,
-                providerID: args.model?.providerID,
-                modelID: args.model?.modelID,
-                agentName: args.agentName,
-            }),
-    });
+    const measure = measureLkgReplayRequest({ ...args, limit });
     if (measure.fit === "under") return { fits: true };
     return {
         fits: false,

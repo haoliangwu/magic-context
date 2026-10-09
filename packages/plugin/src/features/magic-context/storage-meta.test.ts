@@ -95,7 +95,9 @@ describe("storage-meta", () => {
             // statements read its state and sweep the session's unmapped
             // legacy FTS rows.
             expect(db.transaction).toHaveBeenCalledTimes(1);
-            expect(db.prepare).toHaveBeenCalledTimes(38);
+            // The indexed temporal choices are session-owned too; adding their
+            // deletion must not split cleanup across separate transactions.
+            expect(db.prepare).toHaveBeenCalledTimes(39);
         });
     });
 });

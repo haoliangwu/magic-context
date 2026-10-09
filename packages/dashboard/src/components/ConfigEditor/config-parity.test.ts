@@ -94,6 +94,7 @@ describe("ConfigEditor ⇄ schema parity", () => {
   it("#given schema-deprecated ignored keys #then the form renders no control for them", () => {
     const deprecated = deprecatedSchemaPaths(loadSchema());
     expect(deprecated).toContain("protected_tags");
+    expect(deprecated).toContain("smart_drops");
     expect(
       deprecated.filter((leaf) =>
         RENDERED_PREFIXES.some((prefix) => isCoveredBy(leaf, prefix) || isCoveredBy(prefix, leaf)),
@@ -102,7 +103,9 @@ describe("ConfigEditor ⇄ schema parity", () => {
 
     const source = readFileSync(resolve(import.meta.dir, "./ConfigEditor.tsx"), "utf-8");
     const renderedDeprecatedControls = deprecated.filter((leaf) =>
-      source.includes(`key: "${leaf}"`),
+      // Controls may use a generic field descriptor or hand-written JSX.
+      // Neither may read, write or display a deprecated setting's exact key.
+      [`"${leaf}"`, `'${leaf}'`, `>${leaf}<`].some((needle) => source.includes(needle)),
     );
     expect(renderedDeprecatedControls).toEqual([]);
   });

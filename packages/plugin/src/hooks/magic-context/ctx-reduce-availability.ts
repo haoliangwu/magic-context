@@ -550,6 +550,53 @@ export function markCtxReducePermissionDenyLogged(sessionId: string): void {
     ctxReducePermissionDenyLogged.set(sessionId, true);
 }
 
+/** Reads started by observeCtxReducePermissionDeny that have not settled yet, by session. */
+const ctxReducePermissionObservations = new Map<string, Promise<void>>();
+
+/**
+ * Start a background read of the live ctx_reduce permission and log once when
+ * OpenCode denies it after the session's verdict froze.
+ *
+ * The read only feeds that log line: a deny added after the freeze cannot change
+ * the frozen verdict without rewriting the cached prefix, so nothing on the wire
+ * depends on it. The transform therefore never waits for it. Awaiting it inline
+ * made every cache-busting pass wait for two OpenCode API round trips (agents
+ * and session), which took 14 seconds on a loaded host. At most one read per
+ * session is in flight, so a slow host cannot pile up reads across passes.
+ */
+export function observeCtxReducePermissionDeny(
+    client: PluginContext["client"],
+    sessionId: string,
+    activeAgent?: string,
+): Promise<void> | undefined {
+    if (hasLoggedCtxReducePermissionDeny(sessionId)) return undefined;
+    const inFlight = ctxReducePermissionObservations.get(sessionId);
+    if (inFlight) return inFlight;
+    const read = (async () => {
+        try {
+            const denied = await resolveToolPermissionDenied(
+                client,
+                sessionId,
+                CTX_REDUCE_TOOL,
+                activeAgent,
+            );
+            if (denied && !hasLoggedCtxReducePermissionDeny(sessionId)) {
+                markCtxReducePermissionDenyLogged(sessionId);
+                sessionLog(
+                    sessionId,
+                    "ctx_reduce permission is denied by OpenCode; frozen guidance remains until session restart",
+                );
+            }
+        } catch (error) {
+            sessionLog(sessionId, "ctx_reduce permission read failed (ignored):", error);
+        } finally {
+            ctxReducePermissionObservations.delete(sessionId);
+        }
+    })();
+    ctxReducePermissionObservations.set(sessionId, read);
+    return read;
+}
+
 // --- todowrite convenience wrappers ---
 
 export function resolveTodowriteAvailabilityFromMessages(

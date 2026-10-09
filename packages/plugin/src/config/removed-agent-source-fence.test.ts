@@ -23,6 +23,13 @@ const SOURCE_ROOTS = [
     join(REPO_ROOT, "packages", "dashboard", "src-tauri", "src"),
 ];
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".rs", ".json"]);
+// The dashboard labels sessions from other CortexKit agents, and one of their run
+// kinds shares this name. These files name that external run kind, not the retired
+// Magic Context agent, so they are allowed to mention it.
+const EXTERNAL_RUN_KIND_FILES = new Set([
+    join(REPO_ROOT, "packages", "dashboard", "src", "lib", "session-label.ts"),
+    join(REPO_ROOT, "packages", "dashboard", "src", "lib", "session-label.test.ts"),
+]);
 
 function sourceFiles(directory: string, files: string[] = []): string[] {
     for (const entry of readdirSync(directory)) {
@@ -44,7 +51,9 @@ describe("retired agent source fence", () => {
         const offenses: string[] = [];
         for (const file of SOURCE_ROOTS.flatMap((root) => sourceFiles(root))) {
             const matches = readFileSync(file, "utf8").match(RETIRED_AGENT_PATTERN) ?? [];
-            const allowed = file === WARNING_SOURCE && matches.length === 1;
+            const allowed =
+                (file === WARNING_SOURCE && matches.length === 1) ||
+                EXTERNAL_RUN_KIND_FILES.has(file);
             if (!allowed && matches.length > 0) {
                 offenses.push(`${relative(REPO_ROOT, file)} (${matches.length})`);
             }

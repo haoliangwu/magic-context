@@ -4,9 +4,12 @@ import {
     getLargestMeasuredToolDefinitionTokens,
     recordToolDefinition,
 } from "../../features/magic-context/tool-definition-tokens";
+import { outgoingContextRefusal } from "./emergency-fail-closed";
 import {
+    createFinalWireUsageTracker,
     describeFinalWireTail,
     estimateFinalWireInputTokens,
+    estimateOutgoingWireForRefusal,
     type FinalWireTokenEstimate,
 } from "./final-wire-token-estimate";
 import { estimateTokens } from "./read-session-formatting";
@@ -15,6 +18,158 @@ import type { MessageLike } from "./tag-messages";
 const MODEL = { providerID: "test-provider", modelID: "test-model", agentName: "build" };
 
 afterEach(() => __resetToolDefinitionMeasurements());
+
+it("healthy refusal settles over and under byte bounds without token counts", () => {
+    recordToolDefinition(MODEL.providerID, MODEL.modelID, MODEL.agentName, "read", "Read", {});
+    const huge = estimateOutgoingWireForRefusal(
+        {
+            messages: [toolMessage("x".repeat(12 * 1024 * 1024 + 1000))],
+            systemPromptTokens: 100,
+            ...MODEL,
+        },
+        16000,
+    );
+    expect(huge.refusalBasis).toBe("byte-bound");
+    expect(huge.refusalGrade).toBe(true);
+    expect(huge.messageTokens).toEqual({ conversation: 0, toolCall: 0 });
+    const small = estimateOutgoingWireForRefusal(
+        { messages: [toolMessage("x".repeat(4000))], systemPromptTokens: 100, ...MODEL },
+        16000,
+    );
+    expect(small.refusalBasis).toBe("byte-bound");
+    expect(small.refusalGrade).toBe(false);
+    expect(small.messageTokens).toEqual({ conversation: 0, toolCall: 0 });
+});
+
+it("uncertain refusal bounds pathological text without changing shared tokenization", () => {
+    const ordinary = estimateTokens("ordinary words");
+    recordToolDefinition(MODEL.providerID, MODEL.modelID, MODEL.agentName, "read", "Read", {});
+    const text = "x".repeat(16385);
+    const startedAt = performance.now();
+    const result = estimateOutgoingWireForRefusal(
+        { messages: [toolMessage(text)], systemPromptTokens: 100, ...MODEL },
+        10000,
+    );
+    expect(result.messageTokens.toolCall).toBeGreaterThanOrEqual(Buffer.byteLength(text));
+    expect(result.refusalGrade).toBe(false);
+    expect(performance.now() - startedAt).toBeLessThan(1000);
+    expect(estimateTokens("ordinary words")).toBe(ordinary);
+});
+
+it("borrowed tool definitions and family fallback are admission-only even on complete over-limit envelopes", () => {
+    recordToolDefinition("other", "route", "build", "probe", "word ".repeat(20000), {});
+    const messages = [toolMessage("word ".repeat(20000))];
+    const borrowed = estimateFinalWireInputTokens({
+        messages,
+        systemPromptTokens: 100,
+        providerID: "anthropic",
+        modelID: "claude-fable-5-1",
+        agentName: "build",
+    });
+    expect(borrowed.trusted).toBe(true);
+    expect(borrowed.tokens).toBeGreaterThan(16000);
+    expect(borrowed.toolDefinitionsMeasured).toBe(false);
+    expect(borrowed.refusalGrade).toBe(false);
+    expect(outgoingContextRefusal(borrowed, 16000)).toBeUndefined();
+    recordToolDefinition("anthropic", "claude-fable-5-2", "build", "probe", "A probe", {});
+    const inherited = estimateFinalWireInputTokens({
+        messages,
+        systemPromptTokens: 100,
+        providerID: "anthropic",
+        modelID: "claude-fable-5-2",
+        agentName: "build",
+    });
+    expect(inherited.trusted).toBe(true);
+    expect(inherited.toolDefinitionsMeasured).toBe(true);
+    expect(inherited.refusalGrade).toBe(false);
+    expect(outgoingContextRefusal(inherited, 16000)).toBeUndefined();
+});
+
+it("OpenCode correlated provider usage wins over full-prefix estimates and rejects stale evidence", () => {
+    const route = { providerID: "anthropic", modelID: "claude-fable-5-1", agentName: "build" };
+    recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
+    const tracker = createFinalWireUsageTracker();
+    const prefix = [
+        {
+            info: { id: "input", role: "user" },
+            parts: [{ type: "text", text: "word ".repeat(20000) }],
+        },
+    ] as MessageLike[];
+    const envelope = { systemPromptTokens: 100, systemPromptHash: "system-v1", ...route };
+    tracker.capture("session", { messages: prefix, ...envelope });
+    const reply = {
+        info: {
+            id: "reply",
+            role: "assistant",
+            parentID: "input",
+            ...route,
+            finish: "stop",
+            time: { completed: Date.now() + 1 },
+            tokens: { input: 100, cache: { read: 20, write: 10 } },
+        },
+        parts: [{ type: "text", text: "New reply" }],
+    } as unknown as MessageLike;
+    const messages = [...prefix, reply];
+    const measured = tracker.estimate("session", { messages, ...envelope });
+    expect(measured.tokens).toBeGreaterThan(16000);
+    expect(measured.refusalBasis).toBe("provider-prefix");
+    expect(measured.refusalTokens).toBeGreaterThanOrEqual(130);
+    expect(measured.refusalTokens).toBeLessThan(200);
+    expect(outgoingContextRefusal(measured, 16000)).toBeUndefined();
+    for (const input of [
+        { messages, ...envelope, systemPromptHash: "system-v2" },
+        {
+            messages: [{ ...prefix[0], parts: [{ type: "text", text: "changed prefix" }] }, reply],
+            ...envelope,
+        },
+        {
+            messages: [...prefix, { ...reply, info: { ...reply.info, parentID: "other" } }],
+            ...envelope,
+        },
+        {
+            messages: [...prefix, { ...reply, info: { ...reply.info, providerID: "other" } }],
+            ...envelope,
+        },
+    ])
+        expect(tracker.estimate("session", input).refusalBasis).toBe("calibrated");
+    recordToolDefinition(
+        route.providerID,
+        route.modelID,
+        route.agentName,
+        "probe",
+        "Changed schema",
+        {},
+    );
+    expect(tracker.estimate("session", { messages, ...envelope }).refusalBasis).toBe("calibrated");
+});
+
+it("OpenCode measured preceding overflow does not refuse a fitting protected subset", () => {
+    const route = { providerID: "anthropic", modelID: "claude-fable-5-1", agentName: "build" };
+    recordToolDefinition(route.providerID, route.modelID, route.agentName, "probe", "A probe", {});
+    const tracker = createFinalWireUsageTracker();
+    const envelope = { systemPromptTokens: 100, systemPromptHash: "system-v1", ...route };
+    const prefix = [
+        { info: { id: "input", role: "user" }, parts: [{ type: "text", text: "hello" }] },
+    ] as MessageLike[];
+    tracker.capture("session", { messages: prefix, ...envelope });
+    const reply = {
+        info: {
+            id: "reply",
+            role: "assistant",
+            parentID: "input",
+            ...route,
+            finish: "stop",
+            time: { completed: Date.now() + 1 },
+            tokens: { input: 15000, cache: { read: 900, write: 200 } },
+        },
+        parts: [{ type: "text", text: "hello" }],
+    } as unknown as MessageLike;
+    const estimate = tracker.estimate("session", { messages: [...prefix, reply], ...envelope });
+    expect(estimate.tokens).toBeLessThan(1000);
+    expect(estimate.refusalTokens).toBeGreaterThan(16000);
+    expect(outgoingContextRefusal(estimate, 16000, 0)).toBeUndefined();
+    expect(outgoingContextRefusal(estimate, 16000, 10)).toBeUndefined();
+});
 
 function estimate(messages: MessageLike[]): FinalWireTokenEstimate {
     recordToolDefinition(MODEL.providerID, MODEL.modelID, MODEL.agentName, "read", "Read a file", {

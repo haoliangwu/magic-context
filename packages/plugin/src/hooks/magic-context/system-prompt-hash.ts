@@ -205,6 +205,13 @@ export function createSystemPromptHashHandler(deps: {
     /** When true, inject a "BEWARE: history compression is on" warning so the
      *  agent doesn't mimic its own caveman-compressed past output. */
     experimentalCavemanTextCompression?: boolean;
+    /**
+     * True when the messages transform for this same request already ran (the
+     * host calls the system hook after it). Consumes that per-request signal.
+     * Absent (tests, hosts without the signal): a system change is assumed to be
+     * seen before the messages transform, as on a system-first host.
+     */
+    consumeMessagesPrepared?: (sessionId: string) => boolean;
 }): {
     handler: (
         input: {
@@ -320,6 +327,10 @@ export function createSystemPromptHashHandler(deps: {
             return;
         }
 
+        // Read after the skip checks above: a skipped title/summary call for this
+        // session must not consume the marker left by the main request's messages pass.
+        const requestMessagesFinal = deps.consumeMessagesPrepared?.(sessionId) ?? false;
+
         // ── Step 1: Inject magic-context guidance ──
         // Subagents with callable ctx_reduce get only the minimal drop mechanics
         // guidance. Subagents without the tool get no Magic Context guidance,
@@ -420,6 +431,15 @@ export function createSystemPromptHashHandler(deps: {
                 sessionMetaEarly.lastResponseTime,
                 Date.now(),
             );
+        // When this request's messages are already final (OpenCode 1 runs the
+        // messages transform before this hook), a changed system prompt is already
+        // a full provider-cache rewrite on this request, and Magic Context can no
+        // longer fold into it. Queuing a rebuild for the next request would make the
+        // provider rewrite its cache a second time. Adopt the new identity here, as
+        // on an idle-expired request; queued work rides the next natural bust.
+        // This must not release the sticky date: OpenCode 1 reports
+        // `requestMessagesFinal` on every request, warm or not.
+        const adoptSystemChange = idleCacheExpired || requestMessagesFinal;
 
         // ── Step 2: Coalesce content/preset and date changes into one bust ──
         const DATE_PATTERN = /Today's date: .+/;
@@ -505,13 +525,13 @@ export function createSystemPromptHashHandler(deps: {
         if (previousHash !== "" && previousHash !== "0" && previousHash !== currentHash) {
             sessionLog(
                 sessionId,
-                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : "triggering flush"}`,
+                `system prompt hash changed: ${previousHash} → ${currentHash} (len=${systemContent.length}), ${idleCacheExpired ? "adopting on idle-expired request" : requestMessagesFinal ? "adopting on the request whose messages are already final" : "triggering flush"}`,
             );
-            // On a warm request, signal all three independent
-            // refresh lifetimes. The semantic prompt epoch changed on this turn,
-            // so history rebuild, adjunct refresh, and materialization should ride
-            // the same cycle.
-            if (!idleCacheExpired) {
+            // When the following messages transform can still fold into this
+            // request, signal all three independent refresh lifetimes. The semantic
+            // prompt epoch changed on this turn, so history rebuild, adjunct refresh,
+            // and materialization should ride the same cycle.
+            if (!adoptSystemChange) {
                 deps.historyRefreshSessions.add(sessionId);
                 deps.systemPromptRefreshSessions.add(sessionId);
                 deps.pendingMaterializationSessions.add(sessionId);
@@ -555,7 +575,7 @@ export function createSystemPromptHashHandler(deps: {
                     // hash with that cached render so the following pass recognizes
                     // the unchanged system prompt and reuses the cache.
                     cachedM0SystemHash:
-                        !hasPersistedHash || idleCacheExpired ? currentHash : undefined,
+                        !hasPersistedHash || adoptSystemChange ? currentHash : undefined,
                 });
             } catch (error) {
                 sessionLog(sessionId, "system prompt meta persist failed (fail-open):", error);

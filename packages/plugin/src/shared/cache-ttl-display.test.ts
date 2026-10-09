@@ -45,7 +45,7 @@ describe("resolveCacheTtlDisplay", () => {
         });
 
         expect(configured.source).toBe("config");
-        expect(session).toEqual({ value: "45m", source: "session", modelKey });
+        expect(session).toEqual({ value: "1h", source: "config", modelKey });
         expect(fallback).toEqual({ value: "5m", source: "default", modelKey });
     });
 

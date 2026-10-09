@@ -21,8 +21,8 @@
  * data dir is the production reality, not a test shortcut.
  *
  * Environment honesty: `detectRustModePrereqs()` returns a printable skip reason
- * when cargo is missing, the sibling subconscious workspace is absent, or the
- * platform is unsupported — the lane SKIPs rather than green-washing or hanging.
+ * when cargo or the sibling subconscious source is absent (unless CI supplied a
+ * complete prebuilt binary pair), or the platform is unsupported.
  */
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
@@ -30,7 +30,6 @@ import {
     appendFileSync,
     copyFileSync,
     existsSync,
-    linkSync,
     mkdirSync,
     readdirSync,
     readFileSync,
@@ -157,8 +156,9 @@ const RUST_E2E_CARGO_TARGET_DIR = join(
     REPO_ROOT,
     "packages/e2e-tests/.cache/rust-e2e-cargo-target",
 );
+const RUST_E2E_DEV_BIN_DIR = join(RUST_E2E_CARGO_TARGET_DIR, "dev-bin");
 
-/** ck-mc lives in THIS workspace; ck-subc in the sibling subconscious workspace. */
+/** ck-mc lives in THIS workspace; the lock-pinned ck-subc source is built separately. */
 const CK_MC_RELEASE = join(RUST_E2E_CARGO_TARGET_DIR, "release/ck-mc");
 
 /**
@@ -168,6 +168,25 @@ const CK_MC_RELEASE = join(RUST_E2E_CARGO_TARGET_DIR, "release/ck-mc");
  */
 function currentTreeCkMcBinary(_configuredBinary: string | undefined): string {
     return CK_MC_RELEASE;
+}
+
+/** Give every test executable a distinct process name, regardless of its source path. */
+function stageDevBinary(
+    source: string,
+    filename: string,
+    targetDir = RUST_E2E_DEV_BIN_DIR,
+): string {
+    if (!filename.startsWith("ckdev-")) {
+        throw new Error(`test binary name must start with ckdev-: ${filename}`);
+    }
+    mkdirSync(targetDir, { recursive: true });
+    const destination = join(targetDir, filename);
+    if (resolve(source) === resolve(destination)) return destination;
+    rmSync(destination, { force: true });
+    // A copy, never a hard link: on macOS a daemon exec'd through a hard link to
+    // cargo's output was occasionally SIGKILLed at startup, while a copy never was.
+    copyFileSync(source, destination);
+    return destination;
 }
 
 /**
@@ -190,10 +209,6 @@ export interface RustModePrereqs {
     subconsciousRoot?: string;
 }
 
-/**
- * Detect whether the hermetic Rust stack can run here. Never throws; returns a
- * printable reason so the suite can SKIP cleanly on an unsupported machine.
- */
 export function detectRustModePrereqs(): RustModePrereqs {
     if (process.platform === "win32") {
         return {
@@ -202,25 +217,32 @@ export function detectRustModePrereqs(): RustModePrereqs {
         };
     }
 
-    const cargo = spawnSync("cargo", ["--version"], { stdio: "ignore" });
-    if (cargo.error || cargo.status !== 0) {
-        return {
-            ok: false,
-            skipReason: "cargo is not available on PATH; cannot build ck-mc / ck-subc",
-        };
-    }
-
+    const prebuiltPaths = [
+        process.env.MC_E2E_CK_MC_PREBUILT_BIN,
+        process.env.MC_E2E_CK_MC_DRIVE_FAULT_BIN,
+        process.env.MC_E2E_CK_SUBC_BIN,
+    ];
+    const hasPrebuiltPair = prebuiltPaths.every((path) => path && existsSync(path));
     const subconsciousRoot = subconsciousCandidates().find((candidate) =>
         existsSync(join(candidate, "Cargo.toml")),
     );
-    if (!subconsciousRoot) {
-        return {
-            ok: false,
-            skipReason: `sibling subconscious workspace not found (looked in: ${subconsciousCandidates().join(", ")}); cannot build the ck-subc daemon`,
-        };
+    if (!hasPrebuiltPair) {
+        const cargo = spawnSync("cargo", ["--version"], { stdio: "ignore" });
+        if (cargo.error || cargo.status !== 0) {
+            return {
+                ok: false,
+                skipReason: "cargo is not available on PATH; cannot build the ck-mc / ck-subc test binaries",
+            };
+        }
+        if (!subconsciousRoot) {
+            return {
+                ok: false,
+                skipReason: `sibling subconscious source not found (looked in: ${subconsciousCandidates().join(", ")}); needed to build the ck-subc daemon`,
+            };
+        }
     }
 
-    return { ok: true, subconsciousRoot };
+    return { ok: true, ...(subconsciousRoot ? { subconsciousRoot } : {}) };
 }
 
 // ── build (memoized once per process, like real_daemon's BUILD_LOCK) ──────────
@@ -260,28 +282,34 @@ function runCargo(
     });
 }
 
-/**
- * Resolve the sibling daemon source to build from.
- *
- * The sibling checkout on a developer box is another seat's live working tree, and
- * that tree is mid-edit whenever its owner is working: a release gate on 2026-09-18
- * failed on `E0433 cannot find type Sha256` in subconscious's ck.rs, an edit SUBC
- * had not committed yet. Building the daemon from the sibling's COMMITTED HEAD in
- * a detached scratch worktree makes the gate depend on a revision, not on whoever
- * has an editor open. The scratch worktree is keyed on the sha so a repeat build
- * reuses it, and the shared e2e target directory keeps Cargo's cache warm. In CI
- * the sibling is a fresh checkout and HEAD is the working tree, so this is a no-op
- * there beyond the extra worktree.
- */
 function committedSiblingSource(subconsciousRoot: string): { root: string; sha: string } {
-    const head = spawnSync("git", ["-C", subconsciousRoot, "rev-parse", "HEAD"], {
-        encoding: "utf8",
+    const lock = readFileSync(join(REPO_ROOT, "Cargo.lock"), "utf8");
+    const subcPackages = lock
+        .split(/(?=\[\[package\]\]\n)/)
+        .filter((section) => /^name = "subc-core"$/m.test(section));
+    const revisions = subcPackages.flatMap((section) => {
+        const source = section.match(
+            /^source = "git\+https:\/\/github\.com\/cortexkit\/subconscious\?rev=([0-9a-f]{40})#([0-9a-f]{40})"$/m,
+        );
+        if (!source) return [];
+        if (source[1] !== source[2]) {
+            throw new Error(`Cargo.lock subc-core revision does not match its source fragment: ${source[0]}`);
+        }
+        return [source[2]];
     });
-    const sha = head.status === 0 ? head.stdout.trim() : "";
-    if (!/^[0-9a-f]{40}$/.test(sha)) {
-        // Not a git checkout (a tarball or vendored copy): build what is there.
-        return { root: subconsciousRoot, sha: "working-tree" };
+    if (revisions.length !== 1) {
+        throw new Error(`expected one lock-pinned subc-core revision in Cargo.lock, found ${revisions.length}`);
     }
+    const sha = revisions[0]!;
+    const available = spawnSync("git", ["-C", subconsciousRoot, "cat-file", "-e", `${sha}^{commit}`], {
+        stdio: "ignore",
+    });
+    if (available.status !== 0) {
+        throw new Error(
+            `the sibling subconscious checkout does not contain Cargo.lock's pinned revision ${sha}; fetch that revision before running Rust e2e tests`,
+        );
+    }
+
     const scratchRoot = join(dirname(RUST_E2E_CARGO_TARGET_DIR), "subconscious-src");
     const stamp = join(scratchRoot, ".mc-e2e-sha");
     if (existsSync(stamp) && readFileSync(stamp, "utf8").trim() === sha) {
@@ -298,7 +326,7 @@ function committedSiblingSource(subconsciousRoot: string): { root: string; sha: 
     );
     if (added.status !== 0) {
         throw new Error(
-            `failed to stage the sibling daemon source at ${sha} (git worktree add): ${added.stderr}`,
+            `failed to stage the pinned daemon source at ${sha} (git worktree add): ${added.stderr}`,
         );
     }
     writeFileSync(stamp, `${sha}\n`);
@@ -306,14 +334,13 @@ function committedSiblingSource(subconsciousRoot: string): { root: string; sha: 
 }
 
 /**
- * Use an explicitly supplied CI-built module/daemon pair, or build both from
- * their current workspaces incrementally for local release runs. The fault-feature
- * variant is a separate binary; never pair only one prebuilt component with a
- * locally rebuilt counterpart. Local builds use the e2e-owned Cargo target and
- * are memoized by feature set for this test process.
+ * Use an explicitly supplied CI-built module/daemon pair, or build both locally
+ * from the current module and lock-pinned daemon source. The fault-feature variant
+ * is a separate binary; never pair only one prebuilt component with a locally built
+ * counterpart. Local builds use the e2e-owned Cargo target and are memoized by feature set.
  */
 export async function buildHermeticBinaries(
-    subconsciousRoot: string,
+    subconsciousRoot?: string,
     options: { driveFault?: boolean } = {},
 ): Promise<BuiltBinaries> {
     // The fault arms live behind a non-default Cargo feature, so a scenario that
@@ -332,7 +359,13 @@ export async function buildHermeticBinaries(
             if (!prebuiltModule || !prebuiltDaemon || !existsSync(prebuiltModule) || !existsSync(prebuiltDaemon)) {
                 throw new Error(`incomplete hermetic prebuilt binary pair for ${buildKey}`);
             }
-            return { ckMcBin: prebuiltModule, ckSubcBin: prebuiltDaemon };
+            return {
+                ckMcBin: stageDevBinary(prebuiltModule, `ckdev-mc-e2e-${buildKey}`),
+                ckSubcBin: stageDevBinary(prebuiltDaemon, "ckdev-subc"),
+            };
+        }
+        if (!subconsciousRoot) {
+            throw new Error("subconscious source is required to build the lock-pinned ck-subc daemon");
         }
         const cargoEnv = rustE2eCargoEnv();
         let ckMcBin = currentTreeCkMcBinary(process.env.MC_E2E_CK_MC_BIN);
@@ -345,23 +378,8 @@ export async function buildHermeticBinaries(
             );
         }
 
-        // Run the module under a dev-distinct process name so a test binary is
-        // never mistaken for the production ck-mc in Activity Monitor / ps.
-        // A hardlink shares the inode (no copy cost, always current build);
-        // fall back to a copy across filesystems.
-        const devNamed = join(dirname(ckMcBin), `ckdev-mc-e2e-${buildKey}`);
-        try {
-            rmSync(devNamed, { force: true });
-            linkSync(ckMcBin, devNamed);
-            ckMcBin = devNamed;
-        } catch {
-            try {
-                copyFileSync(ckMcBin, devNamed);
-                ckMcBin = devNamed;
-            } catch {
-                // Keep the original path; naming is cosmetic, never a test failure.
-            }
-        }
+        // Keep the dev name even when linking across filesystems is unavailable.
+        ckMcBin = stageDevBinary(ckMcBin, `ckdev-mc-e2e-${buildKey}`);
 
         const ckSubcRelease = join(RUST_E2E_CARGO_TARGET_DIR, "release/ck-subc");
         const daemonSource = committedSiblingSource(subconsciousRoot);
@@ -376,7 +394,7 @@ export async function buildHermeticBinaries(
             );
         }
 
-        return { ckMcBin, ckSubcBin: ckSubcRelease };
+        return { ckMcBin, ckSubcBin: stageDevBinary(ckSubcRelease, "ckdev-subc") };
     })();
     buildPromises.set(buildKey, buildPromise);
     return buildPromise;
@@ -1119,5 +1137,6 @@ export const __hermeticSubcTest = {
     isStaleRustE2ePidRecord,
     rustE2eCargoEnv,
     rustE2eCargoTargetDir: RUST_E2E_CARGO_TARGET_DIR,
+    stageDevBinary,
     stalePidAgeMs: RUST_E2E_STALE_PID_AGE_MS,
 };

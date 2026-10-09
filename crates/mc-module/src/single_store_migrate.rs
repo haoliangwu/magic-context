@@ -27,6 +27,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use mc_store::private_permissions::{create_directory, ensure_directory, tighten_tree, write_file};
 use mc_store::single_store_schema::{self as schema, DomainTables, CONTEXT_TABLES, LEGACY_TABLES};
 use mc_store::{McStoreError, MemoryRenderSnapshot, StoredCompartment, WorkspaceMembership};
 use rusqlite::types::Value as SqlValue;
@@ -2889,7 +2890,8 @@ fn backup(options: &EngineOptions) -> Result<(), EngineError> {
 
 /// The copy-and-check half of [`backup`], without the migration's undo instructions.
 pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
-    std::fs::create_dir_all(&options.backup_dir)?;
+    let private = crate::config::private_storage_permissions_enabled();
+    ensure_directory(&options.backup_dir, private)?;
     let mut manifest = String::from("name\tsource\tschema_version\tsha256\n");
     for (name, source) in [
         ("context.db", &options.context_db),
@@ -2942,7 +2944,17 @@ pub(crate) fn backup_files(options: &EngineOptions) -> Result<(), EngineError> {
             source.display(),
         ));
     }
-    std::fs::write(options.backup_dir.join("MANIFEST.tsv"), manifest)?;
+    write_file(
+        &options.backup_dir.join("MANIFEST.tsv"),
+        manifest.as_bytes(),
+        private,
+    )?;
+    let report = tighten_tree(&options.backup_dir, private);
+    tracing::info!(
+        tightened = report.tightened,
+        failures = report.failures,
+        "mc-module: migration backup permission tightening"
+    );
     Ok(())
 }
 
@@ -3246,7 +3258,7 @@ impl DryRunScratch {
         ));
         // `create_dir` (not `create_dir_all`) so an existing directory is never adopted
         // and then deleted by the drop below.
-        std::fs::create_dir(&path)?;
+        create_directory(&path, crate::config::private_storage_permissions_enabled())?;
         Ok(DryRunScratch { path })
     }
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Check the live context.db and store.db versions and source epoch constants before placement.
 set -euo pipefail
+umask 077
 
 usage() { echo "usage: $0 [--dry-run] [--no-restart] [--require-epochs-unchanged] [--source-ref REF] STAGED_BINARY" >&2; exit 2; }
 die() { echo "place-ck-mc: $*" >&2; exit 1; }

@@ -1000,6 +1000,8 @@ pub(crate) fn refresh_tail_hygiene_baseline_calibrated(
             evaluable: true,
             generation_invalidated: false,
             baseline_parts: frozen.baseline_parts,
+            protected_tools_policy: previous
+                .and_then(|baseline| baseline.protected_tools_policy.clone()),
             content_signature,
             channel1_post_reduce_grace_baseline_u: previous
                 .and_then(|baseline| baseline.channel1_post_reduce_grace_baseline_u),

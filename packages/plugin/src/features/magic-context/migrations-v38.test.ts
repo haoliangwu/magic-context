@@ -36,7 +36,9 @@ describe("migration v38 — transform decisions", () => {
             runMigrations(db);
 
             expect(tableNames(db)).toContain("transform_decisions");
-            expect(indexNames(db)).toContain("idx_transform_decisions_session_harness");
+            // The current migration chain replaces v38's prefix-only index with retention coverage.
+            expect(indexNames(db)).toContain("idx_transform_decisions_retention");
+            expect(indexNames(db)).not.toContain("idx_transform_decisions_session_harness");
             expect(columnNames(db, "transform_decisions")).toEqual([
                 "session_id",
                 "harness",
@@ -73,7 +75,8 @@ describe("migration v38 — transform decisions", () => {
             runMigrations(db);
 
             expect(tableNames(db)).toContain("transform_decisions");
-            expect(indexNames(db)).toContain("idx_transform_decisions_session_harness");
+            expect(indexNames(db)).toContain("idx_transform_decisions_retention");
+            expect(indexNames(db)).not.toContain("idx_transform_decisions_session_harness");
             db.prepare(
                 `INSERT OR REPLACE INTO transform_decisions (
                     session_id, harness, message_id, ts_ms, decision, materialized,

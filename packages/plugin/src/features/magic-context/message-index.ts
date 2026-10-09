@@ -46,6 +46,8 @@ export interface MessageHistoryOrphanSweepResult {
     scanned: number;
     deleted: number;
     cursor: string;
+    /** Why a parked sweep did not run, when that is not simply a host without an OpenCode store. */
+    reason?: string;
 }
 
 export interface MessageHistoryOrphanSweepOptions {
@@ -855,11 +857,16 @@ export function ensureMessagesIndexed(
  * sweep reads. Pi and OMP keep theirs elsewhere, so there is nothing here for
  * the sweep to compare against — that is an absent source, not an error, and
  * the caller parks the sweep instead of failing the maintenance pass.
+ *
+ * OpenCode 2 is parked too. This sweep judges a session orphaned when OpenCode
+ * 1's `session` table has no row for it, but OpenCode 2 keeps its sessions in
+ * `session_v2`. A store OpenCode 2 migrated from OpenCode 1 still carries the
+ * old `session` table, so the OpenCode 1 store opens cleanly and every
+ * OpenCode 2 session looks orphaned: sweeping there would delete live session
+ * state. Sweeping OpenCode 2 needs a check against `session_v2` instead.
  */
-function harnessSupportsOpenCodeOrphanSweep(
-    harness: HarnessId,
-): harness is "opencode" | "opencode2" {
-    return harness === "opencode" || harness === "opencode2";
+function harnessSupportsOpenCodeOrphanSweep(harness: HarnessId): harness is "opencode" {
+    return harness === "opencode";
 }
 
 function getMessageHistoryOrphanSweepState(
@@ -946,6 +953,15 @@ function sweepOrphanedOpenCodeMessageIndexesInBackground(
             now + unavailableReprobeMs - cooldownMs,
             harness,
         );
+        if (harness === "opencode2") {
+            return {
+                status: "unavailable",
+                scanned: 0,
+                deleted: 0,
+                cursor,
+                reason: "OpenCode 2 keeps its sessions in session_v2, which this sweep does not read",
+            };
+        }
         return { status: "unavailable", scanned: 0, deleted: 0, cursor };
     }
 

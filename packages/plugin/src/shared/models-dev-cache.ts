@@ -25,14 +25,14 @@
  * for Pi and Pi's own path is used.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ContextLimitProvenance } from "./context-limit-provenance";
 import { getMagicContextStorageDir } from "./data-path";
 import { getHarness } from "./harness";
 import { modelRefLookupOrder } from "./harness-provider-map";
 import { sessionLog } from "./logger";
-import { shouldEnforcePrivateStoragePermissions } from "./storage-permissions";
+import { writeStorageFileAtomicSync } from "./storage-permissions";
 import {
     deriveWindowGeometry,
     getWindowOverlay,
@@ -182,16 +182,8 @@ function persistApiCache(): void {
         }
     }
     try {
-        const dir = getMagicContextStorageDir();
-        mkdirSync(dir, { recursive: true });
         const target = persistFilePath();
-        const tmp = `${target}.${process.pid}.tmp`;
-        if (shouldEnforcePrivateStoragePermissions()) {
-            writeFileSync(tmp, JSON.stringify(obj), { encoding: "utf-8", mode: 0o600 });
-        } else {
-            writeFileSync(tmp, JSON.stringify(obj), { encoding: "utf-8" });
-        }
-        renameSync(tmp, target);
+        writeStorageFileAtomicSync(target, JSON.stringify(obj));
     } catch {
         // best-effort — a failed persist only loses cold-start warmth, not correctness
     }

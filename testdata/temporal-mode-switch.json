@@ -1,0 +1,116 @@
+{
+  "request": {
+    "kind": "transform",
+    "v": 2,
+    "serializer_profile": "opencode-aisdk",
+    "session_id": "temporal-mode-wire",
+    "render_config": "cfg0",
+    "tool_present": true,
+    "auto_search_enabled": false,
+    "messages": [
+      {
+        "mid": "prior",
+        "ordinal": 1,
+        "ck": {
+          "role": "assistant",
+          "content": [
+            {
+              "kind": {
+                "type": "text",
+                "text": "answer"
+              }
+            }
+          ],
+          "meta": {
+            "harness_id": "prior",
+            "ordinal": 1,
+            "synthetic": false,
+            "summary": false,
+            "errored": false,
+            "created_at_ms": 100000,
+            "completed_at_ms": 0
+          }
+        }
+      },
+      {
+        "mid": "user",
+        "ordinal": 2,
+        "ck": {
+          "role": "user",
+          "content": [
+            {
+              "kind": {
+                "type": "text",
+                "text": "question"
+              }
+            }
+          ],
+          "meta": {
+            "harness_id": "user",
+            "ordinal": 2,
+            "synthetic": false,
+            "summary": false,
+            "errored": false,
+            "created_at_ms": 600000
+          }
+        }
+      },
+      {
+        "mid": "later",
+        "ordinal": 3,
+        "ck": {
+          "role": "user",
+          "content": [
+            {
+              "kind": {
+                "type": "text",
+                "text": "follow up"
+              }
+            }
+          ],
+          "meta": {
+            "harness_id": "later",
+            "ordinal": 3,
+            "synthetic": false,
+            "summary": false,
+            "errored": false,
+            "created_at_ms": 1200000
+          }
+        }
+      },
+      {
+        "mid": "near",
+        "ordinal": 4,
+        "ck": {
+          "role": "user",
+          "content": [
+            {
+              "kind": {
+                "type": "text",
+                "text": "nearby"
+              }
+            }
+          ],
+          "meta": {
+            "harness_id": "near",
+            "ordinal": 4,
+            "synthetic": false,
+            "summary": false,
+            "errored": false,
+            "created_at_ms": 1201000
+          }
+        }
+      }
+    ]
+  },
+  "ts_users": [
+    "§2§ <!-- +5m -->\nquestion",
+    "§3§ <!-- +10m -->\nfollow up",
+    "§4§ nearby"
+  ],
+  "rust_users": [
+    "§2§ <!-- +10m -->\nquestion",
+    "§3§ <!-- +10m -->\nfollow up",
+    "§4§ nearby"
+  ]
+}

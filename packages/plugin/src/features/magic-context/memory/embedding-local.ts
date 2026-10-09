@@ -1,5 +1,5 @@
-import { chmodSync, mkdirSync, readdirSync, statSync } from "node:fs";
-import { open, stat, unlink, writeFile } from "node:fs/promises";
+import { readdirSync, statSync } from "node:fs";
+import { stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { workerData } from "node:worker_threads";
@@ -8,7 +8,13 @@ import { getMagicContextStorageDir } from "../../../shared/data-path";
 import { getHarness } from "../../../shared/harness";
 import { log } from "../../../shared/logger";
 import { importPluginModule } from "../../../shared/stale-plugin-build";
-import { shouldEnforcePrivateStoragePermissions } from "../../../shared/storage-permissions";
+import {
+    createStorageFileHandleAsync,
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    writeStorageFileAsync,
+    writeStorageFileHandleAsync,
+} from "../../../shared/storage-permissions";
 import { classifyLocalEmbeddingFailure, type EmbeddingFailure } from "./embedding-failure";
 import { getEmbeddingProviderIdentity } from "./embedding-identity";
 import type { EmbeddingProvider, EmbeddingPurpose } from "./embedding-provider";
@@ -117,7 +123,7 @@ export function resolveLocalEmbeddingWorkerRuntime(
  * so two processes never call `createPipeline()` at the exact same instant.
  *
  * Contract:
- *   - Uses `open(path, "wx")` — atomic-create with exclusive flag on POSIX,
+ *   - Uses the shared private-file helper in exclusive-create mode on POSIX,
  *     and the equivalent on Windows (ERROR_FILE_EXISTS).
  *   - Writes our PID + timestamp to the lock file for diagnostics.
  *   - If the lock is held by another process, polls every 150ms.
@@ -135,10 +141,13 @@ async function acquireModelLoadLock(lockPath: string): Promise<() => Promise<voi
     const waitStart = Date.now();
     while (true) {
         try {
-            const handle = await open(lockPath, "wx");
+            const handle = await createStorageFileHandleAsync(lockPath, "wx");
             // Best-effort write of PID + timestamp for diagnostics.
             try {
-                await handle.writeFile(`pid=${process.pid} started=${Date.now()}\n`);
+                await writeStorageFileHandleAsync(
+                    handle,
+                    `pid=${process.pid} started=${Date.now()}\n`,
+                );
             } catch {
                 /* non-fatal */
             }
@@ -200,7 +209,7 @@ function startLockHeartbeat(lockPath: string): () => void {
     const HEARTBEAT_MS = Math.floor(STALE_LOCK_MS / 3);
     const timer = setInterval(() => {
         // writeFile with fresh content updates mtime; any error is non-fatal.
-        writeFile(lockPath, `pid=${process.pid} alive=${Date.now()}\n`).catch(() => {});
+        writeStorageFileAsync(lockPath, `pid=${process.pid} alive=${Date.now()}\n`).catch(() => {});
     }, HEARTBEAT_MS);
     // Don't keep the event loop alive solely for the heartbeat.
     timer.unref?.();
@@ -896,22 +905,7 @@ export class LocalEmbeddingProvider implements EmbeddingProvider {
                 // or buffer" failures. Using our own storage dir survives plugin updates too.
                 const modelCacheDir = modelCacheDirForRuntime();
                 try {
-                    // Keep the cache owner-only by default because it shares the
-                    // storage tree with memories/history. Trusted-group deployments
-                    // manage this directory externally, so skip both mode creation
-                    // and chmod rather than attempting a different permission change.
-                    if (shouldEnforcePrivateStoragePermissions()) {
-                        mkdirSync(modelCacheDir, { recursive: true, mode: 0o700 });
-                        if (process.platform !== "win32") {
-                            try {
-                                chmodSync(modelCacheDir, 0o700);
-                            } catch {
-                                // Non-fatal — leave default perms if chmod is rejected.
-                            }
-                        }
-                    } else {
-                        mkdirSync(modelCacheDir, { recursive: true });
-                    }
+                    ensureStorageDirectorySync(modelCacheDir);
                     env.cacheDir = modelCacheDir;
                 } catch {
                     // Non-fatal — fall back to library default if we can't create the dir

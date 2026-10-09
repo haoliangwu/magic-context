@@ -1,10 +1,6 @@
 import {
-    chmodSync,
-    copyFileSync,
-    cpSync,
     type Dirent,
     existsSync,
-    mkdirSync,
     readdirSync,
     readFileSync,
     rmdirSync,
@@ -45,7 +41,14 @@ import {
 import { configureContextDatabasePragmas } from "../../shared/sqlite-context-pragmas";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { importPluginModule } from "../../shared/stale-plugin-build";
-import { shouldEnforcePrivateStoragePermissions } from "../../shared/storage-permissions";
+import {
+    copyStorageFileSync,
+    copyStorageTreeSync,
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    tightenStorageTreeSync,
+    writeStorageFileSync,
+} from "../../shared/storage-permissions";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 
 import { ensureContextStoreUuid } from "./context-store-uuid";
@@ -60,12 +63,13 @@ import {
     LKG_SLOTS_DDL,
     SESSION_REPLAY_DECISIONS_DDL,
 } from "./migration-v94-write-split";
+import { installV95PerfSchema } from "./migration-v95-perf-indexes";
 import { runMigrationsOffThread } from "./migration-worker-client";
 import {
     FORK_MIGRATION_VERSION_FLOOR,
+    getMainThreadMigrationBodyCount,
     hasPendingMigrations,
     runMigrations,
-    runMigrationsWithRetry,
 } from "./migrations";
 import { installCompartmentHistoryVersions } from "./storage-compartment-history-version";
 import { ensureColumn, healAllNullColumns } from "./storage-schema-helpers";
@@ -157,7 +161,7 @@ export function __resetSchemaFenceStateForTests(): void {
     lastUnconfirmedMigrationHolders = null;
 }
 
-export const LATEST_SUPPORTED_VERSION = 94;
+export const LATEST_SUPPORTED_VERSION = 95;
 
 /**
  * Every runtime backend receives the same finite wait before the first schema
@@ -166,64 +170,13 @@ export const LATEST_SUPPORTED_VERSION = 94;
  */
 export const BOOT_SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
-// chmod is meaningless on Windows (POSIX modes are not honored), so all
-// permission tightening is skipped there. mkdir's `mode` is likewise ignored.
-const PERMISSIONS_ENFORCEABLE = process.platform !== "win32";
-
-const defaultStoragePermissionFs = { chmodSync, mkdirSync };
-let storagePermissionFs = defaultStoragePermissionFs;
-
-/** Test seam: captures permission-changing calls without changing real fixture modes. */
-export function __setStoragePermissionFsForTests(
-    overrides: Partial<typeof defaultStoragePermissionFs>,
-): void {
-    storagePermissionFs = { ...defaultStoragePermissionFs, ...overrides };
-}
-
-export function __resetStoragePermissionFsForTests(): void {
-    storagePermissionFs = defaultStoragePermissionFs;
-}
-
-/**
- * Create `dir` recursively. When private permissions are enabled, also create
- * and tighten it to owner-only 0o700. When an operator manages trusted-group
- * permissions, do not pass a mode or chmod an existing directory.
- */
 function ensureSecureStorageDir(dir: string): void {
-    if (!shouldEnforcePrivateStoragePermissions()) {
-        storagePermissionFs.mkdirSync(dir, { recursive: true });
-        return;
-    }
-
-    storagePermissionFs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    if (!PERMISSIONS_ENFORCEABLE) return;
-    try {
-        storagePermissionFs.chmodSync(dir, 0o700);
-    } catch (error) {
-        log(
-            `[magic-context] could not restrict storage dir permissions on ${dir}: ${getErrorMessage(error)}`,
-        );
-    }
+    ensureStorageDirectorySync(dir);
 }
 
-/**
- * Restrict the SQLite DB file and its WAL/SHM sidecars to owner-only (0o600)
- * only when Magic Context owns storage permission management. A trusted-group
- * deployment keeps the operator's modes unchanged, including sidecars.
- */
-function restrictDatabaseFilePermissions(dbPath: string): void {
-    if (!PERMISSIONS_ENFORCEABLE || !shouldEnforcePrivateStoragePermissions()) return;
-    for (const suffix of ["", "-wal", "-shm"]) {
-        const file = `${dbPath}${suffix}`;
-        if (!existsSync(file)) continue;
-        try {
-            storagePermissionFs.chmodSync(file, 0o600);
-        } catch (error) {
-            log(
-                `[magic-context] could not restrict DB file permissions on ${file}: ${getErrorMessage(error)}`,
-            );
-        }
-    }
+function tightenStorageTree(dir: string): void {
+    const { failures } = tightenStorageTreeSync(dir);
+    log(`[magic-context] storage permission tightening failures=${failures}`);
 }
 
 export interface DatabaseBootTimings {
@@ -233,6 +186,8 @@ export interface DatabaseBootTimings {
 }
 
 export interface OpenDatabaseOptions {
+    /** Host-side synchronous reads may reuse/open only an already-current schema. */
+    allowMigrations?: boolean;
     dbPath?: string;
     latestSupportedVersion?: number;
     /** Test/diagnostic override; production uses BOOT_SQLITE_BUSY_TIMEOUT_MS. */
@@ -349,7 +304,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath: string, targetDbDir: string)
         const dst = join(targetDbDir, `context.db${suffix}`);
         if (existsSync(src)) {
             try {
-                copyFileSync(src, dst);
+                copyStorageFileSync(src, dst);
             } catch (error) {
                 log(`[magic-context] failed to copy ${src}:`, getErrorMessage(error));
             }
@@ -361,7 +316,7 @@ function migrateLegacyStorageIfNeeded(targetDbPath: string, targetDbDir: string)
     const targetModelsDir = join(targetDbDir, "models");
     if (existsSync(legacyModelsDir) && !existsSync(targetModelsDir)) {
         try {
-            cpSync(legacyModelsDir, targetModelsDir, { recursive: true });
+            copyStorageTreeSync(legacyModelsDir, targetModelsDir);
         } catch (error) {
             log("[magic-context] failed to copy embedding model cache:", getErrorMessage(error));
         }
@@ -1151,7 +1106,9 @@ function finishDatabaseOpen(
     loadToolDefinitionMeasurements(db);
     // When enabled, tighten the DB + WAL/SHM sidecars now that WAL mode has
     // created them. Externally managed trusted-group storage skips this entirely.
-    restrictDatabaseFilePermissions(dbPath);
+    // SQLite creates WAL sidecars itself; the startup tree pass also covers files
+    // materialized during this open. The helper logs failure counts only.
+    tightenStorageTree(dirname(dbPath));
     databases.set(dbPath, db);
     pathByDatabase.set(db, dbPath);
     persistenceByDatabase.set(db, true);
@@ -1236,7 +1193,6 @@ export function initializeDatabase(
       harness TEXT NOT NULL DEFAULT 'opencode',
       UNIQUE(session_id, sequence)
     );
-    CREATE INDEX IF NOT EXISTS idx_compartments_session ON compartments(session_id);
 
     CREATE TABLE IF NOT EXISTS compartment_chunk_embeddings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1297,7 +1253,6 @@ export function initializeDatabase(
       harness TEXT NOT NULL DEFAULT 'opencode',
       PRIMARY KEY(session_id, message_ordinal)
     );
-    CREATE INDEX IF NOT EXISTS idx_compression_depth_session ON compression_depth(session_id);
 
     CREATE TABLE IF NOT EXISTS session_facts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1603,7 +1558,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       stale_reason           TEXT,
       PRIMARY KEY (project_path, path)
     );
-    CREATE INDEX IF NOT EXISTS idx_project_key_files_project ON project_key_files(project_path);
     CREATE INDEX IF NOT EXISTS idx_project_key_files_generated_at ON project_key_files(project_path, generated_at);
 
     CREATE TABLE IF NOT EXISTS project_key_files_version (
@@ -1988,10 +1942,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       input_tokens       INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (session_id, harness, message_id)
     );
-    CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
-      ON transform_decisions(session_id, harness);
 
-    CREATE INDEX IF NOT EXISTS idx_tags_session_tag_number ON tags(session_id, tag_number);
     CREATE INDEX IF NOT EXISTS idx_tags_session_message_id ON tags(session_id, message_id);
 
     -- Clone/import paths can write tags before session bootstrap. Keep trigger-created
@@ -2037,9 +1988,7 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
       WHERE NEW.session_id != OLD.session_id
       ON CONFLICT(session_id) DO UPDATE SET tags_version = tags_version + 1;
     END;
-    CREATE INDEX IF NOT EXISTS idx_pending_ops_session ON pending_ops(session_id);
     CREATE INDEX IF NOT EXISTS idx_pending_ops_session_tag_id ON pending_ops(session_id, tag_id);
-    CREATE INDEX IF NOT EXISTS idx_source_contents_session ON source_contents(session_id);
     
     CREATE TABLE IF NOT EXISTS recomp_compartments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2529,8 +2478,6 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
         input_tokens       INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (session_id, harness, message_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_transform_decisions_session_harness
-        ON transform_decisions(session_id, harness);
     `);
 
     // transform_decisions existed before comparison telemetry was introduced.
@@ -2585,6 +2532,12 @@ CREATE INDEX IF NOT EXISTS idx_dream_queue_pending ON dream_queue(started_at, en
     // here. Migration v6 handles `notes` separately (see migrations.ts).
     // notes.anchor_ordinal is added by migration v29 for the same reason — it
     // cannot go here because the table doesn't exist yet on a fresh DB.
+    // An upgrade changes indexes/triggers only inside the migration transaction.
+    // Fresh/current schemas share the same installer, without rescanning FTS on open.
+    const version = getPersistedSchemaVersion(db);
+    // Fresh stores include the v95 temporal decision table. Older stores wait
+    // for the same migration step rather than installing a new schema lane.
+    if (version === 0 || version >= 95) installV95PerfSchema(db, false, version === 0);
 }
 
 const CHANNEL2_CLAIM_TTL_MS = 10 * 60_000;
@@ -2704,10 +2657,25 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             migrateLegacyStorageIfNeeded(dbPath, dbDir);
         }
         ensureSecureStorageDir(dbDir);
+        tightenStorageTree(dbDir);
+        if (!existsSync(dbPath) && shouldEnforcePrivateStoragePermissions()) {
+            try {
+                writeStorageFileSync(dbPath, new Uint8Array(), { flag: "wx" });
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            }
+        }
 
         db = new Database(dbPath);
         installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
         if (!enforceSchemaFence(db, dbPath, latestSupportedVersion)) {
+            closeQuietly(db);
+            return null;
+        }
+        if (options?.allowMigrations === false && hasPendingMigrations(db)) {
+            log(
+                `[magic-context] storage not ready: pending migrations at ${dbPath}; host callers must await the async opener`,
+            );
             closeQuietly(db);
             return null;
         }
@@ -2716,7 +2684,12 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             return null;
         }
         initializeDatabase(db, busyTimeoutMs);
-        runMigrations(db);
+        if (options?.allowMigrations === false) {
+            if (hasPendingMigrations(db)) {
+                closeQuietly(db);
+                return null;
+            }
+        } else runMigrations(db);
         ensureContextStoreUuid(db);
         return finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
     } catch (error) {
@@ -2731,6 +2704,11 @@ export function openDatabase(dbPathOrOptions?: string | OpenDatabaseOptions): Da
             `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
         );
     }
+}
+
+/** Tool/RPC/timer access must not turn an earlier async boot failure into a synchronous upgrade. */
+export function openCurrentDatabase(options: OpenDatabaseOptions = {}): Database | null {
+    return openDatabase({ ...options, allowMigrations: false });
 }
 
 /**
@@ -2768,8 +2746,17 @@ export async function openDatabaseAsync(
     const pending = pendingAsyncOpens.get(dbPath);
     if (pending) return pending;
 
+    // A worker cannot share an in-memory connection. Reject before file creation
+    // or permission hardening can mistake a SQLite pseudo-path for a real file.
+    if (!isFileBackedPath(dbPath)) {
+        throw new Error(
+            "async migration requires a file-backed database; use the explicit synchronous opener for in-memory or URI test databases",
+        );
+    }
+
     const opening = (async (): Promise<Database | null> => {
         let db: Database | undefined;
+        const mainThreadBodiesBefore = getMainThreadMigrationBodyCount();
         const openStartedAt = performance.now();
         let openMs = 0;
         let guardMs = 0;
@@ -2779,6 +2766,14 @@ export async function openDatabaseAsync(
         try {
             if (!explicitDbPath) migrateLegacyStorageIfNeeded(dbPath, dbDir);
             ensureSecureStorageDir(dbDir);
+            tightenStorageTree(dbDir);
+            if (!existsSync(dbPath) && shouldEnforcePrivateStoragePermissions()) {
+                try {
+                    writeStorageFileSync(dbPath, new Uint8Array(), { flag: "wx" });
+                } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+                }
+            }
 
             db = new Database(dbPath);
             installBootBusyTimeout(db, dbPath, busyTimeoutMs, options?.onBootBusyTimeout);
@@ -2808,17 +2803,26 @@ export async function openDatabaseAsync(
             // worker has committed, so no caller can read a half-migrated schema.
             // With nothing pending, nothing is started and the open costs what it
             // did before.
-            if (isFileBackedPath(dbPath) && hasPendingMigrations(db)) {
+            if (hasPendingMigrations(db)) {
                 await runMigrationsOffThread({
                     dbPath,
                     busyTimeoutMs,
                     sqlitePragmaConfig: { ...sqlitePragmaConfig },
                 });
             }
-            // Already-current after the worker, so this reaches runMigrations' read-only
-            // fast path. If no worker could start, this applies the migrations here.
+            // A worker must finish the upgrade before the main connection initializes.
+            // Never substitute the synchronous runner for a failed or incomplete worker.
+            if (hasPendingMigrations(db)) {
+                throw new Error(
+                    "the migration worker did not complete the pending migration; reinstall or rebuild the plugin",
+                );
+            }
             initializeDatabase(db, busyTimeoutMs);
-            await runMigrationsWithRetry(db);
+            if (hasPendingMigrations(db)) {
+                throw new Error(
+                    "storage initialization left a pending migration; reinstall or rebuild the plugin",
+                );
+            }
             ensureContextStoreUuid(db);
             const opened = finishDatabaseOpen(db, dbPath, explicitDbPath, latestSupportedVersion);
             migrateMs = performance.now() - migrateStartedAt;
@@ -2831,6 +2835,9 @@ export async function openDatabaseAsync(
                 `[magic-context] storage unavailable: ${detail}. Magic Context is disabled for this run; check log for details.`,
             );
         } finally {
+            log(
+                `[migrations] async open main-thread migration-body count: ${getMainThreadMigrationBodyCount() - mainThreadBodiesBefore} (total=${getMainThreadMigrationBodyCount()}) path=${dbPath}`,
+            );
             if (openMs === 0) openMs = performance.now() - openStartedAt;
             if (guardStartedAt !== null && guardMs === 0) {
                 guardMs = performance.now() - guardStartedAt;

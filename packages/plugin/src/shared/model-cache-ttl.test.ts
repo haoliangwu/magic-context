@@ -29,8 +29,8 @@ describe("known model cache TTL", () => {
         expect(resolveCacheTtl("5m", "openai/gpt-6")).toBe("30m");
         expect(resolveCacheTtl("10m", "openai/gpt-6")).toBe("10m");
     });
-    it("honors per-model entries before built-ins and built-ins before object defaults", () => {
-        expect(resolveCacheTtl({ default: "10m" }, "openai/gpt-6")).toBe("30m");
+    it("honors per-model entries and configured defaults before built-ins", () => {
+        expect(resolveCacheTtl({ default: "10m" }, "openai/gpt-6")).toBe("10m");
         expect(resolveCacheTtl({ default: "10m", "gpt-6": "5m" }, "openai/gpt-6")).toBe("5m");
         expect(resolveCacheTtl({ default: "10m", "openai/*": "never" }, "openai/gpt-6")).toBe(
             "never",

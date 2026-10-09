@@ -55,12 +55,14 @@ async function callDrop(args: {
 	protectedTags?: number;
 	floor?: number;
 	protectedTokens?: number;
+	protectedTools?: Readonly<Record<string, number>>;
 }) {
 	const tool = createCtxReduceTool({
 		db: args.db,
 		protectedTags: args.protectedTags,
 		floor: args.floor,
 		protectedTokens: args.protectedTokens,
+		protectedTools: args.protectedTools,
 	});
 	const result = await tool.execute(
 		"call-1",
@@ -116,6 +118,88 @@ describe("Pi ctx_reduce tool", () => {
 		expect(ops).toHaveLength(1);
 		expect(ops[0].operation).toBe("drop");
 		expect(ops[0].tagId).toBe(2);
+	});
+
+	it("skips ctx_reduce stamps while still queueing sibling tags", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reduce-self-stamp";
+		seedTags(db, sessionId, [
+			{ tagNumber: 41, messageId: "m41" },
+			{ tagNumber: 42, messageId: "m42" },
+		]);
+		db.prepare(
+			"UPDATE tags SET type = 'tool', tool_name = 'ctx_reduce' WHERE session_id = ? AND tag_number = 41",
+		).run(sessionId);
+		db.prepare(
+			"UPDATE tags SET type = 'tool', tool_name = 'read' WHERE session_id = ? AND tag_number = 42",
+		).run(sessionId);
+
+		try {
+			const { isError, text } = await callDrop({
+				db,
+				sessionId,
+				drop: "41,42",
+				floor: 0,
+			});
+
+			expect(isError).toBe(false);
+			expect(text).toBe(
+				"Queued: deferred drop §42§. Held: §42 is inside the protected working set; it applies once newer work displaces it. §41§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+			);
+			expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([42]);
+			const selfOnly = await callDrop({ db, sessionId, drop: "41", floor: 0 });
+			expect(selfOnly.text).toBe(
+				"§41§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+			);
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("orders mixed outcomes as free drop, protected hold, then ctx_reduce self-stamp", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-reduce-mixed-outcomes";
+		try {
+			for (const [number, name] of [
+				[1, "custom"],
+				[2, "ctx_reduce"],
+				[3, "bash"],
+			] as const)
+				insertTag(db, sessionId, `call-${number}`, "tool", 4, number, 0, name);
+			// Large later results keep token-window protection separate from the per-tool hold being tested.
+			for (const number of [100, 101, 102])
+				insertTag(
+					db,
+					sessionId,
+					`pad-${number}`,
+					"tool",
+					32000,
+					number,
+					0,
+					"bash",
+					0,
+					null,
+					null,
+					{ tokenCount: 8000, inputTokenCount: 0, reasoningTokenCount: 0 },
+				);
+			const result = await callDrop({
+				db,
+				sessionId,
+				drop: "2,1,3",
+				floor: 0,
+				protectedTools: { custom: 1 },
+			});
+			expect(result.text).toBe(
+				"Queued: drop §3§, deferred drop §1§. Held: §1 is inside the protected working set; it applies once newer work displaces it. §2§ is a ctx_reduce call; leave those alone, they are cleaned up automatically.",
+			);
+			expect(
+				getPendingOps(db, sessionId)
+					.map((op) => op.tagId)
+					.sort(),
+			).toEqual([1, 3]);
+		} finally {
+			closeQuietly(db);
+		}
 	});
 
 	it("parses comma + dash ranges (3-5,7,9 → [3,4,5,7,9])", async () => {

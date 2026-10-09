@@ -2,6 +2,7 @@ import type { createCompactionHandler } from "../../features/magic-context/compa
 import { resolveProjectIdentityForSession } from "../../features/magic-context/memory/project-identity";
 import { scheduleClearAndReindex } from "../../features/magic-context/message-index-async";
 import {
+    detectLatestTurnThinkingMismatch,
     detectOverflow,
     detectThinkingBindingMismatch,
     isPrefixBoundThinkingModel,
@@ -10,7 +11,6 @@ import { observeSessionActivity } from "../../features/magic-context/session-act
 import { resolveSessionCacheTtl } from "../../features/magic-context/session-cache-ttl";
 import { recordSessionProjectIdentity } from "../../features/magic-context/session-project-storage";
 import {
-    armThinkingBindingRecovery,
     clearDetectedContextLimit,
     clearHistorianFailureState,
     clearPendingCompactionMarkerStateIf,
@@ -38,6 +38,7 @@ import {
 } from "../../features/magic-context/storage-meta-persisted";
 import { clearSession } from "../../features/magic-context/storage-meta-session";
 import type { Tagger } from "../../features/magic-context/tagger";
+import { deleteTemporalDecision } from "../../features/magic-context/temporal-decisions";
 import {
     clearTransformDecisionSession,
     scheduleOpenCodeTransformDecisionWrite,
@@ -58,7 +59,7 @@ import {
 import { hasTrustedAbsoluteWall } from "../../shared/window-geometry";
 import { maybeDeliverChannel2 } from "./channel2-delivery";
 import { removeCompactionMarkerForSession } from "./compaction-marker-manager";
-import { noteContextLimitResolution, provenFloorForModel } from "./context-limit-resolution";
+import { noteContextLimitResolution } from "./context-limit-resolution";
 import {
     getMessageRemovedInfo,
     getMessageUpdatedAssistantInfo,
@@ -73,8 +74,14 @@ import {
     resolveModelKey,
     resolveSessionId,
 } from "./event-resolvers";
+import { armBindingRecoverySafely, armLatestThinkingRecovery } from "./latest-thinking-recovery";
+import { lkgProviderInputTotal, noteLkgProviderResponse } from "./lkg-measured-request";
 import { dropSlot } from "./lkg-slot";
 import { clearNoteNudgeTriggerOnly } from "./note-nudger";
+import {
+    recordOpenCodeProvenInputFloor,
+    resolveOpenCodeProvenInputFloor,
+} from "./opencode-proven-floor";
 import { readRawSessionMessages } from "./read-session-chunk";
 import {
     clearTrackedOpenCodeSession,
@@ -83,6 +90,7 @@ import {
 } from "./read-session-db";
 import { invalidateTrueRawTokenCache } from "./read-session-true-raw-tokens";
 import { type NotificationParams, sendStatusNotification } from "./send-session-notification";
+import { isAnthropicFamilyRoute } from "./sentinel";
 import { clearMessageTokensCache } from "./transform";
 import { resetDegradedCacheCount } from "./transform-postprocess-phase";
 
@@ -121,12 +129,14 @@ export interface EventHandlerDeps {
     rustSessionCleanup?: boolean;
     allowHomeProject?: boolean;
     config: {
-        clear_reasoning_age?: number;
+        clear_reasoning_age?: unknown;
         execute_threshold_percentage?: number | { default: number; [modelKey: string]: number };
         execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
         cache_ttl: CacheTtlConfig;
+        cacheTtlConfigured?: boolean;
         commit_cluster_trigger?: { enabled: boolean; min_clusters: number };
     };
+    sampleCacheTtlConfig?: () => { cache_ttl: CacheTtlConfig; cacheTtlConfigured?: boolean };
     tagger: Tagger;
     // openDatabase() returns Database | null, but the hook only constructs these
     // deps after it has already null-checked and disabled MC on storage failure,
@@ -206,6 +216,7 @@ function cleanupRemovedMessageState(
     return deps.db
         .transaction(() => {
             const removedTagNumbers = deleteTagsByMessageId(deps.db, sessionId, messageId);
+            deleteTemporalDecision(deps.db, sessionId, messageId);
             sessionLog(
                 sessionId,
                 `event message.removed: deleted ${removedTagNumbers.length} tag(s) for message ${messageId}`,
@@ -327,13 +338,15 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     );
                 }
                 const modelKey = resolveModelKey(info.providerID, info.modelID);
+                const ttlConfig = deps.sampleCacheTtlConfig?.() ?? deps.config;
                 updateSessionMeta(deps.db, info.id, {
                     isSubagent: info.parentID.length > 0,
                     cacheTtl: resolveSessionCacheTtl(
                         deps.db,
                         info.id,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value,
                 });
             } catch (error) {
@@ -349,6 +362,18 @@ export function createEventHandler(deps: EventHandlerDeps) {
             }
             recordPromptSessionError(errInfo.sessionID, errInfo.error);
             try {
+                if (detectLatestTurnThinkingMismatch(errInfo.error)) {
+                    const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
+                    if (
+                        !deps.compactionOff &&
+                        isAnthropicFamilyRoute(model?.providerID, model?.modelID)
+                    ) {
+                        armLatestThinkingRecovery(deps.db, errInfo.sessionID);
+                        dropSlot(errInfo.sessionID, "latest-thinking-recovery-arm");
+                        deps.onSessionCacheInvalidated?.(errInfo.sessionID);
+                    }
+                    return;
+                }
                 const bindingMismatch = detectThinkingBindingMismatch(errInfo.error);
                 if (bindingMismatch.isBindingMismatch) {
                     const model = findLastAssistantModelFromOpenCodeDb(errInfo.sessionID);
@@ -357,7 +382,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                         !deps.compactionOff &&
                         isPrefixBoundThinkingModel(model?.providerID, model?.modelID)
                     ) {
-                        armThinkingBindingRecovery(deps.db, errInfo.sessionID);
+                        armBindingRecoverySafely(deps.db, errInfo.sessionID);
                         sessionLog(
                             errInfo.sessionID,
                             `thinking binding recovery armed from session.error (provider paths: failing=${bindingMismatch.failingBlockPath ?? "?"} firstChanged=${bindingMismatch.firstChangedPath ?? "?"})`,
@@ -524,6 +549,19 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 return;
             }
 
+            noteLkgProviderResponse({
+                sessionId: info.sessionID,
+                responseId: info.messageID,
+                modelKey:
+                    info.providerID && info.modelID
+                        ? `${info.providerID}/${info.modelID}`
+                        : undefined,
+                inputTokens: lkgProviderInputTotal(info.tokens),
+                completedAt: info.completedAt,
+                finish: info.finish,
+                error: info.error,
+            });
+
             // Invalidate this message's cached token contribution. The message
             // content is finalized at this event — if a prior transform pass
             // happened to cache partial/streaming content (or the message is
@@ -547,6 +585,16 @@ export function createEventHandler(deps: EventHandlerDeps) {
             let messageHadOverflowError = false;
 
             if (info.error !== undefined && info.error !== null) {
+                if (
+                    detectLatestTurnThinkingMismatch(info.error) &&
+                    !deps.compactionOff &&
+                    isAnthropicFamilyRoute(info.providerID, info.modelID)
+                ) {
+                    armLatestThinkingRecovery(deps.db, info.sessionID);
+                    dropSlot(info.sessionID, "latest-thinking-recovery-arm");
+                    deps.onSessionCacheInvalidated?.(info.sessionID);
+                    return;
+                }
                 const bindingMismatch = detectThinkingBindingMismatch(info.error);
                 if (
                     bindingMismatch.isBindingMismatch &&
@@ -555,7 +603,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     isPrefixBoundThinkingModel(info.providerID, info.modelID)
                 ) {
                     try {
-                        armThinkingBindingRecovery(deps.db, info.sessionID);
+                        armBindingRecoverySafely(deps.db, info.sessionID);
                         sessionLog(
                             info.sessionID,
                             `thinking binding recovery armed from message.updated (provider paths: failing=${bindingMismatch.failingBlockPath ?? "?"} firstChanged=${bindingMismatch.firstChangedPath ?? "?"})`,
@@ -768,19 +816,22 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     updates.lastResponseTime = responseTime;
                 }
 
-                if (typeof deps.config.cache_ttl === "string") {
+                const ttlConfig = deps.sampleCacheTtlConfig?.() ?? deps.config;
+                if (typeof ttlConfig.cache_ttl === "string") {
                     updates.cacheTtl = resolveSessionCacheTtl(
                         deps.db,
                         info.sessionID,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value;
                 } else if (modelKey) {
                     updates.cacheTtl = resolveSessionCacheTtl(
                         deps.db,
                         info.sessionID,
-                        deps.config.cache_ttl,
+                        ttlConfig.cache_ttl,
                         modelKey,
+                        ttlConfig.cacheTtlConfigured,
                     ).value;
                 }
 
@@ -822,7 +873,7 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 let refreshLimitsAfterRecording: (() => Promise<void>) | undefined;
                 if (hasUsageTokens) {
                     const pressureInputTokens = totalInputTokens;
-                    const requestSucceeded = !messageHadOverflowError;
+                    const requestSucceeded = !messageHadOverflowError && !responseFailed;
                     const successfulUsageProof = requestSucceeded && !aboveTrustedWall;
                     // A limit learned from an earlier overflow error is stale
                     // once the provider accepts a larger request, whatever the
@@ -860,9 +911,9 @@ export function createEventHandler(deps: EventHandlerDeps) {
                     // proved it, the same rule resolveContextLimit applies. Carrying
                     // another model's floor over would give this model a limit none
                     // of its own requests supports.
-                    const observedSafeInputTokens = provenFloorForModel(
-                        sessionMeta.observedSafeInputTokens,
-                        sessionMeta.lastObservedModelKey,
+                    const observedSafeInputTokens = resolveOpenCodeProvenInputFloor(
+                        deps.db,
+                        info.sessionID,
                         modelKey,
                     );
                     const provenSafeInputTokens = successfulUsageProof
@@ -1058,6 +1109,14 @@ export function createEventHandler(deps: EventHandlerDeps) {
                 }
 
                 updateSessionMeta(deps.db, info.sessionID, updates);
+                if (modelKey && updates.observedSafeInputTokens !== undefined) {
+                    recordOpenCodeProvenInputFloor(
+                        deps.db,
+                        info.sessionID,
+                        modelKey,
+                        updates.observedSafeInputTokens,
+                    );
+                }
                 if (refreshLimitsAfterRecording) {
                     await refreshLimitsAfterRecording();
                 }

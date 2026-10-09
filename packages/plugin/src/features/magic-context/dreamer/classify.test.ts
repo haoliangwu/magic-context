@@ -437,6 +437,62 @@ describe("module-backed classification", () => {
             expect(
                 db.prepare("SELECT classified_at FROM memories WHERE id = ?").get(contextIds[0]),
             ).toEqual({ classified_at: null });
+            // String models configure no variant, so the request names none.
+            expect(taskCall?.body).not.toHaveProperty("model_variants");
+        } finally {
+            closeQuietly(db);
+        }
+    });
+
+    test("sends each chain model's configured variant for the module runner", async () => {
+        const db = freshDb();
+        try {
+            const projectIdentity = "git:module-classify-variant";
+            addMemories(db, projectIdentity, 10);
+            const calls: ClassifyModuleCallArgs[] = [];
+            const args = moduleArgs(db, projectIdentity, (call) => {
+                calls.push(call);
+                if (call.method === "dreamer.run_task") {
+                    const items = (
+                        call.body as {
+                            payload: {
+                                items: Array<{ memory_id: number; content_hash: string }>;
+                            };
+                        }
+                    ).payload.items;
+                    const manifest = items
+                        .map(
+                            (item) =>
+                                `<memory id="${item.memory_id}" importance="80" scope="project" shareable="true"/>`,
+                        )
+                        .join("\n");
+                    return { result: { manifest_text: `<classify>${manifest}</classify>` } };
+                }
+                const rows = (
+                    call.body as {
+                        arguments: { rows: Array<{ memory_id: number }> };
+                    }
+                ).arguments.rows;
+                return { result: { accepted: rows.map((row) => row.memory_id), rejected: [] } };
+            });
+            args.model = { model: "openai/profile-dreamer", qualifier: "high" };
+            args.fallbackModels = [
+                "anthropic/plain-fallback",
+                // A repeated model keeps the first entry's slot and its variant.
+                { model: "openai/profile-dreamer", qualifier: "low" },
+            ];
+            await runClassify(args);
+
+            const taskCall = calls.find((call) => call.method === "dreamer.run_task");
+            const body = taskCall?.body as {
+                model_chain: string[];
+                model_variants?: Record<string, string>;
+            };
+            expect(body.model_chain).toEqual([
+                "openai/profile-dreamer",
+                "anthropic/plain-fallback",
+            ]);
+            expect(body.model_variants).toEqual({ "openai/profile-dreamer": "high" });
         } finally {
             closeQuietly(db);
         }

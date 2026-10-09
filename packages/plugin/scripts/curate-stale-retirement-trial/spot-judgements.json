@@ -1,0 +1,16 @@
+[
+  {"id":6321,"label":"true","reason":"task-prompts.ts:62,276 still explicitly protects the regions; generating proposals does not repeal the preservation rule."},
+  {"id":6385,"label":"stale","reason":"dashboard/src-tauri/src/db.rs:2568–2575,2706–2718 now excludes previous output from the no-cache-write growth fallback."},
+  {"id":17233,"label":"unsure","reason":"r7.3 §14.1 uses native compaction and no D5 route is found locally, but the claimed external gateway cutover cannot be independently proven here."},
+  {"id":20352,"label":"stale","reason":"event-handler.ts:743–755 updates the idle clock after a successful completion without usage; the old usage-only restriction is replaced."},
+  {"id":22700,"label":"stale","reason":"The current mc-tool-catalog-v1.md summary and §2.1 use three role presets and composition-controlled compaction, replacing the former catalog preset."},
+  {"id":20130,"label":"stale","reason":"storage-db.ts:163 explicitly sets the current supported schema fence to 94."},
+  {"id":21434,"label":"stale","reason":"The current r7.3 design and errata replace the older current-revision marker."},
+  {"id":5191,"label":"stale","reason":"compartment-embedding.ts:30–35 explicitly retires the old summary-vector column as inert in favor of chunk embeddings."},
+  {"id":20458,"label":"stale","reason":"r7.3 §4.5 and errata ALF ordering explicitly replace sequential provider fetches with parallel frozen fetches."},
+  {"id":20784,"label":"stale","reason":"r7.3:342 explicitly replaces self-asserted parent references with verified scope parents."},
+  {"id":21671,"label":"unsure","reason":"The cited OFFSET helper is ordinal-range hydration; actual page continuation at read-session-raw.ts:238–261 and 456–484 remains keyset-based, so the model has not established replacement of the paging rule."},
+  {"id":5073,"label":"stale","reason":"compartment-runner-types.ts:85–93 explicitly propagates configured maxTokens to the OC2 wire; the old host-wide no-effect claim no longer holds."},
+  {"id":20492,"label":"stale","reason":"r7.3:342 explicitly replaces the separate delegation registry with registered scopes."},
+  {"id":20780,"label":"stale","reason":"r7.3:342,391 replaces the old delegation boolean with scoped route admission."}
+]

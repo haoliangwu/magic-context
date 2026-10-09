@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -64,8 +64,8 @@ describe("startup migrations run on a worker thread", () => {
         const dbPath = join(root, "context.db");
         expect(await openDatabaseAsync({ dbPath })).not.toBeNull();
         closeDatabase();
-        // A worker that cannot load would make the client log and fall back; one
-        // that fails would reject the open. Neither may happen with nothing pending.
+        // A missing or failed worker must reject a pending upgrade, but a current
+        // store needs no worker and must remain usable.
         const marker = join(root, "started.marker");
         const probe = join(root, "probe-worker.mjs");
         writeFileSync(
@@ -92,15 +92,83 @@ describe("startup migrations run on a worker thread", () => {
         );
     });
 
-    test("a worker that cannot load falls back to migrating on the main thread", async () => {
+    test("a worker that cannot load refuses pending v95 without a main-thread fallback", async () => {
         const dbPath = join(root, "context.db");
+        expect(openDatabase(dbPath)).not.toBeNull();
+        closeDatabase();
+        const setup = new Database(dbPath);
+        setup.exec(
+            "DELETE FROM schema_migrations WHERE version=95; DROP TABLE git_commit_fts_rowid_map",
+        );
+        setup.close();
         __setMigrationWorkerEntryForTests(pathToFileURL(join(root, "missing-worker.mjs")));
         const before = __getMainThreadMigrationBodyCountForTests();
 
-        expect(await openDatabaseAsync({ dbPath })).not.toBeNull();
+        await expect(openDatabaseAsync({ dbPath })).rejects.toThrow(
+            "the migration worker could not start",
+        );
 
-        expect(persistedVersion(dbPath)).toBe(LATEST);
-        expect(__getMainThreadMigrationBodyCountForTests() - before).toBe(MIGRATIONS.length);
+        expect(persistedVersion(dbPath)).toBe(94);
+        expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
+    });
+
+    test("a worker constructor failure names the cause and repair action without migrating", async () => {
+        __setMigrationWorkerEntryForTests(new URL("https://invalid.test/worker.mjs"));
+        const before = __getMainThreadMigrationBodyCountForTests();
+        await expect(openDatabaseAsync({ dbPath: join(root, "constructor.db") })).rejects.toThrow(
+            "reinstall or rebuild the plugin",
+        );
+        expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
+    });
+
+    test("a worker exiting before ready fails closed instead of migrating on the host", async () => {
+        const entry = join(root, "early-exit.mjs");
+        writeFileSync(entry, "process.exit(17)");
+        __setMigrationWorkerEntryForTests(pathToFileURL(entry));
+        const before = __getMainThreadMigrationBodyCountForTests();
+        await expect(openDatabaseAsync({ dbPath: join(root, "exit.db") })).rejects.toThrow(
+            "exited with code 17 before loading",
+        );
+        expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
+    });
+
+    test("a worker reporting completion before ready cannot authorize storage initialization", async () => {
+        const entry = join(root, "premature-done.mjs");
+        writeFileSync(
+            entry,
+            `import {parentPort} from "node:worker_threads"; parentPort.postMessage({type:"done"});`,
+        );
+        __setMigrationWorkerEntryForTests(pathToFileURL(entry));
+        const before = __getMainThreadMigrationBodyCountForTests();
+        await expect(openDatabaseAsync({ dbPath: join(root, "premature.db") })).rejects.toThrow(
+            "reported completion before ready",
+        );
+        expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
+    });
+
+    test("an incomplete worker cannot cause the async opener to run pending bodies", async () => {
+        const entry = join(root, "incomplete.mjs");
+        writeFileSync(
+            entry,
+            `import {parentPort} from "node:worker_threads"; parentPort.postMessage({type:"ready"}); parentPort.postMessage({type:"done"});`,
+        );
+        __setMigrationWorkerEntryForTests(pathToFileURL(entry));
+        const before = __getMainThreadMigrationBodyCountForTests();
+        await expect(openDatabaseAsync({ dbPath: join(root, "incomplete.db") })).rejects.toThrow(
+            "did not complete the pending migration",
+        );
+        expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
+    });
+
+    test("the async opener refuses in-memory migrations; only the explicit sync path owns them", async () => {
+        const literalFile = join(process.cwd(), ":memory:");
+        expect(existsSync(literalFile)).toBe(false);
+        const before = __getMainThreadMigrationBodyCountForTests();
+        await expect(openDatabaseAsync(":memory:")).rejects.toThrow(
+            "use the explicit synchronous opener",
+        );
+        expect(__getMainThreadMigrationBodyCountForTests()).toBe(before);
+        expect(existsSync(literalFile)).toBe(false);
     });
 
     test("a synchronous open of a database still being migrated is refused instead of migrating it", async () => {

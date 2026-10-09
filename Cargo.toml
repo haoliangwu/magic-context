@@ -8,22 +8,22 @@ members = ["crates/mc-core", "crates/mc-store", "crates/mc-module", "crates/mc-t
 exclude = ["packages/dashboard/src-tauri"]
 
 [workspace.dependencies]
-# CortexKit cache-stability core + storage substrate. Sibling path-deps for local
-# co-dev (not yet published); pin a published version at first release. magic-context
-# is a sibling of commons/ and subconscious/, so these resolve identically to the
-# alfonso-core arrangement.
-cortexkit-cache-core = { path = "../commons/crates/cortexkit-cache-core" }
-cortexkit-store = { path = "../commons/crates/cortexkit-store" }
-cortexkit-store-types = { path = "../commons/crates/cortexkit-store-types" }
-cortexkit-lease = { path = "../commons/crates/cortexkit-lease" }
+# Published commons crates use their current lockfile versions from crates.io.
+# cache-core is not published, so pin the source to an immutable commit.
+cortexkit-cache-core = { git = "https://github.com/cortexkit/commons", rev = "067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7" }
+cortexkit-store = "=0.2.1"
+cortexkit-store-types = "=0.2.2"
+cortexkit-lease = "=0.1.0"
+cortexkit-log = { version = "=0.3.4", features = ["store-paths"] }
 
-# subc wire contract + module SDK. Path-deps to the same sibling source so
-# subc-protocol/transport unify with subc-client-rs's transitive use (no [patch]).
-subc-protocol = { path = "../subconscious/crates/subc-protocol" }
-subc-control = { path = "../subconscious/crates/subc-control" }
-subc-transport = { path = "../subconscious/crates/subc-transport" }
-subc-client-rs = { path = "../subconscious/crates/subc-client-rs" }
-subc-core = { path = "../subconscious/crates/subc-core" }
+# Published subc wire/SDK crates use crates.io. subc-core is unpublished; this
+# revision matches the version in the pre-migration lockfile.
+subc-protocol = "=0.29.1"
+subc-control = "=0.28.0"
+subc-transport = "=0.10.0"
+subc-client-rs = "=0.26.1"
+subc-os = "=0.1.5"
+subc-core = { git = "https://github.com/cortexkit/subconscious", rev = "1a14993c120725fa1dce7267b6e7d0823835930c" }
 
 # Internal crates.
 mc-core = { path = "crates/mc-core" }
@@ -37,8 +37,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 
-# The tool-provider role crates on crates.io depend on subc-protocol from
-# crates.io. Point that at the same sibling source the workspace builds, so
-# their ErrorBody and the module's are one type.
-[patch.crates-io]
-subc-protocol = { path = "../subconscious/crates/subc-protocol" }
+# subc-core is sourced from Git, but its workspace siblings that have published
+# crates.io releases must resolve from the registry rather than the Git checkout.
+[patch."https://github.com/cortexkit/subconscious"]
+subc-cgroup = { version = "=0.1.5" }
+subc-control = { version = "=0.28.0" }
+subc-daemon = { version = "=0.31.2" }
+subc-jobobject = { version = "=0.2.0" }
+subc-jsonc = { version = "=0.1.2" }
+subc-os = { version = "=0.1.5" }
+subc-protocol = { version = "=0.29.1" }
+subc-transport = { version = "=0.10.0" }
+subc-uptime = { version = "=0.1.1" }

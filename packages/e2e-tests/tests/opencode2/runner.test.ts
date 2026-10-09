@@ -49,6 +49,36 @@ test("fd guard refuses operator paths and permits isolated database", () => {
 	).not.toThrow();
 	expect(() => assertOpenPaths(["/tmp/unexpected.txt"], fixture.root, [], ["/tmp/unexpected.txt"])).toThrow("forbidden");
 });
+test("Foundation HTTP-cache exception permits only the exact opted-in file and SQLite handles", () => {
+	const previous = process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB;
+	const root = "/throwaway/fixture";
+	const cache = "/private/var/folders/ab/verified-user/C/opencode/Cache.db";
+	try {
+		delete process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB;
+		expect(() => assertOpenPaths([cache], root)).toThrow("forbidden");
+		process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB = cache;
+		for (const suffix of ["", "-wal", "-shm"]) {
+			const path = `${cache}${suffix}`;
+			if (process.platform === "darwin") {
+				expect(() => assertOpenPaths([path], root, [], [path])).not.toThrow();
+			} else {
+				expect(() => assertOpenPaths([path], root)).toThrow("forbidden");
+			}
+		}
+		for (const path of [
+			`${cache}.other.db`, cache.replace("verified-user", "another-user"),
+			cache.replace("Cache.db", "opencode.db"),
+			join(homedir(), ".local/share/opencode/opencode.db"),
+			join(homedir(), ".local/share/cortexkit/magic-context/context.db"),
+			join(homedir(), ".config/opencode/settings.json"),
+		]) expect(() => assertOpenPaths([path], root)).toThrow("forbidden");
+		process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB = join(homedir(), ".local/share/opencode/Cache.db");
+		expect(() => assertOpenPaths([process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB], root)).toThrow("forbidden");
+	} finally {
+		if (previous === undefined) delete process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB;
+		else process.env.MC_E2E_FOUNDATION_HTTP_CACHE_DB = previous;
+	}
+});
 test("live snapshot detects changed database and logs that the top-level HOME fence misses", () => {
 	const { root } = isolation();
 	const home = join(root, "operator-home");

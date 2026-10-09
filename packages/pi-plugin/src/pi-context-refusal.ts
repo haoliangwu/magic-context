@@ -4,6 +4,7 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { isCheckoutClaimRefusalError } from "@magic-context/core/features/magic-context/checkout-claim";
 import { log } from "@magic-context/core/shared/logger";
 import { withSqliteTransformPass } from "@magic-context/core/shared/sqlite";
 
@@ -37,11 +38,23 @@ export function registerPiGuardedContext(
 			return await withSqliteTransformPass(() => handler(event, ctx));
 		} catch (error) {
 			log("[magic-context][pi] turn refused", error);
+			// A checkout-claim refusal is not a retryable preparation failure: the
+			// user has to move the agent first, so show its own message instead.
+			const message = isCheckoutClaimRefusalError(error)
+				? error.message
+				: RETRY_MESSAGE;
 			// Direct handler fixtures lack the host abort API; retain their original
 			// exception contract. Real Pi contexts always supply abort().
 			if (typeof ctx.abort !== "function") throw error;
+			if (message !== RETRY_MESSAGE && ctx.hasUI) {
+				try {
+					ctx.ui.notify(message, "error");
+				} catch (notifyError) {
+					log("[magic-context][pi] refusal notice failed", notifyError);
+				}
+			}
 			try {
-				pi.appendEntry(ENTRY_TYPE, { message: RETRY_MESSAGE });
+				pi.appendEntry(ENTRY_TYPE, { message });
 			} catch (displayError) {
 				log("[magic-context][pi] refusal entry failed", displayError);
 			} finally {

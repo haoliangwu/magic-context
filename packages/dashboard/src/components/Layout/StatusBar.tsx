@@ -1,16 +1,24 @@
 import { Show } from "solid-js";
 import { formatBytes } from "../../lib/api";
 import type { DbHealth } from "../../lib/types";
+import Icon from "../shared/Icon";
 
 interface Props {
   health: DbHealth | undefined;
 }
 
+const COUNTED_TABLES: { table: string; label: string }[] = [
+  { table: "memories", label: "memories" },
+  { table: "compartments", label: "compartments" },
+  { table: "session_facts", label: "facts" },
+  { table: "notes", label: "notes" },
+];
+
 export default function StatusBar(props: Props) {
   const dbStatus = () => {
-    if (!props.health) return { label: "Loading...", color: "amber" };
-    if (!props.health.exists) return { label: "DB: not found", color: "red" };
-    return { label: `DB: ${formatBytes(props.health.size_bytes)}`, color: "green" };
+    if (!props.health) return { label: "Loading…", color: "amber" };
+    if (!props.health.exists) return { label: "Database not found", color: "red" };
+    return { label: "Database", color: "green" };
   };
 
   const count = (name: string) => {
@@ -18,25 +26,23 @@ export default function StatusBar(props: Props) {
   };
 
   return (
-    <div class="status-bar">
-      <div class="status-item">
+    <footer class="status-bar">
+      <div class="status-item" title={props.health?.exists ? props.health.path : undefined}>
         <span class={`status-dot ${dbStatus().color}`} />
+        <Icon name="database" size={13} class="status-icon" />
         <span>{dbStatus().label}</span>
+        <Show when={props.health?.exists && props.health}>
+          {(health) => <span class="status-value">{formatBytes(health().size_bytes)}</span>}
+        </Show>
       </div>
       <Show when={props.health?.exists}>
-        <div class="status-item">
-          <span>{count("memories")} memories</span>
-        </div>
-        <div class="status-item">
-          <span>{count("compartments")} compartments</span>
-        </div>
-        <div class="status-item">
-          <span>{count("session_facts")} facts</span>
-        </div>
-        <div class="status-item">
-          <span>{count("notes")} notes</span>
-        </div>
+        {COUNTED_TABLES.map((entry) => (
+          <div class="status-item">
+            <span class="status-value">{count(entry.table).toLocaleString()}</span>
+            <span>{entry.label}</span>
+          </div>
+        ))}
       </Show>
-    </div>
+    </footer>
   );
 }

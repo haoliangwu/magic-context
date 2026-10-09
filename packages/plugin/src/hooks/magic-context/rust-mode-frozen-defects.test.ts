@@ -181,6 +181,7 @@ function frozenSession(label: string, options: { compactionOff?: boolean } = {})
             if (step === "throw-busy") throw sqliteBusy();
             return {
                 decision: step,
+                prefix_bust_permitted: step === "HARD" || step === "SOFT",
                 served_from: "transform",
                 row_version: pass,
                 native_messages: moduleOutput(lastInput),
@@ -832,9 +833,9 @@ describe("a healthy frozen pass is admitted like any other replay", () => {
                 const { conversation, lastServed } = await freezeWithTwoDefers(s);
                 s.setModuleOutput(moduleCompacts ? compacting : tagAllUsers);
                 conversation.push(assistant(sid, "a4"), user(sid, "m-huge", HUGE));
-                const served = await s.run([...conversation], "SOFT+");
-                const lines = logLines(logSpy, sid);
                 if (moduleCompacts) {
+                    const served = await s.run([...conversation], "SOFT+");
+                    const lines = logLines(logSpy, sid);
                     // The frozen bytes cannot be sent and the module's can: adopt them.
                     expect(lines).toContain(
                         "lkg_frozen_replay_released reason=frozen_over_context_limit",
@@ -845,7 +846,12 @@ describe("a healthy frozen pass is admitted like any other replay", () => {
                     );
                     expect(JSON.stringify(huge?.parts)).toContain("[compacted tool output]");
                 } else {
-                    // Both are over: adopting would bust the cache and fit no better.
+                    // Neither candidate fits. Keep the last-served representation,
+                    // but refuse this request instead of sending known-over bytes.
+                    await expect(s.run([...conversation], "SOFT+")).rejects.toBeInstanceOf(
+                        EmergencyFailClosedError,
+                    );
+                    const lines = logLines(logSpy, sid);
                     expect(lines.some((line) => line.startsWith("frozen_fit_both_over"))).toBe(
                         true,
                     );
@@ -853,7 +859,7 @@ describe("a healthy frozen pass is admitted like any other replay", () => {
                         lines.some((line) => line.startsWith("lkg_frozen_replay_released")),
                     ).toBe(false);
                     expect(s.frozenFields().lkgRepresentationFrozen).toBe(true);
-                    expect(sha(served.slice(0, lastServed.length))).toBe(sha(lastServed));
+                    expect(sha(JSON.parse(getInMemorySlot(sid)!.jsonPrefix))).toBe(sha(lastServed));
                 }
             }
         } finally {

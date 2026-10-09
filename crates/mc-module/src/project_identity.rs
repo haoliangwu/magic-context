@@ -23,6 +23,8 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+
+use mc_store::private_permissions::write_file_atomic as write_private_file_atomic;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -286,23 +288,8 @@ fn remember_git_identity(sidecar_dir: &Path, directory: &Path, identity: &str) {
         return;
     }
     let record = serde_json::json!({ "directory": key, "identity": identity }).to_string();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let temporary = destination.with_extension(format!("{}.{nanos}.tmp", std::process::id()));
-    let written = std::fs::create_dir_all(sidecar_dir)
-        .and_then(|()| {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            let mut file = options.open(&temporary)?;
-            std::io::Write::write_all(&mut file, record.as_bytes())
-        })
-        .and_then(|()| std::fs::rename(&temporary, &destination));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
+    let private = crate::config::private_storage_permissions_enabled();
+    let _ = write_private_file_atomic(&destination, record.as_bytes(), private);
 }
 
 /// Where the host keeps its remembered-identity sidecars: `project-identities/` beside the

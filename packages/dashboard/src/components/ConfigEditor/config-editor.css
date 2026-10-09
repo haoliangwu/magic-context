@@ -24,6 +24,77 @@
   color: var(--text-secondary);
 }
 
+.config-editor .config-action-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 14px 18px;
+  margin-bottom: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+}
+
+.config-file-meta {
+  flex: 1 1 280px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.config-file-meta code {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.config-file-meta span {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.config-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.config-segmented {
+  display: flex;
+  padding: 3px;
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.config-segmented button {
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+.config-segmented button.active {
+  background: var(--bg-active);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-segment);
+}
+.config-save {
+  min-width: 110px;
+}
+.config-save:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.config-editor :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
 .config-workspace {
   display: grid;
   grid-template-columns: 188px minmax(0, 1fr);
@@ -68,6 +139,11 @@
   opacity: 0.7;
 }
 
+/* The dimmed index numbers fall below AA on light surfaces; keep them opaque. */
+:root[data-theme="light"] .config-section-index button span {
+  opacity: 1;
+}
+
 .config-section-index button:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
@@ -86,6 +162,8 @@
 }
 
 .config-section-panel {
+  container-name: config-section;
+  container-type: inline-size;
   min-width: 0;
   padding: 16px 20px;
   background: var(--bg-card);
@@ -122,18 +200,27 @@
 }
 
 .config-section-panel .config-card-content {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 32px;
+  display: flex;
+  flex-direction: column;
 }
 
 .config-section-panel .config-field {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 156px;
-  gap: 4px 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 1.3fr);
+  gap: 4px 24px;
   padding: 14px 0;
   border-bottom: 1px solid var(--border);
   align-content: start;
+}
+
+.config-section-panel .config-field:nth-last-child(1 of .config-field:not([hidden])) {
+  border-bottom: 0;
+}
+
+.config-section-panel .config-field > input[type="number"],
+.config-section-panel .config-field > .toggle-switch {
+  width: 156px;
+  justify-self: end;
 }
 
 .config-section-panel .config-field > * {
@@ -166,9 +253,27 @@
   grid-row: auto;
 }
 
+.config-section-panel .config-card-content > .config-field-desc {
+  padding: 14px 0;
+  line-height: 1.6;
+}
+
+/* Composite editors need independent rows. The generic field placements must
+   not put the fallback list and its add picker into the same grid cell. */
+.config-section-panel .config-field-wide {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.config-section-panel .config-field-wide > *,
+.config-section-panel .config-field-wide > .config-field-header,
+.config-section-panel .config-field-wide > .config-field-desc {
+  grid-column: 1 / -1;
+  grid-row: auto;
+}
+
 .config-section-panel .config-input {
   max-width: none;
-  min-width: 0;
+  min-width: 120px;
   font-size: 12px;
 }
 
@@ -222,7 +327,7 @@
 }
 
 .config-restart-badge {
-  border: 1px solid #59401f;
+  border: 1px solid var(--restart-border);
   border-radius: var(--radius-sm);
   padding: 1px 5px;
   color: var(--amber);
@@ -231,32 +336,48 @@
 }
 
 .config-defaults {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 20px;
-  padding: 14px 0;
+  display: block;
 }
 
 .config-defaults .config-field-desc {
   display: block;
-  min-height: 32px;
-  margin: 4px 0 8px;
+  margin: 0;
 }
 
-.config-help {
+.config-help-button {
+  border: 1px solid var(--border-light);
+  border-radius: 50%;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  background: transparent;
   color: var(--text-secondary);
   font-size: 11px;
-  margin-top: 4px;
-}
-
-.config-help summary,
-.config-overrides summary {
   cursor: pointer;
 }
 
-.config-help p {
-  margin-top: 6px;
-  line-height: 1.5;
+.config-help-popover {
+  padding: 16px;
+  overflow: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-help);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.config-help-popover p {
+  margin: 8px 0 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+.config-help-popover a {
+  color: var(--accent);
+}
+
+.config-overrides summary {
+  cursor: pointer;
 }
 
 .config-overrides {
@@ -304,7 +425,7 @@
 }
 
 .config-model-table {
-  min-width: 800px;
+  min-width: 960px;
 }
 
 .config-task-table {
@@ -396,7 +517,7 @@
 
 .config-task-edit-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 24px;
 }
 
@@ -414,7 +535,7 @@
 
 .config-agent-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 16px;
   padding: 14px 0;
 }
@@ -432,10 +553,114 @@
 }
 
 .config-agent-card .config-field {
-  display: flex;
-  flex-direction: column;
-  border-bottom: 0;
+  padding: 14px 0;
+}
+
+.config-section-panel .model-chain-list {
+  padding: 0;
+  width: 100%;
+  background: transparent;
+  border: 0;
+}
+.config-section-panel .model-chain-item {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(160px, 200px) 28px;
+  gap: 12px;
+  align-items: center;
   padding: 8px 0;
+}
+.config-section-panel .model-chain-add {
+  margin: 8px 0 0;
+}
+.config-list-editor,
+.config-tool-descriptions {
+  width: 100%;
+}
+.config-list-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 8px 0;
+}
+.config-list-row .config-input {
+  flex: 1 1 240px;
+}
+.config-tool-row {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.config-tool-row:last-child {
+  border-bottom: 0;
+}
+.config-tool-row .config-field-header {
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.config-tool-row textarea {
+  resize: vertical;
+  width: 100%;
+  line-height: 1.6;
+  font-family: var(--sans-font);
+}
+.config-route-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 12px;
+  table-layout: fixed;
+}
+.config-route-table th {
+  font-size: 11px;
+  text-align: left;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.config-route-table td {
+  padding: 8px 8px 8px 0;
+}
+.config-route-table th:nth-child(2) {
+  width: 140px;
+}
+.config-route-table th:last-child {
+  width: 32px;
+}
+.config-route-table .config-input {
+  width: 100%;
+}
+.model-select-dropdown {
+  overflow-y: auto;
+}
+.search-picker {
+  min-width: 0;
+}
+.model-select {
+  position: relative;
+}
+.model-select:has(> .model-select-clear) .model-select-trigger {
+  padding-right: 44px;
+}
+.model-select > .model-select-clear {
+  position: absolute;
+  right: 24px;
+  top: 8px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.config-editor .model-select-value {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.config-editor .model-select-trigger {
+  min-width: 120px;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
 }
 
 .config-task-harness {
@@ -445,17 +670,6 @@
 .config-section-panel :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
-}
-
-@media (max-width: 1200px) {
-  .config-section-panel .config-card-content,
-  .config-agent-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .config-defaults {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 800px) {
@@ -486,13 +700,65 @@
   }
 }
 
-@media (max-width: 540px) {
-  .config-defaults {
-    grid-template-columns: 1fr;
+/* Use available section width, not the window width: app navigation, the section
+   index and agent-card padding can leave a narrow editor in a wide window. */
+@container config-section (max-width: 640px) {
+  .config-section-panel .config-field {
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .config-section-panel .config-field {
-    display: flex;
-    flex-direction: column;
+  .config-section-panel .config-field > *,
+  .config-section-panel .config-field > .config-field-header,
+  .config-section-panel .config-field > .config-field-desc {
+    grid-column: 1;
+    grid-row: auto;
+  }
+
+  .config-section-panel .config-field > input[type="number"],
+  .config-section-panel .config-field > .toggle-switch {
+    width: 100%;
+    justify-self: stretch;
+  }
+
+  .config-section-panel .model-chain-item {
+    grid-template-columns: minmax(120px, 1fr) 28px;
+  }
+
+  .model-chain-item > .model-select {
+    grid-column: 1 / -1;
+  }
+
+  .model-chain-item > .search-picker {
+    grid-column: 1;
+  }
+
+  .model-chain-item > .config-icon-btn {
+    grid-column: 2;
+  }
+
+  .config-route-table thead {
+    display: none;
+  }
+
+  .config-route-table tbody {
+    display: grid;
+    gap: 12px;
+  }
+
+  .config-route-table tr {
+    display: grid;
+    grid-template-columns: minmax(120px, 1fr) 28px;
+  }
+
+  .config-route-table td:first-child {
+    grid-column: 1 / -1;
+  }
+
+  .config-route-table td:nth-child(2) {
+    grid-column: 1;
+  }
+
+  .config-route-table td:last-child {
+    grid-column: 2;
   }
 }

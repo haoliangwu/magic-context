@@ -300,6 +300,11 @@ function parsePiConfig(
 	warnings: string[];
 } {
 	const preMigrationWarnings: string[] = [];
+	if (Object.hasOwn(rawConfig, "clear_reasoning_age")) {
+		preMigrationWarnings.push(
+			"clear_reasoning_age is deprecated and ignored. Magic Context now keeps reasoning up to a token budget, keep_reasoning_tokens (default 10,000). Remove the key, or set keep_reasoning_tokens to a token count.",
+		);
+	}
 	const configWithoutRemovedAgent = stripRemovedAgentConfig(
 		rawConfig,
 		preMigrationWarnings,
@@ -672,6 +677,10 @@ export function loadPiConfigDetailed(
 	const recoveredTopLevelKeys: string[] = [];
 	const cacheTtlConfigured = Object.hasOwn(rawConfig, "cache_ttl");
 	const parsed = parsePiConfig(rawConfig, recoveredTopLevelKeys);
+	// This runtime-only flag records whether cache_ttl was present; do not expose it as a user setting.
+	Object.defineProperty(parsed.config, "cacheTtlConfigured", {
+		value: cacheTtlConfigured,
+	});
 	// An ignored invalid project value is still a config the user must fix, so
 	// keep reporting it as schema recovery (parity with the OpenCode loader).
 	for (const key of projectRestoredTopLevelKeys) {

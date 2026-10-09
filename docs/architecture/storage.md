@@ -50,7 +50,46 @@ Tables fall into two groups:
 - **Session-scoped** tables carry a `harness` column (`opencode`, `opencode2`, `pi`, `omp`) so hosts never confuse each other's sessions.
 - **Project-scoped** tables (memories, git commits, workspaces and similar) are shared across hosts on purpose: a memory written from Pi is visible in OpenCode for the same project.
 
-`context.db` and the Rust module's `store.db` (same directory, own migration chain in `crates/mc-store`) are one consistency unit. Authority and mirror state in each refers to the other, so restore both from the same backup or neither.
+`context.db` is the domain-state database; the Rust module's `store.db` (same directory, with its own migration chain in `crates/mc-store`) holds rebuildable private session/cache state. The module attaches to `context.db`, and the pair is one consistency unit: back up and restore both together.
+
+## WAL durability boundary
+
+Runtime connections use WAL mode with `synchronous=NORMAL`: the host sets it for
+`context.db` in `src/shared/sqlite-context-pragmas.ts`, and ck-mc applies it to
+WAL-mode `store.db` connections in `crates/mc-store/src/lib.rs`. This saves a WAL
+sync on each commit. SQLite's guarantee is structural consistency after a process
+crash, OS crash or power loss, not lossless durability: a process crash alone
+does not normally discard committed WAL frames, but an OS crash or power loss can
+roll back one or more recently acknowledged transactions. SQLite does not promise
+an exact count or time window for those lost commits. `NORMAL` is not an assertion
+that the latest commit survives sudden power loss, nor an unconditional guarantee
+against every broken filesystem or storage device.
+
+The two files have independent WALs and sync/checkpoint boundaries. Treating
+`context.db` and `store.db` as one application consistency unit does not make a
+multi-file transaction power-loss atomic. ck-mc stages some context publications
+in `store.db` and later commits the corresponding rows in `context.db`; ordinary
+process-crash recovery replays a surviving pending row. That protocol is not a
+cross-file fsync barrier: for example, if the pending-row deletion reaches stable
+storage but the matching `context.db` commit does not, the row that would replay
+that write is gone. An empty/rebuilt `store.db` cache is supported and the next
+session pass can do its normal HARD/bootstrap fold, but a lost `context.db`
+transaction is not generally recreated from that cache. A memory, note or other
+context-owned update can remain absent unless its writer retries it. Restore both
+files from the same backup set; never mix snapshots or restore just one.
+
+There are other persisted cross-store boundaries. In Rust mode the replay-blocking
+marker-admission fence and the LKG slot are in `context.db`, while OpenCode's
+compaction marker rows are in `opencode.db`. The fence is committed before a
+marker move, but NORMAL can still lose that recent fence at power loss even if
+the separate host-store update survives. Startup's marker consistency probe is
+diagnostic-only: it retains state and waits for a priced publication to replace
+inconsistent marker rows. A lost latest LKG capture likewise leaves only an older
+slot or none; the loader checks its stored pieces and the replay path checks the
+input ids/content and model/provider before using it. If no valid LKG remains,
+Rust mode may serve raw input only when its conservative fit check succeeds;
+otherwise it refuses rather than replaying an unverified snapshot. These checks
+bound the recovery behavior, but they do not make the recent writes durable.
 
 ## Session-scoped tables
 

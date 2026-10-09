@@ -194,7 +194,7 @@ describe("executeStatus", () => {
         expect(status).toContain(
             "Config: PARSE FAILED (/tmp/magic-context.jsonc:1:1) — recovered values applied; fix the file",
         );
-        expect(status).toContain("Cache TTL: 1h (config for anthropic/claude-opus-5)");
+        expect(status).toContain("Cache TTL: 1h (your config)");
         expect(getOrCreateSessionMeta(db, SESSION_ID).cacheTtl).toBe("5m");
         db.close();
         if (originalOpenCodeDb === undefined) delete process.env.OPENCODE_DB;

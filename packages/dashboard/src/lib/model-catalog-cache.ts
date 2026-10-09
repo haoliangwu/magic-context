@@ -11,6 +11,7 @@ export function loadCachedModelCatalogs(storage: Pick<Storage, "getItem">): Mode
       opencode: Array.isArray(catalogs.opencode) ? catalogs.opencode : [],
       pi: Array.isArray(catalogs.pi) ? catalogs.pi : [],
       omp: Array.isArray(catalogs.omp) ? catalogs.omp : [],
+      ...(catalogs.opencodeVariants ? { opencodeVariants: catalogs.opencodeVariants } : {}),
     };
   } catch {
     return { opencode: [], pi: [], omp: [] };
@@ -26,6 +27,13 @@ export function retainLoadedCatalogs(
     opencode: fresh.opencode.length ? fresh.opencode : previous.opencode,
     pi: fresh.pi.length ? fresh.pi : previous.pi,
     omp: fresh.omp.length ? fresh.omp : previous.omp,
+    ...(fresh.opencodeVariants || previous.opencodeVariants
+      ? {
+          opencodeVariants: fresh.opencode.length
+            ? fresh.opencodeVariants
+            : previous.opencodeVariants,
+        }
+      : {}),
   };
   // Empty discovery is transient, not an authoritative removal of a provider's models.
   if (merged.opencode.length || merged.pi.length || merged.omp.length) {

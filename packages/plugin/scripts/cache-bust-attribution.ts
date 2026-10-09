@@ -17,6 +17,7 @@ export type CacheBustDivergenceClass =
     | "usage_missing"
     | "provider_full_miss"
     | "provider_short_read_identical_bytes"
+    | "tail_shrink_no_rewrite"
     | "self_inflicted_epoch"
     | "unfaulted_epoch"
     | "unaccounted_defer_pass"
@@ -103,6 +104,8 @@ export interface CacheBustAttributionInput {
     currentModel?: string;
     /** The meter read short while the reusable byte prefix was unchanged. */
     providerShortReadWithIdenticalPrefix?: boolean;
+    /** The only normalized wire change is a shorter tail, not a rewrite. */
+    tailShrink?: boolean;
     /** Current raw OpenCode message count divided by the preceding pass count. */
     ocInputStepRatio?: number;
     decision?: CacheBustDecisionAttribution;
@@ -209,6 +212,11 @@ export const CACHE_BUST_RULE_TABLE: readonly CacheBustRule[] = [
         rule: "provider read fell short while the reusable byte prefix was unchanged; provider-side latency or eviction, not a prompt rewrite",
     },
     {
+        divergenceClass: "tail_shrink_no_rewrite",
+        accounted: true,
+        rule: "the tail became shorter and the meter estimates at most 64 rewritten tokens; no meaningful cache write occurred",
+    },
+    {
         divergenceClass: "self_inflicted_epoch",
         accounted: false,
         rule: "epoch_change has no restart/deploy/config epoch and either only mur: changed or raw OpenCode input stepped by at least 4×",
@@ -249,6 +257,7 @@ const ACCOUNTED_CLASSES = new Set(
     CACHE_BUST_RULE_TABLE.filter((row) => row.accounted).map((row) => row.divergenceClass),
 );
 const EPOCH_REASONS = new Set(["project_memory_epoch", "epoch_change", "compartment_render_epoch"]);
+const TAIL_SHRINK_REWRITE_NOISE_TOKENS = 64;
 
 export function isUnaccountedCacheBustClass(divergenceClass: string): boolean {
     return !ACCOUNTED_CLASSES.has(divergenceClass as CacheBustDivergenceClass);
@@ -318,6 +327,19 @@ export function classifyCacheBust(input: CacheBustAttributionInput): CacheBustDi
         input.providerComparableRead === 0 &&
         previousTotal !== undefined &&
         previousTotal >= 10_000;
+
+    // A shorter tail can make the meter read below the previous total without
+    // rewriting any reusable prefix. Allow only the provider's 64-token noise
+    // floor here so genuine 1k+ tail rewrites remain actionable.
+    if (
+        !usageMissing &&
+        !providerFullMiss &&
+        input.tailShrink &&
+        input.rewrittenTokens !== undefined &&
+        input.rewrittenTokens <= TAIL_SHRINK_REWRITE_NOISE_TOKENS
+    ) {
+        return "tail_shrink_no_rewrite";
+    }
 
     const decision = input.decision;
     if (!decision) {

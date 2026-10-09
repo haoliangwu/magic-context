@@ -35,6 +35,27 @@ afterEach(() => {
 
 describe("storage-ops", () => {
     describe("pending ops", () => {
+        it("100 enqueues are idempotent per session, tag and operation and preserve the first row", () => {
+            db = makeMemoryDatabase();
+            queuePendingOp(db, "ses-1", 1, "drop", 10);
+            const first = getPendingOps(db, "ses-1");
+            for (let n = 0; n < 99; n++) queuePendingOp(db, "ses-1", 1, "drop", 20 + n);
+            expect(getPendingOps(db, "ses-1")).toEqual(first);
+            expect(getPendingOpsCount(db, "ses-1")).toBe(1);
+            // Queue identity includes the operation and session: a noop can coexist
+            // with a drop, and tag numbers are independent across sessions.
+            db.prepare(
+                "INSERT INTO pending_ops (session_id, tag_id, operation, queued_at) VALUES (?, ?, ?, ?)",
+            ).run("ses-1", 2, "noop", 1);
+            queuePendingOp(db, "ses-1", 2, "drop", 200);
+            queuePendingOp(db, "ses-2", 1, "drop", 300);
+            expect(getPendingOps(db, "ses-1").map((op) => op.tagId)).toEqual([1, 2]);
+            expect(getPendingOps(db, "ses-2")).toHaveLength(1);
+            removePendingOp(db, "ses-1", 1);
+            queuePendingOp(db, "ses-1", 1, "drop", 400);
+            expect(getPendingOps(db, "ses-1").map((op) => op.queuedAt)).toEqual([200, 400]);
+        });
+
         it("probes pending drops with a scalar read instead of materializing queue rows", () => {
             db = makeMemoryDatabase();
             queuePendingOp(db, "ses-probe", 1, "drop", 1);

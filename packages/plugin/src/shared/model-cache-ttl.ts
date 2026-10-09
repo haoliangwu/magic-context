@@ -28,6 +28,8 @@ const MODEL_CACHE_LIFETIMES = [
 export function resolveModelCacheTtl(
     config: CacheTtlConfig | undefined,
     modelKey: string | undefined,
+    configuredExplicitly = typeof config === "object" ||
+        (typeof config === "string" && config !== "5m"),
 ): ResolvedCacheTtl {
     if (config && typeof config !== "string") {
         const match =
@@ -37,11 +39,13 @@ export function resolveModelCacheTtl(
             modelKey !== "default"
                 ? config[modelKey]
                 : resolveModelConfigValue(config, modelKey)?.value;
-        if (match !== undefined) return { value: match, source: "config", modelKey };
+        const value = match ?? config.default;
+        if (value !== undefined && configuredExplicitly)
+            return { value, source: "config", modelKey };
     }
-    // A non-5m global string is an explicit policy. The generic 5m default is
-    // not evidence of provider eviction: documented lifetimes avoid paid rewrites.
-    if (typeof config === "string" && config !== "5m")
+    // The loader supplies provenance: an explicit 5m is policy too. Older callers
+    // without that bit still distinguish non-default strings from the schema's 5m.
+    if (typeof config === "string" && configuredExplicitly)
         return { value: config, source: "config", modelKey };
     const model =
         canonicalModelIdentity(modelKey ?? "")

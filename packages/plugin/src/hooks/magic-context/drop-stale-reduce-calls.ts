@@ -116,6 +116,8 @@ export function dropStaleReduceCalls(
     options: {
         detect?: boolean;
         protectedCount?: number;
+        /** Per-tool keep counts apply on first stripping a call, not when replaying a saved strip. */
+        protectedCallIds?: ReadonlySet<string>;
         /** Reports only newly edited locations, never frozen-id replay. */
         onFirstApplication?: (message: MessageLike, partIndex: number) => void;
     } = {},
@@ -140,6 +142,11 @@ export function dropStaleReduceCalls(
             i < protectedStart &&
             id !== undefined &&
             messageHasReducePart(message) &&
+            !message.parts.some((part) => {
+                if (!isRecord(part)) return false;
+                const callId = part.callID ?? part.toolCallId ?? part.id;
+                return typeof callId === "string" && options.protectedCallIds?.has(callId);
+            }) &&
             !message.parts.some(toolPartHasUserAnswer);
 
         if (!inFrozen && !isNewDetection) continue;

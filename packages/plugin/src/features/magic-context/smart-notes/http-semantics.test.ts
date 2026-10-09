@@ -7,7 +7,9 @@ import { closeQuietly } from "../../../shared/sqlite-helpers";
 import { runMigrations } from "../migrations";
 import { initializeDatabase } from "../storage-db";
 import { addNote } from "../storage-notes";
+import { githubRateLimitResponses } from "./__tests__/github-http-fixture.test";
 import { createSmartNoteCapabilities } from "./capabilities";
+import { dryRunSmartNoteCheck } from "./compiler";
 import { runDueCompiledSmartNoteChecks } from "./runner";
 import { runCompiledSmartNoteCheck } from "./sandbox-runner";
 import { guardedSmartNoteHttpGet } from "./ssrf-guard";
@@ -21,6 +23,65 @@ import { SmartNoteNetworkError } from "./types";
 const signal = new AbortController().signal;
 const resolver = { lookup: async () => [{ address: "1.1.1.1", family: 4 as const }] };
 const resource = "https://api.github.com/repos/owner/repo/releases/latest";
+
+for (const response of githubRateLimitResponses(Math.floor(Date.now() / 1000) + 7200)) {
+    test(`guard classifies ${response.name} on repository probes in dry-run and check`, async () => {
+        for (const phase of ["dry-run", "check"]) {
+            const urls: string[] = [];
+            const factory = (runSignal: AbortSignal) => ({
+                ...createSmartNoteCapabilities({ projectRoot: process.cwd(), signal: runSignal }),
+                httpGet: (url: string) =>
+                    guardedSmartNoteHttpGet(url, {
+                        signal: runSignal,
+                        resolver,
+                        requestAddress: async (validation) => {
+                            urls.push(validation.url.href);
+                            return validation.url.href === resource
+                                ? { status: 404, body: '{"message":"Not Found"}' }
+                                : response;
+                        },
+                    }),
+            });
+            const code = `function check(cap) { try { cap.httpGet("${resource}"); } catch(e) {} return {met:true}; }`;
+            const startedAt = Date.now();
+            const result =
+                phase === "dry-run"
+                    ? await dryRunSmartNoteCheck(code, factory)
+                    : await runCompiledSmartNoteCheck({
+                          compiledCheck: code,
+                          capabilityFactory: factory,
+                      });
+            expect(result).toMatchObject({
+                ok: false,
+                cancelled: false,
+                network: true,
+                persistent: false,
+            });
+            if (!result.ok && !result.cancelled) {
+                expect(result.uncheckable).not.toBe(true);
+                expect(result.retryAt).toBeGreaterThanOrEqual(
+                    response.name === "primary 403"
+                        ? Number(response.headers["x-ratelimit-reset"]) * 1000
+                        : startedAt + response.delayMs,
+                );
+            }
+            expect(urls).toEqual([resource, "https://api.github.com/repos/owner/repo"]);
+        }
+    });
+}
+
+test("a readable GitHub body mentioning secondary rate limits is not itself a limit", async () => {
+    expect(
+        await guardedSmartNoteHttpGet(resource, {
+            signal,
+            resolver,
+            requestAddress: async () => ({
+                status: 200,
+                body: "secondary rate limit documentation",
+            }),
+        }),
+    ).toEqual({ status: 200, body: "secondary rate limit documentation" });
+});
 
 function get(status: number, parentStatus = 200) {
     return (url: string) =>

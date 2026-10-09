@@ -292,7 +292,7 @@ export function createIsolatedEnv(): IsolatedEnv {
  * - magic-context.jsonc: starts with small thresholds so tests trigger historian
  *   deterministically with modest scripted token counts.
  */
-function writeConfigs(
+export function writeConfigs(
     env: IsolatedEnv,
     mockProviderURL: string,
     opts: SpawnOptions,
@@ -399,25 +399,23 @@ function writeConfigs(
         console.error(`[mock-config] ${JSON.stringify({ configDir: env.configDir, mockProviderURL, opencodeConfig, magicContext })}`);
     }
 
-    // The plugin's loadPluginConfig() looks for magic-context.jsonc under
-    // ${XDG_CONFIG_HOME}/opencode/magic-context.jsonc (user config) or
-    // <workdir>/magic-context.jsonc (project root).
-    //
-    // We set XDG_CONFIG_HOME=env.configDir in the child env, so the user
-    // config path resolves to env.configDir/opencode/magic-context.jsonc.
-    // Put the file there; a sibling one in env.configDir is never read.
-    const userConfigDir = join(env.configDir, "opencode");
+    // Write the authoritative shared user config on every boot, including restarts.
+    // A legacy OpenCode file is ignored once startup migration has created the
+    // CortexKit file, so rewriting that legacy path would leave old settings live.
+    const userConfigDir = join(env.configDir, "cortexkit");
     mkdirSync(userConfigDir, { recursive: true });
     writeFileSync(
         join(userConfigDir, "magic-context.jsonc"),
         JSON.stringify(magicContext, null, 2),
     );
 
-    // Same directory, but this file is OpenCode's own global config — the layer
+    // OpenCode's own global config stays in its host-specific directory — the layer
     // a launcher's OPENCODE_CONFIG_DIR sits on top of rather than replacing.
     if (opts.openCodeGlobalConfigExtra) {
+        const openCodeConfigDir = join(env.configDir, "opencode");
+        mkdirSync(openCodeConfigDir, { recursive: true });
         writeFileSync(
-            join(userConfigDir, "opencode.json"),
+            join(openCodeConfigDir, "opencode.json"),
             JSON.stringify(
                 { $schema: "https://opencode.ai/config.json", ...opts.openCodeGlobalConfigExtra },
                 null,
@@ -622,7 +620,7 @@ interface RustSpawnResources {
  */
 async function provisionRustMode(existingEnv?: IsolatedEnv): Promise<RustSpawnResources> {
     const prereqs = detectRustModePrereqs();
-    if (!prereqs.ok || !prereqs.subconsciousRoot) {
+    if (!prereqs.ok) {
         throw new Error(
             `MC_E2E_MODE=rust prerequisite failure: ${prereqs.skipReason ?? "unknown prerequisite"}`,
         );
@@ -708,6 +706,9 @@ export async function spawnOpencode(opts: SpawnOptions): Promise<SpawnedOpencode
         // OpenCode also scans ~/.opencode outside the XDG config tree. Keep that
         // lookup in the fixture, not in the operator's home directory.
         childEnv.HOME = dirname(env.dataDir);
+        // Foundation's HTTP cache on macOS ignores HOME/XDG unless its user home
+        // is overridden too. Keep that SQLite cache in the same private fixture.
+        childEnv.CFFIXED_USER_HOME = childEnv.HOME;
         childEnv.OPENCODE_CONFIG_DIR = env.configDir;
         childEnv.XDG_CONFIG_HOME = env.configDir;
         childEnv.XDG_DATA_HOME = env.dataDir;

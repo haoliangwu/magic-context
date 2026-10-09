@@ -8,6 +8,7 @@ import type { Database as DatabaseType } from "../../shared/sqlite";
 import { Database, withPrivilegedWriter } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
+import { upsertCommits } from "./git-commits/storage-git-commits";
 import {
     ensureContextStoreUuid,
     installAuthorityManagedMarker,
@@ -93,6 +94,12 @@ function applyExactlyOneMigration(db: DatabaseType, migration: (typeof MIGRATION
 // a distinctive column value, and each value must be present at walk end.
 const CLAIMED_ARM_SIGNATURES = [
     {
+        arm: "populateV95GitFtsAtV94",
+        table: "git_commits",
+        column: "sha",
+        like: "armed-v95-commit",
+    },
+    {
         arm: "populateTsOwnedRows",
         table: "memories",
         column: "content",
@@ -156,6 +163,18 @@ function assertClaimedTablesNonEmpty(db: DatabaseType): void {
             );
         }
     }
+}
+
+function populateV95GitFtsAtV94(db: DatabaseType): void {
+    upsertCommits(db, PROJECT_PATH, [
+        {
+            sha: "armed-v95-commit",
+            shortSha: "armed",
+            message: "populated git FTS before rowid indexing",
+            author: "fixture",
+            committedAtMs: 1,
+        },
+    ]);
 }
 
 function assertPopulatedRowsLanded(db: DatabaseType, state: ReplayState): void {
@@ -708,6 +727,22 @@ function populateForVersion(db: DatabaseType, version: number, state: ReplayStat
                     )
                     .all(),
             ).toEqual([{ name: "lkg_slot_chunks" }, { name: "session_replay_decisions" }]);
+            populateModuleOwnedRows(db, version, state);
+            // A real legacy FTS row must exist before the next migration copies its rowid.
+            populateV95GitFtsAtV94(db);
+            return;
+        case 95:
+            if (!state.armed) throw new Error(`migration v${version} reached an unarmed store`);
+            expect(
+                db
+                    .prepare(`SELECT m.fts_rowid AS rowid, f.sha
+                FROM git_commit_fts_rowid_map m JOIN git_commits_fts f ON f.rowid=m.fts_rowid
+                WHERE m.sha=?`)
+                    .get("armed-v95-commit"),
+            ).toMatchObject({
+                rowid: expect.any(Number),
+                sha: "armed-v95-commit",
+            });
             populateModuleOwnedRows(db, version, state);
             return;
         default:

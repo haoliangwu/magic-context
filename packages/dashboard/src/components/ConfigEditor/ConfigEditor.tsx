@@ -12,13 +12,20 @@ import { jsoncErrorMessage, parseJsonc } from "../../lib/jsonc";
 import { invoke } from "../../lib/platform";
 import type { ModelCatalogs, OpencodeInstallState, ProjectConfigEntry } from "../../lib/types";
 import { configSaveBlocker } from "./config-save-guard";
-import { configDefault, configSchemaNode, defaultPlaceholder } from "./config-schema";
+import { configDefault, configSchemaNode, defaultLabel, defaultPlaceholder } from "./config-schema";
 import type { DreamTaskConfig, DreamTaskModelConfig } from "./DreamerTasksField";
 import DreamerTasksField from "./DreamerTasksField";
 import HarnessModelFields, { type Harness, modelCatalogForHarness } from "./HarnessModelFields";
+import HelpPopover from "./HelpPopover";
+import { LANGUAGE_OPTIONS } from "./languages";
+import ModelRoutes from "./ModelRoutes";
+import ModelSelect from "./ModelSelect";
 import PerModelTable from "./PerModelTable";
 import { PER_MODEL_KEYS, type PerModelValues } from "./per-model-overrides";
+import SearchPicker from "./SearchPicker";
+import StringList from "./StringList";
 import { structuredConfigSaveContent } from "./structured-save";
+import ToolDescriptions, { normalizeToolDescriptions } from "./ToolDescriptions";
 import "./config-editor.css";
 
 // ── JSONC helpers ───────────────────────────────────────────
@@ -114,7 +121,7 @@ const FIELD_DEFS: FieldDef[] = [
       "Shared across harnesses. Model used to compress each memory into a mural cue. The mural image itself is rendered deterministically.",
     section: "Background models",
   },
-  // The four context defaults and their exceptions are rendered by PerModelTable.
+  // Context defaults and their exceptions are rendered by PerModelTable.
   // Tags & cleanup
   {
     key: "protected_tokens",
@@ -122,14 +129,6 @@ const FIELD_DEFS: FieldDef[] = [
     type: "number",
     description:
       "Absolute token floor protected from automatic reclaim (4,000–1,000,000). Leave blank to derive it from the model's usable context window. User-level only.",
-    section: "Context window",
-  },
-  {
-    key: "clear_reasoning_age",
-    label: "Clear Reasoning Age",
-    type: "number",
-    description:
-      "Reasoning blocks older than this many tags are removed whole, only on passes that already rebuild the cache.",
     section: "Context window",
   },
   // Historian
@@ -421,14 +420,7 @@ function ConfigForm(props: {
   };
   const inheritedDefault = (key: string) => (
     <Show when={getNestedValue(formData(), key) === undefined}>
-      <span class="config-inherited">
-        Default:{" "}
-        {configDefault(key) === true
-          ? "on"
-          : configDefault(key) === false
-            ? "off"
-            : String(configDefault(key))}
-      </span>
+      <span class="config-inherited">Default: {defaultLabel(key)}</span>
     </Show>
   );
   const booleanSetting = (key: string) => getNestedValue(formData(), key) ?? configDefault(key);
@@ -441,7 +433,7 @@ function ConfigForm(props: {
     // Patch the values into the file text rather than re-serializing the
     // object, so the user's comments survive. The guard above has already
     // checked that `props.content` parses.
-    props.onSave(structuredConfigSaveContent(props.content, formData()));
+    props.onSave(structuredConfigSaveContent(props.content, normalizeToolDescriptions(formData())));
   };
 
   const handleRawSave = () => {
@@ -511,6 +503,22 @@ function ConfigForm(props: {
               handleFieldChange(field.key, v ? Number(v) : undefined);
             }}
           />
+        ) : field.key === "language" ? (
+          <SearchPicker
+            label="Output Language"
+            value={value() as string | undefined}
+            options={LANGUAGE_OPTIONS}
+            emptyLabel="No override"
+            onChange={(next) => handleFieldChange(field.key, next)}
+          />
+        ) : field.key === "mural.model" ? (
+          <ModelSelect
+            label="Cue Compressor Model"
+            models={[...new Set(Object.values(props.modelCatalogs).filter(Array.isArray).flat())]}
+            value={value() as string | undefined}
+            placeholder="Use built-in cue model"
+            onChange={(next) => handleFieldChange(field.key, next || undefined)}
+          />
         ) : (
           <input
             class="config-input"
@@ -538,17 +546,27 @@ function ConfigForm(props: {
     <div class={`config-editor ${showKeys() ? "show-config-keys" : ""}`}>
       {/* Sticky Action Bar */}
       <div class="config-action-bar">
-        <div class="tab-pills" style={{ margin: "0" }}>
+        <div class="config-file-meta">
+          <code title={props.path}>{props.path}</code>
+          <span>
+            {isUserScope()
+              ? "Shared CortexKit user config · OpenCode, Pi & OMP"
+              : "Project configuration"}
+          </span>
+        </div>
+        <fieldset class="config-segmented" aria-label="Editor mode">
           <button
             type="button"
-            class={`tab-pill ${!showRaw() ? "active" : ""}`}
+            classList={{ active: !showRaw() }}
+            aria-pressed={!showRaw()}
             onClick={() => setShowRaw(false)}
           >
             Form
           </button>
           <button
             type="button"
-            class={`tab-pill ${showRaw() ? "active" : ""}`}
+            classList={{ active: showRaw() }}
+            aria-pressed={showRaw()}
             onClick={() => {
               setShowRaw(true);
               setRawEdit(null);
@@ -556,16 +574,17 @@ function ConfigForm(props: {
           >
             Raw JSONC
           </button>
-        </div>
-        <div style={{ display: "flex", "align-items": "center", gap: "12px" }}>
+        </fieldset>
+        <div class="config-header-actions">
           <Show when={!showRaw()}>
-            <label class="config-keys-toggle">
+            <label class="toggle-switch config-keys-toggle">
               <input
                 type="checkbox"
                 checked={showKeys()}
                 onChange={(event) => setShowKeys(event.currentTarget.checked)}
-              />{" "}
-              Show config keys
+              />
+              <span class="toggle-slider" />
+              <span>Show config keys</span>
             </label>
           </Show>
           <Show when={saveMessage()}>
@@ -582,15 +601,14 @@ function ConfigForm(props: {
           </Show>
           <button
             type="button"
-            class="btn primary sm"
-            disabled={!hasChanges()}
-            onClick={handleFormSave}
-            style={{
-              opacity: hasChanges() ? 1 : 0.4,
-              cursor: hasChanges() ? "pointer" : "default",
-            }}
+            class="btn primary sm config-save"
+            disabled={showRaw() ? rawEdit() == null || rawEdit() === props.content : !hasChanges()}
+            onClick={() => (showRaw() ? handleRawSave() : handleFormSave())}
           >
-            Save Changes
+            {(showRaw() && rawEdit() != null && rawEdit() !== props.content) ||
+            (!showRaw() && hasChanges())
+              ? "● Save changes"
+              : "Saved"}
           </button>
         </div>
       </div>
@@ -632,9 +650,6 @@ function ConfigForm(props: {
                 onInput={(e) => setRawEdit(e.currentTarget.value)}
               />
               <div style={{ display: "flex", gap: "8px", "margin-top": "12px" }}>
-                <button type="button" class="btn primary sm" onClick={handleRawSave}>
-                  Save
-                </button>
                 <button type="button" class="btn sm" onClick={() => setRawEdit(null)}>
                   Cancel
                 </button>
@@ -1031,7 +1046,15 @@ function ConfigForm(props: {
                               PER_MODEL_KEYS.map((key) => [key, formData()[key]]),
                             )}
                             onChange={handlePerModelChange}
-                            models={[...new Set(Object.values(props.modelCatalogs).flat())]}
+                            models={[
+                              ...new Set(
+                                [
+                                  props.modelCatalogs.opencode,
+                                  props.modelCatalogs.pi,
+                                  props.modelCatalogs.omp,
+                                ].flat(),
+                              ),
+                            ]}
                             userScope={isUserScope()}
                           />
                         </div>
@@ -1050,35 +1073,8 @@ function ConfigForm(props: {
                     | Record<string, unknown>
                     | undefined) ?? {};
                 const userScope = () => (props.scope ?? "user") === "user";
-                const [modelsDraft, setModelsDraft] = createSignal<string | undefined>();
-                const [toolsDraft, setToolsDraft] = createSignal<string | undefined>();
                 const defaultPreset = () =>
                   promptSurface().default === "light" ? "light" : "full";
-                const modelsJson = () =>
-                  JSON.stringify(
-                    (promptSurface().models as Record<string, unknown> | undefined) ?? {},
-                    null,
-                    2,
-                  );
-                const toolsJson = () =>
-                  JSON.stringify(
-                    (promptSurface().tool_descriptions as Record<string, unknown> | undefined) ??
-                      {},
-                    null,
-                    2,
-                  );
-                const modelsEditorValue = () => modelsDraft() ?? modelsJson();
-                const toolsEditorValue = () => toolsDraft() ?? toolsJson();
-                const parseObject = (text: string): Record<string, unknown> | undefined => {
-                  try {
-                    const value = parseJsonc(text);
-                    return value && typeof value === "object" && !Array.isArray(value)
-                      ? (value as Record<string, unknown>)
-                      : undefined;
-                  } catch {
-                    return undefined;
-                  }
-                };
                 const setPromptSurface = (patch: Record<string, unknown>) =>
                   handleFieldChange("prompt_surface", { ...promptSurface(), ...patch });
 
@@ -1112,28 +1108,19 @@ function ConfigForm(props: {
                           <option value="light">light</option>
                         </select>
                       </div>
-                      <div class="config-field">
+                      <div class="config-field config-field-wide">
                         <div class="config-field-header">
                           <span class="config-field-label">Model routes</span>
                           <span class="config-field-key">prompt_surface.models</span>
                         </div>
                         <span class="config-field-desc">
-                          JSON object of provider/model or provider/* keys to full or light. Leave
-                          empty for default routing.
+                          Routes from provider/model or provider/* to full or light. Leave empty for
+                          default routing.
                         </span>
-                        <textarea
-                          class="code-editor"
-                          rows={4}
-                          value={modelsEditorValue()}
-                          onInput={(e) => {
-                            const value = e.currentTarget.value;
-                            setModelsDraft(value);
-                            const next = parseObject(value);
-                            if (next) {
-                              setPromptSurface({ models: next });
-                              setModelsDraft(undefined);
-                            }
-                          }}
+                        <ModelRoutes
+                          models={models()}
+                          value={promptSurface().models as Record<string, unknown> | undefined}
+                          onChange={(next) => setPromptSurface({ models: next })}
                         />
                       </div>
                       <Show when={userScope()}>
@@ -1163,29 +1150,23 @@ function ConfigForm(props: {
                         </div>
                       </Show>
                       <Show when={userScope()}>
-                        <div class="config-field">
+                        <div class="config-field config-field-wide">
                           <div class="config-field-header">
                             <span class="config-field-label">Tool-description overrides</span>
                             <span class="config-field-key">prompt_surface.tool_descriptions</span>
                           </div>
                           <span class="config-field-desc">
-                            User-only JSON object keyed by tool ID. Only top-level descriptions
+                            User-only overrides keyed by tool ID. Only top-level descriptions
                             change; IDs, parameter schemas, and parameter descriptions remain fixed.
                           </span>
-                          <textarea
-                            class="code-editor"
-                            rows={4}
-                            disabled={!userScope()}
-                            value={toolsEditorValue()}
-                            onInput={(e) => {
-                              const value = e.currentTarget.value;
-                              setToolsDraft(value);
-                              const next = parseObject(value);
-                              if (next) {
-                                setPromptSurface({ tool_descriptions: next });
-                                setToolsDraft(undefined);
-                              }
-                            }}
+                          <ToolDescriptions
+                            preset={defaultPreset()}
+                            value={
+                              promptSurface().tool_descriptions as
+                                | Record<string, unknown>
+                                | undefined
+                            }
+                            onChange={(next) => setPromptSurface({ tool_descriptions: next })}
                           />
                         </div>
                       </Show>
@@ -1222,6 +1203,7 @@ function ConfigForm(props: {
                             agent={agent}
                             harness={backgroundHarness()}
                             models={modelsForHarness(backgroundHarness())}
+                            variants={props.modelCatalogs.opencodeVariants}
                             value={getNestedValue(formData(), `${agent}.${backgroundHarness()}`)}
                             onChange={(block) =>
                               handleFieldChange(`${agent}.${backgroundHarness()}`, block)
@@ -1371,6 +1353,7 @@ function ConfigForm(props: {
                       handleFieldChange(path, next);
                     }}
                     models={modelsForHarness(dreamerHarness())}
+                    variants={props.modelCatalogs.opencodeVariants}
                   />
                 </div>
               </div>
@@ -1433,20 +1416,13 @@ function ConfigForm(props: {
                       <div class="config-field" hidden={activeSection() !== "History"}>
                         <div class="config-field-header">
                           <span class="config-field-label">Temporal Awareness</span>
+                          <HelpPopover topic="temporal_awareness" label="Temporal Awareness" />
                           <span class="config-field-key">temporal_awareness</span>
                         </div>
                         <span class="config-field-desc">
                           Inject elapsed-time markers (e.g. <code>+12m</code>, <code>+3d 4h</code>)
                           between user messages with &gt;5 min gaps.
                         </span>
-                        <details class="config-help">
-                          <summary>History rendering details</summary>
-                          <p>
-                            Add start-date/end-date attributes on rendered compartments. Helps the
-                            agent reason about session pacing across long-running and multi-day
-                            sessions. On by default.
-                          </p>
-                        </details>
                         <label class="toggle-switch">
                           <input
                             type="checkbox"
@@ -1467,6 +1443,7 @@ function ConfigForm(props: {
                       <div class="config-field" hidden={activeSection() !== "Memory & search"}>
                         <div class="config-field-header">
                           <span class="config-field-label">Auto Search Hint</span>
+                          <HelpPopover topic="auto_search" label="Auto Search Hint" />
                           <span class="config-field-key">memory.auto_search.enabled</span>
                         </div>
                         <span class="config-field-desc">
@@ -1474,14 +1451,6 @@ function ConfigForm(props: {
                           and append a compact <code>&lt;ctx-search-hint&gt;</code> block of vague
                           fragments when the top hit clears the score threshold.
                         </span>
-                        <details class="config-help">
-                          <summary>Hint behavior</summary>
-                          <p>
-                            Does NOT inject full content — just nudges the agent to run ctx_search
-                            for the real result if relevant. Adds one embedding round-trip per new
-                            user turn. On by default.
-                          </p>
-                        </details>
                         <label class="toggle-switch">
                           <input
                             type="checkbox"
@@ -1558,19 +1527,13 @@ function ConfigForm(props: {
                       <div class="config-field" hidden={activeSection() !== "Memory & search"}>
                         <div class="config-field-header">
                           <span class="config-field-label">Git Commit Indexing</span>
+                          <HelpPopover topic="git_commit_indexing" label="Git Commit Indexing" />
                           <span class="config-field-key">memory.git_commit_indexing.enabled</span>
                         </div>
                         <span class="config-field-desc">
                           Index <code>HEAD</code> non-merge commits into <code>ctx_search</code> as
                           a 4th source alongside memories, facts, and message history.
                         </span>
-                        <details class="config-help">
-                          <summary>Why index commits?</summary>
-                          <p>
-                            Useful for agents recalling regressions, prior fixes, and decisions
-                            without running git log manually. Off by default.
-                          </p>
-                        </details>
                         <label class="toggle-switch">
                           <input
                             type="checkbox"
@@ -1650,22 +1613,15 @@ function ConfigForm(props: {
                       <div class="config-field" hidden={activeSection() !== "History"}>
                         <div class="config-field-header">
                           <span class="config-field-label">Caveman Text Compression</span>
+                          <HelpPopover
+                            topic="caveman_text_compression"
+                            label="Caveman Text Compression"
+                          />
                           <span class="config-field-key">caveman_text_compression.enabled</span>
                         </div>
                         <span class="config-field-desc">
                           Age-tiered compression for long user/assistant text parts.
                         </span>
-                        <details class="config-help">
-                          <summary>Compression policy</summary>
-                          <p>
-                            Active for primary sessions when enabled; subagents are excluded because
-                            their context is curated by the parent. Outside the protected tail,
-                            oldest 20% of eligible tags get ultra compression, next 20% full, next
-                            20% lite, newest 40% untouched. Always compresses from the original
-                            source, so depth shifts are equivalent to compressing the original text
-                            directly. Off by default.
-                          </p>
-                        </details>
                         <label class="toggle-switch">
                           <input
                             type="checkbox"
@@ -1726,7 +1682,9 @@ function ConfigForm(props: {
                 const todowriteOverlay = () => Boolean(booleanSetting("todowrite.overlay"));
                 const setTodowrite = (patch: Record<string, unknown>) =>
                   handleFieldChange("todowrite", { ...todowrite(), ...patch });
-                const smartDrops = () => Boolean(booleanSetting("smart_drops"));
+                const [protectedToolsDraft, setProtectedToolsDraft] = createSignal<
+                  string | undefined
+                >();
                 const sqlite = () =>
                   (getNestedValue(formData(), "sqlite") as
                     | { cache_size_mb?: number; mmap_size_mb?: number }
@@ -1746,7 +1704,6 @@ function ConfigForm(props: {
                     ? value.filter((entry): entry is string => typeof entry === "string")
                     : [];
                 };
-                const piExtensionsText = () => piExtensions().join("\n");
 
                 return (
                   <div
@@ -1793,20 +1750,13 @@ function ConfigForm(props: {
                       <div class="config-field" hidden={activeSection() !== "Advanced"}>
                         <div class="config-field-header">
                           <span class="config-field-label">Keep Subagent Sessions</span>
+                          <HelpPopover topic="keep_subagents" label="Keep Subagent Sessions" />
                           <span class="config-field-key">keep_subagents</span>
                         </div>
                         <span class="config-field-desc">
                           Retain the child sessions magic-context spawns for its own agents
                           (historian, dreamer, memory migration, key-files, user-memory).
                         </span>
-                        <details class="config-help">
-                          <summary>Retention behavior</summary>
-                          <p>
-                            By default these are deleted on success; enable this to keep their full
-                            transcript and token usage for debugging. Kept sessions accumulate until
-                            cleared. Off by default.
-                          </p>
-                        </details>
                         <label class="toggle-switch">
                           <input
                             type="checkbox"
@@ -1934,68 +1884,85 @@ function ConfigForm(props: {
                             </span>
                           </label>
                         </div>
-                        <div class="config-field" hidden={activeSection() !== "Advanced"}>
+                        <div
+                          class="config-field config-field-wide"
+                          hidden={activeSection() !== "Advanced"}
+                        >
                           <div class="config-field-header">
                             <span class="config-field-label">Pi Subagent Extensions</span>
                             <span class="config-field-key">pi.subagent_extensions</span>
                           </div>
                           <span class="config-field-desc">
                             Optional user-level allowlist for extensions loaded by Pi subagent
-                            children. Enter one extension path or package per line.
+                            children. Add one extension path or package per row.
                           </span>
-                          <textarea
-                            class="code-editor"
-                            rows={4}
-                            value={piExtensionsText()}
-                            placeholder="extensions/my-tools.ts"
-                            onInput={(e) => {
-                              const entries = e.currentTarget.value
-                                .split("\n")
-                                .map((entry) => entry.trim())
-                                .filter(Boolean);
+                          <StringList
+                            label="Pi Subagent Extensions"
+                            value={piExtensions()}
+                            onChange={(entries) =>
                               handleFieldChange(
                                 "pi.subagent_extensions",
-                                entries.length > 0 ? entries : undefined,
-                              );
-                            }}
+                                entries.length ? entries : undefined,
+                              )
+                            }
                           />
                         </div>
                       </Show>
 
-                      {/* Smart drops */}
+                      {/* Automatic result protection */}
                       <div class="config-field" hidden={activeSection() !== "Context window"}>
                         <div class="config-field-header">
-                          <span class="config-field-label">Smart Drops</span>
-                          <span class="config-field-key">smart_drops</span>
+                          <span class="config-field-label">Protected Tools</span>
+                          <span class="config-field-key">protected_tools</span>
                         </div>
                         <span class="config-field-desc">
-                          Experimental: content-aware reclaim of provably-superseded tool output, on
-                          top of the existing auto-drop.
+                          Keep each tool's newest active results from automatic and queued drops.
+                          Counts merge over the defaults; 0 disables protection for a tool.
                         </span>
                         <details class="config-help">
-                          <summary>What gets reclaimed</summary>
+                          <summary>Protection policy</summary>
                           <p>
-                            Drops superseded todowrite, spent ctx_reduce, and zero-value status
-                            outputs, and compresses older edits to a file while keeping the newest.
-                            Only acts on passes already busting the cache, so it never causes a
-                            cache bust on its own. Off by default while cache stability is being
-                            proven.
+                            Enter a JSON object mapping tool names to whole numbers ≥ 0. Names
+                            ignore case and leading mcp_. Protection applies even at 95% pressure,
+                            with no byte cap: large protected outputs can reach refusal sooner.
+                            Changes affect later cache-rebuilding passes. Queued drops wait for
+                            newer calls to displace the result; historian summaries and folds are
+                            unaffected.
                           </p>
                         </details>
-                        <label class="toggle-switch">
-                          <input
-                            type="checkbox"
-                            checked={smartDrops()}
-                            onChange={(e) =>
-                              handleFieldChange("smart_drops", e.currentTarget.checked)
+                        <textarea
+                          class="code-editor"
+                          rows={4}
+                          placeholder={'{ "todowrite": 1, "ctx_reduce": 3 }'}
+                          value={
+                            protectedToolsDraft() ??
+                            JSON.stringify(
+                              getNestedValue(formData(), "protected_tools") ?? {},
+                              null,
+                              2,
+                            )
+                          }
+                          onInput={(e) => {
+                            const text = e.currentTarget.value;
+                            setProtectedToolsDraft(text);
+                            try {
+                              const next = parseJsonc(text);
+                              if (
+                                next &&
+                                typeof next === "object" &&
+                                !Array.isArray(next) &&
+                                Object.values(next).every(
+                                  (n) => typeof n === "number" && Number.isInteger(n) && n >= 0,
+                                )
+                              ) {
+                                handleFieldChange("protected_tools", next);
+                                setProtectedToolsDraft(undefined);
+                              }
+                            } catch {
+                              /* Keep invalid drafts visible without saving them. */
                             }
-                          />
-                          <span class="toggle-slider" />
-                          <span class="toggle-label">
-                            {smartDrops() ? "Enabled" : "Disabled"}
-                            {inheritedDefault("smart_drops")}
-                          </span>
-                        </label>
+                          }}
+                        />
                       </div>
 
                       {/* System prompt injection */}
@@ -2282,19 +2249,6 @@ export default function ConfigEditor(props: {
             when={!userConfig.loading}
             fallback={<div class="empty-state">Loading config...</div>}
           >
-            <div style={{ "margin-bottom": "8px" }}>
-              <table class="kv-table">
-                <tbody>
-                  <tr>
-                    <td>Path</td>
-                    <td style={{ "word-break": "break-all" }}>{userConfig()?.path ?? "—"}</td>
-                  </tr>
-                </tbody>
-              </table>
-              <p style={{ "font-size": "11px", color: "var(--text-muted)", margin: "4px 0 0" }}>
-                Shared CortexKit user config (OpenCode, Pi, and OMP)
-              </p>
-            </div>
             <Show
               when={userConfig()?.exists}
               fallback={

@@ -245,6 +245,12 @@ export const USER_FACING_FAILURES = {
         sentence: "Magic Context has no context.db.",
         action: "Run `npx @cortexkit/magic-context doctor store init`, then restart ck-mc.",
     },
+    checkout_claim_held_elsewhere: {
+        code: "MC-C16",
+        sentence:
+            "This request was not sent: this agent is checked out on another machine, so Magic Context will not work on its sessions here.",
+        action: "Move the agent back to this machine, then send your message again.",
+    },
     single_store_migration_required: {
         code: "MC-C14",
         sentence: "Magic Context's Rust mode needs a one-time migration of its store.",

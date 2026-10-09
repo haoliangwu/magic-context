@@ -18,7 +18,9 @@ import { getMemoriesByProject } from "../../features/magic-context/memory/storag
 import { runMigrations } from "../../features/magic-context/migrations";
 import { initializeDatabase } from "../../features/magic-context/storage-db";
 import { reserveProtectedTailDrainTokens } from "../../features/magic-context/storage-meta-persisted";
+import { getPendingOps } from "../../features/magic-context/storage-ops";
 import { getPrimerCandidatesForProject } from "../../features/magic-context/storage-primers";
+import { insertTag } from "../../features/magic-context/storage-tags";
 import { getUserMemoryCandidates } from "../../features/magic-context/user-memory/storage-user-memory";
 import type { PluginContext } from "../../plugin/types";
 import * as loggerModule from "../../shared/logger";
@@ -270,6 +272,66 @@ async function runWithLease(args: {
 }
 
 describe("runCompartmentAgent wrapup controls", () => {
+    it("OpenCode publish selects drop candidates and reads raw messages before taking the writer", async () => {
+        const db = createDb();
+        const sessionId = "ses-publish-lock-scope";
+        insertTag(db, sessionId, "m-1:p0", "message", 10, 1);
+        const scanStates: boolean[] = [];
+        const queueStates: boolean[] = [];
+        const rawReadStates: boolean[] = [];
+        const prepare = db.prepare.bind(db);
+        const prepareSpy = spyOn(db, "prepare").mockImplementation((sql) => {
+            const statement = prepare(sql);
+            if (
+                sql.startsWith("SELECT") &&
+                sql.includes("FROM tags") &&
+                sql.includes("status = 'active'")
+            ) {
+                const all = statement.all.bind(statement);
+                spyOn(statement, "all").mockImplementation((...params) => {
+                    scanStates.push(db.inTransaction);
+                    return all(...params);
+                });
+            }
+            if (sql.startsWith("INSERT INTO pending_ops")) {
+                const run = statement.run.bind(statement);
+                spyOn(statement, "run").mockImplementation((...params) => {
+                    queueStates.push(db.inTransaction);
+                    return run(...params);
+                });
+            }
+            return statement;
+        });
+        const unregister = setRawMessageProvider(sessionId, {
+            readMessages: () => {
+                rawReadStates.push(db.inTransaction);
+                return rawMessages(3);
+            },
+            getMessageCount: () => 3,
+        });
+        try {
+            await runWithLease({
+                db,
+                sessionId,
+                snapshot: wrapupSnapshot(db, sessionId),
+                forceKeepLastCompartment: true,
+                forceDrainQuota: true,
+                memoryEnabled: false,
+            });
+            expect(getCompartments(db, sessionId)).toHaveLength(1);
+            expect(getPendingOps(db, sessionId).map((op) => op.tagId)).toEqual([1]);
+            expect(scanStates.length).toBeGreaterThan(0);
+            expect(scanStates.every((inTransaction) => !inTransaction)).toBe(true);
+            expect(rawReadStates.length).toBeGreaterThan(0);
+            expect(rawReadStates.every((inTransaction) => !inTransaction)).toBe(true);
+            expect(queueStates).toEqual([true]);
+        } finally {
+            unregister();
+            prepareSpy.mockRestore();
+            closeQuietly(db);
+        }
+    });
+
     it("persists a forced final compartment but skips facts, user observations, and primers", async () => {
         const project = resolveProjectIdentity("/tmp/wrapup-runner");
         for (const forceKeepLastCompartment of [true, false]) {

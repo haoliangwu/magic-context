@@ -6,6 +6,7 @@ import {
     FAIL_CLOSED_DOCTOR_COMMAND,
     isFailClosedBlockingError,
 } from "../features/magic-context/fail-closed-block";
+import { getOrCreateSessionMeta, updateSessionMeta } from "../features/magic-context/storage";
 import {
     __resetSchemaFenceStateForTests,
     closeDatabase,
@@ -16,10 +17,21 @@ import {
 } from "../features/magic-context/storage-db";
 import {
     addTrailingBlankDecisions,
+    recordDetectedContextLimit,
     recordOverflowDetected,
     resetEmergencyRecoveryRegistryForTest,
 } from "../features/magic-context/storage-meta-persisted";
+import {
+    __resetToolDefinitionMeasurements,
+    recordToolDefinition,
+} from "../features/magic-context/tool-definition-tokens";
 import { DegradedPassRefusalError } from "../hooks/magic-context/degraded-pass-refusal";
+import {
+    clearLkgMeasuredRequest,
+    noteLkgProviderResponse,
+} from "../hooks/magic-context/lkg-measured-request";
+import { captureLkgSlot } from "../hooks/magic-context/lkg-replay";
+import { dropSlot } from "../hooks/magic-context/lkg-slot";
 import { RawFallbackContextLimitError } from "../hooks/magic-context/raw-fallback-context-limit";
 import { StorageBusyRefusalError } from "../hooks/magic-context/storage-busy-refusal";
 import { finalizeMessageRepresentation } from "../hooks/magic-context/transform-postprocess-phase";
@@ -29,6 +41,123 @@ import { createMessagesTransformHandler, IncompleteUserMessageError } from "./me
 
 afterEach(() => {
     resetEmergencyRecoveryRegistryForTest();
+});
+
+describe("TypeScript wrapper measured LKG admission", () => {
+    for (const [label, inputTokens, tailText, serves] of [
+        ["small measured tail is served", 633_258, "continue", true],
+        [
+            "near-limit measured input plus a big tail is refused",
+            871_000,
+            "big tail ".repeat(20_000),
+            false,
+        ],
+        ["unmeasured request uses the full estimate", 0, "continue", false],
+    ] as const) {
+        it(label, async () => {
+            const sessionId = `ts-measured-${inputTokens}`;
+            const model = { providerID: "wrapper-fit", modelID: "unknown-tokenizer" };
+            const modelKey = `${model.providerID}/${model.modelID}`;
+            const db = openDatabase();
+            if (!db) throw new Error("throwaway database unavailable");
+            getOrCreateSessionMeta(db, sessionId);
+            updateSessionMeta(db, sessionId, { systemPromptTokens: 100 });
+            recordDetectedContextLimit(db, sessionId, 872_000, modelKey);
+            recordToolDefinition(
+                model.providerID,
+                model.modelID,
+                undefined,
+                "read",
+                "read fixture",
+                {},
+            );
+            const raw = [
+                {
+                    info: {
+                        id: "input",
+                        role: "user",
+                        sessionID: sessionId,
+                        model,
+                        time: { created: 1 },
+                    },
+                    parts: [{ type: "text", text: "x ".repeat(500_000) }],
+                },
+            ];
+            const served = structuredClone(raw);
+            served[0]!.parts[0]!.text += " transformed prefix";
+            noteLkgProviderResponse({ sessionId, modelKey, responseId: "reply", inputTokens: 0 });
+            expect(
+                captureLkgSlot({
+                    sessionId,
+                    input: raw as never,
+                    output: served as never,
+                    modelKey,
+                    providerKey: model.providerID,
+                    systemPromptTokens: 100,
+                }),
+            ).toBe(true);
+            if (inputTokens)
+                noteLkgProviderResponse({
+                    sessionId,
+                    modelKey,
+                    responseId: "reply",
+                    inputTokens,
+                    finish: "stop",
+                });
+            const tail = [
+                {
+                    info: {
+                        id: "reply",
+                        role: "assistant",
+                        sessionID: sessionId,
+                        time: { created: 2 },
+                    },
+                    parts: [{ type: "text", text: "small reply" }],
+                },
+                {
+                    info: {
+                        id: "next",
+                        role: "user",
+                        sessionID: sessionId,
+                        model,
+                        time: { created: 3 },
+                    },
+                    parts: [{ type: "text", text: tailText }],
+                },
+            ];
+            const output = { messages: [...raw, ...tail] };
+            let replayed = false;
+            const handler = createMessagesTransformHandler({
+                magicContext: {
+                    "experimental.chat.messages.transform": async () => {
+                        throw new StorageBusyRefusalError(
+                            new Error("fixture busy"),
+                            "typescript-transform",
+                        );
+                    },
+                },
+                rustReplayParticipant: () => null,
+                onLkgReplay: () => {
+                    replayed = true;
+                },
+            });
+            try {
+                if (serves) {
+                    await handler({}, output as never);
+                    expect(output.messages).toEqual([...served, ...tail]);
+                } else
+                    await expect(handler({}, output as never)).rejects.toBeInstanceOf(
+                        StorageBusyRefusalError,
+                    );
+                expect(replayed).toBe(serves);
+            } finally {
+                dropSlot(sessionId);
+                clearLkgMeasuredRequest(sessionId);
+                __resetToolDefinitionMeasurements();
+                closeDatabase();
+            }
+        });
+    }
 });
 
 // Minimal fake message shape — just needs info + parts.

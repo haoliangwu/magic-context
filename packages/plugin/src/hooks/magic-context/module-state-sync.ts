@@ -1070,6 +1070,7 @@ async function collectModuleStateSyncPayload(args: {
     // When starting a module from an existing session, include all TypeScript
     // units already dropped before the first transform. Otherwise the transform
     // reads older raw data and needs another cache invalidation to process them.
+    // A mode switch is a rebuilding pass; temporal decisions remain engine-owned and first-writer-wins after that rebuild.
     const dropSeedState = args.force
         ? buildDropSeeds({
               db: args.pass.db,

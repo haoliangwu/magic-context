@@ -18,6 +18,7 @@ export const DOCTOR_SUBCOMMANDS_WITH_OWN_HELP: ReadonlySet<string> = new Set([
     "migrate",
     "migrate-session",
     "repair-db",
+    "git-fts-map",
 ]);
 
 const HARNESS_LINES = [
@@ -67,6 +68,7 @@ export const DOCTOR_HELP = [
     "    migrate-session             Re-home an OpenCode session to another directory",
     "    merge-identities            Preview or explicitly merge split identities",
     "    repair-db                   Back up and salvage a corrupted shared database",
+    "    git-fts-map                 Diagnose git FTS inventory; --repair backs up both stores offline",
     "    list-hidden-sessions        List Magic Context OpenCode 2 roots",
     "",
 ].join("\n");

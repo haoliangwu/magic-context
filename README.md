@@ -404,6 +404,32 @@ bun run format      # Format (Biome)
 
 Dream execution requires a live OpenCode server (the dreamer creates ephemeral child sessions). Use `/ctx-dream` inside OpenCode for on-demand maintenance.
 
+### Mutation catalogue
+
+A passing safety test proves little until it has been seen to fail. [`mutations.toml`](mutations.toml) is the checked-in catalogue: each row deliberately breaks one guard in production code and names the test that must fail because of it, so a guard cannot quietly stop guarding. A row earns its place by guarding a silent, costly failure: a prompt-cache bust, a refusal that must fail closed, a wire contract, crash safety, data loss, file permissions. Every exactly-once guard (a lease, a compare-and-set clear) has at least one row through the real production path. Style and cosmetics do not get rows.
+
+The pinned [`ck-mutate`](https://github.com/cortexkit/commons/tree/7d08e73722fa3e79bbcc2607753978ab768f1c6b/crates/cortexkit-mutate) runner replays it from a clean tree: it checks that each named test passes, applies the break, requires the test to fail, and restores the source byte for byte.
+
+```sh
+cargo install --locked --git https://github.com/cortexkit/commons --rev 7d08e73722fa3e79bbcc2607753978ab768f1c6b cortexkit-mutate
+bun install --frozen-lockfile
+ck-mutate check                       # anchors match exactly once; cargo test names exist
+ck-mutate run --all                   # every row (slow: the Rust rows rebuild mc-module)
+ck-mutate run --diff origin/master    # only the rows a change touches
+ck-mutate run --only ts-schema-fence-refuses-newer-database
+```
+
+Every row must report CAUGHT. [`mutations.yml`](.github/workflows/mutations.yml) replays the rows a pull request (or a `train/**` push) touches, the full catalogue on every push to master, and the full catalogue with `--broad` nightly. Never `git checkout` a file while a replay runs: it removes the mutation and fakes a survivor.
+
+To add a row:
+
+1. Pick the production line that *is* the guard and copy `old` from the file, never from memory. Make `new` the smallest edit that removes the protection (`if (false)`, `return true`, a dropped condition), not an edit that breaks compilation.
+2. Find the test that should catch it. Apply the edit by hand, run that test file, and confirm the test goes red for the guarded reason, then restore the file. If nothing goes red, that is a finding: add the missing test first, in its own commit.
+3. Add the row. Bun tests are `command` rows: copy an existing row and set `expect_red` to the anchored `-t` regex of the full test name (describe names and test name joined by spaces, regex metacharacters escaped, each space written `\s`). Rust tests in mc-module are `command` rows running `cargo test --lib -- --exact`; small Rust targets are `cargo` rows with `only = true`. Add `expect_message` (a substring, or `/regex/`) whenever the test could also fail for an unrelated reason.
+4. Run `ck-mutate check`, then `ck-mutate run --only <id>`, and commit the row only once it reports CAUGHT.
+
+A row that stops being caught is a finding to fix, not a row to delete.
+
 ---
 
 ### Cache-bust sentinel

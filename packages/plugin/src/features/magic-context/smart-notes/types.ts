@@ -67,6 +67,14 @@ export class SmartNoteNetworkError extends Error {
     }
 }
 
+/** Deadline/abort failures describe transport availability, not broken check logic. */
+export function smartNoteNetworkTimeout(message: string): SmartNoteNetworkError {
+    return new SmartNoteNetworkError(message, {
+        terminal: true,
+        retryAt: Date.now() + SMART_NOTE_CHECK_FLOOR_MS,
+    });
+}
+
 export class SmartNoteSecurityError extends Error {
     readonly isSmartNoteSecurityError = true;
 

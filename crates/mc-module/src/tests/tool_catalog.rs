@@ -827,6 +827,108 @@ async fn planless_calls_keep_legacy_response_bytes_even_on_a_v1_declaring_route(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn reconnect_after_restart_refetches_catalog_or_uses_planless_legacy_dispatch() {
+    let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);
+    let (first_handler, store, _dir, project) = handler_with_store_and_resolver(
+        Arc::new(ProducerState::default()),
+        example_module_config(),
+        resolver.clone(),
+    );
+    first_handler.bind_route(
+        7,
+        SessionBinding {
+            config: example_module_config(),
+            ..binding_with_harness(project.to_str().unwrap(), "claude-code", "ses")
+        },
+    );
+    let role_versions = BTreeMap::from([("tool-provider".to_string(), "v1".to_string())]);
+    first_handler.record_route_role_versions(7, Some(&role_versions));
+
+    let catalog_request = role_request("head", true, "full");
+    let first_catalog = first_handler
+        .dispatch_value(
+            7,
+            json!({"name": "tool.catalog", "arguments": catalog_request.clone()}),
+        )
+        .await;
+    let first_catalog = tool_body(first_catalog);
+    assert!(first_catalog["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "ctx_reduce"));
+    assert_eq!(first_handler.frozen_tool_catalogs.lock().unwrap().len(), 1);
+    drop(first_handler);
+
+    // A new handler is a new ck-mc process: the store survives, but the
+    // process-local frozen role catalog does not.
+    let restarted = McHandler::with_producer_factory_config_resolver(
+        Arc::new(TestProducerFactory {
+            state: Arc::new(ProducerState::default()),
+        }),
+        example_module_config(),
+        resolver,
+    );
+    restarted.store.set(Arc::clone(&store)).ok().unwrap();
+    restarted.bind_route(
+        7,
+        SessionBinding {
+            config: example_module_config(),
+            ..binding_with_harness(project.to_str().unwrap(), "claude-code", "ses")
+        },
+    );
+    restarted.record_route_role_versions(7, Some(&role_versions));
+    assert!(restarted.frozen_tool_catalogs.lock().unwrap().is_empty());
+
+    store
+        .seed_tags_for_test(
+            "ses",
+            &[TagMintInput {
+                block_id: "reconnect-target".to_string(),
+                kind: "message".to_string(),
+                token_count: 1,
+                source_bytes: b"reconnect target".to_vec(),
+            }],
+            1,
+        )
+        .unwrap();
+
+    // The Claude Code/subc-mcp compatibility path omits the preset when no
+    // frozen catalog is available, retaining the legacy facade dispatch.
+    let legacy = restarted
+        .dispatch_value(7, json!({"name": "ctx_reduce", "arguments": {"drop": "1"}}))
+        .await;
+    assert!(!tool_is_error(legacy));
+
+    // A role-aware reconnect restores the compacting head grant by fetching the
+    // full composition again before sending a preset-bearing call.
+    let catalog = restarted
+        .dispatch_value(
+            7,
+            json!({"name": "tool.catalog", "arguments": catalog_request}),
+        )
+        .await;
+    let catalog = tool_body(catalog);
+    assert!(catalog["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "ctx_reduce"));
+    let compacting_head_call = restarted
+        .dispatch_value(
+            7,
+            json!({
+                "name": "ctx_reduce",
+                "preset": "head",
+                "arguments": {"drop": "1"},
+                "composition": {"compaction": {"provider": "magic-context"}}
+            }),
+        )
+        .await;
+    assert!(!tool_is_error(compacting_head_call));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn shared_head_catalog_refuses_helper_writes_without_mutating_store_and_allows_head() {
     for compacting in [false, true] {
         let resolver = FakeSessionResolver::with(&[("ses", FakeResolve::Hit("ses".to_string()))]);

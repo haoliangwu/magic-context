@@ -12,10 +12,11 @@ import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
  * stayed live. Layer C filters by `(callId, tool_owner_message_id)`.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
     closeDatabase,
     getPendingOps,
@@ -23,7 +24,14 @@ import {
     openDatabase,
     updateTagStatus,
 } from "../../features/magic-context/storage";
-import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
+import { queuePendingOp } from "../../features/magic-context/storage-ops";
+import { getActiveTagsBySession } from "../../features/magic-context/storage-tags";
+import { applyPendingOperations } from "./apply-operations";
+import {
+    prepareCompartmentDrops,
+    queueDropsForCompartmentalizedMessages,
+    queuePreparedCompartmentDrops,
+} from "./compartment-runner-drop-queue";
 import { withRawMessageProvider } from "./read-session-chunk";
 import type { RawMessage } from "./read-session-raw";
 
@@ -61,6 +69,131 @@ function makeRawMessages(messages: RawMessage[]) {
 }
 
 describe("queueDropsForCompartmentalizedMessages composite identity", () => {
+    it("review regression: repeated historian publication of a held result must have bounded pending depth", () => {
+        useTempDataHome("drop-queue-held-bound-");
+        const db = openDatabase();
+        insertTag(db, "ses-1", "held-call", "tool", 100, 1, 0, "todowrite", 0, "held-owner");
+        const observed = {
+            messageFileKeys: new Set<string>(),
+            toolObservations: new Map([["held-call", new Set(["held-owner"])]]),
+        };
+        queueDropsForCompartmentalizedMessages(db, "ses-1", 1, observed);
+        const first = getPendingOps(db, "ses-1");
+        for (let n = 0; n < 99; n++)
+            queueDropsForCompartmentalizedMessages(db, "ses-1", 1, observed);
+        expect(getPendingOps(db, "ses-1")).toHaveLength(1);
+        expect(getPendingOps(db, "ses-1")).toEqual(first);
+        const active = getActiveTagsBySession(db, "ses-1");
+        expect(
+            applyPendingOperations(
+                "ses-1",
+                db,
+                new Map(),
+                protectedToolTagNumbers(active, { todowrite: 1 }),
+            ),
+        ).toBe(false);
+        expect(getActiveTagsBySession(db, "ses-1")).toEqual(active);
+        expect(getPendingOps(db, "ses-1")).toEqual(first);
+    });
+
+    it("prepared drops are byte-identical to the previous queue with a frozen clock", () => {
+        useTempDataHome("drop-queue-byte-parity-");
+        const db = openDatabase();
+        insertTag(db, "ses-1", "m1:p0", "message", 10, 5);
+        insertTag(db, "ses-1", "m1:file1", "file", 10, 3);
+        insertTag(db, "ses-1", "call", "tool", 10, 1, 0, "read", 0, "inside");
+        insertTag(db, "ses-1", "call", "tool", 10, 2, 0, "read", 0, "outside");
+        insertTag(db, "ses-1", "legacy", "tool", 10, 4);
+        insertTag(db, "ses-1", "m1:p1", "message", 10, 6);
+        updateTagStatus(db, "ses-1", 6, "dropped");
+        insertTag(db, "ses-1", "tail:p0", "message", 10, 7);
+        // Preserve an existing row's identity when publication selects it again.
+        queuePendingOp(db, "ses-1", 3, "drop", 900);
+        const keys = {
+            messageFileKeys: new Set(["m1:p0", "m1:file1", "m1:p1"]),
+            toolObservations: new Map([
+                ["call", new Set(["inside"])],
+                ["legacy", new Set(["inside"])],
+            ]),
+        };
+        const clock = spyOn(Date, "now").mockReturnValue(1234);
+        const queueBytes = () =>
+            JSON.stringify(db.prepare("SELECT * FROM pending_ops ORDER BY id").all());
+        try {
+            // Frozen reference implementation of the preselection-free queue.
+            db.exec("BEGIN IMMEDIATE");
+            for (const tag of getActiveTagsBySession(db, "ses-1")) {
+                const owners = keys.toolObservations.get(tag.messageId);
+                const matches =
+                    tag.type === "tool"
+                        ? owners !== undefined &&
+                          (tag.toolOwnerMessageId === null || owners.has(tag.toolOwnerMessageId))
+                        : keys.messageFileKeys.has(tag.messageId);
+                if (matches) queuePendingOp(db, "ses-1", tag.tagNumber, "drop");
+            }
+            const previousBytes = queueBytes();
+            expect(getPendingOps(db, "ses-1").map((op) => op.tagId)).toEqual([3, 1, 4, 5]);
+            db.exec("ROLLBACK");
+            const prepared = prepareCompartmentDrops(db, "ses-1", 2, keys);
+            db.exec("BEGIN IMMEDIATE");
+            queuePreparedCompartmentDrops(db, prepared);
+            expect(queueBytes()).toBe(previousBytes);
+            db.exec("ROLLBACK");
+            expect(getPendingOps(db, "ses-1").map((op) => op.tagId)).toEqual([3]);
+        } finally {
+            if (db.inTransaction) db.exec("ROLLBACK");
+            clock.mockRestore();
+        }
+    });
+
+    it("revalidates candidate status and source identity after concurrent changes", () => {
+        useTempDataHome("drop-queue-revalidation-");
+        const db = openDatabase();
+        for (let number = 1; number <= 8; number++) {
+            insertTag(db, "ses-1", `m${number}:p0`, "message", 10, number);
+        }
+        insertTag(db, "ses-1", "call", "tool", 10, 9, 0, "read", 0, null);
+        const keys = {
+            messageFileKeys: new Set(Array.from({ length: 8 }, (_, i) => `m${i + 1}:p0`)),
+            toolObservations: new Map([["call", new Set(["inside"])]]),
+        };
+        const prepared = prepareCompartmentDrops(db, "ses-1", 9, keys);
+        expect(prepared.candidates).toHaveLength(9);
+        // These commits stand in for a foreground transform while the publisher
+        // waits to acquire the writer. No stale candidate may target a new source.
+        updateTagStatus(db, "ses-1", 1, "dropped");
+        updateTagStatus(db, "ses-1", 2, "compacted");
+        db.prepare("DELETE FROM tags WHERE session_id = ? AND tag_number = 3").run("ses-1");
+        insertTag(db, "ses-1", "m3:p0", "message", 10, 3);
+        db.prepare(
+            "UPDATE tags SET message_id = 'tail:p0' WHERE session_id = ? AND tag_number = 4",
+        ).run("ses-1");
+        db.prepare("UPDATE tags SET type = 'file' WHERE session_id = ? AND tag_number = 5").run(
+            "ses-1",
+        );
+        db.prepare("UPDATE tags SET tag_number = 60 WHERE session_id = ? AND tag_number = 6").run(
+            "ses-1",
+        );
+        db.prepare(
+            "UPDATE tags SET session_id = 'ses-other' WHERE session_id = ? AND tag_number = 7",
+        ).run("ses-1");
+        db.prepare(
+            "UPDATE tags SET tool_owner_message_id = 'outside' WHERE session_id = ? AND tag_number = 9",
+        ).run("ses-1");
+        // A size-only update leaves the source identity intact.
+        db.prepare("UPDATE tags SET byte_size = 99 WHERE session_id = ? AND tag_number = 8").run(
+            "ses-1",
+        );
+        db.exec("BEGIN IMMEDIATE");
+        try {
+            queuePreparedCompartmentDrops(db, prepared);
+            expect(getPendingOps(db, "ses-1").map((op) => op.tagId)).toEqual([8]);
+            db.exec("COMMIT");
+        } finally {
+            if (db.inTransaction) db.exec("ROLLBACK");
+        }
+    });
+
     it("does NOT queue a drop for a callId reused outside the compartment", async () => {
         //#given — `read:32` is invoked twice: at message 5 (in
         // compartment), again at message 10 (outside compartment).

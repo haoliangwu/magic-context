@@ -13,12 +13,18 @@ import {
   cacheEventLabel,
   cacheReadLabel,
   cacheWriteLabel,
+  formatTokensShort,
+  latestContextFill,
   selectWorstCacheEvent,
+  sentenceCaseLabel,
 } from "../../lib/cache-format";
+import { livePollDue } from "../../lib/live-poll";
+import { sessionLabel } from "../../lib/session-label";
 import type { DbCacheEvent, Harness, SessionCacheStats } from "../../lib/types";
 import HarnessBadge from "../HarnessBadge";
 import CacheTimeline from "../shared/CacheTimeline";
 import FilterSelect from "../shared/FilterSelect";
+import Icon from "../shared/Icon";
 
 export type HarnessFilter = "all" | Harness;
 
@@ -87,27 +93,6 @@ export function cacheActivityNote(sessions: SessionCacheStats[]): string | null 
 
 export function cacheSessionTitle(row: SessionCacheStats): string {
   return row.title || truncate(row.session_id, 16);
-}
-
-// Longest session name a card shows as-is. Longer names are shortened to
-// their last meaningful part so cards stay one line; the tooltip keeps the
-// full name.
-const CARD_TITLE_MAX = 20;
-
-/**
- * Short card label for a session. Names like `alfonso:consult-<uuid>` share a
- * long prefix and differ only at the end, so the label drops everything up to
- * the last `:` and, if the rest is still long, keeps its first word plus its
- * last 6 characters: `consult-…a1b2c3`.
- */
-export function cacheCardTitle(row: SessionCacheStats): string {
-  const full = cacheSessionTitle(row);
-  if (full.length <= CARD_TITLE_MAX) return full;
-  const tail = full.slice(full.lastIndexOf(":") + 1);
-  if (tail.length <= CARD_TITLE_MAX) return tail;
-  const head = /^[^-_]+/.exec(tail)?.[0] ?? "";
-  if (head.length > 0 && head.length <= 12) return `${head}-…${tail.slice(-6)}`;
-  return `${tail.slice(0, 8)}…${tail.slice(-6)}`;
 }
 
 export interface CacheCardSummary {
@@ -526,9 +511,6 @@ export default function CacheDiagnostics() {
     bumpWindows();
   };
 
-  const resolveTitle = (harness: Harness, sessionId: string) =>
-    sessionNames()[`${harness}:${sessionId}`] || truncate(sessionId, 16);
-
   onMount(async () => {
     // Remount fast path: rehydrate from the module-level windows synchronously.
     if (cachedWindows.size > 0) {
@@ -563,10 +545,23 @@ export default function CacheDiagnostics() {
 
   // Single 1s reconciliation loop: cheap cache-stats re-list + incremental
   // per-session fetches (only for sessions whose activity advanced). In-flight
-  // latched so a slow pass can't stack.
+  // latched so a slow pass can't stack. Backs off while the window is in the
+  // background and stops while it is hidden (see lib/live-poll.ts); coming
+  // back to the window refreshes at once.
   let reconcileInFlight = false;
-  const tick = async () => {
+  let ticksSinceRefresh = 0;
+  const tick = async (force = false) => {
     if (paused() || reconcileInFlight) return;
+    ticksSinceRefresh += 1;
+    const due =
+      force ||
+      livePollDue({
+        hidden: document.visibilityState === "hidden",
+        focused: document.hasFocus(),
+        ticksSinceRefresh,
+      });
+    if (!due) return;
+    ticksSinceRefresh = 0;
     reconcileInFlight = true;
     try {
       await reconcile();
@@ -577,7 +572,16 @@ export default function CacheDiagnostics() {
     }
   };
   const tickInterval = setInterval(() => void tick(), 1000);
-  onCleanup(() => clearInterval(tickInterval));
+  const refreshOnReturn = () => {
+    if (document.visibilityState !== "hidden") void tick(true);
+  };
+  document.addEventListener("visibilitychange", refreshOnReturn);
+  window.addEventListener("focus", refreshOnReturn);
+  onCleanup(() => {
+    clearInterval(tickInterval);
+    document.removeEventListener("visibilitychange", refreshOnReturn);
+    window.removeEventListener("focus", refreshOnReturn);
+  });
 
   // Selection helper. Ensures the newly-selected session has a window (loads it
   // immediately if not already held) so its chart appears without a poll lag.
@@ -737,153 +741,115 @@ export default function CacheDiagnostics() {
     });
   };
 
-  const severityIcon = (event: Pick<DbCacheEvent, "severity" | "cold_start">) => {
-    if (event.cold_start) return "🔵";
-    switch (event.severity) {
-      case "stable":
-        return "🟢";
-      case "info":
-        return "🔵";
-      case "warning":
-        return "🟡";
-      case "warming":
-        return "⚪";
-      case "bust":
-        return "🔴";
-      case "full_bust":
-        return "⚫";
-      case "unknown":
-      case "aggregate":
-        return "⚪";
-      default:
-        return "⚪";
-    }
-  };
-
-  // Map a severity string to a bar/pill color class. Severity is the source of
-  // truth — list pills + bar-fills use the shared cacheEventColorClass.
-
-  // Bar-fill WIDTH for the turn/step list rows scales with retention (hit_ratio
-  // now carries the cross-step retention), clamped to [0,1].
-  const barFraction = (event: {
-    severity: string;
-    hit_ratio: number;
-    cold_start: boolean;
-  }): number => {
-    if (event.severity === "unknown" || event.severity === "info" || event.cold_start) return 1;
-    return Math.min(1, Math.max(0, event.hit_ratio));
-  };
-
-  // For the SESSION-aggregate strip only: stat.hit_ratio is an overall
+  // For the SESSION-aggregate figure only: stat.hit_ratio is an overall
   // read/total efficiency number (not a per-step health classification), so a
   // simple threshold color is appropriate there.
   const hitColor = (ratio: number) =>
     ratio >= 0.9 ? "var(--green)" : ratio >= 0.5 ? "var(--amber)" : "var(--red)";
 
+  // The figure on a card: health-coloured when it judges the cache, plain text
+  // when it is a real number without a verdict (a cold first run), and muted
+  // only for the placeholder dash.
+  const figureColor = (summary: CacheCardSummary) => {
+    if (summary.text === CACHE_FIGURE_PLACEHOLDER) return "var(--text-muted)";
+    return summary.tone === "neutral" ? "var(--text-primary)" : hitColor(summary.ratio);
+  };
+
+  const steps = () =>
+    totalTimelineSteps() > timelineEvents().length
+      ? `last ${timelineEvents().length} of ${totalTimelineSteps()} steps`
+      : `${timelineEvents().length} ${timelineEvents().length === 1 ? "step" : "steps"}`;
+
   return (
     <>
       <div class="section-header">
         <h1 class="section-title">Cache Diagnostics</h1>
-        <div class="section-actions" style={{ "align-items": "center" }}>
-          <FilterSelect
-            value={String(timelineLimit())}
-            onChange={(value) => {
-              setTimelineLimit(Number(value));
-              // Window size is the per-session event bound — reload every window
-              // fresh at the new size (no backward-fill).
-              void reloadAllWindows();
-            }}
-            placeholder="Recent"
-            options={[
-              { value: "200", label: "Recent: 200" },
-              { value: "400", label: "Recent: 400" },
-              { value: "600", label: "Recent: 600" },
-              { value: "800", label: "Recent: 800" },
-              { value: "1000", label: "Recent: 1000" },
-            ]}
-          />
-          <FilterSelect
-            value={harnessFilter()}
-            onChange={(value) => {
-              const harness = value as HarnessFilter;
-              setHarnessFilter(harness);
-              // Keep a session selected (no combined view): if the current
-              // selection no longer matches the harness filter, re-select the
-              // top card of the filtered set.
-              const sel = selectedSession();
-              if (sel && harness !== "all" && sel.harness !== harness) {
-                const top = filteredStats()[0];
-                selectSession(top ? { harness: top.harness, sessionId: top.session_id } : null);
-              }
-              void reconcile();
-            }}
-            placeholder="Harness"
-            options={cacheHarnessOptions}
-          />
-          {/* padding matches .fsel-trigger (6px 10px) so the buttons and the two
-              pickers render at identical heights in this toolbar. */}
-          <button
-            type="button"
-            class={`btn ${showUnmanagedSessions() ? "primary" : ""}`}
-            style={{ padding: "6px 10px" }}
-            onClick={() => setShowUnmanagedSessions(!showUnmanagedSessions())}
-          >
-            {showUnmanagedSessions() ? "Hide unmanaged" : "Show unmanaged"}
-          </button>
-          <button
-            type="button"
-            class={`btn ${!hideSubagents() ? "primary" : ""}`}
-            style={{ padding: "6px 10px" }}
-            onClick={() => {
-              setHideSubagents(!hideSubagents());
-              void reconcile();
-            }}
-          >
-            {hideSubagents() ? "Show subagents" : "Hide subagents"}
-          </button>
-          <button
-            type="button"
-            class={`btn ${paused() ? "primary" : ""}`}
-            style={{ padding: "6px 10px" }}
-            onClick={() => setPaused(!paused())}
-          >
-            {paused() ? "▶ Resume" : "⏸ Pause"}
-          </button>
-          <Show when={!paused()}>
-            <span
-              style={{
-                color: "var(--green)",
-                "font-size": "12px",
-                display: "inline-flex",
-                "align-items": "center",
-                "margin-left": "4px",
+        <div class="section-actions toolbar">
+          <div class="toolbar-group">
+            <FilterSelect
+              value={String(timelineLimit())}
+              onChange={(value) => {
+                setTimelineLimit(Number(value));
+                // Window size is the per-session event bound — reload every window
+                // fresh at the new size (no backward-fill).
+                void reloadAllWindows();
+              }}
+              placeholder="Recent"
+              options={[
+                { value: "200", label: "Recent: 200" },
+                { value: "400", label: "Recent: 400" },
+                { value: "600", label: "Recent: 600" },
+                { value: "800", label: "Recent: 800" },
+                { value: "1000", label: "Recent: 1000" },
+              ]}
+            />
+            <FilterSelect
+              value={harnessFilter()}
+              onChange={(value) => {
+                const harness = value as HarnessFilter;
+                setHarnessFilter(harness);
+                // Keep a session selected (no combined view): if the current
+                // selection no longer matches the harness filter, re-select the
+                // top card of the filtered set.
+                const sel = selectedSession();
+                if (sel && harness !== "all" && sel.harness !== harness) {
+                  const top = filteredStats()[0];
+                  selectSession(top ? { harness: top.harness, sessionId: top.session_id } : null);
+                }
+                void reconcile();
+              }}
+              placeholder="Harness"
+              options={cacheHarnessOptions}
+            />
+          </div>
+          <div class="toolbar-group">
+            <button
+              type="button"
+              class="toggle-chip"
+              aria-pressed={showUnmanagedSessions()}
+              onClick={() => setShowUnmanagedSessions(!showUnmanagedSessions())}
+            >
+              <Show when={showUnmanagedSessions()}>
+                <Icon name="check" size={13} />
+              </Show>
+              Show unmanaged
+            </button>
+            <button
+              type="button"
+              class="toggle-chip"
+              aria-pressed={!hideSubagents()}
+              onClick={() => {
+                setHideSubagents(!hideSubagents());
+                void reconcile();
               }}
             >
-              ● Live
+              <Show when={!hideSubagents()}>
+                <Icon name="check" size={13} />
+              </Show>
+              Show subagents
+            </button>
+          </div>
+          <div class="toolbar-group">
+            <span class={`live-status ${paused() ? "paused" : ""}`} aria-live="polite">
+              <span class="live-dot" />
+              {paused() ? "Paused" : "Live"}
             </span>
-          </Show>
+            <button type="button" class="btn toolbar-btn" onClick={() => setPaused(!paused())}>
+              <Icon name={paused() ? "play" : "pause"} size={13} />
+              {paused() ? "Resume" : "Pause"}
+            </button>
+          </div>
         </div>
       </div>
 
       {/* Session cards */}
-      <div style={{ padding: "0 20px 12px" }}>
+      <div class="cache-section">
         <Show when={activityNote()}>
-          {(note) => (
-            <div style={{ "font-size": "11px", color: "var(--amber)", "margin-bottom": "8px" }}>
-              {note()}
-            </div>
-          )}
+          {(note) => <div class="cache-activity-note">{note()}</div>}
         </Show>
         <Show when={filteredStats().length > 0}>
-          <div
-            style={{ "font-size": "11px", color: "var(--text-secondary)", "margin-bottom": "8px" }}
-          >
-            Recent Sessions
-          </div>
-          <div
-            ref={measureCardRow}
-            style={{ display: "flex", gap: `${CARD_GAP}px`, "flex-wrap": "nowrap" }}
-          >
+          <div class="section-eyebrow">Recent sessions</div>
+          <div ref={measureCardRow} class="cache-card-row" style={{ gap: `${CARD_GAP}px` }}>
             <For each={filteredStats()}>
               {(stat) => {
                 const isActive = () => {
@@ -892,20 +858,15 @@ export default function CacheDiagnostics() {
                     selected?.sessionId === stat.session_id && selected.harness === stat.harness
                   );
                 };
+                const label = sessionLabel(stat.harness, stat.session_id, stat.title);
+                // Every Broca session is managed, so only the exception is
+                // marked: an unmanaged card listed because the toggle is on.
+                const unmanaged = isManagedFilterableHarness(stat.harness) && !stat.managed;
                 return (
                   <button
                     type="button"
-                    class="card"
-                    style={{
-                      cursor: "pointer",
-                      // Equal width: every card flexes from a 0 basis so they
-                      // share the row evenly; min-width gates how many fit (the
-                      // count is computed from the row width, so they never wrap).
-                      flex: "1 1 0",
-                      "min-width": "0",
-                      "border-color": isActive() ? "var(--accent)" : undefined,
-                      "text-align": "left",
-                    }}
+                    class={`cache-card ${isActive() ? "active" : ""}`}
+                    aria-pressed={isActive()}
                     onClick={() => {
                       // Select-only: clicking a card focuses that session's
                       // window. Clicking the already-active card is a no-op
@@ -915,80 +876,44 @@ export default function CacheDiagnostics() {
                       }
                     }}
                   >
-                    <div
-                      title={cacheSessionTitle(stat)}
-                      style={{
-                        "font-size": "11px",
-                        color: "var(--text-muted)",
-                        "margin-bottom": "4px",
-                        overflow: "hidden",
-                        "text-overflow": "ellipsis",
-                        "white-space": "nowrap",
-                      }}
-                    >
-                      <span style={{ display: "inline-flex", "align-items": "center", gap: "6px" }}>
-                        <HarnessBadge harness={stat.harness} />
-                        <Show when={isManagedFilterableHarness(stat.harness) && stat.managed}>
-                          <span
-                            class="pill blue"
-                            style={{ "font-size": "9px", "line-height": "1.3" }}
-                          >
-                            Managed
-                          </span>
-                        </Show>
-                        <span>{cacheCardTitle(stat)}</span>
-                      </span>
-                    </div>
                     {/* Every line of a card is one fixed-height, non-wrapping
                         line, so cards in the row stay one height whatever
                         they show. */}
-                    <div
+                    <span class="cache-card-name" title={label.tooltip}>
+                      <Show when={label.name} fallback={<span class="id-text">{label.id}</span>}>
+                        {label.name}
+                      </Show>
+                    </span>
+                    <span class="cache-card-meta" title={label.tooltip}>
+                      <HarnessBadge harness={stat.harness} />
+                      <Show when={label.owner}>
+                        {(owner) => <span class="quiet-label">{owner()}</span>}
+                      </Show>
+                      <Show when={label.name && label.id}>
+                        <span class="id-text">{label.id}</span>
+                      </Show>
+                      <Show when={unmanaged}>
+                        <span class="quiet-label">unmanaged</span>
+                      </Show>
+                    </span>
+                    <span
+                      class="cache-card-figure"
                       title={stat.summary.title}
-                      style={{
-                        "font-size": "20px",
-                        "font-weight": "700",
-                        height: "28px",
-                        "line-height": "28px",
-                        overflow: "hidden",
-                        "text-overflow": "ellipsis",
-                        "white-space": "nowrap",
-                        color:
-                          stat.summary.tone === "neutral"
-                            ? "var(--text-muted)"
-                            : hitColor(stat.summary.ratio),
-                        "font-family": "var(--mono-font)",
-                      }}
+                      style={{ color: figureColor(stat.summary) }}
                     >
                       {stat.summary.text}
-                    </div>
-                    <div
-                      class="card-meta"
-                      title={stat.summary.title}
-                      style={{
-                        "margin-top": "4px",
-                        "flex-wrap": "nowrap",
-                        overflow: "hidden",
-                        "white-space": "nowrap",
-                      }}
-                    >
+                    </span>
+                    <span class="cache-card-foot" title={stat.summary.title}>
                       <span>{stat.countLabel}</span>
                       <Show when={stat.summary.note}>
-                        {(note) => (
-                          <span
-                            style={{
-                              color: "var(--text-muted)",
-                              overflow: "hidden",
-                              "text-overflow": "ellipsis",
-                            }}
-                          >
-                            {note()}
-                          </span>
-                        )}
+                        {(note) => <span class="cache-card-note">{note()}</span>}
                       </Show>
                       <Show when={stat.bust_count > 0}>
-                        <span style={{ color: "var(--red)" }}>{stat.bust_count} busts</span>
+                        <span class="cache-card-busts">
+                          {stat.bust_count} {stat.bust_count === 1 ? "bust" : "busts"}
+                        </span>
                       </Show>
-                    </div>
+                    </span>
                   </button>
                 );
               }}
@@ -998,35 +923,18 @@ export default function CacheDiagnostics() {
       </div>
 
       {/* Chart */}
-      <div style={{ padding: "0 20px 12px" }}>
-        <Show when={filteredEvents().length > 0}>
-          <div class="chart-container">
-            <div
-              style={{
-                "font-size": "11px",
-                color: "var(--text-secondary)",
-                "margin-bottom": "8px",
-                display: "flex",
-                "justify-content": "space-between",
-              }}
-            >
-              <span style={{ display: "inline-flex", "align-items": "center", gap: "6px" }}>
-                <Show when={selectedSession()}>
-                  {(selected) => <HarnessBadge harness={selected().harness} />}
-                </Show>
-                Cache Hit Timeline
-              </span>
-              <span>
-                {totalTimelineSteps() > timelineEvents().length
-                  ? `last ${timelineEvents().length} of ${totalTimelineSteps()} steps`
-                  : `${timelineEvents().length} steps`}
-              </span>
-            </div>
-            {/* The session line sits on its own row under the title rather than
-                beside it: long names (Broca's especially) then wrap across the
-                chart's full width instead of squeezing the step count. */}
+      <Show when={filteredEvents().length > 0}>
+        <div class="cache-section">
+          <div class="section-eyebrow">Cache hit timeline</div>
+          <div class="chart-container cache-chart">
             <Show when={selectedSession()}>
               {(selected) => {
+                const label = () =>
+                  sessionLabel(
+                    selected().harness,
+                    selected().sessionId,
+                    sessionNames()[windowKey(selected().harness, selected().sessionId)],
+                  );
                 const header = () =>
                   cacheSessionHeader(
                     selected().harness,
@@ -1034,44 +942,58 @@ export default function CacheDiagnostics() {
                     sessionNames()[windowKey(selected().harness, selected().sessionId)],
                   );
                 const models = () => sessionModelSummary(filteredEvents());
+                const fill = () => latestContextFill(filteredEvents());
                 return (
-                  <div
-                    style={{
-                      display: "flex",
-                      "flex-wrap": "wrap",
-                      "align-items": "baseline",
-                      gap: "4px 12px",
-                      "font-size": "12px",
-                      "margin-bottom": "8px",
-                    }}
-                  >
-                    <span
-                      class="mono"
-                      title={header().tooltip}
-                      style={{
-                        color: "var(--text-primary)",
-                        "font-weight": "600",
-                        "overflow-wrap": "anywhere",
-                        "min-width": "0",
-                      }}
-                    >
-                      {header().name}
-                    </span>
-                    <Show when={header().innerHarness}>
-                      {(inner) => (
-                        <span style={{ color: "var(--text-secondary)" }}>via {inner()}</span>
-                      )}
-                    </Show>
-                    <Show when={models()}>
-                      {(summary) => (
-                        <span
-                          class="mono"
-                          style={{ color: "var(--text-secondary)" }}
-                          title={summary().all.join("\n")}
+                  <div class="cache-chart-head">
+                    <div class="cache-chart-title" title={label().tooltip}>
+                      <HarnessBadge harness={selected().harness} />
+                      <span class="cache-chart-name">
+                        <Show
+                          when={label().name}
+                          fallback={<span class="id-text selectable">{label().id}</span>}
                         >
-                          {summary().provider ? `${summary().provider} · ` : ""}
-                          {sessionModelLabel(summary())}
-                        </span>
+                          {label().name}
+                        </Show>
+                      </span>
+                      <Show when={label().owner}>
+                        {(owner) => <span class="quiet-label">{owner()}</span>}
+                      </Show>
+                      <Show when={label().name && label().id}>
+                        <span class="id-text selectable">{label().id}</span>
+                      </Show>
+                    </div>
+                    <span class="cache-chart-steps">{steps()}</span>
+                    <div class="cache-chart-sub">
+                      <Show when={header().innerHarness}>
+                        {(inner) => <span>via {inner()}</span>}
+                      </Show>
+                      <Show when={models()}>
+                        {(summary) => (
+                          <span title={summary().all.join("\n")}>
+                            {summary().provider ? `${summary().provider} · ` : ""}
+                            {sessionModelLabel(summary())}
+                          </span>
+                        )}
+                      </Show>
+                    </div>
+                    <Show when={fill()}>
+                      {(f) => (
+                        <div
+                          class="context-fill"
+                          title={`Newest step: ${f().prompt.toLocaleString()} of ${f().limit.toLocaleString()} context-window tokens`}
+                        >
+                          <span class="context-fill-label">Context</span>
+                          <span class="context-fill-meter" aria-hidden="true">
+                            <span
+                              class={`context-fill-value ${f().ratio > 1 ? "over" : ""}`}
+                              style={{ width: `${Math.min(100, f().ratio * 100)}%` }}
+                            />
+                          </span>
+                          <span class="num">
+                            {formatTokensShort(f().prompt)} of {formatTokensShort(f().limit)}
+                          </span>
+                          <span class="num context-fill-pct">{Math.round(f().ratio * 100)}%</span>
+                        </div>
                       )}
                     </Show>
                   </div>
@@ -1084,17 +1006,19 @@ export default function CacheDiagnostics() {
               onBarClick={focusStepInList}
             />
           </div>
-        </Show>
-      </div>
+        </div>
+      </Show>
 
-      {/* Event log */}
+      {/* Turn list */}
       <div class="scroll-area">
         <Show when={!loading()} fallback={<div class="empty-state">Loading cache events...</div>}>
           <Show
             when={cacheTurns().length > 0}
             fallback={
               <div class="empty-state">
-                <span class="empty-state-icon">📊</span>
+                <span class="empty-state-icon">
+                  <Icon name="gauge" size={28} />
+                </span>
                 <span>No cache events found</span>
                 <span style={{ "font-size": "11px" }}>
                   Cache data is read from OpenCode, Pi, Claude Code, and Codex sessions
@@ -1102,13 +1026,23 @@ export default function CacheDiagnostics() {
               </div>
             }
           >
-            <div class="list-gap">
+            <div class="section-eyebrow">Turns</div>
+            <div class="cache-turns">
+              <div class="cache-turn-grid cache-turns-head">
+                <span>Time</span>
+                <span>Status</span>
+                <span class="num">Cache hit</span>
+                <span class="num">Prompt</span>
+                <span class="num">Cached</span>
+                <span class="num">New</span>
+                <span>Steps</span>
+              </div>
               <For each={[...cacheTurns()].reverse()}>
                 {(turn) => {
                   // Parent stats reflect the turn's FINAL step (the prompt that
                   // actually shipped), not an aggregate across steps. Aggregation
                   // double-counts a bust child and produces nonsense like
-                  // prompt=823k for a 540k actual turn (see fix in chart-bar above).
+                  // prompt=823k for a 540k actual turn.
                   const last = turn.events[turn.events.length - 1];
                   const worstCause = turn.worstEvent.cause;
                   const isExpanded = () => expandedTurns().has(turn.turnId);
@@ -1125,6 +1059,10 @@ export default function CacheDiagnostics() {
                     ? {
                         role: "button" as const,
                         tabindex: 0,
+                        // A getter keeps the attribute reactive through the spread.
+                        get "aria-expanded"() {
+                          return isExpanded();
+                        },
                         onClick: () => toggleTurn(turn.turnId),
                         onKeyDown: (e: KeyboardEvent) => {
                           if (e.key === "Enter" || e.key === " ") {
@@ -1137,103 +1075,46 @@ export default function CacheDiagnostics() {
                   return (
                     <div
                       id={`cache-turn-${turn.turnId}`}
-                      class="card cache-turn-row"
-                      {...interactiveProps}
-                      style={{ cursor: isMultiStep ? "pointer" : "default" }}
+                      class={`cache-turn tone-${cacheEventColorClass(turn.worstEvent)}`}
                     >
                       <div
-                        style={{
-                          display: "flex",
-                          "align-items": "center",
-                          gap: "8px",
-                          "margin-bottom": "4px",
-                          "min-width": "0",
-                        }}
+                        class={`cache-turn-grid cache-turn-main ${isMultiStep ? "expandable" : ""}`}
+                        {...interactiveProps}
                       >
-                        <span style={{ "flex-shrink": "0" }}>{severityIcon(turn.worstEvent)}</span>
-                        <span style={{ "flex-shrink": "0", display: "inline-flex" }}>
-                          <HarnessBadge harness={turn.harness} />
+                        <span class="num cache-cell-time">{formatDateTime(turn.startTime)}</span>
+                        <span class="cache-cell-status">
+                          <CacheStatus event={turn.worstEvent} />
                         </span>
-                        <span
-                          class="mono"
-                          style={{
-                            "font-size": "11px",
-                            color: "var(--text-secondary)",
-                            "flex-shrink": "0",
-                          }}
-                        >
-                          {formatDateTime(turn.startTime)}
-                        </span>
-                        <span
-                          class={`pill ${cacheEventColorClass(turn.worstEvent)}`}
-                          style={{ "flex-shrink": "0" }}
-                        >
-                          {cacheEventLabel(turn.worstEvent)}
-                        </span>
-                        <Show when={isMultiStep}>
-                          <span class="pill gray" style={{ "flex-shrink": "0" }}>
-                            {isExpanded() ? "▾" : "▸"} {turn.events.length} steps
-                          </span>
-                        </Show>
-                        <span
-                          class="mono"
-                          style={{
-                            "font-size": "10px",
-                            color: "var(--text-muted)",
-                            "min-width": "0",
-                            overflow: "hidden",
-                            "text-overflow": "ellipsis",
-                            "white-space": "nowrap",
-                            flex: "1 1 auto",
-                          }}
-                          title={resolveTitle(turn.harness, turn.sessionId)}
-                        >
-                          {resolveTitle(turn.harness, turn.sessionId)}
-                        </span>
-                      </div>
-                      <div class="card-meta" style={{ gap: "12px" }}>
                         <Show
                           when={turn.worstSeverity !== "unknown" && !unreportedTurn}
                           fallback={
-                            <span
-                              class={unreportedTurn ? undefined : "mono"}
-                              style={{ color: "var(--text-muted)" }}
-                            >
-                              {unreportedTurn ? CACHE_NOT_REPORTED : "no cache data"}
+                            <span class="num cache-cell-muted">
+                              {unreportedTurn ? "not reported" : "no data"}
                             </span>
                           }
                         >
-                          <span
-                            class="mono"
-                            style={{
-                              color: `var(--${cacheEventColorClass(turn.worstEvent)})`,
-                              "font-weight": "600",
-                            }}
-                            title={cacheRatioTitle(last)}
-                          >
+                          <span class="num cache-cell-hit" title={cacheRatioTitle(last)}>
                             {(turnRetention * 100).toFixed(1)}%
                           </span>
                         </Show>
-                        <span class="mono">prompt={totalPrompt.toLocaleString()}</span>
-                        <span class="mono">cached={cacheReadLabel(last)}</span>
-                        <span class="mono">new={cacheWriteLabel(turn.events)}</span>
-                        <div class="cache-bar">
-                          <div
-                            class={`cache-bar-fill ${cacheEventColorClass(turn.worstEvent)}`}
-                            style={{
-                              width: `${barFraction({ severity: turn.worstSeverity, hit_ratio: turnRetention, cold_start: turn.worstEvent.cold_start }) * 100}%`,
-                            }}
-                          />
-                        </div>
+                        <span class="num">{totalPrompt.toLocaleString()}</span>
+                        <TokenCell text={cacheReadLabel(last)} />
+                        <TokenCell text={cacheWriteLabel(turn.events)} />
+                        <span class="cache-cell-steps">
+                          <Show when={isMultiStep}>
+                            <Icon
+                              name={isExpanded() ? "chevron-down" : "chevron-right"}
+                              size={13}
+                            />
+                            {turn.events.length} steps
+                          </Show>
+                        </span>
                       </div>
                       <Show when={worstCause}>
                         {(cause) => (
                           <div
-                            style={{
-                              "margin-top": "6px",
-                              "font-size": "11px",
-                              color: `var(--${cacheCauseColor(cause())})`,
-                            }}
+                            class="cache-turn-cause"
+                            style={{ color: `var(--${cacheCauseColor(cause())})` }}
                             title={cacheCauseTooltip(cause())}
                           >
                             Cause: {cacheCauseLabel(cause())}
@@ -1241,7 +1122,7 @@ export default function CacheDiagnostics() {
                         )}
                       </Show>
                       <Show when={isExpanded()}>
-                        <div class="cache-turn-expanded">
+                        <div class="cache-steps">
                           {/* Newest-step first inside the drill-down so the user
                               reads top-to-bottom matching the outer recent-turn
                               ordering (which is also newest-first). */}
@@ -1252,72 +1133,40 @@ export default function CacheDiagnostics() {
                               return (
                                 <div
                                   id={`cache-step-${event.message_id}`}
-                                  class={`cache-step-row ${selectedStepId() === event.message_id ? "selected" : ""}`}
+                                  class={`cache-step-row tone-${cacheEventColorClass(event)} ${selectedStepId() === event.message_id ? "selected" : ""}`}
                                 >
-                                  <div class="cache-step-header">
-                                    <span style={{ "flex-shrink": "0" }}>
-                                      {severityIcon(event)}
-                                    </span>
-                                    <span
-                                      class="mono"
-                                      style={{
-                                        "font-size": "11px",
-                                        color: "var(--text-secondary)",
-                                        "flex-shrink": "0",
-                                      }}
-                                    >
+                                  <div class="cache-turn-grid">
+                                    <span class="num cache-cell-time">
                                       {formatDateTime(event.timestamp)}
                                     </span>
-                                    <span
-                                      class={`pill ${cacheEventColorClass(event)}`}
-                                      style={{ "flex-shrink": "0" }}
-                                    >
-                                      {cacheEventLabel(event)}
+                                    <span class="cache-cell-status">
+                                      <CacheStatus event={event} />
                                     </span>
-                                  </div>
-                                  <div class="cache-step-meta">
                                     <Show
                                       when={event.severity !== "unknown" && event.cache_reported}
                                       fallback={
-                                        <span
-                                          class={event.cache_reported ? "mono" : undefined}
-                                          style={{ color: "var(--text-muted)" }}
-                                        >
-                                          {cacheEventPercentage(event)}
+                                        <span class="num cache-cell-muted">
+                                          {event.cache_reported ? "no data" : "not reported"}
                                         </span>
                                       }
                                     >
                                       <span
-                                        class="mono"
-                                        style={{
-                                          color: `var(--${cacheEventColorClass(event)})`,
-                                          "font-weight": "600",
-                                        }}
+                                        class="num cache-cell-hit"
                                         title={cacheRatioTitle(event)}
                                       >
                                         {cacheEventPercentage(event)}
                                       </span>
                                     </Show>
-                                    <span class="mono">
-                                      prompt={evTotalPrompt.toLocaleString()}
-                                    </span>
-                                    <span class="mono">cached={cacheReadLabel(event)}</span>
-                                    <span class="mono">new={cacheWriteLabel([event])}</span>
-                                    <div class="cache-bar">
-                                      <div
-                                        class={`cache-bar-fill ${cacheEventColorClass(event)}`}
-                                        style={{ width: `${barFraction(event) * 100}%` }}
-                                      />
-                                    </div>
+                                    <span class="num">{evTotalPrompt.toLocaleString()}</span>
+                                    <TokenCell text={cacheReadLabel(event)} />
+                                    <TokenCell text={cacheWriteLabel([event])} />
+                                    <span />
                                   </div>
                                   <Show when={event.cause}>
                                     {(cause) => (
                                       <div
-                                        style={{
-                                          "margin-top": "4px",
-                                          "font-size": "11px",
-                                          color: `var(--${cacheCauseColor(cause())})`,
-                                        }}
+                                        class="cache-turn-cause"
+                                        style={{ color: `var(--${cacheCauseColor(cause())})` }}
                                         title={cacheCauseTooltip(cause())}
                                       >
                                         Cause: {cacheCauseLabel(cause())}
@@ -1340,4 +1189,27 @@ export default function CacheDiagnostics() {
       </div>
     </>
   );
+}
+
+/**
+ * A turn or step's status, said once. Problems (warnings and busts) are a
+ * coloured pill so they stand out down the list; everything else (stable, cold
+ * start, run totals) is quiet text.
+ */
+function CacheStatus(props: { event: DbCacheEvent }) {
+  const color = () => cacheEventColorClass(props.event);
+  const text = () => sentenceCaseLabel(cacheEventLabel(props.event));
+  return (
+    <Show
+      when={color() === "red" || color() === "amber"}
+      fallback={<span class="cache-status-text">{text()}</span>}
+    >
+      <span class={`pill ${color()}`}>{text()}</span>
+    </Show>
+  );
+}
+
+/** A token count cell; "not reported" (and partial counts' note) reads quieter. */
+function TokenCell(props: { text: string }) {
+  return <span class={`num ${/\d/.test(props.text) ? "" : "cache-cell-muted"}`}>{props.text}</span>;
 }

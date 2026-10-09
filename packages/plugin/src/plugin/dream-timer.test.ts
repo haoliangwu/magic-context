@@ -69,6 +69,8 @@ describe("dream-timer registration cleanup", () => {
         _resetDreamTimerForTests();
     });
     test("does not overlap maintenance ticks and releases the guard after completion", async () => {
+        // Host boot completes the async storage open before registering timers.
+        expect(openDatabase()).toBeTruthy();
         const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-timer-overlap-"));
         let interval: (() => void) | undefined;
         const setIntervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((
@@ -122,6 +124,8 @@ describe("dream-timer registration cleanup", () => {
     });
 
     test("stale same-directory cleanup preserves the replacement registration", async () => {
+        // Registration may reuse current storage, but must not migrate a cold store.
+        expect(openDatabase()).toBeTruthy();
         const directory = createTestTempDirFromPath(join(tmpdir(), "mc-dream-timer-cleanup-"));
         const timerHandle = {
             unref: mock(() => {}),

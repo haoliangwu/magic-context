@@ -17,6 +17,7 @@ import {
     compareOpenCodeMessagesByCanonicalOrder,
     findBoundaryUserMessage,
     getOpenCodeMessageById,
+    isOpenCodeGapHistorianAbsent,
     listSessionCompactionMarkers,
     removeCompactionMarker,
     removeForeignCompactionMarker,
@@ -24,7 +25,7 @@ import {
 } from "../../features/magic-context/compaction-marker";
 import {
     getCompartmentsByEndMessageId,
-    hasPartialCompartmentEndThrough,
+    getUncoveredCompartmentEndsThrough,
 } from "../../features/magic-context/compartment-storage";
 import {
     getPersistedCompactionMarkerState,
@@ -91,7 +92,24 @@ export type MarkerUpdateOutcome =
           kind: "stale-skip";
           reason: "compartment-removed" | "target-superseded" | "partial-message-boundary";
       }
-    | { kind: "retryable-failure"; error: Error };
+    | {
+          kind: "retryable-failure";
+          error: Error;
+          /**
+           * Omitted means the host marker's commit status is unknown. Only a confirmed
+           * unchanged marker keeps the previous last-known-good request (LKG)
+           * eligible for replay.
+           */
+          cut?: "definitely-no-cut" | "uncertain";
+      };
+
+export function markerUpdateDefinitelyDidNotCut(outcome: MarkerUpdateOutcome): boolean {
+    return (
+        outcome.kind === "already-current" ||
+        outcome.kind === "stale-skip" ||
+        (outcome.kind === "retryable-failure" && outcome.cut === "definitely-no-cut")
+    );
+}
 
 /**
  * Validate that a deferred pending-marker target is still the right thing to
@@ -120,7 +138,7 @@ function validatePendingTarget(
     db: Database,
     sessionId: string,
     pending: PendingCompactionMarker,
-): "ok" | "compartment-removed" | "target-superseded" | "partial-message-boundary" {
+): "ok" | "compartment-removed" | "target-superseded" {
     // 1. PRIMARY: raw OpenCode message must still exist. May throw on DB
     //    failure; caller catches and returns retryable-failure.
     const ocMessage = getOpenCodeMessageById(sessionId, pending.endMessageId);
@@ -143,7 +161,6 @@ function validatePendingTarget(
         return "compartment-removed";
     }
     const compartment = compartments[0];
-    if (compartment.endBlockIndex != null) return "partial-message-boundary";
     if (compartment.endMessage !== pending.ordinal) {
         // Same end-message id but different ordinal — a later publish already
         // moved the marker past us. Skip this stale pending and let the newer
@@ -218,6 +235,56 @@ function existingMarkerAlreadyCoversTarget(
     return true;
 }
 
+function boundaryWouldDiscardUncoveredMessage(
+    db: Database,
+    sessionId: string,
+    ordinal: number,
+    boundaryMessageId: string,
+): boolean {
+    const current = getPersistedCompactionMarkerState(db, sessionId);
+    const partials = getUncoveredCompartmentEndsThrough(db, sessionId, ordinal);
+    // OpenCode keeps the boundary user message and everything after it. A partly
+    // summarized message at or after that user stays visible, so it need not
+    // prevent this marker move. Unknown message order is not proof of safety.
+    for (const partial of partials) {
+        // boundaryOrdinal is the summary target, not where OpenCode starts its input.
+        // For an assistant target, OpenCode also retains the preceding user and rest
+        // of that turn. Ignore an old summary end only if timestamp/ID order proves
+        // it is strictly before the old retained user; equal or unknown order stays checked.
+        if (
+            current &&
+            compareOpenCodeMessagesByCanonicalOrder(
+                sessionId,
+                partial.endMessageId,
+                current.boundaryMessageId,
+            ) === -1
+        )
+            continue;
+        const ordering = compareOpenCodeMessagesByCanonicalOrder(
+            sessionId,
+            boundaryMessageId,
+            partial.endMessageId,
+        );
+        if (ordering !== null && ordering <= 0) continue;
+        // The next summary can start beyond end+1 because the historian skips
+        // synthetic messages. Require both recorded message IDs to exist, and
+        // check that every intervening message would be skipped by the historian.
+        if (
+            partial.successorStartMessageId &&
+            partial.successorStartMessage !== null &&
+            partial.successorStartMessage > partial.endMessage + 1 &&
+            isOpenCodeGapHistorianAbsent(
+                sessionId,
+                partial.endMessageId,
+                partial.successorStartMessageId,
+            )
+        )
+            continue;
+        return true;
+    }
+    return false;
+}
+
 /**
  * Apply a deferred compaction-marker mutation owned by a specific pending
  * blob. Called from the transform postprocess drain — see
@@ -248,6 +315,16 @@ export function applyDeferredCompactionMarker(
     directory?: string,
     trustedBoundary?: TrustedMaterializedCompactionBoundary,
 ): MarkerUpdateOutcome {
+    let cut: "definitely-no-cut" | "uncertain" = "definitely-no-cut";
+    // Step timings for the applied-drain log line. The drain reads both stores
+    // and writes OpenCode's under its lock; one slow step must be attributable.
+    let stepStartedAt = performance.now();
+    const stepMs: string[] = [];
+    const endStep = (name: string): void => {
+        const now = performance.now();
+        stepMs.push(`${name}Ms=${(now - stepStartedAt).toFixed(1)}`);
+        stepStartedAt = now;
+    };
     try {
         // Rust may fence the target with the exact durable boundary returned by the
         // materializing response. Other callers validate against local compartment rows.
@@ -258,13 +335,10 @@ export function applyDeferredCompactionMarker(
             trustedBoundary.rowVersion > 0 &&
             trustedBoundary.ordinal === pending.ordinal &&
             trustedBoundary.endMessageId === pending.endMessageId;
-        // Host compaction markers discard whole messages. An indexed end may leave
-        // later blocks unsummarized, so such a marker would lose those blocks.
-        const validation = hasPartialCompartmentEndThrough(db, sessionId, pending.ordinal)
-            ? "partial-message-boundary"
-            : responseFencesTarget
-              ? "ok"
-              : validatePendingTarget(db, sessionId, pending);
+        const validation = responseFencesTarget
+            ? "ok"
+            : validatePendingTarget(db, sessionId, pending);
+        endStep("validate");
         if (validation !== "ok") {
             sessionLog(
                 sessionId,
@@ -292,19 +366,36 @@ export function applyDeferredCompactionMarker(
         // under us), leave the old marker intact so OpenCode keeps its current
         // cache boundary instead of seeing a needless no-marker/full-history pass.
         const boundary = findBoundaryUserMessage(sessionId, pending.endMessageId);
+        // Covers the existing-marker coverage check above and this lookup.
+        endStep("boundary");
         if (!boundary) {
             return {
                 kind: "retryable-failure",
+                cut: "definitely-no-cut",
                 error: new Error(
                     `no user boundary found at or before endMessageId ${pending.endMessageId} (ordinal ${pending.ordinal}); preserving existing marker`,
                 ),
             };
         }
 
+        // Keep the user at or before a partly summarized message so its entire tool
+        // turn remains visible. Reject a later user boundary if it would discard parts
+        // not covered by a following summary. Rust records the final block of fully
+        // summarized messages too; a block index alone does not prove missing coverage.
+        if (boundaryWouldDiscardUncoveredMessage(db, sessionId, pending.ordinal, boundary.id)) {
+            sessionLog(
+                sessionId,
+                `compaction-marker drain: stale-skip (partial-message-boundary) for ordinal ${pending.ordinal} endMessageId=${pending.endMessageId}`,
+            );
+            return { kind: "stale-skip", reason: "partial-message-boundary" };
+        }
+        endStep("discardCheck");
+
         // Replace both host-store row sets under one BEGIN IMMEDIATE. A busy
         // store fails before deletion; any later failure rolls the deletion back.
         const removedSummaryMessageId = existing?.summaryMessageId ?? null;
-        const result = replaceCompactionMarker(existing, {
+        cut = "uncertain";
+        const replacement = replaceCompactionMarker(existing, {
             sessionId,
             endOrdinal: pending.ordinal,
             endMessageId: pending.endMessageId,
@@ -312,14 +403,15 @@ export function applyDeferredCompactionMarker(
             directory: directory ?? process.cwd(),
             resolvedBoundary: boundary,
         });
-        if (!result) {
+        endStep("replace");
+        if (replacement.kind !== "committed") {
             return {
                 kind: "retryable-failure",
-                error: new Error(
-                    `atomic marker replacement failed for ordinal ${pending.ordinal}; will retry`,
-                ),
+                cut: replacement.kind,
+                error: replacement.error,
             };
         }
+        const result = replacement.marker;
 
         persistMarkerStateAndDropReplacedTag(
             db,
@@ -331,9 +423,10 @@ export function applyDeferredCompactionMarker(
             },
             removedSummaryMessageId,
         );
+        endStep("persist");
         sessionLog(
             sessionId,
-            `compaction-marker drain: applied at ordinal ${pending.ordinal}, boundary user msg ${result.boundaryMessageId}`,
+            `compaction-marker drain: applied at ordinal ${pending.ordinal}, boundary user msg ${result.boundaryMessageId} ${stepMs.join(" ")}`,
         );
         return {
             kind: "applied",
@@ -354,7 +447,7 @@ export function applyDeferredCompactionMarker(
             `compaction-marker drain: retryable failure for ordinal ${pending.ordinal}:`,
             error,
         );
-        return { kind: "retryable-failure", error };
+        return { kind: "retryable-failure", error, cut };
     }
 }
 
@@ -396,9 +489,6 @@ export function updateCompactionMarkerAfterPublication(
         return false;
     }
 
-    if (hasPartialCompartmentEndThrough(db, sessionId, lastCompartmentEnd)) {
-        return false;
-    }
     const existing = getPersistedCompactionMarkerState(db, sessionId);
     const removedSummaryMessageId = existing?.summaryMessageId ?? null;
 
@@ -429,7 +519,11 @@ export function updateCompactionMarkerAfterPublication(
         return false;
     }
 
-    const result = replaceCompactionMarker(existing, {
+    if (boundaryWouldDiscardUncoveredMessage(db, sessionId, lastCompartmentEnd, boundary.id)) {
+        return false;
+    }
+
+    const replacement = replaceCompactionMarker(existing, {
         sessionId,
         endOrdinal: lastCompartmentEnd,
         endMessageId: targetEndMessageId,
@@ -438,7 +532,8 @@ export function updateCompactionMarkerAfterPublication(
         resolvedBoundary: boundary,
     });
 
-    if (result) {
+    if (replacement.kind === "committed") {
+        const result = replacement.marker;
         persistMarkerStateAndDropReplacedTag(
             db,
             sessionId,

@@ -70,6 +70,10 @@ export interface RegisterToolsOptions {
 	/** Number of recent tags that ctx_reduce should treat as protected
 	 *  (deferred drops instead of immediate). Should match `magic_context.protected_tags`. */
 	protectedTags?: number;
+	protectedTools?: Readonly<Record<string, number>>;
+	resolveProtectedTools?: (ctx: {
+		cwd: string;
+	}) => Readonly<Record<string, number>> | undefined;
 	/** Resolve protected-tag config from the current cwd at tool-call time. */
 	resolveProtectedTags?: (ctx: { cwd: string }) => number | undefined;
 	/** When true, ctx_note accepts smart notes (surface_condition) because
@@ -209,6 +213,8 @@ export function registerMagicContextTools(
 				createCtxReduceTool({
 					db: opts.db,
 					protectedTags: opts.protectedTags ?? 20,
+					protectedTools: opts.protectedTools,
+					resolveProtectedTools: opts.resolveProtectedTools,
 					resolveProtectedTags: opts.resolveProtectedTags,
 				}),
 			),

@@ -7,6 +7,10 @@
     "core:default",
     "updater:default",
     "dialog:default",
-    "process:default"
+    "process:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://docs.cortexkit.io/magic-context/*" }]
+    }
   ]
 }

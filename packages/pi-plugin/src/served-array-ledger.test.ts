@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
-import { readFileSync, rmSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTestTempDirFromPath } from "../../plugin/src/shared/test-temp-dir";
@@ -40,6 +40,30 @@ function message(index: number): Record<string, unknown> {
 }
 
 describe("Pi served-array digest ledger", () => {
+	test("creates every ledger artifact without group or world access", () => {
+		if (process.platform === "win32") return;
+		const storageDir = join(
+			tmpdir(),
+			"magic-context",
+			`pi-owner-only-${process.pid}-${randomUUID()}`,
+		);
+		temporaryDirectories.push(storageDir);
+		capturePiServedArray("private", [message(0)], {
+			storageDir,
+			fullBodyCapture: true,
+		});
+		flushPiServedArrayLedger();
+
+		const inspect = (path: string): void => {
+			const stat = statSync(path);
+			const mode = stat.mode & 0o777;
+			expect(mode & 0o077, `${path} mode ${mode.toString(8)}`).toBe(0);
+			if (!stat.isDirectory()) return;
+			for (const entry of readdirSync(path)) inspect(join(path, entry));
+		};
+		inspect(storageDir);
+	});
+
 	test("reuses the same-pass LKG bytes without walking messages again", () => {
 		const storageDir = temporaryDirectory();
 		const messages = Array.from({ length: 45 }, (_, index) => message(index));

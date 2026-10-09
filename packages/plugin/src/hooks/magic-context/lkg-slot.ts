@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { BoundedSessionMap } from "../../shared/bounded-session-map";
 import { sessionLog } from "../../shared/logger";
+import { clearCapturedLkgMeasurement } from "./lkg-measured-request";
 import type { MessageLike } from "./transform-operations";
 
 export interface LkgSlot {
@@ -575,12 +576,18 @@ export function getSlot(sessionId: string): LkgSlot | undefined {
     return copySlotForRead(entry.slot);
 }
 
-export function dropSlot(sessionId: string, _reason?: string): void {
+/** Evict only the process copy; durable replay authority is unchanged. */
+export function forgetInMemorySlot(sessionId: string): void {
     const entry = lkgHeapHolder.entries.get(sessionId);
     if (entry) {
         lkgHeapHolder.entries.delete(sessionId);
         totalBytes -= entry.bytes;
     }
+}
+
+export function dropSlot(sessionId: string, _reason?: string): void {
+    clearCapturedLkgMeasurement(sessionId);
+    forgetInMemorySlot(sessionId);
     // The durable row must follow the drop: a slot invalidated in memory
     // (model change, reshape, recovery arm, deletion) is equally invalid after
     // a restart. Clear best-effort; a missed clear still meets the replay fences.

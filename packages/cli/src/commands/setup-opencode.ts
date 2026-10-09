@@ -349,7 +349,7 @@ export function writeMagicContextConfig(
     configPath: string,
     options: MagicContextSetupChoices,
 ): void {
-    writeFileAtomic(configPath, planMagicContextConfig(configPath, options));
+    writeFileAtomic(configPath, planMagicContextConfig(configPath, options), { ownerOnly: true });
 }
 
 /**
@@ -379,7 +379,7 @@ export function applyOpenCodeSetupConfigs(
     const tuiText = choices.hostGeneration === "v1" ? planTuiConfigUpdate(paths.tuiConfig) : null;
 
     if (opencodeText !== null) writeFileAtomic(paths.opencodeConfig, opencodeText);
-    writeFileAtomic(paths.magicContextConfig, magicContextText);
+    writeFileAtomic(paths.magicContextConfig, magicContextText, { ownerOnly: true });
     if (tuiText !== null) writeFileAtomic(paths.tuiConfig, tuiText);
 }
 // ─── Main Setup Flow ──────────────────────────────────────

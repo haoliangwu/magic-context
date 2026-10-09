@@ -3,10 +3,101 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTestTempDirFromPath } from "../../shared/test-temp-dir";
-import { appendCompartments, getCompartmentsByEndMessageId } from "./compartment-storage";
+import {
+    appendCompartments,
+    getCompartmentsByEndMessageId,
+    getUncoveredCompartmentEndThrough,
+} from "./compartment-storage";
 import { closeDatabase, openDatabase } from "./storage";
 
 const tempDirs: string[] = [];
+
+describe("getUncoveredCompartmentEndThrough", () => {
+    test("releases same-message continuation at a later last-block anchor, but not an unknown or earlier anchor", () => {
+        useTempDataHome("indexed-continuation-");
+        const db = openDatabase();
+        appendCompartments(db, "ses", [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                endBlockIndex: 1,
+                title: "partial",
+                content: "partial",
+            },
+            {
+                sequence: 1,
+                startMessage: 2,
+                endMessage: 4,
+                startMessageId: "m2",
+                endMessageId: "m4",
+                startBlockIndex: 5,
+                endBlockIndex: 2,
+                title: "continues",
+                content: "continues",
+            },
+        ]);
+        expect(getUncoveredCompartmentEndThrough(db, "ses", 2)).toBeNull();
+        expect(getUncoveredCompartmentEndThrough(db, "ses")).toEqual({
+            endMessageId: "m4",
+            endMessage: 4,
+        });
+        expect(getUncoveredCompartmentEndThrough(db, "other")).toBeNull();
+        for (const anchor of [null, 0, 1]) {
+            db.prepare(
+                "UPDATE compartments SET start_block_index=? WHERE session_id='ses' AND sequence=1",
+            ).run(anchor);
+            expect(getUncoveredCompartmentEndThrough(db, "ses", 2)).toEqual({
+                endMessageId: "m2",
+                endMessage: 2,
+            });
+        }
+    });
+
+    test("next ordinal releases an indexed end even at a nonzero start anchor, but gaps do not", () => {
+        useTempDataHome("indexed-next-ordinal-");
+        const db = openDatabase();
+        appendCompartments(db, "ses", [
+            {
+                sequence: 0,
+                startMessage: 1,
+                endMessage: 2,
+                startMessageId: "m1",
+                endMessageId: "m2",
+                endBlockIndex: 1,
+                title: "indexed",
+                content: "indexed",
+            },
+            {
+                sequence: 1,
+                startMessage: 3,
+                endMessage: 4,
+                startMessageId: "m3",
+                endMessageId: "m4",
+                startBlockIndex: 7,
+                title: "next",
+                content: "next",
+            },
+        ]);
+        expect(getUncoveredCompartmentEndThrough(db, "ses")).toBeNull();
+        db.prepare(
+            "UPDATE compartments SET start_message=4 WHERE session_id='ses' AND sequence=1",
+        ).run();
+        expect(getUncoveredCompartmentEndThrough(db, "ses")).toEqual({
+            endMessageId: "m2",
+            endMessage: 2,
+        });
+        db.prepare(
+            "UPDATE compartments SET start_message=3, sequence=2 WHERE session_id='ses' AND sequence=1",
+        ).run();
+        expect(getUncoveredCompartmentEndThrough(db, "ses")).toEqual({
+            endMessageId: "m2",
+            endMessage: 2,
+        });
+    });
+});
 
 function useTempDataHome(prefix: string): string {
     const dir = createTestTempDirFromPath(join(tmpdir(), prefix));

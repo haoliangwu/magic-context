@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+    chmodSync,
     closeSync,
     mkdirSync,
     openSync,
@@ -30,6 +31,7 @@ import { createTestTempDirFromPath } from "../../../plugin/src/shared/test-temp-
 
 import type { PromptIO, PromptSpinner, SelectOption } from "../lib/prompts";
 import {
+    copyDatabaseBundle,
     defaultSqliteExecutable,
     migrateAndCheckRecoveredDatabase,
     REPAIR_DB_EXIT,
@@ -286,6 +288,21 @@ afterEach(() => {
 });
 
 describe("doctor repair-db", () => {
+    it("creates private database backup files", () => {
+        if (process.platform === "win32") return;
+        const root = createTestTempDirFromPath(
+            join(tmpdir(), "magic-context/doctor-backup-permissions-"),
+        );
+        tempDirs.push(root);
+        const source = join(root, "context.db");
+        const destination = join(root, "backups", "context.db");
+        writeFileSync(source, "backup fixture");
+        chmodSync(source, 0o644);
+
+        expect(copyDatabaseBundle(source, destination)).toEqual([destination]);
+        expect(statSync(destination).mode & 0o777).toBe(0o600);
+    });
+
     if (!salvageCapability.available) {
         // The salvage test below is registered as skipped; this test states why
         // and proves the skip came from a deliberate probe verdict rather than a

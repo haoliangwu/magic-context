@@ -1,15 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-    cpSync,
-    existsSync,
-    mkdirSync,
-    mkdtempSync,
-    readdirSync,
-    readFileSync,
-    renameSync,
-    writeFileSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
     projectDirectoryKey,
@@ -25,6 +16,10 @@ import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path"
 import { resolveOpenCodeDbPath } from "@magic-context/core/shared/opencode-db-path";
 import type { Database } from "@magic-context/core/shared/sqlite";
 import { configureContextDatabasePragmas } from "@magic-context/core/shared/sqlite-context-pragmas";
+import {
+    ensureStorageDirectorySync,
+    writeStorageFileAtomicSync,
+} from "@magic-context/core/shared/storage-permissions";
 import {
     CLI_SCHEMA_FLOOR_VERSION,
     openExistingContextDatabase,
@@ -388,8 +383,16 @@ export function runMergeIdentityCli(args: string[], deps: Partial<MergeIdentityD
     );
     const sidecarRoot = join(storageDir, "project-identities");
     const sidecarBackup = join(backup, "project-identities");
-    mkdirSync(sidecarBackup);
-    if (existsSync(sidecarRoot)) cpSync(sidecarRoot, sidecarBackup, { recursive: true });
+    ensureStorageDirectorySync(sidecarBackup);
+    if (existsSync(sidecarRoot)) {
+        for (const entry of readdirSync(sidecarRoot)) {
+            if (!entry.endsWith(".json")) continue;
+            writeStorageFileAtomicSync(
+                join(sidecarBackup, entry),
+                readFileSync(join(sidecarRoot, entry)),
+            );
+        }
+    }
     console.log(
         `Restore identity sidecars too: rm -rf ${quote(sidecarRoot)}; cp -R ${quote(sidecarBackup)} ${quote(sidecarRoot)}`,
     );
@@ -410,18 +413,15 @@ export function runMergeIdentityCli(args: string[], deps: Partial<MergeIdentityD
     if (to.startsWith("git:"))
         for (const directory of directories) {
             const root = join(storageDir, "project-identities");
-            mkdirSync(root, { recursive: true });
+            ensureStorageDirectorySync(root);
             const path = join(
                 root,
                 `${createHash("sha256").update(projectDirectoryKey(directory)).digest("hex")}.json`,
             );
-            const temporary = `${path}.merge.tmp`;
-            writeFileSync(
-                temporary,
+            writeStorageFileAtomicSync(
+                path,
                 JSON.stringify({ directory: projectDirectoryKey(directory), identity: options.to }),
-                { mode: 0o600 },
             );
-            renameSync(temporary, path);
         }
     return 0;
 }

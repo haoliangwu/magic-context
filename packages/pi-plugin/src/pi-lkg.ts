@@ -38,6 +38,7 @@ interface PiLkgInputSnapshot {
 	id: string;
 	messageIndex: number;
 	fields: readonly LkgContentField[];
+	providerUsageSignature?: string;
 }
 
 export interface PiLkgPassSnapshot {
@@ -81,6 +82,10 @@ interface PiLkgSessionState {
 	capturedRequest?: PiLkgCapturePlan & {
 		envelopeSignature: string;
 		usage?: { signature: string; inputTokens: number };
+	};
+	measuredRequest?: PiLkgCapturePlan & {
+		envelopeSignature: string;
+		usage: { signature: string; inputTokens: number };
 	};
 }
 
@@ -188,6 +193,7 @@ export function notePiLkgProviderUsage(
 			signature: usage.signature,
 			inputTokens: usage.inputTokens,
 		};
+		if (state) state.measuredRequest = { ...request, usage: request.usage };
 		return true;
 	} catch {
 		return false;
@@ -212,6 +218,12 @@ export interface PiLkgCoordinator {
 		snapshot: PiLkgPassSnapshot,
 		parentOf?: (id: string) => string | null | undefined,
 	): PiLkgReplayResult;
+	/** Provider evidence for a healthy output, without performing a replay. */
+	measureOutgoingPrefix(
+		snapshot: PiLkgPassSnapshot,
+		messages: readonly unknown[],
+		parentOf?: (id: string) => string | null | undefined,
+	): PiMeasuredPrefixFit | undefined;
 	captureAppliedPass(args: {
 		snapshot: PiLkgPassSnapshot;
 		outputMessages: readonly unknown[];
@@ -429,9 +441,28 @@ function snapshotInputs(
 			`pi-lkg-unmapped:${lkgContentDigestFromFields(fields)}`;
 		if (seen.has(id)) return { inputs: [], failure: "lkg_duplicate_entry_id" };
 		seen.add(id);
-		inputs.push({ id, messageIndex: index, fields });
+		inputs.push({
+			id,
+			messageIndex: index,
+			fields,
+			providerUsageSignature: completedProviderUsage(messages[index])
+				?.signature,
+		});
 	}
 	return { inputs, failure: null };
+}
+
+/** Compact JSON arrays preserve the exact serialized rows before their closing
+ * bracket. A measurement cannot cover a rewritten row, even with the same ids. */
+function extendsMeasuredRequest(
+	measuredJson: string,
+	nextJson: string,
+): boolean {
+	return (
+		measuredJson === nextJson ||
+		(measuredJson.length > 2 &&
+			nextJson.startsWith(`${measuredJson.slice(0, -1)},`))
+	);
 }
 
 /**
@@ -538,7 +569,7 @@ export function createPiLkgCoordinator(
 		slot: LkgSlot | undefined,
 		parentOf?: (id: string) => string | null | undefined,
 	): PiMeasuredPrefixFit | undefined => {
-		const request = stateFor(snapshot.sessionId).capturedRequest;
+		const request = stateFor(snapshot.sessionId).measuredRequest;
 		const anchor = snapshot.replayAnchorInputIndex;
 
 		if (
@@ -547,40 +578,55 @@ export function createPiLkgCoordinator(
 			!parentOf ||
 			anchor === null ||
 			!snapshot.pristineTail ||
-			request.captureSequence !==
-				stateFor(snapshot.sessionId).captureSequence ||
-			request.captureSequence !== slot.captureSequence ||
-			request.capturedAt !== slot.capturedAt ||
-			request.jsonPrefix !== slot.jsonPrefix ||
+			!extendsMeasuredRequest(request.jsonPrefix, slot.jsonPrefix) ||
 			!request.modelKey ||
 			request.modelKey !== slot.modelKey ||
 			request.modelKey !== snapshot.modelKey ||
 			request.providerKey !== slot.providerKey ||
 			request.providerKey !== snapshot.providerKey ||
-			slot.lastInputMessageId !== request.inputs.at(-1)?.id ||
-			snapshot.inputs[anchor]?.id !== slot.lastInputMessageId
+			snapshot.inputs[anchor]?.id !== slot.lastInputMessageId ||
+			exactReusablePrefix(snapshot.inputs, request.inputs) !==
+				request.inputs.length
 		)
 			return;
-		const assistantId = snapshot.inputs[anchor + 1]?.id;
-		const usage = completedProviderUsage(snapshot.pristineTail[0]);
+		const assistant = snapshot.inputs[request.inputs.length];
+		const assistantId = assistant?.id;
 		if (
 			!assistantId ||
 			assistantId.startsWith("pi-lkg-unmapped:") ||
-			usage?.signature !== request.usage.signature
+			assistant.providerUsageSignature !== request.usage.signature
 		)
 			return;
+		let appendedMessages: MessageLike[];
 		try {
-			if (parentOf(assistantId) !== slot.lastInputMessageId) return;
+			if (parentOf(assistantId) !== request.inputs.at(-1)?.id) return;
+			const measuredLength = (JSON.parse(request.jsonPrefix) as unknown[])
+				.length;
+			const prefix = JSON.parse(slot.jsonPrefix) as MessageLike[];
+			const replyId =
+				measuredLength < prefix.length
+					? slot.piOutputEntryIds?.[measuredLength]
+					: snapshot.inputs[anchor + 1]?.id;
+			if (replyId !== assistantId) return;
+			appendedMessages = [
+				...prefix.slice(measuredLength),
+				...snapshot.pristineTail,
+			];
+			if (
+				completedProviderUsage(appendedMessages[0])?.signature !==
+				request.usage.signature
+			)
+				return;
 		} catch {
 			return;
 		}
-		// The accepted assistant reply is new input on this replay, so it remains
-		// in the tail priced above the provider's prior-request input count.
+		// Every message added since the measured request is new input, including
+		// its reply and any later unmeasured captures, not just the latest raw tail.
 		return {
 			modelKey: piModelRefToCanonical(request.modelKey).toLowerCase(),
 			inputTokens: request.usage.inputTokens,
 			envelopeSignature: request.envelopeSignature,
-			appendedMessages: snapshot.pristineTail,
+			appendedMessages,
 		};
 	};
 	const replay: PiLkgCoordinator["replay"] = (snapshot, parentOf) => {
@@ -750,6 +796,17 @@ export function createPiLkgCoordinator(
 			capturedAt: Date.now(),
 			captureSequence: state.captureSequence,
 		};
+		// Capturing an unmeasured retry must not erase evidence for its unchanged
+		// served prefix. A rebuild, edited row, route or envelope does erase it.
+		if (
+			state.measuredRequest &&
+			(state.measuredRequest.modelKey !== plan.modelKey ||
+				state.measuredRequest.providerKey !== plan.providerKey ||
+				state.measuredRequest.envelopeSignature !==
+					args.hostEnvelopeSignature ||
+				!extendsMeasuredRequest(state.measuredRequest.jsonPrefix, jsonPrefix))
+		)
+			state.measuredRequest = undefined;
 		state.capturedRequest = args.hostEnvelopeSignature
 			? { ...plan, envelopeSignature: args.hostEnvelopeSignature }
 			: undefined;
@@ -766,8 +823,8 @@ export function createPiLkgCoordinator(
 		if (unchanged && !state.syncCaptureRequired) {
 			// Provider usage can arrive before the deferred commit. Refresh the
 			// replay slot's identity in memory now without rewriting unchanged
-			// durable bytes. The new capturedRequest has no usage, so previous
-			// measurements remain superseded.
+			// durable bytes. The new capturedRequest awaits its own usage; the last
+			// measured request can still price an identical or append-only prefix.
 			const kept = {
 				...livePrior,
 				capturedAt: plan.capturedAt,
@@ -932,6 +989,38 @@ export function createPiLkgCoordinator(
 			return result;
 		},
 		captureAppliedPass,
+		measureOutgoingPrefix(snapshot, messages, parentOf) {
+			try {
+				const slot = getSlot(snapshot.sessionId);
+				const measured = measuredPrefixFor(snapshot, slot, parentOf);
+				if (!slot || !measured) return;
+				const prefix = JSON.parse(slot.jsonPrefix) as unknown[];
+				// A healthy reclaim may have removed or rewritten the old prefix.
+				// Usage belongs to those exact served bytes, never to their replacement.
+				if (
+					!Array.isArray(prefix) ||
+					messages.length < prefix.length ||
+					JSON.stringify(messages.slice(0, prefix.length)) !== slot.jsonPrefix
+				)
+					return;
+				const measuredRequest = stateFor(snapshot.sessionId).measuredRequest;
+				if (!measuredRequest) return;
+				const measuredLength = (
+					JSON.parse(measuredRequest.jsonPrefix) as unknown[]
+				).length;
+				const appendedMessages = messages.slice(measuredLength);
+				// Tagging/stripping can rewrite the new reply's content. Its usage
+				// identity must still match; price the actual returned tail separately.
+				if (
+					completedProviderUsage(appendedMessages[0])?.signature !==
+					measuredRequest.usage.signature
+				)
+					return;
+				return { ...measured, appendedMessages };
+			} catch {
+				return;
+			}
+		},
 	};
 }
 

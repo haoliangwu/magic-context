@@ -6,8 +6,13 @@ import {
   cacheEventLabel,
   cacheReadLabel,
   cacheWriteLabel,
+  ctxBarGeom,
+  latestContextFill,
+  niceTokenCeil,
   normalizeEstimatedContextLimits,
   selectWorstCacheEvent,
+  sentenceCaseLabel,
+  timelineAxis,
 } from "./cache-format";
 import type { DbCacheEvent } from "./types";
 
@@ -231,5 +236,62 @@ describe("cacheReadLabel", () => {
     expect(cacheReadLabel(ev({ cache_read: 90 }))).toBe((90).toLocaleString());
     expect(cacheReadLabel(ev({ cache_read: 0 }))).toBe("0");
     expect(cacheReadLabel(ev({ cache_read: 0, cache_reported: false }))).toBe("not reported");
+  });
+});
+
+describe("cache timeline axis", () => {
+  it("rounds axis tops up to readable token counts", () => {
+    expect(niceTokenCeil(252_202)).toBe(300_000);
+    expect(niceTokenCeil(140_000)).toBe(150_000);
+    expect(niceTokenCeil(1_000)).toBe(1_000);
+    expect(niceTokenCeil(0)).toBe(1);
+  });
+
+  it("scales a small prompt in a large window to the session's own range", () => {
+    // A 219k prompt in a 1.05M window: scaled to the window it filled only a
+    // fifth of the chart; on its own range it fills most of it.
+    const step = ev({ cache_read: 219_008, input_tokens: 298, context_limit: 1_050_000 });
+    const axis = timelineAxis([step], 1_050_000);
+    expect(axis).toEqual({ max: 300_000, windowInRange: false });
+    expect(ctxBarGeom(step, axis.max).outerPct).toBeCloseTo(73.1, 1);
+    expect(ctxBarGeom(step).outerPct).toBeCloseTo(20.9, 1);
+  });
+
+  it("uses the whole window once prompts come close to it", () => {
+    const step = ev({ cache_read: 180_000, input_tokens: 20_000, context_limit: 272_000 });
+    expect(timelineAxis([step], 272_000)).toEqual({ max: 272_000, windowInRange: true });
+  });
+
+  it("still flags a prompt that overflowed its window", () => {
+    const step = ev({ cache_read: 300_000, context_limit: 272_000 });
+    const axis = timelineAxis([step], 272_000);
+    const geom = ctxBarGeom(step, axis.max);
+    expect(geom.overflow).toBe(true);
+    expect(geom.outerPct).toBe(100);
+  });
+});
+
+describe("latestContextFill", () => {
+  it("reports the newest step's share of its recorded window", () => {
+    const fill = latestContextFill([
+      ev({ timestamp: 1, cache_read: 100_000, context_limit: 1_000_000 }),
+      ev({ timestamp: 2, cache_read: 210_000, input_tokens: 9_306, context_limit: 1_050_000 }),
+    ]);
+    expect(fill).toEqual({ prompt: 219_306, limit: 1_050_000, ratio: 219_306 / 1_050_000 });
+  });
+
+  it("says nothing when the window was only estimated", () => {
+    expect(
+      latestContextFill([
+        ev({ cache_read: 5_000, context_limit: 5_000, context_limit_estimated: true }),
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe("sentenceCaseLabel", () => {
+  it("turns upper-case row labels into sentence case", () => {
+    expect(sentenceCaseLabel("COLD START · RUN TOTAL")).toBe("Cold start · run total");
+    expect(sentenceCaseLabel("FULL BUST")).toBe("Full bust");
   });
 });

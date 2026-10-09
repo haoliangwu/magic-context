@@ -8,6 +8,7 @@ import type {
 } from "../../features/magic-context/dreamer/task-registry";
 import { toolTemplateError } from "../../shared/historian-tool-template";
 import { isValidPromptSurfaceModelKey } from "../../shared/prompt-surface";
+import { DEFAULT_PROTECTED_TOOLS, mergeProtectedTools } from "../../shared/protected-tools-policy";
 import { AgentOverrideConfigSchema } from "./agent-overrides";
 
 export const DEFAULT_EXECUTE_THRESHOLD_PERCENTAGE = 65;
@@ -640,6 +641,10 @@ const AgentMetadataSchema = AgentOverrideConfigSchema.pick({
 
 /** Combined dreamer metadata plus independent strict execution blocks. */
 export const DreamerConfigSchema = AgentMetadataSchema.extend({
+    // Its own node rather than the one shared with the historian through
+    // AgentMetadataSchema: `dreamer.disable` is a live-reload key and the
+    // historian's is not, and the live marker is set on the schema node.
+    disable: z.boolean().optional().describe("Disable this agent"),
     runner: z
         .enum(["broca", "host"])
         .optional()
@@ -918,6 +923,8 @@ export interface MuralConfig {
 }
 
 export interface MagicContextConfig {
+    /** The loader sets this to distinguish an explicit `5m` from the built-in default; users do not configure it. */
+    cacheTtlConfigured?: boolean;
     enabled: boolean;
     /** User-level setting that lets a session in the canonical home directory use project memory. */
     allow_home_project: boolean;
@@ -955,7 +962,9 @@ export interface MagicContextConfig {
     execute_threshold_tokens?: { default?: number; [modelKey: string]: number | undefined };
     protected_tokens?: number;
     protected_tags?: number;
-    clear_reasoning_age: number;
+    protected_tools: Record<string, number>;
+    clear_reasoning_age?: unknown;
+    keep_reasoning_tokens?: number | Record<string, number>;
     history_budget_percentage: number;
     historian_timeout_ms: number;
     commit_cluster_trigger: {
@@ -1038,7 +1047,8 @@ export interface MagicContextConfig {
      *  on its own; when off, the messages sent to the model are byte-identical to
      *  the age-based-only behavior. Experimental, opt-in, default off until cache
      *  stability is proven. */
-    smart_drops: boolean;
+    /** Deprecated and ignored: supersession reclaim is always on. */
+    smart_drops?: unknown;
     /**
      * Age-tier caveman compression for long user/assistant text parts.
      * Graduated from `experimental.caveman_text_compression`; opt-in, default off.
@@ -1187,7 +1197,7 @@ export const MagicContextConfigSchema = z
             .union([z.string(), z.object({ default: z.string() }).catchall(z.string())])
             .default("5m")
             .describe(
-                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard). Explicit per-model entries win; otherwise GPT-5.6 and later (including gpt-6*, through any provider prefix) use a built-in 30m lifetime before the object default or 5m fallback. An unset or global "5m" opts into built-in defaults; any other global string is an explicit policy and wins. Policy is frozen per session, including across restarts; a model switch resolves against that frozen policy. /ctx-status shows the effective value and source. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
+                'How long Magic Context assumes the provider\'s cached prefix stays valid. This is MC\'s own deferral gate — it does not change the provider\'s actual cache lifetime. String (e.g. "5m", "1h", "30s") or per-model object ({ default: "5m", "provider/model": "1h", "provider/*": "never" }); keys resolve most-specific first (exact provider/model, bare model ID, shorter dash-prefixes, then the provider/* wildcard, then default). User and project settings, including an explicit "5m" or object default, apply on the next pass. Only built-in defaults are frozen per session, including across restarts: when unset, GPT-5.6 and later (including gpt-6*, through any provider prefix) use 30m, other models use 5m. /ctx-status shows the effective TTL and whether it comes from your config or a frozen built-in default. Editing the TTL does not itself rewrite prompt bytes; a lowered TTL rebuilds only after normal idle expiry. OpenAI documents at least 30 minutes since the latest write or reuse: https://developers.openai.com/api/docs/guides/prompt-caching (Cache lifetime and Summary of model differences). Set to "never" to mean MC never assumes expiry (for lanes kept warm externally by a cache-keep tool) — disables the idle-TTL heuristic so MC never initiates a rebuild based on elapsed time. Provider-side extended TTL is a separate request-level concern (cache_control: { ttl } in the request body).',
             ),
         prompt_surface: PromptSurfaceConfigSchema.default({ default: "full" }).describe(
             "Prompt-surface presets: default is full; models use bare model IDs, provider/model, or provider/* routing keys. Guidance and tool-description overrides are user-level only. OpenCode 1.x, Pi, and OMP register tool descriptions once per process (they follow the default preset). OpenCode 2 rewrites the five ctx_* descriptions per request from the draft model.",
@@ -1254,10 +1264,21 @@ export const MagicContextConfigSchema = z
             )
             .meta({ deprecated: true }),
         clear_reasoning_age: z
-            .number()
-            .min(10)
-            .default(50)
-            .describe("Clear reasoning/thinking blocks older than N tags (default: 50)"),
+            .unknown()
+            .optional()
+            .describe("Deprecated and ignored. Use keep_reasoning_tokens instead.")
+            .meta({ deprecated: true }),
+        keep_reasoning_tokens: z
+            .union([
+                z.number().int().min(0).max(1_000_000),
+                z
+                    .object({ default: z.number().int().min(0).max(1_000_000).optional() })
+                    .catchall(z.number().int().min(0).max(1_000_000)),
+            ])
+            .optional()
+            .describe(
+                "Reasoning tokens to keep on rebuilding passes. Number or per-model object; exact, shorter model keys, provider/*, then default. Omitted: fixed 10,000. 0 removes all eligible historical reasoning; newest and exempt steps always stay.",
+            ),
         history_budget_percentage: z
             .number()
             .min(0.05)
@@ -1346,12 +1367,12 @@ export const MagicContextConfigSchema = z
                     .boolean()
                     .default(true)
                     .describe(
-                        "When true (default), Magic Context creates and re-tightens its storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages directory, database, WAL/SHM, cache, and RPC file permissions externally; Magic Context then never chmods or supplies restrictive creation modes. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
+                        "When true (default), Magic Context creates and re-tightens its TypeScript-mode storage directories to owner-only 0700 and storage files to owner-only 0600. Set false only for a deliberate trusted-group deployment whose operator manages those files externally; in TypeScript mode Magic Context then skips its own creation modes and recursive tightening. In Rust transform mode, ck-mc's store library always keeps the shared data directory owner-only 0700, regardless of this setting. USER-LEVEL ONLY — ignored in project config for security. On Windows, POSIX chmod modes are already meaningless, so this setting is a no-op.",
                     ),
             })
             .default({ enforce_private_permissions: true })
             .describe(
-                "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; every group member able to read the storage can read all stored session content and memories.",
+                "Storage permission policy. The default keeps session content and memories owner-private. Disabling enforcement is for trusted shared-group storage managed externally; TypeScript mode follows that policy, but Rust transform mode always keeps its shared data directory owner-only because ck-mc's store library enforces it.",
             ),
         embedding: EmbeddingConfigSchema.default({
             provider: "local",
@@ -1438,10 +1459,18 @@ export const MagicContextConfigSchema = z
             "Pi-only child-process extension controls. This setting is user-level only; project configuration cannot choose which extensions a user's subagent children load.",
         ),
         smart_drops: z
-            .boolean()
-            .default(false)
+            .unknown()
+            .optional()
             .describe(
-                "Content-aware reclaim of provably-superseded tool output, layered on the existing execute-pass auto-drop. When on: superseded todowrite (keep newest 1), spent ctx_reduce (keep newest 3), and zero-value meta (bash_status, bash_kill, ctx_note read/dismiss) outputs are dropped; older edits to a file are compressed to a filePath-preserving marker while the newest edit per file stays full. Only acts on passes already busting the cache, so it never originates a cache bust. Honors the protected-tag reserve. Experimental: opt-in, default off until cache stability is proven; when off the wire is byte-identical to the positional-only reclaim. Requires a restart.",
+                "Deprecated: ignored. Content-aware supersession reclaim is always on, only on passes already rebuilding the cache. Remove this key; it no longer does anything.",
+            )
+            .meta({ deprecated: true }),
+        protected_tools: z
+            .record(z.string(), z.number().int().nonnegative())
+            .default({ ...DEFAULT_PROTECTED_TOOLS })
+            .transform((map) => mergeProtectedTools(map))
+            .describe(
+                "Keep each tool's newest N still-active results in every automatic drop lane (issue 621). User and project maps merge over defaults {todowrite: 1, ctx_reduce: 3}; 0 turns protection off. Names are case-insensitive and ignore leading mcp_. Holds even at 95% pressure, with no byte cap: large protected outputs can reach refusal sooner. Queued drops, from the agent or historian publication, are held until newer calls displace the result and a later cache-rebuilding pass applies them. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Changes and rotation never originate a bust; dropped results are never restored.",
             ),
         caveman_text_compression: z
             .object({
@@ -1571,6 +1600,7 @@ export const MagicContextConfigSchema = z
 
 /** Settings whose fresh values can be used by later agent runs without changing rendered prompt bytes. */
 export const LIVE_RELOAD_CONFIG_PATHS = [
+    "cache_ttl",
     "mural.model",
     "toast_duration_ms",
     "historian.opencode.model",
@@ -1589,6 +1619,7 @@ export const LIVE_RELOAD_CONFIG_PATHS = [
     "commit_cluster_trigger.enabled",
     "commit_cluster_trigger.min_clusters",
     "memory.auto_promote",
+    "dreamer.disable",
     "dreamer.maxTokens",
     "dreamer.opencode.model",
     "dreamer.opencode.fallback_models",

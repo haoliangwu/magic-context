@@ -163,7 +163,7 @@ const LAYOUT_CASES: LayoutCase[] = [
         status: LONG_VALUE_STATUS,
         terminalWidth: 80,
         dialogWidth: 60,
-        expected: ["Configured", "context-preview)", "Execute threshold", "Esc to close"],
+        expected: ["Configured", "your config)", "Execute threshold", "Esc to close"],
         rows: COMPLETE_ROWS,
     },
 ];

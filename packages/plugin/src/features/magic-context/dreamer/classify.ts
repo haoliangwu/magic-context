@@ -521,11 +521,20 @@ async function runClassifyThroughModule(
         memories: chunk.map(toPromptMemory),
         anchors,
     });
-    const modelChain = [args.model, ...(args.fallbackModels ?? [])]
+    const modelEntries = [args.model, ...(args.fallbackModels ?? [])]
         .map(toModelEntry)
-        .filter((entry) => entry !== undefined)
-        .map((entry) => entry.model);
-    const resolvedModelChain = [...new Set(modelChain)];
+        .filter((entry) => entry !== undefined);
+    const resolvedModelChain = [...new Set(modelEntries.map((entry) => entry.model))];
+    // Each chain model's configured variant (e.g. a reasoning effort), keyed like the
+    // chain. The module sends it as the runner's `model.variant`. The chain keeps the
+    // first entry for a repeated model, so that entry's variant wins here too.
+    const modelVariants: Record<string, string> = {};
+    const variantSeen = new Set<string>();
+    for (const entry of modelEntries) {
+        if (variantSeen.has(entry.model)) continue;
+        variantSeen.add(entry.model);
+        if (entry.qualifier) modelVariants[entry.model] = entry.qualifier;
+    }
     const commandId = `classify:${args.moduleCommandId ?? Date.now()}:${createHash("sha256")
         .update(chunk.map((candidate) => candidate.id).join(","))
         .digest("hex")
@@ -547,6 +556,7 @@ async function runClassifyThroughModule(
                 // Always sent, even when empty: the module has no chain of its own and
                 // refuses a request without one, while an empty chain reports "no models".
                 model_chain: resolvedModelChain,
+                ...(Object.keys(modelVariants).length > 0 ? { model_variants: modelVariants } : {}),
                 payload: {
                     prompt_body: prompt,
                     items: chunk.map((candidate) => ({

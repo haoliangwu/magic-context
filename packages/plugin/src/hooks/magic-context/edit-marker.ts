@@ -1,21 +1,14 @@
-// Smart-drops Phase 2: superseded-edit compression. When a file has been edited
-// more than once, the older edits' bulky diffs are dead weight (the newest edit
-// is what matters), but FULLY dropping them loses the agent's record that it
-// edited that file/region. An "edit marker" is the middle ground: keep the
-// tool_use call with its `filePath` verbatim and a short region-hint prefix of
-// the diff, replace the output with `[dropped §N§]`, and clamp the rest.
+// When a file is edited repeatedly, shorten older diffs instead of removing the
+// calls entirely. Keeping the path and a short diff prefix lets the assistant
+// identify which file and region each older edit affected.
 //
-// This is a SEPARATE representation from the existing `truncate()` skeleton
-// (which clamps every arg, incl. filePath, to 5 chars). It must never change the
-// existing skeleton bytes — that path replays on every pass, including flag-off
-// defer passes, so altering it would silently bust the cache for users who never
-// enabled smart-drops. Edit-marker bytes are produced ONLY for `drop_mode =
-// "edit_marker"` rows, which only exist when `smart_drops` is on.
+// This representation is used only for edit_marker rows on cache-rebuilding
+// passes. Do not change the existing truncate() skeleton: it replays on every
+// pass, and changing its bytes would invalidate cached prefixes even when this
+// behavior is not enabled.
 //
-// Determinism / idempotency: callers always start from the ORIGINAL wire part
-// (the transform rebuilds the message array from source every pass), so applying
-// this fresh each pass is byte-stable. The `endsWith(SENTINEL)` guard also makes
-// a within-pass double-application a no-op.
+// Each rebuild starts from the original wire part, so the result is stable.
+// The sentinel also makes applying the marker twice in one pass a no-op.
 
 const TRUNCATION_SENTINEL = "...[truncated]";
 

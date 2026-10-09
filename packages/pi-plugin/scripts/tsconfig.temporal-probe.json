@@ -1,0 +1,5 @@
+{
+    "extends": "../tsconfig.json",
+    "compilerOptions": { "types": ["bun", "node"] },
+    "include": ["temporal-drain-extension.ts", "capture-temporal-upgrade-fixture.ts", "../../e2e-tests/scripts/pi-temporal-drain-probe.ts"]
+}

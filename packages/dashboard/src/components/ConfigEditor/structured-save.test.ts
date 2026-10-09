@@ -1,7 +1,4 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { parse } from "comment-json";
 import { parseJsonc } from "../../lib/jsonc";
 import { structuredConfigSaveContent } from "./structured-save";
@@ -22,25 +19,37 @@ const commentedConfig = `{
 `;
 
 describe("structured config form save", () => {
-  it("round-trips a JSONC temp file byte-for-byte except changed value tokens", () => {
-    const directory = mkdtempSync(join(tmpdir(), "dashboard-config-"));
-    const path = join(directory, "magic-context.jsonc");
+  it("adding an override preserves every existing byte, including trailing commas and unusual spacing", () => {
+    const source =
+      '{\r\n\t// Keep the operator comment.\r\n\t"future" : { "spacing" :  42, },\r\n}\r\n';
+    expect(structuredConfigSaveContent(source, { ...parseJsonc(source), language: "tr" })).toBe(
+      source.replace("\r\n}\r\n", '\r\n\t"language": "tr",\r\n}\r\n'),
+    );
+    const inline = '{ /* keep */ "unknown" :  1, }';
+    expect(structuredConfigSaveContent(inline, { ...parseJsonc(inline), enabled: true })).toBe(
+      '{ /* keep */ "unknown" :  1, "enabled": true, }',
+    );
+    const noComma = '{"a":1 // keep this comment with a\n}\n';
+    expect(structuredConfigSaveContent(noComma, { ...parseJsonc(noComma), language: "tr" })).toBe(
+      '{"a":1, // keep this comment with a\n  "language": "tr"\n}\n',
+    );
+    const inlineComment = '{"a":1 /* keep */ }';
+    expect(
+      structuredConfigSaveContent(inlineComment, { ...parseJsonc(inlineComment), language: "tr" }),
+    ).toBe('{"a":1, /* keep */ "language": "tr" }');
+  });
+  // The save path is a pure string transform, so the round trip needs no file:
+  // CRLF, tabs, comments and the trailing comma must all survive untouched.
+  it("round-trips JSONC text byte-for-byte except changed value tokens", () => {
     const original =
       '{\r\n\t// dotfiles formatting stays\r\n\t"enabled" : true,\r\n\t"cache_ttl": { "default" : "5m", /* model note */ "provider/model": "1h" },\r\n\t"dreamer": {"tasks": { "verify": {"schedule" : "0 3 * * *"} }},\r\n\t"unknown" : [1, /* keep */ 2],\r\n}\r\n';
-    try {
-      writeFileSync(path, original);
-      const source = readFileSync(path, "utf8");
-      const form = structuredClone(parseJsonc(source));
-      (form.cache_ttl as Record<string, unknown>)["provider/model"] = "never";
-      const dreamer = form.dreamer as { tasks: { verify: { schedule: string } } };
-      dreamer.tasks.verify.schedule = "";
-      writeFileSync(path, structuredConfigSaveContent(source, form));
-      expect(readFileSync(path, "utf8")).toBe(
-        original.replace('"1h"', '"never"').replace('"0 3 * * *"', '""'),
-      );
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
+    const form = structuredClone(parseJsonc(original));
+    (form.cache_ttl as Record<string, unknown>)["provider/model"] = "never";
+    const dreamer = form.dreamer as { tasks: { verify: { schedule: string } } };
+    dreamer.tasks.verify.schedule = "";
+    expect(structuredConfigSaveContent(original, form)).toBe(
+      original.replace('"1h"', '"never"').replace('"0 3 * * *"', '""'),
+    );
   });
 
   it("leaves an unchanged file completely untouched, including trailing whitespace", () => {

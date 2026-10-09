@@ -8,6 +8,7 @@ import {
     isTerminalSmartNoteNetworkError,
     SmartNoteNetworkError,
     SmartNoteSecurityError,
+    smartNoteNetworkTimeout,
 } from "./types";
 
 export interface ResolvedSmartNoteAddress {
@@ -32,6 +33,7 @@ export interface SmartNoteResolver {
 interface SmartNoteAddressResponse {
     status: number;
     body: string;
+    headers?: IncomingHttpHeaders;
     location?: string;
     bytesRead?: number;
 }
@@ -39,7 +41,12 @@ interface SmartNoteAddressResponse {
 type SmartNoteAddressRequest = (
     validation: SmartNoteUrlValidation,
     candidate: ResolvedSmartNoteAddress,
-    options: { signal: AbortSignal; timeoutMs: number; bodyLimitBytes: number },
+    options: {
+        signal: AbortSignal;
+        timeoutMs: number;
+        bodyLimitBytes: number;
+        headers?: Record<string, string>;
+    },
 ) => Promise<SmartNoteAddressResponse>;
 
 export interface GuardedSmartNoteHttpGetOptions {
@@ -48,10 +55,11 @@ export interface GuardedSmartNoteHttpGetOptions {
     timeoutMs?: number;
     bodyLimitBytes?: number;
     requestAddress?: SmartNoteAddressRequest;
+    githubToken?: string | null;
 }
 
 const DNS_TIMEOUT_MS = 3_000;
-const DEFAULT_HTTP_TIMEOUT_MS = 5_000;
+export const SMART_NOTE_HTTP_TIMEOUT_MS = 5_000;
 // Bound streamed network input independently of compiler/model output limits.
 const DEFAULT_HTTP_BODY_LIMIT_BYTES = 1024 * 1024;
 const MAX_HTTP_ADDRESS_CANDIDATES = 4;
@@ -128,7 +136,7 @@ export async function guardedSmartNoteHttpGet(
     input: string,
     options: GuardedSmartNoteHttpGetOptions,
 ): Promise<{ status: number; body: string }> {
-    const timeoutMs = options.timeoutMs ?? DEFAULT_HTTP_TIMEOUT_MS;
+    const timeoutMs = options.timeoutMs ?? SMART_NOTE_HTTP_TIMEOUT_MS;
     const bodyLimitBytes = options.bodyLimitBytes ?? DEFAULT_HTTP_BODY_LIMIT_BYTES;
     const requestAddress = options.requestAddress ?? requestValidatedAddress;
     const controller = new AbortController();
@@ -159,6 +167,10 @@ export async function guardedSmartNoteHttpGet(
                         signal: controller.signal,
                         timeoutMs: Math.max(1, deadline - performance.now()),
                         bodyLimitBytes: remainingBytes,
+                        // Re-check each redirect target so the credential never travels to another host.
+                        ...(options.githubToken && validation.url.host === "api.github.com"
+                            ? { headers: { Authorization: `Bearer ${options.githubToken}` } }
+                            : {}),
                     });
                     break;
                 } catch (error) {
@@ -173,7 +185,12 @@ export async function guardedSmartNoteHttpGet(
                 }
             }
             if (!response) throw toNetworkError(lastError, "all validated addresses failed");
-            remainingBytes -= response.bytesRead ?? Buffer.byteLength(response.body);
+            const responseBytes = response.bytesRead ?? Buffer.byteLength(response.body);
+            if (options.githubToken) {
+                // HTTP response bodies are guest-visible and must not reflect the credential.
+                response.body = response.body.split(options.githubToken).join("[redacted]");
+            }
+            remainingBytes -= responseBytes;
             if (remainingBytes < 0) {
                 throw new SmartNoteNetworkError(
                     `SMART_NOTE_NETWORK: response body too large at ${validation.url.href} (received at least ${bodyLimitBytes - remainingBytes} bytes; limit ${bodyLimitBytes})`,
@@ -184,6 +201,7 @@ export async function guardedSmartNoteHttpGet(
                 );
             }
             if (!HTTP_REDIRECT_STATUSES.has(response.status)) {
+                assertReadableHttpResponse(response, validation.url.href);
                 return { status: response.status, body: response.body };
             }
             if (redirects >= MAX_HTTP_REDIRECTS) {
@@ -212,7 +230,6 @@ export async function guardedSmartNoteHttpGet(
         return await Promise.race([
             (async () => {
                 const response = await follow(input);
-                assertReadableHttpStatus(response.status, input);
                 if (response.status === 404 || response.status === 410) {
                     const parent = readableParentUrl(new URL(input));
                     if (parent) {
@@ -220,7 +237,6 @@ export async function guardedSmartNoteHttpGet(
                         // treating its watched resource as missing. Reuse the resource
                         // request's SSRF policy, byte budget and wall-clock deadline.
                         const container = await follow(parent);
-                        assertReadableHttpStatus(container.status, parent);
                         if (container.status < 200 || container.status >= 300) {
                             throw new SmartNoteNetworkError(
                                 `SMART_NOTE_NETWORK: source container is not publicly readable at ${parent} (HTTP ${container.status}); cannot check ${input}`,
@@ -233,15 +249,13 @@ export async function guardedSmartNoteHttpGet(
             })(),
             new Promise<never>((_, reject) => {
                 timer = setTimeout(() => {
-                    reject(
-                        new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out", {
-                            terminal: true,
-                        }),
-                    );
+                    reject(smartNoteNetworkTimeout("SMART_NOTE_NETWORK: request timed out"));
                     controller.abort();
                 }, timeoutMs);
             }),
-        ]);
+        ]).catch((error: unknown) => {
+            throw redactGithubTokenFromError(error, options.githubToken);
+        });
     } finally {
         if (timer) clearTimeout(timer);
         options.signal.removeEventListener("abort", onAbort);
@@ -267,7 +281,29 @@ function rateLimitRetryAt(headers: IncomingHttpHeaders): number {
     );
 }
 
-function assertReadableHttpStatus(status: number, url: string): void {
+function assertReadableHttpResponse(response: SmartNoteAddressResponse, url: string): void {
+    const { status, body } = response;
+    const headers = response.headers ?? {};
+    // GitHub can report secondary limits with quota remaining and no Retry-After.
+    // Check the bounded body before treating a 403 as inaccessible, including the extra
+    // request that verifies the repository itself is readable. Newly compiled checks use
+    // this guard for their test run before acceptance, as do scheduled checks.
+    const githubSecondaryLimit =
+        ["api.github.com", "github.com", "raw.githubusercontent.com"].includes(
+            new URL(url).hostname,
+        ) && /secondary rate limit/i.test(body);
+    if (
+        (status === 401 || status === 403 || status === 429) &&
+        (status === 429 ||
+            headers["x-ratelimit-remaining"] === "0" ||
+            headers["retry-after"] !== undefined ||
+            githubSecondaryLimit)
+    ) {
+        throw new SmartNoteNetworkError(
+            `SMART_NOTE_NETWORK: rate-limited HTTP ${status} at ${url}`,
+            { terminal: true, retryAt: rateLimitRetryAt(headers) },
+        );
+    }
     if (status === 401 || status === 403 || status === 451) {
         throw new SmartNoteNetworkError(
             `SMART_NOTE_NETWORK: source is not publicly readable at ${url} (HTTP ${status})`,
@@ -390,7 +426,12 @@ export function createPinnedLookup(candidate: { address: string; family: 4 | 6 }
 export function requestValidatedAddress(
     validation: SmartNoteUrlValidation,
     candidate: ResolvedSmartNoteAddress,
-    options: { signal: AbortSignal; timeoutMs: number; bodyLimitBytes: number },
+    options: {
+        signal: AbortSignal;
+        timeoutMs: number;
+        bodyLimitBytes: number;
+        headers?: Record<string, string>;
+    },
 ): Promise<SmartNoteAddressResponse> {
     // A request-local agent prevents global keep-alive or proxying agents from
     // reusing a socket that was not opened through the pinned lookup below.
@@ -410,6 +451,7 @@ export function requestValidatedAddress(
                     Host: hostHeader,
                     "User-Agent": "magic-context-smart-note-check/1",
                     Accept: "text/plain, application/json;q=0.9, */*;q=0.1",
+                    ...options.headers,
                 },
                 // Anti-rebinding: DNS was resolved and classified above; the
                 // connector is pinned to that exact pre-validated IP while TLS
@@ -460,31 +502,10 @@ export function requestValidatedAddress(
                 });
                 response.on("end", () => {
                     const status = response.statusCode ?? 0;
-                    const rateLimited =
-                        (status === 401 || status === 403 || status === 429) &&
-                        (status === 429 ||
-                            response.headers["x-ratelimit-remaining"] === "0" ||
-                            response.headers["retry-after"] !== undefined);
-                    if (rateLimited) {
-                        reject(
-                            new SmartNoteNetworkError(
-                                `SMART_NOTE_NETWORK: rate-limited HTTP ${status} at ${url.href}`,
-                                { terminal: true, retryAt: rateLimitRetryAt(response.headers) },
-                            ),
-                        );
-                        return;
-                    }
-                    if (status >= 500) {
-                        reject(
-                            new SmartNoteNetworkError(
-                                `SMART_NOTE_NETWORK: transient HTTP ${status}`,
-                            ),
-                        );
-                        return;
-                    }
                     resolve({
                         status,
                         body: Buffer.concat(chunks).toString("utf8"),
+                        headers: response.headers,
                         location: response.headers.location,
                         bytesRead: bytes,
                     });
@@ -496,16 +517,12 @@ export function requestValidatedAddress(
         // branch: passing an Error to destroy() lets stream internals re-throw
         // it where no listener reaches.
         const onAbort = () => {
-            reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted"));
+            reject(smartNoteNetworkTimeout("SMART_NOTE_NETWORK: aborted"));
             request.destroy();
         };
         options.signal.addEventListener("abort", onAbort, { once: true });
         request.on("timeout", () => {
-            reject(
-                new SmartNoteNetworkError("SMART_NOTE_NETWORK: request timed out", {
-                    terminal: true,
-                }),
-            );
+            reject(smartNoteNetworkTimeout("SMART_NOTE_NETWORK: request timed out"));
             request.destroy();
         });
         request.on("error", (error) => {
@@ -515,6 +532,23 @@ export function requestValidatedAddress(
         request.on("close", () => options.signal.removeEventListener("abort", onAbort));
         request.end();
     }).finally(() => agent.destroy());
+}
+
+function redactGithubTokenFromError(error: unknown, token: string | null | undefined): unknown {
+    if (!token) return error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes(token)) return error;
+    const redacted = message.split(token).join("[redacted]");
+    if (error instanceof SmartNoteNetworkError) {
+        return new SmartNoteNetworkError(redacted, {
+            terminal: error.terminal,
+            persistent: error.persistent,
+            uncheckable: error.uncheckable,
+            retryAt: error.retryAt,
+        });
+    }
+    if (error instanceof SmartNoteSecurityError) return new SmartNoteSecurityError(redacted);
+    return new Error(redacted);
 }
 
 export function createSmartNoteRequestAgent(): https.Agent {
@@ -675,12 +709,12 @@ async function withAbortAndTimeout<T>(
             promise,
             new Promise<T>((_, reject) => {
                 timer = setTimeout(
-                    () => reject(new SmartNoteNetworkError(timeoutMessage)),
+                    () => reject(smartNoteNetworkTimeout(timeoutMessage)),
                     timeoutMs,
                 );
                 signal.addEventListener(
                     "abort",
-                    () => reject(new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted")),
+                    () => reject(smartNoteNetworkTimeout("SMART_NOTE_NETWORK: aborted")),
                     { once: true },
                 );
             }),
@@ -691,7 +725,7 @@ async function withAbortAndTimeout<T>(
 }
 
 function throwIfAborted(signal: AbortSignal): void {
-    if (signal.aborted) throw new SmartNoteNetworkError("SMART_NOTE_NETWORK: aborted");
+    if (signal.aborted) throw smartNoteNetworkTimeout("SMART_NOTE_NETWORK: aborted");
 }
 
 function toNetworkError(error: unknown, fallback: string): SmartNoteNetworkError {

@@ -1,4 +1,4 @@
-import { newestCtxReduceTagNumbers } from "../../features/magic-context/reclaim-protection";
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import type { TagEntry } from "../../features/magic-context/types";
 import { isRecord } from "../../shared/record-type-guard";
 import { stableStringify } from "../../shared/stable-json";
@@ -91,6 +91,8 @@ export interface TailHygienePostReduceGrace {
 }
 
 export interface TailHygieneBaseline {
+    /** Keep counts adopted on the last rebuilding pass; absent on legacy baselines. */
+    protectedToolsPolicy?: Readonly<Record<string, number>>;
     baselineU: number;
     baselineT: number;
     turnDeltaU: number;
@@ -393,11 +395,10 @@ function messageIdForTag(tag: TagEntry): string | null {
 function resolveProtectedTagNumbers(
     tags: readonly TagEntry[],
     protectedTagNumbersInput: ReadonlySet<number>,
+    protectedToolTags?: ReadonlySet<number>,
 ): Set<number> {
     const protectedNumbers = new Set(protectedTagNumbersInput);
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(
-        tags.filter((tag) => tag.status === "active" && tag.type === "tool"),
-    );
+    const protectedCtxReduceTags = protectedToolTags ?? protectedToolTagNumbers(tags);
     for (const tagNumber of protectedCtxReduceTags) protectedNumbers.add(tagNumber);
     return protectedNumbers;
 }
@@ -428,12 +429,17 @@ function buildTagAttribution(args: {
     tags: readonly TagEntry[];
     toolIdentities: ReadonlyMap<unknown, ToolPartIdentity>;
     protectedTagNumbers: ReadonlySet<number>;
+    protectedToolTags?: ReadonlySet<number>;
 }): {
     protectedNumbers: ReadonlySet<number>;
     messageTags: ReadonlyMap<string, TagEntry>;
     toolTagsByPart: ReadonlyMap<unknown, TagEntry>;
 } {
-    const protectedNumbers = resolveProtectedTagNumbers(args.tags, args.protectedTagNumbers);
+    const protectedNumbers = resolveProtectedTagNumbers(
+        args.tags,
+        args.protectedTagNumbers,
+        args.protectedToolTags,
+    );
     const messageTags = new Map<string, TagEntry>();
     const exactToolTags = new Map<string, TagEntry>();
     const orphanTagsByCall = new Map<string, TagEntry[]>();
@@ -634,6 +640,7 @@ type MeasurementInput = {
     protectedTagNumbers: ReadonlySet<number>;
     /** Active tags whose drop is queued but not yet materialized into the rendered tail. */
     pendingDropTagNumbers?: ReadonlySet<number>;
+    protectedToolTags?: ReadonlySet<number>;
 };
 
 interface ReplayMeasurement extends TailHygieneMeasurement {
@@ -662,6 +669,7 @@ function measureWithReplay(
         tags: input.tags,
         toolIdentities,
         protectedTagNumbers: input.protectedTagNumbers,
+        protectedToolTags: input.protectedToolTags,
     });
     const toolOutputs = input.messages.map((message, index) =>
         message.parts.map((part, partIndex) =>
@@ -1155,14 +1163,28 @@ export function refreshTailHygieneBaseline(input: {
     tags: readonly TagEntry[];
     /** Canonical tag-number membership from persisted row mass and the floor snapshot. */
     protectedTagNumbers: ReadonlySet<number>;
+    protectedToolTags?: ReadonlySet<number>;
     pendingDropTagNumbers?: ReadonlySet<number>;
     cacheBusting: boolean;
+    protectedTools?: Readonly<Record<string, number>>;
     previous?: TailHygieneBaseline;
     /** Frozen decision ratios. They change only on an authorized bust. */
     calibration?: { toolsRatio: number; proseRatio: number };
     hygieneUnitsVersion?: number;
     now?: number;
 }): TailHygieneBaseline {
+    const protectedToolsPolicy = adoptedProtectedToolsPolicy(
+        input.protectedTools,
+        input.previous?.protectedToolsPolicy,
+        input.cacheBusting,
+        !!input.previous,
+    );
+    const protectedToolTags = protectedToolTagNumbers(input.tags, protectedToolsPolicy);
+    input = {
+        ...input,
+        protectedToolTags,
+        protectedTagNumbers: new Set([...input.protectedTagNumbers, ...protectedToolTags]),
+    };
     const pendingDropTagNumbers = input.pendingDropTagNumbers ?? new Set<number>();
     const cached = input.previous
         ? baselineMeasurementMemo.get(input.previous.baselineParts)
@@ -1240,6 +1262,7 @@ export function refreshTailHygieneBaseline(input: {
         retainBaselineMeasurement(frozen.baselineParts, memo);
         return {
             ...frozen,
+            protectedToolsPolicy,
             hygieneUnitsVersion: frozenCalibration.hygieneUnitsVersion,
             toolsRatio: frozenCalibration.toolsRatio,
             proseRatio: frozenCalibration.proseRatio,
@@ -1278,6 +1301,7 @@ export function refreshTailHygieneBaseline(input: {
     }
     return {
         ...input.previous,
+        protectedToolsPolicy,
         turnDeltaU,
         turnDeltaT,
         evaluable: true,
@@ -1317,3 +1341,5 @@ export function assertTailHygieneContentUnchangedIfEnabled(
         assertTailHygieneContentUnchanged(input);
     }
 }
+
+import { adoptedProtectedToolsPolicy } from "../../features/magic-context/reclaim-protection";

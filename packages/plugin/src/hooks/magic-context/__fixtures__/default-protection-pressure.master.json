@@ -1,0 +1,106 @@
+{
+  "source": "53bfd742 (current master after protected_tools revert, issue 624 and harness fix); production injectM0M1, runPostTransformPhase, evaluateEmergencyFailClosed and ctx_reduce facade; frozen Date.now=1700000000000",
+  "passes": [
+    {
+      "stage": "pressure",
+      "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history></session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u1\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Investigate pressure.\"}]},{\"info\":{\"id\":\"a1\",\"role\":\"assistant\"},\"parts\":[{\"type\":\"text\",\"text\":\"An ordinary unprotected answer.\"}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+      "fold": false,
+      "refusal": {
+        "shouldAbort": false,
+        "reason": "proceed"
+      }
+    },
+    {
+      "stage": "fold",
+      "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history>\\n## 1-2 · Investigation\\nThe investigation is summarized; continue from the retained user turn.\\n</session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+      "fold": true,
+      "refusal": {
+        "shouldAbort": false,
+        "reason": "proceed"
+      }
+    },
+    {
+      "stage": "provider-overflow",
+      "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history>\\n## 1-2 · Investigation\\nThe investigation is summarized; continue from the retained user turn.\\n</session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+      "fold": false,
+      "refusal": {
+        "shouldAbort": true,
+        "reason": "provider-overflow-abort"
+      }
+    },
+    {
+      "stage": "fold-after-overflow",
+      "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history>\\n## 1-2 · Investigation\\nThe investigation is summarized; continue from the retained user turn.\\n</session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+      "fold": true,
+      "refusal": {
+        "shouldAbort": false,
+        "reason": "proceed"
+      }
+    },
+    {
+      "stage": "defer",
+      "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history>\\n## 1-2 · Investigation\\nThe investigation is summarized; continue from the retained user turn.\\n</session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+      "fold": false,
+      "refusal": {
+        "shouldAbort": false,
+        "reason": "below-emergency-band"
+      }
+    }
+  ],
+  "agentDrop": {
+    "passes": [
+      {
+        "stage": "pressure",
+        "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history></session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u1\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Investigate pressure.\"}]},{\"info\":{\"id\":\"a1\",\"role\":\"assistant\"},\"parts\":[{\"type\":\"text\",\"text\":\"An ordinary unprotected answer.\"}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+        "fold": false,
+        "refusal": {
+          "shouldAbort": false,
+          "reason": "proceed"
+        }
+      },
+      {
+        "stage": "fold",
+        "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history>\\n## 1-2 · Investigation\\nThe investigation is summarized; continue from the retained user turn.\\n</session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+        "fold": true,
+        "refusal": {
+          "shouldAbort": false,
+          "reason": "proceed"
+        }
+      },
+      {
+        "stage": "provider-overflow",
+        "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history>\\n## 1-2 · Investigation\\nThe investigation is summarized; continue from the retained user turn.\\n</session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+        "fold": true,
+        "refusal": {
+          "shouldAbort": false,
+          "reason": "proceed"
+        }
+      },
+      {
+        "stage": "fold-after-overflow",
+        "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history>\\n## 1-2 · Investigation\\nThe investigation is summarized; continue from the retained user turn.\\n</session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+        "fold": true,
+        "refusal": {
+          "shouldAbort": false,
+          "reason": "proceed"
+        }
+      },
+      {
+        "stage": "defer",
+        "wireBytes": "[{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history>\\n## 1-2 · Investigation\\nThe investigation is summarized; continue from the retained user turn.\\n</session-history>\",\"synthetic\":true}]},{\"info\":{\"role\":\"user\",\"sessionID\":\"default-pressure-parity\",\"syntheticHead\":true},\"parts\":[{\"type\":\"text\",\"text\":\"<session-history-since>(no new content since last materialization)</session-history-since>\",\"synthetic\":true}]},{\"info\":{\"id\":\"u2\",\"role\":\"user\"},\"parts\":[{\"type\":\"text\",\"text\":\"Continue the investigation.\"}]}]",
+        "fold": false,
+        "refusal": {
+          "shouldAbort": false,
+          "reason": "below-emergency-band"
+        }
+      }
+    ],
+    "acknowledgment": "Queued: drop §1§.",
+    "ledgerBefore": "active",
+    "ledgerAfter": "dropped",
+    "queued": [
+      1
+    ],
+    "pendingAfter": []
+  }
+}

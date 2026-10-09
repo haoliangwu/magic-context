@@ -15,10 +15,11 @@
  * Leave both empty (`""` and `[]`) to skip the dialog entirely.
  */
 
-import * as fs from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import { compareSemverCore } from "../hooks/auto-update-checker/semver";
 import { getMagicContextStorageDir } from "./data-path";
+import { ensureStorageDirectorySync, writeStorageFileAtomicSync } from "./storage-permissions";
 
 /**
  * Bump only when there are user-visible changes worth a startup dialog.
@@ -60,8 +61,8 @@ type AnnouncementStateRead =
 function readAnnouncementState(): AnnouncementStateRead {
     try {
         const file = getStateFilePath();
-        if (!fs.existsSync(file)) return { status: "missing" };
-        const version = fs.readFileSync(file, "utf-8").trim();
+        if (!existsSync(file)) return { status: "missing" };
+        const version = readFileSync(file, "utf-8").trim();
         if (!version) return { status: "error" };
         return { status: "valid", version };
     } catch {
@@ -88,8 +89,8 @@ export function markAnnouncementSeen(version: string): void {
     if (!version) return;
     try {
         const dir = getMagicContextStorageDir();
-        fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(getStateFilePath(), version);
+        ensureStorageDirectorySync(dir);
+        writeStorageFileAtomicSync(getStateFilePath(), version);
     } catch {
         // best-effort
     }

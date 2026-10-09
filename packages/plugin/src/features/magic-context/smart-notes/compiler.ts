@@ -313,7 +313,6 @@ export async function dryRunSmartNoteCheck(
             };
         },
         signal,
-        timeoutMs: 2_000,
     });
     // A note can wait for a release artifact that does not exist yet, so
     // inaccessible HTTP sources are advisory rather than compilation errors.

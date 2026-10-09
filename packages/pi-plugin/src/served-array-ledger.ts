@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { getMagicContextStorageDir } from "@magic-context/core/shared/data-path";
 import { log } from "@magic-context/core/shared/logger";
+import {
+	ensureStorageDirectorySync,
+	writeStorageFileSync,
+} from "@magic-context/core/shared/storage-permissions";
 import type { PiLkgSerializedOutput } from "./pi-lkg";
 
 export const PI_SERVED_ARRAY_TAIL_MESSAGES = 40;
@@ -144,14 +147,11 @@ function recordWriteFailure(error: unknown): void {
 
 function appendPendingLines(filePath: string, lines: string[]): void {
 	try {
-		fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-		const fd = fs.openSync(filePath, "a", 0o600);
-		try {
-			fs.fchmodSync(fd, 0o600);
-			fs.writeFileSync(fd, lines.join(""), { encoding: "utf8" });
-		} finally {
-			fs.closeSync(fd);
-		}
+		ensureStorageDirectorySync(path.dirname(filePath));
+		writeStorageFileSync(filePath, lines.join(""), {
+			encoding: "utf8",
+			flag: "a",
+		});
 	} catch (error) {
 		recordWriteFailure(error);
 	}

@@ -9,6 +9,8 @@ import {
   ctxBarGeom,
   formatTokensShort,
   normalizeEstimatedContextLimits,
+  type TimelineAxis,
+  timelineAxis,
 } from "../../lib/cache-format";
 import type { DbCacheEvent } from "../../lib/types";
 
@@ -16,6 +18,8 @@ interface TimelineSegment {
   /** Context window shared by every event in this run (0 = unknown/unreported). */
   limit: number;
   events: DbCacheEvent[];
+  /** The segment's own y-axis (see timelineAxis). */
+  axis: TimelineAxis;
 }
 
 /**
@@ -34,9 +38,10 @@ function segmentByContextLimit(events: DbCacheEvent[]): TimelineSegment[] {
     if (last && last.limit === limit) {
       last.events.push(event);
     } else {
-      segments.push({ limit, events: [event] });
+      segments.push({ limit, events: [event], axis: { max: 1, windowInRange: false } });
     }
   }
+  for (const segment of segments) segment.axis = timelineAxis(segment.events, segment.limit);
   return segments;
 }
 
@@ -46,12 +51,16 @@ function formatLimitLabel(limit: number): string {
 
 /**
  * The per-step cache timeline. Bars are grouped into one rounded box per context
- * window; within a box each bar's HEIGHT scales to that window (prompt /
- * context_limit), so the chart reads as the window filling up and dropping at
- * execute passes. The inner segment is the cached (cheap) portion, colored by
- * the step's severity. Each box carries its own left-side axis, and a vertical
- * "old → new" divider marks where the window changed. Steps where Magic Context
- * reclaimed context get a full-height marker line whose tooltip explains why.
+ * window; within a box each bar's HEIGHT is the prompt size on that box's own
+ * token axis. The axis spans the segment's range rather than the whole window
+ * (a 219k session in a 1M window would otherwise be a thin strip), and the
+ * window is still shown: as a dashed line when it is within the axis, or as an
+ * off-scale label at the top of the box when it is far above. The inner segment
+ * is the cached (cheap) portion, colored by the step's severity; busts also get
+ * a red-tinted bar and a red tick above it so they stand out at any density.
+ * A vertical "old → new" divider marks where the window changed. Steps where
+ * Magic Context reclaimed context get a full-height marker line whose tooltip
+ * explains why.
  *
  * Shared by the global Cache Diagnostics page and the per-session viewer; the
  * caller owns scroll-to-list behavior via onBarClick.
@@ -86,10 +95,17 @@ export default function CacheTimeline(props: {
     segmentByContextLimit(normalizeEstimatedContextLimits(props.events)),
   );
 
-  const renderBar = (event: DbCacheEvent) => {
-    const g = ctxBarGeom(event);
+  const renderBar = (event: DbCacheEvent, axis: TimelineAxis) => {
+    const g = ctxBarGeom(event, axis.max);
     const isUnknown = event.severity === "unknown";
-    const outerClass = isUnknown ? "unknown" : event.severity === "full_bust" ? "full_bust" : "";
+    const isBust = event.severity === "bust" || event.severity === "full_bust";
+    const outerClass = isUnknown
+      ? "unknown"
+      : event.severity === "full_bust"
+        ? "bust full_bust"
+        : isBust
+          ? "bust"
+          : "";
     const pctOfWindow = g.limit > 0 ? (g.prompt / g.limit) * 100 : 0;
     const cachedOfPrompt = g.prompt > 0 ? (event.cache_read / g.prompt) * 100 : 0;
     const cachedLine =
@@ -116,6 +132,9 @@ export default function CacheTimeline(props: {
     const title = `${formatDateTime(event.timestamp)}\n${cacheEventLabel(event)}${g.overflow ? " · OVERFLOW" : ""}\nPrompt: ${g.prompt.toLocaleString()} / ${windowLabel} (${pctOfWindow.toFixed(1)}% of window)\n${cachedLine}\nUncached: ${(event.input_tokens + event.cache_write).toLocaleString()}\nCache writes: ${cacheWriteLabel([event])}${dropLine}${causeTip ? `\n${causeTip}` : ""}\n(click → jump to step in list)`;
     return (
       <div class="ctx-bar-slot">
+        <Show when={isBust}>
+          <span class="ctx-bust-mark" />
+        </Show>
         <Show when={event.is_drop}>
           <button
             type="button"
@@ -147,67 +166,103 @@ export default function CacheTimeline(props: {
   };
 
   return (
-    <div class="ctx-chart" ref={chartRef}>
-      <Show when={hoveredDrop()}>
-        {(tip) => (
-          <div
-            class="ctx-drop-tip"
-            style={{
-              left: `${Math.min(92, Math.max(8, tip().xPct))}%`,
-            }}
-          >
-            <div class="ctx-drop-tip-title">⬇ Magic Context reclaimed context</div>
-            <div class="ctx-drop-tip-row">{formatDateTime(tip().event.timestamp)}</div>
-            <div class="ctx-drop-tip-row">
-              {(() => {
-                const cause = tip().event.cause;
-                return cause ? `Cause: ${cacheCauseLabel(cause)}` : "Cause not recorded";
-              })()}
+    <div class="ctx-chart-wrap">
+      <div class="ctx-chart" ref={chartRef}>
+        <Show when={hoveredDrop()}>
+          {(tip) => (
+            <div
+              class="ctx-drop-tip"
+              style={{
+                left: `${Math.min(92, Math.max(8, tip().xPct))}%`,
+              }}
+            >
+              <div class="ctx-drop-tip-title">⬇ Magic Context reclaimed context</div>
+              <div class="ctx-drop-tip-row">{formatDateTime(tip().event.timestamp)}</div>
+              <div class="ctx-drop-tip-row">
+                {(() => {
+                  const cause = tip().event.cause;
+                  return cause ? `Cause: ${cacheCauseLabel(cause)}` : "Cause not recorded";
+                })()}
+              </div>
+              <div class="ctx-drop-tip-hint">click → jump to step</div>
             </div>
-            <div class="ctx-drop-tip-hint">click → jump to step</div>
-          </div>
-        )}
-      </Show>
-      <div class="ctx-segments">
-        <For each={segments()}>
-          {(seg, i) => (
-            <>
-              <Show when={i() > 0}>
-                <div
-                  class="ctx-model-divider"
-                  title={`Context window changed: ${formatLimitLabel(segments()[i() - 1].limit)} → ${formatLimitLabel(seg.limit)}`}
-                >
-                  <span class="ctx-model-divider-label">
-                    {formatLimitLabel(segments()[i() - 1].limit)} → {formatLimitLabel(seg.limit)}
-                  </span>
-                </div>
-              </Show>
-              <div class="ctx-segment" style={{ "flex-grow": String(seg.events.length) }}>
-                <div
-                  class="ctx-axis"
-                  title={
-                    seg.limit > 0
-                      ? "Bar height = prompt / this model's context window"
-                      : "Context window not reported for these steps"
-                  }
-                >
-                  <span>{formatLimitLabel(seg.limit)}</span>
-                  <span>{seg.limit > 0 ? formatTokensShort(seg.limit / 2) : ""}</span>
-                  <span>0</span>
-                </div>
-                <div class="ctx-segment-box">
-                  {/* faint gridlines at 25/50/75% to read the scale against */}
-                  <div class="ctx-gridline" style={{ bottom: "25%" }} />
-                  <div class="ctx-gridline" style={{ bottom: "50%" }} />
-                  <div class="ctx-gridline" style={{ bottom: "75%" }} />
-                  <div class="ctx-bars">
-                    <For each={seg.events}>{(event) => renderBar(event)}</For>
+          )}
+        </Show>
+        <div class="ctx-segments">
+          <For each={segments()}>
+            {(seg, i) => (
+              <>
+                <Show when={i() > 0}>
+                  <div
+                    class="ctx-model-divider"
+                    title={`Context window changed: ${formatLimitLabel(segments()[i() - 1].limit)} → ${formatLimitLabel(seg.limit)}`}
+                  >
+                    <span class="ctx-model-divider-label">
+                      {formatLimitLabel(segments()[i() - 1].limit)} → {formatLimitLabel(seg.limit)}
+                    </span>
+                  </div>
+                </Show>
+                <div class="ctx-segment" style={{ "flex-grow": String(seg.events.length) }}>
+                  <div
+                    class="ctx-segment-caption"
+                    title={
+                      seg.limit <= 0
+                        ? "Context window not reported for these steps"
+                        : seg.axis.windowInRange
+                          ? `Context window: ${seg.limit.toLocaleString()} tokens (dashed line)`
+                          : `Context window: ${seg.limit.toLocaleString()} tokens, above this chart's scale`
+                    }
+                  >
+                    <Show when={seg.limit > 0} fallback="window not reported">
+                      <Show when={seg.axis.windowInRange}>
+                        <span class="ctx-window-swatch" />
+                      </Show>
+                      {formatLimitLabel(seg.limit)} window
+                      <Show when={!seg.axis.windowInRange}> ↑</Show>
+                    </Show>
+                  </div>
+                  <div class="ctx-segment-body">
+                    <div class="ctx-axis" title="Bar height = prompt size in tokens">
+                      <span>{formatTokensShort(seg.axis.max)}</span>
+                      <span>{formatTokensShort(seg.axis.max / 2)}</span>
+                      <span>0</span>
+                    </div>
+                    <div class="ctx-segment-box">
+                      <div class="ctx-bars">
+                        {/* faint gridlines at 25/50/75% of the axis to read the scale against */}
+                        <div class="ctx-gridline" style={{ bottom: "25%" }} />
+                        <div class="ctx-gridline" style={{ bottom: "50%" }} />
+                        <div class="ctx-gridline" style={{ bottom: "75%" }} />
+                        <Show when={seg.limit > 0 && seg.axis.windowInRange}>
+                          <div class="ctx-window-line" />
+                        </Show>
+                        <For each={seg.events}>{(event) => renderBar(event, seg.axis)}</For>
+                      </div>
+                    </div>
                   </div>
                 </div>
-              </div>
-            </>
-          )}
-        </For>
+              </>
+            )}
+          </For>
+        </div>
+      </div>
+      <div class="ctx-legend">
+        <span class="ctx-legend-item">
+          <span class="ctx-legend-swatch cached" />
+          Cached
+        </span>
+        <span class="ctx-legend-item">
+          <span class="ctx-legend-swatch uncached" />
+          Uncached
+        </span>
+        <span class="ctx-legend-item">
+          <span class="ctx-legend-swatch bust" />
+          Bust
+        </span>
+        <span class="ctx-legend-item">
+          <span class="ctx-legend-swatch reclaim" />
+          Context reclaimed
+        </span>
       </div>
     </div>
   );

@@ -17,6 +17,7 @@ import type { LkgSlot } from "./lkg-slot";
 function fixture(): { db: Database; raw: BunDatabase } {
     const raw = new BunDatabase(":memory:");
     raw.exec(`${LKG_SLOTS_DDL} ${LKG_SLOT_CHUNKS_DDL}
+        CREATE TABLE session_meta (session_id TEXT PRIMARY KEY, trailing_blank_decisions TEXT DEFAULT '');
         CREATE TABLE session_projects (session_id TEXT, updated_at INTEGER);`);
     return { db: raw as unknown as Database, raw };
 }
@@ -32,6 +33,24 @@ const slot: LkgSlot = {
 };
 
 describe("LKG durable write discipline", () => {
+    it("does not hydrate a durable slot while marker rebuilding admission is fenced", () => {
+        const { db, raw } = fixture();
+        try {
+            expect(saveLkgSlotToDb(db, "ses", slot)).toBe(true);
+            raw.query("INSERT INTO session_meta VALUES (?, ?)").run(
+                "ses",
+                '{"version":2,"trailingBlank":{},"rustMarkerAdmissionFence":true}',
+            );
+            expect(loadPersistedLkgSlot(db, "ses")).toBeUndefined();
+            raw.query("UPDATE session_meta SET trailing_blank_decisions=? WHERE session_id=?").run(
+                '{"version":2,"trailingBlank":{}}',
+                "ses",
+            );
+            expect(loadPersistedLkgSlot(db, "ses")?.jsonPrefix).toBe(slot.jsonPrefix);
+        } finally {
+            raw.close();
+        }
+    });
     it("writes once for identical passes, but persists a one-byte change and a clear", () => {
         const { db, raw } = fixture();
         try {

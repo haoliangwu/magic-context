@@ -6,6 +6,7 @@ import { LIVE_RELOAD_CONFIG_PATHS, type MagicContextConfig } from "./schema/magi
 /** Copy only schema-marked live paths from fresh config; other settings retain boot values. */
 export function sampleLiveConfig<T extends MagicContextConfig>(boot: T, fresh: T): T {
     const result = { ...boot } as Record<string, unknown>;
+    result.cacheTtlConfigured = fresh.cacheTtlConfigured;
     for (const path of LIVE_RELOAD_CONFIG_PATHS) {
         const parts = path.split(".");
         let value: unknown = fresh;

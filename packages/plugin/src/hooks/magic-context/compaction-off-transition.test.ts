@@ -41,7 +41,7 @@ import {
     setPendingCompactionMarkerState,
     setPersistedCompactionMarkerState,
 } from "../../features/magic-context/storage-meta-persisted";
-import { Database } from "../../shared/sqlite";
+import { Database, withSqliteTransformPass } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import { MARKER_SUMMARY_TEXT } from "./compaction-marker-manager";
 import {
@@ -573,6 +573,55 @@ describe("removeMcOwnedCompactionMarkers (flip-off deletion contract)", () => {
 // ── Mode-record algebra ──────────────────────────────────────────
 
 describe("reconcileCompactionMode — transition algebra", () => {
+    it("retains a durable off transition after SQLITE_BUSY and removes the stale marker on retry", () => {
+        useTempDataHome("mc-mode-busy-removal-retry-");
+        const ocDb = createOpenCodeDb("ses-1");
+        ocDb.exec("PRAGMA journal_mode=WAL");
+        insertMessage(ocDb, "ses-1", { id: "msg-user-1", role: "user" });
+        insertCanonicalMcMarker(ocDb, "ses-1", {
+            boundaryMessageId: "msg-user-1",
+            summaryId: "msg-mc-summary",
+            partId: "prt-mc-compaction",
+            summaryPartId: "prt-mc-summary-text",
+        });
+        const originalRows = dumpRows(ocDb, "ses-1");
+        const db = openDatabase();
+        getOrCreateSessionMeta(db, "ses-1");
+        const args = {
+            db,
+            sessionId: "ses-1",
+            compactionOff: true,
+            historianRunnable: true,
+            compartmentInProgress: false,
+        };
+        ocDb.exec("BEGIN IMMEDIATE");
+        try {
+            const startedAt = performance.now();
+            expect(() => withSqliteTransformPass(() => reconcileCompactionMode(args))).toThrow(
+                /database is locked/,
+            );
+            expect(performance.now() - startedAt).toBeGreaterThanOrEqual(4500);
+            expect(getCompactionModeRecord(db, "ses-1")).toBe("off_notice_pending");
+            expect(dumpRows(ocDb, "ses-1")).toEqual(originalRows);
+        } finally {
+            ocDb.exec("ROLLBACK");
+        }
+        // A new process sees the pending record even though the earlier pass
+        // threw before returning a mode record for its caller to commit.
+        closeCompactionMarkerDb();
+        const retry = reconcileCompactionMode(args);
+        expect(retry.markerCleanup).toMatchObject({ verified: true, removedRows: 3 });
+        expect(retry.recordToWrite).toBe("off");
+        expect(retry.notice).toBe(COMPACTION_OFF_FLIP_NOTICE);
+        commitCompactionModeRecord(db, "ses-1", retry.recordToWrite!);
+        expect(getCompactionModeRecord(db, "ses-1")).toBe("off");
+        expect(dumpRows(ocDb, "ses-1")).toEqual({
+            messages: [originalRows.messages.find((row) => row.id === "msg-user-1")],
+            parts: [],
+        });
+        closeQuietly(ocDb);
+    }, 15_000);
+
     it("keeps an unverified cleanup retry durable until the schema becomes verifiable", () => {
         useTempDataHome("mc-mode-schema-retry-");
         const ocDb = createOpenCodeDb("ses-1");

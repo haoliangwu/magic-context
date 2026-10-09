@@ -639,3 +639,56 @@ describe("applyPiHeuristicCleanup emergency floor accounting", () => {
 		}
 	});
 });
+it("Pi stale removal honors a custom ctx_reduce keep count above three", () => {
+	const db = createTestDb();
+	const sessionId = "pi-protected-stale-six";
+	try {
+		const messages: unknown[] = [];
+		for (let n = 1; n <= 6; n++)
+			messages.push(
+				userMessage(`request ${n}`, n * 3 - 2),
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "toolCall",
+							id: `reduce-${n}`,
+							name: "ctx_reduce",
+							arguments: {},
+						},
+					],
+					timestamp: n * 3 - 1,
+				},
+				{
+					...toolResultMessage(`reduce-${n}`, `result ${n}`, n * 3),
+					toolName: "ctx_reduce",
+				},
+			);
+		const { transcript, targets } = tagMessages(sessionId, db, messages);
+		const result = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
+			protectedTags: 0,
+			protectedCutoff: 100,
+			staleReduceStripEnabled: true,
+			protectedTools: { ctx_reduce: 6 },
+		});
+		transcript.commit();
+		expect(result.droppedStaleReduceCalls).toBe(0);
+		expect(
+			getTagsBySession(db, sessionId).filter((tag) => tag.status === "dropped"),
+		).toEqual([]);
+		const disabled = applyPiHeuristicCleanup(sessionId, db, targets, messages, {
+			protectedTags: 0,
+			protectedCutoff: 100,
+			staleReduceStripEnabled: true,
+			protectedTools: { ctx_reduce: 0 },
+		});
+		expect(disabled.droppedStaleReduceCalls).toBe(6);
+		expect(
+			getTagsBySession(db, sessionId)
+				.filter((tag) => tag.type === "tool")
+				.every((tag) => tag.status === "dropped"),
+		).toBe(true);
+	} finally {
+		closeQuietly(db);
+	}
+});

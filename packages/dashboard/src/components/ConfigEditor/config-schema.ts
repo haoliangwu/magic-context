@@ -26,7 +26,19 @@ export function configDefault(path: string): unknown {
         : undefined;
     node = node?.properties?.[part];
   }
-  return inherited ?? node?.default;
+  // auto_update is optional in the schema, but the runtime opts out only on false.
+  return inherited ?? node?.default ?? (path === "auto_update" ? true : undefined);
+}
+
+export function defaultLabel(path: string): string {
+  const value = configDefault(path);
+  return value === undefined
+    ? "No override"
+    : value === true
+      ? "on"
+      : value === false
+        ? "off"
+        : String(value);
 }
 
 export function defaultPlaceholder(path: string, unset = "No override"): string {

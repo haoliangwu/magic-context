@@ -65,12 +65,20 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
                 "FM-OC-3 recovery",
             );
 
+            // A recovered module can apply a healthy defer while the host keeps
+            // serving frozen LKG bytes. Recovery must not require a cache rewrite.
+            // A parked shortcut cannot satisfy this: it neither applies nor advances
+            // the producer's row version.
+            const healthyAppliedPass = (pass: ReturnType<typeof h.readRustPasses>[number]) =>
+                pass.applied &&
+                pass.rowVersion > (healthyVersions.at(-1) ?? 0) &&
+                (pass.servedFrom === "transform" || pass.servedFrom === "lkg_frozen");
             const passes = await h.waitFor(
                 () => {
                     const observed = h.readRustPasses();
                     return observed
                         .slice(recoveryStart)
-                        .some((pass) => pass.servedFrom === "transform")
+                        .some(healthyAppliedPass)
                         ? observed
                         : undefined;
                 },
@@ -78,7 +86,7 @@ describe.skipIf(!rustPrereqs.ok)("rust failure-mode drill FM-OC-3: parked self-h
             );
             const recovery = passes.slice(recoveryStart);
             expect(recovery.length).toBeLessThanOrEqual(RUST_PARK_RETRY_INTERVAL * 2);
-            expect(recovery.some((pass) => pass.servedFrom === "transform")).toBe(true);
+            expect(recovery.some(healthyAppliedPass)).toBe(true);
 
             const recoveryVersions = recovery
                 .map((pass) => pass.rowVersion)

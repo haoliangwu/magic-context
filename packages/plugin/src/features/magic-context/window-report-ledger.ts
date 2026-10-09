@@ -4,6 +4,7 @@ import type { ContextLimitProvenance } from "../../shared/context-limit-provenan
 import { getMagicContextStorageDir } from "../../shared/data-path";
 import { piModelRefToCanonical } from "../../shared/harness-provider-map";
 import { log } from "../../shared/logger";
+import { ensureStorageDirectorySync, writeStorageFileSync } from "../../shared/storage-permissions";
 import { getOrCreateSessionMeta } from "./storage-meta-session";
 
 const WINDOW_REPORTS_FILE = "window-reports.jsonl";
@@ -341,7 +342,7 @@ export function buildWindowReport(input: AppendWindowReportInput): WindowReport 
 export function appendWindowReport(report: WindowReport): void {
     try {
         const reportPath = getWindowReportsPath();
-        fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+        ensureStorageDirectorySync(path.dirname(reportPath));
         if (
             fs.existsSync(reportPath) &&
             fs.statSync(reportPath).size > WINDOW_REPORTS_ROTATION_BYTES
@@ -350,7 +351,10 @@ export function appendWindowReport(report: WindowReport): void {
             fs.rmSync(rotatedPath, { force: true });
             fs.renameSync(reportPath, rotatedPath);
         }
-        fs.appendFileSync(reportPath, `${JSON.stringify(report)}\n`);
+        writeStorageFileSync(reportPath, `${JSON.stringify(report)}\n`, {
+            encoding: "utf8",
+            flag: "a",
+        });
     } catch (error) {
         recordSwallowedWrite(error);
     }

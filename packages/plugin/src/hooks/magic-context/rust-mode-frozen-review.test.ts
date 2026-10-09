@@ -186,6 +186,9 @@ function reviewSession(label: string) {
             return {
                 ...(typeof step === "string" ? {} : step.response),
                 decision: typeof step === "string" ? step : step.decision,
+                prefix_bust_permitted: ["HARD", "SOFT"].includes(
+                    typeof step === "string" ? step : step.decision,
+                ),
                 served_from: "transform",
                 row_version: pass,
                 native_messages: moduleOutput(lastInput),

@@ -265,7 +265,7 @@ export function writeMagicContextConfig(
     }
 
     Object.assign(editableChild(config, "embedding"), options.embedding);
-    writeFileAtomic(configPath, `${stringifyJsonc(config, null, 2)}\n`);
+    writeFileAtomic(configPath, `${stringifyJsonc(config, null, 2)}\n`, { ownerOnly: true });
 }
 
 async function chooseEmbedding(prompts: PromptIO): Promise<EmbeddingChoice> {

@@ -2,8 +2,8 @@ import type { Database } from "../../../shared/sqlite";
 import { getLeaseHolder, peekLeaseHolderAndExpiry } from "../dreamer/lease";
 import { leaseKeyFor } from "../dreamer/task-registry";
 import { markNoteReady } from "../storage-notes";
-import { createSmartNoteCapabilities } from "./capabilities";
-import { runCompiledSmartNoteCheck } from "./sandbox-runner";
+import { createSmartNoteCapabilities, readSmartNoteGithubToken } from "./capabilities";
+import { runCompiledSmartNoteCheck, SMART_NOTE_CHECK_TIMEOUT_MS } from "./sandbox-runner";
 import { nextSmartNoteCheckDueAt } from "./schedule";
 import {
     commitSmartNoteState,
@@ -26,6 +26,7 @@ export interface RunDueCompiledSmartNoteChecksArgs {
     leaseHeld?: () => boolean;
     signal?: AbortSignal;
     retinaHandoff?: boolean;
+    githubToken?: string | null;
 }
 
 export interface RunDueCompiledSmartNoteChecksResult {
@@ -71,9 +72,17 @@ export async function runDueCompiledSmartNoteChecks(
     let networkFailed = 0;
     const leaseHeld =
         args.leaseHeld ?? inferEvaluateSmartNotesLeaseHeld(args.db, args.projectIdentity);
+    const githubToken =
+        args.githubToken === undefined ? await readSmartNoteGithubToken() : args.githubToken;
 
     for (const note of due) {
-        if (Date.now() - startedAt >= (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS)) break;
+        const remaining =
+            (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS) - (Date.now() - startedAt);
+        if (remaining <= 0) break;
+        // Admit fewer notes rather than shorten their network deadline. The first
+        // attempt still supports explicitly small test/caller budgets. Loading
+        // and VM queuing must finish within the sweep's remaining budget.
+        if (ran > 0 && remaining < SMART_NOTE_CHECK_TIMEOUT_MS) break;
         if (!note.compiledCheck) continue;
         const compiledCheck = note.compiledCheck;
         ran++;
@@ -81,10 +90,6 @@ export async function runDueCompiledSmartNoteChecks(
         const abortFromCaller = () => controller.abort(args.signal?.reason);
         if (args.signal?.aborted) abortFromCaller();
         else args.signal?.addEventListener("abort", abortFromCaller, { once: true });
-        const remaining = Math.max(
-            500,
-            (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS) - (Date.now() - startedAt),
-        );
         const timer = setTimeout(
             () => controller.abort(new Error("smart-note sweep budget exhausted")),
             remaining,
@@ -96,9 +101,24 @@ export async function runDueCompiledSmartNoteChecks(
                     createSmartNoteCapabilities({
                         projectRoot: args.projectRoot,
                         signal,
+                        githubToken,
                     }),
                 signal: controller.signal,
-                timeoutMs: Math.min(2_000, remaining),
+                // Treat the sweep deadline as an admission/queue deadline, not
+                // an execution deadline: a check that starts in time gets its
+                // full CPU and HTTP budgets even after a slow VM load. The VM's
+                // own deadline caps overrun at one check (6s), and no later note
+                // is admitted once the sweep budget is spent. Caller/lease
+                // cancellation still interrupts an active check immediately.
+                onExecutionStart: () => {
+                    clearTimeout(timer);
+                    // Loading can block the host event loop past an eligible
+                    // timer. Do not admit execution merely because its callback
+                    // has not been delivered yet.
+                    if (Date.now() - startedAt >= (args.sweepBudgetMs ?? DEFAULT_SWEEP_BUDGET_MS)) {
+                        controller.abort(new Error("smart-note sweep budget exhausted"));
+                    }
+                },
             });
             const runFinishedAt = Date.now();
             const expected = {

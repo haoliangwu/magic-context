@@ -116,6 +116,21 @@ describe("dreamer lease (serialized acquisition)", () => {
         closeQuietly(db);
     });
 
+    it("renew with an earlier acquisition's generation fails after the same holder reacquires", () => {
+        // A heartbeat started for one acquisition must not extend a later one,
+        // even when the holder id is the same: the generation is the only thing
+        // that tells the two acquisitions apart once the first was released.
+        const db = makeDb();
+        const first = acquireLeaseWithAcquisition(db, "holder-a");
+        expect(first).not.toBeNull();
+        releaseLease(db, "holder-a");
+        const second = acquireLeaseWithAcquisition(db, "holder-a");
+        expect(second?.generation).toBe((first?.generation ?? 0) + 1);
+        expect(renewLease(db, "holder-a", DREAMING_LEASE_KEY, first?.generation)).toBe(false);
+        expect(renewLease(db, "holder-a", DREAMING_LEASE_KEY, second?.generation)).toBe(true);
+        closeQuietly(db);
+    });
+
     it("release is a no-op after another holder reclaims the lease", () => {
         const db = makeDb();
         expect(acquireLease(db, "holder-a")).toBe(true);

@@ -62,7 +62,10 @@ import { beginSqliteWriterAsync } from "../../shared/sqlite";
 import { logSlowWriteTransaction } from "../../shared/write-transaction-timing";
 import { updateCompactionMarkerAfterPublication } from "./compaction-marker-manager";
 import { buildCompartmentAgentPrompt, COMPARTMENT_AGENT_SYSTEM_PROMPT } from "./compartment-prompt";
-import { queueDropsForCompartmentalizedMessages } from "./compartment-runner-drop-queue";
+import {
+    prepareCompartmentDrops,
+    queuePreparedCompartmentDrops,
+} from "./compartment-runner-drop-queue";
 import { runValidatedHistorianPass } from "./compartment-runner-historian";
 import type { HiddenCompartmentRunnerDeps } from "./compartment-runner-types";
 import {
@@ -1028,6 +1031,13 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
             lastCompartmentEnd,
             { db, fromMessageIndex: offset },
         );
+        const preparedDrops = prepareCompartmentDrops(
+            db,
+            sessionId,
+            lastCompartmentEnd,
+            compartmentTagKeys,
+            offset,
+        );
         let published = false;
         const transactionStartedAt = startHistorianPublishStage(sessionId, "publish-txn");
         const lockAcquiredAt = await beginSqliteWriterAsync(db, "historian-publish");
@@ -1111,13 +1121,7 @@ export async function runCompartmentAgent(deps: HiddenCompartmentRunnerDeps): Pr
                 }
             }
 
-            queueDropsForCompartmentalizedMessages(
-                db,
-                sessionId,
-                lastCompartmentEnd,
-                compartmentTagKeys,
-                offset,
-            );
+            queuePreparedCompartmentDrops(db, preparedDrops);
             finishHistorianPublishStage(
                 sessionId,
                 "post-publish-drops",

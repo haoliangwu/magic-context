@@ -33,8 +33,10 @@ fn context() -> ProducerContext<'static> {
         protected_tokens_provenance: "derived",
         compaction_enabled: true,
         smart_drops: false,
+        protected_tools: [("todowrite".to_string(), 1), ("ctx_reduce".to_string(), 3)].into(),
         cache_ttl: "5m".into(),
         cache_ttl_provenance: CacheTtlProvenance::Default,
+        cache_ttl_policy: None,
         model_key: None,
         observed_last_response_at_ms: None,
         guidance_date: Some("Today's date: Thu Jan 01 1970".into()),
@@ -141,7 +143,7 @@ fn subagent_flip_defers_served_tags_and_tags_new_tail_on_first_sight() {
         "ck": { "role": "user", "content": [{"kind": {"type": "text", "text": "new tail"}}],
             "meta": {"harness_id": "m9", "created_at_ms": 5_400_000}}
     }));
-    let grown: TransformRequest = serde_json::from_value(raw).unwrap();
+    let mut grown: TransformRequest = serde_json::from_value(raw).unwrap();
     let first_sight = run(&store, &grown);
     let replay = run(&store, &grown);
     assert!(!store.load("review").unwrap().meta.initialized);
@@ -151,10 +153,31 @@ fn subagent_flip_defers_served_tags_and_tags_new_tail_on_first_sight() {
     assert!(tagged(&transition));
     assert_eq!(first_sight.action, "SOFT+");
     let wire = String::from_utf8(bytes(&first_sight)).unwrap();
-    assert!(wire.contains("§9§ <!-- +10m -->"));
+    // First-sight tags remain additive on a defer, but new temporal choices
+    // wait for a rebuilding pass so they cannot change the frozen prefix.
+    assert!(wire.contains("§9§ new tail"));
+    assert!(!wire.contains("§9§ <!-- +10m -->"));
     assert!(wire.contains("§1§ message 1"));
     assert_eq!(replay.action, "SOFT+");
     assert_eq!(bytes(&first_sight), bytes(&replay));
+    grown.usage = Some(
+        serde_json::from_value(json!({
+            "current_total_input_tokens": 96_000,
+            "context_limit_tokens": 100_000,
+            "final_wire_input_tokens": 0,
+            "final_wire_trusted": false
+        }))
+        .unwrap(),
+    );
+    let rebuilt = run(&store, &grown);
+    assert_eq!(rebuilt.action, "SOFT");
+    assert!(String::from_utf8(bytes(&rebuilt))
+        .unwrap()
+        .contains("§9§ <!-- +10m -->"));
+    grown.usage.as_mut().unwrap().current_total_input_tokens = 1_000;
+    let rebuilt_replay = run(&store, &grown);
+    assert_eq!(rebuilt_replay.action, "SOFT+");
+    assert_eq!(bytes(&rebuilt), bytes(&rebuilt_replay));
 }
 
 #[test]

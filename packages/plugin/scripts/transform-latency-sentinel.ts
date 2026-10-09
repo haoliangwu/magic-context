@@ -1,11 +1,15 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
-import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { homedir, loadavg, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { SubcClient } from "@cortexkit/subc-client";
-
+import { loadPluginConfig } from "../src/config";
 import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
+import {
+    setStoragePrivatePermissionEnforcement,
+    writeStorageFileAtomicSync,
+} from "../src/shared/storage-permissions";
 import { parseAgentDeliverReply } from "./cache-bust-sentinel";
 
 const HOUR = 3_600_000;
@@ -36,10 +40,7 @@ function readState(path: string): State {
     return value;
 }
 function saveState(path: string, state: State): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    writeStorageFileAtomicSync(path, `${JSON.stringify(state)}\n`);
 }
 
 // Leave an incomplete final line at the watermark; it can only be parsed after its newline arrives.
@@ -316,6 +317,9 @@ export async function runLatencySentinel(options: LatencyOptions): Promise<{ ale
 
 if (import.meta.main) {
     try {
+        setStoragePrivatePermissionEnforcement(
+            loadPluginConfig(process.cwd()).storage.enforce_private_permissions,
+        );
         const args = process.argv.slice(2);
         const values = new Map<string, string>();
         const flags = new Set(["--opencode-log", "--pi-log", "--module-log", "--db", "--peer-db", "--state-file", "--connection-file", "--since", "--until"]);

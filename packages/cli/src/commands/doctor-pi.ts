@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { resolveCortexKitProjectConfigPath } from "@magic-context/core/config/migrate-config-location";
 import {
     dropInheritedEmbeddingKeyOnRedirect,
@@ -34,6 +34,7 @@ import {
     getMagicContextStorageDir,
     getMagicContextStorageResolution,
 } from "@magic-context/core/shared/data-path";
+import { removeJsoncValue } from "@magic-context/core/shared/jsonc-edit";
 import {
     isPrototypePollutionKey,
     parseJsoncRecovering,
@@ -47,7 +48,6 @@ import {
     runnablePiModelChains,
 } from "@magic-context/pi-core/model-chain-health";
 import { parse as parseCommentJson, stringify as stringifyJsonc } from "comment-json";
-
 import { writeFileAtomic } from "../lib/atomic-write";
 import {
     hasUserConfigLocationMigrationRefusal,
@@ -103,6 +103,7 @@ import {
     readStorageVersions,
 } from "../lib/storage-versions";
 import { runV22BackfillCommands, type V22BackfillCommandArgs } from "../lib/v22-backfill-commands";
+import { removeDeprecatedReasoningAge } from "./reasoning-config-migration";
 import { writePiSettingsPackage } from "./setup-pi";
 
 const PACKAGE_NAME = "@cortexkit/pi-magic-context";
@@ -123,6 +124,7 @@ interface RepairPlan {
     addPackageEntry: boolean;
     writeUserConfig: boolean;
     clearCachePaths: string[];
+    reasoningAgeConfigPaths: string[];
 }
 
 interface HealthReport {
@@ -597,6 +599,7 @@ async function runHealthChecks(options: {
         addPackageEntry: false,
         writeUserConfig: false,
         clearCachePaths: [],
+        reasoningAgeConfigPaths: [],
     };
     const self = options.deps.selfVersion();
 
@@ -687,6 +690,14 @@ async function runHealthChecks(options: {
             continue;
         }
         const parsed = readMagicContextJsonc(path, label);
+        if (!parsed.error && Object.hasOwn(parsed.value, "clear_reasoning_age")) {
+            repairPlan.reasoningAgeConfigPaths.push(path);
+            add(
+                results,
+                "warn",
+                `${label} clear_reasoning_age is deprecated and ignored; doctor removes it`,
+            );
+        }
         if (parsed.error)
             add(results, "fail", `${label} magic-context.jsonc is invalid JSONC: ${parsed.error}`);
         else add(results, "pass", `${label} magic-context.jsonc is valid JSONC: ${path}`);
@@ -1101,18 +1112,29 @@ async function runHealthChecks(options: {
 }
 
 function writeDefaultMagicContextConfig(path: string): void {
-    mkdirSync(dirname(path), { recursive: true });
     // Only the editor schema reference: writing every schema default explicitly
     // would pin those values, so later default changes would never take effect.
     const config = {
         $schema:
             "https://raw.githubusercontent.com/cortexkit/magic-context/master/assets/magic-context.schema.json",
     };
-    writeFileAtomic(path, `${stringifyJsonc(config, null, 2)}\n`);
+    writeFileAtomic(path, `${stringifyJsonc(config, null, 2)}\n`, { ownerOnly: true });
 }
 
 function repair(plan: RepairPlan, prompts: PromptIO): number {
     let fixed = 0;
+    for (const path of plan.reasoningAgeConfigPaths) {
+        const content = readFileSync(path, "utf8");
+        const parsed = readJsonc(path);
+        if (parsed.error) continue;
+        const messages = removeDeprecatedReasoningAge(parsed.value);
+        if (messages.length === 0) continue;
+        writeFileAtomic(path, removeJsoncValue(content, ["clear_reasoning_age"]), {
+            ownerOnly: true,
+        });
+        for (const message of messages) prompts.log.success(message);
+        fixed++;
+    }
     if (plan.addPackageEntry) {
         const settingsPath = getPiUserExtensionsPath();
         try {

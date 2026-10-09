@@ -1,0 +1,13 @@
+{
+  "messages": [
+    { "id": "prior", "role": "assistant", "created": 100000, "completed": 300000, "text": "answer" },
+    { "id": "user", "role": "user", "created": 600000, "text": "question" },
+    { "id": "later", "role": "user", "created": 1200000, "text": "follow up" },
+    { "id": "near", "role": "user", "created": 1201000, "text": "nearby" }
+  ],
+  "served_users": [
+    "§2§ <!-- +5m -->\nquestion",
+    "§3§ <!-- +10m -->\nfollow up",
+    "§4§ nearby"
+  ]
+}

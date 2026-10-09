@@ -17,6 +17,23 @@ const fakeCap: SmartNoteCapabilityApi = {
     httpGet: async () => ({ status: 200, body: "ok" }),
 };
 
+async function withinTestDeadline<T>(promise: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                    () => reject(new Error("sandbox did not settle or release its lock")),
+                    800,
+                );
+            }),
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 describe("compiled smart-note QuickJS runner", () => {
     test("runs a check with injected capabilities", async () => {
         const result = await runCompiledSmartNoteCheck({
@@ -121,6 +138,109 @@ describe("compiled smart-note QuickJS runner", () => {
             ),
         ])) as Awaited<ReturnType<typeof runCompiledSmartNoteCheck>>;
         expect(followup).toEqual({ ok: true, result: { met: true } });
+    });
+
+    test.each([
+        "httpGet",
+        "readFile",
+        "gitHeadSha",
+        "gitTag",
+        "gitLog",
+    ] as const)("settles by its deadline and releases the lock when %s ignores abort forever", async (method) => {
+        // Load the shared module before measuring the execution deadline.
+        await runCompiledSmartNoteCheck({
+            compiledCheck: "function check() { return {met:false}; }",
+            capabilities: fakeCap,
+        });
+        let entered!: () => void;
+        const suspended = new Promise<void>((resolve) => {
+            entered = resolve;
+        });
+        let runSignal!: AbortSignal;
+        const startedAt = performance.now();
+        const owner = runCompiledSmartNoteCheck({
+            compiledCheck: `function check(cap) { cap.${method}("https://api.github.com/never"); return {met:true}; }`,
+            capabilityFactory: (signal) => {
+                runSignal = signal;
+                return {
+                    ...fakeCap,
+                    [method]: () => {
+                        entered();
+                        // Deliberately ignore the signal: the VM bridge, not
+                        // a cooperative transport, must enforce the deadline.
+                        return new Promise<never>(() => {});
+                    },
+                };
+            },
+            timeoutMs: 100,
+        });
+        await withinTestDeadline(suspended);
+        // Queue while the owner holds the shared asyncify suspension stack.
+        const followup = runCompiledSmartNoteCheck({
+            compiledCheck:
+                'function check(cap) { return {met:cap.readFile("ready.txt") === "ready"}; }',
+            capabilities: fakeCap,
+        });
+        const result = await withinTestDeadline(owner);
+        const elapsed = performance.now() - startedAt;
+        expect(result).toMatchObject({
+            ok: false,
+            cancelled: false,
+            network: method === "httpGet",
+            persistent: false,
+        });
+        expect(runSignal.aborted).toBe(true);
+        expect(elapsed).toBeGreaterThanOrEqual(75);
+        expect(elapsed).toBeLessThan(750);
+        if (result.ok || result.cancelled) throw new Error("expected deadline failure");
+        if (method === "httpGet") {
+            expect(result.error).toContain("timed out waiting on HTTP");
+            expect(result.retryAt).toBeGreaterThan(Date.now());
+        } else {
+            expect(result.error).toContain("timed out");
+            expect(result.retryAt).toBeUndefined();
+        }
+        expect(await withinTestDeadline(followup)).toEqual({ ok: true, result: { met: true } });
+    });
+
+    test.each([
+        "resolve",
+        "reject",
+    ] as const)("a capability's late %s cannot resume a disposed VM or corrupt the next check", async (settlement) => {
+        let settle!: () => void;
+        const result = await withinTestDeadline(
+            runCompiledSmartNoteCheck({
+                compiledCheck:
+                    'function check(cap) { cap.httpGet("https://example.test/"); return {met:true}; }',
+                capabilities: {
+                    ...fakeCap,
+                    httpGet: () =>
+                        new Promise((resolve, reject) => {
+                            settle = () =>
+                                settlement === "resolve"
+                                    ? resolve({ status: 200, body: "late" })
+                                    : reject(new Error("late transport error"));
+                        }),
+                },
+                timeoutMs: 75,
+            }),
+        );
+        expect(result).toMatchObject({ ok: false, cancelled: false, network: true });
+        const followup = runCompiledSmartNoteCheck({
+            compiledCheck:
+                'function check(cap) { return {met:cap.readFile("ready.txt") === "ready"}; }',
+            capabilities: {
+                ...fakeCap,
+                readFile: async () => {
+                    // Resolve/reject the old transport while a different VM
+                    // is using the same module's asyncify stack.
+                    settle();
+                    await new Promise((resolve) => setTimeout(resolve, 5));
+                    return "ready";
+                },
+            },
+        });
+        expect(await withinTestDeadline(followup)).toEqual({ ok: true, result: { met: true } });
     });
 
     test("rejects a project FIFO without wedging the shared sandbox lock", async () => {

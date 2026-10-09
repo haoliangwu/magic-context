@@ -4,7 +4,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { chmodSync, createWriteStream, mkdirSync, rmSync } from "node:fs";
+import { closeSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { COMPACTION_ENABLED_PATH, isCompactionEnabled } from "../config/agent-disable";
@@ -47,7 +47,7 @@ import { readSessionCacheTtl } from "../features/magic-context/session-cache-ttl
 import { getQuickJsNativeMemoryStats } from "../features/magic-context/smart-notes/sandbox-runner";
 import {
     type ContextDatabase as Database,
-    openDatabase,
+    openCurrentDatabase as openDatabase,
     setSessionWorkMetrics,
 } from "../features/magic-context/storage";
 import {
@@ -125,7 +125,12 @@ import type {
 } from "../shared/rpc-types";
 import { getSqliteMemoryStats } from "../shared/sqlite";
 import { importPluginModule } from "../shared/stale-plugin-build";
-import { shouldEnforcePrivateStoragePermissions } from "../shared/storage-permissions";
+import {
+    createStorageWriteStream,
+    ensureStorageDirectorySync,
+    shouldEnforcePrivateStoragePermissions,
+    writeStorageFileAsync,
+} from "../shared/storage-permissions";
 import {
     resolveTailHygieneStatus,
     type WireTailHygieneBaseline,
@@ -805,6 +810,7 @@ export function buildStatusDetail(
               }
             : undefined;
     const liveConfig = currentPluginConfigReader(directory);
+    const liveTtlConfig = liveConfig?.poll().effective;
     const liveFailure = liveConfig?.lastFailure();
     const detail: StatusDetail = {
         ...base,
@@ -1008,8 +1014,11 @@ export function buildStatusDetail(
 
             const ttlDisplay = resolveCacheTtlDisplay({
                 frozen: readSessionCacheTtl(db, sessionId),
-                configured: (config.cache_ttl ?? "5m") as MagicContextConfig["cache_ttl"],
-                configuredExplicitly: config.cacheTtlConfigured === true,
+                configured: (liveTtlConfig?.cache_ttl ??
+                    config.cache_ttl ??
+                    "5m") as MagicContextConfig["cache_ttl"],
+                configuredExplicitly:
+                    (liveTtlConfig?.cacheTtlConfigured ?? config.cacheTtlConfigured) === true,
                 modelKey,
                 sessionValue: persistedCacheTtl,
                 sessionModelKey: persistedModelKey,
@@ -1288,7 +1297,7 @@ async function writeSnapshotJson(
     snapshot: Record<string, unknown>,
     enforcePrivatePermissions: boolean,
 ): Promise<void> {
-    const writer = createWriteStream(path, enforcePrivatePermissions ? { mode: 0o600 } : undefined);
+    const writer = createStorageWriteStream(path, enforcePrivatePermissions);
     const writeChunk = async (chunk: string): Promise<void> => {
         if (!writer.write(chunk)) await once(writer, "drain");
     };
@@ -1361,10 +1370,7 @@ async function generateDebugHeapSnapshot(
 
     const directory = join(storageDir, "heap-snapshots");
     const enforcePrivatePermissions = shouldEnforcePrivateStoragePermissions();
-    mkdirSync(
-        directory,
-        enforcePrivatePermissions ? { recursive: true, mode: 0o700 } : { recursive: true },
-    );
+    ensureStorageDirectorySync(directory);
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const path = join(directory, `${timestamp}-${process.pid}.heapsnapshot`);
 
@@ -1386,7 +1392,7 @@ async function generateDebugHeapSnapshot(
     }
 
     if (typeof snapshot === "string") {
-        await Bun.write(path, snapshot);
+        await writeStorageFileAsync(path, snapshot, enforcePrivatePermissions);
     } else {
         await writeSnapshotJson(
             path,
@@ -1399,13 +1405,6 @@ async function generateDebugHeapSnapshot(
             },
             enforcePrivatePermissions,
         );
-    }
-    if (enforcePrivatePermissions) {
-        try {
-            chmodSync(path, 0o600);
-        } catch {
-            // A tightening failure does not invalidate the completed diagnostic capture.
-        }
     }
     return { ...memory, path, format, snapshotVersion };
 }
@@ -1453,6 +1452,9 @@ export function registerRpcHandlers(
         liveSessionState: LiveSessionState;
         rustModeModuleClient?: RustModeModuleClient;
         hiddenCompletionExecutor?: HiddenCompletionExecutor;
+        compactionMarkerStrategy?: ManagedRecompContext["compactionMarkerStrategy"];
+        /** Install the host's history source even before a reopened session's first pass. */
+        prepareHistorySession?: (sessionId: string) => void;
         storageDir?: string;
         getDebugMemoryHolders?: () => RuntimeDebugMemoryHolders | undefined;
         getDatabase?: () => Database | null;
@@ -1639,6 +1641,7 @@ export function registerRpcHandlers(
         return {
             client: args.client as ManagedRecompContext["client"],
             hiddenCompletionExecutor: args.hiddenCompletionExecutor,
+            compactionMarkerStrategy: args.compactionMarkerStrategy,
             db,
             liveSessionState,
             directory,
@@ -1692,6 +1695,7 @@ export function registerRpcHandlers(
             };
         }
         const ctx = await buildManagedCtx(db);
+        args.prepareHistorySession?.(sessionId);
         // Fire-and-forget. OpenCode 1 force-persists the outcome as a chat row so a
         // multi-minute recomp's result stays in scrollback instead of a 5s toast.
         // OpenCode 2 has no SDK client to write that row with, so the outcome goes
@@ -1802,6 +1806,7 @@ export function registerRpcHandlers(
                 liveSessionState.pendingMaterializationSessions.has(sid),
         };
         log(`[rpc] wrapup requested for session ${sessionId} (keep ${messagesToKeep})`);
+        args.prepareHistorySession?.(sessionId);
         // Fire-and-forget: a wrapup runs the historian over the live tail and can
         // take minutes, which is far longer than an RPC caller can wait.
         void runManagedWrapup(ctx, sessionId, { messagesToKeep })

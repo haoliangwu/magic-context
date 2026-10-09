@@ -221,6 +221,14 @@ export interface ModuleCallTimings {
     settle: number;
 }
 
+function moduleRequestBody(body: unknown, method: string): unknown {
+    if (!isRecord(body)) return body;
+    // Flat management requests dispatch on method; MCP facade calls dispatch on
+    // name/arguments and must remain method-free to reach the facade handler.
+    const facade = typeof body.name === "string" && isRecord(body.arguments);
+    return { ...body, ...(facade ? {} : { method }), accept_reply_pages: true };
+}
+
 export class SubcModuleTransport {
     private readonly connectionFile: string;
     private readonly moduleId: string;
@@ -593,13 +601,7 @@ export class SubcModuleTransport {
                         args.body instanceof Uint8Array
                             ? args.body
                             : Buffer.from(
-                                  JSON.stringify(
-                                      args.body !== null &&
-                                          typeof args.body === "object" &&
-                                          !Array.isArray(args.body)
-                                          ? { ...args.body, accept_reply_pages: true }
-                                          : args.body,
-                                  ),
+                                  JSON.stringify(moduleRequestBody(args.body, args.method)),
                               );
                     timings.encode += performance.now() - encodeStartedAt;
                     const issueStartedAt = performance.now();

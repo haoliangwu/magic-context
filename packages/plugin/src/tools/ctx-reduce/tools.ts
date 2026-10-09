@@ -5,7 +5,9 @@ import {
     type ProtectionWindowResult,
 } from "../../features/magic-context/protection-window";
 import { parseRangeString } from "../../features/magic-context/range-parser";
+import { protectedToolTagNumbers } from "../../features/magic-context/reclaim-protection";
 import {
+    getActiveTagsBySession,
     getOrCreateSessionMeta,
     getPendingOps,
     getTagsByNumbers,
@@ -19,7 +21,7 @@ import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { renderCapabilityRefusal } from "../../shared/user-facing-codes";
 import { unwrapImitatedReducedArgs } from "../unwrap-imitated-reduced-args";
-import { CTX_REDUCE_DESCRIPTION } from "./constants";
+import { CTX_REDUCE_DESCRIPTION, ctxReduceSelfStampMessage } from "./constants";
 import type { CtxReduceArgs } from "./types";
 
 export { CTX_REDUCE_LIGHT_DESCRIPTION } from "../light-descriptions";
@@ -27,12 +29,12 @@ export { CTX_REDUCE_LIGHT_DESCRIPTION } from "../light-descriptions";
 export interface CtxReduceToolDeps {
     db: Database;
     /**
-     * Union projection form: protectedSet (tag-number set form).
-     * Coordinate space: tag-number space.
-     * Empty-window behavior: empty set means zero tool tags are protected by the window;
-     * requested drops apply immediately, and non-tool tags are never reclaim targets.
+     * Tag numbers protected by the current token window. An empty set means no
+     * results are held by that window; per-tool keep counts still hold queued
+     * drops until newer calls displace the result and a rebuilding pass applies them.
      */
     protectedSet?: ReadonlySet<number> | ((sessionId: string) => ReadonlySet<number>);
+    protectedTools?: Readonly<Record<string, number>>;
     getProtectionWindow?: (sessionId: string) => ProtectionWindowResult;
     floor?: number;
     getSessionTokens?: (sessionId: string) => number;
@@ -135,13 +137,52 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                         return renderCapabilityRefusal("context_cleanup");
                     }
                     const queued = typeof record.queued === "number" ? record.queued : 0;
+                    const refusedStamps = Array.isArray(record.ctx_reduce_self_stamps)
+                        ? record.ctx_reduce_self_stamps.filter(
+                              (tagNumber): tagNumber is number =>
+                                  typeof tagNumber === "number" && Number.isInteger(tagNumber),
+                          )
+                        : [];
+                    const refusedStampNote = refusedStamps.map(ctxReduceSelfStampMessage).join(" ");
+                    const acceptedTagNumbers = Array.isArray(record.ctx_reduce_queued_tags)
+                        ? record.ctx_reduce_queued_tags.filter(
+                              (tagNumber): tagNumber is number =>
+                                  typeof tagNumber === "number" && Number.isInteger(tagNumber),
+                          )
+                        : null;
                     if (queued <= 0) {
+                        if (refusedStampNote) return refusedStampNote;
                         return "All requested tags were already queued or processed. No new action is needed.";
+                    }
+                    if (
+                        Array.isArray(record.held_tag_numbers) &&
+                        record.held_tag_numbers.length > 0
+                    ) {
+                        const held = record.held_tag_numbers.filter(
+                            (number): number is number => typeof number === "number",
+                        );
+                        const immediate = Array.isArray(record.immediate_tag_numbers)
+                            ? record.immediate_tag_numbers.filter(
+                                  (number): number is number => typeof number === "number",
+                              )
+                            : [];
+                        const sentence =
+                            held.length === 1
+                                ? `Held: §${held[0]} is inside the protected working set; it applies once newer work displaces it.`
+                                : `Held: ${held.map((id) => `§${id}`).join(", ")} are inside the protected working set; they apply once newer work displaces them.`;
+                        const acknowledgement =
+                            immediate.length > 0
+                                ? `Queued: drop ${formatIds(immediate)}. ${sentence}`
+                                : sentence;
+                        return `${acknowledgement}${refusedStampNote ? ` ${refusedStampNote}` : ""}`;
                     }
                     // The module owns range parsing and tag canonicalization. Keep the
                     // existing queued acknowledgement shape without reimplementing that
                     // parsing in the OpenCode tool.
-                    return `Queued: drop ${formatRawDropForAck(args.drop)}.`;
+                    const acknowledgedDrop = acceptedTagNumbers
+                        ? formatIds(acceptedTagNumbers)
+                        : formatRawDropForAck(args.drop);
+                    return `Queued: drop ${acknowledgedDrop}.${refusedStampNote ? ` ${refusedStampNote}` : ""}`;
                 } catch (error) {
                     sessionLog(sessionId, "ctx_reduce capability refusal", error);
                     return renderCapabilityRefusal("context_cleanup");
@@ -165,6 +206,18 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
                 return `Error: Unknown tag(s) ${formatIds(unknownIds)}. Check available tags in conversation.`;
             }
 
+            const ctxReduceSelfStampIds = new Set(
+                allTags
+                    .filter((tag) => tag.toolName?.toLowerCase() === "ctx_reduce")
+                    .map((tag) => tag.tagNumber),
+            );
+            const ctxReduceSelfStampNote = dropIds
+                .filter((id) => ctxReduceSelfStampIds.has(id))
+                .filter((id, index, ids) => ids.indexOf(id) === index)
+                .map(ctxReduceSelfStampMessage)
+                .join(" ");
+            dropIds = dropIds.filter((id) => !ctxReduceSelfStampIds.has(id));
+
             // Form: protectedSet (tag-number set form). Coordinate space: tag-number space.
             // Empty-window behavior: empty set means zero tool tags are protected by the window;
             // non-tool tags never become reclaim targets.
@@ -185,6 +238,13 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             }
 
             const tagStatusMap = new Map(allTags.map((tag) => [tag.tagNumber, tag.status]));
+            protectedSet = new Set([
+                ...protectedSet,
+                ...protectedToolTagNumbers(
+                    getActiveTagsBySession(deps.db, sessionId),
+                    deps.protectedTools,
+                ),
+            ]);
             const inertWhitespaceTagNumbers = new Set(
                 getInertWhitespaceAssistantTags(deps.db, sessionId).map((tag) => tag.tagNumber),
             );
@@ -221,12 +281,13 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             const skippedCount = preFilterDropCount - dropIds.length;
 
             if (dropIds.length === 0) {
-                return [
-                    inertNote,
-                    "All requested tags were already queued or processed. No new action is needed.",
-                ]
-                    .filter(Boolean)
-                    .join(" ");
+                const noActionNotes = [ctxReduceSelfStampNote, inertNote].filter(Boolean);
+                if (!ctxReduceSelfStampNote) {
+                    noActionNotes.push(
+                        "All requested tags were already queued or processed. No new action is needed.",
+                    );
+                }
+                return noActionNotes.join(" ");
             }
 
             try {
@@ -263,15 +324,15 @@ function createCtxReduceTool(deps: CtxReduceToolDeps): ToolDefinition {
             }
 
             if (immediateDropIds.length > 0 && heldSentence.length > 0) {
-                return `Queued: drop ${formatIds(immediateDropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""} ${heldSentence}`;
+                return `Queued: drop ${formatIds(immediateDropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""} ${heldSentence}${ctxReduceSelfStampNote ? ` ${ctxReduceSelfStampNote}` : ""}`;
             }
             if (immediateDropIds.length > 0) {
-                return `Queued: drop ${formatIds(immediateDropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""}`;
+                return `Queued: drop ${formatIds(immediateDropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""}${ctxReduceSelfStampNote ? ` ${ctxReduceSelfStampNote}` : ""}`;
             }
             if (heldSentence.length > 0) {
-                return `${heldSentence}${skippedNote}${inertNote ? ` ${inertNote}` : ""}`;
+                return `${heldSentence}${skippedNote}${inertNote ? ` ${inertNote}` : ""}${ctxReduceSelfStampNote ? ` ${ctxReduceSelfStampNote}` : ""}`;
             }
-            return `Queued: drop ${formatIds(dropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""}`;
+            return `Queued: drop ${formatIds(dropIds)}.${skippedNote}${inertNote ? ` ${inertNote}` : ""}${ctxReduceSelfStampNote ? ` ${ctxReduceSelfStampNote}` : ""}`;
         },
     });
 }

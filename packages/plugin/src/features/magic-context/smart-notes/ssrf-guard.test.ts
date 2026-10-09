@@ -476,7 +476,13 @@ describe("guarded HTTPS request agent", () => {
                         bodyLimitBytes: 10,
                     },
                 ),
-            ).toEqual({ status: 302, body: "�", location: "/cdn", bytesRead: 1 });
+            ).toEqual({
+                status: 302,
+                body: "�",
+                headers: { location: "/cdn" },
+                location: "/cdn",
+                bytesRead: 1,
+            });
         } finally {
             spy.mockRestore();
         }

@@ -13,8 +13,10 @@ import {
 import {
 	getHistorianFailureState,
 	getOverflowState,
+	getPendingOps,
 	getPendingPiCompactionMarkerState,
 	getPersistedNoteNudge,
+	insertTag,
 	loadProtectedTailMeta,
 	recordOverflowDetected,
 	reserveProtectedTailDrainTokens,
@@ -651,6 +653,65 @@ describe("runPiHistorian", () => {
 			closeQuietly(db);
 		}
 	});
+	it("Pi publish selects drop candidates and reads raw messages before taking the writer", async () => {
+		const scanStates: boolean[] = [];
+		const queueStates: boolean[] = [];
+		const rawReadStates: boolean[] = [];
+		let publishingDb: ReturnType<typeof createTestDb> | undefined;
+		let restorePrepare = () => {};
+		const { db } = await runHistorianWith({
+			outputs: [successXml()],
+			memoryEnabled: false,
+			get providerMessages() {
+				if (!publishingDb) throw new Error("Provider ran before fixture setup");
+				rawReadStates.push(publishingDb.inTransaction);
+				return rawMessages();
+			},
+			beforeRun(db) {
+				publishingDb = db;
+				insertTag(db, "ses-historian", "m1:p0", "message", 10, 1);
+				const prepare = db.prepare.bind(db);
+				const prepareSpy = spyOn(db, "prepare").mockImplementation((sql) => {
+					const statement = prepare(sql);
+					if (
+						sql.startsWith("SELECT") &&
+						sql.includes("FROM tags") &&
+						sql.includes("status = 'active'")
+					) {
+						const all = statement.all.bind(statement);
+						spyOn(statement, "all").mockImplementation((...params) => {
+							scanStates.push(db.inTransaction);
+							return all(...params);
+						});
+					}
+					if (sql.startsWith("INSERT INTO pending_ops")) {
+						const run = statement.run.bind(statement);
+						spyOn(statement, "run").mockImplementation((...params) => {
+							queueStates.push(db.inTransaction);
+							return run(...params);
+						});
+					}
+					return statement;
+				});
+				restorePrepare = () => prepareSpy.mockRestore();
+			},
+		});
+		try {
+			expect(getCompartments(db, "ses-historian")).toHaveLength(1);
+			expect(getPendingOps(db, "ses-historian").map((op) => op.tagId)).toEqual([
+				1,
+			]);
+			expect(scanStates.length).toBeGreaterThan(0);
+			expect(scanStates.every((inTransaction) => !inTransaction)).toBe(true);
+			expect(rawReadStates.length).toBeGreaterThan(0);
+			expect(rawReadStates.every((inTransaction) => !inTransaction)).toBe(true);
+			expect(queueStates).toEqual([true]);
+		} finally {
+			restorePrepare();
+			closeQuietly(db);
+		}
+	});
+
 	it("runs the Pi subagent and records facts and events that actually publish", async () => {
 		const { db, runner } = await runHistorianWith({
 			outputs: [

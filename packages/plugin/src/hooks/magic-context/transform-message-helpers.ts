@@ -34,6 +34,28 @@ export function findLastUserMessageId(messages: MessageLike[]): string | null {
     return null;
 }
 
+/** Note reminders can accompany real user-role channel notices as well as prose.
+ * Resolve once against the final wire window, not the historian's meaningful-
+ * text predicate: tagging a reminder-only message must not change its identity.
+ */
+export function findNoteNudgeUserMessageId(messages: MessageLike[]): string | null {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.info.role !== "user" || typeof message.info.id !== "string") continue;
+        if (
+            message.parts.some(
+                (part) =>
+                    isTextPart(part) &&
+                    (part as { ignored?: boolean }).ignored !== true &&
+                    part.text.trim(),
+            )
+        ) {
+            return message.info.id;
+        }
+    }
+    return null;
+}
+
 export function appendReminderToLatestUserMessage(
     messages: MessageLike[],
     reminder: string,
@@ -57,7 +79,7 @@ export function appendReminderToUserMessageById(
     reminder: string,
 ): boolean {
     for (const message of messages) {
-        if (message.info.id !== messageId || !isMeaningfulUserMessage(message)) {
+        if (message.info.id !== messageId || message.info.role !== "user") {
             continue;
         }
 

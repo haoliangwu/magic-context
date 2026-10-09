@@ -14,10 +14,12 @@ use crate::historian_runner::HistorianRunnerKind;
 pub const DEFAULT_THALAMUS_MODULE_ID: &str = "thalamus";
 pub const DEFAULT_RUNNER_MODULE_ID: &str = "broca";
 
-/// Runtime selection for module routes. A hosted historian runner has no cross-module target.
+/// Static module targets. Hosting background completions does not disable the provider runner
+/// route: a runner may still call this module for compaction or step-transform work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteTargetConfig {
     runner_module_id: Option<String>,
+    provider_runner_module_id: String,
 }
 
 impl Default for RouteTargetConfig {
@@ -28,20 +30,24 @@ impl Default for RouteTargetConfig {
 
 impl RouteTargetConfig {
     pub fn runner_module(module_id: impl Into<String>) -> Self {
+        let module_id = module_id.into();
         Self {
-            runner_module_id: Some(module_id.into()),
+            runner_module_id: Some(module_id.clone()),
+            provider_runner_module_id: module_id,
         }
     }
 
-    /// Select the host-owned runner path. The module must not advertise Broca in this mode.
+    /// Host-owned background completions spend no quota through a module route. The provider
+    /// runner target remains available, but is used only when a runner calls us as a provider.
     pub fn host_runner() -> Self {
         Self {
             runner_module_id: None,
+            provider_runner_module_id: DEFAULT_RUNNER_MODULE_ID.to_string(),
         }
     }
 
     /// The route selection a resolved historian runner implies: Broca's route for
-    /// the Broca runner, no runner route at all for the host runner.
+    /// the Broca runner, no background-completion route for the host runner.
     pub fn for_historian_runner(runner: HistorianRunnerKind) -> Self {
         match runner {
             HistorianRunnerKind::Broca => Self::default(),
@@ -52,8 +58,8 @@ impl RouteTargetConfig {
     /// The route selection the user tier's runner settings imply for the whole
     /// process. A role left unconfigured is decided per request by the harness, and
     /// a Claude Code request with nothing configured goes to Broca, so the Broca
-    /// route stays declared unless every role that uses it is configured to the host
-    /// runner.
+    /// background-completion route stays declared unless both roles are configured to the host
+    /// runner. Provider callbacks and transcript reads have a separate, static target.
     pub fn for_configured_runners(runners: ConfiguredRunners) -> Self {
         let host = Some(HistorianRunnerKind::Host);
         if runners.historian == host && runners.dreamer == host {
@@ -65,6 +71,17 @@ impl RouteTargetConfig {
 
     pub fn runner_module_id(&self) -> Option<&str> {
         self.runner_module_id.as_deref()
+    }
+
+    /// Select the one runner served by the compaction and step-transform providers. This is
+    /// process configuration, never a module id supplied by a session's plan or request.
+    pub fn with_provider_runner_module(mut self, module_id: impl Into<String>) -> Self {
+        self.provider_runner_module_id = module_id.into();
+        self
+    }
+
+    pub fn provider_runner_module_id(&self) -> &str {
+        &self.provider_runner_module_id
     }
 
     pub(crate) fn target(&self, route: RegisteredRoute) -> Option<RouteTarget> {
@@ -82,15 +99,21 @@ impl RouteTargetConfig {
 pub(crate) enum RegisteredRoute {
     SessionResolve,
     HistorianRunner,
+    ProviderRunner,
 }
 
 impl RegisteredRoute {
-    const ALL: [Self; 2] = [Self::SessionResolve, Self::HistorianRunner];
+    const ALL: [Self; 3] = [
+        Self::SessionResolve,
+        Self::HistorianRunner,
+        Self::ProviderRunner,
+    ];
 
     fn module_id(self, config: &RouteTargetConfig) -> Option<&str> {
         match self {
             Self::SessionResolve => Some(DEFAULT_THALAMUS_MODULE_ID),
             Self::HistorianRunner => config.runner_module_id(),
+            Self::ProviderRunner => Some(config.provider_runner_module_id()),
         }
     }
 
@@ -101,7 +124,10 @@ impl RegisteredRoute {
         match self {
             // A lookup on the session registry: it spends nothing and shapes no surface.
             Self::SessionResolve => Vec::new(),
-            // The runner route carries every model call this module makes, so both
+            // Callbacks and transcript reads spend no provider quota. Declaring this target
+            // does not open a connection or require the runner to be registered at startup.
+            Self::ProviderRunner => Vec::new(),
+            // The background runner route carries every model call this module makes, so both
             // callers of it spend the user's provider quota.
             Self::HistorianRunner => vec![
                 SelfSignalDeclaration {
@@ -144,7 +170,8 @@ pub const PROVIDER_USAGE_DOMAIN: &str = "provider-usage";
 
 /// Self-signals for the manifest under the resolved runner configuration. They come from
 /// the same registry that opens routes and fills `consumes`, so a host-runner
-/// configuration drops them together with the runner target. An empty list still means
+/// configuration drops them together with the background-completion target, not the optional
+/// provider runner target. An empty list still means
 /// "examined, none to register".
 pub fn self_signals(config: &RouteTargetConfig) -> Vec<SelfSignalDeclaration> {
     RegisteredRoute::ALL
@@ -187,8 +214,37 @@ mod tests {
         );
         assert_eq!(
             route_targets(&RouteTargetConfig::host_runner()),
-            vec!["thalamus".to_string()]
+            vec!["thalamus".to_string(), "broca".to_string()]
         );
+    }
+
+    #[test]
+    fn provider_runner_target_is_static_and_spends_no_quota() {
+        for (config, expected) in [
+            (RouteTargetConfig::default(), "broca"),
+            (
+                RouteTargetConfig::runner_module("scripted-runner"),
+                "scripted-runner",
+            ),
+            (RouteTargetConfig::host_runner(), "broca"),
+            (
+                RouteTargetConfig::host_runner().with_provider_runner_module("scripted-runner"),
+                "scripted-runner",
+            ),
+        ] {
+            assert_eq!(
+                config.target(RegisteredRoute::ProviderRunner),
+                Some(RouteTarget::ManagementSurface {
+                    module_id: expected.to_string()
+                }),
+                "{config:?}"
+            );
+            assert!(RegisteredRoute::ProviderRunner.self_signals().is_empty());
+        }
+        let host = RouteTargetConfig::host_runner().with_provider_runner_module("scripted-runner");
+        assert_eq!(route_targets(&host), vec!["thalamus", "scripted-runner"]);
+        assert!(host.target(RegisteredRoute::HistorianRunner).is_none());
+        assert!(self_signals(&host).is_empty());
     }
 
     #[test]
@@ -210,14 +266,15 @@ mod tests {
         assert!(names(&RouteTargetConfig::host_runner()).is_empty());
     }
 
-    /// Drift guard: a route's behaviors are declared exactly while its target is
-    /// declared consumed, and every declaration names the surface it shapes.
+    /// Hosting completions still needs no background runner, even though an optional
+    /// provider runner route is declared for callbacks and transcript reads.
     #[test]
-    fn a_host_runner_declares_no_runner_route_and_no_quota_signals() {
+    fn a_host_runner_declares_no_completion_route_and_no_quota_signals() {
         let hosted = RouteTargetConfig::for_historian_runner(HistorianRunnerKind::Host);
         assert_eq!(hosted, RouteTargetConfig::host_runner());
         assert!(self_signals(&hosted).is_empty());
-        assert!(!route_targets(&hosted).contains(&DEFAULT_RUNNER_MODULE_ID.to_string()));
+        assert!(hosted.target(RegisteredRoute::HistorianRunner).is_none());
+        assert!(hosted.target(RegisteredRoute::ProviderRunner).is_some());
         let broca = RouteTargetConfig::for_historian_runner(HistorianRunnerKind::Broca);
         assert_eq!(broca, RouteTargetConfig::default());
         assert_eq!(self_signals(&broca).len(), 2);
@@ -226,11 +283,10 @@ mod tests {
     /// Drift guard for the per-harness default: the manifest is built once per
     /// process, before any request says which harness it comes from. With nothing
     /// configured a Claude Code request still routes to Broca, so the Broca edge and
-    /// its quota signals stay declared. Only a configuration that sends every role
-    /// to the host drops them, and a configuration that keeps either role on Broca
-    /// keeps them.
+    /// its quota signals stay declared. Only a configuration that sends both background roles
+    /// to the host drops their route and signals; the optional provider route stays available.
     #[test]
-    fn the_broca_edge_is_dropped_only_when_every_role_is_configured_to_the_host() {
+    fn the_completion_route_is_dropped_only_when_both_roles_are_configured_to_the_host() {
         use HistorianRunnerKind::{Broca, Host};
         let cases = [
             (None, None, true),
@@ -241,18 +297,23 @@ mod tests {
             (Some(Broca), Some(Broca), true),
             (Some(Host), Some(Host), false),
         ];
-        for (historian, dreamer, keeps_broca) in cases {
+        for (historian, dreamer, keeps_completion_route) in cases {
             let config =
                 RouteTargetConfig::for_configured_runners(ConfiguredRunners { historian, dreamer });
             let label = format!("historian={historian:?} dreamer={dreamer:?}");
             assert_eq!(
-                route_targets(&config).contains(&DEFAULT_RUNNER_MODULE_ID.to_string()),
-                keeps_broca,
+                config.target(RegisteredRoute::HistorianRunner).is_some(),
+                keeps_completion_route,
                 "{label}"
             );
             assert_eq!(
+                route_targets(&config),
+                vec!["thalamus".to_string(), "broca".to_string()],
+                "{label}: provider runner remains an optional target"
+            );
+            assert_eq!(
                 self_signals(&config).len(),
-                if keeps_broca { 2 } else { 0 },
+                if keeps_completion_route { 2 } else { 0 },
                 "{label}"
             );
         }
@@ -274,7 +335,15 @@ mod tests {
             "no config: Claude Code still needs Broca"
         );
         fs::write(&path, r#"{ "historian": { "runner": "host" } }"#).expect("write");
-        assert_eq!(edges(&path), vec!["thalamus".to_string()]);
+        assert_eq!(
+            edges(&path),
+            vec!["thalamus".to_string(), "broca".to_string()]
+        );
+        let hosted = RouteTargetConfig::for_configured_runners(
+            crate::config::user_configured_runners_at(&path),
+        );
+        assert!(hosted.target(RegisteredRoute::HistorianRunner).is_none());
+        assert!(self_signals(&hosted).is_empty());
         fs::write(
             &path,
             r#"{ "historian": { "runner": "host" }, "dreamer": { "runner": "broca" } }"#,
@@ -338,6 +407,334 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Run after building ck-mc and ck-subc from the workspace and Cargo.lock's subc revision
+    /// into the workspace's debug target directory. No installed daemon or runner is used.
+    /// ServiceClient declares possible route targets; unlike required capabilities, it
+    /// must not make startup, health, tools, or host completions depend on Broca.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires the workspace's ck-mc and ck-subc debug binaries"]
+    async fn a_host_runner_starts_and_serves_without_broca_through_real_subc() {
+        use std::process::{Child, Command, Stdio};
+        use std::time::Duration;
+
+        use serde_json::{json, Value};
+        use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
+        use subc_protocol::BindIdentity;
+
+        struct Process(Child);
+        impl Drop for Process {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        async fn call(consumer: &SubcConsumer, identity: &BindIdentity, request: Value) -> Value {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                let result = consumer
+                    .call(
+                        RouteTarget::ToolProvider {
+                            module_id: crate::DEFAULT_MODULE_ID.to_string(),
+                        },
+                        identity.clone(),
+                        serde_json::to_vec(&request).unwrap(),
+                        CallOptions {
+                            timeout: Duration::from_secs(60),
+                            ..CallOptions::default()
+                        },
+                    )
+                    .await;
+                match result {
+                    Ok(bytes) => return serde_json::from_slice(&bytes).unwrap(),
+                    Err(error)
+                        if error.code() == Some("store_opening")
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!(
+                        "{}: {error:?}",
+                        request["kind"]
+                            .as_str()
+                            .or(request["method"].as_str())
+                            .or(request["name"].as_str())
+                            .unwrap_or("call")
+                    ),
+                }
+            }
+        }
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| workspace.join("target"));
+        let binaries = target.join("debug");
+        for name in ["ck-subc", "ck-mc"] {
+            assert!(
+                binaries.join(name).is_file(),
+                "build {name} before running this test"
+            );
+        }
+        let scratch_parent = std::env::temp_dir().join("magic-context/mc-module-host-runner");
+        fs::create_dir_all(&scratch_parent).unwrap();
+        let dir = tempfile::tempdir_in(scratch_parent).unwrap();
+        let root = dir.path();
+        let dev_binaries = root.join("bin");
+        fs::create_dir_all(&dev_binaries).unwrap();
+        for (source_name, dev_name) in [("ck-subc", "ckdev-subc"), ("ck-mc", "ckdev-mc")] {
+            let source = binaries.join(source_name);
+            let destination = dev_binaries.join(dev_name);
+            // A copy, never a hard link: on macOS a daemon exec'd through a hard link
+            // to cargo's output was occasionally SIGKILLed at startup; a copy never was.
+            fs::copy(&source, &destination)
+                .map(|_| ())
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to stage {} as {}: {error}",
+                        source.display(),
+                        destination.display()
+                    )
+                });
+        }
+        for name in ["config/cortexkit", "data", "runtime", "project"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        fs::write(
+            root.join("config/cortexkit/subc.jsonc"),
+            r#"{"version":1,"modules":{}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("config/cortexkit/magic-context.jsonc"),
+            r#"{
+            "historian":{"runner":"host","protected_tokens":0},
+            "dreamer":{"runner":"host"}
+        }"#,
+        )
+        .unwrap();
+        // A fresh Rust-mode installation provisions context.db through the public CLI,
+        // independently of any running host or runner module.
+        let provisioned = Command::new("bun")
+            .args([
+                "run",
+                "packages/cli/src/index.ts",
+                "doctor",
+                "store",
+                "init",
+            ])
+            .current_dir(workspace)
+            .env("HOME", root.join("config"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
+            .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            provisioned.status.success(),
+            "store init failed: {} {}",
+            String::from_utf8_lossy(&provisioned.stdout),
+            String::from_utf8_lossy(&provisioned.stderr)
+        );
+        let command = |name: &str| {
+            let mut command = Command::new(dev_binaries.join(name));
+            command
+                .current_dir(workspace)
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_RUNTIME_DIR", root.join("runtime"))
+                .env("HOME", root.join("config"))
+                .env_remove("MAGIC_CONTEXT_TEST_DATA_DIR")
+                .env_remove("MAGIC_CONTEXT_STORAGE_DIR")
+                .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
+                .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
+                .env_remove(subc_os::LAUNCH_NONCE_FD_ENV)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit());
+            command
+        };
+        let mut daemon = Process(
+            command("ckdev-subc")
+                .env("SUBC_PORT", "0")
+                .env("SUBC_CGROUP_PLACEMENT", "disabled")
+                .spawn()
+                .unwrap(),
+        );
+        let connection_file = root.join("runtime/subc-connection.json");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !connection_file.is_file() {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "daemon exited before startup"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "daemon did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut module = Process(
+            command("ckdev-mc")
+                .arg("--subc")
+                .arg(&connection_file)
+                .spawn()
+                .unwrap(),
+        );
+        let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let registered = loop {
+            let catalog = consumer.catalog_list().await.unwrap();
+            if let Some(module) = catalog
+                .modules
+                .iter()
+                .find(|module| module.module_id == crate::DEFAULT_MODULE_ID)
+            {
+                assert_eq!(
+                    catalog.modules.len(),
+                    1,
+                    "no runner or gateway may be registered"
+                );
+                break module.clone();
+            }
+            assert!(
+                module.0.try_wait().unwrap().is_none(),
+                "ck-mc exited before registering"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ck-mc did not register without Broca"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(registered.ready, "{registered:?}");
+        assert!(registered.not_ready.is_none(), "{registered:?}");
+        assert_eq!(registered.self_signals, Some(vec![]));
+        assert!(
+            registered.capabilities.is_none(),
+            "no required runner capability"
+        );
+        let identity = BindIdentity::new(
+            fs::canonicalize(root.join("project")).unwrap(),
+            "opencode",
+            "ses",
+        );
+        let tools = call(
+            &consumer,
+            &identity,
+            json!({"name":"tool.catalog","arguments":{"preset":"head"}}),
+        )
+        .await;
+        assert!(
+            tools["tools"]
+                .as_array()
+                .is_some_and(|tools| !tools.is_empty()),
+            "{tools}"
+        );
+        // HELLO can precede the asynchronous store open. Wait for actual readiness,
+        // not just registration, before exercising the transform and historian.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let health = call(
+                &consumer,
+                &identity,
+                json!({"kind":"health","session_id":"ses"}),
+            )
+            .await;
+            if health["store_open"] == true {
+                assert_eq!(health["ok"], true, "{health}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "store did not open: {health}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let transformed = call(
+            &consumer,
+            &identity,
+            crate::tests::request(crate::tests::big_messages()),
+        )
+        .await;
+        assert_eq!(transformed["status"], "ok", "{transformed}");
+        assert_eq!(transformed["historian"]["fired"], true, "{transformed}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let run = loop {
+            let pending = call(
+                &consumer,
+                &identity,
+                json!({"method":"historian.pending","v":1}),
+            )
+            .await;
+            if let Some(run) = pending["runs"].as_array().and_then(|runs| runs.first()) {
+                break run.clone();
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "host historian did not queue work: {pending}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let claimed = call(
+            &consumer,
+            &identity,
+            json!({"method":"historian.claim","v":1,
+            "run_id":run["run_id"],"claimant_instance_id":"runner-route-test"}),
+        )
+        .await;
+        assert_eq!(claimed["ok"], true, "{claimed}");
+        let completed = call(&consumer, &identity, json!({"method":"historian.complete","v":1,
+            "run_id":run["run_id"],"token":claimed["token"],"output":{
+                "text":crate::tests::historian_output_for_prompt(claimed["prompt"]["user"].as_str().unwrap()),
+                "length_capped":false}})).await;
+        assert_eq!(completed["ok"], true, "{completed}");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = call(
+                &consumer,
+                &identity,
+                json!({"method":"session.status","v":1,"session_id":"ses"}),
+            )
+            .await;
+            assert_eq!(status["historian"]["runner"]["runner"], "host", "{status}");
+            if status["compartment_count"].as_u64().unwrap() > 0 {
+                assert!(status["historian"]["last_failure"].is_null(), "{status}");
+                assert_eq!(
+                    status["historian"]["publish_health_degraded"], false,
+                    "{status}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "host historian did not finish: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let health = call(
+            &consumer,
+            &identity,
+            json!({"kind":"health","session_id":"ses"}),
+        )
+        .await;
+        assert_eq!(health["ok"], true, "{health}");
+        assert_eq!(health["store_open"], true, "{health}");
+        assert_eq!(consumer.catalog_list().await.unwrap().modules.len(), 1);
+        assert!(
+            module.0.try_wait().unwrap().is_none(),
+            "ck-mc must keep serving without Broca"
+        );
+        consumer.close().await;
     }
 
     #[test]

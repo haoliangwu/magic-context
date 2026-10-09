@@ -158,20 +158,23 @@ current JSON protocol was introduced in `0.16.0`.
 
 ### Rust-mode lane: how it works
 
-The lane spawns a real `ck-subc` daemon (from the sibling `subconscious`
-workspace, the same binary `crates/mc-module/tests/real_daemon.rs` uses) and the
-`ck-mc` module (this workspace) connected to it, then boots `opencode serve` in
-Rust transform mode against them. The wiring uses no product change: the plugin's
+The lane builds the Cargo targets `ck-subc` and `ck-mc`, stages them as
+`ckdev-subc` and `ckdev-mc-e2e-*`, and launches only those dev-named copies. This
+keeps test process names distinct from the installed fleet without changing the
+module identity: `ck-mc` still registers as `magic-context` via its built-in
+`DEFAULT_MODULE_ID` (or the daemon-supplied `SUBC_MODULE_ID`). The daemon comes
+from the sibling `subconscious` workspace and the module from this workspace;
+the harness then boots `opencode serve` in Rust transform mode against them. The wiring uses no product change: the plugin's
 Rust module client reads the default connection file at
 `${XDG_DATA_HOME}/cortexkit/run/subc-connection.json`, and the harness points the
 daemon's `XDG_RUNTIME_DIR` there so its connection file lands exactly where the
 plugin looks. The module opens its own store under the same data dir (the
 production shared-cortexkit layout).
 
-Environment honesty: `RustTestHarness.detectPrereqs()` preflights the stack
-(cargo present, sibling `subconscious` workspace present, supported platform) and
-the suite SKIPs with a printed reason when any is missing — never green-washing,
-never hanging.
+Environment honesty: `RustTestHarness.detectPrereqs()` preflights Cargo and either the
+locked sibling `subconscious` source needed to build `ck-subc` or a complete set of
+prebuilt binaries. The suite SKIPs with a printed reason when inputs are missing or
+the platform is unsupported — never green-washing, never hanging.
 
 ### Rust build-lock contention drill
 

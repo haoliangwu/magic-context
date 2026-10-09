@@ -48,6 +48,48 @@ bun scripts/importance-anchoring-trial/analyze.ts "$TMPDIR/magic-context/importa
 
 The follow-up alternates arm order by case, adds only sixty provider calls, and does not regenerate A–D observations. The analyzer carries those response records and superseded-run spend forward from `prior-evidence.json`, adds E/A2, reports distances from the recorded original and both A generations, and compares title/P1 arrays against both A and A2. No P1 bodies are needed to compare hashes. Retain only the newly sanitized `evidence.json`, then delete the temporary root again. A repeat of a previously used arm requires a new lineage namespace; do not append to an existing provider session or interpret its replay as another independent generation.
 
+## Rubric-first system-prompt trial
+
+Use only the **existing saved inputs**, not `prepare.ts`/`restore-inputs.ts` or a
+live database. Copy `inputs/0.json`–`29.json` and `manifest.json` to a private
+`$TMPDIR/magic-context/historian-scoring-<unique-name>/` root, plus an authorized
+copy of the Broca connection descriptor as `subc-connection.json`. No live
+configuration or database is needed. A model argument enables this mode:
+
+```sh
+timeout 5400s bun scripts/importance-anchoring-trial/run.ts "$ROOT" 30 E,F,E2 google/antigravity-gemini-3.8-flash
+timeout 5400s bun scripts/importance-anchoring-trial/run.ts "$ROOT" 30 E,F,E2 openrouter/deepseek/deepseek-v4.1-flash
+timeout 60s bun scripts/importance-anchoring-trial/analyze-scoring.ts "$ROOT" google/antigravity-gemini-3.8-flash openrouter/deepseek/deepseek-v4.1-flash
+```
+
+E and E2 use the saved system and `prompts.E`; F uses the same user bytes with
+the regenerated system. Cohort hashes, three scored seeds, three scored diverse
+references and four unscored recent references are checked. The runner sets all
+six isolation variables under the root and records `lsof -p` database handles
+before connecting. No OpenCode host is launched; Broca remains the existing
+provider service. Temperature is 0.1, tools are empty, and max output is 32,000.
+
+Each model/arm has its own lineage and results directory. Resuming the same
+command skips all completed outputs, including missing-score answers. Only
+provider/transport failures are retried, with fresh lineages; superseded failed
+attempts and their reported usage are retained. There are no automatic retries,
+repair prompts, fallbacks or resampling of completed outputs. The DeepSeek
+credit-limited pilot can be resumed this way **only after authorization and a
+credit refill**. `analyze-scoring.ts` reports scored denominators explicitly,
+paired noise and the common-triplet subset; credit failures are not zero scores.
+
+A transport disconnect does not prove the provider cancelled a run. Before
+retrying an unknown-outcome transport failure, query `run.status` with its
+original admission identity. If it completed, recover the original answer with
+`run.result` and its `session.subscribe` replay instead of regenerating it. In
+this trial, two such original outputs were recovered and used in the primary
+analysis; their unnecessary fresh-lineage retries are retained as excluded
+completed attempts with usage, never substituted for the original scores.
+
+Keep only sanitized `scoring-evidence.json` in git. `scoring-quality.json` and
+raw outputs contain P1 bodies and stay private in the throwaway root. Selected
+first lines may be quoted in the report for the requested qualitative check.
+
 ## Checks
 
 ```sh

@@ -98,6 +98,17 @@ Several independent budgets and boundaries decide where the pass lands:
 - **Injected memory text and optional mural:** project memory and the memory mural have their own budgets and selection rules.
 - **The protected recent token window:** recent turns stay untouched until they age past the token floor.
 - **Unsettled live work:** in-flight reasoning and messages that have not settled yet remain in the prompt.
+
+Historical reasoning has its own retention budget, `keep_reasoning_tokens` (fixed default
+10,000). On passes that already rebuild the cache, Magic Context keeps whole assistant
+steps newest first until the next step does not fit; that step and everything older form
+the removed prefix. The newest assistant and the reasoning-exempt step count toward the
+budget but always stay. Provider-reported reasoning counts take precedence over plaintext
+estimates; encrypted reasoning with no count or text costs a fixed 1,000 tokens per step.
+The budget never starts a rebuild itself. Defer passes replay the frozen ids and watermarks
+byte-identically, and raising the budget never restores removed reasoning. Signed-thinking
+models retain their oldest-prefix stop rule. `clear_reasoning_age` is deprecated and ignored;
+`doctor` removes it, without converting tag ages into tokens.
 - **Conversation-vs-tool-output mix:** settled conversation condenses into compact history, while tool output can only be dropped or reclaimed.
 - **Reclaimable tool output:** how much tool output was queued with `ctx_reduce` or was old enough for age-based reclaim.
 
@@ -126,15 +137,15 @@ The next prompt is 90k tokens, or 45%: 12k fixed prompt and memory + 19k history
 You can change when a pass triggers with the per-model execute threshold, improve agent-driven cleanup with `ctx_reduce`, choose a stronger historian model, and align cache assumptions with `cache_ttl`. None of these configures a post-pass landing percentage. See the [generated configuration reference](/reference/configuration/#context-management) for exact keys and ranges.
 :::
 
-## Enable smart drops when useful
+## Automatic supersession and protected tools
 
-`smart_drops` is optional and off by default. When enabled, it adds content-aware selection to a pass that is already rebuilding the cache:
+Supersession is always on and adds content-aware selection only to passes already rebuilding the cache. The deprecated `smart_drops` key is accepted but ignored:
 
 - keeps only the newest `todowrite` result and newest three spent `ctx_reduce` results;
 - drops zero-value `bash_status`, `bash_kill`, and `ctx_note` read or dismiss results;
 - replaces older edits or writes to the same file with a small marker that preserves the file path, while keeping the newest edit full.
 
-Smart drops honor normal protection and never initiate a cache rewrite. Enable the setting in `magic-context.jsonc`, then restart the harness. See the [configuration reference](/reference/configuration/) for the source-generated description.
+`protected_tools` maps tool names to the number of newest still-active results to keep in all automatic lanes. User and project maps merge over `{ "todowrite": 1, "ctx_reduce": 3 }`; 0 disables protection. Names ignore case and leading `mcp_`. Protection holds even at 95% with no byte cap, so large protected outputs can reach refusal sooner. Queued drops from the agent or historian publication are held until newer calls displace the result, then applied on a later rebuilding pass. The historian's summary is unaffected; the raw result leaves at the next fold. Frozen strips are unaffected. Rotation and config changes never originate a bust or restore drops. See the [configuration reference](/reference/configuration/).
 
 ## Hide the reduce surface
 

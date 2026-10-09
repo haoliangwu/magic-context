@@ -257,6 +257,7 @@ export async function spawnOpencode1(
 	const env: NodeJS.ProcessEnv = {
 		PATH: process.env.PATH,
 		HOME: fixture.env.HOME,
+		CFFIXED_USER_HOME: fixture.env.HOME,
 		XDG_CONFIG_HOME: configHome,
 		XDG_DATA_HOME: fixture.env.XDG_DATA_HOME,
 		XDG_STATE_HOME: fixture.env.XDG_STATE_HOME,
@@ -322,8 +323,10 @@ export async function spawnOpencode1(
 			2,
 		),
 	);
+	const magicContextConfigDir = join(configHome, "cortexkit");
+	mkdirSync(magicContextConfigDir, { recursive: true });
 	writeFileSync(
-		join(openCodeConfigDir, "magic-context.jsonc"),
+		join(magicContextConfigDir, "magic-context.jsonc"),
 		JSON.stringify(
 			{
 				auto_update: false,

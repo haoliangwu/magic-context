@@ -3,14 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>Magic Context Dashboard</title>
+    <!-- Blocking on purpose: sets <html data-theme> before anything paints. -->
+    <script src="/assets/theme-boot.js"></script>
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body, #root { height: 100%; }
+      html { background: #0a0a0f; color: #e4e4ef; color-scheme: dark; }
+      html[data-theme="light"] { background: #f4f1ec; color: #1f1d1a; color-scheme: light; }
       body {
         font-family: 'Inter', 'Geist Sans', system-ui, -apple-system, sans-serif;
-        background: #0a0a0f;
-        color: #e4e4ef;
+        background: inherit;
+        color: inherit;
         overflow: hidden;
         -webkit-font-smoothing: antialiased;
         -moz-osx-font-smoothing: grayscale;

@@ -2,7 +2,8 @@ import { resolveToolTier } from "../../hooks/magic-context/emergency-drop";
 import { getHarness } from "../../shared/harness";
 import type { Database, Statement as PreparedStatement } from "../../shared/sqlite";
 import { contentTagOwnerMessageId, TEXT_TAG_IDENTITY_MARKER } from "../../shared/tag-owner-id";
-import { newestCtxReduceTagNumbers } from "./reclaim-protection";
+import { tagOrderConstraintIndex } from "./migration-v95-perf-indexes";
+import { removePendingOp } from "./storage-ops";
 import type { TagEntry } from "./types";
 
 declare module "./types" {
@@ -356,7 +357,7 @@ const getActiveToolTagsForAgeReclaimStatements = new WeakMap<Database, PreparedS
 
 /**
  * Return age-reclaim candidates with the same persisted token estimate used by reclaim hints.
- * The newest ctx_reduce exemplars are omitted before the watermark/value checks in the caller.
+ * Protection is applied by the caller using its shared per-selection snapshot.
  * Legacy rows with neither token column populated remain eligible for fail-safe reclaim.
  */
 export function getActiveToolTagsForAgeReclaim(
@@ -394,8 +395,7 @@ export function getActiveToolTagsForAgeReclaim(
                         : (outputTokens ?? 0) + (inputTokens ?? 0),
             };
         });
-    const protectedCtxReduceTags = newestCtxReduceTagNumbers(tags);
-    return tags.filter((tag) => !protectedCtxReduceTags.has(tag.tagNumber));
+    return tags;
 }
 
 /**
@@ -700,6 +700,34 @@ export function getAllStatusTagTokenTotalsFlat(
         totals.set(owner, (totals.get(owner) ?? 0) + weight);
     }
     return { totals, nullMessageIds };
+}
+
+/** Only message tags prove ownership of their own assistant's reasoning group.
+ * Tool tags describe the preceding thought, not their tool owner, and parallel
+ * tools repeat that estimate. Repeated text tags likewise charge the group once.
+ */
+export function getReasoningTokenEstimatesByMessage(
+    db: Database,
+    sessionId: string,
+    proseRatio: number,
+): Map<string, number> {
+    const rows = db
+        .prepare(
+            `SELECT type, message_id, tool_owner_message_id, reasoning_token_count FROM tags WHERE session_id = ? AND reasoning_token_count IS NOT NULL`,
+        )
+        .all(sessionId) as Array<{
+        type: string;
+        message_id: string;
+        tool_owner_message_id: string | null;
+        reasoning_token_count: number;
+    }>;
+    const totals = new Map<string, number>();
+    for (const row of rows) {
+        if (row.type !== "message") continue;
+        const id = ownerMessageIdForTagRow(row);
+        totals.set(id, Math.max(totals.get(id) ?? 0, row.reasoning_token_count * proseRatio));
+    }
+    return totals;
 }
 
 /** Bump a tag's input_token_count — the token mirror of `updateTagInputByteSize`. */
@@ -1846,9 +1874,10 @@ export function markTagsCompactedByMessageIds(
     db: Database,
     sessionId: string,
     messageIds: Iterable<string>,
+    eligibleTagNumbers?: ReadonlySet<number>,
 ): number {
     const ids = new Set(messageIds);
-    if (ids.size === 0) return 0;
+    if (ids.size === 0 || eligibleTagNumbers?.size === 0) return 0;
 
     // SQLite's default LIKE folds ASCII only, whereas String.toLowerCase also
     // folds Unicode. Wildcards in the source id were escaped by the old query.
@@ -1895,7 +1924,7 @@ export function markTagsCompactedByMessageIds(
         .prepare(`WITH ids AS MATERIALIZED (
             SELECT value AS source_id, lower(value) AS folded_id FROM json_each(?)
         )
-        SELECT id, message_id, tool_owner_message_id FROM tags INDEXED BY idx_tags_session_tag_number
+        SELECT id, tag_number, message_id, tool_owner_message_id FROM tags INDEXED BY ${tagOrderConstraintIndex(db)}
         WHERE session_id = ? AND status IN ('active', 'dropped') AND (
             message_id IN (SELECT source_id FROM ids)
             OR tool_owner_message_id IN (SELECT source_id FROM ids)
@@ -1913,10 +1942,15 @@ export function markTagsCompactedByMessageIds(
             nulPrefixes.size > 0 ? 1 : 0,
         ) as {
         id: number;
+        tag_number: number;
         message_id: string | null;
         tool_owner_message_id: string | null;
     }[];
-    const candidates = rows.filter((row) => matches(row.message_id, row.tool_owner_message_id));
+    const candidates = rows.filter(
+        (row) =>
+            (eligibleTagNumbers === undefined || eligibleTagNumbers.has(row.tag_number)) &&
+            matches(row.message_id, row.tool_owner_message_id),
+    );
     if (candidates.length === 0) return 0;
 
     // Recheck identity as well as status: another process can retarget or retire
@@ -1926,7 +1960,7 @@ export function markTagsCompactedByMessageIds(
          WHERE id = ? AND session_id = ?
             AND status IN ('active', 'dropped')
             AND message_id IS ? AND tool_owner_message_id IS ?
-          RETURNING id`,
+          RETURNING tag_number`,
     );
     let cursor = 0;
     let changed = 0;
@@ -1935,7 +1969,18 @@ export function markTagsCompactedByMessageIds(
         let processed = 0;
         do {
             const row = candidates[cursor++];
-            if (update.get(row.id, sessionId, row.message_id, row.tool_owner_message_id)) changed++;
+            const retired = update.get(
+                row.id,
+                sessionId,
+                row.message_id,
+                row.tool_owner_message_id,
+            ) as { tag_number: number } | null;
+            if (retired) {
+                // Retiring this source removes it from the request, so delete its queued
+                // operation in the same transaction instead of waiting for another drain.
+                removePendingOp(db, sessionId, retired.tag_number);
+                changed++;
+            }
             processed++;
         } while (cursor < candidates.length && processed < 128 && performance.now() - start < 8);
     });
@@ -2396,6 +2441,36 @@ export function getTagsByNumbers(
         .filter(isTagRow);
 
     return rows.map(toTagEntry);
+}
+
+const newestToolTagNumberStatements = new WeakMap<Database, PreparedStatement>();
+
+/**
+ * Tag numbers of the session's newest `limit` tool tags, any status, newest
+ * first. Equals filtering a full `getTagsBySession` load to tool tags and
+ * keeping the highest numbers: the row checks mirror `isTagRow`, so a malformed
+ * row is skipped here exactly as that load skips it. The walk runs backwards on
+ * the UNIQUE(session_id, tag_number) index and stops after `limit` rows.
+ */
+export function getNewestToolTagNumbers(db: Database, sessionId: string, limit: number): number[] {
+    if (limit <= 0) return [];
+    let statement = newestToolTagNumberStatements.get(db);
+    if (!statement) {
+        statement = db.prepare(
+            `SELECT tag_number FROM tags
+              WHERE session_id = ? AND type = 'tool'
+                AND typeof(message_id) = 'text'
+                AND typeof(status) = 'text'
+                AND typeof(byte_size) IN ('integer', 'real')
+                AND typeof(tag_number) IN ('integer', 'real')
+              ORDER BY tag_number DESC
+              LIMIT ?`,
+        );
+        newestToolTagNumberStatements.set(db, statement);
+    }
+    return (statement.all(sessionId, limit) as Array<{ tag_number: number }>).map(
+        (row) => row.tag_number,
+    );
 }
 
 const droppedNumberStatements = new WeakMap<Database, PreparedStatement>();

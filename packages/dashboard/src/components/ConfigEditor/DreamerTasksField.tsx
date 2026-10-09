@@ -3,14 +3,9 @@ import { createSignal, Index, Show } from "solid-js";
 import { describeCron, isValidCronShape } from "../../lib/cron";
 import { configDefault } from "./config-schema";
 import { patchTaskConfig, scheduleSummary, toggledSchedule } from "./dreamer-schedule";
-import {
-  type Harness,
-  type ModelEntry,
-  modelEntryWithModel,
-  modelId,
-  thinkingLevelsForHarness,
-} from "./HarnessModelFields";
+import { type Harness, type ModelEntry, modelEntryWithModel, modelId } from "./HarnessModelFields";
 import ModelSelect from "./ModelSelect";
+import VariantSelect from "./VariantSelect";
 
 export interface DreamTaskConfig {
   schedule?: string;
@@ -142,6 +137,7 @@ interface DreamerTasksFieldProps {
   modelTasks: ModelTasksValue;
   onModelTasksChange: (tasks: Record<string, DreamTaskModelConfig> | undefined) => void;
   models: string[];
+  variants?: Record<string, string[]>;
 }
 
 export default function DreamerTasksField(props: DreamerTasksFieldProps) {
@@ -351,37 +347,16 @@ export default function DreamerTasksField(props: DreamerTasksFieldProps) {
                             <code class="config-field-key">
                               dreamer.{props.harness}.tasks.{meta().name}.{qualifierKey()}
                             </code>
-                            <Show
-                              when={props.harness === "opencode"}
-                              fallback={
-                                <select
-                                  class="config-input config-select"
-                                  value={String(taskModel()[qualifierKey()] ?? "")}
-                                  onChange={(event) =>
-                                    updateModel(meta().name, {
-                                      [qualifierKey()]: event.currentTarget.value || undefined,
-                                    })
-                                  }
-                                >
-                                  <option value="">Use harness default</option>
-                                  <Index each={thinkingLevelsForHarness(props.harness)}>
-                                    {(level) => <option value={level()}>{level()}</option>}
-                                  </Index>
-                                </select>
+                            <VariantSelect
+                              harness={props.harness}
+                              model={modelId(taskModel().model)}
+                              variants={props.variants}
+                              label={`Task ${qualifierLabel().toLowerCase()}`}
+                              value={taskModel()[qualifierKey()] as string | undefined}
+                              onChange={(value) =>
+                                updateModel(meta().name, { [qualifierKey()]: value })
                               }
-                            >
-                              <input
-                                class="config-input"
-                                type="text"
-                                value={String(taskModel()[qualifierKey()] ?? "")}
-                                placeholder="Use harness default"
-                                onInput={(event) =>
-                                  updateModel(meta().name, {
-                                    [qualifierKey()]: event.currentTarget.value || undefined,
-                                  })
-                                }
-                              />
-                            </Show>
+                            />
                           </div>
                           <Show when={promotionThresholdDefault(meta().name) !== undefined}>
                             <div class="dreamer-task-param">

@@ -224,8 +224,8 @@ export class RustTestHarness {
 
     /**
      * Preflight the lane. Cheap and never throws — call it in a describe-level
-     * guard so a machine without cargo / the subconscious sibling / a supported
-     * platform SKIPs with a printed reason instead of failing or hanging.
+     * guard so a machine without Cargo, without a lock-pinned daemon source or
+     * prebuilt binaries, or on an unsupported platform SKIPs with a printed reason.
      */
     static detectPrereqs(): RustModePrereqs {
         return detectRustModePrereqs();
@@ -233,7 +233,7 @@ export class RustTestHarness {
 
     static async create(options: RustTestHarnessOptions = {}): Promise<RustTestHarness> {
         const prereqs = detectRustModePrereqs();
-        if (!prereqs.ok || !prereqs.subconsciousRoot) {
+        if (!prereqs.ok) {
             throw new Error(
                 `RustTestHarness prerequisites unmet: ${prereqs.skipReason ?? "unknown"}. ` +
                     "Guard the suite with RustTestHarness.detectPrereqs() and skip instead of creating.",
@@ -414,7 +414,11 @@ export class RustTestHarness {
      * project transform_mode (ts↔rust) — the cold-start-drop-seed scenario builds
      * TS-mode state then restarts in Rust to prove drop-tag state seeds correctly.
      */
-    async restart(opts: { rust?: boolean; magicContextConfig?: Record<string, unknown> } = {}): Promise<void> {
+    async restart(opts: {
+        rust?: boolean;
+        magicContextConfig?: Record<string, unknown>;
+        openCodeConfigExtra?: Record<string, unknown>;
+    } = {}): Promise<void> {
         if (this.contextDbCached) {
             try {
                 this.contextDbCached.close();
@@ -433,6 +437,7 @@ export class RustTestHarness {
                 modelContextLimit: this.modelContextLimit,
                 historianModelContextLimit: this.historianModelContextLimit,
                 magicContextConfig: opts.magicContextConfig,
+                openCodeConfigExtra: opts.openCodeConfigExtra,
                 startHistorianProducer: this.historianProducerAvailable,
                 historianRunner: this.historianRunner,
                 providerID: this.providerID,

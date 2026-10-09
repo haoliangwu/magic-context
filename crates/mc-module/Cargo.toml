@@ -23,13 +23,13 @@ mc-tokenizer = { path = "../mc-tokenizer" }
 cortexkit-store-types = { workspace = true }
 cortexkit-store = { workspace = true }
 cortexkit-lease = { workspace = true }
-cortexkit-log = { path = "../../../commons/crates/cortexkit-log", features = ["store-paths"] }
+cortexkit-log = { workspace = true }
 tracing = "0.1"
 subc-protocol = { workspace = true }
 subc-control = { workspace = true }
 subc-transport = { workspace = true }
 subc-client-rs = { workspace = true }
-subc-os = { path = "../../../subconscious/crates/subc-os" }
+subc-os = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Provider context-overflow error patterns (scheduler unit). Plain regex (no
@@ -42,14 +42,15 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Same pin as the workspace uses everywhere else so the Connection/Transaction types
 # unify with mc-store's and cortexkit-store's.
 rusqlite = { workspace = true }
-# The tool-provider/v1 role contract: tool.catalog and role.describe wire types,
-# schema and composition digests, and the capability-tag check. Its own
-# subc-protocol dependency is unified with the workspace's by [patch.crates-io].
+# subc-protocol is resolved from crates.io, matching the role crate's dependency.
 cortexkit-role-tool-provider = "=0.5.0"
 # RFC 8785 (JCS) canonical JSON for tool.catalog's answer bytes and digests: the
 # same canonicaliser the role crate uses, so floats and non-ASCII keys in a
 # caller's composition hash exactly as the runner hashes them.
 serde_jcs = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.3", features = ["fs"] }
 
 [features]
 # Joint CC rig-drive fault injection. DEFAULT OFF.

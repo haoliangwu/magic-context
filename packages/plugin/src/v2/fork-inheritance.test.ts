@@ -7,6 +7,10 @@ import { join } from "node:path";
 import { runMigrations } from "../features/magic-context/migrations";
 import { copySessionStateForClone } from "../features/magic-context/storage-clone";
 import { initializeDatabase } from "../features/magic-context/storage-db";
+import {
+    freezeTemporalDecisions,
+    getTemporalDecisions,
+} from "../features/magic-context/temporal-decisions";
 import { Database } from "../shared/sqlite";
 import { closeQuietly } from "../shared/sqlite-helpers";
 import { createTestTempDirFromPath } from "../shared/test-temp-dir";
@@ -257,6 +261,38 @@ describe("forkBoundarySeq", () => {
 });
 
 describe("seedV2ForkFromParent", () => {
+    it("forks indexed temporal choices by mapped identity, retaining pending and empty rows", () => {
+        const { reader } = createStore();
+        const db = createContextDb();
+        seedParentState(db);
+        freezeTemporalDecisions(
+            db,
+            PARENT,
+            new Map([
+                [parentId(6), "<!-- +5m -->\n"],
+                [parentId(8), ""],
+                [parentId(10), "<!-- +1h -->\n"],
+            ]),
+        );
+        db.prepare(
+            "INSERT INTO temporal_decisions(session_id,message_id,marker) VALUES (?,?,NULL)",
+        ).run(PARENT, parentId(4));
+        expect(seedV2ForkFromParent({ db, store: reader, sessionId: FORK }).kind).toBe("seeded");
+        expect(getTemporalDecisions(db, FORK)).toEqual(
+            new Map([
+                [forkId(6), "<!-- +5m -->\n"],
+                [forkId(8), ""],
+            ]),
+        );
+        expect(
+            db
+                .prepare(
+                    "SELECT marker FROM temporal_decisions WHERE session_id=? AND message_id=?",
+                )
+                .get(FORK, forkId(4)),
+        ).toEqual({ marker: null });
+        expect(getTemporalDecisions(db, PARENT).has(parentId(10))).toBe(true);
+    });
     it("copies history blocks, tags, drops and queued operations up to the fork boundary", () => {
         const { reader } = createStore();
         const db = createContextDb();

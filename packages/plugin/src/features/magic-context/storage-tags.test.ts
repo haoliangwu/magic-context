@@ -12,6 +12,7 @@ import {
     getActiveTagTokenAggregate,
     getDroppedTagsByNumbers,
     getMaxDroppedTagNumber,
+    getNewestToolTagNumbers,
     getOldestActiveUnprotectedToolTags,
     getRecentTagOwnerMessageIds,
     getTagById,
@@ -1008,6 +1009,34 @@ describe("storage-tags", () => {
 
             expect(deleteTagsByMessageId(db, "ses-1", "msg-1")).toEqual([1, 2]);
             expect(getTagsBySession(db, "ses-1").map((tag) => tag.tagNumber)).toEqual([3]);
+        });
+    });
+
+    describe("#given getNewestToolTagNumbers", () => {
+        it("#when tags mix types, statuses, sessions and a malformed row #then it equals the newest tool tags of a full session load", () => {
+            db = makeMemoryDatabase();
+            for (let tagNumber = 1; tagNumber <= 25; tagNumber += 1) {
+                insertTag(db, "ses-1", `call-${tagNumber}`, "tool", 10, tagNumber);
+            }
+            updateTagStatus(db, "ses-1", 25, "dropped");
+            updateTagStatus(db, "ses-1", 24, "compacted");
+            insertTag(db, "ses-1", "msg-26", "message", 10, 26);
+            insertTag(db, "ses-2", "call-other", "tool", 10, 27);
+            // A row the full loader rejects (no byte size) must not take a window slot.
+            db.prepare(
+                "INSERT INTO tags (session_id, message_id, type, byte_size, tag_number) VALUES ('ses-1', 'call-28', 'tool', NULL, 28)",
+            ).run();
+
+            const fromFullLoad = getTagsBySession(db, "ses-1")
+                .filter((tag) => tag.type === "tool")
+                .map((tag) => tag.tagNumber)
+                .sort((left, right) => right - left)
+                .slice(0, 20);
+
+            expect(getNewestToolTagNumbers(db, "ses-1", 20)).toEqual(fromFullLoad);
+            expect(fromFullLoad[0]).toBe(25);
+            expect(fromFullLoad.at(-1)).toBe(6);
+            expect(getNewestToolTagNumbers(db, "ses-1", 0)).toEqual([]);
         });
     });
 });

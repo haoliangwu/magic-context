@@ -84,7 +84,10 @@ import {
 	COMPARTMENT_AGENT_SYSTEM_PROMPT,
 	HISTORIAN_EDITOR_SYSTEM_PROMPT,
 } from "@magic-context/core/hooks/magic-context/compartment-prompt";
-import { queueDropsForCompartmentalizedMessages } from "@magic-context/core/hooks/magic-context/compartment-runner-drop-queue";
+import {
+	prepareCompartmentDrops,
+	queuePreparedCompartmentDrops,
+} from "@magic-context/core/hooks/magic-context/compartment-runner-drop-queue";
 import {
 	buildHistorianFailureNotice,
 	buildHistorianRepairPrompt,
@@ -1407,6 +1410,12 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 				lastNewEnd,
 				{ db },
 			);
+			const preparedDrops = prepareCompartmentDrops(
+				db,
+				sessionId,
+				lastNewEnd,
+				compartmentTagKeys,
+			);
 			let published = false;
 			db.exec("BEGIN IMMEDIATE");
 			const transactionStartedAt = performance.now();
@@ -1463,12 +1472,7 @@ export async function runPiHistorian(deps: PiHistorianDeps): Promise<void> {
 					}
 				}
 
-				queueDropsForCompartmentalizedMessages(
-					db,
-					sessionId,
-					lastNewEnd,
-					compartmentTagKeys,
-				);
+				queuePreparedCompartmentDrops(db, preparedDrops);
 
 				clearHistorianFailureState(db, sessionId);
 				// Healthy historian progress clears the drain-failure backoff. Normal

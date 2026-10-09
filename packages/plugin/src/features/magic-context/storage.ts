@@ -52,6 +52,7 @@ export {
     isDatabasePersisted,
     LATEST_SUPPORTED_VERSION,
     type OpenDatabaseOptions,
+    openCurrentDatabase,
     openDatabase,
     runSqliteOptimize,
     schemaVersionIsSupported,
@@ -67,6 +68,7 @@ export {
     recordEmbeddingMeasurement,
     type SynapseBatchLedgerInput,
 } from "./storage-embedding-measurements";
+export { countHistorianRuns } from "./storage-historian-runs";
 export {
     deleteIdentityRekeyMap,
     getIdentityRekeyMap,
@@ -293,6 +295,7 @@ export {
     getMaxDroppedTagNumber,
     getMaxTagNumberBySession,
     getMinMessageTagNumberForRawId,
+    getNewestToolTagNumbers,
     getOldestActiveUnprotectedToolTags,
     getPersistedToolTagAccounting,
     getTagById,

@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 export interface RustPrerequisiteOptions {
     repoRoot?: string;
     allowBuild?: boolean;
-    /** Hermetic e2e builds ck-mc in its own Cargo target, so it needs source rather than a prebuilt binary. */
+    /** Hermetic runner owns ck-mc selection and may use a prebuilt binary pair. */
     requireCkMc?: boolean;
     env?: NodeJS.ProcessEnv;
 }
@@ -16,7 +16,6 @@ export interface RustPrerequisiteResult {
     ok: boolean;
     missing: string[];
     ckMcBin?: string;
-    commonsRoot?: string;
     subconsciousRoot?: string;
 }
 
@@ -65,7 +64,6 @@ export function detectRustPrerequisites(options: RustPrerequisiteOptions = {}): 
     const requireCkMc = options.requireCkMc ?? true;
     const missing: string[] = [];
     const cargo = pathCommand("cargo", env.PATH);
-    const commonsRoot = resolve(repoRoot, "../commons");
     const subconsciousRoot = resolve(repoRoot, "../subconscious");
 
     if (!existsSync(join(repoRoot, "Cargo.toml"))) {
@@ -75,12 +73,10 @@ export function detectRustPrerequisites(options: RustPrerequisiteOptions = {}): 
     } else if (!cargoMetadata(cargo, repoRoot, env)) {
         missing.push("cargo workspace: cargo metadata failed");
     }
-    if (!existsSync(join(commonsRoot, "Cargo.toml"))) {
-        missing.push(`sibling checkout: ../commons is missing (${join(commonsRoot, "Cargo.toml")})`);
-    }
-    if (!existsSync(join(subconsciousRoot, "Cargo.toml"))) {
+    const hasPrebuiltCkSubc = isExecutable(env.MC_E2E_CK_SUBC_BIN ?? "");
+    if (!existsSync(join(subconsciousRoot, "Cargo.toml")) && !hasPrebuiltCkSubc) {
         missing.push(
-            `sibling checkout: ../subconscious is missing (${join(subconsciousRoot, "Cargo.toml")})`,
+            `ck-subc binary: sibling ../subconscious source or executable MC_E2E_CK_SUBC_BIN is required (${join(subconsciousRoot, "Cargo.toml")})`,
         );
     }
 
@@ -109,7 +105,6 @@ export function detectRustPrerequisites(options: RustPrerequisiteOptions = {}): 
         ok: missing.length === 0,
         missing,
         ...(ckMcBin ? { ckMcBin } : {}),
-        ...(existsSync(join(commonsRoot, "Cargo.toml")) ? { commonsRoot } : {}),
         ...(existsSync(join(subconsciousRoot, "Cargo.toml")) ? { subconsciousRoot } : {}),
     };
 }

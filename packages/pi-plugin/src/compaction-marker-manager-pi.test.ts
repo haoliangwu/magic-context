@@ -32,6 +32,73 @@ function branch(extra: unknown[] = []): unknown[] {
 }
 
 describe("Pi deferred compaction marker manager", () => {
+	it("blocks an indexed end with an uncovered remainder even with a precomputed kept entry", () => {
+		const db = createTestDb();
+		try {
+			appendCompartments(db, "ses", [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: 2,
+					startMessageId: "m1",
+					endMessageId: "m2",
+					endBlockIndex: 0,
+					title: "partial",
+					content: "partial",
+				},
+			]);
+			const appendCompaction = mock(() => "compact-1");
+			expect(
+				applyDeferredPiCompactionMarker(
+					{ db, readBranchEntries: () => branch(), appendCompaction },
+					"ses",
+					pending(),
+				),
+			).toEqual({ kind: "stale-skip", reason: "partial-message-boundary" });
+			expect(appendCompaction).not.toHaveBeenCalled();
+		} finally {
+			closeQuietly(db);
+		}
+	});
+
+	it("advances past older indexed ends whose successor covers the remainder", () => {
+		const db = createTestDb();
+		try {
+			appendCompartments(db, "ses", [
+				{
+					sequence: 0,
+					startMessage: 1,
+					endMessage: 1,
+					startMessageId: "m1",
+					endMessageId: "m1",
+					endBlockIndex: 0,
+					title: "indexed",
+					content: "indexed",
+				},
+				{
+					sequence: 1,
+					startMessage: 2,
+					endMessage: 2,
+					startMessageId: "m2",
+					endMessageId: "m2",
+					startBlockIndex: 3,
+					title: "successor",
+					content: "successor",
+				},
+			]);
+			const appendCompaction = mock(() => "compact-1");
+			expect(
+				applyDeferredPiCompactionMarker(
+					{ db, readBranchEntries: () => branch(), appendCompaction },
+					"ses",
+					pending(),
+				).kind,
+			).toBe("applied");
+			expect(appendCompaction).toHaveBeenCalledTimes(1);
+		} finally {
+			closeQuietly(db);
+		}
+	});
 	it("findLatestCompactionFirstKept walks newest-first", () => {
 		expect(
 			findLatestCompactionFirstKept([

@@ -1,10 +1,14 @@
 #!/usr/bin/env bun
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { SubcClient } from "@cortexkit/subc-client";
-
+import { loadPluginConfig } from "../src/config";
 import { getDataDir, getMagicContextStorageDir } from "../src/shared/data-path";
+import {
+    setStoragePrivatePermissionEnforcement,
+    writeStorageFileAtomicSync,
+} from "../src/shared/storage-permissions";
 import { parseAgentDeliverReply } from "./cache-bust-sentinel";
 
 const HOUR = 3_600_000;
@@ -76,10 +80,7 @@ function loadState(path: string, now: number): State {
 }
 
 function saveState(path: string, state: State): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, path);
+    writeStorageFileAtomicSync(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 function key(alert: Alert): string {
@@ -219,6 +220,9 @@ function parseArgs(args: string[]): FailureSentinelOptions & { once: boolean; in
 
 if (import.meta.main) {
     try {
+        setStoragePrivatePermissionEnforcement(
+            loadPluginConfig(process.cwd()).storage.enforce_private_permissions,
+        );
         const options = parseArgs(process.argv.slice(2));
         do {
             await runFailureSentinel(options);

@@ -274,11 +274,13 @@ describe("Pi status dialog", () => {
 					"80-100": 1,
 				},
 			});
-			// The distribution is data the status surfaces no longer draw: the
-			// single view dropped the Importance histogram row.
-			expect(
-				renderPiStatusOverlay(detail, plainTheme(), 74).join("\n"),
-			).not.toContain("Importance");
+			expect(detail.historianRuns).toBe(0);
+			const overlay = renderPiStatusOverlay(detail, plainTheme(), 74).join(
+				"\n",
+			);
+			expect(overlay).toContain("Historian runs");
+			expect(overlay).toMatch(/Historian runs\s+0/);
+			expect(overlay).not.toContain("Importance");
 		} finally {
 			closeQuietly(db);
 		}
@@ -333,19 +335,16 @@ describe("Pi status dialog", () => {
 			const summary = formatPiStatusSummary(statusFixture);
 			expect(summary).toBe(`Magic Context Status
 Context: 1.0% of usable context (1,000 / 100,000 tokens)
-Cache lifetime: 1h (config for anthropic/claude-opus-5)
+Cache lifetime: 1h (your config)
 Automatic compression: at 65.0% of usable context
 History compression: Waiting for enough conversation history
 Reclaimable: 3 spent tool outputs (~14k tokens)
 Memory: 0 memories · 0 notes
 Search indexing: Off
 Warning: The last context update did not finish. Send another message to retry. (MC-S02)
-Warning: History compression could not finish this turn. It will retry automatically. (MC-H01)`);
-			for (const value of [
-				"1.0%",
-				"65.0%",
-				"1h (config for anthropic/claude-opus-5)",
-			]) {
+Warning: History compression could not finish this turn. It will retry automatically. (MC-H01)
+Window source: catalog; denominator: 100000 tokens`);
+			for (const value of ["1.0%", "65.0%", "1h (your config)"]) {
 				expect(summary).toContain(value);
 			}
 			for (const forbidden of [

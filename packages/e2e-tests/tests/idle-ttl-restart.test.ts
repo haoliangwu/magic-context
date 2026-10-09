@@ -714,6 +714,13 @@ forEachHost(import.meta.url, "idle TTL head replay", (host) => {
 			});
 			await send("warm request with no usage");
 			await h.waitForMockQuiescence();
+			// Wait for the two scheduler lines asserted below (the expired execute and
+			// the warm defer). Other `decision=` lines, such as a HARD pass's todo
+			// permission probe, can satisfy a looser count while the warm pass's line is
+			// still in the plugin's buffered log.
+			const schedulerLine = RUST_MODE
+				? /rust pass:.*scheduler=(?:execute|defer)/
+				: /(?:scheduler:|transform: usage=).*decision=(?:execute|defer)/;
 			await h.waitFor(
 				() =>
 					logs()
@@ -722,7 +729,7 @@ forEachHost(import.meta.url, "idle TTL head replay", (host) => {
 							(line) =>
 								line.includes(session) &&
 								Date.parse(line.slice(1, 25)) >= start &&
-								/decision=/.test(line),
+								schedulerLine.test(line),
 						).length >= 2,
 				{ timeoutMs: 5_000, label: "no-usage scheduler logs" },
 			);

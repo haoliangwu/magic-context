@@ -1,0 +1,153 @@
+{
+  "schema": 1,
+  "startedAt": "2026-10-07T09:56:28.760Z",
+  "updatedAt": "2026-10-07T09:56:30.546Z",
+  "baseCommit": "392930c8c167e84d148290f464a28fe9269f26cc",
+  "credentialId": "oauth:anthropic",
+  "authBootstrap": {
+    "hostVersion": "1.18.30",
+    "upstreamCalls": 0,
+    "isolation": {
+      "pid": 60427,
+      "dbFiles": [
+        "<root>/data/opencode/live.db-shm",
+        "<root>/data/cortexkit/magic-context/context.db-shm",
+        "<root>/data/opencode/live.db",
+        "<root>/data/opencode/live.db-wal",
+        "<root>/data/cortexkit/magic-context/context.db",
+        "<root>/data/cortexkit/magic-context/context.db-wal"
+      ],
+      "rootRemoved": true
+    }
+  },
+  "endpoint": "https://api.anthropic.com/v1/messages",
+  "bindingBeta": true,
+  "thinking": {
+    "type": "adaptive",
+    "display": "summarized",
+    "block_binding": {
+      "prefix_mismatch_behavior": "error"
+    }
+  },
+  "effort": "low",
+  "maxTokens": 512,
+  "cacheAnchor": "4600 repetitions of ' anchor', explicit 5m system breakpoint",
+  "callCap": 32,
+  "callsUsed": 2,
+  "results": [
+    {
+      "model": "claude-opus-5-5",
+      "outcome": "aborted",
+      "reason": "Error: Seed rejected: HTTP 429",
+      "signedBlocks": 0,
+      "completedTurns": 0,
+      "calls": [
+        {
+          "index": 1,
+          "at": "2026-10-07T09:56:28.762Z",
+          "model": "claude-opus-5-5",
+          "phase": "seed-1-tool",
+          "status": 429,
+          "accepted": false,
+          "requestId": "req_011CfngDmtuHEVT47wjeHyZX",
+          "error": "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit. Please try again later.\"},\"request_id\":\"req_011CfngDmtuHEVT47wjeHyZX\"}",
+          "usage": null,
+          "diagnostics": {},
+          "request": {
+            "kind": "aux",
+            "bytes": 33213,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {
+                  "prefix_mismatch_behavior": "error"
+                }
+              },
+              "maxTokens": 512,
+              "outputConfig": {
+                "effort": "low"
+              },
+              "systemHash": "79261e0c0e097790665c1eda6eb472f8b83b4f86e77d661f1d8235623e465e8b",
+              "toolsHash": "66483fcfbdf3440e292ceb87824e6a265316f28831a2118c719bc60e6d2feff8",
+              "history": [
+                {
+                  "role": "user",
+                  "signed": [],
+                  "nonThinking": [
+                    {
+                      "type": "text",
+                      "hash": "387b3fe418da9caf04d10a620c64136cf8497cb89764cae59873bfd4e063ddc4"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "outcome": "aborted",
+      "reason": "Error: Seed rejected: HTTP 429",
+      "signedBlocks": 0,
+      "completedTurns": 0,
+      "calls": [
+        {
+          "index": 2,
+          "at": "2026-10-07T09:56:29.839Z",
+          "model": "claude-sonnet-5-5",
+          "phase": "seed-1-tool",
+          "status": 429,
+          "accepted": false,
+          "requestId": "req_011CfngDrFqMUJZQaTgj98xg",
+          "error": "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your account's rate limit. Please try again later.\"},\"request_id\":\"req_011CfngDrFqMUJZQaTgj98xg\"}",
+          "usage": null,
+          "diagnostics": {},
+          "request": {
+            "kind": "aux",
+            "bytes": 33215,
+            "reasoningMap": "",
+            "reasoningItems": 0,
+            "emptyReasoning": 0,
+            "toolCalls": 0,
+            "toolResults": 0,
+            "flags": {
+              "thinking": {
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {
+                  "prefix_mismatch_behavior": "error"
+                }
+              },
+              "maxTokens": 512,
+              "outputConfig": {
+                "effort": "low"
+              },
+              "systemHash": "79261e0c0e097790665c1eda6eb472f8b83b4f86e77d661f1d8235623e465e8b",
+              "toolsHash": "66483fcfbdf3440e292ceb87824e6a265316f28831a2118c719bc60e6d2feff8",
+              "history": [
+                {
+                  "role": "user",
+                  "signed": [],
+                  "nonThinking": [
+                    {
+                      "type": "text",
+                      "hash": "387b3fe418da9caf04d10a620c64136cf8497cb89764cae59873bfd4e063ddc4"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

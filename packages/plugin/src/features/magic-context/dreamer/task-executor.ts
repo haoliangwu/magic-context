@@ -138,6 +138,15 @@ export interface DreamTaskExecutorDeps {
     hiddenCompletionExecutor?: HiddenCompletionExecutor;
     /** Existing user session used by a completion-only host. */
     parentSessionId?: string;
+    /**
+     * Finds a parent session when none was handed in. OpenCode 2's schedule
+     * timer uses it: a timer run has no triggering session, and a hidden child
+     * created without a parent would show up as a top-level session in the
+     * user's session list. When this is set and finds nothing, every task that
+     * needs a child session is skipped (not failed); database-only tasks and
+     * smart-note evaluation still run.
+     */
+    findParentSessionId?: () => Promise<string | undefined> | string | undefined;
     /** Filesystem directory of the project this drain owns (NOT the identity). */
     sessionDirectory: string;
     /** Opens the OpenCode DB read-only (for the key-files candidate scan). The
@@ -424,7 +433,26 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
     let parentSessionIdPromise: Promise<string | undefined> | undefined;
 
     const resolveParentSessionId = (deadline: number): Promise<string | undefined> => {
-        if (deps.hiddenCompletionExecutor || deps.parentSessionId || backgroundSessionsAreHidden)
+        if (deps.parentSessionId) return Promise.resolve(deps.parentSessionId);
+        const findParentSessionId = deps.findParentSessionId;
+        if (findParentSessionId) {
+            parentSessionIdPromise ??= (async () => {
+                try {
+                    return await findParentSessionId();
+                } catch (error) {
+                    log(
+                        `[dreamer] parent lookup failed for ${deps.sessionDirectory}: ${describeError(error).brief}`,
+                    );
+                    return undefined;
+                }
+            })().then((parent) => {
+                // A session can be opened in this directory after the lookup.
+                if (!parent) parentSessionIdPromise = undefined;
+                return parent;
+            });
+            return parentSessionIdPromise;
+        }
+        if (deps.hiddenCompletionExecutor || backgroundSessionsAreHidden)
             return Promise.resolve(deps.parentSessionId);
         if (!parentSessionIdPromise) {
             parentSessionIdPromise = (async () => {
@@ -708,15 +736,24 @@ export function createDreamTaskExecutor(deps: DreamTaskExecutorDeps): TaskExecut
             // Tasks that may finish without any child session keep running:
             // host-only database work, and smart-note evaluation, whose compiled
             // checks run in the local sandbox (or defer to the wake plane).
+            // A host that supplies its own parent lookup (OpenCode 2's timer)
+            // needs that parent for the same reason, carrier or not.
+            const parentRequired =
+                deps.findParentSessionId !== undefined ||
+                (deps.client !== undefined &&
+                    !deps.hiddenCompletionExecutor &&
+                    !backgroundSessionsAreHidden);
             if (
-                deps.client &&
-                !deps.hiddenCompletionExecutor &&
-                !backgroundSessionsAreHidden &&
+                parentRequired &&
                 !parent &&
                 DREAM_TASK_CAPABILITIES[config.task].transport !== "host-only" &&
                 config.task !== "evaluate-smart-notes"
             )
-                return skip("no ordinary parent session is available on this host");
+                return skip(
+                    deps.findParentSessionId
+                        ? "no session in this directory to hold the run's child session; it runs once one exists"
+                        : "no ordinary parent session is available on this host",
+                );
             if (
                 deps.hiddenCompletionExecutor?.capabilities.tools === false &&
                 DREAM_TASK_CAPABILITIES[config.task].requiresTools

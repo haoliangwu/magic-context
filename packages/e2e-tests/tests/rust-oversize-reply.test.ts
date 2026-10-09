@@ -54,6 +54,7 @@ describe.skipIf(!prereqs.ok)("bounded replies through a real daemon", () => {
         try {
             const route = await client.routeOpen({ kind: "tool_provider", module_id: "magic-context" }, { harness: "opencode", project_root: project, session }, { consumerIdentity: null });
             const template = await client.request(route, screenshotRequest("QUJD")) as Record<string, unknown>;
+            expect(template.prefix_bust_permitted).toBe(false);
             expect(template.native_messages).toBeArray();
             const native = template.native_messages as Array<{ parts: Array<{ type: string; url?: string }> }>;
             expect(native).toHaveLength(48);
@@ -109,10 +110,24 @@ describe.skipIf(!prereqs.ok)("bounded replies through a real daemon", () => {
                 await following;
                 expect(raw).toBe(expected);
                 expect(JSON.stringify(reply)).toBe(expected);
+                expect((reply as Record<string, unknown>).prefix_bust_permitted).toBe(false);
                 expect(maximumFrame).toBeLessThanOrEqual(512 * 1024);
                 const replayFirst = await client.request(route, screenshotRequest(image));
                 const replay = await assembleReplyPages(replayFirst, (id, index) => client.request(route, { method: "reply.page", reply_page_id: id, reply_page_index: index }));
                 expect(JSON.stringify(replay)).toBe(expected);
+                expect((replay as Record<string, unknown>).prefix_bust_permitted).toBe(false);
+
+                // The ordinary constructor also carries permission through a
+                // real paged reply, not only the historian passthrough default.
+                const normalSession = "ordinary-paged-permission";
+                const normalRoute = await client.routeOpen({ kind: "tool_provider", module_id: "magic-context" }, { harness: "opencode", project_root: project, session: normalSession }, { consumerIdentity: null });
+                const normalPages = buildPagedModuleTransformPayloads({ ...screenshotRequest(image), session_id: normalSession });
+                for (const { page } of normalPages.slice(0,-1)) await client.request(normalRoute,page);
+                const normalFirst = await client.request(normalRoute,normalPages.at(-1)!.page);
+                expect(normalFirst).toHaveProperty("reply_page");
+                const normal = await assembleReplyPages(normalFirst, (id,index)=>client.request(normalRoute,{method:"reply.page",reply_page_id:id,reply_page_index:index})) as Record<string,unknown>;
+                expect(normal.status).toBe("ok");
+                expect(normal.prefix_bust_permitted).toBe(true);
             } catch (error) {
                 await following.catch(() => undefined);
                 if (!baseline) throw error;

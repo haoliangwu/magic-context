@@ -85,10 +85,9 @@ run_e2e_group() {
 }
 
 echo "  [e2e:rust:prerequisites:start] resolving current Rust workspaces..."
-# `--hermetic` verifies the two source workspaces without performing the obsolete
-# root-target ck-mc build. HermeticSubcStack performs the one authoritative build
-# into its e2e-owned target directory and renames that current-tree binary to
-# ckdev-mc-e2e before spawning it.
+# `--hermetic` verifies the root Cargo workspace and daemon source/artifact inputs
+# without requiring a prebuilt ck-mc. The hermetic harness builds ck-mc into its
+# e2e-owned target directory when shards have not supplied a prebuilt binary.
 if ! bun "$PREREQUISITE_DETECTOR" --hermetic; then
     echo "Error: Rust e2e prerequisite detector failed; the rust group is RED (never skipped)." >&2
     echo "  [e2e:rust:prerequisites:end] status=fail"

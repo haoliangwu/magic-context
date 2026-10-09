@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 import {
@@ -10,6 +10,7 @@ import {
 } from "../../shared/auto-update-provenance";
 import { getOpenCodeStorageDir } from "../../shared/data-path";
 import { log } from "../../shared/logger";
+import { writeStorageFileAtomicSync } from "../../shared/storage-permissions";
 import { resolveInstallContext } from "./cache";
 import {
     extractChannel,
@@ -171,10 +172,7 @@ function checkStatePath(storageDir: string | null): string {
 }
 
 function writeCheckState(path: string, state: AutoUpdateCheckState): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.tmp.${process.pid}`;
-    writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
-    renameSync(tmp, path);
+    writeStorageFileAtomicSync(path, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 function claimCheckSlot(storageDir: string | null, intervalMs: number): boolean {
@@ -224,16 +222,11 @@ function writePendingUpdateMarker(
 ): void {
     recordUpdaterPinnedSpec(storageDir, update.spec);
     try {
-        const dir = storageDir ?? dirname(pendingMarkerPath(storageDir));
-        mkdirSync(dir, { recursive: true });
         const path = pendingMarkerPath(storageDir);
-        const temp = `${path}.tmp.${process.pid}`;
-        writeFileSync(
-            temp,
+        writeStorageFileAtomicSync(
+            path,
             `${JSON.stringify({ spec: update.spec, version, configPaths: update.configPaths, writtenAt: Date.now() }, null, 2)}\n`,
-            "utf-8",
         );
-        renameSync(temp, path);
     } catch (err) {
         warn(`[auto-update-checker] Could not write pending update marker: ${String(err)}`);
     }

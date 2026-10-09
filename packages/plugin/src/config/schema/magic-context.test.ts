@@ -9,6 +9,25 @@ import {
 } from "./magic-context";
 
 describe("MagicContextConfigSchema", () => {
+    it("documents that Rust transform mode always keeps the shared data directory private", () => {
+        const inputSchema = MagicContextConfigSchema._def.in as unknown as {
+            shape: {
+                storage: {
+                    unwrap: () => {
+                        shape: {
+                            enforce_private_permissions: { description?: string };
+                        };
+                    };
+                };
+            };
+        };
+        const description =
+            inputSchema.shape.storage.unwrap().shape.enforce_private_permissions.description ?? "";
+        expect(description).toContain("Rust transform mode");
+        expect(description).toContain("always keeps the shared data directory owner-only 0700");
+        expect(description).toContain("regardless of this setting");
+    });
+
     describe("defaults", () => {
         it("applies defaults for an empty config", () => {
             const result = MagicContextConfigSchema.parse({});
@@ -23,7 +42,6 @@ describe("MagicContextConfigSchema", () => {
                 cache_ttl: "5m",
                 prompt_surface: { default: "full" },
                 execute_threshold_percentage: 65,
-                clear_reasoning_age: 50,
                 history_budget_percentage: DEFAULT_HISTORY_BUDGET_PERCENTAGE,
                 historian_timeout_ms: DEFAULT_HISTORIAN_TIMEOUT_MS,
                 embedding: {
@@ -166,7 +184,7 @@ describe("MagicContextConfigSchema", () => {
 
             const result = MagicContextConfigSchema.parse(input);
 
-            expect(result).toEqual(input);
+            expect(result).toEqual({ ...input, protected_tools: { todowrite: 1, ctx_reduce: 3 } });
         });
 
         it("accepts a boolean storage permission policy and rejects non-booleans", () => {
@@ -682,8 +700,10 @@ describe("MagicContextConfigSchema", () => {
             ).toBe(30000);
         });
 
-        it("rejects clear_reasoning_age below minimum", () => {
-            expect(() => MagicContextConfigSchema.parse({ clear_reasoning_age: 9 })).toThrow();
+        it("accepts deprecated clear_reasoning_age without applying its old validation", () => {
+            expect(
+                MagicContextConfigSchema.parse({ clear_reasoning_age: 9 }).keep_reasoning_tokens,
+            ).toBeUndefined();
         });
 
         it("rejects historian_timeout_ms below minimum", () => {

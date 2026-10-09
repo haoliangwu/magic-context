@@ -17,14 +17,14 @@ describe("Rust release prerequisite detector", () => {
         const root = join(parent, "repo");
         temporaryRoots.push(parent);
         mkdirSync(root, { recursive: true });
-        mkdirSync(join(parent, "commons"), { recursive: true });
         mkdirSync(join(parent, "subconscious"), { recursive: true });
         writeFileSync(join(root, "Cargo.toml"), "[workspace]\nmembers = []\n");
-        writeFileSync(join(parent, "commons/Cargo.toml"), "[workspace]\nmembers = []\n");
         writeFileSync(join(parent, "subconscious/Cargo.toml"), "[workspace]\nmembers = []\n");
 
         const cargoOnly = join(root, "cargo-only");
         mkdirSync(cargoOnly);
+        const cargo = writeTestExecutable("cargo", "#!/bin/sh\n[ \"$1\" = metadata ] && exit 0\nexit 1\n");
+        const cargoBin = dirname(cargo);
         // Shared content-addressed stub, alone in its directory and reused across
         // runs (see writeTestExecutable); the afterEach cleanup never touches it.
         const ckMc = writeTestExecutable("ck-mc", "#!/bin/sh\nexit 0\n");
@@ -48,9 +48,19 @@ describe("Rust release prerequisite detector", () => {
         const hermetic = detectRustPrerequisites({
             repoRoot: root,
             requireCkMc: false,
-            env: { PATH: cargoOnly },
+            env: { PATH: cargoBin },
         });
-        expect(hermetic.ok).toBe(false);
+        expect(hermetic.ok).toBe(true);
         expect(hermetic.missing.join("\n")).not.toContain("ck-mc binary");
+
+        rmSync(join(parent, "subconscious"), { recursive: true, force: true });
+        const prebuiltCkSubc = writeTestExecutable("ck-subc", "#!/bin/sh\nexit 0\n");
+        const prebuilt = detectRustPrerequisites({
+            repoRoot: root,
+            requireCkMc: false,
+            env: { PATH: cargoBin, MC_E2E_CK_SUBC_BIN: prebuiltCkSubc },
+        });
+        expect(prebuilt.ok).toBe(true);
+        expect(prebuilt.subconsciousRoot).toBeUndefined();
     });
 });

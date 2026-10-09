@@ -1,15 +1,5 @@
 import { spawnSync } from "node:child_process";
-import {
-    chmodSync,
-    closeSync,
-    constants,
-    copyFileSync,
-    existsSync,
-    openSync,
-    renameSync,
-    rmSync,
-    statSync,
-} from "node:fs";
+import { closeSync, existsSync, openSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { ensureContextStoreUuid } from "@magic-context/core/features/magic-context/context-store-uuid";
@@ -26,6 +16,10 @@ import {
     inspectWindowsProcessesSync,
 } from "@magic-context/core/shared/rpc-utils";
 import { Database, type Database as DatabaseType } from "@magic-context/core/shared/sqlite";
+import {
+    copyStorageFileSync,
+    openStorageFileSync,
+} from "@magic-context/core/shared/storage-permissions";
 
 import { CLI_SCHEMA_FLOOR_VERSION } from "../lib/database-access";
 import { type PromptIO, promptIO } from "../lib/prompts";
@@ -204,7 +198,7 @@ export function copyDatabaseBundle(sourceBase: string, destinationBase: string):
         const source = `${sourceBase}${suffix}`;
         if (!existsSync(source)) continue;
         const destination = `${destinationBase}${suffix}`;
-        copyFileSync(source, destination, constants.COPYFILE_EXCL);
+        copyStorageFileSync(source, destination);
         copiedPaths.push(destination);
     }
     return copiedPaths;
@@ -307,7 +301,7 @@ function runRecoverShell(
 ): { ok: true } | { ok: false; detail: string; attempted: boolean; unavailable: boolean } {
     let dumpWriteFd: number | null = null;
     try {
-        dumpWriteFd = openSync(dumpPath, "wx", 0o600);
+        dumpWriteFd = openStorageFileSync(dumpPath, "wx");
         const recovered = spawnSync(sqliteExecutable, [sourcePath, ".recover"], {
             stdio: ["ignore", dumpWriteFd, "pipe"],
             encoding: "utf8",
@@ -328,6 +322,8 @@ function runRecoverShell(
             };
         }
 
+        const recoveredSeedFd = openStorageFileSync(recoveredPath, "wx");
+        closeSync(recoveredSeedFd);
         const dumpReadFd = openSync(dumpPath, "r");
         try {
             const replayed = spawnSync(sqliteExecutable, [recoveredPath], {
@@ -463,6 +459,8 @@ function readCountsFromOpenDatabase(db: DatabaseType): RowCounts {
 function prepareFreshDatabase(path: string): SalvageResult {
     let db: DatabaseType | null = null;
     try {
+        const seedFd = openStorageFileSync(path, "wx");
+        closeSync(seedFd);
         db = new Database(path);
         const schemaVersionBefore = getPersistedSchemaVersion(db);
         initializeDatabase(db);
@@ -680,8 +678,6 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
             return reportSafetyRefusal(prompts, dbPath, finalInspection, backup.basePath);
         }
         try {
-            const originalMode = statSync(dbPath).mode & 0o777;
-            chmodSync(recoveredPath, originalMode);
             const originalAsidePath = uniqueBase(`${dbPath}.corrupt-original-${stamp}`);
             const moved = activateReplacement(dbPath, recoveredPath, originalAsidePath);
             reportSchemaTransition(prompts, salvageResult);
@@ -739,8 +735,6 @@ export async function runRepairDb(options: RunRepairDbOptions = {}): Promise<Rep
     }
 
     try {
-        const originalMode = statSync(dbPath).mode & 0o777;
-        chmodSync(freshPath, originalMode);
         const originalAsidePath = uniqueBase(`${dbPath}.corrupt-original-${stamp}`);
         const moved = activateReplacement(dbPath, freshPath, originalAsidePath);
         reportSchemaTransition(prompts, fresh);

@@ -108,6 +108,11 @@
         "input": { "providerShortReadWithIdenticalPrefix": true }
     },
     {
+        "class": "tail_shrink_no_rewrite",
+        "decision": { "decision": "unknown" },
+        "input": { "tailShrink": true, "rewrittenTokens": 0 }
+    },
+    {
         "class": "self_inflicted_epoch",
         "decision": {
             "materialized": true,

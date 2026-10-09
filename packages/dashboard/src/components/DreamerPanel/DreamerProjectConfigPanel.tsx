@@ -189,7 +189,7 @@ export default function DreamerProjectConfigPanel(props: {
                 {(message) => (
                   <p
                     class="config-field-desc"
-                    style={{ color: "var(--danger, #e5484d)", "margin-bottom": "12px" }}
+                    style={{ color: "var(--danger)", "margin-bottom": "12px" }}
                   >
                     {message()}
                   </p>

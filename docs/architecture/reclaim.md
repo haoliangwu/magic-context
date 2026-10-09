@@ -59,12 +59,14 @@ Age reclaim drops old tool outputs without the agent asking, in two steps so it 
 
 ## Smart drops
 
-`smart_drops: true` (opt-in, off by default) adds content-aware reclaim on busting passes (`supersession-reclaim.ts`):
+Supersession always adds content-aware reclaim on busting passes (`supersession-reclaim.ts`); the deprecated `smart_drops` key is ignored:
 
 - **Spent control-plane outputs**: all but the newest `todowrite`, `ctx_reduce` calls beyond the protected three, zero-value meta calls (`bash_status`, `bash_kill`), and `ctx_note` read and dismiss calls.
 - **Superseded edits**: an `edit` or `write` to a file that has been edited again later is compressed to `edit_marker` mode (`edit-marker.ts`), which keeps the file path verbatim and the first 40 characters of the change as a region hint and replaces the output with the placeholder. The newest edit per file stays whole, so the model still knows which files and regions it touched.
 
 Supersession ignores tool calls owned by the newest 20 distinct messages (`SUPERSESSION_RECENT_MESSAGE_WINDOW`), derived from persisted tag order so the protection does not shift when the provider-visible array contracts and re-expands.
+
+All automatic lanes also honour `protected_tools`, a user/project map merged over `{todowrite: 1, ctx_reduce: 3}`. A shared active-population snapshot protects each tool's newest N tag ordinals, with case-insensitive and leading-`mcp_` matching. This protection holds at 95%, unlike the token window and tier reserve, and applies to edit markers and dedup too. Queued drops from the agent or historian publication are held by that same set until newer calls displace the result and a rebuilding pass applies the drop. The historian's summary is unaffected and the raw result leaves at the next fold. Frozen strips remain independent. Map changes and rotation never originate a bust or restore dropped results.
 
 ## Heuristic cleanup and emergency drops
 
@@ -81,7 +83,7 @@ At the force band (`max(85%, execute threshold + 2%)`, so 92% at the highest all
 
 ## Strip and replay
 
-Some mutations are not drops but strips of content the provider does not need (`strip-content.ts`): cleared reasoning older than `clear_reasoning_age` tags (default 50), structural noise, stale placeholders, processed images, merged-assistant reasoning, stale `ctx_reduce` calls (`drop-stale-reduce-calls.ts`) and injected system messages. Each strip is a stateless function plus persisted state. The pattern is **detect and freeze on a busting pass, replay on every pass**: the affected ids are recorded in `session_meta` (for example `stripped_placeholder_ids`, `stale_reduce_stripped_ids`, `processed_image_stripped_ids`, `merged_reasoning_stripped_ids`) and every later pass, defer passes included, re-applies exactly that set. Frozen sets are bounded and entries are removed when their message is removed.
+Some mutations are not drops but strips of content the provider does not need (`strip-content.ts`): reasoning beyond `keep_reasoning_tokens` (fixed default 10,000), structural noise, stale placeholders, processed images, merged-assistant reasoning, stale `ctx_reduce` calls (`drop-stale-reduce-calls.ts`) and injected system messages. Each strip is a stateless function plus persisted state. The pattern is **detect and freeze on a busting pass, replay on every pass**: the affected ids are recorded in `session_meta` (for example `stripped_placeholder_ids`, `stale_reduce_stripped_ids`, `processed_image_stripped_ids`, `merged_reasoning_stripped_ids`) and every later pass, defer passes included, re-applies exactly that set. Frozen sets are bounded and entries are removed when their message is removed.
 
 Emptied content is provider-aware (`sentinel.ts`): providers that accept empty parts get an empty sentinel, others get a placeholder, because some providers break tool adjacency on empty parts. `variantChangeBustsProviderCache` decides whether a reasoning-effort change is itself a cache bust worth flushing queued work into.
 
