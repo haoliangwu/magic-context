@@ -67,7 +67,7 @@ import { clearModelsDevCache, refreshModelLimitsFromApi } from "../../shared/mod
 import { Database } from "../../shared/sqlite";
 import { closeQuietly } from "../../shared/sqlite-helpers";
 import type { MarkerUpdateOutcome } from "./compaction-marker-manager";
-import { registerActiveCompartmentRun } from "./compartment-runner";
+import { getActiveCompartmentRun, registerActiveCompartmentRun } from "./compartment-runner";
 import { createToolExecuteAfterHook } from "./hook-handlers";
 import { injectM0M1 } from "./inject-compartments";
 import { captureSlot, getSlot, resetLkgSlotsForTest } from "./lkg-slot";
@@ -3630,6 +3630,8 @@ describe("createTransform protected tail", () => {
         //#when
         await transform({}, { messages });
 
+        // Eligibility now runs after the pass; the no-op still clears its intent.
+        await getActiveCompartmentRun("ses-pt-flag")?.promise;
         //#then: no historian session created and flag was cleared
         expect(createSession).not.toHaveBeenCalled();
         const meta = getOrCreateSessionMeta(db, "ses-pt-flag");
@@ -3741,6 +3743,7 @@ describe("createTransform protected tail", () => {
 
         //#when — second pass detects stale flag, clears it (no eligible history to resume)
         await transform({}, { messages });
+        await getActiveCompartmentRun("ses-pt-pending")?.promise;
 
         //#then
         expect(getOrCreateSessionMeta(db, "ses-pt-pending").compartmentInProgress).toBe(false);
@@ -5184,3 +5187,66 @@ for (const { modelID, prefixBound } of [
         }
     });
 }
+
+it("OpenCode spent drain budget keeps served defer bytes unchanged without historian startup", async () => {
+    useTempDataHome("transform-spent-drain-bytes-");
+    const sessionId = "ses-transform-spent-drain-bytes";
+    const raw = [
+        ...Array.from({ length: 6 }, (_, i) => ({
+            id: `m${i + 1}`,
+            role: i % 2 ? "assistant" : "user",
+            text: i % 2 ? "done" : "history ".repeat(3500),
+        })),
+        ...Array.from({ length: 5 }, (_, i) => ({
+            id: `m${i + 7}`,
+            role: "user",
+            text: "protected",
+        })),
+    ];
+    createOpenCodeDbForTransform(sessionId, raw);
+    const db = openDatabase();
+    getOrCreateSessionMeta(db, sessionId);
+    for (const [i, id] of ["m1", "m3", "m5"].entries())
+        insertTag(db, sessionId, id, "message", 3500, i + 1);
+    db.prepare(
+        "UPDATE session_meta SET protected_tail_drain_window_started_at = ?, protected_tail_drain_tokens = 500000 WHERE session_id = ?",
+    ).run(Date.now(), sessionId);
+    const runner = await import("./compartment-runner");
+    const start = spyOn(runner, "startCompartmentAgent").mockImplementation(() => {});
+    try {
+        const transform = createTransform({
+            tagger: createTagger(),
+            scheduler: { shouldExecute: () => "defer" },
+            contextUsageMap: new Map([
+                [
+                    sessionId,
+                    { usage: { percentage: 25, inputTokens: 50_000 }, updatedAt: Date.now() },
+                ],
+            ]),
+            db,
+            historyRefreshSessions: new Set(),
+            pendingMaterializationSessions: new Set(),
+            lastHeuristicsTurnId: new Map(),
+            protectedTokens: 0,
+            client: {
+                session: { get: mock(async () => ({ data: { directory: "/tmp" } })) },
+            } as unknown as PluginContext["client"],
+            directory: "/tmp",
+        });
+        const pass = async () => {
+            const messages = raw.map((m) => ({
+                info: { id: m.id, role: m.role, sessionID: sessionId },
+                parts: [{ type: "text", text: m.text }],
+            })) as TestMessage[];
+            await transform({}, { messages });
+            return JSON.stringify(messages);
+        };
+        const bytes = await pass();
+        expect(await pass()).toBe(bytes);
+        expect(await pass()).toBe(bytes);
+        expect(start).not.toHaveBeenCalled();
+        expect(getOrCreateSessionMeta(db, sessionId).compartmentInProgress).toBe(false);
+    } finally {
+        start.mockRestore();
+    }
+});

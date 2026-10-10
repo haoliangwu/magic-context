@@ -17,6 +17,7 @@ import { sessionLog } from "../../shared/logger";
 import type { Database } from "../../shared/sqlite";
 import { contentTagOwnerMessageId } from "../../shared/tag-owner-id";
 import { hasReclaimRide, type ReclaimRideSignals, reclaimRideLabel } from "./cache-busting-signals";
+import { isHistorianDrainBudgetSpent } from "./historian-drain-gate";
 import {
     createDefaultBoundarySnapshotForTests,
     getRawHistoryEligibility,
@@ -399,7 +400,9 @@ function getUnsummarizedTailInfo(
                           usageSource: "live",
                           taggerFloor,
                       });
-            const hasProtectedEligibleHead = boundary.offset < boundary.protectedTailStart;
+            const hasProtectedEligibleHead =
+                boundary.offset <
+                Math.min(boundary.protectedTailStart, boundary.eligibleEndOrdinal);
 
             if (!hasProtectedEligibleHead) {
                 return {
@@ -422,7 +425,7 @@ function getUnsummarizedTailInfo(
                 sessionId,
                 scanBudget,
                 rawEligibility.offset,
-                boundary.protectedTailStart,
+                boundary.eligibleEndOrdinal,
             );
             const isMeaningful =
                 chunk.hasMore ||
@@ -476,6 +479,17 @@ export function checkCompartmentTrigger(
         );
         return { shouldFire: false };
     }
+
+    if (
+        isHistorianDrainBudgetSpent({
+            db,
+            sessionId,
+            usagePercentage: usage.percentage,
+            contextLimit: resolveBoundaryContextLimit(usage, contextLimit),
+            executeThresholdPercentage,
+        })
+    )
+        return { shouldFire: false };
 
     const lazyInMemoryTail = typeof inMemoryTail === "function" ? inMemoryTail : undefined;
     let resolvedInMemoryTail = typeof inMemoryTail === "function" ? undefined : inMemoryTail;

@@ -801,6 +801,15 @@ fn opencode_removal_stops_at_the_first_ineligible_message_on_prefix_bound_models
     assert!(!is_prefix_bound_thinking_model(Some(
         "anthropic/claude-sonnet-5-50"
     )));
+    assert!(is_prefix_bound_thinking_model(Some(
+        "anthropic/claude-haiku-5-5"
+    )));
+    assert!(is_prefix_bound_thinking_model(Some(
+        "amazon-bedrock/us.anthropic.claude-haiku-5-5-v1:0"
+    )));
+    assert!(!is_prefix_bound_thinking_model(Some(
+        "anthropic/claude-haiku-4-5"
+    )));
 }
 
 /// The same scenarios as the TypeScript and Pi lanes, from one shared golden file.

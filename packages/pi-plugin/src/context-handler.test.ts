@@ -17,6 +17,7 @@ import {
 	isSessionReconciled,
 } from "@magic-context/core/features/magic-context/message-index-async";
 import { readEpochFloorSnapshot } from "@magic-context/core/features/magic-context/protection-window";
+import { recordSessionProjectIdentity } from "@magic-context/core/features/magic-context/session-project-storage";
 import {
 	acquireWrapupInProgress,
 	addNote,
@@ -45,6 +46,7 @@ import {
 } from "@magic-context/core/features/magic-context/storage";
 import { openDatabase } from "@magic-context/core/features/magic-context/storage-db";
 import {
+	DRAIN_WINDOW_MS,
 	getEmergencyInputSample,
 	getMergedReasoningStrippedIds,
 	getOverflowState,
@@ -97,6 +99,8 @@ import {
 	setPiChannel1Baseline,
 } from "./ctx-reduce-nudge-pi";
 import { injectM0M1Pi, mustMaterializePi } from "./inject-compartments-pi";
+import * as piHistorian from "./pi-historian-runner";
+import { capturePiServedArray } from "./served-array-ledger";
 import {
 	assistantMessage,
 	assistantToolCall,
@@ -109,6 +113,101 @@ import {
 } from "./test-utils.test";
 import { createCtxReduceTool } from "./tools/ctx-reduce";
 import { createPiTranscript } from "./transcript-pi";
+
+it("Pi spent drain budget prevents historian startup, preserves served bytes, and resumes asynchronously at reset", async () => {
+	const db = createTestDb();
+	const sessionId = "ses-pi-spent-drain-hot-path";
+	const fake = createFakePi();
+	const start = spyOn(piHistorian, "runPiHistorian").mockImplementation(
+		async () => {},
+	);
+	const logger = await import("@magic-context/core/shared/logger");
+	const log = spyOn(logger, "sessionLog");
+	try {
+		updateSessionMeta(db, sessionId, { piStableIdScheme: 1 });
+		registerPiContextHandler(fake.pi as never, {
+			db,
+			protectedTags: 0,
+			historian: {
+				runner: {
+					harness: "pi",
+					run: mock(async () => ({
+						ok: true,
+						assistantText: "",
+						durationMs: 1,
+					})),
+				} as unknown as SubagentRunner,
+				model: "test/historian",
+				historianChunkTokens: 20_000,
+				executeThresholdPercentage: 80,
+				protectedTags: 0,
+			},
+		});
+		const handler = fake.handlers.get("context") as (
+			event: { messages: never[] },
+			ctx: never,
+		) => Promise<{ messages: unknown[] }>;
+		const raw = [
+			...Array.from({ length: 12 }, (_, i) =>
+				i % 2
+					? assistantMessage("history ".repeat(6000), i + 1)
+					: userMessage("history ".repeat(6000), i + 1),
+			),
+			...Array.from({ length: 5 }, (_, i) => userMessage("protected", i + 13)),
+		];
+		const pass = (tokens: number) => {
+			const messages = structuredClone(raw);
+			return handler({ messages: messages as never[] }, {
+				...fakeContext(
+					sessionId,
+					process.cwd(),
+					messages.map((_, i) => `entry-${i + 1}`),
+					messages,
+				),
+				getContextUsage: () => ({
+					tokens,
+					percent: tokens / 2000,
+					contextWindow: 200_000,
+				}),
+			} as never);
+		};
+		const startedAt = Date.now();
+		db.prepare(
+			"UPDATE session_meta SET protected_tail_drain_window_started_at = ?, protected_tail_drain_tokens = 500000 WHERE session_id = ?",
+		).run(startedAt, sessionId);
+		const first = await pass(156_000);
+		await awaitInFlightHistorians(sessionId);
+		const bytes = JSON.stringify(first.messages);
+		for (let i = 0; i < 2; i++) {
+			updateSessionMeta(db, sessionId, { lastResponseTime: Date.now() });
+			expect(JSON.stringify((await pass(156_000)).messages)).toBe(bytes);
+			await awaitInFlightHistorians(sessionId);
+		}
+		expect(start).not.toHaveBeenCalled();
+		expect(getOrCreateSessionMeta(db, sessionId).compartmentInProgress).toBe(
+			false,
+		);
+		expect(
+			log.mock.calls.filter(
+				([id, text]) =>
+					id === sessionId && String(text).includes("next eligible at"),
+			),
+		).toHaveLength(1);
+		db.prepare(
+			"UPDATE session_meta SET protected_tail_drain_window_started_at = ? WHERE session_id = ?",
+		).run(Date.now() - DRAIN_WINDOW_MS, sessionId);
+		await pass(156_000);
+		expect(start).not.toHaveBeenCalled();
+		await awaitInFlightHistorians(sessionId);
+		expect(start).toHaveBeenCalledTimes(1);
+	} finally {
+		await awaitInFlightHistorians(sessionId);
+		start.mockRestore();
+		log.mockRestore();
+		clearContextHandlerSession(sessionId);
+		closeQuietly(db);
+	}
+});
 
 describe("Pi context project identity cache", () => {
 	it("serves byte-identical output with cached identity and one host-usage read per context", async () => {
@@ -260,6 +359,117 @@ for (const configured of [true, false]) {
 }
 
 describe("Pi project binding retry", () => {
+	it("logs an actual binding change once and stays quiet for an unchanged pass", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-binding-change-log";
+		const logger = await import("@magic-context/core/shared/logger");
+		const log = spyOn(logger, "sessionLog");
+		try {
+			recordSessionProjectIdentity(db, sessionId, "git:old");
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:new",
+				db,
+				"/workspace/new",
+			);
+
+			const changeLogs = () =>
+				log.mock.calls.filter(([, message]) =>
+					String(message).startsWith("project binding changed"),
+				);
+			expect(changeLogs()).toHaveLength(1);
+			expect(changeLogs()[0]).toEqual([
+				sessionId,
+				"project binding changed harness=pi cwd=/workspace/new old=git:old new=git:new",
+			]);
+
+			contextHandlerInternals.updateSessionProjectTracking(
+				sessionId,
+				"git:new",
+				db,
+				"/workspace/new",
+			);
+			expect(changeLogs()).toHaveLength(1);
+		} finally {
+			log.mockRestore();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
+	it("rate-limits failed writes and logs one recovery", async () => {
+		const db = createTestDb();
+		const sessionId = "ses-pi-binding-write-log";
+		const logger = await import("@magic-context/core/shared/logger");
+		const log = spyOn(logger, "sessionLog");
+		const clock = spyOn(Date, "now").mockReturnValue(1_000);
+		const schema = (
+			db
+				.prepare(
+					"SELECT sql FROM sqlite_master WHERE name = 'session_projects'",
+				)
+				.get() as { sql: string }
+		).sql;
+		try {
+			db.exec("DROP TABLE session_projects");
+			const observe = () =>
+				contextHandlerInternals.updateSessionProjectTracking(
+					sessionId,
+					"git:retry",
+					db,
+					"/workspace/retry",
+				);
+			observe();
+			const failureLogs = () =>
+				log.mock.calls.filter(([, message]) =>
+					String(message).startsWith("project binding write failed"),
+				);
+			expect(failureLogs()).toHaveLength(1);
+			expect(failureLogs()[0][1]).toContain(
+				"project binding write failed harness=pi cwd=/workspace/retry attempted=git:retry:",
+			);
+			expect(failureLogs()[0][1]).toContain("no such table: session_projects");
+
+			clock.mockReturnValue(1_000 + 599_999);
+			observe();
+			expect(failureLogs()).toHaveLength(1);
+
+			clock.mockReturnValue(1_000 + 600_000);
+			observe();
+			expect(failureLogs()).toHaveLength(2);
+
+			db.exec(schema);
+			clock.mockReturnValue(1_000 + 600_001);
+			observe();
+			const recoveryLogs = log.mock.calls.filter(([, message]) =>
+				String(message).startsWith("project binding write recovered"),
+			);
+			expect(recoveryLogs).toHaveLength(1);
+			expect(recoveryLogs[0]).toEqual([
+				sessionId,
+				"project binding write recovered harness=pi cwd=/workspace/retry identity=git:retry",
+			]);
+			const changeLogs = log.mock.calls.filter(([, message]) =>
+				String(message).startsWith("project binding changed"),
+			);
+			expect(changeLogs).toHaveLength(1);
+			// Recovery is also the first successful binding write, so it reports the
+			// actual no-binding → project transition.
+			expect(changeLogs[0][1]).toContain("old=none new=git:retry");
+			const persisted = db
+				.prepare(
+					"SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'pi'",
+				)
+				.get(sessionId) as { project_path: string };
+			expect(persisted.project_path).toBe("git:retry");
+		} finally {
+			clock.mockRestore();
+			log.mockRestore();
+			clearContextHandlerSession(sessionId);
+			closeQuietly(db);
+		}
+	});
+
 	it("retries a failed first write without adding steady-state writes", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-retry-binding";
@@ -268,7 +478,9 @@ describe("Pi project binding retry", () => {
 				.prepare(
 					"SELECT sql FROM sqlite_master WHERE name = 'session_projects'",
 				)
-				.get() as { sql: string }
+				.get() as {
+				sql: string;
+			}
 		).sql;
 		try {
 			db.exec("DROP TABLE session_projects");
@@ -1080,7 +1292,9 @@ describe("Pi fallback tag adoption", () => {
 				sessionId,
 				tagger,
 				fingerprints,
-				{ hasFallbackMessageTags: false },
+				{
+					hasFallbackMessageTags: false,
+				},
 			);
 			expect(readTagRow(db, sessionId, 7)?.messageId).toBe(`${realId}:p0`);
 			expect(tagger.getTag(sessionId, `${realId}:p0`, "message")).toBe(7);
@@ -1454,7 +1668,11 @@ describe("Pi fallback tag adoption", () => {
 				0,
 				null,
 				null,
-				{ tokenCount: 9, inputTokenCount: null, reasoningTokenCount: null },
+				{
+					tokenCount: 9,
+					inputTokenCount: null,
+					reasoningTokenCount: null,
+				},
 			);
 			db.prepare(
 				"UPDATE tags SET status = 'dropped' WHERE session_id = ? AND tag_number = 71",
@@ -1463,6 +1681,9 @@ describe("Pi fallback tag adoption", () => {
 			queuePendingOp(db, sessionId, 71, "drop", 200);
 			tagger.bindTag(sessionId, `${fallbackId}:p0`, 70);
 			tagger.bindTag(sessionId, `${realId}:p0`, 71);
+			capturePiServedArray(sessionId, [userMessage("§71§ hello", 70)], {
+				servedTagNumbers: [71],
+			});
 
 			contextHandlerInternals.adoptPiFallbackTags(
 				db,
@@ -1601,7 +1822,7 @@ describe("Pi fallback tag adoption", () => {
 		}
 	});
 
-	it("cheap-gate: does not build the owner map when no pi-msg tool owners exist", () => {
+	it("prepares tool owners outside the writer even if discovery found no synthetic owners", () => {
 		const db = createTestDb();
 		try {
 			const sessionId = "ses-pi-tool-owner-cheap-gate";
@@ -1619,8 +1840,9 @@ describe("Pi fallback tag adoption", () => {
 				0,
 				"entry-real",
 			);
-			// Split a gate hole from a wrong test premise: the tool-owner gate MUST
-			// be false here (no pi-msg-* owners), so the branch-walk never runs.
+			// A sibling can add a synthetic tool-owner tag before BEGIN. Prepare
+			// assistant/call identities even when no such tag is visible yet, so
+			// resolving the new tag needs no branch walk while holding the writer.
 			expect(hasPiFallbackToolOwnerTags(db, sessionId)).toBe(false);
 
 			let resolverCalls = 0;
@@ -1632,15 +1854,14 @@ describe("Pi fallback tag adoption", () => {
 				{
 					messages: [assistantToolCall("call-real", "Read", {}, 90)],
 					resolveStableId: () => {
+						expect(db.inTransaction).toBe(false);
 						resolverCalls += 1;
 						return "entry-real";
 					},
 				},
 			);
 
-			// The cheap hasPiFallbackToolOwnerTags gate short-circuits before any
-			// branch walk, so the resolver is never consulted.
-			expect(resolverCalls).toBe(0);
+			expect(resolverCalls).toBe(1);
 		} finally {
 			closeQuietly(db);
 		}
@@ -2818,7 +3039,9 @@ describe("registerPiContextHandler", () => {
 			);
 			expect(
 				db.prepare("SELECT status FROM notes WHERE id=?").get(notice.id),
-			).toEqual({ status: "dismissed" });
+			).toEqual({
+				status: "dismissed",
+			});
 			clearContextHandlerSession(sessionId);
 			onNoteTrigger(db, sessionId, "todos_complete");
 			await turn("entry-3");
@@ -4330,6 +4553,8 @@ describe("registerPiContextHandler", () => {
 			await expect(
 				handler(throwingEvent, fakeContext("ses-context") as never),
 			).rejects.toMatchObject({ name: "PiStorageBusyError" });
+			// Refusal is immediate; storage diagnostics are deliberately deferred.
+			await new Promise<void>((resolve) => setImmediate(resolve));
 			expect(getOrCreateSessionMeta(db, "ses-context").lastTransformError).toBe(
 				"boom messages",
 			);
@@ -4841,6 +5066,10 @@ describe("registerPiContextHandler", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-cleared-historian-publish";
 		let release!: () => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, sessionId, "previous failure");
 			const runner = {
@@ -4848,6 +5077,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => {
 					await new Promise<void>((resolve) => {
 						release = resolve;
+						markStarted();
 					});
 					return {
 						ok: true as const,
@@ -4885,9 +5115,11 @@ describe("registerPiContextHandler", () => {
 					messages as never,
 				) as never,
 			);
+			await started;
 			expect(runner.run).toHaveBeenCalledTimes(1);
 
 			clearContextHandlerSession(sessionId);
+			await started;
 			release();
 			await awaitInFlightHistorians();
 
@@ -4903,6 +5135,10 @@ describe("registerPiContextHandler", () => {
 		const db = createTestDb();
 		const sessionId = "ses-pi-active-historian-publish";
 		let release!: () => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, sessionId, "previous failure");
 			const runner = {
@@ -4910,6 +5146,7 @@ describe("registerPiContextHandler", () => {
 				run: mock(async () => {
 					await new Promise<void>((resolve) => {
 						release = resolve;
+						markStarted();
 					});
 					return {
 						ok: true as const,
@@ -4947,6 +5184,7 @@ describe("registerPiContextHandler", () => {
 					messages as never,
 				) as never,
 			);
+			await started;
 			release();
 			await awaitInFlightHistorians();
 
@@ -4963,6 +5201,10 @@ describe("registerPiContextHandler", () => {
 		const clearedSessionId = "ses-pi-cleared-multi-historian";
 		const activeSessionId = "ses-pi-active-multi-historian";
 		const releases: Array<() => void> = [];
+		let markBothStarted!: () => void;
+		const bothStarted = new Promise<void>((resolve) => {
+			markBothStarted = resolve;
+		});
 		try {
 			incrementHistorianFailure(db, clearedSessionId, "previous failure");
 			incrementHistorianFailure(db, activeSessionId, "previous failure");
@@ -4972,6 +5214,7 @@ describe("registerPiContextHandler", () => {
 					const callIndex = releases.length;
 					await new Promise<void>((resolve) => {
 						releases.push(resolve);
+						if (releases.length === 2) markBothStarted();
 					});
 					return {
 						ok: true as const,
@@ -5020,6 +5263,7 @@ describe("registerPiContextHandler", () => {
 					activeMessages as never,
 				) as never,
 			);
+			await bothStarted;
 			expect(runner.run).toHaveBeenCalledTimes(2);
 
 			clearContextHandlerSession(clearedSessionId);

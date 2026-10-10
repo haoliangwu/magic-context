@@ -252,6 +252,7 @@ export const PREFIX_BOUND_THINKING_MODELS: ReadonlyArray<readonly [string, numbe
     ["fable", 5, 1],
     ["opus", 5, 5],
     ["sonnet", 5, 5],
+    ["haiku", 5, 5],
 ];
 
 // One pattern built from the list: the family, then the version with `-`, `_`
